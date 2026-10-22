@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ live | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
+| **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
+| **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ replaced by 0.1.83 | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
 | **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ replaced by 0.1.82 | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
 | **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ replaced by 0.1.81 | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
 | **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ replaced by 0.1.80 | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
@@ -91,6 +92,100 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.83 — Control-path hardening: the admin answers mesh callers by an allowlist, orchestrator actions get a direction, the router binds WAN senders, SSH on the DMZ hosts, only a vouched email identifies a person (A-62, A-20, A-22, A-42, A-46 stage 4, A-55, A-79)
+
+- **Date:** 2026-10-22 (ART) · **Previous version:** 0.1.82 · **Commit:** `5fb8dab`.
+- **Scope:** motherbee and the three spokes (core update). No step by hand: the code, the baked
+  policy or the orchestrator applies everything (the operator's rule for this batch).
+- **Design:** docs/control-path-hardening-v1.md. One design review (security, operations) and one
+  code review round (security, operations, correctness); the code review's fixes are FINDINGS A-79.
+- **What changed:**
+  - **SY.admin (A-62):**
+    - mesh callers by an allowlist (`mesh_access`, `authorize_mesh_caller`); a caller on an ingress
+      or egress hive gets nothing; roles come from the registry and fail closed;
+    - SY.wf-rules publishes only inline workflow packages, never `wf.engine`, with only the fields
+      it sends, and `sync_hint` waits at most 5 s;
+    - node teardown is one `teardown_node`: the secrets first, then the ILK, each step reported;
+    - the WF ownership check reads shared memory (503 `INVENTORY_UNAVAILABLE` when it cannot);
+    - `kill_node` and `remove_node_instance` wait 180 s.
+  - **Orchestrator actions (A-20):** rule (3) admits mutations only from `SY.orchestrator@motherbee`
+    and reads also from the same hive; rule (4) never admits the spoke-only handshake on the
+    motherbee; the orchestrator answers admin messages only from its own hive's SY.admin.
+  - **SY.identity:** an orchestrator acts only on its own hive's nodes; canonical ILK ids at every
+    boundary, replicas included; a channel another ILK holds is never taken (`ICH_CONFLICT`); a
+    node registers no email.
+  - **The router (A-22, A-79):**
+    - sockets 0600 with a peer-uid check;
+    - a WAN sender resolves only in its peer's bucket;
+    - a UUID two hives list resolves to neither;
+    - from hive P's LSA: only nodes `*@P`, routes for P's destinations, taps on P's traffic to P's
+      nodes;
+    - a tap copy carries no SYSTEM authority;
+    - sibling regions must belong to the router's user.
+  - **SSH (A-46 stage 4 minimal, A-55):**
+    - `table inet fluxbee_ingress`: SSH only from the motherbee and `ingress.ssh_allow_from`,
+      applied at boot and on reconcile with a boot unit, never narrowed on an input failure;
+    - the join checks its own SSH source before installing anything;
+    - `egress.ssh_from_wan` (default true);
+    - no ufw or firewalld writes; an active one raises `host_firewall_active`.
+  - **A-42:** the frontdesk takes handoffs only from IO nodes with the `frontdesk_handoff` mark
+    (io.api, io.cloud and the first-contact gate stamp it); a typed email is `claimed_email`, never
+    indexed or merged; the vouched email survives the conversation; the registration tool acts only
+    on the message's own ILK.
+  - **Debt:** one rcgen (0.14) and x509-parser (0.18), checked against a CA made by 0.1.82;
+    `turns.ctx`/`seq` no longer written, now nullable (dropped next release); stale IO docs; dead
+    code.
+- **Deploy:**
+  - build of `5fb8dab` in 22 min, publish in 12 s, deploy in 251 s;
+  - snapshots `pre-hardening-0-1-83` on the 4 VMs (`pre-batch-0-1-80` was deleted);
+  - 0.1.83 on all 4 (core hash `fc2edab98e4b9740`): the spokes, still on 0.1.82, took the core
+    update over the mesh from the motherbee, whose certificate rcgen 0.14 issued; health clean.
+- **Gate:**
+  - **SSH on ingress1:** its table holds loopback, SSH from 10.10.10.10 and a drop of every other
+    SSH; the boot unit is enabled; one "applied" line. 10.10.10.30:22 opens from the motherbee and
+    loopback, not from worker1 or egress1. egress1's SSH is unchanged.
+  - **Refusals, from a throwaway mesh client:**
+    - a node on ingress1 asking SY.admin: `UNAUTHORIZED` (*an ingress or egress hive … may ask
+      SY.admin for nothing*);
+    - a `WF.*` node on worker1 asking for `inventory`: `UNAUTHORIZED`;
+    - a SPAWN from ingress1 to the motherbee: dropped by the router (the one denial in health);
+    - an admin read from ingress1 to the motherbee's orchestrator: `FORBIDDEN`;
+    - an ILK_PURGE from a non-orchestrator: `UNAUTHORIZED_REGISTRAR`.
+  - **What keeps working:**
+    - a node's life on worker1: an active test tenant, `AI.gate0183@worker1` launched, a secret
+      dedicated to it, `kill_node` with `purge_instance` reporting `vault_secrets_purged` 1 of 1
+      and the ILK marked and purged (`teardown_node` from `SY.orchestrator@worker1`);
+    - Archi relaying `inventory` to SY.admin (an SCMD, no model): 4 hives, 32 nodes;
+    - Cloud through the public door: a relay (`list_tenants`), `create_tenant`, and
+      `register_human` complete with the email in `identification.email`;
+    - a workflow deployed on worker1 through SY.wf-rules in 5 s, then deleted;
+    - `POST /acme/test`: issued and checked against Let's Encrypt staging.
+  - **Logs:** SY.admin refused only the two probes; the orchestrator's inbox only the probe.
+    SY.admin logged each hive's role at start.
+  - **Router:** three `foreign_source` warnings (7 frames), all transient: RT.gateway@egress1 at its
+    restart and the gate node on worker1 at its connect and purge, before or after its hive's LSA
+    listed it. 0.1.82 dropped the same frames without a log line.
+  - **Storage:** `turns.ctx`/`seq` nullable, none written since the deploy; turns keep landing.
+  - **Health:** `failed=0` on all 4; the motherbee's one denial is the SPAWN probe.
+  - **Covered by tests only:** a forged WAN sender, UUID shadowing, taps (PROD has none), the
+    sibling-region check, SY.identity's scope from a real orchestrator name, the join pre-checks (no
+    join was run), the conversation's claimed email, channel conflicts.
+- **Cleanup:** the gate tenants (deleted and purged), the gate node and its secret (purged by the
+  teardown), the gate person (deleted and purged), the gate workflow (deleted).
+- **Upgrading another hive:**
+  - nothing by hand;
+  - a hive whose registry entry lacks `hive_id`, `role` or `status: connected`, or whose join is not
+    `done`, is refused every mesh request at SY.admin (each role is logged at start);
+  - where operators reach the ingress by SSH from another network, list it in add_hive's
+    `ssh_allow_from`, or set `ingress.ssh_allow_from` in the ingress's `hive.yaml` and restart its
+    orchestrator.
+- **Rollback:**
+  - snapshot `pre-hardening-0-1-83`;
+  - or `apt install fluxbee=0.1.82` plus the core update of the spokes (0.1.82 accepts the nullable
+    `ctx`/`seq`). The ingress keeps `fluxbee_ingress` and its boot unit, which 0.1.82 does not
+    know: SSH stays limited to the motherbee until `fluxbee-ingress-nft.service` is disabled and
+    the table deleted.
 
 ## 0.1.82 — The edge's certificate from Let's Encrypt, issued and renewed by SY.admin; the vault's notice reaches the edge (O6, A-78, PB-1)
 

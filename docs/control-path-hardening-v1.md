@@ -1,8 +1,8 @@
 # Control-path hardening (v1)
 
-**Status:** implemented for 0.1.83 (2026-10-22), after one design review (security and operations)
-and one code review round (security, operations, correctness). The code review's fixes are in
-FINDINGS A-79. **Findings:**
+**Status:** validated on 8.x in 0.1.83 (2026-10-22), after one design review (security and
+operations) and one code review round (security, operations, correctness). The code review's fixes
+are in FINDINGS A-79; the gate is in the ledger. **Findings:**
 A-62, A-20, A-22 (partial), A-46 stage 4 (minimal), A-55 (a switch), A-42, and three found by the
 review (§3–§5). **Decisions:** the operator, 2026-10-22: the batch, the A-62 table, D-2 un-parked,
 A-42 rule (b), SSH on the DMZ hosts, the technical debt in the same release. After the review: the

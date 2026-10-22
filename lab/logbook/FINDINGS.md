@@ -241,7 +241,7 @@ no change required
   (15 → 0 local changes); after that `WF.w1probe@worker1` became HEALTHY: the first WF running on
   a worker.
 
-### A-22 🟡 PARTIAL (0.1.44) · the rest (P-1) PARKED — A local node could send messages as another node
+### A-22 🟡 PARTIAL (0.1.44 + 0.1.83: sockets 0600 with a peer-uid check) · binding a name to its process (P-1) PARKED with A-60 — A local node could send messages as another node
 
 - **What happened:** the router looked up a frame's sender by the `routing.src` the frame declared,
   and from there stamped its L2 name, which is what the gate uses to decide protected actions.
@@ -647,7 +647,13 @@ The operator's answer (2026-10-02): *"sí a todo"* ("yes to everything").
   PROD were deleted.
 
 
-### A-42 🟡 PARKED (security package, 2026-10-02) — The merge by email does not verify that the email belongs to whoever writes it
+### A-42 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22) — The merge by email does not verify that the email belongs to whoever writes it
+
+- **Resolved (0.1.83, design §7, rule (b)):** only an email the channel vouches for (the IO
+  node's handoff, Cloud, io.api's integrator) goes in `identification.email` and can merge; a
+  typed one is `claimed_email`, never indexed or merged; the frontdesk takes handoffs only from
+  IO nodes with the `frontdesk_handoff` mark. Live: Cloud's `register_human` registered a person
+  with the vouched email. An explicit merge by the operator is not offered yet.
 
 - **What happens (since 0.1.54, A-37):** if someone writes the email of another person in the same
   tenant, SY.identity does the merge, and their channel becomes associated with that person's ILK.
@@ -777,7 +783,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
   Only the ones that write the manifest stop: the orchestrator was down for 44 s.
 
-### A-46 ✅ RESOLVED (0.1.57: the ingress no longer reaches Archi) · the stage-4 firewall and Archi's API auth PARKED — Archi's HTTP API has no authentication and is reachable from the ingress
+### A-46 ✅ RESOLVED (0.1.57: the ingress no longer reaches Archi) · stage 4 minimal LIVE (0.1.83: SSH on the DMZ hosts) · the full stage-4 firewall and Archi's API auth PARKED — Archi's HTTP API has no authentication and is reachable from the ingress
 
 - **Status (2026-10-19 review):** stage 1 (loopback binds) shipped in 0.1.57 and stages 2-3 closed with A-47; the stage-4 firewall and authentication for Archi's API are parked in the posture table (2026-10-07).
 
@@ -1071,6 +1077,44 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-80 🟡 OPEN (found 2026-10-22) — A restore is refused when another tenant holds the same email
+
+- **What happens:** `check_ilk_restorable` (src/bin/sy_identity.rs) looks the person's vouched
+  email up across every tenant, while emails are unique per tenant. Restoring a marked person is
+  refused with `ILK_KEY_CONFLICT` when someone in another tenant holds the same email.
+- **Fix:** look the email up in the person's own tenant, as registration does.
+
+### A-79 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22) — What the hardening reviews found besides A-62, A-20, A-22 and A-42
+
+Found by the design review and the code review round of
+[control-path-hardening-v1](../../docs/control-path-hardening-v1.md); fixed in `5fb8dab`.
+Covered by tests; the ones marked *live* were seen on 8.x.
+
+- **The router:**
+  - a WAN frame's sender was looked up in every hive's bucket, not its peer's, so root on a spoke
+    could send as another spoke's node (it now resolves only in the peer's bucket, or among the
+    hub's vouched nodes when the peer is that hub; *live*: the few frames of a node not yet or no
+    longer listed are counted as `foreign_source`, which 0.1.82 dropped without a log line);
+  - a hive's LSA could carry any node name, routes matching other hives' names and taps on other
+    hives' traffic (it now carries only `*@P`, routes for P's destinations and taps P is party to
+    and that target P's nodes), and a UUID it advertised could shadow another hive's node (a UUID
+    two hives list now resolves to neither);
+  - a tap copy carried SYSTEM authority (it no longer does), and a sibling router's shared-memory
+    region was read whoever owned it (it must be the router's user's, with no group or world
+    write).
+- **SY.admin:** wf-rules could publish `wf.engine` itself, which every workflow runs; the teardown
+  purged the ILK before deleting its secrets, so they could not be tied to a hive (now one
+  `teardown_node`; *live*); `test_hold_ms` and an unbounded `sync_hint` wait reached the mesh; the
+  WF ownership check waited on the orchestrator's queue (now read from shared memory).
+- **SY.orchestrator:** its admin inbox answered reads to any caller and forwarded them under its
+  own name (*live*: FORBIDDEN); non-canonical ILK ids were stored as given.
+- **SY.identity:** an orchestrator could delete, purge or rewrite any person; a non-canonical
+  `ilk_id` slipped past the scope check and overwrote another ILK at the database's upsert; a
+  channel another ILK held could be taken over; a node could register an email.
+- **The frontdesk:** a handoff was recognized by its shape alone and from any sender; a handoff
+  without an email inherited the typed one; a vouched email was lost when the handoff had no
+  name; the registration tool acted on an ILK the model named.
 
 ### A-78 ✅ VALIDATED ON 8.x (0.1.82, 2026-10-21) — The vault's change notice never reaches the edge
 
@@ -2101,7 +2145,14 @@ router reviews.
 - **Pending for the next stages:** reassigning nodes (with the vault's permissions, stage 2), and
   the tenant's state as a gate and the rest of D8 (stage 3).
 
-### A-62 🟡 PARKED (cost/benefit, 2026-10-13) — Any node on the mesh can ask the admin for any action
+### A-62 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22) — Any node on the mesh can ask the admin for any action
+
+- **Resolved (0.1.83, [control-path-hardening-v1](../../docs/control-path-hardening-v1.md) §2):**
+  SY.admin admits a mesh caller only by its allowlist (`mesh_access`, `authorize_mesh_caller`);
+  a caller on an ingress or egress hive gets nothing, roles come from the registry and fail
+  closed. Live: a node on ingress1 and a `WF.*` node on worker1 were refused; Archi, IO.cloud,
+  SY.wf-rules (a deploy) and the orchestrator's `teardown_node` were admitted. What root on a
+  spoke can still do is the design's §9.
 
 - **What happens (seen in the code on 2026-10-07):** the admin's internal gateway (`ADMIN_COMMAND`)
   does not look at who is calling, except for a few actions with their own gate: Cloud's relay
@@ -2437,7 +2488,7 @@ router reviews.
     it, as egress and ingress already did: without vendor it never gets Syncthing, and nothing
     repairs it.
 
-### A-55 🟡 PARKED BY DECISION (D31) — The egress's SSH door
+### A-55 🟡 PARKED BY DECISION (D31) · a switch since 0.1.83 (`egress.ssh_from_wan: false`) — The egress's SSH door
 
 - **What it is:** the operator keeps SSH (tcp 22) open on `egress.wan_iface` for operation and
   maintenance during this development. In PROD it is 192.168.8.240, an internal network behind a
@@ -2462,7 +2513,13 @@ router reviews.
   `folder_id` for the `dist` channel: it only accepted `fluxbee-dist`, even though the handler
   already knew how to honor a specific folder) → 0.1.43 accepts any `fluxbee-dist*`.
 
-### A-20 🟡 PARTIAL (0.1.42 + 0.1.45) · direction PARKED — With CONFIG_CHANGED crossing hives, its receivers applied any origin the router admitted
+### A-20 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22: the direction) — With CONFIG_CHANGED crossing hives, its receivers applied any origin the router admitted
+
+- **Resolved (0.1.83, design §3):** rule (3) admits orchestrator mutations only from
+  `SY.orchestrator@motherbee` and reads also from the same hive; rule (4) never admits
+  `ADD_HIVE_FINALIZE`/`REMOVE_HIVE_CLEANUP` on the motherbee; the orchestrator answers admin
+  messages only from its own hive's SY.admin. Live: a SPAWN from ingress1 was dropped and an
+  admin read to the motherbee's orchestrator answered FORBIDDEN; spawns on worker1 still work.
 
 - **What happened:** the router's gate for CONFIG_CHANGED admits the primary admin **and the
   orchestrators** (rule 3 of the system policy). SY.opa.rules applied a compile/apply/clear from

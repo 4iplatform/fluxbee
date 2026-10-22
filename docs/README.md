@@ -64,6 +64,10 @@ One page per node: [rt-gateway](nodes/rt-gateway.md) (the router),
 
 Decisions as they were taken, with the operator's reasons. Dated; not rewritten afterwards.
 
+- [control-path-hardening-v1](control-path-hardening-v1.md): what a spoke may ask of the control
+  plane: SY.admin's mesh allowlist, orchestrator actions with a direction, WAN senders bound to
+  their session, SSH on the DMZ hosts, only a vouched email identifies a person (A-62, A-20, A-22,
+  A-42, A-79).
 - [acme-edge-certificates-v1](acme-edge-certificates-v1.md): the edge's certificate from an ACME
   CA, issued and renewed by SY.admin with TLS-ALPN-01 (O6, A-78).
 - [router-stream-v1](router-stream-v1.md): the router stream, cognition per communication, LLM
