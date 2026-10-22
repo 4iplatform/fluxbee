@@ -54,15 +54,15 @@ UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
   sy-orchestrator sy-storage sy-identity sy-cognition sy-timer sy-wf-rules sy-frontdesk-gov)
 
 echo "== [1/5] build rust =="
-cargo build --release --bins
-cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+cargo build --release --locked --bins
+cargo build --release --locked -p sy-frontdesk-gov --bin sy-frontdesk-gov
 # ai.generic: `cargo build --bins` does NOT build this. The root Cargo.toml has BOTH a [package]
 # (json-router) and a [workspace], and without --workspace `--bins` only builds the ROOT package's
 # bins — workspace MEMBERS are skipped. That is why sy-frontdesk-gov above (also a member) needs its
 # own line, and ai-generic needs one too. Without it the .deb build dies at [3/5] with "binary does
 # not exist: target/release/ai_node_runner" on any clean box — it only ever "worked" where a
 # previous manual build had left the binary behind.
-cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
+cargo build --release --locked -p fluxbee-ai-nodes --bin ai_node_runner
 # Build every nodes/io crate the base-node manifest references (singleton infra nodes +
 # io.* runtimes). wf-generic (go) is built in the go step below.
 IO_PKGS="$( { mf singletons; mf runtimes; } | awk -F'\t' '$4=="nodes/io"{print $2}' | sort -u )"
@@ -258,7 +258,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3
+Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3, ca-certificates
 Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh

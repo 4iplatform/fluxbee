@@ -206,7 +206,24 @@ def health(since):
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
         ok = ok and rows.get(hive, "") == (
             "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0")
-    return ok
+    return certificate_health() and ok
+
+
+def certificate_health():
+    """The edge certificate's open conditions (GET /acme/status, docs/acme-edge-certificates-v1.md
+    §7): a critical one fails the health check. A hive without the route (before 0.1.82) passes."""
+    status = admin("GET", "/acme/status", timeout=30)
+    body = status.get("payload") if isinstance(status.get("payload"), dict) else status
+    if "conditions" not in body:
+        return True
+    conditions = body.get("conditions") or []
+    critical = [c.get("kind") for c in conditions if c.get("severity") == "critical"]
+    config = body.get("config") or {}
+    print("%-10s acme=%s name=%s conditions=%s%s" % (
+        "edge-cert", config.get("state"), config.get("name"),
+        ",".join(c.get("kind", "?") for c in conditions) or "none",
+        " CRITICAL" if critical else ""))
+    return not critical
 
 
 def utc_stamp(epoch):

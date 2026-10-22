@@ -160,6 +160,14 @@ LAN leg is in place, and reports it (`egress_nat_applied`, `egress_ipv4_forwardi
 `EGRESS_NAT_NOT_READY` (`EGRESS_NAT_NOT_VERIFIED` when the box cannot be read). The interfaces and their addresses are the operator's: the orchestrator
 never configures them, and the egress fails its own boot on any of these.
 
+**Internet probe.** The egress, a worker that routes through it and the motherbee check the
+internet with an HTTPS GET of their own `egress.reachability_url` (the egress at boot and every
+drift tick, the others at boot); a failure is a warning in that hive's journal. There is no
+default: without the URL the probe does not run and logs `internet_reachable=not_configured`. An
+egress join takes `egress.reachability_url` from the request, else the motherbee's, and refuses
+anything but an `https://` URL; a worker join copies the motherbee's with `gateway_ip`. A hive
+joined before gets it by adding the line to its hive.yaml and restarting `sy-orchestrator`.
+
 A successful join's result (`join.result` in `GET /hives/<id>`) carries `warnings`. A join that
 logged in with `ssh_password` (its key-first probe failed and the password seeded the motherbee
 key) and did not harden SSH says there that password logins stay enabled on the box, and how to
@@ -340,6 +348,90 @@ It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes
 taps and the history. Re-running is safe; a summary goes to
 `/var/lib/fluxbee/state/factory-reset.log`.
 
+## Certificates (ACME)
+
+The public edge's certificate comes from an ACME certificate authority, Let's Encrypt unless
+configured otherwise, validated with TLS-ALPN-01 on the :443 the edge already opens. SY.admin on
+the motherbee orders and renews it, and the edge serves it from SY.vault and reloads it without a
+restart ([SY.admin](../nodes/sy-admin.md#the-acme-client), [SY.edge](../nodes/sy-edge.md); design:
+[docs/acme-edge-certificates-v1.md](../acme-edge-certificates-v1.md)). The certified name is the
+host of `admin.public_base_url`; the CA comes from the `acme:` section. Nothing in the code names
+a domain or a CA.
+
+**Set up a fresh installation:**
+
+1. **DNS.** An A record for the name to the ingress' public address, and an AAAA record if the
+   ingress has a public IPv6 address. A record that points elsewhere makes the CA validate the
+   wrong host.
+2. **Port 443/tcp** open on the ingress to the whole internet: the CA validates from several
+   places it does not publish. Port 80 is not used.
+3. **The ingress' secret name.** Its `edge.tls_vault_key` must start with `edge_tls` (new
+   installations use `edge_tls`); SY.admin writes no other secret.
+4. **The motherbee's hive.yaml:**
+
+   ```yaml
+   admin:
+     public_base_url: "https://hive-k3m9x7q2.example.com"   # port 443, a DNS name with a dot
+     public_edge_node: "SY.edge@ingress1"   # needed when more than one ingress is connected
+   acme:
+     terms_agreed: true                     # you accept the CA's terms
+     # optional: directory_url, staging_directory_url, profile, contact, trust_anchor
+   ```
+
+5. **Restart SY.admin** when it is idle (`sudo systemctl restart sy-admin`): a restart cuts
+   executor plans and relayed Cloud commands in flight.
+6. **Read `GET /acme/status`.** `config.state` must be `on`; when it is `off`, `config.reason`
+   says why (the same line is in `journalctl -u sy-admin`). `terms_url` is the terms you agreed
+   to, and `edge.live` is what the edge serves.
+7. **Optionally, `POST /acme/test`** (it creates the staging account and arms the edge, so confirm
+   it first): a staging order with the real name, issued and checked but never installed. Its
+   result is `last_test` in the status; a staging root is reported as untrusted, as expected.
+8. The first check runs 2 min after SY.admin starts. An edge with no certificate gets one ordered
+   then; `last_attempt` and `issued` in the status show the result, and `renewal.renew_at` when
+   the next renewal is due. A failure shows in `last_attempt` and backs off 1 h, 2 h, 4 h and so
+   on, up to 24 h.
+
+**Move a hand-seeded certificate to ACME.** The check never replaces a certificate it did not
+issue: it alerts (`foreign_certificate` once the leaf passes two thirds of its lifetime,
+`name_not_covered` when it does not cover the name) and leaves it. `POST /acme/renew`, confirmed,
+orders now: the new certificate goes into the edge's secret, the hand-seeded one stays in the
+vault as the previous version, and the edge reloads. From then on the check renews it by itself.
+The same call certifies a new name after `public_base_url` changed and SY.admin restarted.
+
+**Roll back.** `POST /hives/motherbee/vault/secrets/<the edge's secret>/rollback` puts the previous
+version back, then `POST /acme/reload` makes the edge serve it. The check then sees a hand-seeded
+leaf and leaves it. Roll the vault back before downgrading to a version that cannot renew. The
+vault keeps one previous version, so after two renewals the hand-seeded certificate is no longer
+there: keep its files.
+
+**When the edge refuses a certificate SY.admin issued**, SY.admin rolls the secret back at once,
+raises `install_refused` (critical) and orders nothing until you act: find the cause in
+`install_refused.detail` and the edge's journal, then `POST /acme/renew`. A refused first
+certificate has no previous version to go back to: delete the secret
+(`DELETE /hives/motherbee/vault/secrets/<the edge's secret>`) before renewing. A refusal because
+the edge could not read SY.vault (`transient`) is not a refusal: the certificate stays and the
+next check reloads it.
+
+**"The vault holds a version the edge does not serve."** SY.admin writes the edge's secret only
+over the write the edge serves (version and `updated_at`), after one reload. When a renewal stops
+with this, the vault holds something the edge refused or never loaded: `POST /acme/reload` to see
+why the edge keeps its certificate, then roll the secret back (or delete one the edge never
+served) and renew.
+
+**An edge that answers `status: error`** (no public listener, a `disk` or `plaintext` edge asked
+to reload) is a configuration error, shown in `edge.config_error`: nothing is ordered and no
+`edge_unreachable` is raised. `acme.trust_anchor`, when set, is trusted for every connection to
+the CA as well as for the issued chain.
+
+**Alerts.** The certificate conditions (`renewal_failed`, `renewal_overdue`, `expiring`,
+`name_not_covered`, `foreign_certificate`, `install_refused`, `edge_without_certificate`,
+`edge_unreachable`) are in `GET /acme/status` while open, and in `GET /drift-alerts` with
+`category: certificate`: one row when a condition opens and an `info` row when it closes. The
+expiry conditions run without `acme:` too.
+
+**When the motherbee is down,** nothing renews and nothing alerts. An external monitor of the
+public name's certificate expiry, run from outside the installation, covers that.
+
 ## Health checks
 
 | Check | What it tells |
@@ -352,6 +444,7 @@ taps and the history. Re-running is safe; a summary goes to
 | `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
+| `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the orchestrators record (`category` `core`, `egress`, `posture`, `syncthing`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes |
 | `GET /config/storage/metrics` | SY.storage's inbox |
 | `systemctl --failed`, `journalctl -u <unit>` | per host |
 

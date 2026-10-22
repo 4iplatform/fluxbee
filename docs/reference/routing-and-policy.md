@@ -208,8 +208,9 @@ hands it to the node when the node is its own (`handle_peer_message`, `handle_wa
 At the router where it enters from a node (`handle_message`):
 
 1. `trace_id` must be a UUID. A `trace_id` seen in the last 30 s is dropped (`BroadcastCache`).
-2. Every local node except the sender gets it, when it passes the VPN check (§8.2) and, if
-   `meta.target` is set, its name matches it (`pattern_match`: exact, or `*` wildcards).
+2. Every local node except the sender gets it, when it passes the VPN check for a broadcast
+   (§8.2, `vpn_allows_broadcast_between`) and, if `meta.target` is set, its name matches it
+   (`pattern_match`: exact, or `*` wildcards).
 3. `ttl >= 2`: a copy to every sibling router (`broadcast_to_peers`).
 4. `ttl >= 3`: toward the WAN. The gateway sends it to every WAN peer; another router sends it to
    the gateway sibling (`forward_broadcast_to_wan`).
@@ -274,12 +275,12 @@ wasm and baked into the router binary with `include_bytes!` (`src/router/system_
 ### 6.2 Protected actions and who may send them
 
 The gate covers system messages (`meta.type` compared without case, `is_system_kind`) whose
-`meta.msg` is one of the 27 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
+`meta.msg` is one of the 30 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
 `src_l2_name` (§2) and the hive of the router doing the delivery.
 
 | Rule in `system.rego` | Actions | Allowed origin |
 | --- | --- | --- |
-| (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB` | `SY.admin@motherbee` |
+| (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` |
 | (2) | `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` | `SY.admin@motherbee` |
 | (3) | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_GET`, `NODE_CONFIG_SET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@<any hive>` |
 | (4) | every protected action outside (1) and (2): the (3) list and `INVENTORY_REQUEST` | `SY.admin@<this hive>` |
@@ -531,11 +532,17 @@ nodes of two hives in one VPN, load the same rule on both. A changed VPN is writ
 region (`update_node_vpn`); the node is not told, ANNOUNCE carries it only at HELLO.
 
 **The check** (`vpn_allows_between`), at every delivery decision: UUID or name, local, sibling or
-remote, broadcast fan-out, tap copies.
+remote, tap copies. A broadcast fan-out asks `vpn_allows_broadcast_between`, the same check
+without the vault notice of rule 1.
 
-1. If either end is `SY.edge`, only the edge rules apply: `EDGE_*` commands from
-   `SY.admin@motherbee` and their `*_RESPONSE` back to it; non-system traffic between the edge and
-   `IO.*` nodes; `VAULT_GET` and `VAULT_GET_RESPONSE` with `SY.vault`. Nothing else.
+1. If either end is `SY.edge`, only the edge rules apply: the edge commands of §6.2 rule (1) from
+   `SY.admin@motherbee` and their `*_RESPONSE` back to it (`EDGE_SERVICE_COMMANDS`,
+   `EDGE_SERVICE_RESPONSES`); non-system traffic between the edge and `IO.*` nodes; `VAULT_GET`
+   and `VAULT_GET_RESPONSE` with `SY.vault`; and `VAULT_SECRET_CHANGED` from
+   `SY.vault@motherbee` to the edge, addressed to it, never as a broadcast (A-78,
+   `edge_vault_notice_allowed`). SY.vault's broadcast names every stored key, its tenant and its
+   owners, so it stays out of the DMZ; SY.vault sends the edge the notices about its own secrets
+   instead ([SY.vault](../nodes/sy-vault.md#vault_secret_changed)). Nothing else.
 2. A system message with `meta.scope: "global"` passes, whoever sends it.
 3. If either end's name starts with `SY.` or `RT.`, it passes.
 4. Otherwise the two `vpn_id`s must be equal. VPN 0 is an ordinary VPN here: a node in VPN 0 and one

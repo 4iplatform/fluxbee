@@ -16,9 +16,11 @@ use axum::routing::any;
 use axum::Router;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
-    MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
-    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
-    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
+    MSG_EDGE_ACME_CHALLENGE, MSG_EDGE_ACME_CHALLENGE_RESPONSE, MSG_EDGE_CLOSE_URL,
+    MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
+    MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_TLS_RELOAD, MSG_EDGE_TLS_RELOAD_RESPONSE,
+    MSG_EDGE_TLS_STATUS, MSG_EDGE_TLS_STATUS_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED,
     SYSTEM_KIND,
 };
@@ -26,8 +28,10 @@ use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
     parse_node_config_request, try_handle_default_node_status, NodeConfig,
     NodeConfigControlRequest, NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher,
-    RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver, RpcError, RpcRequestLabels,
 };
+use json_router::tls_material::{self, ChainDiagnosis, MaterialError};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -96,6 +100,8 @@ mod http_ingress {
 }
 
 const RPC_CH_SYSTEM: &str = "system";
+/// The three TLS commands, taken off the system channel so the sequential loop never delays them.
+const RPC_CH_TLS: &str = "tls";
 
 /// Request headers the edge forwards INWARD — a strict ALLOWLIST (fail-closed, §7.5/M2).
 /// Only these named-safe headers reach the internal IO node; EVERYTHING else — the raw
@@ -245,10 +251,11 @@ async fn main() -> Result<(), SyEdgeError> {
     )
     .await;
 
-    // What TLS material we ended up actually serving. Declared out here, not inside the
-    // frontend block, because the message loop below is what consults it: a role with no
-    // public door still receives vault broadcasts and must NOT react to them.
-    let mut live_tls = LiveTlsMaterial::NotFromVault;
+    // The public listener's TLS (docs/acme-edge-certificates-v1.md §4), shared by the acceptor,
+    // the TLS command task, the vault notices of the loop below and the awaiting re-reads. `None`
+    // on a role with no public door: such an edge still receives vault notices and must NOT react
+    // to them, and it answers the TLS commands with an error.
+    let mut edge_tls: Option<Arc<EdgeTls>> = None;
 
     // Ingress-hive role: run the public HTTPS door. Fail-closed — absent on any
     // other role (`resolve_http_listen`).
@@ -271,86 +278,65 @@ async fn main() -> Result<(), SyEdgeError> {
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             public_inflight: Arc::new(Semaphore::new(config.public_max_inflight)),
         });
-        // TLS: vault-sourced (preferred) or on-disk PEM. FAIL-CLOSED — if TLS is
-        // requested but the material can't be built, do NOT fall back to plaintext
-        // on the public listener; skip the frontend entirely.
-        let tls_requested = config.tls_vault_key.is_some()
-            || (config.tls_cert.is_some() && config.tls_key.is_some());
-        // Set when the failure is a transient "vault not up yet", so the fail-closed
-        // message below does not blame the operator for a cold boot.
-        let mut tls_failure_is_transient = false;
-        let tls: Option<Arc<rustls::ServerConfig>> = if let Some(vault_key) =
-            config.tls_vault_key.clone()
-        {
-            tracing::info!(vault_hive = %config.vault_hive, key = %vault_key, ilk = %self_ilk, "sy-edge fetching TLS cert from vault");
-            match fetch_tls_config_from_vault(
-                Arc::clone(&dispatcher),
-                self_ilk.clone(),
-                self_name.clone(),
-                config.vault_hive.clone(),
-                &vault_key,
-            )
-            .await
-            {
-                Ok((cfg, version, diagnosis, fingerprint)) => {
-                    log_tls_chain_diagnosis("vault", diagnosis);
-                    live_tls = LiveTlsMaterial::FromVault {
-                        version,
-                        fingerprint: Some(fingerprint),
-                    };
-                    Some(Arc::new(cfg))
-                }
+        // TLS: vault-sourced (preferred), on-disk PEM, or explicit plaintext. FAIL-CLOSED: a TLS
+        // configuration that cannot work never falls back to plaintext on the public listener.
+        // A vault edge never exits for its secret, though: it starts AWAITING (§4).
+        let mode = TlsMode::resolve(
+            config.tls_vault_key.as_deref(),
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )
+        .map_err(|err| {
+            tracing::error!(error = %err, "sy-edge: invalid TLS configuration; refusing to bind the public listener");
+            err
+        })?;
+        let tls = match mode {
+            TlsMode::Plaintext => Arc::new(EdgeTls::plaintext()),
+            TlsMode::Disk { cert, key } => match EdgeTls::from_disk(cert, key, now_unix_secs()) {
+                Ok(tls) => Arc::new(tls),
                 Err(err) => {
-                    tls_failure_is_transient = err.is_transient();
-                    if tls_failure_is_transient {
-                        tracing::warn!(
-                            error = %err.detail(),
-                            "sy-edge: vault not reachable yet; systemd retries in ~5s (normal on cold boot)"
-                        );
-                    } else {
-                        tracing::error!(error = %err.detail(), "sy-edge: TLS cert fetch from vault failed");
-                    }
-                    None
+                    tracing::error!(
+                        error = %err,
+                        "sy-edge: TLS requested but the cert files did not load; refusing to bind the public listener in plaintext (fail-closed). Fix the files; systemd restarts in ~5s."
+                    );
+                    return Err(err.into());
                 }
+            },
+            TlsMode::Vault { key } => {
+                tracing::info!(vault_hive = %config.vault_hive, key = %key, ilk = %self_ilk, "sy-edge reading its TLS certificate from the vault");
+                let source = VaultSecretSource {
+                    client: fluxbee_sdk::VaultClient::new(
+                        Arc::clone(&dispatcher),
+                        config.vault_hive.clone(),
+                        fluxbee_sdk::VaultCallerOwned::new(self_ilk.clone(), self_name.clone()),
+                    ),
+                    timeout: VAULT_TLS_READ_TIMEOUT,
+                };
+                let tls = Arc::new(EdgeTls::vault(key, Arc::new(source)));
+                start_vault_tls(&tls, AWAITING_SCHEDULE).await;
+                tls
             }
-        } else if let (Some(cert), Some(key)) = (config.tls_cert.clone(), config.tls_key.clone()) {
-            match load_tls_config(&cert, &key) {
-                Ok((cfg, diagnosis)) => {
-                    log_tls_chain_diagnosis("disk", diagnosis);
-                    Some(Arc::new(cfg))
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "sy-edge: TLS cert load from disk failed");
-                    None
-                }
-            }
-        } else {
-            None
         };
-        if tls_requested && tls.is_none() {
-            if tls_failure_is_transient {
-                // Same fail-closed exit, but do not send the operator hunting for a broken
-                // secret: the material simply is not reachable yet.
-                tracing::warn!(
-                    "sy-edge: TLS material not available yet; refusing to bind the public listener \
-                     in plaintext (fail-closed). systemd restarts in ~5s — expected during a cold \
-                     boot, no operator action needed."
-                );
-            } else {
-                tracing::error!(
-                    "sy-edge: TLS requested but no valid cert loaded; refusing to bind the public \
-                     listener in plaintext (fail-closed). Fix the vault secret / cert files and restart."
-                );
+        edge_tls = Some(Arc::clone(&tls));
+        tokio::spawn(async move {
+            if let Err(err) = run_frontend(listen, state, tls).await {
+                tracing::error!(error = %err, "sy-edge public frontend exited");
             }
-            return Err("TLS requested but no valid cert loaded".into());
-        } else {
-            tokio::spawn(async move {
-                if let Err(err) = run_frontend(listen, state, tls).await {
-                    tracing::error!(error = %err, "sy-edge public frontend exited");
-                }
-            });
-        }
+        });
     }
+
+    // The TLS commands answer beside the sequential loop below (§4): EDGE_PUBLISH_BLOB can hold
+    // that loop for a minute, and SY.admin's ACME order must not wait behind it.
+    let tls_commands = dispatcher
+        .take_command_receiver(RPC_CH_TLS)
+        .await
+        .map_err(|err| format!("sy-edge tls receiver: {err}"))?;
+    tokio::spawn(run_tls_commands(
+        tls_commands,
+        sender.clone(),
+        edge_tls.clone(),
+        config.ttl,
+    ));
 
     // FIX-6 (part 2): active reaper. Part 1 drops expired public-artifact rows at LOAD; this
     // periodically prunes them from the live registry AND persists the pruned ledger, so a
@@ -485,153 +471,61 @@ async fn main() -> Result<(), SyEdgeError> {
                             &registry,
                         )
                         .await;
-                        // TLS material is NOT covered by resolve_secrets: it is read exactly once
-                        // at boot into an immutable `Arc<rustls::ServerConfig>` already moved into
-                        // the running listener, so a rotated cert stayed invisible until someone
-                        // restarted the unit by hand (observed in prod: vault at version 2 with the
-                        // full chain while the edge still served the chainless version 1).
-                        // React with exit(0) and let systemd restart us — the same contract
-                        // sy.identity and sy.storage use for boot-only vault material
-                        // (Model D' VA-J'-13). Hot-swapping via a rustls cert resolver would avoid
-                        // the brief public-listener gap and is the better end state; it is tracked
-                        // as PB-1 in lab/logbook/PENDING-BUGS.md.
-                        //
-                        // Matching is BY KEY here, deliberately diverging from the
-                        // `(resource_type, tenant_id, ilk)` guidance on VaultSecretChangedPayload:
-                        // that guidance is for consumers who resolve a secret by interest, whereas
-                        // the edge is configured with one explicit `tls_vault_key` and fetches by
-                        // that exact key. Key equality is precisely the condition that invalidates
-                        // what we loaded.
+                        // The TLS certificate is NOT covered by resolve_secrets. A change to the
+                        // edge's own key (put, rotate, rollback, or SY.vault re-announcing at its
+                        // boot) does what EDGE_TLS_RELOAD does: one re-read, the shared verdict, a
+                        // swap in place when it passes (PB-1, docs/acme-edge-certificates-v1.md
+                        // §4). Nothing exits. It runs in its own task, so this loop never waits on
+                        // the vault for it.
                         let is_bootstrap = msg.meta.action.as_deref()
                             == Some(fluxbee_sdk::protocol::VAULT_BOOTSTRAP_ACTION);
+                        let live = edge_tls
+                            .as_ref()
+                            .map(|tls| tls.live_material())
+                            .unwrap_or(LiveTlsMaterial::NotFromVault);
+                        let tls_key = edge_tls
+                            .as_ref()
+                            .and_then(|tls| tls.mode.vault_key())
+                            .map(str::to_string);
                         match tls_secret_change_action(
                             &msg.payload,
-                            config.tls_vault_key.as_deref(),
-                            live_tls.clone(),
+                            tls_key.as_deref(),
+                            &live,
                             is_bootstrap,
                         ) {
-                            TlsSecretChange::ReloadRequired { key, op, version } => {
-                                // Prove the NEW material loads BEFORE surrendering the listener.
-                                // Exiting first and discovering the problem on the way back up
-                                // would turn one bad `vault_put` into a public HTTPS outage —
-                                // the same asymmetry DeletedKeepServing already encodes.
-                                //
-                                // RETRIED on a transient failure. A single blip on the link to
-                                // the vault would otherwise abandon a legitimate rotation
-                                // outright: nothing re-fires this decision, so the edge would
-                                // keep serving the old cert until it expired. The material
-                                // itself is almost certainly fine — it is the fetch that failed.
-                                let mut probe = Err(TlsFetchFailure::VaultUnavailable(
-                                    "not attempted".to_string(),
-                                ));
-                                for attempt in 1..=TLS_RELOAD_PROBE_ATTEMPTS {
-                                    probe = fetch_tls_config_from_vault(
-                                        Arc::clone(&dispatcher),
-                                        self_ilk.clone(),
-                                        self_name.clone(),
-                                        config.vault_hive.clone(),
-                                        &key,
-                                    )
-                                    .await
-                                    .map(|(_, _, diagnosis, _)| diagnosis);
-                                    // Only a transient failure is worth retrying: bad material
-                                    // will be just as bad next time.
-                                    match &probe {
-                                        Err(failure) if failure.is_transient() => {
-                                            if attempt < TLS_RELOAD_PROBE_ATTEMPTS {
-                                                tracing::warn!(
-                                                    key = %key,
-                                                    attempt = attempt,
-                                                    detail = %failure.detail(),
-                                                    "sy-edge: TLS reload probe could not reach the vault; retrying"
-                                                );
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    TLS_RELOAD_PROBE_BACKOFF_SECS,
-                                                ))
-                                                .await;
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                                match tls_reload_verdict(probe) {
-                                    TlsReloadVerdict::RestartToLoad => {
-                                        tracing::warn!(
-                                            key = %key,
-                                            op = %op,
-                                            version = version,
-                                            "sy-edge: TLS cert changed in vault; exiting(0) for systemd restart to load it (cannot hot-swap a live listener)"
-                                        );
-                                        // Flush before the process goes away.
-                                        tokio::time::sleep(std::time::Duration::from_millis(250))
-                                            .await;
-                                        std::process::exit(0);
-                                    }
-                                    TlsReloadVerdict::KeepServing { detail, transient } => {
-                                        tracing::error!(
-                                            key = %key,
-                                            op = %op,
-                                            version = version,
-                                            transient = transient,
-                                            detail = %detail,
-                                            "sy-edge: REFUSING to restart for the new TLS material — still serving the previously loaded cert. Fix the secret and re-put it (vault_rollback restores the last good version)."
-                                        );
-                                    }
-                                }
-                            }
-                            TlsSecretChange::BootstrapAlreadyLoaded {
+                            TlsSecretChange::Reload {
                                 key,
+                                op,
                                 version,
-                                live_fingerprint,
+                                bootstrap,
                             } => {
-                                // CONFIRM before suppressing. A vault rollback sets
-                                // `current_version = previous_version` and the next put re-mints
-                                // that same number, so a matching version can denote DIFFERENT
-                                // material — and suppressing on it would leave the edge serving
-                                // a cert the operator already replaced.
-                                match fetch_tls_config_from_vault(
-                                    Arc::clone(&dispatcher),
-                                    self_ilk.clone(),
-                                    self_name.clone(),
-                                    config.vault_hive.clone(),
-                                    &key,
-                                )
-                                .await
-                                {
-                                    Ok((_, _, _, fingerprint))
-                                        if live_fingerprint.as_deref() == Some(&fingerprint) =>
-                                    {
-                                        tracing::info!(
-                                            key = %key,
-                                            version = version,
-                                            "sy-edge: sy-vault re-announced at its own boot the material already live; not restarting"
-                                        );
-                                    }
-                                    Ok(_) => {
-                                        tracing::warn!(
-                                            key = %key,
-                                            version = version,
-                                            "sy-edge: bootstrap announced the live version number but DIFFERENT material (a vault rollback reuses numbers); restarting to load it"
-                                        );
-                                        tokio::time::sleep(std::time::Duration::from_millis(250))
-                                            .await;
-                                        std::process::exit(0);
-                                    }
-                                    Err(failure) => {
-                                        // Cannot confirm: keep serving. A bootstrap re-announce
-                                        // is not urgent, and the next one will retry.
-                                        tracing::warn!(
-                                            key = %key,
-                                            detail = %failure.detail(),
-                                            "sy-edge: could not confirm the bootstrap-announced material; keeping the current cert"
-                                        );
-                                    }
+                                let (live_version, live_fingerprint) = match &live {
+                                    LiveTlsMaterial::FromVault {
+                                        version,
+                                        fingerprint,
+                                    } => (*version, Some(fingerprint.as_str())),
+                                    _ => (None, None),
+                                };
+                                tracing::info!(
+                                    key = %key,
+                                    op = %op,
+                                    version,
+                                    bootstrap,
+                                    live_version = ?live_version,
+                                    live_fingerprint = ?live_fingerprint,
+                                    "sy-edge: TLS secret changed in the vault; re-reading it in place"
+                                );
+                                if let Some(tls) = edge_tls.clone() {
+                                    let trigger = format!("VAULT_SECRET_CHANGED {op}");
+                                    tokio::spawn(async move {
+                                        let _ = tls.reload(&trigger).await;
+                                    });
                                 }
                             }
                             TlsSecretChange::DeletedKeepServing { key } => {
                                 tracing::error!(
                                     key = %key,
-                                    "sy-edge: TLS cert DELETED from vault; still serving the previously loaded cert. A restart would leave this edge with no HTTPS frontend — restore the secret."
+                                    "sy-edge: TLS cert DELETED from the vault; still serving the certificate already loaded (nothing restarts). Restore the secret, or let SY.admin issue one."
                                 );
                             }
                             TlsSecretChange::Malformed { error } => {
@@ -688,6 +582,20 @@ async fn main() -> Result<(), SyEdgeError> {
 fn build_sy_edge_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_SYSTEM)
+        .command_channel(RPC_CH_TLS)
+        // The TLS commands get their own channel, consumed beside the sequential system loop
+        // (`run_tls_commands`). Commands, never responses: they go before any pending waiter.
+        .pre_pending_rule(
+            RouteMatch::one_of(
+                SYSTEM_KIND,
+                [
+                    MSG_EDGE_TLS_STATUS,
+                    MSG_EDGE_TLS_RELOAD,
+                    MSG_EDGE_ACME_CHALLENGE,
+                ],
+            ),
+            RouteTarget::Command(RPC_CH_TLS),
+        )
         .post_pending_rule(
             RouteMatch::any_msg_type(SYSTEM_KIND),
             RouteTarget::Command(RPC_CH_SYSTEM),
@@ -1274,7 +1182,8 @@ async fn send_edge_reply(
 
 /// node_config (§9): apply the edge's OWN config live where possible, and reply. Today `log_level`
 /// applies live (tracing reload); every other key is reported as `restart_required` (rebind :443,
-/// swap TLS, change NIC need a process restart). This is the edge configuring ITSELF — never the
+/// change the TLS mode or its source, change NIC need a process restart; a new certificate under
+/// the same vault key does not: EDGE_TLS_RELOAD). This is the edge configuring ITSELF — never the
 /// URL table (that's EDGE_OPEN_URL/CLOSE_URL).
 async fn apply_node_config(
     sender: &NodeSender,
@@ -1733,7 +1642,7 @@ struct FrontendState {
 async fn run_frontend(
     listen: String,
     state: Arc<FrontendState>,
-    tls: Option<Arc<rustls::ServerConfig>>,
+    tls: Arc<EdgeTls>,
 ) -> Result<(), SyEdgeError> {
     let app = Router::new()
         .route("/e/:ich", any(invoke_root))
@@ -1743,159 +1652,862 @@ async fn run_frontend(
         .with_state(state);
     let listener = TcpListener::bind(&listen).await?;
     let addr = listener.local_addr()?;
-    match tls {
-        Some(tls_config) => {
-            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            tracing::info!(addr = %addr, "sy-edge public HTTPS frontend ready (TLS)");
-            loop {
-                let (tcp, _peer) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy-edge accept failed");
-                        continue;
-                    }
+    if tls.mode == TlsMode::Plaintext {
+        tracing::info!(addr = %addr, "sy-edge public HTTP frontend ready (plaintext)");
+        axum::serve(listener, app).await?;
+        return Ok(());
+    }
+    tracing::info!(
+        addr = %addr,
+        mode = tls.mode.as_str(),
+        serving = tls.is_serving(),
+        "sy-edge public HTTPS frontend ready (TLS)"
+    );
+    serve_tls_listener(
+        listener,
+        app,
+        tls,
+        DoorLimits::new(MAX_TLS_CONNECTIONS, HTTP_HEADER_READ_TIMEOUT),
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// TLS (docs/acme-edge-certificates-v1.md §4): the mode, one acceptor that chooses a
+// configuration per connection, the ACME TLS-ALPN-01 challenge, hot reload (PB-1) and the
+// AWAITING state of a vault edge with no usable secret.
+// ---------------------------------------------------------------------------
+
+/// ONE timeout for reading the ClientHello and finishing the handshake, on every path: a client
+/// that connects and sends nothing, or stops halfway, never holds a task longer than this.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The ALPN protocol of the TLS-ALPN-01 challenge (RFC 8737).
+const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+const ACME_CHALLENGE_DEFAULT_TTL_SECS: u64 = 600;
+const ACME_CHALLENGE_MAX_TTL_SECS: u64 = 1800;
+/// A reload reads the vault ONCE, with this timeout. No probing loop on this path: SY.admin, a
+/// vault notice or the awaiting re-reads ask again.
+const VAULT_TLS_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// When an awaiting edge re-reads its secret: every 3 s for the first 2 minutes while the vault
+/// does not answer (a cold boot; before AWAITING the unit restarted every 5 s), otherwise after
+/// 30 s, then twice as late each time, up to 5 min.
+const AWAITING_SCHEDULE: AwaitingSchedule = AwaitingSchedule {
+    transient: Duration::from_secs(3),
+    transient_window: Duration::from_secs(120),
+    first: Duration::from_secs(30),
+    max: Duration::from_secs(300),
+};
+/// The most connections the public TLS door holds at once, handshakes included; one more is
+/// closed at accept.
+const MAX_TLS_CONNECTIONS: usize = 4096;
+/// HTTP/1: a request head must arrive within this, and so must the first byte after the
+/// handshake. hyper applies it only with a timer (`serve_tls_connection`).
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// After a failed accept (out of file descriptors, say) the loop waits this long, never spins.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// Connections refused at the cap are logged at most once per interval, with their count.
+const REFUSED_CONNECTIONS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How the public listener does TLS. Only a `Vault` edge reloads its certificate and answers
+/// ACME challenges; the other modes report themselves in `EDGE_TLS_STATUS`, and SY.admin leaves
+/// them alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TlsMode {
+    /// No TLS: an `allow_plaintext` ingress (`add_hive` refuses it on port 443), or a dev listener.
+    Plaintext,
+    /// `edge.tls_cert` + `edge.tls_key` from disk, read once at boot.
+    Disk { cert: PathBuf, key: PathBuf },
+    /// `{cert, key}` from SY.vault under `edge.tls_vault_key`, read with the edge's own ILK.
+    Vault { key: String },
+}
+
+impl TlsMode {
+    /// The mode the configuration asks for. A vault key wins over disk files. An empty vault key,
+    /// or a disk pair with one half missing, is refused: never served as plaintext.
+    fn resolve(
+        vault_key: Option<&str>,
+        cert: Option<&std::path::Path>,
+        key: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        if let Some(vault_key) = vault_key {
+            let vault_key = vault_key.trim();
+            if vault_key.is_empty() {
+                return Err("edge.tls_vault_key is empty".to_string());
+            }
+            return Ok(Self::Vault {
+                key: vault_key.to_string(),
+            });
+        }
+        match (cert, key) {
+            (Some(cert), Some(key)) => Ok(Self::Disk {
+                cert: cert.to_path_buf(),
+                key: key.to_path_buf(),
+            }),
+            (None, None) => Ok(Self::Plaintext),
+            (Some(_), None) => Err("edge.tls_cert is set without edge.tls_key".to_string()),
+            (None, Some(_)) => Err("edge.tls_key is set without edge.tls_cert".to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Disk { .. } => "disk",
+            Self::Vault { .. } => "vault",
+        }
+    }
+
+    fn vault_key(&self) -> Option<&str> {
+        match self {
+            Self::Vault { key } => Some(key),
+            _ => None,
+        }
+    }
+}
+
+/// Why a vault edge has no usable certificate, typed so SY.admin can act on it (§4, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsVerdict {
+    /// The vault has no secret under the key (`KEY_NOT_FOUND`).
+    NotFound,
+    /// The vault refused this edge (`UNAUTHORIZED`): a wrong owner, or an inactive tenant.
+    Forbidden,
+    /// The secret itself is wrong: no `cert`/`key`, a chain that fails the shared verdict
+    /// (truncated, expired, not yet valid, key mismatch, unparseable, leaf only when it would
+    /// replace a served certificate), or a request or stored value the vault calls invalid.
+    InvalidMaterial,
+    /// No verdict on the secret: the vault did not answer (`vault_failure_is_transport`), or it
+    /// could not do its job (`IDENTITY_UNAVAILABLE`, `STORAGE_ERROR`, `IO_ERROR`,
+    /// `ENCRYPTION_ERROR`, `NODE_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, any code it may add). A good
+    /// certificate is never rolled back for a busy SQLite.
+    Transient,
+}
+
+impl TlsVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Forbidden => "forbidden",
+            Self::InvalidMaterial => "invalid_material",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+/// A refused read or reload: the typed verdict, and a line an operator can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TlsRefusal {
+    verdict: TlsVerdict,
+    detail: String,
+}
+
+impl TlsRefusal {
+    fn material(detail: impl Into<String>) -> Self {
+        Self {
+            verdict: TlsVerdict::InvalidMaterial,
+            detail: detail.into(),
+        }
+    }
+
+    /// Keep the vault's verdict typed. Only an answer about the secret itself is `not_found`,
+    /// `forbidden` or `invalid_material`; everything else says the vault could not do its job,
+    /// which is `transient` (an unknown code included: a retry costs a delay, a wrong refusal
+    /// costs SY.admin rolling back a good certificate).
+    fn from_vault_error(secret_key: &str, err: fluxbee_sdk::VaultError) -> Self {
+        let verdict = if fluxbee_sdk::vault_failure_is_transport(&err) {
+            TlsVerdict::Transient
+        } else {
+            match &err {
+                fluxbee_sdk::VaultError::Service { code, .. } => match code.as_str() {
+                    "KEY_NOT_FOUND" => TlsVerdict::NotFound,
+                    "UNAUTHORIZED" => TlsVerdict::Forbidden,
+                    "INVALID_REQUEST" | "INVALID_VALUE" => TlsVerdict::InvalidMaterial,
+                    _ => TlsVerdict::Transient,
+                },
+                // An answer that does not parse says nothing about the secret.
+                fluxbee_sdk::VaultError::Json(_) => TlsVerdict::Transient,
+                _ => TlsVerdict::InvalidMaterial,
+            }
+        };
+        Self {
+            verdict,
+            detail: format!("vault get '{secret_key}' failed: {err}"),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({ "reason": self.verdict.as_str(), "detail": self.detail })
+    }
+}
+
+fn material_refusal(err: MaterialError) -> TlsRefusal {
+    TlsRefusal::material(err.to_string())
+}
+
+/// The edge's `{cert, key}` secret as the vault holds it, with the identity of the write it came
+/// from: SY.vault's rollback re-mints version numbers, so the version and the metadata's
+/// `updated_at` together name one write.
+#[derive(Debug, Clone)]
+struct VaultTlsSecret {
+    cert: String,
+    key: String,
+    version: Option<i64>,
+    updated_at: Option<String>,
+}
+
+/// Where a vault edge reads its certificate: SY.vault in production, a fake in the tests.
+#[async_trait::async_trait]
+trait TlsSecretSource: Send + Sync {
+    async fn read(&self, key: &str) -> Result<VaultTlsSecret, TlsRefusal>;
+}
+
+/// `SY.vault@<vault_hive>`, read with the edge's own ILK: the dedicated-owner match, so no
+/// identity SHM is needed on the ingress hive.
+struct VaultSecretSource {
+    client: fluxbee_sdk::VaultClient,
+    timeout: Duration,
+}
+
+#[async_trait::async_trait]
+impl TlsSecretSource for VaultSecretSource {
+    async fn read(&self, key: &str) -> Result<VaultTlsSecret, TlsRefusal> {
+        let resp = self
+            .client
+            .get(key, self.timeout)
+            .await
+            .map_err(|err| TlsRefusal::from_vault_error(key, err))?;
+        let value = resp.value.ok_or_else(|| {
+            TlsRefusal::material("vault returned no value for the edge tls secret")
+        })?;
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    TlsRefusal::material(format!("edge tls secret is missing a '{name}' PEM field"))
+                })
+        };
+        // SY.vault answers a VAULT_GET with the record's metadata, the same a VAULT_GET_METADATA
+        // returns (`handle_get` in sy_vault.rs), and every write sets its `updated_at`. A second
+        // call could only repeat it, and the router's edge gate admits only VAULT_GET.
+        let updated_at = resp
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.updated_at.clone());
+        if updated_at.is_none() {
+            tracing::warn!(key = %key, "sy-edge: the vault's answer carries no updated_at; vault_updated_at stays null");
+        }
+        Ok(VaultTlsSecret {
+            cert: field("cert")?,
+            key: field("key")?,
+            version: resp.version,
+            updated_at,
+        })
+    }
+}
+
+/// The certificate the main configuration serves, and what `EDGE_TLS_STATUS` says about it.
+#[derive(Clone)]
+struct ServedTls {
+    config: Arc<rustls::ServerConfig>,
+    leaf: tls_material::LeafInfo,
+    leaf_pem: String,
+    /// The whole chain served. A re-put that only fixes the intermediates keeps the leaf's
+    /// fingerprint and is still a change.
+    chain: Vec<CertificateDer<'static>>,
+    /// The vault write it came from, as the last read found it: the secret's version and its
+    /// metadata's `updated_at`. Both `None` from disk.
+    vault_version: Option<i64>,
+    vault_updated_at: Option<String>,
+    /// Unix seconds.
+    loaded_at: i64,
+}
+
+enum TlsState {
+    /// Plaintext mode: no TLS at all.
+    Off,
+    Serving(Arc<ServedTls>),
+    /// A vault edge with no usable secret: armed ACME handshakes are answered, every other TLS
+    /// handshake is dropped, and nothing is ever served in plaintext.
+    Awaiting(TlsRefusal),
+}
+
+struct ArmedChallenge {
+    /// Lowercase hex, so a clear names exactly the arm it means.
+    digest: String,
+    config: Arc<rustls::ServerConfig>,
+    /// Unix seconds.
+    expires_at: i64,
+}
+
+/// The `EDGE_ACME_CHALLENGE` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChallengeAnswer {
+    name: String,
+    armed: bool,
+    expires_at: Option<i64>,
+}
+
+/// What one reload did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReloadOutcome {
+    /// The served chain changed (or the edge left AWAITING).
+    changed: bool,
+    refused: Option<TlsRefusal>,
+}
+
+/// The public listener's TLS: its mode, the main configuration it serves now (or why it has
+/// none), and the armed ACME challenges. Shared by the acceptor, which reads it once per new
+/// connection, the TLS command task, the vault notices of the system loop and the awaiting
+/// re-reads.
+struct EdgeTls {
+    mode: TlsMode,
+    /// Where a `Vault` edge reads its secret; `None` for the other modes.
+    source: Option<Arc<dyn TlsSecretSource>>,
+    state: RwLock<TlsState>,
+    /// Armed TLS-ALPN-01 challenges by normalized name, in memory only.
+    challenges: std::sync::Mutex<HashMap<String, ArmedChallenge>>,
+    /// One reload at a time: a command, a vault notice and an awaiting re-read never race a swap.
+    reload_lock: tokio::sync::Mutex<()>,
+    /// Set once the first read finished, so its outcome is always logged at its full level.
+    read_once: std::sync::atomic::AtomicBool,
+    handshake_timeout: Duration,
+}
+
+impl EdgeTls {
+    fn new(mode: TlsMode, source: Option<Arc<dyn TlsSecretSource>>, state: TlsState) -> Self {
+        Self {
+            mode,
+            source,
+            state: RwLock::new(state),
+            challenges: std::sync::Mutex::new(HashMap::new()),
+            reload_lock: tokio::sync::Mutex::new(()),
+            read_once: std::sync::atomic::AtomicBool::new(false),
+            handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+        }
+    }
+
+    fn plaintext() -> Self {
+        Self::new(TlsMode::Plaintext, None, TlsState::Off)
+    }
+
+    /// A disk edge: the files are read once, here, and judged as at any boot (a truncated or
+    /// leaf-only chain is served loudly; anything else that fails the verdict is refused).
+    fn from_disk(cert: PathBuf, key: PathBuf, now: i64) -> Result<Self, String> {
+        let cert_pem =
+            std::fs::read(&cert).map_err(|err| format!("read {}: {err}", cert.display()))?;
+        let key_pem =
+            std::fs::read(&key).map_err(|err| format!("read {}: {err}", key.display()))?;
+        let (checked, diagnosis) =
+            check_material(&cert_pem, &key_pem, now).map_err(|refusal| refusal.detail)?;
+        log_tls_chain_diagnosis("disk", diagnosis);
+        Ok(Self::new(
+            TlsMode::Disk { cert, key },
+            None,
+            TlsState::Serving(Arc::new(served_tls(checked, None, None, now))),
+        ))
+    }
+
+    /// A vault edge before its first read: awaiting until `reload` finds usable material.
+    fn vault(key: String, source: Arc<dyn TlsSecretSource>) -> Self {
+        Self::new(
+            TlsMode::Vault { key },
+            Some(source),
+            TlsState::Awaiting(TlsRefusal {
+                verdict: TlsVerdict::Transient,
+                detail: "the secret has not been read yet".to_string(),
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, TlsState> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, TlsState> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_challenges(&self) -> std::sync::MutexGuard<'_, HashMap<String, ArmedChallenge>> {
+        self.challenges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn served(&self) -> Option<Arc<ServedTls>> {
+        match &*self.read_state() {
+            TlsState::Serving(served) => Some(Arc::clone(served)),
+            TlsState::Off | TlsState::Awaiting(_) => None,
+        }
+    }
+
+    /// The main configuration, read once per new connection; `None` while awaiting.
+    fn main_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.served().map(|served| Arc::clone(&served.config))
+    }
+
+    fn is_serving(&self) -> bool {
+        matches!(&*self.read_state(), TlsState::Serving(_))
+    }
+
+    /// The verdict an awaiting edge waits on; `None` once it serves.
+    fn awaiting_verdict(&self) -> Option<TlsVerdict> {
+        match &*self.read_state() {
+            TlsState::Awaiting(refusal) => Some(refusal.verdict),
+            TlsState::Off | TlsState::Serving(_) => None,
+        }
+    }
+
+    /// What this edge serves from the vault, read from the shared state at the moment of the
+    /// decision, so it can never lag a swap.
+    fn live_material(&self) -> LiveTlsMaterial {
+        if self.mode.vault_key().is_none() {
+            return LiveTlsMaterial::NotFromVault;
+        }
+        match &*self.read_state() {
+            TlsState::Serving(served) => LiveTlsMaterial::FromVault {
+                version: served.vault_version,
+                fingerprint: served.leaf.fingerprint.clone(),
+            },
+            TlsState::Off | TlsState::Awaiting(_) => LiveTlsMaterial::Awaiting,
+        }
+    }
+
+    /// The `EDGE_TLS_STATUS` answer, also the body of `EDGE_TLS_RELOAD`'s.
+    fn status_payload(&self) -> Value {
+        let (state, refusal, served) = match &*self.read_state() {
+            TlsState::Off => ("serving", None, None),
+            TlsState::Serving(served) => ("serving", None, Some(Arc::clone(served))),
+            TlsState::Awaiting(refusal) => ("awaiting", Some(refusal.clone()), None),
+        };
+        let served = served.as_deref();
+        json!({
+            "status": "ok",
+            "mode": self.mode.as_str(),
+            "tls_vault_key": self.mode.vault_key(),
+            "state": state,
+            "reason": refusal.as_ref().map(|refusal| refusal.verdict.as_str()),
+            "detail": refusal.as_ref().map(|refusal| refusal.detail.as_str()),
+            "leaf_pem": served.map(|served| served.leaf_pem.as_str()),
+            "fingerprint": served.map(|served| served.leaf.fingerprint.as_str()),
+            "not_before": served.map(|served| served.leaf.not_before),
+            "not_after": served.map(|served| served.leaf.not_after),
+            "names": served.map(|served| served.leaf.names.clone()),
+            "issuer": served.map(|served| served.leaf.issuer.as_str()),
+            "chain_len": served.map(|served| served.leaf.chain_len),
+            "loaded_at": served.map(|served| served.loaded_at),
+            "vault_version": served.and_then(|served| served.vault_version),
+            "vault_updated_at": served.and_then(|served| served.vault_updated_at.as_deref()),
+        })
+    }
+
+    /// The acceptor's choice for one ClientHello (§4):
+    /// - ALPN exactly `["acme-tls/1"]` and a challenge armed for the SNI: that challenge;
+    /// - ALPN exactly `["acme-tls/1"]` and nothing armed (or no SNI): drop;
+    /// - anything else, `acme-tls/1` mixed with other protocols included: the main
+    ///   configuration, or drop while awaiting.
+    fn route_hello(&self, sni: Option<&str>, alpn: Option<&[&[u8]]>, now: i64) -> HelloRoute {
+        if matches!(alpn, Some([only]) if *only == ACME_TLS_ALPN) {
+            let name = sni.map(tls_material::normalize_name).unwrap_or_default();
+            if name.is_empty() {
+                return HelloRoute::Drop("acme-tls/1 without SNI");
+            }
+            return match self.challenge_config(&name, now) {
+                Some(config) => HelloRoute::Challenge { name, config },
+                None => HelloRoute::Drop("acme-tls/1 for a name with no armed challenge"),
+            };
+        }
+        match self.main_config() {
+            Some(config) => HelloRoute::Main(config),
+            None => HelloRoute::Drop("awaiting a certificate: no main configuration"),
+        }
+    }
+
+    /// Arm a TLS-ALPN-01 challenge for `name` until `now + ttl_secs`. A newer arm for the same
+    /// name replaces the older one.
+    fn arm_challenge(
+        &self,
+        name: &str,
+        digest: &str,
+        ttl_secs: u64,
+        now: i64,
+    ) -> Result<ChallengeAnswer, String> {
+        let name = acme_challenge_name(name)?;
+        let digest = acme_challenge_digest(digest)?;
+        if !(1..=ACME_CHALLENGE_MAX_TTL_SECS).contains(&ttl_secs) {
+            return Err(format!(
+                "ttl_secs must be 1..={ACME_CHALLENGE_MAX_TTL_SECS}, got {ttl_secs}"
+            ));
+        }
+        let config = acme_challenge_server_config(&name, &digest)?;
+        let expires_at = now.saturating_add(ttl_secs as i64);
+        let mut challenges = self.lock_challenges();
+        challenges.retain(|_, armed| armed.expires_at > now);
+        challenges.insert(
+            name.clone(),
+            ArmedChallenge {
+                digest: hex::encode(digest),
+                config,
+                expires_at,
+            },
+        );
+        tracing::info!(name = %name, expires_at, "sy-edge armed an ACME TLS-ALPN-01 challenge");
+        Ok(ChallengeAnswer {
+            name,
+            armed: true,
+            expires_at: Some(expires_at),
+        })
+    }
+
+    /// Clear the challenge armed for `name` only when it carries `digest`, so a late clear never
+    /// removes a newer arm. The answer says what stays armed.
+    fn clear_challenge(
+        &self,
+        name: &str,
+        digest: &str,
+        now: i64,
+    ) -> Result<ChallengeAnswer, String> {
+        let name = acme_challenge_name(name)?;
+        let digest = hex::encode(acme_challenge_digest(digest)?);
+        let mut challenges = self.lock_challenges();
+        challenges.retain(|_, armed| armed.expires_at > now);
+        if challenges
+            .get(&name)
+            .is_some_and(|armed| armed.digest == digest)
+        {
+            challenges.remove(&name);
+            tracing::info!(name = %name, "sy-edge cleared an ACME TLS-ALPN-01 challenge");
+        }
+        let remaining = challenges.get(&name).map(|armed| armed.expires_at);
+        Ok(ChallengeAnswer {
+            name,
+            armed: remaining.is_some(),
+            expires_at: remaining,
+        })
+    }
+
+    /// The configuration of the challenge armed for `name` (normalized), unless it expired.
+    fn challenge_config(&self, name: &str, now: i64) -> Option<Arc<rustls::ServerConfig>> {
+        let mut challenges = self.lock_challenges();
+        match challenges.get(name) {
+            Some(armed) if armed.expires_at > now => Some(Arc::clone(&armed.config)),
+            Some(_) => {
+                challenges.remove(name);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// `EDGE_TLS_RELOAD`, a `VAULT_SECRET_CHANGED` for the edge's own key, and every awaiting
+    /// re-read: read the secret ONCE and judge it with the shared verdict. The main configuration
+    /// is swapped only when the material passes; connections already open finish on the one they
+    /// started with. A refusal keeps what is served and says why. Nothing exits.
+    async fn reload(&self, trigger: &str) -> Result<ReloadOutcome, String> {
+        let (TlsMode::Vault { key }, Some(source)) = (&self.mode, self.source.as_ref()) else {
+            return Err(format!(
+                "this edge's TLS mode is {}: only a vault edge reloads its certificate",
+                self.mode.as_str()
+            ));
+        };
+        let _one_at_a_time = self.reload_lock.lock().await;
+        let before = BeforeReload {
+            serving: self.is_serving(),
+            awaiting: self.awaiting_verdict(),
+            first: !self
+                .read_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst),
+        };
+        let outcome = match source.read(key).await {
+            Ok(secret) => self.apply_material(
+                secret.cert.as_bytes(),
+                secret.key.as_bytes(),
+                secret.version,
+                secret.updated_at,
+                now_unix_secs(),
+            ),
+            Err(refusal) => self.record_refusal(refusal),
+        };
+        log_reload_outcome(key, trigger, &before, &outcome, self.served().as_deref());
+        Ok(outcome)
+    }
+
+    /// Judge PEM material and decide what it means for the main configuration:
+    /// - the chain served already (a bootstrap re-announce, a rotate or rollback to the same
+    ///   bytes): nothing swaps, and the vault write identity follows the read;
+    /// - a truncated chain, or a leaf with no intermediates, that would REPLACE a served
+    ///   certificate: refused. With nothing served (boot, awaiting) it is served, loudly: an edge
+    ///   up on a weak chain beats an edge that is down;
+    /// - anything else that passed: swapped in.
+    fn apply_material(
+        &self,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        vault_version: Option<i64>,
+        vault_updated_at: Option<String>,
+        now: i64,
+    ) -> ReloadOutcome {
+        let (checked, diagnosis) = match check_material(cert_pem, key_pem, now) {
+            Ok(checked) => checked,
+            Err(refusal) => return self.record_refusal(refusal),
+        };
+        let mut state = self.write_state();
+        if let TlsState::Serving(current) = &*state {
+            if current.chain == checked.chain {
+                let unchanged = ServedTls {
+                    vault_version,
+                    vault_updated_at,
+                    ..(**current).clone()
                 };
-                let acceptor = acceptor.clone();
-                let app = app.clone();
-                tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(tcp).await {
-                        Ok(stream) => stream,
-                        Err(err) => {
-                            tracing::debug!(error = %err, "tls handshake failed");
-                            return;
-                        }
-                    };
-                    let io = hyper_util::rt::TokioIo::new(tls_stream);
-                    let service = hyper_util::service::TowerToHyperService::new(app);
-                    if let Err(err) = hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-                    {
-                        tracing::debug!(error = %err, "sy-edge tls connection error");
-                    }
-                });
+                *state = TlsState::Serving(Arc::new(unchanged));
+                return ReloadOutcome {
+                    changed: false,
+                    refused: None,
+                };
+            }
+            if let Some(complaint) = diagnosis.complaint() {
+                return ReloadOutcome {
+                    changed: false,
+                    refused: Some(TlsRefusal::material(format!(
+                        "not replacing the served certificate: {complaint}"
+                    ))),
+                };
             }
         }
-        None => {
-            tracing::info!(addr = %addr, "sy-edge public HTTP frontend ready (plaintext)");
-            axum::serve(listener, app).await?;
-            Ok(())
+        *state = TlsState::Serving(Arc::new(served_tls(
+            checked,
+            vault_version,
+            vault_updated_at,
+            now,
+        )));
+        drop(state);
+        log_tls_chain_diagnosis("vault", diagnosis);
+        ReloadOutcome {
+            changed: true,
+            refused: None,
+        }
+    }
+
+    /// A failed read or a refused material: what is served stays; an awaiting edge records why.
+    fn record_refusal(&self, refusal: TlsRefusal) -> ReloadOutcome {
+        if let TlsState::Awaiting(reason) = &mut *self.write_state() {
+            *reason = refusal.clone();
+        }
+        ReloadOutcome {
+            changed: false,
+            refused: Some(refusal),
         }
     }
 }
 
-/// Build a rustls server config from in-memory PEM cert chain + private key.
-const BEGIN_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+/// What held before a reload's read, to report its outcome.
+#[derive(Debug, Clone, Copy)]
+struct BeforeReload {
+    serving: bool,
+    awaiting: Option<TlsVerdict>,
+    /// The edge's first read (boot): its outcome is always reported in full.
+    first: bool,
+}
 
-/// How many times to re-probe the vault before giving up on a reload.
-///
-/// Nothing re-fires the reload decision, so abandoning it on the first transient error would
-/// strand a legitimate cert rotation until the certificate expired.
-const TLS_RELOAD_PROBE_ATTEMPTS: u32 = 3;
-const TLS_RELOAD_PROBE_BACKOFF_SECS: u64 = 5;
-
-/// What the PEM parse revealed about the certificate chain.
-///
-/// Reported instead of raised. The boot path is fail-closed under `Restart=always`, so turning a
-/// truncated chain into an `Err` would take a currently-serving public HTTPS door DOWN and put it
-/// in a crash loop the next time the unit restarts for any reason — a host reboot, a `.deb`
-/// upgrade, an OOM. An edge up on a bad chain beats an edge that is down, so boot logs this
-/// loudly and serves anyway. Only the reload path, which still holds a good listener, refuses to
-/// act on it.
+/// How a reload is reported, decided apart from the logging so it can be tested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TlsChainDiagnosis {
-    /// `-----BEGIN CERTIFICATE-----` markers present in the PEM.
-    markers: usize,
-    /// Certificates the parser actually produced.
-    parsed: usize,
+enum ReloadReport {
+    /// A new certificate is served.
+    Loaded,
+    /// The material read is the one served.
+    Unchanged,
+    /// A serving edge refused what the vault holds: ERROR, the operator fixes the secret.
+    Refused,
+    /// A serving edge got no verdict from the vault: WARN, the current certificate stays.
+    VaultSilent,
+    /// The edge awaits, at boot or for another reason than before: ERROR.
+    Awaiting,
+    /// The edge still awaits for the same reason: WARN (DEBUG for the fast transient re-reads).
+    StillAwaiting,
 }
 
-impl TlsChainDiagnosis {
-    /// The PEM held more certificates than the parser returned: some were dropped in silence.
-    ///
-    /// The real-world cause is a leaf's `END` glued to the next `BEGIN` on one line (CRLF
-    /// mangling). openssl reads ZERO certs from such a file; `rustls_pemfile::certs` returns
-    /// `Ok` with only the leaf and NO error, because its end-of-section test is satisfied by the
-    /// glued line and the intermediate's body is then consumed outside any section. The edge
-    /// serves a leaf-only chain and strict clients fail.
-    fn truncated(&self) -> bool {
-        self.markers != self.parsed
-    }
-
-    /// A chain with no intermediates.
-    fn leaf_only(&self) -> bool {
-        self.parsed == 1
-    }
-
-    /// One line an operator can act on, or `None` when the chain is healthy.
-    fn complaint(&self) -> Option<String> {
-        if self.truncated() {
-            Some(format!(
-                "TLS cert PEM is TRUNCATED: {} '-----BEGIN CERTIFICATE-----' markers but only {} \
-                 certificate(s) parsed. Almost always an END/BEGIN glued on one line — openssl \
-                 reads ZERO certs from such a file while rustls silently keeps just the leaf. \
-                 Normalize the PEM (CRLF->LF, one marker per line) and re-put it.",
-                self.markers, self.parsed
-            ))
-        } else if self.leaf_only() {
-            Some(
-                "TLS chain is a LEAF WITH NO INTERMEDIATES. Browsers may still succeed via AIA \
-                 fetch, but strict clients (Go, Python ssl, Meta/Slack webhooks) WILL fail. \
-                 Serve leaf + intermediates."
-                    .to_string(),
-            )
-        } else {
-            None
+fn reload_report(before: &BeforeReload, outcome: &ReloadOutcome) -> ReloadReport {
+    match &outcome.refused {
+        None if outcome.changed => ReloadReport::Loaded,
+        None => ReloadReport::Unchanged,
+        Some(refusal) if before.serving => {
+            if refusal.verdict == TlsVerdict::Transient {
+                ReloadReport::VaultSilent
+            } else {
+                ReloadReport::Refused
+            }
         }
+        Some(refusal) if before.first || before.awaiting != Some(refusal.verdict) => {
+            ReloadReport::Awaiting
+        }
+        Some(_) => ReloadReport::StillAwaiting,
     }
 }
 
-fn tls_config_from_pem(
+fn log_reload_outcome(
+    key: &str,
+    trigger: &str,
+    before: &BeforeReload,
+    outcome: &ReloadOutcome,
+    served: Option<&ServedTls>,
+) {
+    let report = reload_report(before, outcome);
+    if let Some(refusal) = &outcome.refused {
+        let reason = refusal.verdict.as_str();
+        let detail = refusal.detail.as_str();
+        match report {
+            ReloadReport::Refused => tracing::error!(
+                key = %key,
+                trigger = %trigger,
+                reason,
+                detail,
+                "sy-edge: REFUSED the TLS material in the vault; still serving the certificate already loaded. Fix the secret and re-put it (vault_rollback restores the last good version)."
+            ),
+            ReloadReport::VaultSilent => tracing::warn!(
+                key = %key,
+                trigger = %trigger,
+                detail,
+                "sy-edge: the vault did not answer for the TLS secret; the current certificate stays"
+            ),
+            ReloadReport::Awaiting => tracing::error!(
+                key = %key,
+                trigger = %trigger,
+                reason,
+                detail,
+                "sy-edge: AWAITING a usable TLS certificate: armed ACME challenges are answered, every other TLS handshake is dropped, nothing is served in plaintext. The secret is re-read on its own."
+            ),
+            _ if refusal.verdict == TlsVerdict::Transient => tracing::debug!(
+                key = %key,
+                trigger = %trigger,
+                detail,
+                "sy-edge: still AWAITING: the vault did not answer"
+            ),
+            _ => tracing::warn!(
+                key = %key,
+                trigger = %trigger,
+                reason,
+                detail,
+                "sy-edge: still AWAITING a usable TLS certificate"
+            ),
+        }
+        return;
+    }
+    match served {
+        Some(served) if report == ReloadReport::Loaded => tracing::info!(
+            key = %key,
+            trigger = %trigger,
+            fingerprint = %served.leaf.fingerprint,
+            not_after = served.leaf.not_after,
+            vault_version = ?served.vault_version,
+            vault_updated_at = ?served.vault_updated_at,
+            "sy-edge: TLS certificate loaded in place (open connections finish on the previous one)"
+        ),
+        _ => tracing::info!(
+            key = %key,
+            trigger = %trigger,
+            "sy-edge: TLS secret re-read; the material served is unchanged"
+        ),
+    }
+}
+
+/// The shared verdict on PEM material (`tls_material::inspect`): what will be served, and the
+/// diagnosis of the PEM as given. A truncated chain is judged on exactly what the parser kept;
+/// whether it, or a leaf with no intermediates, may be served depends on what is served already
+/// (`EdgeTls::apply_material`).
+fn check_material(
     cert_pem: &[u8],
     key_pem: &[u8],
-) -> Result<(rustls::ServerConfig, TlsChainDiagnosis), SyEdgeError> {
-    // rustls 0.23 needs a process crypto provider before ServerConfig::builder()
-    // (mirrors src/mesh_tls.rs). Idempotent: ignore "already installed".
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut cert_reader = cert_pem;
-    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
-    if cert_chain.is_empty() {
-        return Err("no certificates found in PEM cert material".into());
+    now: i64,
+) -> Result<(tls_material::CheckedMaterial, ChainDiagnosis), TlsRefusal> {
+    match tls_material::inspect(cert_pem, key_pem, now) {
+        Ok(checked) => {
+            let diagnosis = checked.diagnosis;
+            Ok((checked, diagnosis))
+        }
+        Err(MaterialError::Truncated { .. }) => {
+            let (chain, diagnosis) =
+                tls_material::parse_chain(cert_pem).map_err(material_refusal)?;
+            let kept: String = chain
+                .iter()
+                .map(|der| der_to_pem("CERTIFICATE", der.as_ref()))
+                .collect();
+            let checked =
+                tls_material::inspect(kept.as_bytes(), key_pem, now).map_err(material_refusal)?;
+            Ok((checked, diagnosis))
+        }
+        Err(err) => Err(material_refusal(err)),
     }
-    // SUBSTRING count, not a line-prefix count: the failure this exists to catch puts the second
-    // marker in the middle of a line, so anything anchored to line starts cannot see it.
-    let diagnosis = TlsChainDiagnosis {
-        markers: cert_pem
-            .windows(BEGIN_CERTIFICATE_MARKER.len())
-            .filter(|w| *w == BEGIN_CERTIFICATE_MARKER)
-            .count(),
-        parsed: cert_chain.len(),
-    };
-    let mut key_reader = key_pem;
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or("no private key found in PEM key material")?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)?;
-    Ok((config, diagnosis))
 }
 
-/// Log whatever the chain diagnosis found, at boot, without refusing to serve.
-fn log_tls_chain_diagnosis(source: &str, diagnosis: TlsChainDiagnosis) {
+/// Checked material as the main configuration serves it.
+fn served_tls(
+    checked: tls_material::CheckedMaterial,
+    vault_version: Option<i64>,
+    vault_updated_at: Option<String>,
+    now: i64,
+) -> ServedTls {
+    let leaf_pem = checked
+        .chain
+        .first()
+        .map(|der| der_to_pem("CERTIFICATE", der.as_ref()))
+        .unwrap_or_default();
+    ServedTls {
+        config: Arc::new(main_server_config(checked.certified_key)),
+        leaf: checked.leaf,
+        leaf_pem,
+        chain: checked.chain,
+        vault_version,
+        vault_updated_at,
+        loaded_at: now,
+    }
+}
+
+/// The main configuration: the checked chain and key for every client, and an empty ALPN list,
+/// as before (rustls then ignores what the client offers).
+fn main_server_config(certified_key: rustls::sign::CertifiedKey) -> rustls::ServerConfig {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+            certified_key,
+        )))
+}
+
+/// A DER blob as PEM, 64 base64 characters per line.
+fn der_to_pem(label: &str, der: &[u8]) -> String {
+    let encoded = base64_encode(der);
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        pem.push_str(&String::from_utf8_lossy(line));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
+}
+
+/// Log what the chain diagnosis found for a chain being loaded. A complaint here (truncated, or a
+/// leaf with no intermediates) means it is served anyway, because nothing else is served (boot,
+/// awaiting, a disk edge); a reload that would replace a served certificate refuses such a chain.
+fn log_tls_chain_diagnosis(source: &str, diagnosis: ChainDiagnosis) {
     match diagnosis.complaint() {
-        Some(complaint) if diagnosis.truncated() => {
+        Some(complaint) => {
             tracing::error!(
                 source = %source,
                 markers = diagnosis.markers,
                 parsed = diagnosis.parsed,
-                "sy-edge: {complaint} SERVING ANYWAY (refusing to bind would take the public door down)."
+                "sy-edge: {complaint} SERVING ANYWAY: nothing else is being served, and refusing would leave the public door down."
             );
-        }
-        Some(complaint) => {
-            tracing::warn!(source = %source, parsed = diagnosis.parsed, "sy-edge: {complaint}");
         }
         None => {
             tracing::info!(
@@ -1907,87 +2519,553 @@ fn log_tls_chain_diagnosis(source: &str, diagnosis: TlsChainDiagnosis) {
     }
 }
 
-/// Build a rustls server config from PEM files on disk.
-fn load_tls_config(
-    cert_path: &std::path::Path,
-    key_path: &std::path::Path,
-) -> Result<(rustls::ServerConfig, TlsChainDiagnosis), SyEdgeError> {
-    let cert_pem = std::fs::read(cert_path)?;
-    let key_pem = std::fs::read(key_path)?;
-    tls_config_from_pem(&cert_pem, &key_pem)
+/// The name a challenge is armed for: lowercase, no trailing dot, a DNS host name. Never a
+/// wildcard (TLS-ALPN-01 cannot validate one, RFC 8737 §3) nor an IP literal.
+fn acme_challenge_name(raw: &str) -> Result<String, String> {
+    let name = tls_material::normalize_name(raw);
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    if name.is_empty()
+        || name.len() > 253
+        || name.parse::<std::net::IpAddr>().is_ok()
+        || !name.split('.').all(valid_label)
+    {
+        return Err(format!(
+            "name must be a DNS host name (no wildcard, no IP literal), got '{raw}'"
+        ));
+    }
+    Ok(name)
 }
 
-/// The TLS material this edge currently has live, for reload decisions.
-///
-/// `version` is what the vault reported on the BOOT fetch and must never be updated by a
-/// reload probe: if a probe wrote its version back here, an edge that refused to load bad
-/// material would silently claim to serve it, and the complaint would go quiet.
+/// The TLS-ALPN-01 digest: the SHA-256 of the key authorization, 64 hex characters. Checked here,
+/// before rcgen, which asserts its length.
+fn acme_challenge_digest(raw: &str) -> Result<[u8; 32], String> {
+    let raw = raw.trim();
+    let mut digest = [0_u8; 32];
+    if raw.len() != 64 || hex::decode_to_slice(raw, &mut digest).is_err() {
+        return Err(
+            "digest must be 64 hex characters (the SHA-256 of the key authorization)".to_string(),
+        );
+    }
+    Ok(digest)
+}
+
+/// The TLS-ALPN-01 certificate (RFC 8737 §3), minted here so no private key crosses the mesh: a
+/// fresh P-256 key, an empty subject, SAN = the name, and the critical `acmeIdentifier`
+/// extension holding the digest.
+fn acme_challenge_certificate(
+    name: &str,
+    digest: &[u8; 32],
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+    let key = rcgen::KeyPair::generate().map_err(|err| format!("challenge key: {err}"))?;
+    let mut params = rcgen::CertificateParams::new(vec![name.to_string()])
+        .map_err(|err| format!("challenge certificate: {err}"))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.custom_extensions = vec![rcgen::CustomExtension::new_acme_identifier(digest)];
+    let cert = params
+        .self_signed(&key)
+        .map_err(|err| format!("challenge certificate: {err}"))?;
+    Ok((
+        cert.der().clone(),
+        PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    ))
+}
+
+/// The configuration a challenge handshake finishes with: the challenge certificate and
+/// `alpn_protocols = ["acme-tls/1"]`. Built from a `CertifiedKey` directly: rustls'
+/// `with_single_cert` re-parses the leaf with webpki, which refuses the unknown critical
+/// `acmeIdentifier` extension the certificate exists to carry.
+fn acme_challenge_server_config(
+    name: &str,
+    digest: &[u8; 32],
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    let (cert, key) = acme_challenge_certificate(name, digest)?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let signing_key = rustls::crypto::ring::default_provider()
+        .key_provider
+        .load_private_key(key)
+        .map_err(|err| format!("challenge key: {err}"))?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+            rustls::sign::CertifiedKey::new(vec![cert], signing_key),
+        )));
+    config.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// What the acceptor does with one ClientHello.
+#[derive(Debug)]
+enum HelloRoute {
+    /// Finish the handshake with the challenge's configuration, then close. HTTP is never
+    /// reached.
+    Challenge {
+        name: String,
+        config: Arc<rustls::ServerConfig>,
+    },
+    /// Today's path: the main configuration, then HTTP.
+    Main(Arc<rustls::ServerConfig>),
+    /// Close without a handshake.
+    Drop(&'static str),
+}
+
+/// The public TLS door's limits against slow or abundant clients.
+#[derive(Clone)]
+struct DoorLimits {
+    /// One permit per connection, its handshake included.
+    connections: Arc<Semaphore>,
+    max_connections: usize,
+    /// The first request byte after the handshake, and every HTTP/1 request head, must arrive
+    /// within this.
+    header_read_timeout: Duration,
+}
+
+impl DoorLimits {
+    fn new(max_connections: usize, header_read_timeout: Duration) -> Self {
+        Self {
+            connections: Arc::new(Semaphore::new(max_connections)),
+            max_connections,
+            header_read_timeout,
+        }
+    }
+}
+
+/// Counts the connections refused at the cap and says when to log them: at most once per
+/// interval, with how many there were since the last line.
+#[derive(Debug, Default)]
+struct RefusedConnections {
+    unlogged: u64,
+    last_logged: Option<Instant>,
+}
+
+impl RefusedConnections {
+    /// Note one refused connection; `Some(count)` when it is time to log `count` of them.
+    fn note(&mut self, now: Instant, interval: Duration) -> Option<u64> {
+        self.unlogged += 1;
+        if self
+            .last_logged
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
+/// The TLS accept loop: one task per connection, at most `limits.max_connections` at once. A
+/// connection over the cap is closed at once; a failed accept waits `ACCEPT_ERROR_BACKOFF`.
+async fn serve_tls_listener(
+    listener: TcpListener,
+    app: Router,
+    tls: Arc<EdgeTls>,
+    limits: DoorLimits,
+) -> Result<(), SyEdgeError> {
+    let mut refused = RefusedConnections::default();
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(error = %err, "sy-edge accept failed");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        let Ok(permit) = Arc::clone(&limits.connections).try_acquire_owned() else {
+            drop(tcp);
+            if let Some(count) = refused.note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL) {
+                tracing::warn!(
+                    refused = count,
+                    max_connections = limits.max_connections,
+                    "sy-edge: at its connection cap; closing new connections"
+                );
+            }
+            continue;
+        };
+        tokio::spawn(serve_tls_connection(
+            tcp,
+            app.clone(),
+            Arc::clone(&tls),
+            limits.header_read_timeout,
+            permit,
+        ));
+    }
+}
+
+/// One connection, holding its permit to the end: the handshake (`accept_tls`), then hyper.
+/// hyper-util's HTTP/1-or-2 sniffing waits for bytes with no timeout of its own, so the first
+/// request byte must come within `header_read_timeout` here; after it, hyper's timer applies the
+/// same timeout to every HTTP/1 request head, an idle keep-alive connection included.
+async fn serve_tls_connection(
+    tcp: tokio::net::TcpStream,
+    app: Router,
+    tls: Arc<EdgeTls>,
+    header_read_timeout: Duration,
+    _permit: OwnedSemaphorePermit,
+) {
+    let Some(tls_stream) = accept_tls(tcp, &tls).await else {
+        return;
+    };
+    // The bytes read here stay buffered for hyper; writes pass straight through.
+    let mut stream = tokio::io::BufReader::new(tls_stream);
+    match tokio::time::timeout(
+        header_read_timeout,
+        tokio::io::AsyncBufReadExt::fill_buf(&mut stream),
+    )
+    .await
+    {
+        Ok(Ok(first)) if !first.is_empty() => {}
+        Ok(Ok(_)) => return,
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "sy-edge tls connection error");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("sy-edge closed a connection that sent nothing after its handshake");
+            return;
+        }
+    }
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let service = hyper_util::service::TowerToHyperService::new(app);
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
+        tracing::debug!(error = %err, "sy-edge tls connection error");
+    }
+}
+
+/// Read the ClientHello, choose a configuration and finish the handshake, all under ONE timeout.
+/// `Some` only for the main path: a challenge is answered and closed here, and a dropped hello
+/// never gets a handshake.
+async fn accept_tls<IO>(io: IO, tls: &EdgeTls) -> Option<tokio_rustls::server::TlsStream<IO>>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(tls.handshake_timeout, handshake_by_hello(io, tls)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "tls handshake failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = tls.handshake_timeout.as_millis() as u64,
+                "tls handshake timed out"
+            );
+            None
+        }
+    }
+}
+
+async fn handshake_by_hello<IO>(
+    io: IO,
+    tls: &EdgeTls,
+) -> std::io::Result<Option<tokio_rustls::server::TlsStream<IO>>>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let start =
+        tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io).await?;
+    let route = {
+        let hello = start.client_hello();
+        let alpn: Option<Vec<&[u8]>> = hello.alpn().map(Iterator::collect);
+        tls.route_hello(hello.server_name(), alpn.as_deref(), now_unix_secs())
+    };
+    match route {
+        HelloRoute::Main(config) => start.into_stream(config).await.map(Some),
+        HelloRoute::Challenge { name, config } => {
+            let mut stream = start.into_stream(config).await?;
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+            tracing::info!(name = %name, "sy-edge answered an ACME TLS-ALPN-01 challenge");
+            Ok(None)
+        }
+        HelloRoute::Drop(reason) => {
+            tracing::debug!(
+                reason,
+                "sy-edge dropped a TLS connection at its ClientHello"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// A vault edge's boot read. Anything but usable material leaves it AWAITING instead of exiting
+/// (a missing secret used to crash-loop the unit, so a new ingress could never answer the
+/// challenge for its first certificate), and a task re-reads the secret until it serves.
+async fn start_vault_tls(tls: &Arc<EdgeTls>, schedule: AwaitingSchedule) {
+    match tls.reload("boot").await {
+        Ok(outcome) if outcome.refused.is_some() => {
+            tokio::spawn(run_awaiting_rereads(Arc::clone(tls), schedule));
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!(error = %err, "sy-edge: boot read of the TLS secret failed"),
+    }
+}
+
+/// When an awaiting edge re-reads its secret (`AWAITING_SCHEDULE` in production).
+#[derive(Debug, Clone, Copy)]
+struct AwaitingSchedule {
+    /// The delay while the vault gives no verdict (`transient`), during the first
+    /// `transient_window` of awaiting.
+    transient: Duration,
+    transient_window: Duration,
+    /// Otherwise: `first`, then twice as late each time, up to `max`.
+    first: Duration,
+    max: Duration,
+}
+
+/// The delays of one awaiting stretch.
+struct AwaitingBackoff {
+    schedule: AwaitingSchedule,
+    next_long: Duration,
+}
+
+impl AwaitingBackoff {
+    fn new(schedule: AwaitingSchedule) -> Self {
+        Self {
+            schedule,
+            next_long: schedule.first,
+        }
+    }
+
+    /// The delay before the next re-read, given the verdict the edge awaits on and how long it
+    /// has been awaiting.
+    fn next(&mut self, verdict: TlsVerdict, awaiting_for: Duration) -> Duration {
+        if verdict == TlsVerdict::Transient && awaiting_for < self.schedule.transient_window {
+            return self.schedule.transient;
+        }
+        let delay = self.next_long;
+        self.next_long = delay.saturating_mul(2).min(self.schedule.max);
+        delay
+    }
+}
+
+/// While awaiting, re-read the secret on `schedule` and stop once the edge serves. A command or
+/// a vault notice may get there first; the loop then just ends.
+async fn run_awaiting_rereads(tls: Arc<EdgeTls>, schedule: AwaitingSchedule) {
+    let started = Instant::now();
+    let mut backoff = AwaitingBackoff::new(schedule);
+    while let Some(verdict) = tls.awaiting_verdict() {
+        tokio::time::sleep(backoff.next(verdict, started.elapsed())).await;
+        if tls.is_serving() {
+            return;
+        }
+        if let Err(err) = tls.reload("awaiting re-read").await {
+            tracing::error!(error = %err, "sy-edge: awaiting re-read failed");
+            return;
+        }
+    }
+}
+
+/// The three TLS commands (§4), from `SY.admin@motherbee` only. They arrive on their own channel
+/// (`RPC_CH_TLS`) and each runs in its own task over the shared state, so they never wait behind
+/// `EDGE_PUBLISH_BLOB` (up to 60 s) or a secret resolution in the sequential system loop.
+async fn run_tls_commands(
+    mut commands: RpcCommandReceiver,
+    sender: NodeSender,
+    tls: Option<Arc<EdgeTls>>,
+    ttl: u8,
+) {
+    while let Some(msg) = commands.recv().await {
+        let sender = sender.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            if let Some((response, payload)) = tls_command_reply(tls.as_deref(), &msg).await {
+                send_edge_reply(&sender, &msg, response, payload, ttl).await;
+            }
+        });
+    }
+}
+
+async fn tls_command_reply(tls: Option<&EdgeTls>, msg: &Message) -> Option<(&'static str, Value)> {
+    match msg.meta.msg.as_deref() {
+        Some(MSG_EDGE_TLS_STATUS) => {
+            Some((MSG_EDGE_TLS_STATUS_RESPONSE, tls_status_answer(tls, msg)))
+        }
+        Some(MSG_EDGE_TLS_RELOAD) => Some((
+            MSG_EDGE_TLS_RELOAD_RESPONSE,
+            tls_reload_answer(tls, msg).await,
+        )),
+        Some(MSG_EDGE_ACME_CHALLENGE) => Some((
+            MSG_EDGE_ACME_CHALLENGE_RESPONSE,
+            acme_challenge_answer(tls, msg),
+        )),
+        other => {
+            tracing::warn!(msg = ?other, "sy-edge: unexpected message on the TLS command channel");
+            None
+        }
+    }
+}
+
+/// The edge a TLS command acts on, once its origin is checked.
+fn tls_command_edge<'a>(
+    tls: Option<&'a EdgeTls>,
+    msg: &Message,
+    action: &str,
+) -> Result<&'a EdgeTls, String> {
+    authorize_edge_service_command(msg, action)?;
+    tls.ok_or_else(|| format!("{action}: this edge serves no public listener"))
+}
+
+/// The same, for the commands only a vault edge serves.
+fn vault_tls_command_edge<'a>(
+    tls: Option<&'a EdgeTls>,
+    msg: &Message,
+    action: &str,
+) -> Result<&'a EdgeTls, String> {
+    let tls = tls_command_edge(tls, msg, action)?;
+    if tls.mode.vault_key().is_none() {
+        return Err(format!(
+            "{action}: this edge's TLS mode is {}; only a vault edge reloads its certificate and answers ACME challenges",
+            tls.mode.as_str()
+        ));
+    }
+    Ok(tls)
+}
+
+fn tls_command_error(action: &str, msg: &Message, err: String) -> Value {
+    tracing::warn!(error = %err, trace_id = %msg.routing.trace_id, "sy-edge {action} failed");
+    json!({ "status": "error", "error": err })
+}
+
+/// `EDGE_TLS_STATUS`: what the listener serves.
+fn tls_status_answer(tls: Option<&EdgeTls>, msg: &Message) -> Value {
+    match tls_command_edge(tls, msg, MSG_EDGE_TLS_STATUS) {
+        Ok(tls) => tls.status_payload(),
+        Err(err) => tls_command_error(MSG_EDGE_TLS_STATUS, msg, err),
+    }
+}
+
+/// `EDGE_TLS_RELOAD`: one re-read and verdict; the STATUS fields plus `changed` and, when
+/// refused, `refused: {reason, detail}`.
+async fn tls_reload_answer(tls: Option<&EdgeTls>, msg: &Message) -> Value {
+    let tls = match vault_tls_command_edge(tls, msg, MSG_EDGE_TLS_RELOAD) {
+        Ok(tls) => tls,
+        Err(err) => return tls_command_error(MSG_EDGE_TLS_RELOAD, msg, err),
+    };
+    match tls.reload(MSG_EDGE_TLS_RELOAD).await {
+        Ok(outcome) => {
+            let mut payload = tls.status_payload();
+            if let Value::Object(fields) = &mut payload {
+                fields.insert("changed".to_string(), json!(outcome.changed));
+                if let Some(refusal) = &outcome.refused {
+                    fields.insert("refused".to_string(), refusal.to_json());
+                }
+            }
+            payload
+        }
+        Err(err) => tls_command_error(MSG_EDGE_TLS_RELOAD, msg, err),
+    }
+}
+
+/// `EDGE_ACME_CHALLENGE`: `{name, digest, ttl_secs?}` arms, `{name, digest, clear: true}` clears.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcmeChallengeRequest {
+    name: String,
+    digest: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    #[serde(default)]
+    clear: bool,
+}
+
+fn acme_challenge_answer(tls: Option<&EdgeTls>, msg: &Message) -> Value {
+    let outcome: Result<ChallengeAnswer, String> = (|| {
+        let tls = vault_tls_command_edge(tls, msg, MSG_EDGE_ACME_CHALLENGE)?;
+        let request: AcmeChallengeRequest = serde_json::from_value(msg.payload.clone())
+            .map_err(|err| format!("invalid EDGE_ACME_CHALLENGE payload: {err}"))?;
+        let now = now_unix_secs();
+        if request.clear {
+            tls.clear_challenge(&request.name, &request.digest, now)
+        } else {
+            tls.arm_challenge(
+                &request.name,
+                &request.digest,
+                request.ttl_secs.unwrap_or(ACME_CHALLENGE_DEFAULT_TTL_SECS),
+                now,
+            )
+        }
+    })();
+    match outcome {
+        Ok(answer) => json!({
+            "status": "ok",
+            "name": answer.name,
+            "armed": answer.armed,
+            "expires_at": answer.expires_at,
+        }),
+        Err(err) => tls_command_error(MSG_EDGE_ACME_CHALLENGE, msg, err),
+    }
+}
+
+/// What this edge serves from the vault, for the `VAULT_SECRET_CHANGED` decision. Derived from
+/// `EdgeTls` at the moment of the decision (`EdgeTls::live_material`), so it is consistent with
+/// every swap by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveTlsMaterial {
-    /// Not serving vault-sourced TLS — no public frontend on this role, or the cert came from
-    /// disk. Nothing a vault event can invalidate.
+    /// Not a vault edge: no public door on this role, a disk certificate, or plaintext. Nothing a
+    /// vault event can invalidate.
     NotFromVault,
-    /// Serving vault-sourced TLS. `version` is what the vault reported on the boot fetch;
-    /// `None` means it reported none, so we cannot compare and must treat every event as
-    /// invalidating.
-    ///
-    /// `fingerprint` is a sha256 of the cert material actually loaded, and it is what the
-    /// bootstrap check really compares. Version numbers alone are NOT a safe identity: a vault
-    /// rollback sets `current_version = previous_version` (sy_vault.rs:1253) and the next put
-    /// re-mints it, so within one vault.db a given number can denote different material at
-    /// different times — and suppressing on a stale number would leave the edge serving a cert
-    /// the operator already replaced.
+    /// A vault edge with no usable secret yet: any change to its key may be the one it awaits.
+    Awaiting,
+    /// A vault edge serving the leaf whose `fingerprint` is the SHA-256 of its DER, from vault
+    /// `version` (reported for the log: a version number alone is not an identity, since a vault
+    /// rollback re-mints numbers, sy_vault.rs).
     FromVault {
         version: Option<i64>,
-        fingerprint: Option<String>,
+        fingerprint: String,
     },
 }
 
-/// What a `VAULT_SECRET_CHANGED` broadcast means for this edge's TLS material.
+/// What a `VAULT_SECRET_CHANGED` means for this edge's TLS material.
 #[derive(Debug, PartialEq, Eq)]
 enum TlsSecretChange {
-    /// New TLS material exists for our key; the running listener cannot pick it
-    /// up, so the process must restart.
-    ReloadRequired {
+    /// The value under our key may have changed: do what `EDGE_TLS_RELOAD` does (one re-read,
+    /// the shared verdict, a swap in place when it passes). A bootstrap re-announce is confirmed
+    /// the same way: when the vault still holds the chain served, nothing moves.
+    Reload {
         key: String,
         op: &'static str,
         version: i64,
+        bootstrap: bool,
     },
-    /// Our TLS key was deleted. Deliberately NOT a reload: restarting would fail
-    /// closed with no cert and take the public HTTPS door down.
+    /// Our TLS key was deleted. Keep serving what is loaded; nothing restarts.
     DeletedKeepServing { key: String },
-    /// The broadcast is about some other secret (or TLS-from-vault is not in use).
+    /// The notice is about some other secret, only an assignment, or this edge does not serve
+    /// TLS from the vault.
     Unrelated,
     /// The payload could not be parsed, so we cannot tell.
     Malformed { error: String },
-    /// SY.vault restarted and re-announced, during ITS OWN boot, the exact cert version we
-    /// already serve. Not a change. Reacting here recycled a perfectly healthy public listener
-    /// every single time `sy-vault` bounced — an upgrade, a reboot, a manual restart — for a
-    /// ~5 s gap in public HTTPS each time (PB-9).
-    BootstrapAlreadyLoaded {
-        key: String,
-        version: i64,
-        /// Of the material we currently serve. The caller re-fetches and compares before
-        /// suppressing, because vault version numbers are reused across a rollback.
-        live_fingerprint: Option<String>,
-    },
 }
 
-/// Decide how to react to a `VAULT_SECRET_CHANGED` broadcast, given the vault key
-/// this edge loaded its TLS material from (`None` when TLS is off or disk-sourced).
+/// Decide how to react to a `VAULT_SECRET_CHANGED`, given the vault key of this edge's TLS
+/// (`None` when it is not a vault edge). Split out from the message loop so it is testable.
 ///
-/// Split out from the message loop purely so the decision is testable — the caller
-/// turns `ReloadRequired` into `exit(0)`.
+/// Matching is BY KEY, deliberately diverging from the `(resource_type, tenant_id, ilk)` guidance
+/// on `VaultSecretChangedPayload`: that guidance is for consumers that resolve a secret by
+/// interest, whereas the edge is configured with one explicit `tls_vault_key` and reads that exact
+/// key, so key equality is precisely the condition that invalidates what it loaded.
 fn tls_secret_change_action(
     payload: &serde_json::Value,
     tls_key: Option<&str>,
-    live: LiveTlsMaterial,
+    live: &LiveTlsMaterial,
     is_bootstrap: bool,
 ) -> TlsSecretChange {
     let Some(tls_key) = tls_key else {
         return TlsSecretChange::Unrelated;
     };
-    // Stays ahead of every new check: a payload we cannot read must never be swallowed.
+    // Stays ahead of every other check: a payload we cannot read must never be swallowed.
     let parsed: VaultSecretChangedPayload = match serde_json::from_value(payload.clone()) {
         Ok(p) => p,
         Err(err) => {
@@ -2008,155 +3086,14 @@ fn tls_secret_change_action(
         return TlsSecretChange::Unrelated;
     }
     if matches!(live, LiveTlsMaterial::NotFromVault) {
-        // We hold nothing from the vault to invalidate. This also closes a second latent bounce:
-        // a non-ingress edge has no `http_listen`, so it never fetches TLS at all, yet it can
-        // still inherit `tls_vault_key` from the shared hive.yaml `edge:` section — and used to
-        // exit(0) on a rotation while serving no door whatsoever.
         return TlsSecretChange::Unrelated;
     }
-    // `!=`, never `>`: a vault rollback legitimately moves the version DOWN.
-    if is_bootstrap {
-        if let LiveTlsMaterial::FromVault {
-            version: Some(live_version),
-            fingerprint,
-        } = live
-        {
-            if live_version == parsed.version {
-                // A version match is NECESSARY but not sufficient: the caller confirms the
-                // material is byte-identical before suppressing the reload.
-                return TlsSecretChange::BootstrapAlreadyLoaded {
-                    key: parsed.key,
-                    version: parsed.version,
-                    live_fingerprint: fingerprint,
-                };
-            }
-        }
-    }
-    TlsSecretChange::ReloadRequired {
+    TlsSecretChange::Reload {
         key: parsed.key,
         op: parsed.op.as_str(),
         version: parsed.version,
+        bootstrap: is_bootstrap,
     }
-}
-
-/// Whether a reload should actually surrender the running listener.
-///
-/// The reload path exits the process, so the NEW material must be proven loadable FIRST.
-/// Without this, a `vault_put` of a broken chain turns a healthy edge into a crash loop with
-/// the public door down — the same asymmetry `DeletedKeepServing` already encodes.
-#[derive(Debug, PartialEq, Eq)]
-enum TlsReloadVerdict {
-    RestartToLoad,
-    KeepServing { detail: String, transient: bool },
-}
-
-fn tls_reload_verdict(probe: Result<TlsChainDiagnosis, TlsFetchFailure>) -> TlsReloadVerdict {
-    match probe {
-        Ok(diagnosis) if diagnosis.truncated() => TlsReloadVerdict::KeepServing {
-            detail: diagnosis.complaint().unwrap_or_default(),
-            transient: false,
-        },
-        Ok(_) => TlsReloadVerdict::RestartToLoad,
-        Err(failure) => TlsReloadVerdict::KeepServing {
-            detail: failure.detail().to_string(),
-            transient: failure.is_transient(),
-        },
-    }
-}
-
-/// Fetch the edge's TLS material from `SY.vault@<vault_hive>` (secret value
-/// `{ "cert": "<PEM>", "key": "<PEM>" }`). Authorized by the dedicated-owner match
-/// against the edge's deterministic ilk — no identity SHM needed on the edge hive.
-/// Why the edge could not build its TLS material from the vault.
-///
-/// The distinction is the entire point. On an ingress hive there is no local `sy-vault`,
-/// and systemd cannot order a cross-hive dependency — so `Restart=always` + `RestartSec=5`
-/// IS the retry loop, deliberately (docs/edge-ingress-spec-v6.md §381-386). During a cold
-/// boot the edge legitimately loses this race a few times before the mesh is up. Telling
-/// the operator to "fix the vault secret" in those seconds is simply false: nothing is
-/// broken, and the next restart resolves it. That false instruction was the only real
-/// defect behind the "sy-edge crash-loops at cold boot" report.
-enum TlsFetchFailure {
-    /// No answer came back. Transient; systemd's restart is the retry.
-    VaultUnavailable(String),
-    /// The vault answered, and the material is missing or unusable. Needs a human.
-    MaterialInvalid(String),
-}
-
-impl TlsFetchFailure {
-    fn material(detail: impl Into<String>) -> Self {
-        TlsFetchFailure::MaterialInvalid(detail.into())
-    }
-
-    fn from_vault_error(secret_key: &str, err: fluxbee_sdk::VaultError) -> Self {
-        let detail = format!("vault get '{secret_key}' failed: {err}");
-        match err {
-            // Nothing came back: unreachable peer, or the request expired waiting.
-            // Unreachable/TtlExceeded are TRANSPORT, not a verdict: the router answers them
-            // SYNCHRONOUSLY (no timeout elapses), so without them here a single WAN blip during
-            // a rotation exhausted zero retries and abandoned the reload for good.
-            fluxbee_sdk::VaultError::Node(_)
-            | fluxbee_sdk::VaultError::ActionTimeout { .. }
-            | fluxbee_sdk::VaultError::Unreachable { .. }
-            | fluxbee_sdk::VaultError::TtlExceeded { .. } => {
-                TlsFetchFailure::VaultUnavailable(detail)
-            }
-            // The vault DID reach a verdict (or the answer was unusable). A restart
-            // will reproduce this exactly — it needs the operator.
-            _ => TlsFetchFailure::MaterialInvalid(detail),
-        }
-    }
-
-    fn is_transient(&self) -> bool {
-        matches!(self, TlsFetchFailure::VaultUnavailable(_))
-    }
-
-    fn detail(&self) -> &str {
-        match self {
-            TlsFetchFailure::VaultUnavailable(detail)
-            | TlsFetchFailure::MaterialInvalid(detail) => detail,
-        }
-    }
-}
-
-async fn fetch_tls_config_from_vault(
-    dispatcher: Arc<RouterDispatcher>,
-    self_ilk: String,
-    self_name: String,
-    vault_hive: String,
-    secret_key: &str,
-) -> Result<(rustls::ServerConfig, Option<i64>, TlsChainDiagnosis, String), TlsFetchFailure> {
-    let client = fluxbee_sdk::VaultClient::new(
-        dispatcher,
-        vault_hive,
-        fluxbee_sdk::VaultCallerOwned::new(self_ilk, self_name),
-    );
-    let resp = client
-        .get(secret_key, Duration::from_secs(15))
-        .await
-        .map_err(|err| TlsFetchFailure::from_vault_error(secret_key, err))?;
-    let version = resp.version;
-    let value = resp.value.ok_or_else(|| {
-        TlsFetchFailure::material("vault returned no value for the edge tls secret")
-    })?;
-    let cert = value.get("cert").and_then(|v| v.as_str()).ok_or_else(|| {
-        TlsFetchFailure::material("edge tls secret is missing a 'cert' PEM field")
-    })?;
-    let key = value
-        .get("key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| TlsFetchFailure::material("edge tls secret is missing a 'key' PEM field"))?;
-    let (config, diagnosis) = tls_config_from_pem(cert.as_bytes(), key.as_bytes())
-        .map_err(|err| TlsFetchFailure::material(err.to_string()))?;
-    // Identity of the MATERIAL, not of the version number the vault happens to have assigned
-    // it. The number is reusable; the bytes are not.
-    let fingerprint = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(cert.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
-    Ok((config, version, diagnosis, fingerprint))
 }
 
 /// Resolve any registry entries that carry a `secret_ref` but not yet the secret VALUE by
@@ -2907,6 +3844,14 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Unix seconds, the unit of every TLS date the edge reports (`tls_material::LeafInfo`).
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// A shared-secret entry authorizes the request iff its bearer matches the CURRENT secret,
 /// or a not-yet-expired PREVIOUS secret (the rotation grace window). The previous secret is
 /// only ever set for a brief window right after a rotation, so this widens acceptance for
@@ -3001,6 +3946,7 @@ fn http_error(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
     #[test]
     fn parse_query_params_decodes_webhook_challenge() {
@@ -3028,26 +3974,30 @@ mod tests {
         })
     }
 
-    /// Regression: a rotated TLS cert used to be invisible to a running edge —
-    /// resolve_secrets only refreshed channel secrets, so the vault could sit at
-    /// version 2 with a full chain while the edge kept serving version 1. The
-    /// broadcast must now demand a restart (sy.identity's Model D' VA-J'-13 contract).
+    fn serving_live() -> LiveTlsMaterial {
+        LiveTlsMaterial::FromVault {
+            version: Some(1),
+            fingerprint: "fp1".into(),
+        }
+    }
+
+    /// Regression (PB-1): a rotated TLS cert used to be invisible to a running edge, and then
+    /// cost a process restart. A put, rotate or rollback of the edge's own key now reloads in
+    /// place, and so does a change while the edge awaits its first certificate.
     #[test]
-    fn tls_cert_change_in_vault_demands_restart() {
+    fn a_tls_secret_change_in_the_vault_reloads_in_place() {
         assert_eq!(
             tls_secret_change_action(
                 &vault_changed("edge_tls", "put", 2),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(1),
-                    fingerprint: Some("fp1".into())
-                },
+                &serving_live(),
                 false,
             ),
-            TlsSecretChange::ReloadRequired {
+            TlsSecretChange::Reload {
                 key: "edge_tls".into(),
                 op: "put",
                 version: 2,
+                bootstrap: false,
             }
         );
         for op in ["rotate", "rollback"] {
@@ -3055,130 +4005,112 @@ mod tests {
                 tls_secret_change_action(
                     &vault_changed("edge_tls", op, 3),
                     Some("edge_tls"),
-                    LiveTlsMaterial::FromVault {
-                        version: Some(1),
-                        fingerprint: Some("fp1".into())
-                    },
+                    &serving_live(),
                     false,
                 ),
-                TlsSecretChange::ReloadRequired { .. }
+                TlsSecretChange::Reload { .. }
             ));
         }
+        assert!(matches!(
+            tls_secret_change_action(
+                &vault_changed("edge_tls", "put", 1),
+                Some("edge_tls"),
+                &LiveTlsMaterial::Awaiting,
+                false,
+            ),
+            TlsSecretChange::Reload { .. }
+        ));
     }
 
-    /// An assignment changes who may use the key, never its value: the edge keeps serving.
+    /// An assignment changes who may use the key, never its value: nothing to reload.
     #[test]
-    fn tls_key_assignment_never_restarts_the_public_door() {
+    fn tls_key_assignment_never_reloads() {
         assert_eq!(
             tls_secret_change_action(
                 &vault_changed("edge_tls", "assign", 1),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(1),
-                    fingerprint: Some("fp1".into())
-                },
+                &serving_live(),
                 false,
             ),
             TlsSecretChange::Unrelated
         );
     }
 
-    /// A delete must NOT restart the edge: it would fail closed with no cert and
-    /// turn one bad vault call into a public HTTPS outage.
+    /// A delete keeps serving what is loaded, whatever the edge holds; nothing restarts.
     #[test]
-    fn tls_cert_delete_never_restarts_the_public_door() {
-        assert_eq!(
-            tls_secret_change_action(
-                &vault_changed("edge_tls", "delete", 0),
-                Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(1),
-                    fingerprint: Some("fp1".into())
+    fn tls_cert_delete_keeps_serving() {
+        for live in [
+            serving_live(),
+            LiveTlsMaterial::Awaiting,
+            LiveTlsMaterial::NotFromVault,
+        ] {
+            assert_eq!(
+                tls_secret_change_action(
+                    &vault_changed("edge_tls", "delete", 0),
+                    Some("edge_tls"),
+                    &live,
+                    false,
+                ),
+                TlsSecretChange::DeletedKeepServing {
+                    key: "edge_tls".into()
                 },
-                false,
-            ),
-            TlsSecretChange::DeletedKeepServing {
-                key: "edge_tls".into()
-            }
-        );
+                "{live:?}"
+            );
+        }
     }
 
-    /// Other secrets rotating (postgres, slack, …) must never bounce the edge,
-    /// and an edge not sourcing TLS from the vault ignores the broadcast entirely.
+    /// Other secrets rotating (postgres, slack, …) never touch the edge's TLS, and an edge that
+    /// is not a vault edge ignores the notice entirely.
     #[test]
     fn unrelated_secret_changes_leave_the_edge_alone() {
         assert_eq!(
             tls_secret_change_action(
                 &vault_changed("pg_main", "put", 7),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(1),
-                    fingerprint: Some("fp1".into())
-                },
+                &serving_live(),
                 false,
             ),
             TlsSecretChange::Unrelated
         );
-        // TLS off, or cert loaded from disk: nothing to invalidate.
         assert_eq!(
             tls_secret_change_action(
                 &vault_changed("edge_tls", "put", 2),
                 None,
-                LiveTlsMaterial::NotFromVault,
+                &LiveTlsMaterial::NotFromVault,
                 false,
             ),
             TlsSecretChange::Unrelated
         );
     }
 
-    /// PB-9: `sy-vault` re-announces every secret it holds during ITS OWN boot. Reacting to
-    /// that recycled a healthy public listener on every vault bounce — an upgrade, a reboot,
-    /// a manual restart — for a ~5 s HTTPS gap each time.
+    /// PB-9: SY.vault re-announces every secret at its own boot. That is a reload like any
+    /// other: one re-read, and when the vault still holds the chain served nothing moves
+    /// (`a_reread_of_the_material_already_served_changes_nothing`). The version number decides
+    /// nothing, since a vault rollback re-mints numbers.
     #[test]
-    fn vault_bootstrap_of_the_version_we_already_serve_does_not_restart() {
-        assert_eq!(
-            tls_secret_change_action(
-                &vault_changed("edge_tls", "put", 4),
-                Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(4),
-                    fingerprint: Some("fp".into()),
-                },
-                true,
-            ),
-            TlsSecretChange::BootstrapAlreadyLoaded {
-                key: "edge_tls".into(),
-                version: 4,
-                live_fingerprint: Some("fp".into()),
-            }
-        );
-    }
-
-    /// ...but a bootstrap announcing a DIFFERENT version is a real change we missed while
-    /// down, and must still reload. Uses `!=`, never `>`: a vault rollback moves it DOWN.
-    #[test]
-    fn vault_bootstrap_of_another_version_still_reloads() {
-        for live in [Some(3i64), Some(9i64), None] {
-            assert!(
-                matches!(
-                    tls_secret_change_action(
-                        &vault_changed("edge_tls", "put", 4),
-                        Some("edge_tls"),
-                        LiveTlsMaterial::FromVault {
-                            version: live,
-                            fingerprint: Some("fp".into()),
-                        },
-                        true,
-                    ),
-                    TlsSecretChange::ReloadRequired { .. }
+    fn a_vault_bootstrap_re_announce_is_confirmed_by_a_reload() {
+        for version in [3, 4, 9] {
+            assert_eq!(
+                tls_secret_change_action(
+                    &vault_changed("edge_tls", "put", version),
+                    Some("edge_tls"),
+                    &LiveTlsMaterial::FromVault {
+                        version: Some(4),
+                        fingerprint: "fp".into(),
+                    },
+                    true,
                 ),
-                "live={live:?} must reload"
+                TlsSecretChange::Reload {
+                    key: "edge_tls".into(),
+                    op: "put",
+                    version,
+                    bootstrap: true,
+                }
             );
         }
     }
 
-    /// A role with no public door still receives vault broadcasts. It holds nothing from the
-    /// vault, so it must never exit — it used to bounce while serving no listener at all.
+    /// A role with no public door, a disk certificate or plaintext holds nothing from the vault.
     #[test]
     fn an_edge_serving_no_vault_tls_never_reacts() {
         for bootstrap in [true, false] {
@@ -3186,95 +4118,39 @@ mod tests {
                 tls_secret_change_action(
                     &vault_changed("edge_tls", "put", 2),
                     Some("edge_tls"),
-                    LiveTlsMaterial::NotFromVault,
+                    &LiveTlsMaterial::NotFromVault,
                     bootstrap,
                 ),
                 TlsSecretChange::Unrelated
             );
         }
-        // ...but a delete is still reported as keep-serving, ahead of that check.
-        assert_eq!(
-            tls_secret_change_action(
-                &vault_changed("edge_tls", "delete", 0),
-                Some("edge_tls"),
-                LiveTlsMaterial::NotFromVault,
-                true,
-            ),
-            TlsSecretChange::DeletedKeepServing {
-                key: "edge_tls".into()
-            }
-        );
     }
 
-    /// PB-2, the case that started it: the operator's full-chain .crt had the leaf's END glued
-    /// to the intermediate's BEGIN on one line. openssl reads ZERO certs from that file, while
-    /// rustls returns Ok with just the leaf and no error — so the edge served a leaf-only chain
-    /// and strict clients failed, with nothing in the logs.
-    #[test]
-    fn a_glued_end_begin_is_detected_as_a_truncated_chain() {
-        let leaf = "-----BEGIN CERTIFICATE-----\nQUFB\n-----END CERTIFICATE-----";
-        let inter = "-----BEGIN CERTIFICATE-----\nQkJC\n-----END CERTIFICATE-----\n";
-        let glued = format!("{leaf}{inter}"); // no newline between END and BEGIN
-
-        // The marker count must be a SUBSTRING count: the second marker is mid-line, so
-        // anything anchored to line starts cannot see it.
-        let markers = glued
-            .as_bytes()
-            .windows(BEGIN_CERTIFICATE_MARKER.len())
-            .filter(|w| *w == BEGIN_CERTIFICATE_MARKER)
-            .count();
-        assert_eq!(markers, 2, "both markers must be visible in the raw bytes");
-
-        let truncated = TlsChainDiagnosis { markers, parsed: 1 };
-        assert!(truncated.truncated());
-        assert!(truncated.complaint().unwrap().contains("TRUNCATED"));
-
-        let healthy = TlsChainDiagnosis {
-            markers: 3,
-            parsed: 3,
-        };
-        assert!(!healthy.truncated() && !healthy.leaf_only());
-        assert!(healthy.complaint().is_none());
-
-        let leaf_only = TlsChainDiagnosis {
-            markers: 1,
-            parsed: 1,
-        };
-        assert!(!leaf_only.truncated() && leaf_only.leaf_only());
-        assert!(leaf_only.complaint().unwrap().contains("NO INTERMEDIATES"));
-    }
-
-    /// Pins the EMPIRICAL premise the whole PB-2 design rests on, with real certificates:
-    /// on a glued END/BEGIN, `rustls_pemfile` does NOT error — it returns Ok having silently
-    /// kept only the leaf. (openssl, on the same bytes, reads zero certs.) If a future rustls
-    /// bump starts erroring instead, this test fails and the marker gate can be reconsidered.
+    /// PB-2's empirical premise, pinned with real certificates: on a glued END/BEGIN,
+    /// `rustls_pemfile` (behind `tls_material::parse_chain`) does NOT error; it returns Ok with
+    /// only the leaf, while openssl reads zero certs from the same bytes. If a rustls bump starts
+    /// erroring instead, this fails and the marker gate can be reconsidered.
     #[test]
     fn rustls_silently_drops_the_intermediate_of_a_glued_chain() {
         let ca = json_router::mesh_tls::MeshCa::generate().expect("ca");
         let leaf = ca.issue_leaf("edge-test").expect("leaf");
 
-        // Healthy: leaf + CA, properly separated.
         let clean = format!("{}{}", leaf.cert_pem, ca.ca_cert_pem());
-        let (_, diagnosis) =
-            tls_config_from_pem(clean.as_bytes(), leaf.key_pem.as_bytes()).expect("clean loads");
-        assert_eq!(diagnosis.markers, 2);
-        assert_eq!(
-            diagnosis.parsed, 2,
-            "a well-formed 2-cert chain parses fully"
-        );
+        let (chain, diagnosis) = tls_material::parse_chain(clean.as_bytes()).expect("clean");
+        assert_eq!((chain.len(), diagnosis.markers), (2, 2));
         assert!(!diagnosis.truncated());
 
-        // The operator's actual file: END glued to the next BEGIN, no newline between.
         let glued = format!(
             "{}{}",
             leaf.cert_pem.trim_end_matches('\n'),
             ca.ca_cert_pem()
         );
-        let (_, diagnosis) = tls_config_from_pem(glued.as_bytes(), leaf.key_pem.as_bytes())
-            .expect("glued STILL loads — that is the whole problem");
+        let (chain, diagnosis) = tls_material::parse_chain(glued.as_bytes())
+            .expect("glued STILL parses — that is the whole problem");
         assert_eq!(diagnosis.markers, 2, "both markers are in the bytes");
         assert_eq!(
-            diagnosis.parsed, 1,
+            chain.len(),
+            1,
             "rustls kept only the leaf, with no error — the silent failure PB-2 is about"
         );
         assert!(
@@ -3283,73 +4159,69 @@ mod tests {
         );
     }
 
-    /// The reload path exits the process, so it must prove the NEW material first. A bad
-    /// `vault_put` must never be able to convert a healthy edge into a crash loop.
+    /// The vault's verdict stays typed. Transport is no verdict on the secret: the edge's vault
+    /// is cross-hive by default, and a WAN blip makes the ROUTER answer UNREACHABLE at once.
     #[test]
-    fn a_reload_never_surrenders_the_listener_for_material_that_does_not_load() {
-        assert_eq!(
-            tls_reload_verdict(Ok(TlsChainDiagnosis {
-                markers: 3,
-                parsed: 3
-            })),
-            TlsReloadVerdict::RestartToLoad
-        );
-        // A leaf-only chain is a warning, not a reason to refuse: it is what the operator
-        // asked for and it does serve.
-        assert_eq!(
-            tls_reload_verdict(Ok(TlsChainDiagnosis {
-                markers: 1,
-                parsed: 1
-            })),
-            TlsReloadVerdict::RestartToLoad
-        );
-        assert!(matches!(
-            tls_reload_verdict(Ok(TlsChainDiagnosis {
-                markers: 2,
-                parsed: 1
-            })),
-            TlsReloadVerdict::KeepServing { .. }
-        ));
-        assert!(matches!(
-            tls_reload_verdict(Err(TlsFetchFailure::material("bad pem"))),
-            TlsReloadVerdict::KeepServing {
-                transient: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            tls_reload_verdict(Err(TlsFetchFailure::VaultUnavailable("down".into()))),
-            TlsReloadVerdict::KeepServing {
-                transient: true,
-                ..
-            }
-        ));
-
-        // The edge's vault is cross-hive by default, so a WAN blip makes the ROUTER answer
-        // UNREACHABLE synchronously — no timeout elapses. Classifying that as bad material
-        // burned zero retries and abandoned a legitimate rotation until the cert expired.
-        for transport in [
-            fluxbee_sdk::VaultError::Unreachable {
-                reason: "GATEWAY_UNAVAILABLE".into(),
-                original_dst: "SY.vault@motherbee".into(),
-            },
-            fluxbee_sdk::VaultError::TtlExceeded {
-                original_dst: "SY.vault@motherbee".into(),
-                last_hop: "ingress1".into(),
-            },
-        ] {
-            let failure = TlsFetchFailure::from_vault_error("edge_tls", transport);
-            assert!(
-                failure.is_transient(),
-                "transport failures must be retried, not reported as broken material"
-            );
-            assert!(matches!(
-                tls_reload_verdict(Err(failure)),
-                TlsReloadVerdict::KeepServing {
-                    transient: true,
-                    ..
-                }
-            ));
+    fn the_vault_verdict_stays_typed() {
+        let service = |code: &str| fluxbee_sdk::VaultError::Service {
+            code: code.to_string(),
+            message: "scripted".to_string(),
+        };
+        let cases = [
+            (
+                fluxbee_sdk::VaultError::Unreachable {
+                    reason: "GATEWAY_UNAVAILABLE".into(),
+                    original_dst: "SY.vault@motherbee".into(),
+                },
+                TlsVerdict::Transient,
+            ),
+            (
+                fluxbee_sdk::VaultError::TtlExceeded {
+                    original_dst: "SY.vault@motherbee".into(),
+                    last_hop: "ingress1".into(),
+                },
+                TlsVerdict::Transient,
+            ),
+            (
+                fluxbee_sdk::VaultError::ActionTimeout {
+                    action: "VAULT_GET".into(),
+                    trace_id: "t".into(),
+                    target: "SY.vault@motherbee".into(),
+                    timeout_ms: 15_000,
+                },
+                TlsVerdict::Transient,
+            ),
+            (service("KEY_NOT_FOUND"), TlsVerdict::NotFound),
+            (service("UNAUTHORIZED"), TlsVerdict::Forbidden),
+            // The secret's own fault: the request names an invalid key, or the stored value is.
+            (service("INVALID_REQUEST"), TlsVerdict::InvalidMaterial),
+            (service("INVALID_VALUE"), TlsVerdict::InvalidMaterial),
+            (
+                fluxbee_sdk::VaultError::EmptyValue {
+                    key: "edge_tls".into(),
+                },
+                TlsVerdict::InvalidMaterial,
+            ),
+            // The vault could not do its job: never a reason to roll a good certificate back.
+            (service("IDENTITY_UNAVAILABLE"), TlsVerdict::Transient),
+            (service("STORAGE_ERROR"), TlsVerdict::Transient),
+            (service("IO_ERROR"), TlsVerdict::Transient),
+            (service("ENCRYPTION_ERROR"), TlsVerdict::Transient),
+            (service("NODE_ERROR"), TlsVerdict::Transient),
+            (service("MASTER_KEY_NOT_AVAILABLE"), TlsVerdict::Transient),
+            (service("VAULT_RPC_ERROR"), TlsVerdict::Transient),
+            (service("A_CODE_ADDED_LATER"), TlsVerdict::Transient),
+            (
+                fluxbee_sdk::VaultError::Json(
+                    serde_json::from_str::<Value>("{").expect_err("not JSON"),
+                ),
+                TlsVerdict::Transient,
+            ),
+        ];
+        for (err, verdict) in cases {
+            let refusal = TlsRefusal::from_vault_error("edge_tls", err);
+            assert_eq!(refusal.verdict, verdict, "{}", refusal.detail);
+            assert!(refusal.detail.contains("edge_tls"));
         }
     }
 
@@ -3361,10 +4233,7 @@ mod tests {
             tls_secret_change_action(
                 &serde_json::json!({"op": "put"}),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault {
-                    version: Some(1),
-                    fingerprint: Some("fp1".into())
-                },
+                &serving_live(),
                 false,
             ),
             TlsSecretChange::Malformed { .. }
@@ -3708,7 +4577,7 @@ mod tests {
     fn filter_request_headers_allowlist_is_fail_closed() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer x".parse().unwrap());
-        headers.insert("host", "edge.fluxbee.ai".parse().unwrap());
+        headers.insert("host", "edge.example.com".parse().unwrap());
         headers.insert("connection", "keep-alive".parse().unwrap());
         headers.insert("cookie", "session=abc".parse().unwrap());
         headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
@@ -3839,5 +4708,1489 @@ mod tests {
             resolve_http_listen(Some("0.0.0.0:8443".to_string()), Some("motherbee"), None),
             Some("0.0.0.0:8443".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS (docs/acme-edge-certificates-v1.md §4, §10 "Edge")
+    // -----------------------------------------------------------------------
+
+    const EDGE: &str = "edge.example.com";
+
+    /// A self-signed leaf with rcgen's wide default validity: (cert PEM, key PEM).
+    fn self_signed(names: &[&str]) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let params = rcgen::CertificateParams::new(
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("params");
+        (
+            params.self_signed(&key).expect("cert").pem(),
+            key.serialize_pem(),
+        )
+    }
+
+    /// A self-signed leaf for `EDGE`, valid only between two dates.
+    fn self_signed_between(from: (i32, u8, u8), to: (i32, u8, u8)) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(vec![EDGE.to_string()]).expect("params");
+        params.not_before = rcgen::date_time_ymd(from.0, from.1, from.2);
+        params.not_after = rcgen::date_time_ymd(to.0, to.1, to.2);
+        (
+            params.self_signed(&key).expect("cert").pem(),
+            key.serialize_pem(),
+        )
+    }
+
+    /// A leaf for `EDGE` issued by a fresh CA: (leaf PEM, CA PEM, leaf key PEM).
+    fn issued_by_ca() -> (String, String, String) {
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Edge Test CA");
+        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let leaf = rcgen::CertificateParams::new(vec![EDGE.to_string()])
+            .expect("leaf")
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf cert");
+        (leaf.pem(), ca.pem(), leaf_key.serialize_pem())
+    }
+
+    /// The operator's PB-2 file: the leaf's END glued to the next BEGIN on one line.
+    fn glue(leaf: &str, next: &str) -> String {
+        format!("{}{}", leaf.trim_end_matches('\n'), next)
+    }
+
+    fn leaf_der(cert_pem: &str) -> Vec<u8> {
+        let (chain, _) = tls_material::parse_chain(cert_pem.as_bytes()).expect("chain");
+        chain.first().expect("a leaf").to_vec()
+    }
+
+    type Reply = Result<VaultTlsSecret, TlsRefusal>;
+
+    /// A scripted vault: each read takes the next reply.
+    struct FakeSource {
+        replies: std::sync::Mutex<std::collections::VecDeque<Reply>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSource {
+        fn new(replies: Vec<Reply>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TlsSecretSource for FakeSource {
+        async fn read(&self, _key: &str) -> Result<VaultTlsSecret, TlsRefusal> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .unwrap_or_else(|| refused(TlsVerdict::Transient))
+        }
+    }
+
+    fn secret(material: (String, String)) -> Reply {
+        secret_at(material, 1, "2026-10-21T10:00:00+00:00")
+    }
+
+    /// A secret as one particular vault write holds it.
+    fn secret_at((cert, key): (String, String), version: i64, updated_at: &str) -> Reply {
+        Ok(VaultTlsSecret {
+            cert,
+            key,
+            version: Some(version),
+            updated_at: Some(updated_at.to_string()),
+        })
+    }
+
+    /// A complete chain for `EDGE` (leaf + CA) and its key: what a reload may swap in.
+    fn chained() -> (String, String) {
+        let (leaf, ca, key) = issued_by_ca();
+        (format!("{leaf}{ca}"), key)
+    }
+
+    fn refused(verdict: TlsVerdict) -> Reply {
+        Err(TlsRefusal {
+            verdict,
+            detail: format!("scripted {}", verdict.as_str()),
+        })
+    }
+
+    fn vault_edge(source: &Arc<FakeSource>) -> Arc<EdgeTls> {
+        Arc::new(EdgeTls::vault(
+            "edge_tls".to_string(),
+            Arc::clone(source) as _,
+        ))
+    }
+
+    /// A vault edge already serving `material`.
+    async fn serving_edge(material: (String, String)) -> Arc<EdgeTls> {
+        let tls = vault_edge(&FakeSource::new(vec![secret(material)]));
+        assert!(tls.reload("boot").await.expect("a vault edge").changed);
+        tls
+    }
+
+    /// Two PEM files in a fresh directory, for a disk edge.
+    fn disk_files((cert, key): (String, String)) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sy-edge-tls-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (cert_path, key_path) = (dir.join("edge.crt"), dir.join("edge.key"));
+        std::fs::write(&cert_path, cert).expect("cert file");
+        std::fs::write(&key_path, key).expect("key file");
+        (cert_path, key_path)
+    }
+
+    fn edge_command(src: Option<&str>, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "src-uuid".to_string(),
+                src_l2_name: src.map(ToString::to_string),
+                dst: Destination::Unicast("SY.edge@ingress1".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn admin_command(msg: &str, payload: Value) -> Message {
+        edge_command(Some("SY.admin@motherbee"), msg, payload)
+    }
+
+    async fn answer(tls: Option<&EdgeTls>, msg: &str, payload: Value) -> Value {
+        tls_command_reply(tls, &admin_command(msg, payload))
+            .await
+            .expect("a TLS command")
+            .1
+    }
+
+    /// The `acmeIdentifier` extension of a DER certificate: (critical, raw value).
+    fn acme_identifier(der: &[u8]) -> Option<(bool, Vec<u8>)> {
+        let (_, cert) = X509Certificate::from_der(der).ok()?;
+        cert.extensions()
+            .iter()
+            .find(|ext| ext.oid.to_id_string() == "1.3.6.1.5.5.7.1.31")
+            .map(|ext| (ext.critical, ext.value.to_vec()))
+    }
+
+    /// The tests read what the edge presents; they never judge it. Not even the signatures:
+    /// rustls checks those through webpki, which refuses the challenge certificate's unknown
+    /// critical extension (an ACME validator parses that certificate itself).
+    #[derive(Debug)]
+    struct AcceptAnything;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnything {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn client_config(alpn: &[&[u8]], sni: bool) -> Arc<rustls::ClientConfig> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnything))
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+        config.enable_sni = sni;
+        Arc::new(config)
+    }
+
+    fn server_name(name: &str) -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from(name.to_string()).expect("server name")
+    }
+
+    /// What a client saw of one handshake with the edge's acceptor.
+    struct Seen {
+        /// The leaf presented, when the handshake completed.
+        leaf: Option<Vec<u8>>,
+        alpn: Option<Vec<u8>>,
+        /// The acceptor handed the connection on to HTTP: the main path.
+        reached_http: bool,
+    }
+
+    /// One handshake over an in-process pipe: a rustls client against `accept_tls`.
+    async fn handshake(tls: &Arc<EdgeTls>, name: &str, sni: bool, alpn: &[&[u8]]) -> Seen {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_tls = Arc::clone(tls);
+        let server = tokio::spawn(async move { accept_tls(server_io, &server_tls).await });
+        let client = tokio_rustls::TlsConnector::from(client_config(alpn, sni))
+            .connect(server_name(name), client_io)
+            .await;
+        let (leaf, alpn) = match &client {
+            Ok(stream) => {
+                let (_, connection) = stream.get_ref();
+                (
+                    connection
+                        .peer_certificates()
+                        .and_then(|chain| chain.first())
+                        .map(|leaf| leaf.to_vec()),
+                    connection.alpn_protocol().map(<[u8]>::to_vec),
+                )
+            }
+            Err(_) => (None, None),
+        };
+        let reached_http = server.await.expect("acceptor task").is_some();
+        Seen {
+            leaf,
+            alpn,
+            reached_http,
+        }
+    }
+
+    /// The bytes of a ClientHello, for a client that stops right after it.
+    fn client_hello(alpn: &[&[u8]]) -> Vec<u8> {
+        let mut connection =
+            rustls::ClientConnection::new(client_config(alpn, true), server_name(EDGE))
+                .expect("client");
+        let mut hello = Vec::new();
+        connection.write_tls(&mut hello).expect("hello");
+        hello
+    }
+
+    async fn try_connect_tls(
+        addr: std::net::SocketAddr,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        tokio_rustls::TlsConnector::from(client_config(&[], true))
+            .connect(server_name(EDGE), tcp)
+            .await
+    }
+
+    async fn connect_tls(
+        addr: std::net::SocketAddr,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        try_connect_tls(addr).await.expect("tls handshake")
+    }
+
+    /// A TLS door on a loopback port, serving `/healthz` with `tls` under `limits`.
+    async fn loopback_door(tls: &Arc<EdgeTls>, limits: DoorLimits) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new().route("/healthz", any(|| async { "ok" }));
+        tokio::spawn(serve_tls_listener(listener, app, Arc::clone(tls), limits));
+        addr
+    }
+
+    /// How long until the server closes `stream`: a read that ends (EOF or error) within
+    /// `limit`, after any bytes the server still sends.
+    async fn closed_within<S>(stream: &mut S, limit: Duration) -> Duration
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let started = Instant::now();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match tokio::time::timeout(limit, stream.read(&mut chunk)).await {
+                Err(_) => panic!("the server kept the connection open past {limit:?}"),
+                Ok(Ok(0)) | Ok(Err(_)) => return started.elapsed(),
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    /// Write `bytes` in ten pieces spread over `over`, then keep the pipe open.
+    async fn trickle(
+        mut io: tokio::io::DuplexStream,
+        bytes: Vec<u8>,
+        over: Duration,
+    ) -> tokio::io::DuplexStream {
+        let piece = bytes.len().div_ceil(10).max(1);
+        for chunk in bytes.chunks(piece) {
+            tokio::time::sleep(over / 10).await;
+            tokio::io::AsyncWriteExt::write_all(&mut io, chunk)
+                .await
+                .expect("trickle");
+        }
+        io
+    }
+
+    fn presented_leaf(stream: &tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+        stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .map(|leaf| leaf.to_vec())
+            .expect("a leaf")
+    }
+
+    /// `GET /healthz` over an open connection; the body.
+    async fn get_healthz<S>(stream: &mut S) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::io::AsyncWriteExt::write_all(
+            stream,
+            b"GET /healthz HTTP/1.1\r\nhost: edge.example.com\r\n\r\n",
+        )
+        .await
+        .expect("request");
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+                .await
+                .expect("a response in time")
+                .expect("read");
+            assert!(read > 0, "the connection closed before the response");
+            response.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&response).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length = head.lines().find_map(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().expect("length"))
+                });
+                if let Some(length) = length {
+                    if body.len() >= length {
+                        return body[..length].to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tls_mode_is_explicit_and_never_falls_back_to_plaintext() {
+        let cert = Some(std::path::Path::new("edge.crt"));
+        let key = Some(std::path::Path::new("edge.key"));
+        assert_eq!(
+            TlsMode::resolve(Some(" edge_tls "), cert, key),
+            Ok(TlsMode::Vault {
+                key: "edge_tls".into()
+            }),
+            "a vault key wins over disk files"
+        );
+        assert_eq!(
+            TlsMode::resolve(None, cert, key),
+            Ok(TlsMode::Disk {
+                cert: "edge.crt".into(),
+                key: "edge.key".into()
+            })
+        );
+        assert_eq!(TlsMode::resolve(None, None, None), Ok(TlsMode::Plaintext));
+        assert!(TlsMode::resolve(Some("  "), None, None).is_err());
+        assert!(TlsMode::resolve(None, cert, None).is_err());
+        assert!(TlsMode::resolve(None, None, key).is_err());
+    }
+
+    /// RFC 8737 §3: the challenge certificate holds the critical acmeIdentifier extension whose
+    /// value is the 32-byte digest as an OCTET STRING, and the name as its only SAN.
+    #[test]
+    fn the_challenge_certificate_carries_the_critical_digest_and_only_the_name() {
+        let digest = [0xab_u8; 32];
+        let (cert, _) = acme_challenge_certificate(EDGE, &digest).expect("challenge certificate");
+        let (critical, value) = acme_identifier(cert.as_ref()).expect("acmeIdentifier");
+        assert!(critical, "the acmeIdentifier extension MUST be critical");
+        let mut octet_string = vec![0x04, 0x20];
+        octet_string.extend_from_slice(&digest);
+        assert_eq!(value, octet_string);
+        let (_, parsed) = X509Certificate::from_der(cert.as_ref()).expect("parses");
+        let san = parsed
+            .subject_alternative_name()
+            .expect("SAN parses")
+            .expect("SAN present");
+        assert!(matches!(
+            san.value.general_names.as_slice(),
+            [GeneralName::DNSName(name)] if *name == EDGE
+        ));
+        assert_eq!(parsed.subject().iter().count(), 0, "an empty subject");
+        assert_eq!(
+            parsed.public_key().algorithm.algorithm.to_id_string(),
+            "1.2.840.10045.2.1",
+            "an EC (P-256) key"
+        );
+    }
+
+    /// rcgen asserts the digest's length; a bad digest must be refused before it gets there.
+    #[test]
+    fn a_digest_that_is_not_32_bytes_of_hex_is_refused_before_rcgen() {
+        let tls = EdgeTls::vault("edge_tls".to_string(), FakeSource::new(vec![]));
+        for digest in [
+            String::new(),
+            "ab".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "zz".repeat(32),
+        ] {
+            assert!(
+                tls.arm_challenge(EDGE, &digest, 600, 1_000).is_err(),
+                "{digest:?}"
+            );
+        }
+        assert!(
+            tls.arm_challenge(EDGE, &"AB".repeat(32), 600, 1_000)
+                .is_ok(),
+            "upper-case hex is hex"
+        );
+    }
+
+    #[test]
+    fn an_armed_challenge_expires_and_a_clear_removes_only_its_own_digest() {
+        let tls = EdgeTls::vault("edge_tls".to_string(), FakeSource::new(vec![]));
+        let first = "aa".repeat(32);
+        let newer = "BB".repeat(32);
+        assert_eq!(
+            tls.arm_challenge("Edge.Example.COM.", &first, 600, 1_000),
+            Ok(ChallengeAnswer {
+                name: EDGE.into(),
+                armed: true,
+                expires_at: Some(1_600)
+            }),
+            "the name is normalized"
+        );
+        assert!(tls.challenge_config(EDGE, 1_599).is_some());
+        assert!(
+            tls.challenge_config(EDGE, 1_600).is_none(),
+            "gone at its TTL"
+        );
+
+        // A late clear of an older arm never removes the newer one.
+        tls.arm_challenge(EDGE, &first, 600, 2_000).expect("arm");
+        tls.arm_challenge(EDGE, &newer, 600, 2_010).expect("re-arm");
+        assert_eq!(
+            tls.clear_challenge(EDGE, &first, 2_020),
+            Ok(ChallengeAnswer {
+                name: EDGE.into(),
+                armed: true,
+                expires_at: Some(2_610)
+            })
+        );
+        assert!(tls.challenge_config(EDGE, 2_020).is_some());
+        assert_eq!(
+            tls.clear_challenge(EDGE, &newer.to_lowercase(), 2_030),
+            Ok(ChallengeAnswer {
+                name: EDGE.into(),
+                armed: false,
+                expires_at: None
+            }),
+            "its own digest, in any case, clears it"
+        );
+        assert!(tls.challenge_config(EDGE, 2_030).is_none());
+
+        assert!(tls.arm_challenge(EDGE, &first, 0, 3_000).is_err());
+        assert!(tls
+            .arm_challenge(EDGE, &first, ACME_CHALLENGE_MAX_TTL_SECS + 1, 3_000)
+            .is_err());
+        assert!(tls
+            .arm_challenge(EDGE, &first, ACME_CHALLENGE_MAX_TTL_SECS, 3_000)
+            .is_ok());
+        for name in [
+            "",
+            "*.example.com",
+            "192.0.2.1",
+            "edge_tls.example.com",
+            "-edge.example.com",
+            "edge..example.com",
+        ] {
+            assert!(
+                tls.arm_challenge(name, &first, 600, 3_000).is_err(),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_acceptor_routes_each_client_hello_as_the_design_table_says() {
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let main_leaf = tls.served().expect("serving").chain[0].to_vec();
+        let digest = [0x5a_u8; 32];
+        tls.arm_challenge(EDGE, &hex::encode(digest), 600, now_unix_secs())
+            .expect("armed");
+        let mut challenge_value = vec![0x04, 0x20];
+        challenge_value.extend_from_slice(&digest);
+
+        // ALPN exactly acme-tls/1, a challenge armed for the SNI: the challenge certificate, the
+        // acme-tls/1 protocol, and the connection closed, never handed to HTTP.
+        for name in [EDGE, "EDGE.Example.com"] {
+            let seen = handshake(&tls, name, true, &[ACME_TLS_ALPN]).await;
+            assert_eq!(seen.alpn.as_deref(), Some(ACME_TLS_ALPN), "{name}");
+            assert_eq!(
+                seen.leaf.as_deref().and_then(acme_identifier),
+                Some((true, challenge_value.clone())),
+                "{name}"
+            );
+            assert!(!seen.reached_http, "a challenge never reaches HTTP");
+        }
+
+        // ALPN exactly acme-tls/1 and nothing armed for the SNI, or no SNI at all: dropped.
+        for (name, sni) in [("other.example.com", true), (EDGE, false)] {
+            let seen = handshake(&tls, name, sni, &[ACME_TLS_ALPN]).await;
+            assert!(seen.leaf.is_none(), "{name} sni={sni}");
+            assert!(!seen.reached_http);
+        }
+
+        // Anything else, acme-tls/1 mixed with other protocols included: the main configuration
+        // with no ALPN negotiated, then HTTP.
+        for (alpn, sni) in [
+            (vec![ACME_TLS_ALPN, b"h2".as_slice()], true),
+            (vec![b"h2".as_slice(), b"http/1.1".as_slice()], true),
+            (vec![], true),
+            (vec![], false),
+        ] {
+            let seen = handshake(&tls, EDGE, sni, &alpn).await;
+            assert_eq!(
+                seen.leaf.as_deref(),
+                Some(main_leaf.as_slice()),
+                "{alpn:?} sni={sni}"
+            );
+            assert_eq!(
+                seen.alpn, None,
+                "{alpn:?}: the main configuration has no ALPN"
+            );
+            assert!(seen.reached_http);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_awaiting_edge_answers_armed_challenges_and_drops_everything_else() {
+        let tls = vault_edge(&FakeSource::new(vec![refused(TlsVerdict::NotFound)]));
+        tls.reload("boot").await.expect("a vault edge");
+        tls.arm_challenge(EDGE, &"ef".repeat(32), 600, now_unix_secs())
+            .expect("armed");
+        let challenge = handshake(&tls, EDGE, true, &[ACME_TLS_ALPN]).await;
+        assert_eq!(challenge.alpn.as_deref(), Some(ACME_TLS_ALPN));
+        for alpn in [
+            vec![],
+            vec![b"h2".as_slice(), b"http/1.1".as_slice()],
+            vec![ACME_TLS_ALPN, b"h2".as_slice()],
+        ] {
+            let seen = handshake(&tls, EDGE, true, &alpn).await;
+            assert!(
+                seen.leaf.is_none() && !seen.reached_http,
+                "{alpn:?}: an awaiting edge serves nothing else"
+            );
+        }
+    }
+
+    /// ONE timeout covers the ClientHello and the handshake. A client trickles its hello over
+    /// 0.7 T and then stalls the handshake: two per-phase timeouts would hold it about 1.7 T.
+    #[tokio::test]
+    async fn one_timeout_covers_the_client_hello_and_the_handshake() {
+        let timeout = Duration::from_secs(1);
+        let source = FakeSource::new(vec![secret(self_signed(&[EDGE]))]);
+        let tls = Arc::new(
+            EdgeTls::vault("edge_tls".to_string(), source).with_handshake_timeout(timeout),
+        );
+        tls.reload("boot").await.expect("a vault edge");
+        tls.arm_challenge(EDGE, &"cd".repeat(32), 600, now_unix_secs())
+            .expect("armed");
+
+        let silent = async {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let started = Instant::now();
+            assert!(accept_tls(server_io, &tls).await.is_none());
+            drop(client_io);
+            started.elapsed()
+        };
+        let trickled = |alpn: Vec<&'static [u8]>| {
+            let tls = Arc::clone(&tls);
+            async move {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let started = Instant::now();
+                let (_client_io, accepted) = tokio::join!(
+                    trickle(client_io, client_hello(&alpn), timeout.mul_f32(0.7)),
+                    accept_tls(server_io, &tls)
+                );
+                assert!(accepted.is_none());
+                started.elapsed()
+            }
+        };
+        let (silent, main_path, challenge_path) =
+            tokio::join!(silent, trickled(Vec::new()), trickled(vec![ACME_TLS_ALPN]));
+        for (case, elapsed) in [
+            ("sends nothing", silent),
+            ("main path", main_path),
+            ("challenge path", challenge_path),
+        ] {
+            assert!(elapsed >= timeout, "{case}: {elapsed:?}");
+            assert!(elapsed < timeout.mul_f32(1.35), "{case}: {elapsed:?}");
+        }
+        assert_eq!(TLS_HANDSHAKE_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_reload_swaps_new_connections_and_keeps_the_open_ones() {
+        let (first, second) = (chained(), chained());
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret(first.clone()),
+            secret(second.clone()),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let addr = loopback_door(
+            &tls,
+            DoorLimits::new(MAX_TLS_CONNECTIONS, HTTP_HEADER_READ_TIMEOUT),
+        )
+        .await;
+
+        let mut open = connect_tls(addr).await;
+        assert_eq!(presented_leaf(&open), leaf_der(&first.0));
+        assert_eq!(get_healthz(&mut open).await, "ok");
+
+        assert_eq!(
+            tls.reload(MSG_EDGE_TLS_RELOAD).await,
+            Ok(ReloadOutcome {
+                changed: true,
+                refused: None
+            })
+        );
+
+        let mut fresh = connect_tls(addr).await;
+        assert_eq!(presented_leaf(&fresh), leaf_der(&second.0));
+        assert_eq!(get_healthz(&mut fresh).await, "ok");
+        // The connection opened before the swap carries on.
+        assert_eq!(get_healthz(&mut open).await, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_reload_refuses_bad_material_and_keeps_serving_the_current_certificate() {
+        let (leaf, ca, key) = issued_by_ca();
+        let good = (format!("{leaf}{ca}"), key.clone());
+        let cases: Vec<(&str, Reply, TlsVerdict)> = vec![
+            (
+                "truncated",
+                secret((glue(&leaf, &ca), key.clone())),
+                TlsVerdict::InvalidMaterial,
+            ),
+            (
+                "expired",
+                secret(self_signed_between((2020, 1, 1), (2021, 1, 1))),
+                TlsVerdict::InvalidMaterial,
+            ),
+            (
+                "not yet valid",
+                secret(self_signed_between((2090, 1, 1), (2091, 1, 1))),
+                TlsVerdict::InvalidMaterial,
+            ),
+            (
+                "key mismatch",
+                secret((good.0.clone(), self_signed(&[EDGE]).1)),
+                TlsVerdict::InvalidMaterial,
+            ),
+            (
+                "leaf only",
+                secret(self_signed(&[EDGE])),
+                TlsVerdict::InvalidMaterial,
+            ),
+            (
+                "deleted",
+                refused(TlsVerdict::NotFound),
+                TlsVerdict::NotFound,
+            ),
+            (
+                "vault silent",
+                refused(TlsVerdict::Transient),
+                TlsVerdict::Transient,
+            ),
+        ];
+        for (case, reply, verdict) in cases {
+            let tls = vault_edge(&FakeSource::new(vec![secret(good.clone()), reply]));
+            tls.reload("boot").await.expect("a vault edge");
+            let before = tls.served().expect("serving");
+            let outcome = tls.reload(MSG_EDGE_TLS_RELOAD).await.expect("a vault edge");
+            assert!(!outcome.changed, "{case}");
+            assert_eq!(
+                outcome.refused.map(|refusal| refusal.verdict),
+                Some(verdict),
+                "{case}"
+            );
+            let after = tls.served().expect("still serving");
+            assert!(
+                Arc::ptr_eq(&before.config, &after.config),
+                "{case}: the main configuration was kept"
+            );
+            assert_eq!(tls.status_payload()["state"], "serving", "{case}");
+        }
+    }
+
+    /// Today's rule (PB-2) when nothing is served yet, at boot or while awaiting: a truncated
+    /// chain is served as parsed, loudly. Every other check still applies.
+    #[tokio::test]
+    async fn a_truncated_chain_is_served_when_nothing_else_is() {
+        let (leaf, ca, key) = issued_by_ca();
+        let tls = vault_edge(&FakeSource::new(vec![secret((
+            glue(&leaf, &ca),
+            key.clone(),
+        ))]));
+        assert_eq!(
+            tls.reload("boot").await,
+            Ok(ReloadOutcome {
+                changed: true,
+                refused: None
+            })
+        );
+        let status = tls.status_payload();
+        assert_eq!(status["state"], "serving");
+        assert_eq!(status["chain_len"], 1, "what the parser kept: the leaf");
+
+        let (cert_path, key_path) = disk_files((glue(&leaf, &ca), key));
+        let disk = EdgeTls::from_disk(cert_path, key_path, now_unix_secs()).expect("disk edge");
+        assert_eq!(disk.status_payload()["chain_len"], 1);
+
+        let (cert_path, key_path) = disk_files(self_signed_between((2020, 1, 1), (2021, 1, 1)));
+        assert!(EdgeTls::from_disk(cert_path, key_path, now_unix_secs()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reread_of_the_material_already_served_changes_nothing() {
+        let material = self_signed(&[EDGE]);
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret_at(material.clone(), 2, "2026-10-21T10:00:00+00:00"),
+            // A rollback re-mints version 2 for the same bytes; only updated_at tells them apart.
+            secret_at(material, 2, "2026-10-21T11:30:00+00:00"),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let first = tls.served().expect("serving");
+        assert_eq!(
+            tls.reload("VAULT_SECRET_CHANGED put").await,
+            Ok(ReloadOutcome {
+                changed: false,
+                refused: None
+            })
+        );
+        let second = tls.served().expect("serving");
+        assert!(Arc::ptr_eq(&first.config, &second.config));
+        assert_eq!(first.loaded_at, second.loaded_at);
+        let status = tls.status_payload();
+        assert_eq!(status["vault_version"], 2);
+        assert_eq!(
+            status["vault_updated_at"], "2026-10-21T11:30:00+00:00",
+            "the write identity follows the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn fixing_the_intermediates_of_the_same_leaf_is_a_change() {
+        let (leaf, ca, key) = issued_by_ca();
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret((leaf.clone(), key.clone())),
+            secret((format!("{leaf}{ca}"), key)),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let leaf_only = tls.status_payload();
+        assert_eq!(leaf_only["chain_len"], 1);
+        assert_eq!(
+            tls.reload(MSG_EDGE_TLS_RELOAD).await,
+            Ok(ReloadOutcome {
+                changed: true,
+                refused: None
+            })
+        );
+        let full = tls.status_payload();
+        assert_eq!(full["chain_len"], 2);
+        assert_eq!(
+            full["fingerprint"], leaf_only["fingerprint"],
+            "the same leaf"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_material_follows_every_swap_and_fingerprints_the_leaf_der() {
+        let (first, second) = (chained(), chained());
+        let tls = vault_edge(&FakeSource::new(vec![
+            refused(TlsVerdict::NotFound),
+            secret(first.clone()),
+            secret(second.clone()),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        assert_eq!(tls.live_material(), LiveTlsMaterial::Awaiting);
+        for (cert, _) in [first, second] {
+            tls.reload(MSG_EDGE_TLS_RELOAD).await.expect("a vault edge");
+            let fingerprint = hex::encode(Sha256::digest(leaf_der(&cert)));
+            assert_ne!(
+                fingerprint,
+                hex::encode(Sha256::digest(cert.as_bytes())),
+                "the leaf's DER, not the PEM"
+            );
+            assert_eq!(
+                tls.live_material(),
+                LiveTlsMaterial::FromVault {
+                    version: Some(1),
+                    fingerprint: fingerprint.clone()
+                }
+            );
+            assert_eq!(tls.status_payload()["fingerprint"], fingerprint);
+        }
+        assert_eq!(
+            EdgeTls::plaintext().live_material(),
+            LiveTlsMaterial::NotFromVault
+        );
+    }
+
+    #[tokio::test]
+    async fn every_vault_verdict_at_boot_awaits_and_the_rereads_leave_it() {
+        let mismatched = (self_signed(&[EDGE]).0, self_signed(&[EDGE]).1);
+        let cases: Vec<(TlsVerdict, Reply)> = vec![
+            (TlsVerdict::NotFound, refused(TlsVerdict::NotFound)),
+            (TlsVerdict::Forbidden, refused(TlsVerdict::Forbidden)),
+            (TlsVerdict::Transient, refused(TlsVerdict::Transient)),
+            (
+                TlsVerdict::InvalidMaterial,
+                secret(self_signed_between((2020, 1, 1), (2021, 1, 1))),
+            ),
+            (TlsVerdict::InvalidMaterial, secret(mismatched)),
+            (
+                TlsVerdict::InvalidMaterial,
+                secret(("not a certificate".into(), "not a key".into())),
+            ),
+        ];
+        for (verdict, first) in cases {
+            let source = FakeSource::new(vec![first.clone(), first, secret(self_signed(&[EDGE]))]);
+            let tls = vault_edge(&source);
+            start_vault_tls(
+                &tls,
+                AwaitingSchedule {
+                    transient: Duration::from_millis(5),
+                    transient_window: Duration::from_secs(60),
+                    first: Duration::from_millis(10),
+                    max: Duration::from_millis(40),
+                },
+            )
+            .await;
+            let status = tls.status_payload();
+            assert_eq!(status["state"], "awaiting", "{verdict:?}");
+            assert_eq!(status["reason"], verdict.as_str());
+            assert!(status["fingerprint"].is_null());
+            assert!(
+                tls.main_config().is_none(),
+                "awaiting has no main configuration"
+            );
+
+            // The re-reads (one more refusal, then a good secret) leave AWAITING on their own.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !tls.is_serving() {
+                assert!(Instant::now() < deadline, "{verdict:?}: still awaiting");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(source.reads(), 3, "{verdict:?}");
+            assert_eq!(tls.status_payload()["state"], "serving");
+        }
+    }
+
+    /// A vault that does not answer at boot is retried every 3 s for 2 minutes (the old unit
+    /// restarted every 5 s); a missing, forbidden or invalid secret waits 30 s doubling to 5 min.
+    #[test]
+    fn awaiting_rereads_follow_the_verdict() {
+        let secs = |durations: Vec<Duration>| -> Vec<u64> {
+            durations.iter().map(Duration::as_secs).collect()
+        };
+        let mut backoff = AwaitingBackoff::new(AWAITING_SCHEDULE);
+        let mut elapsed = Duration::ZERO;
+        let mut delays = Vec::new();
+        while elapsed < Duration::from_secs(120) {
+            let delay = backoff.next(TlsVerdict::Transient, elapsed);
+            delays.push(delay);
+            elapsed += delay;
+        }
+        assert_eq!(delays.len(), 40, "every 3 s for the first 2 minutes");
+        assert!(delays.iter().all(|delay| *delay == Duration::from_secs(3)));
+        let later = (0..6)
+            .map(|_| backoff.next(TlsVerdict::Transient, Duration::from_secs(121)))
+            .collect();
+        assert_eq!(secs(later), vec![30, 60, 120, 240, 300, 300]);
+
+        for verdict in [
+            TlsVerdict::NotFound,
+            TlsVerdict::Forbidden,
+            TlsVerdict::InvalidMaterial,
+        ] {
+            let mut backoff = AwaitingBackoff::new(AWAITING_SCHEDULE);
+            let delays = (0..6)
+                .map(|_| backoff.next(verdict, Duration::ZERO))
+                .collect();
+            assert_eq!(
+                secs(delays),
+                vec![30, 60, 120, 240, 300, 300],
+                "{verdict:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_each_tls_mode_and_only_a_vault_edge_reloads_or_arms() {
+        let plaintext = EdgeTls::plaintext();
+        let status = answer(Some(&plaintext), MSG_EDGE_TLS_STATUS, json!({})).await;
+        assert_eq!(status["status"], "ok");
+        assert_eq!(status["mode"], "plaintext");
+        assert_eq!(status["state"], "serving");
+        assert!(status["tls_vault_key"].is_null() && status["fingerprint"].is_null());
+        assert!(status["vault_version"].is_null() && status["vault_updated_at"].is_null());
+
+        let (cert_path, key_path) = disk_files(self_signed(&[EDGE]));
+        let disk = EdgeTls::from_disk(cert_path, key_path, now_unix_secs()).expect("disk edge");
+        let status = answer(Some(&disk), MSG_EDGE_TLS_STATUS, json!({})).await;
+        assert_eq!(status["mode"], "disk");
+        assert_eq!(status["state"], "serving");
+        assert!(status["tls_vault_key"].is_null());
+        assert_eq!(status["names"], json!([EDGE]));
+        assert_eq!(status["chain_len"], 1);
+        assert_eq!(status["fingerprint"].as_str().map(str::len), Some(64));
+        assert!(status["leaf_pem"]
+            .as_str()
+            .is_some_and(|pem| pem.starts_with("-----BEGIN CERTIFICATE-----\n")));
+        assert!(status["loaded_at"].is_i64());
+        assert!(status["vault_version"].is_null() && status["vault_updated_at"].is_null());
+
+        for edge in [&plaintext, &disk] {
+            for (command, payload) in [
+                (MSG_EDGE_TLS_RELOAD, json!({})),
+                (
+                    MSG_EDGE_ACME_CHALLENGE,
+                    json!({"name": EDGE, "digest": "ab".repeat(32)}),
+                ),
+            ] {
+                let reply = answer(Some(edge), command, payload).await;
+                assert_eq!(reply["status"], "error", "{command}");
+                assert!(reply["error"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("only a vault edge")));
+            }
+        }
+
+        let serving = serving_edge(self_signed(&[EDGE])).await;
+        let status = answer(Some(&serving), MSG_EDGE_TLS_STATUS, json!({})).await;
+        assert_eq!(status["mode"], "vault");
+        assert_eq!(status["tls_vault_key"], "edge_tls");
+        assert_eq!(status["state"], "serving");
+        assert!(status["reason"].is_null());
+        assert_eq!(status["vault_version"], 1);
+        assert_eq!(status["vault_updated_at"], "2026-10-21T10:00:00+00:00");
+        assert!(status["not_before"].as_i64() < status["not_after"].as_i64());
+        assert!(status["issuer"].is_string());
+
+        let awaiting = vault_edge(&FakeSource::new(vec![refused(TlsVerdict::NotFound)]));
+        awaiting.reload("boot").await.expect("a vault edge");
+        let status = answer(Some(&awaiting), MSG_EDGE_TLS_STATUS, json!({})).await;
+        assert_eq!(status["mode"], "vault");
+        assert_eq!(status["state"], "awaiting");
+        assert_eq!(status["reason"], "not_found");
+        assert!(status["detail"].is_string());
+        assert!(status["fingerprint"].is_null() && status["leaf_pem"].is_null());
+        assert!(status["vault_version"].is_null() && status["vault_updated_at"].is_null());
+
+        // An edge with no public listener answers every TLS command with an error.
+        for command in [
+            MSG_EDGE_TLS_STATUS,
+            MSG_EDGE_TLS_RELOAD,
+            MSG_EDGE_ACME_CHALLENGE,
+        ] {
+            let reply = answer(None, command, json!({})).await;
+            assert_eq!(reply["status"], "error", "{command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_answers_the_status_fields_with_changed_and_refused() {
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret_at(chained(), 3, "2026-10-21T10:00:00+00:00"),
+            secret_at(chained(), 4, "2026-10-21T11:00:00+00:00"),
+            refused(TlsVerdict::Forbidden),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let swapped = answer(Some(&tls), MSG_EDGE_TLS_RELOAD, json!({})).await;
+        assert_eq!(swapped["status"], "ok");
+        assert_eq!(swapped["changed"], true);
+        assert!(swapped.get("refused").is_none());
+        assert_eq!(swapped["state"], "serving");
+        assert_eq!(swapped["vault_version"], 4);
+        assert_eq!(swapped["vault_updated_at"], "2026-10-21T11:00:00+00:00");
+
+        let refused = answer(Some(&tls), MSG_EDGE_TLS_RELOAD, json!({})).await;
+        assert_eq!(refused["status"], "ok");
+        assert_eq!(refused["changed"], false);
+        assert_eq!(refused["refused"]["reason"], "forbidden");
+        assert!(refused["refused"]["detail"].is_string());
+        assert_eq!(
+            refused["fingerprint"], swapped["fingerprint"],
+            "still serving what it served"
+        );
+        assert_eq!(
+            refused["vault_version"], 4,
+            "and naming the write it came from"
+        );
+        assert_eq!(refused["vault_updated_at"], "2026-10-21T11:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn the_challenge_command_arms_for_600_s_by_default_and_clears_by_digest() {
+        // An ingress with no certificate yet still answers ACME: that is how it gets its first.
+        let tls = vault_edge(&FakeSource::new(vec![refused(TlsVerdict::NotFound)]));
+        tls.reload("boot").await.expect("a vault edge");
+        let digest = "cd".repeat(32);
+        let before = now_unix_secs();
+        let armed = answer(
+            Some(&tls),
+            MSG_EDGE_ACME_CHALLENGE,
+            json!({"name": EDGE, "digest": digest}),
+        )
+        .await;
+        assert_eq!(armed["status"], "ok");
+        assert_eq!(armed["name"], EDGE);
+        assert_eq!(armed["armed"], true);
+        let expires_at = armed["expires_at"].as_i64().expect("expires_at");
+        assert!((before + 600..=now_unix_secs() + 600).contains(&expires_at));
+
+        let typo = answer(
+            Some(&tls),
+            MSG_EDGE_ACME_CHALLENGE,
+            json!({"name": EDGE, "digest": digest, "ttl": 60}),
+        )
+        .await;
+        assert_eq!(typo["status"], "error", "unknown fields are refused");
+
+        let cleared = answer(
+            Some(&tls),
+            MSG_EDGE_ACME_CHALLENGE,
+            json!({"name": EDGE, "digest": digest, "clear": true}),
+        )
+        .await;
+        assert_eq!(cleared["status"], "ok");
+        assert_eq!(cleared["armed"], false);
+        assert!(cleared["expires_at"].is_null());
+    }
+
+    #[tokio::test]
+    async fn tls_commands_come_only_from_the_motherbee_admin() {
+        let source = FakeSource::new(vec![secret(self_signed(&[EDGE]))]);
+        let tls = vault_edge(&source);
+        tls.reload("boot").await.expect("a vault edge");
+        let challenge = json!({"name": EDGE, "digest": "ab".repeat(32)});
+        for command in [
+            MSG_EDGE_TLS_STATUS,
+            MSG_EDGE_TLS_RELOAD,
+            MSG_EDGE_ACME_CHALLENGE,
+        ] {
+            for origin in [
+                Some("SY.admin@ingress1"),
+                Some("IO.cloud@motherbee"),
+                Some(""),
+                None,
+            ] {
+                let (_, reply) = tls_command_reply(
+                    Some(&tls),
+                    &edge_command(origin, command, challenge.clone()),
+                )
+                .await
+                .expect("a TLS command");
+                assert_eq!(reply["status"], "error", "{command} from {origin:?}");
+            }
+        }
+        assert_eq!(source.reads(), 1, "no reload ran");
+        assert!(
+            tls.challenge_config(EDGE, now_unix_secs()).is_none(),
+            "nothing was armed"
+        );
+        assert_eq!(
+            answer(Some(&tls), MSG_EDGE_TLS_STATUS, json!({})).await["status"],
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_commands_are_answered_while_the_system_loop_is_busy() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        // The sequential loop is stuck on an EDGE_PUBLISH_BLOB: nobody drains its channel.
+        let mut system = dispatcher
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system channel");
+        router
+            .inject(admin_command(MSG_EDGE_PUBLISH_BLOB, json!({})))
+            .await
+            .expect("blob command");
+        let commands = dispatcher
+            .take_command_receiver(RPC_CH_TLS)
+            .await
+            .expect("tls channel");
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        tokio::spawn(run_tls_commands(
+            commands,
+            dispatcher.sender_snapshot(),
+            Some(tls),
+            16,
+        ));
+
+        let status = admin_command(MSG_EDGE_TLS_STATUS, json!({}));
+        router.inject(status.clone()).await.expect("status command");
+        let reply = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("STATUS answered while the loop is busy");
+        assert_eq!(
+            reply.meta.msg.as_deref(),
+            Some(MSG_EDGE_TLS_STATUS_RESPONSE)
+        );
+        assert_eq!(reply.routing.trace_id, status.routing.trace_id);
+        assert!(matches!(
+            &reply.routing.dst,
+            Destination::Unicast(dst) if dst == "SY.admin@motherbee"
+        ));
+        assert_eq!(reply.payload["status"], "ok");
+        assert_eq!(reply.payload["state"], "serving");
+
+        // The blob command still waits for the loop, and no TLS command went its way.
+        assert_eq!(
+            system.try_recv().and_then(|msg| msg.meta.msg),
+            Some(MSG_EDGE_PUBLISH_BLOB.to_string())
+        );
+        assert!(system.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_vault_source_keeps_the_vault_verdict_typed() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let source = Arc::new(VaultSecretSource {
+            client: fluxbee_sdk::VaultClient::new(
+                Arc::clone(&dispatcher),
+                "motherbee",
+                fluxbee_sdk::VaultCallerOwned::new(
+                    fluxbee_sdk::deterministic_system_ilk_id("SY.edge@ingress1"),
+                    "SY.edge@ingress1",
+                ),
+            ),
+            timeout: Duration::from_secs(5),
+        });
+        let (cert, key) = self_signed(&[EDGE]);
+        let written = "2026-10-21T10:00:00.123456789+00:00";
+        type Expected = Result<(Option<i64>, Option<String>), TlsVerdict>;
+        let cases: Vec<(Value, Expected)> = vec![
+            (
+                json!({"status": "error", "error_code": "KEY_NOT_FOUND", "message": "key not found"}),
+                Err(TlsVerdict::NotFound),
+            ),
+            (
+                json!({"status": "error", "error_code": "UNAUTHORIZED", "message": "unauthorized"}),
+                Err(TlsVerdict::Forbidden),
+            ),
+            (
+                json!({"status": "error", "error_code": "IDENTITY_UNAVAILABLE", "message": "caller"}),
+                Err(TlsVerdict::Transient),
+            ),
+            (
+                json!({"status": "error", "error_code": "STORAGE_ERROR", "message": "database is locked"}),
+                Err(TlsVerdict::Transient),
+            ),
+            (
+                json!({"status": "ok", "key": "edge_tls", "value": {"cert": cert}}),
+                Err(TlsVerdict::InvalidMaterial),
+            ),
+            (
+                json!({
+                    "status": "ok",
+                    "key": "edge_tls",
+                    "value": {"cert": cert, "key": key},
+                    "version": 3,
+                    "metadata": {"tenant_id": "tnt:00000000-0000-0000-0000-000000000000", "updated_at": written},
+                }),
+                Ok((Some(3), Some(written.to_string()))),
+            ),
+            (
+                json!({"status": "ok", "key": "edge_tls", "value": {"cert": cert, "key": key}, "version": 4}),
+                Ok((Some(4), None)),
+            ),
+        ];
+        for (vault_reply, expected) in cases {
+            let reader = Arc::clone(&source);
+            let read = tokio::spawn(async move { reader.read("edge_tls").await });
+            let request = router
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("a VAULT_GET");
+            assert_eq!(
+                request.meta.msg.as_deref(),
+                Some(fluxbee_sdk::MSG_VAULT_GET)
+            );
+            assert_eq!(request.payload["key"], "edge_tls");
+            router
+                .inject(Message {
+                    routing: Routing {
+                        src: "vault-uuid".to_string(),
+                        src_l2_name: Some("SY.vault@motherbee".to_string()),
+                        dst: Destination::Unicast(request.routing.src.clone()),
+                        ttl: 16,
+                        trace_id: request.routing.trace_id.clone(),
+                    },
+                    meta: Meta {
+                        msg_type: SYSTEM_KIND.to_string(),
+                        msg: Some(fluxbee_sdk::MSG_VAULT_GET_RESPONSE.to_string()),
+                        ..Meta::default()
+                    },
+                    payload: vault_reply,
+                })
+                .await
+                .expect("vault reply");
+            let got = read
+                .await
+                .expect("read task")
+                .map(|secret| (secret.version, secret.updated_at))
+                .map_err(|refusal| refusal.verdict);
+            assert_eq!(got, expected);
+        }
+    }
+
+    /// STATUS and RELOAD name the vault write served: the version AND the metadata's
+    /// `updated_at`, because a vault rollback re-mints version numbers.
+    #[tokio::test]
+    async fn status_and_reload_name_the_vault_write_served() {
+        let (first, second) = (chained(), chained());
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret_at(first.clone(), 7, "2026-10-21T10:00:00+00:00"),
+            secret_at(second, 8, "2026-10-21T11:00:00+00:00"),
+            // A rollback: the first material again, under the re-minted version 7.
+            secret_at(first, 7, "2026-10-21T12:00:00+00:00"),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let status = answer(Some(&tls), MSG_EDGE_TLS_STATUS, json!({})).await;
+        assert_eq!(
+            (&status["vault_version"], &status["vault_updated_at"]),
+            (&json!(7), &json!("2026-10-21T10:00:00+00:00"))
+        );
+        let put = answer(Some(&tls), MSG_EDGE_TLS_RELOAD, json!({})).await;
+        assert_eq!(put["changed"], true);
+        assert_eq!(
+            (&put["vault_version"], &put["vault_updated_at"]),
+            (&json!(8), &json!("2026-10-21T11:00:00+00:00"))
+        );
+        let rollback = answer(Some(&tls), MSG_EDGE_TLS_RELOAD, json!({})).await;
+        assert_eq!(rollback["changed"], true);
+        assert_eq!(
+            (&rollback["vault_version"], &rollback["vault_updated_at"]),
+            (&json!(7), &json!("2026-10-21T12:00:00+00:00")),
+            "the same version number as at boot, another write"
+        );
+    }
+
+    /// A served edge that gets no verdict from the vault keeps its certificate and only warns:
+    /// the "REFUSED … vault_rollback" error is for material the vault holds and the edge refuses.
+    #[test]
+    fn a_reload_report_tells_a_silent_vault_from_bad_material() {
+        let refused = |verdict| ReloadOutcome {
+            changed: false,
+            refused: Some(TlsRefusal {
+                verdict,
+                detail: "scripted".to_string(),
+            }),
+        };
+        let serving = BeforeReload {
+            serving: true,
+            awaiting: None,
+            first: false,
+        };
+        assert_eq!(
+            reload_report(&serving, &refused(TlsVerdict::Transient)),
+            ReloadReport::VaultSilent
+        );
+        for verdict in [
+            TlsVerdict::NotFound,
+            TlsVerdict::Forbidden,
+            TlsVerdict::InvalidMaterial,
+        ] {
+            assert_eq!(
+                reload_report(&serving, &refused(verdict)),
+                ReloadReport::Refused,
+                "{verdict:?}"
+            );
+        }
+        let boot = BeforeReload {
+            serving: false,
+            awaiting: Some(TlsVerdict::Transient),
+            first: true,
+        };
+        assert_eq!(
+            reload_report(&boot, &refused(TlsVerdict::Transient)),
+            ReloadReport::Awaiting,
+            "the boot read is always reported in full"
+        );
+        let awaiting = BeforeReload {
+            first: false,
+            ..boot
+        };
+        assert_eq!(
+            reload_report(&awaiting, &refused(TlsVerdict::Transient)),
+            ReloadReport::StillAwaiting
+        );
+        assert_eq!(
+            reload_report(&awaiting, &refused(TlsVerdict::NotFound)),
+            ReloadReport::Awaiting,
+            "a new reason is reported in full"
+        );
+        let loaded = ReloadOutcome {
+            changed: true,
+            refused: None,
+        };
+        assert_eq!(reload_report(&awaiting, &loaded), ReloadReport::Loaded);
+        let same = ReloadOutcome {
+            changed: false,
+            refused: None,
+        };
+        assert_eq!(reload_report(&serving, &same), ReloadReport::Unchanged);
+    }
+
+    /// A leaf with no intermediates never REPLACES a served chain; with nothing served it is
+    /// served (loudly), and re-reading the leaf-only chain already served changes nothing.
+    #[tokio::test]
+    async fn a_leaf_only_chain_never_replaces_a_served_certificate() {
+        let full = chained();
+        let leaf_only = self_signed(&[EDGE]);
+        let tls = vault_edge(&FakeSource::new(vec![
+            secret(full.clone()),
+            secret(leaf_only.clone()),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        let outcome = tls.reload(MSG_EDGE_TLS_RELOAD).await.expect("a vault edge");
+        assert_eq!(
+            outcome.refused.as_ref().map(|refusal| refusal.verdict),
+            Some(TlsVerdict::InvalidMaterial)
+        );
+        assert!(outcome
+            .refused
+            .is_some_and(|refusal| refusal.detail.contains("NO INTERMEDIATES")));
+        assert_eq!(tls.status_payload()["chain_len"], 2, "still the full chain");
+
+        let tls = vault_edge(&FakeSource::new(vec![
+            refused(TlsVerdict::NotFound),
+            secret(leaf_only.clone()),
+            secret(leaf_only),
+        ]));
+        tls.reload("boot").await.expect("a vault edge");
+        assert_eq!(
+            tls.reload("awaiting re-read").await,
+            Ok(ReloadOutcome {
+                changed: true,
+                refused: None
+            }),
+            "nothing was served: the leaf is"
+        );
+        assert_eq!(
+            tls.reload("VAULT_SECRET_CHANGED put").await,
+            Ok(ReloadOutcome {
+                changed: false,
+                refused: None
+            }),
+            "the leaf already served is not refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_door_closes_connections_over_its_cap() {
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let addr = loopback_door(&tls, DoorLimits::new(1, HTTP_HEADER_READ_TIMEOUT)).await;
+        let mut first = connect_tls(addr).await;
+        assert_eq!(get_healthz(&mut first).await, "ok");
+        assert!(
+            try_connect_tls(addr).await.is_err(),
+            "a second connection is closed while the first holds the only permit"
+        );
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut third) = try_connect_tls(addr).await {
+                assert_eq!(get_healthz(&mut third).await, "ok");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the permit came back");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_is_closed_at_the_header_timeout() {
+        let header_timeout = Duration::from_millis(300);
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let addr = loopback_door(&tls, DoorLimits::new(16, header_timeout)).await;
+
+        // The handshake completes, then nothing: hyper-util's protocol sniffing has no timeout.
+        let mut silent = connect_tls(addr).await;
+        let closed = closed_within(&mut silent, Duration::from_secs(5)).await;
+        assert!(closed >= header_timeout.mul_f32(0.9), "{closed:?}");
+
+        // One request, then an idle keep-alive connection: hyper's timer closes it.
+        let mut idle = connect_tls(addr).await;
+        assert_eq!(get_healthz(&mut idle).await, "ok");
+        let closed = closed_within(&mut idle, Duration::from_secs(5)).await;
+        assert!(closed >= header_timeout.mul_f32(0.9), "{closed:?}");
+    }
+
+    #[test]
+    fn refused_connections_are_logged_at_most_once_per_interval() {
+        let mut refused = RefusedConnections::default();
+        let start = Instant::now();
+        let interval = Duration::from_secs(10);
+        assert_eq!(
+            refused.note(start, interval),
+            Some(1),
+            "the first is logged"
+        );
+        for second in 1..10 {
+            assert_eq!(
+                refused.note(start + Duration::from_secs(second), interval),
+                None
+            );
+        }
+        assert_eq!(
+            refused.note(start + interval, interval),
+            Some(10),
+            "then once per interval, with the count since"
+        );
+        assert_eq!(MAX_TLS_CONNECTIONS, 4096);
+        assert_eq!(ACCEPT_ERROR_BACKOFF, Duration::from_millis(100));
     }
 }

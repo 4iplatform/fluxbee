@@ -516,7 +516,7 @@ The rules of `fluxbee/system/allow`:
 
 | Rule | Sender | May send |
 | --- | --- | --- |
-| 1 | `SY.admin@motherbee` | edge commands: `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB` |
+| 1 | `SY.admin@motherbee` | edge commands: `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` |
 | 2 | `SY.admin@motherbee` | to any hive: `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` |
 | 3 | `SY.orchestrator@<any hive>` | the node lifecycle and inspection actions it forwards, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` |
 | 4 | `SY.admin@<same hive>` | every other protected action |
@@ -560,7 +560,8 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
 - **Secrets.** Every secret lives in SY.vault on the motherbee (`src/bin/sy_vault.rs`): SQLite at
   `/var/lib/fluxbee/vault.db`, values encrypted with AES-256-GCM under
   `/etc/fluxbee/vault.master.key`. Nodes ask SY.vault for a secret at run time, and a change is
-  broadcast as `VAULT_SECRET_CHANGED`. Node page: [sy-vault.md](../nodes/sy-vault.md).
+  broadcast as `VAULT_SECRET_CHANGED`; the edge gets only the notices about its own secrets, as a
+  unicast (FINDINGS A-78). Node page: [sy-vault.md](../nodes/sy-vault.md).
 
 ## 9. Ports
 

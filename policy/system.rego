@@ -37,8 +37,12 @@ import rego.v1
 
 default allow := false
 
-# Edge service commands (open/close/list URLs): only SY.admin on the primary hive.
-edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB"}
+# Edge service commands (public URLs and blobs, the edge's own certificate and its ACME challenge,
+# docs/acme-edge-certificates-v1.md §5): only SY.admin on the primary hive.
+edge_service_actions := {
+	"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB",
+	"EDGE_TLS_STATUS", "EDGE_TLS_RELOAD", "EDGE_ACME_CHALLENGE",
+}
 
 # Live node config and runtime distribution are forwarded directly by the singleton Admin to
 # managed nodes or orchestrators on workers. CONFIG_CHANGED carries the user OPA policy (writes to

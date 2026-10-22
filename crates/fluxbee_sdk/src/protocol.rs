@@ -551,6 +551,14 @@ pub const MSG_EDGE_PUBLISH_BLOB: &str = "EDGE_PUBLISH_BLOB";
 pub const MSG_EDGE_PUBLISH_BLOB_RESPONSE: &str = "EDGE_PUBLISH_BLOB_RESPONSE";
 pub const MSG_EDGE_UNPUBLISH_BLOB: &str = "EDGE_UNPUBLISH_BLOB";
 pub const MSG_EDGE_UNPUBLISH_BLOB_RESPONSE: &str = "EDGE_UNPUBLISH_BLOB_RESPONSE";
+// The edge's own certificate (SY.admin -> SY.edge; docs/acme-edge-certificates-v1.md §4): what it
+// serves, a reload from the vault, and the TLS-ALPN-01 challenge it answers while SY.admin orders.
+pub const MSG_EDGE_TLS_STATUS: &str = "EDGE_TLS_STATUS";
+pub const MSG_EDGE_TLS_STATUS_RESPONSE: &str = "EDGE_TLS_STATUS_RESPONSE";
+pub const MSG_EDGE_TLS_RELOAD: &str = "EDGE_TLS_RELOAD";
+pub const MSG_EDGE_TLS_RELOAD_RESPONSE: &str = "EDGE_TLS_RELOAD_RESPONSE";
+pub const MSG_EDGE_ACME_CHALLENGE: &str = "EDGE_ACME_CHALLENGE";
+pub const MSG_EDGE_ACME_CHALLENGE_RESPONSE: &str = "EDGE_ACME_CHALLENGE_RESPONSE";
 
 // IO.blob curator worker plane (SY.admin -> IO.blob). These commands never publish a URL and
 // carry no external bytes: admin has already authorized the producer and resolved its tenant;

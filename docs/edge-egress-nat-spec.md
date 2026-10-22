@@ -163,6 +163,7 @@ egress:
   wan_iface: "eth0"                   # interface toward the internet
   lan_iface: "eth1"                   # interface toward the LAN
   ipv6: "blocked"                     # only "blocked" supported in v1
+  reachability_url: "https://example.com"   # optional: the internet probe's target (§9)
 
 storage:
   path: "/var/lib/fluxbee"
@@ -186,6 +187,7 @@ Field rules:
 | `egress.wan_iface` | yes | — | Internet-facing interface name |
 | `egress.lan_iface` | yes | — | LAN-facing interface name |
 | `egress.ipv6` | no | `"blocked"` | Only `"blocked"` accepted in v1 |
+| `egress.reachability_url` | no | none: no probe | The `https://` URL the internet probe GETs (§9). `add_hive` takes the request's, else the motherbee's |
 
 The egress hive does **not** touch its `wan` section to provide egress. WAN is Fluxbee protocol connectivity to motherbee; egress NAT is OS-level network plumbing. They coexist without interaction.
 
@@ -198,12 +200,14 @@ Motherbee declares which gateway workers should use. This drives route injection
 egress:
   gateway_ip: "192.168.8.1"      # where workers send their default route
   edge_hive: "edge-1"            # optional; informational, the egress hive_id (Mode A only)
+  reachability_url: "https://example.com"   # optional; the internet probe's target (§9)
 ```
 
 | Field | Required | Notes |
 |-------|----------|-------|
 | `egress.gateway_ip` | yes (to enable injection) | IPv4 of the egress gateway. If absent, `add_hive` does not inject any egress route |
 | `egress.edge_hive` | no | The egress hive's `hive_id` for inventory clarity. Absent in Mode B |
+| `egress.reachability_url` | no | The `https://` URL the internet probe GETs (§9): the motherbee's own, and the one `add_hive` writes into new workers (with `gateway_ip`) and into an egress whose request names none. Without it nobody probes |
 
 ### 5.3 New Rust structs in `sy_orchestrator.rs`
 
@@ -236,6 +240,7 @@ struct EgressSection {
     ipv6: String,                  // "blocked"
     gateway_ip: Option<String>,    // used on motherbee for worker injection
     edge_hive: Option<String>,     // informational
+    reachability_url: Option<String>, // the internet probe's target (§9); none: no probe
 }
 
 fn default_ipv6_policy() -> String { "blocked".to_string() }
@@ -329,6 +334,11 @@ All other call sites that pass `is_motherbee` into `system_nodes_for_role` / `va
    }
    ```
 
+   The `egress` object may also name `reachability_url`, the `https://` URL the egress' internet
+   probe GETs (§9). Without it the join takes the motherbee's `egress.reachability_url`; with
+   neither, the egress does not probe. Anything but an `https://` URL with a host is refused at
+   request time.
+
    **Source of `system_nodes.egress`:** read from motherbee's own `hive.yaml` `system_nodes.egress` template — symmetric with how `system_nodes.worker` is the worker template. Motherbee must declare a `system_nodes.egress` stanza (minimal: `SY.config.routes`). The egress flow is a **dedicated** function (`add_egress_hive_flow`) that reuses the SSH/core-sync/systemd helpers but skips all worker machinery (blob/dist/identity/syncthing).
 2. **Provisioning a worker when motherbee declares egress**: the existing worker yaml generation, plus `egress.gateway_ip` injected **into the worker yaml**. The worker's own orchestrator applies and reconciles the default route + IPv6 block locally on each boot (§7). The route is not pushed over SSH.
 
@@ -390,7 +400,9 @@ Required behavior on the worker (applied locally by the worker's orchestrator):
 
 1. Set/reconcile the IPv4 default route to `egress.gateway_ip` on each boot.
 2. Apply the IPv6 block (§8.3).
-3. Verify internet reachability through the gateway (ping `fluxbee.ai`, §9).
+3. Verify internet reachability through the gateway: an HTTPS GET of its
+   `egress.reachability_url`, which `add_hive` copies from the motherbee; without one it does not
+   probe (§9).
 4. Report verification fields (§9).
 
 Workers provisioned **before** the egress declaration do not carry `egress.gateway_ip` in their yaml and are not retroactively changed by a later `add_hive`; re-emitting their yaml to add the field is an explicit operator action (out of scope for v1, noted in §11).
@@ -486,36 +498,33 @@ On a `role: egress` host, **nftables is the single firewall backend for both inb
 
 ## 9. Verification
 
-After provisioning, the orchestrator reports explicit fields. No silent success.
+After provisioning, the join reports what it read on the box. No silent success.
 
-For an egress hive:
+An egress join answers these fields, besides `status`, `hive_id`, `address`, the SSH fields, `wan_connected`, `orchestrator_connected`, `warnings` and `note`:
 
 ```json
 {
   "egress_role": "egress",
-  "egress_nat_applied": true,
-  "egress_ipv4_forwarding": true,
-  "egress_ipv6_blocked": true,
-  "egress_conntrack_tuned": true,
+  "egress_lan_cidr": "192.168.8.0/24",
+  "egress_edge_ip": "192.168.8.1",
   "egress_wan_iface": "eth0",
   "egress_lan_iface": "eth1",
-  "egress_internet_reachable": true
-}
-```
-
-For a worker receiving the route:
-
-```json
-{
-  "egress_configured": true,
-  "egress_gateway_ip": "192.168.8.1",
-  "egress_ipv4_ready": true,
+  "egress_nat_applied": true,
+  "egress_lan_leg_ok": true,
+  "egress_ipv4_forwarding": true,
   "egress_ipv6_blocked": true,
-  "egress_internet_reachable": true
+  "egress_internet_reachable": null,
+  "egress_reachability_url": "https://example.com"
 }
 ```
 
-`egress_internet_reachable` is obtained by an ICMP ping to `fluxbee.ai`, with a fallback HTTPS `GET https://fluxbee.ai` when ICMP fails. The HTTPS leg avoids the false-negative where a network filters ICMP but allows 443 (the path egress actually uses), and doubles as a liveness check of the Fluxbee site/cloud. (Public-IP discovery via an IP-echo endpoint is deferred to a later, fuller verification once the complete system is in place.) If IPv4 works but IPv6 is not blocked, the result warns or fails per mode.
+A worker join answers no egress field. The worker applies `egress.gateway_ip` at its own boot and says what it did in its own journal:
+
+```text
+worker egress route reconciled gateway_ip="192.168.8.1" route_applied=true ipv6_blocked=true internet_reachable=true
+```
+
+`internet_reachable` is an HTTPS GET (curl, 5 s) of the hive's own `egress.reachability_url` (`check_internet_reachable`), on the egress at boot and every drift tick, and at boot on a worker that routes through it and on the motherbee. HTTPS is the path egress actually uses, so a network that filters ICMP is no false negative. The URL is the operator's ([ACME design §8](acme-edge-certificates-v1.md)): without it the probe does not run and logs `not_configured`, and the code never pings or fetches a target of its own. A host without `curl` does not probe either and logs `not_probed`. A failed probe (`false`) is a warning in that hive's journal. The egress join answers `egress_internet_reachable: null` and the URL the egress got (`egress_reachability_url`, null for none): the probe's result stays in the egress' journal, not transmitted to the motherbee in v1 (T-VER-1). (Public-IP discovery via an IP-echo endpoint is deferred to a later, fuller verification once the complete system is in place.) If IPv4 works but IPv6 is not blocked, the result warns or fails per mode.
 
 ---
 
@@ -604,5 +613,5 @@ The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logg
 1. **Egress profile floor**: this spec sets the minimal profile to `SY.config.routes` only (plus `RT.gateway` and `SY.orchestrator` implicit in being a hive). Confirm during implementation that the local router boots cleanly with only `SY.config.routes`. If the router needs another SY node to register/initialize, add it and update §5.1.
 2. ~~**`edge_ip` derivation**~~ — **resolved (FINDINGS A-1)**: not derived. The first usable address of the CIDR was a guess that could name an address no interface carried, a gateway no worker reaches; the join reads the address `lan_iface` carries instead (§6.4).
 3. **nftables include mechanism**: dedicated `table inet fluxbee_egress` (self-contained, recommended) vs include file merged into the host's main ruleset. The dedicated table is cleaner for idempotent management; confirm no conflict with any existing host nftables policy.
-4. ~~**IP-echo endpoint for `egress_public_ip`**~~ — **resolved**: v1 verification is an ICMP ping to `fluxbee.ai` (`egress_internet_reachable`), confirming reachability only. Public-IP discovery via IP-echo is deferred to the fuller verification of the complete system.
+4. ~~**IP-echo endpoint for `egress_public_ip`**~~ — **resolved**: v1 verification is an HTTPS GET of the operator's `egress.reachability_url` (`internet_reachable`), confirming reachability only; without the URL there is no probe. Public-IP discovery via IP-echo is deferred to the fuller verification of the complete system.
 5. **conntrack defaults**: 262144 / hashsize 65536 are starting points. Tune to deployment scale.

@@ -12387,6 +12387,12 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({}),
         }),
+        ("GET", ["acme", "status"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "acme_status".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: json!({}),
+        }),
         ("GET", ["config", "storage"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_storage".to_string(),

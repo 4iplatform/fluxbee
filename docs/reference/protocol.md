@@ -438,7 +438,9 @@ SY.vault runs only on the motherbee (`VaultClient::for_primary`,
 After each change SY.vault broadcasts `VAULT_SECRET_CHANGED` (`scope: global`, `ttl` 16) with
 metadata only, never the value: `VaultSecretChangedPayload {op, resource_type, tenant_id, ilk,
 assigned_ilks, general, version, key, hive_id, at_ms}` (`protocol.rs`). A consumer filters it with
-`matches_interest` and reads the secret itself. When SY.vault starts it broadcasts one for every
+`matches_interest` and reads the secret itself. When the secret's owner is an `SY.edge`, SY.vault
+also sends the notice to that edge as a unicast: the router lets only that unicast into the DMZ
+edge, never the broadcast (FINDINGS A-78). When SY.vault starts it broadcasts one for every
 secret with `meta.action` `bootstrap`: nothing changed, so a consumer whose reaction is costly (a
 restart) skips those. The Go SDK has no vault client. Details: [SY.vault](../nodes/sy-vault.md) and
 `docs/history/sy-vault-spec.md`.
@@ -477,7 +479,7 @@ them (`prepare_local_delivery`): the list is `PROTECTED_SYSTEM_ACTIONS`
 
 | Verbs | Allowed senders | Rule |
 | --- | --- | --- |
-| `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB` | `SY.admin@motherbee` | (1) |
+| `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` | (1) |
 | `CONFIG_GET`, `CONFIG_SET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` | `SY.admin@motherbee` | (2) |
 | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_GET`, `NODE_CONFIG_SET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@<any hive>`; `SY.admin@<the same hive>` | (3), (4) |
 | `INVENTORY_REQUEST` | `SY.admin@<the same hive>` | (4) |

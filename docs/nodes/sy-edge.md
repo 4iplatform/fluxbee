@@ -4,9 +4,12 @@ SY.edge is the public door of a Fluxbee mesh. On the ingress hive it serves HTTP
 request on an externalized channel (`/e/<ich>`) into a mesh message for the IO node that owns the
 channel, then returns that node's reply. It also serves the static files that `SY.admin` published
 for producers (`/public/<key>`). It resolves no identity: it forwards by the owner name SY.admin
-gave it, and it takes commands only from `SY.admin@motherbee`.
+gave it, and it takes commands only from `SY.admin@motherbee`. Its certificate comes from SY.vault;
+it swaps a new one in place and answers the ACME TLS-ALPN-01 challenge SY.admin arms when it
+orders one ([ACME design](../acme-edge-certificates-v1.md) §4).
 
-Source: `src/bin/sy_edge.rs`. The URL commands it receives are sent by `SY.admin`
+Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are in
+`src/tls_material.rs`. The URL commands it receives are sent by `SY.admin`
 (`handle_externalize`, `handle_unexternalize`, `handle_list_externalized`,
 `handle_publish_artifact` in `src/bin/sy_admin.rs`).
 
@@ -28,8 +31,9 @@ Source: `src/bin/sy_edge.rs`. The URL commands it receives are sent by `SY.admin
   renders it into the ingress hive.yaml.
 - The binary itself does not refuse a role. It always connects to the router, but it binds the
   public listener only when `role` is `ingress`, or when `SY_EDGE_HTTP_LISTEN` is set
-  (`resolve_http_listen`). On any other role it serves no door, and a VAULT_SECRET_CHANGED for
-  its TLS key is ignored (`LiveTlsMaterial::NotFromVault` in `tls_secret_change_action`).
+  (`resolve_http_listen`). On any other role it serves no door: a VAULT_SECRET_CHANGED for its
+  TLS key is ignored (no `EdgeTls`, so `tls_secret_change_action` gets no key), and the TLS
+  commands are answered with an error.
 - There is no SY.identity on the ingress hive. The edge computes its own ILK from its L2 name
   (`fluxbee_sdk::deterministic_system_ilk_id` in `main`), uses it to read its secrets from the
   vault, and stamps it as `meta.src_ilk` on the requests it forwards to a channel owner.
@@ -40,8 +44,9 @@ On a spoke the unit file is written by the orchestrator: `core_service_unit_cont
 `src/bin/sy_orchestrator.rs` gives `sy-edge` and `sy-orchestrator` (and no other unit)
 `After=network.target rt-gateway.service` and `Wants=rt-gateway.service`. The packaged unit on the
 motherbee (`gen_unit sy-edge ...` in `packaging/build-deb.sh`) has the same ordering. Neither
-orders `sy-vault`: the vault is on the motherbee, so `Restart=always` is the retry loop (comment
-above `TlsFetchFailure`).
+orders `sy-vault`: the vault is on the motherbee. A vault edge does not need it at boot anyway: when
+the secret cannot be read it starts AWAITING and re-reads on its own (see TLS below).
+`Restart=always` remains the retry for a crash and for a disk edge whose files do not load.
 
 `main` in `src/bin/sy_edge.rs`, in order:
 
@@ -50,18 +55,25 @@ above `TlsFetchFailure`).
    (`load_hive_edge`).
 2. Logging from `RUST_LOG` (default `info,sy_edge=debug,fluxbee_sdk=info`), reloadable at run
    time (see Config).
-3. Connects to the router (`RouterDispatcher::connect_with_retry`, retry every 1 s). All
-   `system` messages go to one command channel (`build_sy_edge_rpc_profile`).
+3. Connects to the router (`RouterDispatcher::connect_with_retry`, retry every 1 s). The three
+   TLS commands go to their own command channel, every other `system` message to one shared
+   channel (`build_sy_edge_rpc_profile`).
 4. Loads the endpoint table from `endpoints_path` (`load_registry`) and the public artifact table
    from `publications_path` (`load_public_registry`, which drops expired or invalid rows).
 5. Fetches channel secrets from the vault for rows that carry only a `secret_ref` or
    `verify_token_ref` (`resolve_secrets`).
-6. If a public listener is configured (ingress role, or `SY_EDGE_HTTP_LISTEN`): builds TLS (vault
-   first, then disk files), then starts the HTTP frontend (`run_frontend`). If TLS was requested and could not be built, `main` returns an error
-   and the process exits; it never binds the public port in plaintext in that case.
-7. Starts a reaper that every 600 s drops expired public rows and, if it dropped any, rewrites
+6. If a public listener is configured (ingress role, or `SY_EDGE_HTTP_LISTEN`): resolves the TLS
+   mode (`TlsMode::resolve`) and builds it, then starts the HTTP frontend (`run_frontend`).
+   - `vault`: one read of the secret (`start_vault_tls`). If it cannot be served, the edge starts
+     AWAITING instead of exiting, binds the port anyway, and re-reads in the background.
+   - `disk`: the files must load and pass the checks, else `main` returns an error and the
+     process exits.
+   - An invalid TLS configuration (an empty `tls_vault_key`, only one of `tls_cert`/`tls_key`)
+     also exits. The public port is never bound in plaintext unless the mode is `plaintext`.
+7. Starts the TLS command task (`run_tls_commands`), beside the system loop.
+8. Starts a reaper that every 600 s drops expired public rows and, if it dropped any, rewrites
    the publications file.
-8. Runs the system message loop until the router channel closes.
+9. Runs the system message loop until the router channel closes.
 
 ## HTTP surface
 
@@ -74,9 +86,21 @@ above `TlsFetchFailure`).
 | `/public/:key` | GET, HEAD (else 405 with `Allow: GET, HEAD`) | Serve a published blob (`serve_public_artifact`) |
 | `/healthz` | any | Answers `ok` |
 
-With TLS, each connection is accepted with `tokio_rustls` and a rustls `ServerConfig` with no
-client authentication (`tls_config_from_pem`). Without TLS (dev only, see Config) it uses
-`axum::serve`.
+With TLS, each connection goes through the acceptor of the TLS section below (`accept_tls`), then
+hyper (`serve_tls_connection`); the main `ServerConfig` has no client authentication and an empty
+ALPN list. Without TLS (the `plaintext` mode, see Config) it uses `axum::serve`.
+
+Limits on the TLS door (`serve_tls_listener`, `DoorLimits`):
+
+- **Connections:** at most `MAX_TLS_CONNECTIONS` (4096) at once, handshakes included. One more is
+  closed at accept, and the refusals are logged at most once per 10 s with their count.
+- **Silent clients:** the TLS handshake has its own 10 s timeout (TLS section). After it, the first
+  request byte must arrive within `HTTP_HEADER_READ_TIMEOUT` (30 s). hyper-util's HTTP/1-or-2
+  detection waits with no timeout of its own, so the edge waits for that byte itself. hyper then
+  applies the same 30 s, through a Tokio timer, to every HTTP/1 request head, an idle keep-alive
+  connection included.
+- **A failed accept** (out of file descriptors, say) waits 100 ms before the next one, instead of
+  spinning.
 
 Error bodies are JSON: `{"ok": false, "error_code": ..., "message": ...}` (`http_error`).
 
@@ -157,7 +181,10 @@ edge acks only after the file shows up under the public root with the right size
 
 ## Mesh messages
 
-Handled in the loop at the end of `main`:
+Handled one at a time in the loop at the end of `main`, except the three TLS commands: the RPC
+profile sends those to their own channel (`RPC_CH_TLS`, `build_sy_edge_rpc_profile`), and
+`run_tls_commands` answers each in its own task over the shared TLS state, so they never wait
+behind `EDGE_PUBLISH_BLOB` (up to 60 s) or a secret resolution.
 
 | Message | From | What happens |
 | --- | --- | --- |
@@ -166,17 +193,23 @@ Handled in the loop at the end of `main`:
 | `EDGE_LIST_URLS` | `SY.admin@motherbee` | Return the rows without secret values (`apply_list_urls`) |
 | `EDGE_PUBLISH_BLOB` | `SY.admin@motherbee` | Validate, wait for the file, add the public row (`apply_publish_blob`) |
 | `EDGE_UNPUBLISH_BLOB` | `SY.admin@motherbee` | Remove the public row by `publication_id` (`apply_unpublish_blob`) |
-| `VAULT_SECRET_CHANGED` | `SY.vault@<vault_hive>` | Re-fetch channel secrets; decide on a TLS reload (below) |
+| `EDGE_TLS_STATUS` | `SY.admin@motherbee` | What the listener serves: mode, state, the leaf (`tls_status_answer`; shape in the TLS section) |
+| `EDGE_TLS_RELOAD` | `SY.admin@motherbee` | Re-read the certificate once and swap it in place if it passes (`tls_reload_answer`; vault edge only) |
+| `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` | Arm or clear a TLS-ALPN-01 challenge (`acme_challenge_answer`; vault edge only) |
+| `VAULT_SECRET_CHANGED` | `SY.vault@<vault_hive>` | Re-fetch channel secrets; reload the certificate when the notice is about its key (below) |
 | `CONFIG_GET` / `CONFIG_SET` | `SY.admin@motherbee` | The edge's own config (`apply_node_config`) |
 | `NODE_STATUS_GET` | an orchestrator, or SY.admin / SY.vault of the same hive | Default status reply (`try_handle_default_node_status`) |
 
-The five `EDGE_*` commands are checked twice. The router delivers a protected SYSTEM action only
+The eight `EDGE_*` commands are checked twice. The router delivers a protected SYSTEM action only
 if `policy/system.rego` allows its origin (`prepare_local_delivery` in `src/router/mod.rs`; rule
 (1) for the `EDGE_*` commands, rule (2) for `CONFIG_GET`/`CONFIG_SET`, rules (3)–(5) for
 `NODE_STATUS_GET`). The edge then accepts an `EDGE_*` command only when the router-stamped
 `src_l2_name` equals `EDGE_CONTROL_AUTHORITY`, `"SY.admin@motherbee"`
-(`authorize_edge_service_command`; constant in `src/router/system_policy.rs`). A
-VAULT_SECRET_CHANGED from any origin other than its vault is logged and ignored.
+(`authorize_edge_service_command`; constant in `src/router/system_policy.rs`); a TLS command
+from anyone else changes nothing and gets `{status: "error"}`. A VAULT_SECRET_CHANGED from any
+origin other than its vault is logged and ignored. SY.vault addresses the notices about the edge's
+own secrets to it as a unicast; the router keeps SY.vault's broadcast out of the DMZ (A-78,
+[SY.vault](sy-vault.md)).
 
 Row checks on open (`validate_endpoint_row_for_open`): `ich` not empty; `inbound_family` not
 empty and not `system`; a unicast row needs a fully-qualified `IO.*` `owner_l2_name` and, for
@@ -187,33 +220,147 @@ Who may open what is decided in SY.admin before the edge is asked: an `IO.*` nod
 channel it owns (`authorize_channel_command`), the operator for any channel, and fanout rows only
 by the operator. See [SY.admin](sy-admin.md).
 
-## TLS and certificate rotation
+## TLS and the certificate
 
-The certificate comes from SY.vault: the secret named by `edge.tls_vault_key`, value
-`{"cert": "<PEM chain>", "key": "<PEM key>"}`, read with the edge's own ILK
-(`fetch_tls_config_from_vault`, `VaultCallerOwned`). The secret's owner must be
-`SY.edge@<edge hive>` (comment in `packaging/hive.yaml.example`). Disk files
-(`edge.tls_cert`, `edge.tls_key`) are used only when no vault key is set.
+The design is [ACME certificates for the public edge](../acme-edge-certificates-v1.md) §4. All of
+it lives in `EdgeTls`, shared by the acceptor, the TLS command task, the system loop's vault
+notices and the awaiting re-reads.
 
-At boot a chain whose PEM has more `BEGIN CERTIFICATE` markers than parsed certificates, or a
-leaf with no intermediates, is logged but still served (`TlsChainDiagnosis`,
-`log_tls_chain_diagnosis`).
+### Modes
 
-On a `VAULT_SECRET_CHANGED` for the TLS key (`tls_secret_change_action`):
+`TlsMode::resolve`, from the `edge:` section (see Config):
 
-- **delete**: keep serving the loaded certificate and log an error.
-- **assign**: ignored (the value did not change).
-- **bootstrap re-announce** (SY.vault restarting) of the version already loaded: the edge
-  re-fetches and compares a SHA-256 of the cert PEM; same material, nothing happens; different
-  material, it restarts.
-- **any other change**: the edge first fetches the new material (up to 3 tries, 5 s apart, on
-  transport errors). If it loads and is not truncated, the process calls `exit(0)` after 250 ms
-  and systemd starts it again 5 s later with the new certificate. If not, it keeps serving the
-  old one and logs why (`tls_reload_verdict`).
+| Mode | When | What it serves |
+| --- | --- | --- |
+| `vault` | `tls_vault_key` is set (it wins over disk files) | The secret under that key, `{"cert": "<PEM chain>", "key": "<PEM key>"}`, read with the edge's own ILK (`VaultSecretSource`, `VaultCallerOwned`). Its owner must be `SY.edge@<edge hive>` (comment in `packaging/hive.yaml.example`). The only mode that reloads and answers ACME. |
+| `disk` | `tls_cert` and `tls_key` are both set | The two PEM files, read once at boot (`EdgeTls::from_disk`). |
+| `plaintext` | none of them | No TLS. `add_hive` writes it only with `ingress.allow_plaintext: true`, never on port 443. |
 
-Only `sy-edge` restarts; nothing else on the hive does. The public port is down for those
-seconds. Swapping the certificate in place is open as PB-1 in `lab/logbook/PENDING-BUGS.md`
-(comment in `main`).
+An empty `tls_vault_key`, or only one of `tls_cert` and `tls_key`, is refused at boot.
+
+### The checks
+
+Material passes `tls_material::inspect`, the same function SY.admin runs before it stores a
+certificate: the chain parses and is not truncated (more `BEGIN CERTIFICATE` markers than parsed
+certificates, PB-2), the key matches the leaf, and the leaf is valid now (not expired, not before
+its start) (`check_material`).
+
+Two weak chains depend on what is served (`EdgeTls::apply_material`): a truncated chain, judged on
+the certificates the parser kept, and a leaf with no intermediates, which strict clients (Go,
+Python `ssl`, webhooks) refuse.
+
+- **Something is served:** a reload that would replace it with a weak chain refuses it. Re-reading
+  the chain already served is never a refusal.
+- **Nothing is served** (at boot, while awaiting, a disk edge): the weak chain is served and logged
+  at ERROR (`log_tls_chain_diagnosis`). An edge up on a weak chain beats an edge that is down.
+
+### The acceptor
+
+Every TLS connection is accepted with `tokio_rustls::LazyConfigAcceptor`, which reads the
+ClientHello before a configuration is chosen (`accept_tls`, `EdgeTls::route_hello`):
+
+| ClientHello | Configuration | Then |
+| --- | --- | --- |
+| ALPN exactly `["acme-tls/1"]`, and a challenge armed for its SNI (lowercase, no trailing dot) | that challenge's, with `alpn_protocols = ["acme-tls/1"]` | finish the handshake and close; HTTP is never reached |
+| ALPN exactly `["acme-tls/1"]`, and nothing armed for its SNI, or no SNI | none | close |
+| anything else, `acme-tls/1` mixed with other protocols included | the main one: the served certificate, empty ALPN list | the HTTP routes above |
+| anything else, while awaiting | none | close |
+
+One timeout, 10 s (`TLS_HANDSHAKE_TIMEOUT`), covers reading the ClientHello and finishing the
+handshake, on every path. A client that sends nothing, or stops halfway, is dropped.
+
+### The ACME challenge
+
+SY.admin arms a challenge with `EDGE_ACME_CHALLENGE` while it orders a certificate (design §6).
+The edge mints the TLS-ALPN-01 certificate itself, so no private key crosses the mesh
+(`acme_challenge_certificate`):
+
+- a fresh P-256 key and an empty subject;
+- SAN = the name, which must be a DNS host name: no wildcard, no IP literal;
+- the critical `acmeIdentifier` extension (RFC 8737) holding the digest. The digest must be 64 hex
+  characters, checked before rcgen, which asserts its length.
+
+The challenge's `ServerConfig` is built from a `CertifiedKey` directly
+(`acme_challenge_server_config`). rustls' `with_single_cert` re-parses the leaf with webpki, which
+refuses the unknown critical extension the certificate exists to carry.
+
+An armed challenge lives in memory under its name until `ttl_secs` passes (600 s by default, 1800 s
+at most) or a clear names the same digest. A newer arm replaces an older one, and a late clear
+never removes it.
+
+### Hot reload (PB-1, closed)
+
+The main configuration sits behind a lock that each new connection reads. `EdgeTls::reload`:
+
+1. reads the secret once (15 s, `VAULT_TLS_READ_TIMEOUT`; no retry loop on this path);
+2. checks it;
+3. swaps only when it passes. Connections already open finish on the configuration they started
+   with. Identical material (the same chain) swaps nothing, and `loaded_at` stays.
+
+Each read also records which vault write the edge serves: the secret's version and its metadata's
+`updated_at`, both from the VAULT_GET answer. A vault rollback re-mints version numbers, so only
+the pair names one write. A re-read of the chain already served moves the pair to the write just
+read. (SY.vault answers a VAULT_GET with the record's metadata, the same a VAULT_GET_METADATA
+returns, so the edge makes no second call; the router's edge gate admits only VAULT_GET anyway.)
+
+A refusal keeps the current certificate and says why. When a serving edge gets no verdict from the
+vault (`transient`) it logs a WARN, not the ERROR of a refused secret. Nothing exits, and reloads run
+one at a time. Three things trigger one:
+
+- `EDGE_TLS_RELOAD` from SY.admin.
+- A `VAULT_SECRET_CHANGED` for the edge's own key (`tls_secret_change_action`; matched by key, not
+  by `resource_type`). Put, rotate, rollback and SY.vault's boot re-announce all reload; the
+  re-read tells a re-announce from a change, since a vault rollback re-mints version numbers. The
+  reload runs in its own task, so the loop never waits on the vault for it. A delete keeps
+  serving what is loaded; an assignment changes nothing.
+- The awaiting re-reads (next).
+
+### Awaiting
+
+A vault edge whose secret cannot be served at boot starts with no main configuration instead of
+exiting (`start_vault_tls`). A missing secret used to crash-loop the unit, so a new ingress could
+never answer the challenge for its first certificate. While awaiting it:
+
+- answers armed `acme-tls/1` handshakes, closes every other TLS handshake, and never serves
+  plaintext;
+- re-reads the secret on its own and starts serving when good material appears
+  (`run_awaiting_rereads`, `AWAITING_SCHEDULE`). A reload or a vault notice can get there first.
+
+| The verdict it awaits on | Re-reads |
+| --- | --- |
+| `transient` (a cold boot: the vault is not up yet) | every 3 s for the first 2 minutes, then as below |
+| `not_found`, `forbidden`, `invalid_material` | after 30 s, then twice as late each time, up to 5 min |
+
+The reason is kept typed (`TlsRefusal::from_vault_error`) and reported by `EDGE_TLS_STATUS`. It is
+logged at ERROR at boot and whenever it changes; repeats are a WARN, or DEBUG for the fast
+transient re-reads.
+
+| `reason` | When |
+| --- | --- |
+| `not_found` | the vault has no secret under the key (`KEY_NOT_FOUND`) |
+| `forbidden` | the vault refused the edge (`UNAUTHORIZED`: a wrong owner, an inactive tenant) |
+| `invalid_material` | the secret itself is wrong: no `cert`/`key`, a chain the checks refuse, or a request or stored value the vault calls invalid (`INVALID_REQUEST`, `INVALID_VALUE`) |
+| `transient` | no verdict on the secret: the vault did not answer (`vault_failure_is_transport`), its answer did not parse, or it could not do its job (`IDENTITY_UNAVAILABLE`, `STORAGE_ERROR`, `IO_ERROR`, `ENCRYPTION_ERROR`, `NODE_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, and any code it may add) |
+
+A refused reload uses the same reasons. SY.admin must not roll a certificate back on `transient`:
+nothing was said about the secret.
+
+### The fingerprint
+
+Everywhere the edge reports one (`EDGE_TLS_STATUS`, the logs) it is the SHA-256 of the leaf's DER,
+in hex (`tls_material::LeafInfo`), the same value SY.admin computes.
+
+### The TLS commands
+
+All three come from `SY.admin@motherbee` only, and answer `{status: "error", error}` when they
+cannot run: another origin, an edge with no public listener, or a RELOAD or CHALLENGE on a
+`disk` or `plaintext` edge.
+
+| Command | Request | Answer |
+| --- | --- | --- |
+| `EDGE_TLS_STATUS` | `{}` | `status: "ok"`, `mode`, `tls_vault_key` (null unless `vault`), `state` (`serving` or `awaiting`), `reason` and `detail` (awaiting only), the served leaf (`leaf_pem`, `fingerprint`, `not_before`, `not_after`, `names` (its DNS SANs), `issuer`, `chain_len`, `loaded_at`), and the vault write it came from: `vault_version` (integer) and `vault_updated_at` (the secret's metadata `updated_at`, as SY.vault gives it). Times are Unix seconds. The two `vault_*` fields are null off the vault (`disk`, `plaintext`) and while awaiting; a `plaintext` edge is `serving` with null leaf fields. |
+| `EDGE_TLS_RELOAD` | `{}` | One re-read and verdict: the STATUS fields after it (`vault_version` and `vault_updated_at` included), `changed`, and when refused `refused: {reason, detail}`. A refusal is still `status: "ok"`. |
+| `EDGE_ACME_CHALLENGE` | `{name, digest, ttl_secs?}` to arm, `{name, digest, clear: true}` to clear; other fields are refused | `{status, name, armed, expires_at}`: what stays armed for the name after the command |
 
 ## Config
 
@@ -256,13 +403,18 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
   synced, then renamed (`persist_public_registry`).
 - `blob_public_root`: read only. Filled by Syncthing from the motherbee.
 - The node UUID under `UUID_PERSISTENCE_DIR`.
+- Nothing about TLS: the certificate is read from SY.vault (or the disk files), and the armed ACME
+  challenges live in memory only.
 
 ## Failure behavior
 
-- **No TLS material.** If TLS was requested and could not be loaded, the process exits with an
-  error and systemd retries every 5 s. A vault that does not answer is logged as transient ("normal
-  on cold boot"); a bad or missing secret as an error that needs the operator
-  (`TlsFetchFailure::from_vault_error`).
+- **No usable certificate.** A vault edge starts AWAITING and re-reads on its own; the reason is
+  logged at ERROR and reported by `EDGE_TLS_STATUS` (see TLS). A disk edge whose files do not load
+  exits, and systemd retries every 5 s; so does an invalid TLS configuration. The port is never
+  bound in plaintext in either case.
+- **A bad new certificate.** A reload refuses it, keeps serving the current one and answers why;
+  nothing restarts.
+- **The certificate deleted from the vault.** The edge keeps serving what it loaded.
 - **Bad files.** An unreadable or invalid endpoints file starts an empty table (every `/e/` gets
   404). An invalid publications file starts an empty public table.
 - **Secret not fetched.** The channel answers 401 until a later `resolve_secrets` succeeds: on
@@ -272,9 +424,11 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 
 ## Not there yet
 
-- No ACME or Let's Encrypt: the code has no certificate issuance. The operator puts the PEM
-  chain and key in SY.vault.
-- No in-place certificate swap (PB-1): a rotation restarts the process.
+- The edge issues nothing itself: SY.admin orders the certificate and stores it in SY.vault
+  (design §6), or the operator puts a PEM chain and key there by hand. The edge answers the
+  challenge and serves what the vault holds.
+- One certificate for every name: SNI passthrough for `cloud.<id>` and `archi.<id>` is out of
+  scope for v1 (O5a, design).
 - The `shared-secret` mode is one static bearer per channel. There is no other auth mode.
 - The owner node's reply is always sent as `200 application/json`.
 
@@ -283,7 +437,9 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - `curl -s https://<public host>/healthz` answers `ok` (the route is served on the public
   listener itself).
 - `systemctl status sy-edge` on the ingress hive. The log line
-  `sy-edge public HTTPS frontend ready (TLS)` means the door is up.
+  `sy-edge public HTTPS frontend ready (TLS)` means the port is bound; `serving=false` on it means
+  the edge is AWAITING a certificate.
+- `EDGE_TLS_STATUS` (sent by SY.admin) says what the door serves, or why it awaits.
 - The open channels: `GET /channels/externalized?edge_node=SY.edge@<ingress>` on SY.admin
   (`list_externalized` → `EDGE_LIST_URLS`).
 
@@ -291,7 +447,10 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 
 - [SY.admin](sy-admin.md): `externalize`, `publish_cloud_endpoint`, `publish_artifact`.
 - [SY.orchestrator](sy-orchestrator.md): `add_hive` for the ingress role, units, Syncthing.
-- [SY.vault](sy-vault.md): where the TLS material and channel tokens live.
+- [SY.vault](sy-vault.md): where the TLS material and channel tokens live, and its notices to the
+  edge (A-78).
+- [ACME certificates for the public edge](../acme-edge-certificates-v1.md): the certificate, its
+  checks and the three TLS commands.
 - [The router](rt-gateway.md): the system policy that admits the `EDGE_*` commands.
 - [Edge ingress spec v6](../edge-ingress-spec-v6.md): the design (ICH model, invariants).
 - [IO.blob spec](../io-blob-spec-v1.md): curation and the public folder.

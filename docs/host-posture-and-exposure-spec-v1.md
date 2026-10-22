@@ -1099,6 +1099,11 @@ PROD: `hive-k3m9x7q2`.
 
 ### 5.3 DNS and certificate (manual now)
 
+> **Superseded for the certificate (2026-10-21):** [acme-edge-certificates-v1](acme-edge-certificates-v1.md).
+> SY.admin issues and renews the edge's certificate with ACME (TLS-ALPN-01), the edge reloads it
+> without restarting, and the alerts are relative to the certificate's lifetime instead of a fixed
+> 21 days. The DNS lines below still hold.
+
 - **DNS** (operator, Azure): `<id>` and `archi.<id>` point to the one ingress (O7). Failover is
   manual.
 - **Certificate:** per installation, per O6, never the brand wildcard. Under O5(a) the edge's

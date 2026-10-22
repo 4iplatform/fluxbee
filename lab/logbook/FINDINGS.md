@@ -1072,6 +1072,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-78 🔴 CONFIRMED IN CODE AND IN PROD (2026-10-21) — The vault's change notice never reaches the edge
+
+- **What happens:**
+  - SY.edge reloads its TLS certificate when SY.vault announces a change (`VAULT_SECRET_CHANGED`,
+    `src/bin/sy_edge.rs` ~465-657).
+  - The router's edge gate (`vpn_allows_between`, `src/router/mod.rs` ~5976) comes before the global
+    SYSTEM bypass. It admits only the `EDGE_*` commands and their answers, the IO data path and
+    `VAULT_GET`, and every broadcast fan-out applies it. The notice is dropped.
+- **Evidence in PROD (2026-10-21):** SY.vault has sent 146 notices. Neither sy-edge nor rt-gateway
+  on ingress1 logged one since 2026-08-05, the start of their journals.
+- **Impact:**
+  - PB-1's mitigation ("a key change in the vault restarts the edge") never ran: the 2026-07-30
+    logbook saw the old certificate served after a put until a manual restart.
+  - Channel secrets are not affected: a rotation reaches the edge through a new `EDGE_OPEN_URL`.
+- **How it showed up:** verifying the code for the ACME design (docs/acme-edge-certificates-v1.md §2).
+- **Fix (0.1.82, design §5):**
+  - SY.vault also sends the notice as a unicast to the owner when the owner is an `SY.edge`.
+  - The edge gate admits only that unicast from SY.vault on the primary hive.
+  - The broadcast, which carries every stored key's name and owners, stays out of the DMZ.
+  - The edge reloads without restarting (PB-1).
+
 ### A-77 ✅ RESOLVED (0.1.81, 2026-10-20) — What the closing pass and its review found besides A-72..A-76
 
 Found on 2026-10-19 while verifying the open findings and in the review round of 0.1.81; fixed in

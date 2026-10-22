@@ -113,7 +113,9 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
   of SY.opa.rules picks the target (`resolve_target_with_identity`).
 - **VPNs:** both ends must share a `vpn_id`, except system nodes (`SY.*`, `RT.*`) and `SYSTEM`
   messages with scope `global`, which cross VPNs; traffic to and from `SY.edge` is limited to
-  edge control, IO data and vault reads (`vpn_allows_between`).
+  edge control, IO data, vault reads, and SY.vault's notices about the edge's own secrets, which
+  reach it only as a unicast: a broadcast never does (`vpn_allows_between`,
+  `vpn_allows_broadcast_between`; A-78).
 - **Taps** copy matching unicast messages to a third node, fire-and-forget (see
   [SY.config.routes](sy-config-routes.md)).
 - **Errors to the sender:** `UNREACHABLE {original_dst, reason}` with reasons `NODE_NOT_FOUND`,
@@ -122,7 +124,7 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
 
 ### System authority
 
-27 actions are protected (`PROTECTED_SYSTEM_ACTIONS` in `src/router/system_policy.rs`: node
+30 actions are protected (`PROTECTED_SYSTEM_ACTIONS` in `src/router/system_policy.rs`: node
 lifecycle, `CONFIG_GET`/`CONFIG_SET`/`CONFIG_CHANGED`, `SYSTEM_UPDATE`, edge commands, ...).
 At local delivery the router asks the baked `policy/system.wasm` whether the sender may perform
 the action (`authorize_system`); a denial drops the message with

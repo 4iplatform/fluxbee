@@ -351,11 +351,16 @@ async fn main() -> Result<(), VaultError> {
 }
 
 /// Output of a vault handler. Carries the response payload sent back to
-/// the caller, plus (for mutating actions) an optional broadcast payload
-/// emitted to all hive nodes via `VAULT_SECRET_CHANGED`.
+/// the caller, plus (for mutating actions) an optional payload for the
+/// `VAULT_SECRET_CHANGED` notices: the broadcast to all hive nodes, and the
+/// copy addressed to an edge that owns the secret (`secret_changed_notices`).
 struct HandlerOutcome {
     response: Value,
     broadcast: Option<VaultSecretChangedPayload>,
+    /// The changed secret's owner as the read rules see it (`secret_owner_ilk`: the `ilk` field,
+    /// else the legacy `owner_ilk`, which the payload's `ilk` leaves out), so an edge that reads
+    /// the secret as its owner is also the one told about it.
+    owner: Option<String>,
 }
 
 impl HandlerOutcome {
@@ -363,6 +368,7 @@ impl HandlerOutcome {
         Self {
             response,
             broadcast: None,
+            owner: None,
         }
     }
 }
@@ -516,68 +522,183 @@ async fn handle_vault_message(
     };
     send_system_response(sender, msg, response_action, outcome.response).await?;
 
-    // Broadcast event-driven notification of the change to all hive nodes.
-    // Mirrors the CONFIG_CHANGED pattern: Destination::Broadcast over the
-    // router socket, scope=global, no auth required (metadata only — the
-    // plaintext stays in vault and requires an authorized vault_get).
+    // Event-driven notification of the change: a broadcast to every hive node, mirroring the
+    // CONFIG_CHANGED pattern (scope=global, no auth required: metadata only, the plaintext stays
+    // in vault and requires an authorized vault_get), and the same notice to the edge that owns
+    // the secret, if one does (A-78).
     if let Some(payload) = outcome.broadcast {
-        if let Err(err) = send_broadcast_secret_changed(sender, msg, payload).await {
-            tracing::warn!(
+        let edges = edge_nodes(hive_id, &hive_registry_root());
+        match secret_changed_notices(
+            &sender.uuid().to_string(),
+            msg.meta.dst_ilk.as_deref(),
+            false,
+            &payload,
+            outcome.owner.as_deref(),
+            &edges,
+        ) {
+            Ok(notices) => {
+                for notice in notices {
+                    if let Err(err) = send_secret_changed_notice(sender, notice, &payload).await {
+                        tracing::warn!(
+                            error = %err,
+                            action,
+                            trace_id = %msg.routing.trace_id,
+                            "failed to emit VAULT_SECRET_CHANGED (consumers will retry on next poll/refresh)"
+                        );
+                    }
+                }
+            }
+            Err(err) => tracing::warn!(
                 error = %err,
                 action,
                 trace_id = %msg.routing.trace_id,
-                "failed to emit VAULT_SECRET_CHANGED broadcast (consumers will retry on next poll/refresh)"
-            );
+                "failed to build VAULT_SECRET_CHANGED (consumers will retry on next poll/refresh)"
+            ),
         }
     }
     Ok(())
 }
 
-/// Send a `VAULT_SECRET_CHANGED` broadcast message over the router socket.
-/// `src_trace_id` is the originating mutation's trace_id so observers can
-/// correlate the broadcast with the put/rotate/delete/rollback request.
-async fn send_broadcast_secret_changed(
-    sender: &NodeSender,
-    src_msg: &Message,
-    payload: VaultSecretChangedPayload,
-) -> VaultResult<()> {
-    let broadcast = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Broadcast,
-            ttl: 16,
-            // New trace_id (this is a fan-out event, not a reply). The
-            // payload carries no back-pointer to the mutation trace_id
-            // because consumers don't need it — they react to the resource
-            // change, not to the specific RPC that caused it. If
-            // correlation is needed later, the originating trace_id is
-            // already in vault's audit log under the same `at_ms`.
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
-            src_ilk: src_msg.meta.dst_ilk.clone(),
-            scope: Some(SCOPE_GLOBAL.to_string()),
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload: serde_json::to_value(&payload)?,
+/// The public edge's role. It runs in the DMZ, so the vault keeps two rules for it
+/// (docs/acme-edge-certificates-v1.md §5): it reads no general secret (`authorize_read`), and it
+/// hears about its own secrets in a notice addressed to it, never through the broadcast (A-78).
+const EDGE_NODE_BASE_NAME: &str = "SY.edge";
+
+/// Whether a node name is an edge's, `SY.edge@<hive>`.
+fn is_edge_node_name(name: &str) -> bool {
+    name.split_once('@').map_or(name, |(role, _)| role) == EDGE_NODE_BASE_NAME
+}
+
+/// An edge the vault can address: its node name and the ILK derived from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeNode {
+    name: String,
+    ilk: String,
+}
+
+/// SY.orchestrator's registry of the hives the motherbee joined, one directory per hive id
+/// (`hives_root` in src/bin/sy_orchestrator.rs). The router admits a WAN peer only while its hive
+/// is listed there (A-48).
+fn hive_registry_root() -> PathBuf {
+    json_router::paths::storage_root_dir().join("hives")
+}
+
+/// The edges a secret may belong to: `SY.edge@<hive>` on this hive and on every hive in the
+/// registry. The vault keeps a secret's owner as an ILK, and a system node's ILK is derived from
+/// its name (`deterministic_system_ilk_id`), so an owner is an edge when it is one of these ILKs.
+/// Read for each change, so a hive joined after the vault started counts.
+fn edge_nodes(own_hive: &str, registry_root: &Path) -> Vec<EdgeNode> {
+    let mut hives = vec![own_hive.to_string()];
+    if let Ok(entries) = fs::read_dir(registry_root) {
+        for entry in entries.flatten() {
+            let Ok(hive) = entry.file_name().into_string() else {
+                continue;
+            };
+            if json_router::mesh_hmac::is_valid_hive_id(&hive) && entry.path().is_dir() {
+                hives.push(hive);
+            }
+        }
+    }
+    hives.sort();
+    hives.dedup();
+    hives
+        .into_iter()
+        .map(|hive| {
+            let name = format!("{EDGE_NODE_BASE_NAME}@{hive}");
+            let ilk = fluxbee_sdk::deterministic_system_ilk_id(&name);
+            EdgeNode { name, ilk }
+        })
+        .collect()
+}
+
+/// The edge among `edges` whose ILK is `owner`, if any.
+fn edge_owner<'a>(owner: Option<&str>, edges: &'a [EdgeNode]) -> Option<&'a str> {
+    let owner = owner.map(str::trim).filter(|ilk| !ilk.is_empty())?;
+    edges
+        .iter()
+        .find(|edge| edge.ilk == owner)
+        .map(|edge| edge.name.as_str())
+}
+
+/// The `VAULT_SECRET_CHANGED` notices for one change: the broadcast every interested node filters
+/// (scope `global`), and, when the secret's owner is an edge, the same notice addressed to that
+/// edge. The router keeps the broadcast out of the DMZ, since it names every stored key, its tenant
+/// and its owners (A-78, `vpn_allows_broadcast_between` in src/router/mod.rs).
+///
+/// `owner` is the secret's owner as the read rules see it (`secret_owner_ilk`, the legacy
+/// `owner_ilk` included), not the payload's `ilk`: the edge told is the edge that reads it.
+/// `src_ilk` is the ILK the mutation request was addressed to (none at boot). `bootstrap` marks the
+/// boot re-announcement (`VAULT_BOOTSTRAP_ACTION`), so destructive consumers can tell it apart
+/// from a real change (SY.edge restarts on a TLS change — see PB-9). Each notice gets a new
+/// trace_id: it is an event, not a reply. The payload carries no back-pointer to the mutation's
+/// trace_id because consumers react to the resource change, not to the RPC that caused it; the
+/// originating trace_id is in vault's audit log under the same `at_ms`.
+fn secret_changed_notices(
+    src_uuid: &str,
+    src_ilk: Option<&str>,
+    bootstrap: bool,
+    payload: &VaultSecretChangedPayload,
+    owner: Option<&str>,
+    edges: &[EdgeNode],
+) -> VaultResult<Vec<Message>> {
+    let payload_value = serde_json::to_value(payload)?;
+    let notice = |dst: Destination| {
+        let scope = matches!(dst, Destination::Broadcast).then(|| SCOPE_GLOBAL.to_string());
+        Message {
+            routing: Routing {
+                src: src_uuid.to_string(),
+                src_l2_name: None,
+                dst,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
+                src_ilk: src_ilk.map(str::to_string),
+                scope,
+                action: bootstrap.then(|| VAULT_BOOTSTRAP_ACTION.to_string()),
+                ..Meta::default()
+            },
+            payload: payload_value.clone(),
+        }
     };
-    sender.send(broadcast).await?;
-    tracing::info!(
-        op = %payload.op.as_str(),
-        resource_type = %payload.resource_type,
-        tenant_id = %payload.tenant_id,
-        ilk = %payload.ilk.as_deref().unwrap_or(""),
-        version = payload.version,
-        key = %payload.key,
-        "vault secret changed broadcast sent"
-    );
+    let mut notices = vec![notice(Destination::Broadcast)];
+    if let Some(edge) = edge_owner(owner, edges) {
+        notices.push(notice(Destination::Unicast(edge.to_string())));
+    }
+    Ok(notices)
+}
+
+/// Send one notice from `secret_changed_notices` over the router socket.
+async fn send_secret_changed_notice(
+    sender: &NodeSender,
+    notice: Message,
+    payload: &VaultSecretChangedPayload,
+) -> VaultResult<()> {
+    let edge = match &notice.routing.dst {
+        Destination::Unicast(edge) => Some(edge.clone()),
+        _ => None,
+    };
+    sender.send(notice).await?;
+    match edge {
+        None => tracing::info!(
+            op = %payload.op.as_str(),
+            resource_type = %payload.resource_type,
+            tenant_id = %payload.tenant_id,
+            ilk = %payload.ilk.as_deref().unwrap_or(""),
+            version = payload.version,
+            key = %payload.key,
+            "vault secret changed broadcast sent"
+        ),
+        Some(edge) => tracing::info!(
+            op = %payload.op.as_str(),
+            version = payload.version,
+            key = %payload.key,
+            edge = %edge,
+            "vault secret changed notice sent to the edge that owns the secret"
+        ),
+    }
     Ok(())
 }
 
@@ -595,7 +716,8 @@ async fn send_broadcast_secret_changed(
 ///
 /// Idempotent for consumers already configured: they re-resolve the
 /// same value and continue. The cost is N small messages at boot, where
-/// N = number of secrets in vault.db — bounded by operator intent.
+/// N = number of secrets in vault.db — bounded by operator intent — plus
+/// one addressed to its edge for each secret an edge owns (A-78).
 async fn emit_bootstrap_secret_broadcasts(
     sender: &NodeSender,
     store: &VaultStore,
@@ -606,8 +728,11 @@ async fn emit_bootstrap_secret_broadcasts(
         tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
         return Ok(());
     }
+    let edges = edge_nodes(hive_id, &hive_registry_root());
+    let src_uuid = sender.uuid().to_string();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
+    let mut edge_notices = 0usize;
     for summary in summaries {
         let Some(payload) = build_secret_changed_payload(
             VaultSecretOp::Put,
@@ -626,45 +751,31 @@ async fn emit_bootstrap_secret_broadcasts(
             );
             continue;
         };
-        // Build the broadcast Message directly. We don't have an
-        // originating msg here (this is boot, not a mutation), so we
-        // mint a fresh trace_id and synthesize the routing.
-        let broadcast = Message {
-            routing: Routing {
-                src: sender.uuid().to_string(),
-                src_l2_name: None,
-                dst: Destination::Broadcast,
-                ttl: 16,
-                trace_id: Uuid::new_v4().to_string(),
-            },
-            meta: Meta {
-                msg_type: SYSTEM_KIND.to_string(),
-                msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
-                src_ilk: None,
-                scope: Some(SCOPE_GLOBAL.to_string()),
-                target: None,
-                // Marks this as a boot re-announcement so destructive consumers can tell it
-                // apart from a real change (SY.edge restarts on a TLS change — see PB-9).
-                action: Some(VAULT_BOOTSTRAP_ACTION.to_string()),
-                priority: None,
-                context: None,
-                ..Meta::default()
-            },
-            payload: serde_json::to_value(&payload)?,
-        };
-        if let Err(err) = sender.send(broadcast).await {
-            tracing::warn!(
-                error = %err,
-                key = %summary.key,
-                "bootstrap broadcast failed for one secret; continuing with the rest"
-            );
-            continue;
+        // No originating msg here (this is boot, not a mutation): no src_ilk, and the notices
+        // are marked as the boot re-announcement.
+        let owner = secret_owner_ilk(&summary.metadata);
+        for notice in secret_changed_notices(&src_uuid, None, true, &payload, owner, &edges)? {
+            let to_edge = matches!(notice.routing.dst, Destination::Unicast(_));
+            if let Err(err) = sender.send(notice).await {
+                tracing::warn!(
+                    error = %err,
+                    key = %summary.key,
+                    to_edge,
+                    "bootstrap broadcast failed for one secret; continuing with the rest"
+                );
+                continue;
+            }
+            if to_edge {
+                edge_notices += 1;
+            } else {
+                emitted += 1;
+            }
         }
-        emitted += 1;
     }
     tracing::info!(
         emitted = emitted,
         skipped = skipped,
+        edge_notices = edge_notices,
         "sy.vault bootstrap broadcast complete (rescues consumers that raced ahead at boot)"
     );
     Ok(())
@@ -732,6 +843,10 @@ fn handle_delete(
             "deleted": true,
         }),
         broadcast,
+        owner: pre_metadata
+            .as_ref()
+            .and_then(secret_owner_ilk)
+            .map(str::to_string),
     })
 }
 
@@ -783,6 +898,10 @@ fn handle_rotate(
             "previous_version": result.previous_version,
         }),
         broadcast,
+        owner: pre_metadata
+            .as_ref()
+            .and_then(secret_owner_ilk)
+            .map(str::to_string),
     })
 }
 
@@ -827,6 +946,10 @@ fn handle_rollback(
             "previous_version": result.previous_version,
         }),
         broadcast,
+        owner: pre_metadata
+            .as_ref()
+            .and_then(secret_owner_ilk)
+            .map(str::to_string),
     })
 }
 
@@ -868,6 +991,7 @@ fn handle_put(
         }
     }
     let metadata_for_broadcast = metadata.clone();
+    let owner = secret_owner_ilk(&metadata).map(str::to_string);
     let (version, changed) = store.put(&request.key, request.value, metadata, caller)?;
     // Only emit a broadcast when something actually changed. Idempotent
     // re-puts (same value) return changed=false and version unchanged —
@@ -892,6 +1016,7 @@ fn handle_put(
             "changed": changed,
         }),
         broadcast,
+        owner,
     })
 }
 
@@ -942,6 +1067,7 @@ fn handle_assign(
     } else {
         None
     };
+    let owner = secret_owner_ilk(&metadata).map(str::to_string);
     Ok(HandlerOutcome {
         response: json!({
             "status": "ok",
@@ -951,6 +1077,7 @@ fn handle_assign(
             "changed": changed,
         }),
         broadcast,
+        owner,
     })
 }
 
@@ -1669,6 +1796,8 @@ fn check_caller_binding(
 /// - Pool secret with `tenant_id == "tnt:<uuid>"`: readable by any caller
 ///   in the same tenant (resolved from SHM). If SHM isn't populated yet,
 ///   only the dedicated path applies.
+/// - An edge (`SY.edge@<hive>`, `caller_is_an_edge`) reads no pool secret,
+///   whatever the two rules above would say.
 fn authorize_read(
     caller: &Caller,
     metadata: &VaultMetadata,
@@ -1695,6 +1824,13 @@ fn authorize_read(
     }
     // (2) General: no owner and no assigned node.
     if is_general_secret(metadata) {
+        // Never to an edge: it runs in the DMZ and reads only the secrets it owns or is assigned
+        // (docs/acme-edge-certificates-v1.md §5). Its ILK does not resolve on the motherbee, so it
+        // used to be told to retry; this refuses it for good, and keeps it refused if its ILK
+        // ever resolves.
+        if caller_is_an_edge(caller) {
+            return Err(VaultError::Unauthorized);
+        }
         // (2a) Root-tenant pool universal for SY system callers (no SHM
         // needed). This is the path that closes the boot chicken/egg:
         // any node whose ILK matches a deterministic SY system ILK from
@@ -1733,6 +1869,12 @@ fn authorize_read(
         }
     }
     Err(VaultError::Unauthorized)
+}
+
+/// The caller is an edge, `SY.edge@<any hive>`, by the router-stamped name: a node cannot choose
+/// it, and across hives the router binds it to the authenticated hive (EDGE-01).
+fn caller_is_an_edge(caller: &Caller) -> bool {
+    caller.l2_name.as_deref().is_some_and(is_edge_node_name)
 }
 
 /// The caller proved, by the router-stamped name, that it is a system node: a `SY.*` name and the
@@ -2580,6 +2722,336 @@ mod tests {
                 .code(),
             "UNAUTHORIZED"
         );
+    }
+
+    /// The edge runs in the DMZ: it reads the secrets it owns or is assigned, and no general one,
+    /// even if its ILK ever resolved on the motherbee (docs/acme-edge-certificates-v1.md §5).
+    #[test]
+    fn an_edge_reads_no_general_secret() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let name = "SY.edge@ingress1";
+        let edge_ilk = fluxbee_sdk::deterministic_system_ilk_id(name);
+        let edge = Caller {
+            l2_name: Some(name.to_string()),
+            ilk_id: Some(edge_ilk.clone()),
+            tenant_id: None,
+            ilk_type: None,
+        };
+        let none = HashSet::new();
+        let genesis_pool = metadata(root, None);
+        // Refused for good, where it used to be told to retry (its ILK does not resolve here).
+        let err = authorize_read(&edge, &genesis_pool, &none).unwrap_err();
+        assert_eq!(err.code(), "UNAUTHORIZED");
+        // Refused if it did resolve: in the system set, typed `system`, charged to the tenant.
+        let system_set = HashSet::from([edge_ilk.clone()]);
+        assert_unauthorized(authorize_read(&edge, &genesis_pool, &system_set));
+        let resolved = Caller {
+            tenant_id: Some(root.to_string()),
+            ilk_type: Some("system".to_string()),
+            ..edge.clone()
+        };
+        assert_unauthorized(authorize_read(&resolved, &genesis_pool, &system_set));
+        let charged = Caller {
+            tenant_id: Some("tnt:client-a".to_string()),
+            ..resolved.clone()
+        };
+        assert_unauthorized(authorize_read(
+            &charged,
+            &metadata("tnt:client-a", None),
+            &system_set,
+        ));
+        // Without an ILK the edge's name reads nothing general either.
+        let no_ilk = Caller {
+            ilk_id: None,
+            ..resolved.clone()
+        };
+        assert_unauthorized(authorize_read(&no_ilk, &genesis_pool, &system_set));
+        // Its own certificate and a secret assigned to it, it reads; another edge's, it does not.
+        authorize_read(&edge, &metadata(root, Some(&edge_ilk)), &none).expect("its own");
+        let mut assigned = metadata(root, Some("ilk:someone"));
+        assigned.assigned_ilks = vec![edge_ilk.clone()];
+        authorize_read(&edge, &assigned, &none).expect("assigned to it");
+        let another_edge = fluxbee_sdk::deterministic_system_ilk_id("SY.edge@ingress2");
+        assert_unauthorized(authorize_read(
+            &edge,
+            &metadata(root, Some(&another_edge)),
+            &none,
+        ));
+        // The rule is the edge's alone: any other system node still reads the genesis pool.
+        for other in ["SY.storage@motherbee", "SY.edge.relay@ingress1"] {
+            let ilk = fluxbee_sdk::deterministic_system_ilk_id(other);
+            let caller = Caller {
+                l2_name: Some(other.to_string()),
+                ilk_id: Some(ilk.clone()),
+                tenant_id: None,
+                ilk_type: None,
+            };
+            authorize_read(&caller, &genesis_pool, &HashSet::from([ilk])).expect(other);
+        }
+        for (name, is_edge) in [
+            ("SY.edge@ingress1", true),
+            ("SY.edge@motherbee", true),
+            ("SY.edge", true),
+            ("SY.edge.relay@ingress1", false),
+            ("SY.edgex@ingress1", false),
+            ("sy.edge@ingress1", false),
+            ("IO.edge@ingress1", false),
+        ] {
+            assert_eq!(is_edge_node_name(name), is_edge, "{name}");
+        }
+    }
+
+    fn temp_hive_registry(hives: &[&str]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-vault-hives-{}", Uuid::new_v4().simple()));
+        for hive in hives {
+            fs::create_dir_all(root.join(hive)).expect("create hive dir");
+        }
+        root
+    }
+
+    #[test]
+    fn the_edges_are_this_hives_and_the_joined_hives() {
+        // A file and a name that is not a hive id are not hives; this hive counts once.
+        let registry = temp_hive_registry(&["ingress1", "worker-2", "motherbee", "bad.name"]);
+        fs::write(registry.join("notes.txt"), "not a hive").expect("write file");
+        let edges = edge_nodes("motherbee", &registry);
+        let names: Vec<&str> = edges.iter().map(|edge| edge.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["SY.edge@ingress1", "SY.edge@motherbee", "SY.edge@worker-2"]
+        );
+        for edge in &edges {
+            assert_eq!(
+                edge.ilk,
+                fluxbee_sdk::deterministic_system_ilk_id(&edge.name)
+            );
+        }
+        // No registry (a fresh motherbee): this hive's edge only.
+        let only_this_hive = edge_nodes("motherbee", &registry.join("missing"));
+        assert_eq!(
+            only_this_hive,
+            vec![EdgeNode {
+                name: "SY.edge@motherbee".to_string(),
+                ilk: fluxbee_sdk::deterministic_system_ilk_id("SY.edge@motherbee"),
+            }]
+        );
+        cleanup(registry);
+    }
+
+    /// A-78: the notice about a secret an edge owns also goes to that edge, addressed to it, with
+    /// the payload the edge parses; a secret of any other owner, or of none, gets the broadcast only.
+    /// The owner is the one the read rules see (`secret_owner_ilk`), the legacy field included.
+    #[test]
+    fn a_notice_about_an_edges_secret_is_also_addressed_to_that_edge() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let registry = temp_hive_registry(&["ingress1", "worker1"]);
+        let edges = edge_nodes("motherbee", &registry);
+        let edge_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.edge@ingress1");
+        // As the vault builds them: the payload, and the owner as the read rules see it.
+        let notices_for =
+            |op: VaultSecretOp, secret: &VaultMetadata, src_ilk: Option<&str>, bootstrap: bool| {
+                let event =
+                    build_secret_changed_payload(op, "edge_tls", secret, None, 3, "motherbee")
+                        .expect("a payload");
+                secret_changed_notices(
+                    "vault-uuid",
+                    src_ilk,
+                    bootstrap,
+                    &event,
+                    secret_owner_ilk(secret),
+                    &edges,
+                )
+                .expect("notices")
+            };
+        let owned = metadata(root, Some(&edge_ilk));
+        // Owned through the legacy field: the payload's `ilk` leaves it out, the edge still reads
+        // it (`authorize_read`), so it is told too.
+        let legacy = VaultMetadata {
+            owner_ilk: edge_ilk.clone(),
+            ..metadata(root, None)
+        };
+        for (field, secret) in [("ilk", &owned), ("owner_ilk", &legacy)] {
+            for op in [
+                VaultSecretOp::Put,
+                VaultSecretOp::Rotate,
+                VaultSecretOp::Rollback,
+                VaultSecretOp::Delete,
+            ] {
+                let notices = notices_for(op, secret, Some("ilk:vault"), false);
+                assert_eq!(notices.len(), 2, "{field} {op:?}");
+                let (broadcast, unicast) = (&notices[0], &notices[1]);
+                assert!(matches!(broadcast.routing.dst, Destination::Broadcast));
+                assert_eq!(broadcast.meta.scope.as_deref(), Some(SCOPE_GLOBAL));
+                assert!(
+                    matches!(&unicast.routing.dst, Destination::Unicast(dst) if dst == "SY.edge@ingress1"),
+                    "{field} {op:?}"
+                );
+                assert_eq!(unicast.meta.scope, None);
+                assert_ne!(broadcast.routing.trace_id, unicast.routing.trace_id);
+                for notice in &notices {
+                    assert_eq!(notice.routing.src, "vault-uuid");
+                    assert_eq!(notice.routing.src_l2_name, None);
+                    assert_eq!(notice.meta.msg_type, SYSTEM_KIND);
+                    assert_eq!(notice.meta.msg.as_deref(), Some(MSG_VAULT_SECRET_CHANGED));
+                    assert_eq!(notice.meta.src_ilk.as_deref(), Some("ilk:vault"));
+                    assert_eq!(notice.meta.action, None);
+                    let parsed: VaultSecretChangedPayload =
+                        serde_json::from_value(notice.payload.clone()).expect("the edge parses it");
+                    assert_eq!(parsed.op, op);
+                    assert_eq!(parsed.key, "edge_tls");
+                    assert_eq!(parsed.ilk.as_deref(), secret.ilk.as_deref(), "{field}");
+                }
+            }
+            // The boot re-announcement: both notices marked, with no src_ilk.
+            let boot = notices_for(VaultSecretOp::Put, secret, None, true);
+            assert_eq!(boot.len(), 2, "{field}");
+            for notice in &boot {
+                assert_eq!(notice.meta.action.as_deref(), Some(VAULT_BOOTSTRAP_ACTION));
+                assert_eq!(notice.meta.src_ilk, None);
+            }
+        }
+        // An edge on the vault's own hive is matched too.
+        let local_edge = fluxbee_sdk::deterministic_system_ilk_id("SY.edge@motherbee");
+        let notices = notices_for(
+            VaultSecretOp::Put,
+            &metadata(root, Some(&local_edge)),
+            None,
+            false,
+        );
+        assert!(
+            matches!(&notices[1].routing.dst, Destination::Unicast(dst) if dst == "SY.edge@motherbee")
+        );
+        // Any other owner gets the broadcast alone: another system node (by either field), an
+        // application node, the edge of a hive the registry does not list, no owner, an edge the
+        // secret is only assigned to, and an edge in the legacy field under another node's `ilk`
+        // (the `ilk` wins, as in the read rules).
+        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
+        let mut assigned_to_the_edge = metadata(root, Some("ilk:someone"));
+        assigned_to_the_edge.assigned_ilks = vec![edge_ilk.clone()];
+        for other in [
+            metadata(root, Some(&admin_ilk)),
+            VaultMetadata {
+                owner_ilk: admin_ilk.clone(),
+                ..metadata(root, None)
+            },
+            metadata(root, Some("ilk:11111111-1111-4111-8111-111111111111")),
+            metadata(
+                root,
+                Some(&fluxbee_sdk::deterministic_system_ilk_id(
+                    "SY.edge@ingress9",
+                )),
+            ),
+            metadata(root, None),
+            assigned_to_the_edge,
+            VaultMetadata {
+                owner_ilk: edge_ilk.clone(),
+                ..metadata(root, Some("ilk:someone"))
+            },
+        ] {
+            let notices = notices_for(VaultSecretOp::Put, &other, None, false);
+            assert_eq!(notices.len(), 1, "{:?} {:?}", other.ilk, other.owner_ilk);
+            assert!(matches!(notices[0].routing.dst, Destination::Broadcast));
+        }
+        cleanup(registry);
+    }
+
+    /// The handlers name the owner of every change as the read rules see it, so a put, rotate,
+    /// rollback and delete of an edge's secret each reach that edge, whether the secret names the
+    /// edge in `ilk` or in the legacy `owner_ilk`.
+    #[test]
+    fn every_change_to_an_edges_secret_names_the_edge() {
+        let (mut store, dir) = open_test_store([7u8; 32]);
+        let registry = temp_hive_registry(&["ingress1"]);
+        let edges = edge_nodes("motherbee", &registry);
+        let admin = admin_caller();
+        let admins: HashSet<String> = HashSet::from(["ilk:admin".to_string()]);
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let edge_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.edge@ingress1");
+        let to_the_edge = |out: HandlerOutcome| {
+            let event = out.broadcast.expect("an event");
+            secret_changed_notices(
+                "vault-uuid",
+                None,
+                false,
+                &event,
+                out.owner.as_deref(),
+                &edges,
+            )
+            .expect("notices")
+            .iter()
+            .any(|notice| {
+                matches!(&notice.routing.dst, Destination::Unicast(dst) if dst == "SY.edge@ingress1")
+            })
+        };
+        for (key, field) in [("edge_tls", "ilk"), ("edge_tls_legacy", "owner_ilk")] {
+            let put = |value: Value, metadata: Value| {
+                vault_request(
+                    MSG_VAULT_PUT,
+                    json!({"key": key, "value": value, "metadata": metadata}),
+                )
+            };
+            let scoped = |action: &str, extra: Value| {
+                let mut payload = json!({"key": key, "tenant_id": root});
+                if let (Some(payload), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+                    payload.extend(extra.clone());
+                }
+                vault_request(action, payload)
+            };
+            let mut owned = json!({"tenant_id": root, "resource_type": "tls"});
+            owned[field] = json!(edge_ilk);
+            let out = handle_put(
+                &mut store,
+                &put(json!({"cert": 1}), owned),
+                &admin,
+                &admins,
+                "motherbee",
+            )
+            .expect("put");
+            assert!(to_the_edge(out), "{field}: put");
+            // A new value that does not name the owner keeps it, and the edge is told again.
+            let out = handle_put(
+                &mut store,
+                &put(
+                    json!({"cert": 2}),
+                    json!({"tenant_id": root, "resource_type": "tls"}),
+                ),
+                &admin,
+                &admins,
+                "motherbee",
+            )
+            .expect("put without the owner");
+            assert!(to_the_edge(out), "{field}: put without the owner");
+            let out = handle_rotate(
+                &mut store,
+                &scoped(MSG_VAULT_ROTATE, json!({"value": {"cert": 3}})),
+                &admin,
+                &admins,
+                "motherbee",
+            )
+            .expect("rotate");
+            assert!(to_the_edge(out), "{field}: rotate");
+            let out = handle_rollback(
+                &mut store,
+                &scoped(MSG_VAULT_ROLLBACK, json!({})),
+                &admin,
+                &admins,
+                "motherbee",
+            )
+            .expect("rollback");
+            assert!(to_the_edge(out), "{field}: rollback");
+            let out = handle_delete(
+                &mut store,
+                &scoped(MSG_VAULT_DELETE, json!({})),
+                &admin,
+                &admins,
+                "motherbee",
+            )
+            .expect("delete");
+            assert!(to_the_edge(out), "{field}: delete");
+        }
+        cleanup(registry);
+        cleanup(dir);
     }
 
     #[test]

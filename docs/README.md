@@ -64,6 +64,8 @@ One page per node: [rt-gateway](nodes/rt-gateway.md) (the router),
 
 Decisions as they were taken, with the operator's reasons. Dated; not rewritten afterwards.
 
+- [acme-edge-certificates-v1](acme-edge-certificates-v1.md): the edge's certificate from an ACME
+  CA, issued and renewed by SY.admin with TLS-ALPN-01 (O6, A-78).
 - [router-stream-v1](router-stream-v1.md): the router stream, cognition per communication, LLM
   usage records (A-70).
 - [ilk-tenant-model-v1](ilk-tenant-model-v1.md): the ILK as the actor, the tenant as a cost center.

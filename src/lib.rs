@@ -7,3 +7,4 @@ pub mod router;
 pub mod runtime_manifest;
 pub mod runtime_package;
 pub mod shm;
+pub mod tls_material;

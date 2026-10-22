@@ -1,3 +1,6 @@
+#[path = "sy_admin/acme.rs"]
+mod acme;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Write};
@@ -148,6 +151,9 @@ struct HiveFile {
     blob: Option<BlobSection>,
     storage: Option<StorageSection>,
     ai: Option<HiveAiConfig>,
+    /// The ACME client's section (docs/acme-edge-certificates-v1.md §3), read as raw YAML: a
+    /// section that cannot work turns ACME off with a reason, it never fails the boot.
+    acme: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +317,8 @@ struct AdminContext {
     runtime_manifest_lock: Arc<Mutex<()>>,
     /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
     command_log_lock: Arc<std::sync::Mutex<()>>,
+    /// The public edge's certificate (docs/acme-edge-certificates-v1.md §6, §7).
+    acme: Arc<acme::AcmeService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -611,6 +619,42 @@ async fn main() -> Result<(), AdminError> {
                 .map(|value| value.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty())
         });
+    // The ACME client (docs/acme-edge-certificates-v1.md §6, §7). Its configuration never fails
+    // the boot: a section that cannot work turns ACME off, and the log and /acme/status say why.
+    let acme_config = acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref());
+    match &acme_config {
+        acme::AcmeConfig::Off { .. } => tracing::error!("{}", acme_config.describe()),
+        _ => tracing::info!("{}", acme_config.describe()),
+    }
+    let acme_edge: acme::EdgeResolver = {
+        let configured = public_edge_node.clone();
+        let hives_root = hives_registry_root_for(&state_dir);
+        Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &hives_root))
+    };
+    let acme_ca = Arc::new(acme::InstantAcmeCa::new(
+        &acme_config.trust_anchor_roots(),
+        acme::platform_roots,
+    ));
+    let acme_service = acme::AcmeService::new(
+        acme_config,
+        acme::AcmeDeps {
+            ca: acme_ca,
+            mesh: Arc::new(acme::RouterMesh::new(
+                Arc::clone(&router_client),
+                hive_id.clone(),
+                self_ilk_id.clone(),
+            )),
+            edge: acme_edge,
+            clock: Arc::new(|| Utc::now().timestamp()),
+            random: Arc::new(rand::random::<f64>),
+            platform_roots: Arc::new(acme::platform_roots),
+            timings: acme::Timings::default(),
+        },
+        state_dir.join("sy-admin/acme.json"),
+        self_ilk_id.clone(),
+        hive_id.clone(),
+    );
+    tokio::spawn(Arc::clone(&acme_service).run());
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -628,6 +672,7 @@ async fn main() -> Result<(), AdminError> {
         publication_lock: Arc::new(Mutex::new(())),
         runtime_manifest_lock: Arc::new(Mutex::new(())),
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
+        acme: acme_service,
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
@@ -3376,6 +3421,9 @@ enum InternalActionRoute {
     StreamStatus,
     /// Admin asks SY.storage for the LLM usage records (A-70 stage 3).
     LlmUsage,
+    /// SY.admin's own ACME client for the public edge's certificate
+    /// (docs/acme-edge-certificates-v1.md §7).
+    Acme,
 }
 
 #[derive(Clone, Copy)]
@@ -3386,7 +3434,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "13";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "14";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3990,6 +4038,30 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: true,
         allow_legacy_hive_id: false,
     },
+    InternalActionSpec {
+        action: "acme_status",
+        route: InternalActionRoute::Acme,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "acme_renew",
+        route: InternalActionRoute::Acme,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "acme_test",
+        route: InternalActionRoute::Acme,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "acme_reload",
+        route: InternalActionRoute::Acme,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 async fn handle_publish_artifact(
@@ -4362,10 +4434,11 @@ fn resolve_artifact_publisher(
 
 /// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator.
 fn hives_registry_root(ctx: &AdminContext) -> PathBuf {
-    ctx.state_dir
-        .parent()
-        .unwrap_or(ctx.state_dir.as_path())
-        .join("hives")
+    hives_registry_root_for(&ctx.state_dir)
+}
+
+fn hives_registry_root_for(state_dir: &Path) -> PathBuf {
+    state_dir.parent().unwrap_or(state_dir).join("hives")
 }
 
 /// Every hive a global write must reach: the motherbee plus each joined hive the registry calls
@@ -4405,12 +4478,19 @@ fn connected_hives_with(self_hive: &str, registry_root: &Path) -> Vec<String> {
 }
 
 fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
-    if let Some(edge) = ctx.public_edge_node.as_deref() {
+    resolve_public_edge_node_from(ctx.public_edge_node.as_deref(), &hives_registry_root(ctx))
+}
+
+/// `admin.public_edge_node`, else the one connected ingress in the hives registry.
+fn resolve_public_edge_node_from(
+    configured: Option<&str>,
+    hives_root: &Path,
+) -> Result<String, String> {
+    if let Some(edge) = configured {
         return validate_public_edge_node(edge).map(str::to_string);
     }
-    let hives_root = hives_registry_root(ctx);
     let mut candidates = Vec::new();
-    let entries = fs::read_dir(&hives_root).map_err(|err| {
+    let entries = fs::read_dir(hives_root).map_err(|err| {
         format!(
             "cannot inspect ingress inventory '{}': {err}",
             hives_root.display()
@@ -5785,12 +5865,91 @@ async fn dispatch_internal_admin_command(
             }
             handle_llm_usage(client, &hive_id, query).await?
         }
+        InternalActionRoute::Acme => {
+            let started = Instant::now();
+            let logged_params = admin_command_log_params(&params);
+            let (status, body) = handle_acme_action(ctx, action, &params).await;
+            if !admin_action_is_read_only(action) {
+                let result = Ok(InternalAdminDispatchResult {
+                    http_status: status,
+                    envelope: parse_internal_response_envelope(action, status, &body),
+                });
+                append_internal_dispatch_log(
+                    ctx,
+                    action,
+                    caller_l2_name,
+                    logged_params,
+                    started,
+                    &result,
+                );
+            }
+            (status, body)
+        }
     };
 
     Ok(InternalAdminDispatchResult {
         http_status: status,
         envelope: parse_internal_response_envelope(action, status, &body),
     })
+}
+
+/// The four actions of SY.admin's ACME client (docs/acme-edge-certificates-v1.md §7). None takes
+/// a parameter: a test order names no URL and a renewal no name, both come from hive.yaml.
+async fn handle_acme_action(
+    ctx: &AdminContext,
+    action: &str,
+    params: &serde_json::Value,
+) -> (u16, String) {
+    let unexpected = match params {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(fields) => fields.keys().next().cloned(),
+        _ => Some("a body that is not an object".to_string()),
+    };
+    let result = if let Some(field) = unexpected {
+        Err(acme::ActionRefusal {
+            http_status: 400,
+            error_code: "INVALID_REQUEST",
+            detail: format!("{action} takes no parameters (got {field})"),
+            payload: serde_json::Value::Null,
+        })
+    } else {
+        match action {
+            "acme_status" => Ok((200, ctx.acme.status().await)),
+            "acme_renew" => ctx.acme.begin_renew().map(|payload| (202, payload)),
+            "acme_test" => ctx.acme.begin_test().map(|payload| (202, payload)),
+            "acme_reload" => ctx.acme.reload_action().await.map(|payload| (200, payload)),
+            _ => Err(acme::ActionRefusal {
+                http_status: 400,
+                error_code: "INVALID_REQUEST",
+                detail: format!("unknown ACME action {action}"),
+                payload: serde_json::Value::Null,
+            }),
+        }
+    };
+    match result {
+        Ok((status, payload)) => (
+            status,
+            serde_json::json!({
+                "status": if status == 202 { "accepted" } else { "ok" },
+                "action": action,
+                "payload": payload,
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        ),
+        Err(refusal) => (
+            refusal.http_status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": refusal.payload,
+                "error_code": refusal.error_code,
+                "error_detail": refusal.detail,
+            })
+            .to_string(),
+        ),
+    }
 }
 
 fn parse_internal_response_envelope(
@@ -7302,6 +7461,41 @@ async fn handle_http(
             let (status, resp) = handle_admin_query(ctx, client, "hive_status", None).await?;
             respond_json(stream, status, &resp).await?;
         }
+        // SY.admin's ACME client for the public edge's certificate
+        // (docs/acme-edge-certificates-v1.md §7).
+        ("GET", "/acme/status") => {
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "acme_status",
+                None,
+                serde_json::json!({}),
+                None,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/acme/renew") => {
+            let payload = acme_http_body(&body);
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "acme_renew", None, payload, None)
+                    .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/acme/test") => {
+            let payload = acme_http_body(&body);
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "acme_test", None, payload, None)
+                    .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/acme/reload") => {
+            let payload = acme_http_body(&body);
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "acme_reload", None, payload, None)
+                    .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
         ("GET", "/versions") => {
             let hive = query.get("hive").cloned();
             if hive.is_some() {
@@ -7461,6 +7655,15 @@ async fn handle_http(
         }
     }
     Ok(())
+}
+
+/// The body of an ACME POST: none, or a JSON object (which must be empty: the actions take no
+/// parameters). Anything else reaches the handler as a non-object and is refused there.
+fn acme_http_body(body: &[u8]) -> serde_json::Value {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return serde_json::json!({});
+    }
+    serde_json::from_slice(body).unwrap_or_else(|_| serde_json::Value::String("unparsable".into()))
 }
 
 async fn handle_inventory_http(
@@ -10122,6 +10325,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
         InternalActionRoute::StreamStatus => ("stream_status", None),
         InternalActionRoute::LlmUsage => ("llm_usage", None),
+        InternalActionRoute::Acme => ("acme", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -10261,6 +10465,9 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "wf_rules_apply"
             | "wf_rules_rollback"
             | "wf_rules_delete"
+            | "acme_renew"
+            | "acme_test"
+            | "acme_reload"
     )
 }
 
@@ -10303,6 +10510,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "opa_apply"
             | "opa_rollback"
             | "opa_clear"
+            | "acme_renew"
+            | "acme_test"
     )
 }
 
@@ -10446,6 +10655,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "wf_rules_apply" => "Apply the staged workflow definition.",
         "wf_rules_rollback" => "Rollback to the backup workflow definition.",
         "wf_rules_delete" => "Delete a managed workflow through SY.wf-rules.",
+        "acme_status" => "Read the ACME client of the public edge's certificate: its configuration (and why it is off), the terms URL, the accounts, the edge's live status, the order in flight, the last attempt and test, the next check and renewal point, the last issued certificates and the open certificate conditions.",
+        "acme_renew" => "Order the public edge's certificate now (forced: no backoff, no cap). Replaces a hand-seeded or foreign certificate, certifies a new name, and lifts an install_refused hold. Answers 202; progress in GET /acme/status.",
+        "acme_test" => "Run a test order against the staging directory with the real name: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
+        "acme_reload" => "Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback.",
         _ => "Admin action.",
     }
 }
@@ -10671,6 +10884,10 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
         "wf_rules_rollback" => vec!["POST /hives/{hive}/wf-rules/rollback"],
         "wf_rules_delete" => vec!["POST /hives/{hive}/wf-rules/delete"],
+        "acme_status" => vec!["GET /acme/status"],
+        "acme_renew" => vec!["POST /acme/renew"],
+        "acme_test" => vec!["POST /acme/test"],
+        "acme_reload" => vec!["POST /acme/reload"],
         _ => Vec::new(),
     }
 }
@@ -11220,7 +11437,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "egress",
                 "object",
-                "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional, defaults to the first usable IP of lan_cidr), ipv6 (optional, only \"blocked\" is supported).",
+                "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional: when absent it is read at join from the one address lan_iface carries inside lan_cidr, and none or several fail the join; when given it must be inside lan_cidr and assigned to lan_iface), reachability_url (optional https URL the internet probe GETs; when absent the motherbee's egress.reachability_url is inherited; there is no default, and without one the probe does not run), ipv6 (optional, only \"blocked\" is supported).",
             ),
             admin_action_body_field(
                 "ingress",
@@ -12156,6 +12373,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "wf_rules_delete" => {
             r#"curl -X POST /hives/motherbee/wf-rules/delete -d '{"workflow_name":"invoice","force":false}'"#
         }
+        "acme_status" => "curl -X GET /acme/status",
+        "acme_renew" => "curl -X POST /acme/renew",
+        "acme_test" => "curl -X POST /acme/test",
+        "acme_reload" => "curl -X POST /acme/reload",
         _ => return None,
     };
     Some(text.to_string())
@@ -12495,6 +12716,32 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "set_storage" => vec![
             "This persists the local storage path in hive.yaml on the target hive.",
+        ],
+        "acme_status" => vec![
+            "Motherbee-only: SY.admin is the ACME client (docs/acme-edge-certificates-v1.md).",
+            "config.state is on, off (with the reason) or absent; without an acme section nothing is ordered and the expiry checks still run.",
+            "The certified name is the host of admin.public_base_url; the edge is admin.public_edge_node, else the one connected ingress (edge.not_configured otherwise).",
+            "edge.live is a fresh EDGE_TLS_STATUS; edge.last_seen is what the last check judged by.",
+            "conditions are the open certificate conditions; each wrote one drift alert when it opened and writes an info row when it closes (GET /drift-alerts).",
+        ],
+        "acme_renew" => vec![
+            "Confirm with the operator first: it spends an order at the CA.",
+            "Takes no body: the name comes from admin.public_base_url and the CA from the acme section.",
+            "409 ACME_BUSY while another ACME run is in flight (one at a time); 409 ACME_OFF, EDGE_NOT_CONFIGURED, ACME_RATE_LIMITED, CERTIFICATE_NOT_SERVED (POST /acme/reload first) or ROLLBACK_PENDING when it cannot start.",
+            "Forced: ignores the failure backoff and the issuance cap, never the CA's rate limit. It is the operator's act that lifts an install_refused hold.",
+            "Puts the certificate in the edge's secret (the previous version stays for rollback) and reloads the edge; the result is in GET /acme/status (last_attempt).",
+        ],
+        "acme_test" => vec![
+            "Confirm with the operator first: it arms the edge's challenge and may create the staging account.",
+            "Takes no body: it orders from acme.staging_directory_url, refused (409 ACME_TEST_SAME_DIRECTORY) when that equals acme.directory_url.",
+            "Runs steps 1-5 of the order flow with the real name and no replaces; nothing is stored or installed. A staging chain is reported as untrusted, as expected.",
+            "The result is in GET /acme/status (last_test).",
+        ],
+        "acme_reload" => vec![
+            "Takes no body. The edge re-reads its secret once: it swaps only a certificate that passes its checks, else keeps the current one and says why (422 EDGE_REFUSED, with refused.reason and refused.detail).",
+            "503 EDGE_VAULT_UNAVAILABLE when the edge got no verdict from SY.vault (reason transient): nothing changed, retry later.",
+            "Use it after a manual vault change or a vault rollback (POST /hives/motherbee/vault/secrets/<key>/rollback).",
+            "504 EDGE_NO_ANSWER when the edge does not answer in 75 s; 502 EDGE_ERROR when it cannot run the command (not a vault edge); 409 ACME_BUSY while an ACME run is in flight.",
         ],
         _ => vec![],
     }
@@ -14722,6 +14969,9 @@ async fn handle_vault_command(
             .to_string(),
         ));
     }
+    if let Some(refusal) = refuse_acme_account_access(action, &payload) {
+        return Ok(refusal);
+    }
     let target = format!("SY.vault@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "vault_list" => (MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE),
@@ -14791,6 +15041,42 @@ async fn handle_vault_command(
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// The admin API (the operator, the executor, Archi, Cloud) never writes SY.admin's ACME accounts
+/// (`acme_account:*`, docs/acme-edge-certificates-v1.md §3), and never reads their value: a swapped
+/// account could reuse an authorization of the last 30 days without the edge, and the value is the
+/// account key. Only the ACME client reads and writes them, straight to SY.vault; their metadata
+/// stays readable.
+fn refuse_acme_account_access(action: &str, payload: &serde_json::Value) -> Option<(u16, String)> {
+    if !matches!(
+        action,
+        "vault_put"
+            | "vault_rotate"
+            | "vault_rollback"
+            | "vault_delete"
+            | "vault_assign"
+            | "vault_get"
+    ) {
+        return None;
+    }
+    let key = payload.get("key").and_then(|value| value.as_str())?;
+    if !acme::is_acme_account_key(key) {
+        return None;
+    }
+    Some((
+        403,
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "RESERVED_KEY",
+            "error_detail": format!(
+                "{key} holds SY.admin's ACME account: the admin API neither reads its value nor writes it"
+            ),
+        })
+        .to_string(),
+    ))
 }
 
 /// Every delete, rotate and rollback names the tenant its key belongs to, and SY.vault refuses a
@@ -15441,7 +15727,10 @@ fn build_admin_request(
         | "list_tenant_nodes"
         | "remove_hive"
         | "core_rollback"
-        | "add_hive" => "SY.orchestrator",
+        | "add_hive"
+        // The ACME client's certificate conditions (docs/acme-edge-certificates-v1.md §7): an
+        // internal call, with no HTTP route.
+        | "record_drift_alert" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
     let route_hive = if action_routes_via_local_orchestrator(action) {
@@ -15668,6 +15957,10 @@ fn admin_action_timeout(action: &str) -> Duration {
         "core_rollback" => Duration::from_secs(
             env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
         ),
+        // A reload waits up to 75 s for the edge (docs/acme-edge-certificates-v1.md §6 step 7).
+        "acme_reload" => Duration::from_secs(90),
+        // The status asks the edge for its live status (20 s); renew and test answer 202 at once.
+        "acme_status" | "acme_renew" | "acme_test" => Duration::from_secs(30),
         // SY.storage answers one usage query at a time, each under a 15 s statement timeout.
         "get_llm_usage" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_USAGE_TIMEOUT_SECS").unwrap_or(20))
@@ -15783,6 +16076,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_node_status"
             | "remove_hive"
             | "add_hive"
+            | "record_drift_alert"
     )
 }
 
@@ -18091,6 +18385,7 @@ mod tests {
             publication_lock: Arc::new(Mutex::new(())),
             runtime_manifest_lock: Arc::new(Mutex::new(())),
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
+            acme: acme::tests::inert_service(&state_dir),
         };
         (ctx, harness)
     }
@@ -21053,5 +21348,118 @@ mod tests {
             ..matches.clone()
         };
         assert!(!wrong_tenant.matches_interest(&interest));
+    }
+
+    /// The admin API never writes SY.admin's ACME accounts, nor reads their value
+    /// (docs/acme-edge-certificates-v1.md §3):
+    /// the operator, the executor, Archi and Cloud all reach SY.vault through
+    /// `handle_vault_command`, which refuses before anything is sent.
+    #[tokio::test]
+    async fn the_admin_api_refuses_writes_to_acme_accounts() {
+        let (ctx, mut harness) = opa_test_admin("acme-account-writes");
+        let key = acme::account_vault_key(acme::LETS_ENCRYPT_DIRECTORY);
+        for (action, payload) in [
+            (
+                "vault_put",
+                json!({"key": key, "value": {"id": "x"}, "metadata": {"resource_type": "acme_account"}}),
+            ),
+            ("vault_rotate", json!({"key": key, "value": {"id": "x"}})),
+            ("vault_rollback", json!({"key": key})),
+            ("vault_delete", json!({"key": key.to_uppercase()})),
+            (
+                "vault_assign",
+                json!({"key": key, "assigned_nodes": ["SY.architect@motherbee"]}),
+            ),
+        ] {
+            let (status, body) = handle_vault_command(&ctx, &ctx.rpc, action, payload, None)
+                .await
+                .expect("answered");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(status, 403, "{action}: {body}");
+            assert_eq!(body["error_code"], "RESERVED_KEY", "{action}");
+        }
+        // Over the mesh, as Archi or Cloud would ask.
+        for caller in [Some("SY.architect@motherbee"), Some("IO.cloud@motherbee")] {
+            let refused = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "vault_put",
+                Some("motherbee"),
+                json!({"key": key, "value": {"id": "x"}, "metadata": {"resource_type": "acme_account", "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID}}),
+                caller,
+            )
+            .await
+            .expect("answered");
+            assert_eq!(refused.http_status, 403, "{caller:?}: {}", refused.envelope);
+        }
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing reached SY.vault"
+        );
+        // Nor is its value read; its metadata is.
+        let (status, body) =
+            handle_vault_command(&ctx, &ctx.rpc, "vault_get", json!({"key": key}), None)
+                .await
+                .expect("answered");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error_code"], "RESERVED_KEY");
+        assert!(refuse_acme_account_access("vault_get_metadata", &json!({"key": key})).is_none());
+        // Other keys are not reserved here.
+        assert!(refuse_acme_account_access("vault_put", &json!({"key": "edge_tls"})).is_none());
+        assert!(refuse_acme_account_access("vault_get", &json!({"key": "edge_tls"})).is_none());
+    }
+
+    /// The four ACME actions are in the catalog with their routes, read-only and confirmation
+    /// flags (docs/acme-edge-certificates-v1.md §7).
+    #[test]
+    fn the_acme_actions_are_registered_with_their_contracts() {
+        for (action, route, read_only, confirm) in [
+            ("acme_status", "GET /acme/status", true, false),
+            ("acme_renew", "POST /acme/renew", false, true),
+            ("acme_test", "POST /acme/test", false, true),
+            ("acme_reload", "POST /acme/reload", false, false),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect(action);
+            assert!(matches!(spec.route, InternalActionRoute::Acme));
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], read_only, "{action}");
+            assert_eq!(doc["confirmation_required"], confirm, "{action}");
+            assert_eq!(doc["path_patterns"], json!([route]), "{action}");
+            assert_ne!(doc["summary"], "Admin action.", "{action}");
+            assert!(!admin_action_request_notes(action).is_empty(), "{action}");
+            assert!(admin_action_example_scmd(action).is_some(), "{action}");
+            let (method, path) = route.split_once(' ').unwrap();
+            assert_eq!(admin_methods_allowed_for_path(path), vec![method]);
+        }
+        assert_eq!(admin_action_timeout("acme_reload"), Duration::from_secs(90));
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "14");
+    }
+
+    #[tokio::test]
+    async fn the_acme_actions_take_no_parameters() {
+        let (ctx, _harness) = opa_test_admin("acme-params");
+        for action in ["acme_status", "acme_renew", "acme_test", "acme_reload"] {
+            let (status, body) =
+                handle_acme_action(&ctx, action, &json!({"directory_url": "https://x"})).await;
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(status, 400, "{action}");
+            assert_eq!(body["error_code"], "INVALID_REQUEST");
+        }
+        // Without an acme section: the status answers, renew and test say why they cannot run.
+        let (status, body) = handle_acme_action(&ctx, "acme_status", &json!({})).await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body["payload"]["config"]["state"], "absent");
+        let (status, body) = handle_acme_action(&ctx, "acme_renew", &json!({})).await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 409);
+        assert_eq!(body["error_code"], "ACME_OFF");
+        assert_eq!(acme_http_body(b""), json!({}));
+        assert_eq!(acme_http_body(b"{}"), json!({}));
+        assert!(!acme_http_body(b"not json").is_object());
     }
 }

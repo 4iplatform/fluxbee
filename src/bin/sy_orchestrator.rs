@@ -203,6 +203,31 @@ struct EgressSection {
     /// but not consumed by reconciliation.
     #[allow(dead_code)]
     edge_hive: Option<String>,
+    /// The URL the internet probe GETs over HTTPS (docs/acme-edge-certificates-v1.md §8). Each
+    /// hive that probes reads its own: the egress, the workers that route through it (add_hive
+    /// renders the motherbee's into theirs) and the motherbee. There is no default: without it
+    /// the probe does not run, and reports `not_configured`.
+    reachability_url: Option<String>,
+}
+
+impl EgressSection {
+    /// The URL this hive's internet probe GETs. `None` when hive.yaml names none, or names one
+    /// `validate_reachability_url` refuses (logged): the probe then does not run, and nothing
+    /// picks a target in its place.
+    fn probe_url(&self) -> Option<String> {
+        let url = self
+            .reachability_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())?;
+        match validate_reachability_url(url, "egress.reachability_url") {
+            Ok(url) => Some(url),
+            Err(err) => {
+                tracing::warn!(error = %err, "the internet probe does not run");
+                None
+            }
+        }
+    }
 }
 
 fn default_ipv6_policy() -> String {
@@ -528,6 +553,11 @@ struct DriftAlertEntry {
     severity: String,
     kind: String,
     message: String,
+    /// `open` or `closed` on a condition SY.admin reports (`record_drift_alert`): it writes a row
+    /// when a condition opens and an `info` row when it closes. The orchestrator's own detectors
+    /// record no state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2525,10 +2555,11 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                         // F5: an egress whose NAT is applied but whose WAN has no
                         // route to the internet is DEGRADED, not healthy. Surface
                         // it on every drift tick (not just once at bootstrap) so an
-                        // operator tailing the journal sees a persistent signal.
-                        if !v.internet_reachable {
+                        // operator tailing the journal sees a persistent signal. Without
+                        // egress.reachability_url there is no probe and nothing to say.
+                        if v.internet_reachable == Some(false) {
                             tracing::warn!(
-                                target = EGRESS_PING_TARGET,
+                                reachability_url = eg.reachability_url.as_deref().unwrap_or_default(),
                                 "egress NAT healthy but internet unreachable — DEGRADED; check WAN uplink"
                             );
                         }
@@ -2590,7 +2621,12 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                     .map(str::trim)
                     .filter(|g| !g.is_empty())
                 {
-                    let _ = verify_motherbee_egress(gateway_ip, false, &state.hive_id);
+                    let _ = verify_motherbee_egress(
+                        gateway_ip,
+                        false,
+                        eg.probe_url().as_deref(),
+                        &state.hive_id,
+                    );
                 }
             }
         }
@@ -2786,6 +2822,9 @@ async fn handle_admin(
         "get_deployments" => get_deployments_flow(state, &msg.payload),
         "list_drift_alerts" => list_drift_alerts_flow(state, &msg.payload),
         "get_drift_alerts" => get_drift_alerts_flow(state, &msg.payload),
+        "record_drift_alert" => {
+            record_drift_alert_flow(msg.routing.src_l2_name.as_deref(), &msg.payload)
+        }
         "get_node_config" => get_node_config_flow(state, &msg.payload).await,
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
         "get_node_status" => get_node_status_flow(state, &msg.payload).await,
@@ -5454,9 +5493,35 @@ fn render_worker_egress_yaml(egress: Option<&EgressSection>) -> Result<String, O
     let gateway_ip: std::net::Ipv4Addr = gateway_ip
         .parse()
         .map_err(|_| format!("invalid egress.gateway_ip '{gateway_ip}': bad IPv4 address"))?;
+    // A worker that routes through the egress probes the internet with the motherbee's URL.
+    let reachability_url = render_reachability_url_yaml(egress.reachability_url.as_deref())?;
     Ok(format!(
-        "egress:\n  gateway_ip: \"{gateway_ip}\"\n  ipv6: \"blocked\"\n"
+        "egress:\n  gateway_ip: \"{gateway_ip}\"\n  ipv6: \"blocked\"\n{reachability_url}"
     ))
+}
+
+/// The `egress:` section of an egress hive's hive.yaml (`add_egress_hive_flow`): the NAT it
+/// reconciles, and the URL its internet probe GETs when the join has one.
+fn render_egress_hive_egress_yaml(
+    nat: &EgressNatConfig,
+    edge_ip: std::net::Ipv4Addr,
+    reachability_url: Option<&str>,
+) -> Result<String, OrchestratorError> {
+    let reachability_url = render_reachability_url_yaml(reachability_url)?;
+    Ok(format!(
+        "egress:\n  enabled: true\n  lan_cidr: \"{}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{}\"\n  lan_iface: \"{}\"\n  ipv6: \"blocked\"\n{reachability_url}",
+        nat.lan_cidr, nat.wan_iface, nat.lan_iface,
+    ))
+}
+
+/// The `reachability_url` line of a rendered `egress:` section, or nothing when there is no URL:
+/// the hive then does not probe the internet (docs/acme-edge-certificates-v1.md §8).
+fn render_reachability_url_yaml(url: Option<&str>) -> Result<String, OrchestratorError> {
+    let Some(url) = url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return Ok(String::new());
+    };
+    let url = validate_reachability_url(url, "egress.reachability_url")?;
+    Ok(format!("  reachability_url: \"{url}\"\n"))
 }
 
 fn ensure_dirs(
@@ -6657,7 +6722,6 @@ const EGRESS_NFT_BOOT_UNIT: &str = "fluxbee-egress-nft.service";
 const EGRESS_NFT_BOOT_UNIT_PATH: &str = "/etc/systemd/system/fluxbee-egress-nft.service";
 const EGRESS_CONNTRACK_MAX: u32 = 262_144;
 const EGRESS_CONNTRACK_HASHSIZE: u32 = 65_536;
-const EGRESS_PING_TARGET: &str = "fluxbee.ai";
 
 /// Resolved + validated egress NAT parameters for a `role: egress` hive.
 struct EgressNatConfig {
@@ -6688,7 +6752,10 @@ struct EgressVerification {
     /// way — `false` is not an error, just an honest "not live yet" (F16).
     conntrack_tuned: bool,
     route_applied: bool,
-    internet_reachable: bool,
+    /// The internet probe, an HTTPS GET of `egress.reachability_url`. `None` when it did not run:
+    /// hive.yaml names no URL (`not_configured`), or this pass did not probe (the motherbee's
+    /// watchdog tick). See `internet_reachable_label`.
+    internet_reachable: Option<bool>,
     /// Motherbee only (PB-8): its observed IPv4 default route equals the declared
     /// `egress.gateway_ip`. Purely observational — on that path `route_applied` is
     /// always `false` by contract, because Fluxbee never touches the control plane's route.
@@ -7151,6 +7218,7 @@ fn motherbee_egress_verdict(declared: &str, observed: Option<&str>) -> Motherbee
 fn verify_motherbee_egress(
     gateway_ip: &str,
     probe_internet: bool,
+    probe_url: Option<&str>,
     verify_hive_id: &str,
 ) -> EgressVerification {
     // `route_applied` stays false on purpose: nothing was applied, and saying otherwise is the
@@ -7160,17 +7228,18 @@ fn verify_motherbee_egress(
     let verdict = motherbee_egress_verdict(gateway_ip, observed.as_deref());
     verification.gateway_matches = verdict == MotherbeeEgressVerdict::Match;
 
-    let probed = probe_internet && (command_exists("ping") || command_exists("curl"));
-    if probed {
-        verification.internet_reachable = check_internet_reachable();
+    if probe_internet {
+        verification.internet_reachable = run_internet_probe(probe_url);
     }
+    let probed = verification.internet_reachable.is_some();
+    let internet_reachable = internet_reachable_label(probe_url, verification.internet_reachable);
 
     match &verdict {
         MotherbeeEgressVerdict::Match => tracing::info!(
             declared_gateway = gateway_ip,
             gateway_matches = true,
             probed = probed,
-            internet_reachable = verification.internet_reachable,
+            internet_reachable = %internet_reachable,
             "motherbee egress path matches the declared gateway (read-only; Fluxbee does not manage this route)"
         ),
         MotherbeeEgressVerdict::Bypass { observed } => {
@@ -7194,7 +7263,7 @@ fn verify_motherbee_egress(
             declared_gateway = gateway_ip,
             observed_gateway = %observed,
             probed = probed,
-            internet_reachable = verification.internet_reachable,
+            internet_reachable = %internet_reachable,
             "EGRESS_MOTHERBEE_BYPASS: this hive's IPv4 default route is not the declared egress gateway; \
              the nodes that run here reach the internet through the observed gateway, outside the managed \
              chokepoint. Fluxbee does NOT rewrite the control plane's route — put motherbee on the egress \
@@ -7211,30 +7280,54 @@ fn verify_motherbee_egress(
     verification
 }
 
-/// Smoke-test that the egress path reaches the internet. Tries ICMP first
-/// (cheap), then falls back to an HTTPS GET of the Fluxbee site. The HTTPS leg
-/// avoids the false-negative where a network blocks ICMP but allows 443 (the
-/// path that actually matters for egress), and doubles as a "is Fluxbee infra
-/// up" check — if the site responds, the deployment's cloud side is alive too.
-fn check_internet_reachable() -> bool {
-    let mut ping = Command::new("ping");
-    ping.arg("-c")
-        .arg("1")
-        .arg("-W")
-        .arg("2")
-        .arg(EGRESS_PING_TARGET);
-    if run_cmd(ping, "ping egress target").is_ok() {
-        return true;
-    }
-    // ICMP failed (or is filtered) — confirm via the real egress protocol (443).
+/// Smoke-test that this hive reaches the internet: an HTTPS GET of `url`, its
+/// `egress.reachability_url` (docs/acme-edge-certificates-v1.md §8). HTTPS is the path the egress
+/// actually serves, so a network that filters ICMP but allows 443 reads as reachable. The URL is
+/// the operator's: the code names no target, and a hive without one does not probe
+/// (`EgressSection::probe_url`).
+fn check_internet_reachable(url: &str) -> bool {
     let mut curl = Command::new("curl");
+    // `--globoff`: the operator's URL is fetched as written, never expanded as a curl glob.
     curl.arg("-fsS")
+        .arg("--globoff")
         .arg("--max-time")
         .arg("5")
         .arg("-o")
         .arg("/dev/null")
-        .arg(format!("https://{EGRESS_PING_TARGET}"));
+        .arg(url);
     run_cmd(curl, "https egress reachability").is_ok()
+}
+
+/// The internet probe against this hive's `probe_url`. `None` when there is no URL, or no `curl`
+/// to GET it with: never a `false` nothing measured, which would log DEGRADED on every drift tick.
+fn run_internet_probe(probe_url: Option<&str>) -> Option<bool> {
+    internet_probe_result(
+        probe_url,
+        || command_exists("curl"),
+        check_internet_reachable,
+    )
+}
+
+/// `run_internet_probe` with its two effects passed in: whether `curl` exists, and the GET.
+fn internet_probe_result(
+    probe_url: Option<&str>,
+    curl_exists: impl FnOnce() -> bool,
+    get: impl FnOnce(&str) -> bool,
+) -> Option<bool> {
+    let url = probe_url?;
+    curl_exists().then(|| get(url))
+}
+
+/// What logs say about the internet probe: its result, `not_configured` when hive.yaml names no
+/// usable `egress.reachability_url` (the probe never runs then), or `not_probed` when it names one
+/// and this pass did not probe (the motherbee's watchdog tick, or no `curl` on the host).
+fn internet_reachable_label(probe_url: Option<&str>, reachable: Option<bool>) -> &'static str {
+    match (reachable, probe_url) {
+        (Some(true), _) => "true",
+        (Some(false), _) => "false",
+        (None, None) => "not_configured",
+        (None, Some(_)) => "not_probed",
+    }
 }
 
 /// The IPv4 addresses `ip -4 -o addr show` prints, one line each
@@ -7570,11 +7663,14 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     // so the boot window (ip_forward=1 but no fluxbee_egress table) is closed.
     ensure_egress_nft_boot_unit()?;
 
-    verification.internet_reachable = check_internet_reachable();
-    if !verification.internet_reachable {
+    // Without egress.reachability_url, or without curl, there is no probe: nothing is fetched in
+    // its place, and nothing is called unreachable.
+    let probe_url = eg.probe_url();
+    verification.internet_reachable = run_internet_probe(probe_url.as_deref());
+    if verification.internet_reachable == Some(false) {
         tracing::warn!(
-            target = EGRESS_PING_TARGET,
-            "egress NAT applied but internet ping failed; check WAN uplink"
+            reachability_url = probe_url.as_deref().unwrap_or_default(),
+            "egress NAT applied but the internet probe failed; check WAN uplink"
         );
     }
 
@@ -7588,17 +7684,21 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
         ipv4_forwarding = verification.ipv4_forwarding,
         ipv6_blocked = verification.ipv6_blocked,
         conntrack_tuned = verification.conntrack_tuned,
-        internet_reachable = verification.internet_reachable,
+        internet_reachable =
+            %internet_reachable_label(probe_url.as_deref(), verification.internet_reachable),
         "egress NAT reconciled"
     );
     Ok(verification)
 }
 
 /// Reconcile a worker's default route + IPv6 block from injected
-/// `egress.gateway_ip` (D2). Reapplied on each boot; persistent by repetition.
+/// `egress.gateway_ip` (D2). Reapplied on each boot; persistent by repetition. The internet probe
+/// GETs `probe_url`, the worker's `egress.reachability_url`, and does not run without one or
+/// without curl (`run_internet_probe`).
 fn reconcile_worker_egress(
     gateway_ip: &str,
     ipv6_policy: &str,
+    probe_url: Option<&str>,
 ) -> Result<EgressVerification, OrchestratorError> {
     let gateway_ip = gateway_ip.trim();
     let _: std::net::Ipv4Addr = gateway_ip
@@ -7631,12 +7731,12 @@ fn reconcile_worker_egress(
         );
     }
 
-    verification.internet_reachable = check_internet_reachable();
+    verification.internet_reachable = run_internet_probe(probe_url);
     tracing::info!(
         gateway_ip = gateway_ip,
         route_applied = verification.route_applied,
         ipv6_blocked = verification.ipv6_blocked,
-        internet_reachable = verification.internet_reachable,
+        internet_reachable = %internet_reachable_label(probe_url, verification.internet_reachable),
         "worker egress route reconciled"
     );
     Ok(verification)
@@ -7673,7 +7773,7 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
                 .map(str::trim)
                 .filter(|g| !g.is_empty())
             {
-                reconcile_worker_egress(gateway_ip, &eg.ipv6)?;
+                reconcile_worker_egress(gateway_ip, &eg.ipv6, eg.probe_url().as_deref())?;
             }
         }
         HiveRole::Motherbee => {
@@ -7687,7 +7787,12 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
                 .map(str::trim)
                 .filter(|g| !g.is_empty())
             {
-                let _ = verify_motherbee_egress(gateway_ip, true, &state.hive_id);
+                let _ = verify_motherbee_egress(
+                    gateway_ip,
+                    true,
+                    eg.probe_url().as_deref(),
+                    &state.hive_id,
+                );
             }
         }
         HiveRole::Ingress => {}
@@ -7780,6 +7885,29 @@ fn validate_yaml_scalar(value: &str, label: &str) -> Result<(), OrchestratorErro
         return Err(format!("{label} contains a character unsafe for a YAML scalar").into());
     }
     Ok(())
+}
+
+/// `egress.reachability_url` (docs/acme-edge-certificates-v1.md §8), the URL the internet probe
+/// GETs: an `https://` URL with a host and no whitespace, safe for the double-quoted hive.yaml
+/// scalar add_hive writes it into. Answers it trimmed.
+fn validate_reachability_url(value: &str, label: &str) -> Result<String, OrchestratorError> {
+    let url = value.trim();
+    validate_yaml_scalar(url, label)?;
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(format!("{label} must be an https:// URL, got '{url}'").into());
+    };
+    if rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(format!("{label} '{url}' names no host").into());
+    }
+    if url.chars().any(char::is_whitespace) {
+        return Err(format!("{label} '{url}' contains whitespace").into());
+    }
+    Ok(url.to_string())
 }
 
 fn validate_runtime_sync_tool(value: &str, label: &str) -> Result<(), OrchestratorError> {
@@ -13160,9 +13288,10 @@ fn get_deployments_flow(
 /// that keeps re-detecting the same drift.
 const DRIFT_ALERT_RETAIN_LINES: usize = 2000;
 
-/// Suppress a repeat of the same (hive, category, kind) within this window. The watchdog
+/// Suppress a repeat of the same alert (hive, category, kind) within this window. The watchdog
 /// re-detects standing drift on every tick; without this the file would fill with one row per
-/// tick and the real history would scroll away.
+/// tick and the real history would scroll away. A condition SY.admin reports
+/// (`record_drift_alert`) repeats only its own newest row: see `drift_alerts_with`.
 const DRIFT_ALERT_DEDUP_WINDOW_MS: u64 = 3_600_000;
 
 /// Serializes check -> rotate -> append. Held across the whole sequence so two detectors racing
@@ -13192,62 +13321,95 @@ fn append_drift_alert(
     remote_hash_before: Option<String>,
     remote_hash_after: Option<String>,
 ) {
-    let Ok(_guard) = DRIFT_ALERT_LOCK.lock() else {
-        tracing::warn!("drift alert lock poisoned; not recording");
-        return;
-    };
-    let path = drift_alerts_path();
-    let now = now_epoch_ms() as u64;
-
-    // Dedup + rotation in one read: standing drift must not flood the file, and the file must
-    // not grow without bound.
-    let mut kept: Vec<String> = Vec::new();
-    if let Ok(existing) = fs::read_to_string(&path) {
-        for line in existing.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<DriftAlertEntry>(line) {
-                if entry.hive_id == hive_id
-                    && entry.category == category
-                    && entry.kind == kind
-                    && now.saturating_sub(entry.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
-                {
-                    // Already reported recently. The log still carries every occurrence.
-                    return;
-                }
-            }
-            kept.push(line.to_string());
-        }
-    }
-
     let entry = DriftAlertEntry {
-        alert_id: format!("{category}-{kind}-{hive_id}-{now}"),
-        detected_at: now,
+        alert_id: String::new(),
+        detected_at: 0,
         category: category.to_string(),
         trigger: "detected".to_string(),
         hive_id: hive_id.to_string(),
         severity: severity.to_string(),
         kind: kind.to_string(),
         message,
+        state: None,
         local_hash,
         remote_hash_before,
         remote_hash_after,
     };
-    let Ok(line) = serde_json::to_string(&entry) else {
-        tracing::warn!(kind = kind, "could not serialize a drift alert");
-        return;
+    if let Err(err) = write_drift_alert(entry) {
+        tracing::warn!(kind = kind, error = %err, "could not record a drift alert");
+    }
+}
+
+/// Stamps `entry` now and appends it to the drift store: `Ok(false)` when it repeats a row from
+/// within `DRIFT_ALERT_DEDUP_WINDOW_MS` (`drift_alerts_with`; the log still carries every
+/// occurrence), `Err` when it could not be written. `append_drift_alert`, the detectors' entry
+/// point, turns an `Err` into a warning; `record_drift_alert` answers it to SY.admin.
+fn write_drift_alert(mut entry: DriftAlertEntry) -> Result<bool, String> {
+    let _guard = DRIFT_ALERT_LOCK
+        .lock()
+        .map_err(|_| "drift alert lock poisoned".to_string())?;
+    let path = drift_alerts_path();
+    let now = now_epoch_ms() as u64;
+    entry.detected_at = now;
+    entry.alert_id = format!("{}-{}-{}-{now}", entry.category, entry.kind, entry.hive_id);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let Some(body) = drift_alerts_with(&existing, &entry)? else {
+        return Ok(false);
     };
+    write_file_atomic(&path, body.as_bytes()).map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+/// The drift store once `entry` is appended to `existing`, keeping the newest
+/// `DRIFT_ALERT_RETAIN_LINES` rows, or `None` when `entry` repeats a row from within
+/// `DRIFT_ALERT_DEDUP_WINDOW_MS` before it. Dedup and rotation in one read: standing drift must
+/// not flood the file, and the file must not grow without bound.
+///
+/// - A detector's row (no `state`) repeats any row of the same alert (hive, category, kind)
+///   without a state.
+/// - A condition's row (`state`) repeats only the newest row of the same alert, and only when
+///   that row has the same state. Its rows are transitions, so open → closed → open within the
+///   hour writes all three, and a second open right after an open is not written.
+fn drift_alerts_with(existing: &str, entry: &DriftAlertEntry) -> Result<Option<String>, String> {
+    let recent = |row: &DriftAlertEntry| {
+        entry.detected_at.saturating_sub(row.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
+    };
+    let mut kept: Vec<String> = Vec::new();
+    // The file is append-only, so the last row of the alert is its newest.
+    let mut newest_of_alert: Option<DriftAlertEntry> = None;
+    for line in existing.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_str::<DriftAlertEntry>(line) {
+            if row.hive_id == entry.hive_id
+                && row.category == entry.category
+                && row.kind == entry.kind
+            {
+                if entry.state.is_none() && row.state.is_none() && recent(&row) {
+                    return Ok(None);
+                }
+                newest_of_alert = Some(row);
+            }
+        }
+        kept.push(line.to_string());
+    }
+    if entry.state.is_some()
+        && newest_of_alert
+            .as_ref()
+            .is_some_and(|newest| newest.state == entry.state && recent(newest))
+    {
+        return Ok(None);
+    }
+    let line = serde_json::to_string(entry)
+        .map_err(|err| format!("could not serialize a drift alert: {err}"))?;
     kept.push(line);
     if kept.len() > DRIFT_ALERT_RETAIN_LINES {
         kept.drain(0..kept.len() - DRIFT_ALERT_RETAIN_LINES);
     }
-
     let mut body = kept.join("\n");
     body.push('\n');
-    if let Err(err) = write_file_atomic(&path, body.as_bytes()) {
-        tracing::warn!(error = %err, "could not record a drift alert");
-    }
+    Ok(Some(body))
 }
 
 fn drift_alerts_path() -> PathBuf {
@@ -13449,6 +13611,149 @@ fn get_drift_alerts_flow(
             "error_code": "DRIFT_ALERTS_READ_FAILED",
             "message": err.to_string(),
             "target": target_hive,
+        }),
+    }
+}
+
+/// The kinds SY.admin's certificate checks raise (docs/acme-edge-certificates-v1.md §7,
+/// "Conditions and alerts"): the only kinds `record_drift_alert` takes, all in the category
+/// `certificate`.
+const CERTIFICATE_DRIFT_ALERT_KINDS: &[&str] = &[
+    "renewal_failed",
+    "renewal_overdue",
+    "expiring",
+    "name_not_covered",
+    "foreign_certificate",
+    "install_refused",
+    "edge_without_certificate",
+    "edge_unreachable",
+];
+
+/// A certificate condition `record_drift_alert` takes, once checked.
+#[derive(Debug, PartialEq, Eq)]
+struct CertificateCondition {
+    kind: &'static str,
+    /// `info` when the condition closed, whatever the request said.
+    severity: &'static str,
+    hive_id: String,
+    detail: String,
+    state: &'static str,
+}
+
+/// `record_drift_alert`'s checks, before anything is written: the sender is `SY.admin@motherbee`
+/// as the router stamps it; `category` is `certificate` and `kind` one of
+/// `CERTIFICATE_DRIFT_ALERT_KINDS`; `severity` is `info`, `warning` or `critical`; `state` is
+/// `open` or `closed`; `hive` is a hive id; `detail` is not empty. The `Err` is the answer.
+fn certificate_condition_from_request(
+    src_l2_name: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<CertificateCondition, serde_json::Value> {
+    let admin = format!("SY.admin@{PRIMARY_HIVE_ID}");
+    if src_l2_name != Some(admin.as_str()) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "FORBIDDEN",
+            "message": format!("record_drift_alert is taken only from {admin}"),
+        }));
+    }
+    let invalid = |message: String| {
+        Err(serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+        }))
+    };
+    let field = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    if field("category") != Some("certificate") {
+        return invalid("record_drift_alert takes only the category 'certificate'".to_string());
+    }
+    let Some(kind) = field("kind").and_then(|kind| {
+        CERTIFICATE_DRIFT_ALERT_KINDS
+            .iter()
+            .copied()
+            .find(|known| *known == kind)
+    }) else {
+        return invalid(format!(
+            "kind must be one of {}",
+            CERTIFICATE_DRIFT_ALERT_KINDS.join(", ")
+        ));
+    };
+    let Some(severity) = field("severity").and_then(|severity| {
+        ["info", "warning", "critical"]
+            .into_iter()
+            .find(|known| *known == severity)
+    }) else {
+        return invalid("severity must be info, warning or critical".to_string());
+    };
+    let Some(state) = field("state")
+        .and_then(|state| ["open", "closed"].into_iter().find(|known| *known == state))
+    else {
+        return invalid("state must be open or closed".to_string());
+    };
+    let Some(hive_id) = field("hive").filter(|hive| valid_hive_id(hive)) else {
+        return invalid("hive must be a hive id".to_string());
+    };
+    let Some(detail) = field("detail") else {
+        return invalid("detail is required".to_string());
+    };
+    Ok(CertificateCondition {
+        kind,
+        severity: if state == "closed" { "info" } else { severity },
+        hive_id: hive_id.to_string(),
+        detail: detail.to_string(),
+        state,
+    })
+}
+
+/// `record_drift_alert` (docs/acme-edge-certificates-v1.md §7): SY.admin records that one of its
+/// certificate conditions opened or closed. This orchestrator is the drift store's only writer, so
+/// SY.admin's rows go through `write_drift_alert` and its dedupe like the detectors' do:
+/// `recorded` is false when the condition's newest row, from the last hour, has the same state.
+fn record_drift_alert_flow(
+    src_l2_name: Option<&str>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let condition = match certificate_condition_from_request(src_l2_name, payload) {
+        Ok(condition) => condition,
+        Err(answer) => {
+            tracing::warn!(src_l2_name = ?src_l2_name, answer = %answer, "record_drift_alert refused");
+            return answer;
+        }
+    };
+    let entry = DriftAlertEntry {
+        alert_id: String::new(),
+        detected_at: 0,
+        category: "certificate".to_string(),
+        trigger: "detected".to_string(),
+        hive_id: condition.hive_id,
+        severity: condition.severity.to_string(),
+        kind: condition.kind.to_string(),
+        message: condition.detail,
+        state: Some(condition.state.to_string()),
+        local_hash: None,
+        remote_hash_before: None,
+        remote_hash_after: None,
+    };
+    match write_drift_alert(entry) {
+        Ok(recorded) => {
+            tracing::info!(
+                kind = condition.kind,
+                state = condition.state,
+                recorded = recorded,
+                "certificate condition recorded"
+            );
+            serde_json::json!({ "status": "ok", "recorded": recorded })
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": "DRIFT_ALERT_WRITE_FAILED",
+            "message": format!("the drift alert was not written: {err}"),
         }),
     }
 }
@@ -22656,7 +22961,13 @@ async fn accept_add_hive(
         Err(err) => return invalid(err.to_string()),
     };
     let role = match resolve_add_hive_role(payload) {
-        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(payload) {
+        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(
+            payload,
+            state
+                .egress
+                .as_ref()
+                .and_then(|eg| eg.reachability_url.as_deref()),
+        ) {
             Ok(section) => JoinRole::Egress(section),
             Err(err) => return invalid(err.to_string()),
         },
@@ -24454,21 +24765,25 @@ async fn add_egress_hive_flow(
             return err_payload("CONFIG_FAILED", err.to_string());
         }
     }
+    // The `egress:` section, with the URL the egress' internet probe GETs when there is one
+    // (checked when the join was accepted).
+    let egress_yaml =
+        match render_egress_hive_egress_yaml(&nat, edge_ip, egress.reachability_url.as_deref()) {
+            Ok(yaml) => yaml,
+            Err(err) => return err_payload("CONFIG_FAILED", err.to_string()),
+        };
     // U-2: this was hardcoded `enabled: false`, which left the egress with no core channel and
     // an `update category=core` that sat at 202 sync_pending forever without ever saying the
     // folder did not exist. It now follows motherbee's dist config like the worker's writer.
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\n{egress_yaml}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
         dist_sync_enabled = state.dist.sync_enabled,
         dist_sync_tool = state.dist.sync_tool,
-        lan_cidr = nat.lan_cidr,
-        edge_ip = edge_ip,
-        wan_iface = nat.wan_iface,
-        lan_iface = nat.lan_iface,
+        egress_yaml = egress_yaml,
         system_nodes = render_system_nodes_yaml(HiveRole::Egress, &egress_system_nodes),
     );
     if let Err(err) = write_remote_file(
@@ -24838,7 +25153,8 @@ async fn add_egress_hive_flow(
     // egress with a misconfigured uplink still reaches here. We therefore report
     // `egress_internet_reachable: null` ("not verified by motherbee in v1") instead of letting
     // "ok" imply a working uplink. The egress host re-checks it every drift tick, in its own
-    // journal. Transmitting the real value back here is the T-VER-1 follow-up.
+    // journal, with an HTTPS GET of `egress_reachability_url`; with none (null) it never probes
+    // (`not_configured`). Transmitting the real value back here is the T-VER-1 follow-up.
     // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
     // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
     let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
@@ -24868,6 +25184,7 @@ async fn add_egress_hive_flow(
         "egress_ipv4_forwarding": booted.ipv4_forwarding,
         "egress_ipv6_blocked": booted.ipv6_blocked,
         "egress_internet_reachable": serde_json::Value::Null,
+        "egress_reachability_url": egress.reachability_url,
         "harden_ssh": harden_ssh,
         "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
@@ -24877,7 +25194,7 @@ async fn add_egress_hive_flow(
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "warnings": add_hive_ssh_warnings(password_login, harden_ssh_applied, address),
-        "note": "egress_edge_ip is the address lan_iface carries, read on the egress host before the install. egress_nat_applied, egress_ipv4_forwarding, egress_ipv6_blocked and egress_lan_leg_ok were read there by this join once its orchestrator was up (the fluxbee_egress table is loaded; net.ipv4.ip_forward is 1; IPv6 is disabled; wan_iface and lan_iface exist; edge_ip is on lan_iface). internet_reachable is checked ONLY on the egress host (at its boot and every drift tick, in its journal); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
+        "note": "egress_edge_ip is the address lan_iface carries, read on the egress host before the install. egress_nat_applied, egress_ipv4_forwarding, egress_ipv6_blocked and egress_lan_leg_ok were read there by this join once its orchestrator was up (the fluxbee_egress table is loaded; net.ipv4.ip_forward is 1; IPv6 is disabled; wan_iface and lan_iface exist; edge_ip is on lan_iface). internet_reachable is checked ONLY on the egress host, with an HTTPS GET of egress_reachability_url (at its boot and every drift tick, in its journal); with no egress_reachability_url the egress does not probe (not_configured). Not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
     })
 }
 
@@ -25886,8 +26203,13 @@ fn resolve_add_hive_ssh_creds(
 /// Parse the host-specific egress params from the `add_hive` payload. The
 /// interface names are host-specific (cannot be known by motherbee in advance),
 /// so they are supplied per-host at provisioning time (spec §6.4).
+///
+/// `reachability_url`, the URL the egress' internet probe GETs, is the request's, else the
+/// motherbee's own `egress.reachability_url` (docs/acme-edge-certificates-v1.md §8). With
+/// neither, the egress does not probe: nothing picks a target for it.
 fn resolve_add_hive_egress_section(
     payload: &serde_json::Value,
+    motherbee_reachability_url: Option<&str>,
 ) -> Result<EgressSection, OrchestratorError> {
     let eg = payload.get("egress").and_then(|v| v.as_object()).ok_or(
         "add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)",
@@ -25898,6 +26220,19 @@ fn resolve_add_hive_egress_section(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    let reachability_url = match eg.get("reachability_url") {
+        None | Some(serde_json::Value::Null) => motherbee_reachability_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| validate_reachability_url(url, "the motherbee's egress.reachability_url"))
+            .transpose()?,
+        Some(value) => Some(validate_reachability_url(
+            value
+                .as_str()
+                .ok_or("egress.reachability_url must be a string")?,
+            "egress.reachability_url",
+        )?),
+    };
     let section = EgressSection {
         enabled: true,
         lan_cidr: get_str("lan_cidr"),
@@ -25907,6 +26242,7 @@ fn resolve_add_hive_egress_section(
         ipv6: get_str("ipv6").unwrap_or_else(default_ipv6_policy),
         gateway_ip: None,
         edge_hive: None,
+        reachability_url,
     };
     // Validate eagerly so the operator gets the error at request time (an omitted edge_ip is
     // read on the box by the join, `egress_edge_ip_on_host`).
@@ -27926,6 +28262,7 @@ mod tests {
                     severity: "error".into(),
                     kind: kind.into(),
                     message: "m".into(),
+                    state: None,
                     local_hash: None,
                     remote_hash_before: None,
                     remote_hash_after: None,
@@ -27989,6 +28326,299 @@ mod tests {
             None,
             None,
             None,
+        );
+    }
+
+    /// docs/acme-edge-certificates-v1.md §7: `record_drift_alert` writes the drift store, so it
+    /// is a write, and the F8 origin gate runs before its flow.
+    #[test]
+    fn record_drift_alert_is_a_write_behind_the_origin_gate() {
+        assert_eq!(
+            classify_admin_action("record_drift_alert"),
+            Some(ActionClass::Write)
+        );
+        assert!(admin_action_requires_origin("record_drift_alert"));
+    }
+
+    fn certificate_condition_request(state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "category": "certificate",
+            "kind": "expiring",
+            "severity": "critical",
+            "hive": "ingress1",
+            "detail": "the served leaf has less than a sixth of its lifetime left",
+            "state": state,
+        })
+    }
+
+    fn refusal_code(answer: Result<CertificateCondition, serde_json::Value>) -> String {
+        answer.expect_err("refused")["error_code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Only `SY.admin@motherbee`, exactly as the router stamps it.
+    #[test]
+    fn record_drift_alert_takes_only_admin_at_motherbee() {
+        let payload = certificate_condition_request("open");
+        assert_eq!(
+            certificate_condition_from_request(Some("SY.admin@motherbee"), &payload),
+            Ok(CertificateCondition {
+                kind: "expiring",
+                severity: "critical",
+                hive_id: "ingress1".to_string(),
+                detail: "the served leaf has less than a sixth of its lifetime left".to_string(),
+                state: "open",
+            })
+        );
+        for origin in [
+            None,
+            Some(""),
+            Some("SY.admin@worker1"),
+            Some("SY.admin@ingress1"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.edge@ingress1"),
+            Some(" SY.admin@motherbee"),
+            Some("SY.admin"),
+        ] {
+            assert_eq!(
+                refusal_code(certificate_condition_from_request(origin, &payload)),
+                "FORBIDDEN",
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// Only the category `certificate`, the eight kinds of §7, and a well-formed condition.
+    #[test]
+    fn record_drift_alert_takes_only_the_certificate_conditions() {
+        let admin = Some("SY.admin@motherbee");
+        let kinds = [
+            "renewal_failed",
+            "renewal_overdue",
+            "expiring",
+            "name_not_covered",
+            "foreign_certificate",
+            "install_refused",
+            "edge_without_certificate",
+            "edge_unreachable",
+        ];
+        assert_eq!(CERTIFICATE_DRIFT_ALERT_KINDS, kinds);
+        for kind in kinds {
+            for severity in ["info", "warning", "critical"] {
+                let mut payload = certificate_condition_request("open");
+                payload["kind"] = kind.into();
+                payload["severity"] = severity.into();
+                let condition = certificate_condition_from_request(admin, &payload).unwrap();
+                assert_eq!((condition.kind, condition.severity), (kind, severity));
+            }
+        }
+        for (field, value) in [
+            ("category", serde_json::json!("egress")),
+            ("category", serde_json::json!("posture")),
+            ("category", serde_json::json!("Certificate")),
+            ("category", serde_json::Value::Null),
+            ("kind", serde_json::json!("expired")),
+            ("kind", serde_json::json!("lan_leg_missing")),
+            ("kind", serde_json::Value::Null),
+            ("severity", serde_json::json!("error")),
+            ("severity", serde_json::json!("CRITICAL")),
+            ("severity", serde_json::Value::Null),
+            ("state", serde_json::json!("resolved")),
+            ("state", serde_json::Value::Null),
+            ("hive", serde_json::json!("../ingress1")),
+            ("hive", serde_json::json!("")),
+            ("hive", serde_json::json!(7)),
+            ("detail", serde_json::json!("   ")),
+            ("detail", serde_json::Value::Null),
+        ] {
+            let mut payload = certificate_condition_request("open");
+            payload[field] = value.clone();
+            assert_eq!(
+                refusal_code(certificate_condition_from_request(admin, &payload)),
+                "INVALID_REQUEST",
+                "{field}={value}"
+            );
+        }
+    }
+
+    /// A closed condition is written with severity `info`, whatever its open row said.
+    #[test]
+    fn a_closed_certificate_condition_is_recorded_as_info() {
+        let closed = certificate_condition_from_request(
+            Some("SY.admin@motherbee"),
+            &certificate_condition_request("closed"),
+        )
+        .unwrap();
+        assert_eq!((closed.state, closed.severity), ("closed", "info"));
+    }
+
+    fn drift_row(category: &str, kind: &str, state: Option<&str>, at: u64) -> DriftAlertEntry {
+        DriftAlertEntry {
+            alert_id: format!("{category}-{kind}-ingress1-{at}"),
+            detected_at: at,
+            category: category.into(),
+            trigger: "detected".into(),
+            hive_id: "ingress1".into(),
+            severity: "warning".into(),
+            kind: kind.into(),
+            message: "m".into(),
+            state: state.map(str::to_string),
+            local_hash: None,
+            remote_hash_before: None,
+            remote_hash_after: None,
+        }
+    }
+
+    /// `drift_alerts_with` on an in-memory store: whether `entry` was written.
+    fn append_drift_row(store: &mut String, entry: DriftAlertEntry) -> bool {
+        match drift_alerts_with(store, &entry).unwrap() {
+            Some(body) => {
+                *store = body;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// (kind, state) of every row of a store, in order.
+    fn drift_rows(store: &str) -> Vec<(String, Option<String>)> {
+        store
+            .lines()
+            .map(|line| serde_json::from_str::<DriftAlertEntry>(line).expect("every row parses"))
+            .map(|row| (row.kind, row.state))
+            .collect()
+    }
+
+    /// A condition's rows are transitions: a row repeats only the newest row of its alert, when
+    /// that has the same state. open → closed → open within the hour writes all three.
+    #[test]
+    fn a_condition_row_repeats_only_its_alerts_newest_row() {
+        let base = 1_700_000_000_000u64;
+        let minute = 60_000u64;
+        let mut store = String::new();
+        let mut append = |kind: &str, state: &str, at: u64| {
+            append_drift_row(&mut store, drift_row("certificate", kind, Some(state), at))
+        };
+        assert!(append("edge_unreachable", "open", base));
+        assert!(
+            !append("edge_unreachable", "open", base + minute),
+            "a second open right after an open is kept out"
+        );
+        assert!(append("edge_unreachable", "closed", base + 10 * minute));
+        assert!(
+            append("edge_unreachable", "open", base + 20 * minute),
+            "it opens again within the hour, after its close"
+        );
+        assert!(!append("edge_unreachable", "open", base + 21 * minute));
+        assert!(append("edge_unreachable", "closed", base + 30 * minute));
+        assert!(
+            append("expiring", "open", base + 31 * minute),
+            "another kind is another alert"
+        );
+        assert!(
+            !append("edge_unreachable", "closed", base + 32 * minute),
+            "another kind's row in between does not make the newest one older"
+        );
+        assert!(
+            append(
+                "edge_unreachable",
+                "closed",
+                base + 30 * minute + DRIFT_ALERT_DEDUP_WINDOW_MS
+            ),
+            "the same state an hour later is written again"
+        );
+
+        let state = |kind: &str, state: &str| (kind.to_string(), Some(state.to_string()));
+        assert_eq!(
+            drift_rows(&store),
+            [
+                state("edge_unreachable", "open"),
+                state("edge_unreachable", "closed"),
+                state("edge_unreachable", "open"),
+                state("edge_unreachable", "closed"),
+                state("expiring", "open"),
+                state("edge_unreachable", "closed"),
+            ]
+        );
+    }
+
+    /// The detectors' rows (no state) keep their rule: any row of the same alert from the last
+    /// hour keeps a new one out.
+    #[test]
+    fn a_detector_row_keeps_the_hour_dedupe() {
+        let base = 1_700_000_000_000u64;
+        let mut store = String::new();
+        let mut append =
+            |kind: &str, at: u64| append_drift_row(&mut store, drift_row("egress", kind, None, at));
+        assert!(append("lan_leg_missing", base));
+        assert!(
+            append("ipv4_forwarding_off", base + 1000),
+            "another kind is another alert"
+        );
+        assert!(
+            !append("lan_leg_missing", base + 2000),
+            "standing drift within the hour is kept out"
+        );
+        assert!(append(
+            "lan_leg_missing",
+            base + DRIFT_ALERT_DEDUP_WINDOW_MS
+        ));
+        assert!(!append(
+            "lan_leg_missing",
+            base + DRIFT_ALERT_DEDUP_WINDOW_MS + 1
+        ));
+
+        assert_eq!(
+            drift_rows(&store),
+            [
+                ("lan_leg_missing".to_string(), None),
+                ("ipv4_forwarding_off".to_string(), None),
+                ("lan_leg_missing".to_string(), None),
+            ]
+        );
+        // A detector's row carries no `state` key at all.
+        assert!(store.lines().all(|line| !line.contains("\"state\"")));
+    }
+
+    /// From SY.admin@motherbee the action reaches its flow: a category other than `certificate`
+    /// is refused there, not answered NOT_IMPLEMENTED, and nothing is written.
+    #[tokio::test]
+    async fn record_drift_alert_refuses_another_category_in_its_flow() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        let mut payload = certificate_condition_request("open");
+        payload["category"] = "egress".into();
+        harness
+            .inject(test_admin_command(
+                "record-drift-alert-trace",
+                "record_drift_alert",
+                payload,
+            ))
+            .await
+            .expect("inject admin command");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("reply emitted")
+            .expect("reply message");
+        assert_eq!(reply.routing.trace_id, "record-drift-alert-trace");
+        assert_eq!(reply.meta.action.as_deref(), Some("record_drift_alert"));
+        assert_eq!(
+            reply.payload["error_code"], "INVALID_REQUEST",
+            "{:?}",
+            reply.payload
         );
     }
 
@@ -28525,6 +29155,7 @@ mod tests {
             ipv6: "blocked".to_string(),
             gateway_ip: None,
             edge_hive: None,
+            reachability_url: None,
         }
     }
 
@@ -29022,6 +29653,185 @@ mod tests {
         section.gateway_ip = Some("192.168.8.1".to_string());
         section.ipv6 = "allowed".to_string();
         assert!(render_worker_egress_yaml(Some(&section)).is_err());
+    }
+
+    /// The `egress:` section a join renders, read back as the hive reads its own hive.yaml.
+    fn rendered_egress_section(yaml: &str) -> EgressSection {
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).expect("rendered yaml parses");
+        serde_yaml::from_value(doc["egress"].clone()).expect("an egress section")
+    }
+
+    /// docs/acme-edge-certificates-v1.md §8: a worker that routes through the egress probes with
+    /// the motherbee's `egress.reachability_url`, and without one it gets none and does not probe.
+    #[test]
+    fn the_worker_egress_yaml_carries_the_motherbees_reachability_url() {
+        let mut section = egress_section(false);
+        section.gateway_ip = Some("192.168.8.1".to_string());
+        section.reachability_url = Some("https://example.com/health".to_string());
+        let yaml = render_worker_egress_yaml(Some(&section)).unwrap();
+        assert_eq!(
+            yaml,
+            "egress:\n  gateway_ip: \"192.168.8.1\"\n  ipv6: \"blocked\"\n  reachability_url: \"https://example.com/health\"\n"
+        );
+        let worker = rendered_egress_section(&yaml);
+        assert_eq!(
+            worker.probe_url().as_deref(),
+            Some("https://example.com/health")
+        );
+        assert_eq!(worker.gateway_ip.as_deref(), Some("192.168.8.1"));
+
+        section.reachability_url = None;
+        let yaml = render_worker_egress_yaml(Some(&section)).unwrap();
+        assert!(!yaml.contains("reachability_url"), "{yaml}");
+        assert_eq!(rendered_egress_section(&yaml).probe_url(), None);
+
+        section.reachability_url = Some("http://example.com/health".to_string());
+        assert!(render_worker_egress_yaml(Some(&section)).is_err());
+
+        // A worker that does not route through an egress gets no section, so no probe either.
+        section.gateway_ip = None;
+        section.reachability_url = Some("https://example.com/health".to_string());
+        assert_eq!(render_worker_egress_yaml(Some(&section)).unwrap(), "");
+    }
+
+    /// docs/acme-edge-certificates-v1.md §8: the egress' own hive.yaml carries the URL its join
+    /// resolved, and nothing when it resolved none.
+    #[test]
+    fn the_egress_hive_yaml_carries_the_reachability_url_of_its_join() {
+        let nat = resolve_egress_nat_config(&egress_section(true)).unwrap();
+        let edge_ip = "192.168.8.1".parse::<std::net::Ipv4Addr>().unwrap();
+        let yaml =
+            render_egress_hive_egress_yaml(&nat, edge_ip, Some("https://example.com/health"))
+                .unwrap();
+        assert!(yaml.ends_with(
+            "  ipv6: \"blocked\"\n  reachability_url: \"https://example.com/health\"\n"
+        ));
+        let egress = rendered_egress_section(&yaml);
+        assert!(egress.enabled);
+        assert_eq!(egress.edge_ip.as_deref(), Some("192.168.8.1"));
+        assert_eq!(egress.lan_cidr.as_deref(), Some("192.168.8.0/24"));
+        assert_eq!(egress.wan_iface.as_deref(), Some("eth0"));
+        assert_eq!(egress.lan_iface.as_deref(), Some("eth1"));
+        assert_eq!(
+            egress.probe_url().as_deref(),
+            Some("https://example.com/health")
+        );
+        resolve_egress_nat_config(&egress).expect("the egress boots on what the join wrote");
+
+        let yaml = render_egress_hive_egress_yaml(&nat, edge_ip, None).unwrap();
+        assert!(!yaml.contains("reachability_url"), "{yaml}");
+        assert_eq!(rendered_egress_section(&yaml).probe_url(), None);
+
+        assert!(render_egress_hive_egress_yaml(&nat, edge_ip, Some("ftp://example.com")).is_err());
+    }
+
+    /// docs/acme-edge-certificates-v1.md §8: the probe GETs only an https URL the operator named.
+    /// Without one it does not run and says `not_configured`; nothing picks a target for it.
+    #[test]
+    fn the_internet_probe_runs_only_against_a_configured_https_url() {
+        for (raw, url) in [
+            ("https://example.com", "https://example.com"),
+            (
+                "  https://example.com/health  ",
+                "https://example.com/health",
+            ),
+            (
+                "https://example.com:8443/health?probe=1#x",
+                "https://example.com:8443/health?probe=1#x",
+            ),
+        ] {
+            assert_eq!(
+                validate_reachability_url(raw, "egress.reachability_url").unwrap(),
+                url
+            );
+        }
+        for bad in [
+            "",
+            "example.com",
+            "http://example.com",
+            "HTTPS://example.com",
+            "ftp://example.com",
+            "https://",
+            "https:///health",
+            "https://?probe=1",
+            "https://exa mple.com",
+            "https://example.com/\"x",
+            "https://example.com/\\x",
+            "https://example.com\n/x",
+        ] {
+            assert!(
+                validate_reachability_url(bad, "egress.reachability_url").is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+
+        // not_configured: no URL, a blank one or one that is refused. The probe does not run.
+        let mut section = egress_section(true);
+        for unusable in [None, Some("   "), Some("http://example.com")] {
+            section.reachability_url = unusable.map(str::to_string);
+            assert_eq!(section.probe_url(), None, "{unusable:?}");
+        }
+        section.reachability_url = Some("https://example.com".to_string());
+        assert_eq!(section.probe_url().as_deref(), Some("https://example.com"));
+
+        assert_eq!(EgressVerification::default().internet_reachable, None);
+        assert_eq!(internet_reachable_label(None, None), "not_configured");
+        assert_eq!(
+            internet_reachable_label(Some("https://example.com"), None),
+            "not_probed"
+        );
+        assert_eq!(
+            internet_reachable_label(Some("https://example.com"), Some(true)),
+            "true"
+        );
+        assert_eq!(
+            internet_reachable_label(Some("https://example.com"), Some(false)),
+            "false"
+        );
+
+        // The probe fetches the URL it is given and names no target of its own.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn check_internet_reachable(")
+            .expect("check_internet_reachable");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        assert!(body.contains(".arg(url)"));
+        assert!(!body.contains("\"https://"));
+        assert!(!body.contains("Command::new(\"ping\")"));
+    }
+
+    /// Without curl the probe measures nothing: `None` (`not_probed`), never a `false` that would
+    /// log DEGRADED on every drift tick. Every hive's probe goes through that check.
+    #[test]
+    fn the_internet_probe_without_curl_measures_nothing() {
+        let url = Some("https://example.com/health");
+        let no_get = |_: &str| -> bool { panic!("nothing may be fetched") };
+        let no_check = || -> bool { panic!("no URL, no curl check") };
+        assert_eq!(internet_probe_result(None, no_check, no_get), None);
+        let without_curl = internet_probe_result(url, || false, no_get);
+        assert_eq!(without_curl, None);
+        assert_eq!(internet_reachable_label(url, without_curl), "not_probed");
+        assert_eq!(
+            internet_probe_result(url, || true, |got| got == "https://example.com/health"),
+            Some(true)
+        );
+        assert_eq!(internet_probe_result(url, || true, |_| false), Some(false));
+
+        // The egress, the worker and the motherbee all probe through `run_internet_probe`.
+        let src = include_str!("sy_orchestrator.rs");
+        let body_of = |name: &str| {
+            let start = src.find(name).expect(name);
+            &src[start..start + src[start..].find("\n}\n").expect("its end")]
+        };
+        for function in [
+            "fn reconcile_egress_nat(",
+            "fn reconcile_worker_egress(",
+            "fn verify_motherbee_egress(",
+        ] {
+            let body = body_of(function);
+            assert!(body.contains("run_internet_probe("), "{function}");
+            assert!(!body.contains("check_internet_reachable"), "{function}");
+        }
     }
 
     #[test]
@@ -29808,26 +30618,109 @@ mod tests {
 
     #[test]
     fn resolve_add_hive_egress_section_parses_and_validates() {
-        let section = resolve_add_hive_egress_section(&serde_json::json!({
-            "egress": {
-                "lan_cidr": "192.168.8.0/24",
-                "wan_iface": "eth0",
-                "lan_iface": "eth1"
-            }
-        }))
+        let section = resolve_add_hive_egress_section(
+            &serde_json::json!({
+                "egress": {
+                    "lan_cidr": "192.168.8.0/24",
+                    "wan_iface": "eth0",
+                    "lan_iface": "eth1"
+                }
+            }),
+            None,
+        )
         .unwrap();
         assert!(section.enabled);
         assert_eq!(section.lan_cidr.as_deref(), Some("192.168.8.0/24"));
         assert_eq!(section.ipv6, "blocked");
         assert!(section.gateway_ip.is_none());
+        assert!(section.reachability_url.is_none());
 
         // missing required iface → rejected at request time.
-        assert!(resolve_add_hive_egress_section(&serde_json::json!({
-            "egress": { "lan_cidr": "192.168.8.0/24", "wan_iface": "eth0" }
-        }))
+        assert!(resolve_add_hive_egress_section(
+            &serde_json::json!({
+                "egress": { "lan_cidr": "192.168.8.0/24", "wan_iface": "eth0" }
+            }),
+            None,
+        )
         .is_err());
         // missing egress object entirely → rejected.
-        assert!(resolve_add_hive_egress_section(&serde_json::json!({})).is_err());
+        assert!(resolve_add_hive_egress_section(&serde_json::json!({}), None).is_err());
+    }
+
+    /// docs/acme-edge-certificates-v1.md §8: the egress join's probe URL is the request's, else
+    /// the motherbee's; with neither the egress does not probe. Only an https URL is taken.
+    #[test]
+    fn the_egress_join_takes_its_reachability_url_from_the_request_or_the_motherbee() {
+        let request = |reachability_url: serde_json::Value| {
+            let mut egress = serde_json::json!({
+                "lan_cidr": "192.168.8.0/24",
+                "wan_iface": "eth0",
+                "lan_iface": "eth1",
+            });
+            if !reachability_url.is_null() {
+                egress["reachability_url"] = reachability_url;
+            }
+            serde_json::json!({ "egress": egress })
+        };
+        let resolve = |payload: &serde_json::Value, motherbee: Option<&str>| {
+            resolve_add_hive_egress_section(payload, motherbee).map(|eg| eg.reachability_url)
+        };
+        let mother = Some("https://status.example.com/health");
+
+        // The request's wins, trimmed.
+        assert_eq!(
+            resolve(
+                &request(serde_json::json!(" https://example.com/ping ")),
+                mother
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://example.com/ping")
+        );
+        // Without one, the motherbee's.
+        assert_eq!(
+            resolve(&request(serde_json::Value::Null), mother)
+                .unwrap()
+                .as_deref(),
+            mother
+        );
+        let explicit_null = serde_json::json!({ "egress": {
+            "lan_cidr": "192.168.8.0/24", "wan_iface": "eth0", "lan_iface": "eth1",
+            "reachability_url": null,
+        }});
+        assert_eq!(resolve(&explicit_null, mother).unwrap().as_deref(), mother);
+        // Neither: no URL, so the egress does not probe. Nothing picks one.
+        assert_eq!(
+            resolve(&request(serde_json::Value::Null), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve(&request(serde_json::Value::Null), Some("  ")).unwrap(),
+            None
+        );
+
+        // Only https, from either side.
+        for bad in [
+            serde_json::json!("http://example.com"),
+            serde_json::json!("example.com"),
+            serde_json::json!(""),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                resolve(&request(bad.clone()), mother).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        let err = resolve(
+            &request(serde_json::Value::Null),
+            Some("http://example.com"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("the motherbee's egress.reachability_url"),
+            "{err}"
+        );
     }
 
     fn sample_syncthing_config_with_peer() -> String {

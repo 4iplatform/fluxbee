@@ -65,9 +65,10 @@ vault consumer (`SY.admin`, `SY.architect`, `SY.storage`, `SY.identity`, `SY.cog
 
 The reason is the startup announcement. `emit_bootstrap_secret_broadcasts` sends one
 `VAULT_SECRET_CHANGED` (`op=put`) per stored secret, marked with `meta.action = "bootstrap"`
-(`VAULT_BOOTSTRAP_ACTION`). A router broadcast reaches only the nodes registered at that moment
-(the comment in `validate_system_nodes`), so the consumers must already be on the router. A
-consumer that boots without its secret reacts to that announcement.
+(`VAULT_BOOTSTRAP_ACTION`), and the same notice to the edge that owns the secret, if one does
+(see [VAULT_SECRET_CHANGED](#vault_secret_changed)). A router broadcast reaches only the nodes
+registered at that moment (the comment in `validate_system_nodes`), so the consumers must already
+be on the router. A consumer that boots without its secret reacts to that announcement.
 
 Details that follow from the code:
 
@@ -132,7 +133,7 @@ by the WAN router; on one host it is the name the process declared when it conne
 
 1. The caller owns the secret (`metadata.ilk` equals the caller's ILK).
 2. The caller is in `assigned_ilks`.
-3. The secret is general and:
+3. The secret is general, the caller is not an edge, and:
    - it is in the root tenant and the caller's ILK is in the system set computed from
      hive.yaml, or the identity SHM types the caller as `system`. A `SY.*` node the SHM does not
      hold yet (for example a worker's SY node while the motherbee's identity restarts) gets
@@ -141,6 +142,13 @@ by the WAN router; on one host it is the name the process declared when it conne
 4. Anything else is `UNAUTHORIZED`. There is no administrator bypass: SY.admin cannot read the
    value of a secret owned by or assigned to another node, nor of a non-root tenant's general
    secret.
+
+An edge (stamped name `SY.edge@<hive>`, `caller_is_an_edge`) runs in the DMZ and reads only the
+secrets it owns or is assigned: its certificate, its channel secrets. A general secret is
+`UNAUTHORIZED` for it, whatever the SHM says of it
+([acme-edge-certificates-v1.md](../acme-edge-certificates-v1.md) §5). Before this rule a root
+tenant's general secret was kept from it only because its ILK does not resolve on the motherbee,
+with a retryable `IDENTITY_UNAVAILABLE`.
 
 For `VAULT_GET` the value goes out only while the secret's tenant is active
 (`ensure_tenant_active`, `tenant_check`): the root tenant always counts as active; otherwise the
@@ -168,7 +176,8 @@ lists with `limit: 1` (newest `updated_at` first) and then gets that key.
 Operators and Fluxbee Cloud write through SY.admin, which adds its own gates in
 `src/bin/sy_admin.rs`: the IO.cloud relay may only put, list, assign and delete inside the
 tenant it claims, never the root tenant, never a reserved key, and never set `metadata.ilk`,
-`owner_ilk` or `owner_l2` (`enforce_cloud_relay_content`). Any hive's `SY.orchestrator` may call
+`owner_ilk` or `owner_l2` (`enforce_cloud_relay_content`); no admin-API caller, the operator
+included, touches an `acme_account*` key (see [Reserved keys](#reserved-keys)). Any hive's `SY.orchestrator` may call
 `vault_list` and `vault_delete` to remove the secrets a node owns when the node is purged
 (`ORCHESTRATOR_TEARDOWN_ACTIONS` in `authorize_cloud_relay`).
 
@@ -210,22 +219,44 @@ error answer is `{status: "error", error_code, message}`.
 ### Reserved keys
 
 `CLOUD_RESERVED_VAULT_KEY_PREFIXES` in `crates/fluxbee_sdk/src/vault.rs`: `edge_channel_secret:`,
-`edge_tls`, `ssh:`, `edge_fanout_verify:` (prefix match, case-insensitive,
-`is_cloud_reserved_vault_key`). This is not a vault rule: SY.vault does not check it. SY.admin
-refuses these keys only when the IO.cloud relay asks for a put, assign or delete
-(`enforce_cloud_relay_content`). SY.admin itself stores `edge_channel_secret:<ich>` and the
-fanout verify token, owned by the edge node.
+`edge_tls`, `ssh:`, `edge_fanout_verify:`, `acme_account` (prefix match, case-insensitive,
+`is_cloud_reserved_vault_key`). These are not vault rules: SY.vault checks none of them. SY.admin
+enforces them in its admin API (`src/bin/sy_admin.rs`):
+
+- The IO.cloud relay may not put, assign or delete any of these keys
+  (`enforce_cloud_relay_content`). SY.admin itself stores `edge_channel_secret:<ich>` and the
+  fanout verify token, owned by the edge node.
+- `acme_account*` holds SY.admin's ACME accounts, owned by SY.admin, one per directory URL:
+  `acme_account:<16 hex of SHA-256(directory_url)>`
+  ([acme-edge-certificates-v1.md](../acme-edge-certificates-v1.md) §3). No admin-API caller, the
+  operator included, may put, rotate, roll back, delete, assign or read the value of one: each is
+  refused with `403 RESERVED_KEY` before anything reaches SY.vault. Only SY.admin's own ACME client
+  writes and reads them.
 
 ## VAULT_SECRET_CHANGED
 
 After a mutation that changed something (a put with `changed: true`, rotate, delete, rollback,
 an assign with `changed: true`), SY.vault broadcasts `VAULT_SECRET_CHANGED`
-(`send_broadcast_secret_changed`): `Destination::Broadcast`, scope `global`, a new trace id. The
-payload (`VaultSecretChangedPayload` in `crates/fluxbee_sdk/src/protocol.rs`) carries metadata
-only, never the value: `op` (`put|rotate|delete|rollback|assign`), `resource_type`, `tenant_id`,
-`ilk`, `assigned_ilks` (current and previous, plus a previous owner the change removed),
-`general` (now or before the change), `version` (`0` on delete), `key`, `hive_id`, `at_ms`
-(`build_secret_changed_payload`). A secret without `resource_type` is never announced.
+(`secret_changed_notices`, `send_secret_changed_notice`): `Destination::Broadcast`, scope
+`global`, a new trace id. The payload (`VaultSecretChangedPayload` in
+`crates/fluxbee_sdk/src/protocol.rs`) carries metadata only, never the value: `op`
+(`put|rotate|delete|rollback|assign`), `resource_type`, `tenant_id`, `ilk`, `assigned_ilks`
+(current and previous, plus a previous owner the change removed), `general` (now or before the
+change), `version` (`0` on delete), `key`, `hive_id`, `at_ms` (`build_secret_changed_payload`). A
+secret without `resource_type` is never announced.
+
+**The edge gets its own notices addressed to it (A-78).** The broadcast names every stored key,
+its tenant and its owners, so the router never lets it reach an `SY.edge` in the DMZ
+(`vpn_allows_broadcast_between` in `src/router/mod.rs`). When the secret's owner, as the read
+rules see it (`ilk`, else the legacy `owner_ilk`: `secret_owner_ilk`), is an edge, SY.vault also
+sends the same notice, without the global scope, as a unicast to that edge by
+name: on every change above and in the boot re-announcement (marked `bootstrap` like the
+broadcast). The vault keeps the owner as an ILK, so it matches it against the deterministic ILK of
+`SY.edge@<hive>` for its own hive and for every hive in SY.orchestrator's registry
+(`/var/lib/fluxbee/hives/<hive_id>/`, read at each change; `edge_nodes`, `edge_owner`). An edge
+the secret is only assigned to, or one of a hive the registry does not list, gets nothing. The
+router admits the unicast only from `SY.vault@motherbee` to an `SY.edge`
+([routing-and-policy.md](../reference/routing-and-policy.md) §8.2).
 
 Consumers filter with `VaultSecretChangedPayload::matches_interest`, which mirrors the read
 rules. What they do:
@@ -233,8 +264,8 @@ rules. What they do:
 - SY.storage and SY.identity exit with status 0 so systemd restarts them with the new value,
   and only when the event comes from `SY.vault@<own hive>` (`handle_vault_secret_changed` in
   `src/bin/sy_storage.rs`).
-- SY.edge re-resolves its channel secrets and treats the bootstrap re-announcement differently
-  from a real TLS change (`VAULT_BOOTSTRAP_ACTION`, `src/bin/sy_edge.rs`).
+- SY.edge acts on the unicast above: it re-resolves its channel secrets, and a notice about its
+  certificate's key reaches its TLS handling (`src/bin/sy_edge.rs`, [SY.edge](sy-edge.md)).
 - SY.admin and SY.cognition re-resolve their AI key (`handle_vault_secret_changed_admin` in
   `src/bin/sy_admin.rs`; the handler in `src/bin/sy_cognition.rs`).
 
@@ -251,7 +282,8 @@ identity SHM, or deterministically for a `SY.*` name. It rejects the legacy `met
 ## Config
 
 SY.vault has no `CONFIG_SET`. Its inputs are `/etc/fluxbee/hive.yaml` (`hive_id`, `role`,
-`system_nodes`) and `JSR_LOG_LEVEL`. Paths are constants: `DEFAULT_DB_PATH`,
+`system_nodes`), the hive registry's directory names (`/var/lib/fluxbee/hives`, to name the
+edges) and `JSR_LOG_LEVEL`. Paths are constants: `DEFAULT_DB_PATH`,
 `DEFAULT_MASTER_KEY_PATH`, `DEFAULT_LOCK_PATH`.
 
 ## State on disk
@@ -273,13 +305,15 @@ SY.vault has no `CONFIG_SET`. Its inputs are `/etc/fluxbee/hive.yaml` (`hive_id`
 - If the router channel closes, the main loop returns and the process exits; systemd restarts it.
 - With the identity SHM unavailable, non-SY callers get `IDENTITY_UNAVAILABLE` and SY callers of
   this hive still read the root tenant's general secrets (the boot path).
-- A failed broadcast is logged (`failed to emit VAULT_SECRET_CHANGED broadcast`); the answer to
-  the caller was already sent.
+- A failed notice, broadcast or unicast to an edge, is logged (`failed to emit
+  VAULT_SECRET_CHANGED`); the answer to the caller was already sent.
 
 ## Health
 
 - `systemctl status sy-vault` and `journalctl -u sy-vault`. Startup logs `sy.vault started` and
-  then `sy.vault bootstrap broadcast complete` (or `vault.db is empty, nothing to announce`).
+  then `sy.vault bootstrap broadcast complete` with `emitted` and `edge_notices` (or `vault.db is
+  empty, nothing to announce`). Each change logs `vault secret changed broadcast sent`, and
+  `vault secret changed notice sent to the edge that owns the secret` with the edge's name.
 - The node answers `NODE_STATUS_GET` with the SDK default handler
   (`try_handle_default_node_status` in `crates/fluxbee_sdk/src/status.rs`).
 - `curl -s 127.0.0.1:8080/hives/motherbee/vault/secrets` on the motherbee lists metadata; an

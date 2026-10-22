@@ -43,6 +43,11 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "EDGE_LIST_URLS",
     "EDGE_PUBLISH_BLOB",
     "EDGE_UNPUBLISH_BLOB",
+    // The edge's own certificate: what it serves, a reload from the vault, and the TLS-ALPN-01
+    // challenge it answers while SY.admin orders (docs/acme-edge-certificates-v1.md §4).
+    "EDGE_TLS_STATUS",
+    "EDGE_TLS_RELOAD",
+    "EDGE_ACME_CHALLENGE",
     "SPAWN_NODE",
     "KILL_NODE",
     "START_NODE",
@@ -70,8 +75,8 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
 /// it; it is the SDK's value, so nodes outside this crate cannot drift from it either.
 pub const PRIMARY_HIVE_ID: &str = fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 
-/// The single node authorized to COMMAND an edge (open/close/list URLs) and to receive its
-/// control responses: `SY.admin` on the primary hive. Canonical name — the router's
+/// The single node authorized to COMMAND an edge (its URLs and public blobs, its certificate) and
+/// to receive its control responses: `SY.admin` on the primary hive. Canonical name — the router's
 /// edge-control reachability gates and the edge's own service-command check all reference
 /// THIS constant so the copies of the literal cannot drift. (`policy/system.rego` rule (1)
 /// composes the same decision from role + PRIMARY_HIVE_ID.)
@@ -578,6 +583,9 @@ mod tests {
             "EDGE_LIST_URLS",
             "EDGE_PUBLISH_BLOB",
             "EDGE_UNPUBLISH_BLOB",
+            "EDGE_TLS_STATUS",
+            "EDGE_TLS_RELOAD",
+            "EDGE_ACME_CHALLENGE",
         ];
         for action in never_sent
             .iter()
@@ -606,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_27_actions() {
+    fn protected_set_is_the_30_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -615,6 +623,10 @@ mod tests {
             "EDGE_LIST_URLS",
             "EDGE_PUBLISH_BLOB",
             "EDGE_UNPUBLISH_BLOB",
+            // The edge's certificate and its ACME challenge (docs/acme-edge-certificates-v1.md §5).
+            "EDGE_TLS_STATUS",
+            "EDGE_TLS_RELOAD",
+            "EDGE_ACME_CHALLENGE",
             "SPAWN_NODE",
             "KILL_NODE",
             "START_NODE",
@@ -643,8 +655,19 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 27);
-        for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 30);
+        for action in [
+            "RUNTIME_UPDATE",
+            "HELLO",
+            "LSA",
+            "",
+            "TOTALLY_UNKNOWN",
+            // The answers are not commands: the router's edge gate admits them only back to the
+            // Admin (src/router/mod.rs), and nothing acts on them.
+            "EDGE_TLS_STATUS_RESPONSE",
+            "EDGE_TLS_RELOAD_RESPONSE",
+            "EDGE_ACME_CHALLENGE_RESPONSE",
+        ] {
             assert!(!is_protected_system_action(action));
         }
     }
@@ -684,35 +707,41 @@ mod tests {
 
     #[test]
     fn edge_service_actions_are_motherbee_admin_only() {
-        let ingress_hive = "edge-1";
         for action in [
             "EDGE_OPEN_URL",
             "EDGE_CLOSE_URL",
             "EDGE_LIST_URLS",
             "EDGE_PUBLISH_BLOB",
             "EDGE_UNPUBLISH_BLOB",
+            "EDGE_TLS_STATUS",
+            "EDGE_TLS_RELOAD",
+            "EDGE_ACME_CHALLENGE",
         ] {
-            assert!(authorize_system(
-                action,
-                Some("SY.admin@motherbee"),
-                ingress_hive
-            ));
-            assert!(!authorize_system(
-                action,
-                Some("SY.admin@edge-1"),
-                ingress_hive
-            ));
-            assert!(!authorize_system(
-                action,
-                Some("SY.orchestrator@motherbee"),
-                ingress_hive
-            ));
-            assert!(!authorize_system(
-                action,
-                Some("IO.cloud@motherbee"),
-                ingress_hive
-            ));
-            assert!(!authorize_system(action, None, ingress_hive));
+            // Rule (1) answers whatever hive the edge runs on, the motherbee included.
+            for edge_hive in ["edge-1", "ingress1", "motherbee"] {
+                assert!(
+                    authorize_system(action, Some("SY.admin@motherbee"), edge_hive),
+                    "SY.admin@motherbee must be admitted for {action} on {edge_hive}"
+                );
+                for rogue in [
+                    Some("SY.admin@edge-1"),
+                    Some("SY.admin@ingress1"),
+                    Some("SY.orchestrator@motherbee"),
+                    Some("SY.orchestrator@ingress1"),
+                    Some("SY.edge@ingress1"),
+                    Some("SY.vault@motherbee"),
+                    Some("SY.architect@motherbee"),
+                    Some("IO.cloud@motherbee"),
+                    Some("SY.admin.relay@motherbee"),
+                    Some("SY.admin"),
+                    None,
+                ] {
+                    assert!(
+                        !authorize_system(action, rogue, edge_hive),
+                        "{rogue:?} must be denied {action} on {edge_hive}"
+                    );
+                }
+            }
         }
     }
 

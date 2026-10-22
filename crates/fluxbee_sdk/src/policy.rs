@@ -100,7 +100,10 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         "set_node_config"
         | "node_control_config_set"
         | "publish_artifact"
-        | "unpublish_artifact" => Some(ActionClass::Write),
+        | "unpublish_artifact"
+        // SY.admin's certificate conditions, written to the orchestrator's drift store
+        // (docs/acme-edge-certificates-v1.md §7): a write, so the F8 origin gate runs.
+        | "record_drift_alert" => Some(ActionClass::Write),
         "add_route"
         | "delete_route"
         | "add_vpn"

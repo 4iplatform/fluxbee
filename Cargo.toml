@@ -54,4 +54,15 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 rustls-pemfile = "2"
 x509-parser = "0.16"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "client-legacy", "http1", "http2"] }
+# SY.admin's ACME client for the public edge's certificate (docs/acme-edge-certificates-v1.md §6).
+# Pinned exactly; `ring` keeps aws-lc-rs out, and the CA's TLS is verified against the system
+# store (the .deb depends on ca-certificates).
+instant-acme = { version = "=0.8.5", default-features = false, features = ["ring", "hyper-rustls", "time"] }
+# The platform roots an issued chain must verify to before it is stored (§6 step 5).
+rustls-native-certs = "0.8"
+# A plain GET of the ACME directory (its terms URL and profiles); declared as the AI SDK does.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The HTTPS client SY.admin hands instant-acme, so the CA's TLS is checked against the same roots
+# as the directory and ARI reads: the system's, plus `acme.trust_anchor` (§3).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }

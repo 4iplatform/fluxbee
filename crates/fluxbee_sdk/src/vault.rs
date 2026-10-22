@@ -602,6 +602,9 @@ pub fn vault_key_is_valid(key: &str) -> bool {
 ///   writes it now, and it stays reserved so no Cloud caller takes the name.
 /// - `edge_fanout_verify:<ich>` — the token the edge answers a fanout endpoint's verification
 ///   challenge with (Meta's `hub.challenge`); overwriting it breaks or re-points that webhook.
+/// - `acme_account:<16 hex>` — SY.admin's account at an ACME certificate authority, one per
+///   directory URL (docs/acme-edge-certificates-v1.md §3); overwriting it swaps the account the
+///   edge's certificate is ordered with.
 ///
 /// This is NOT a general vault ACL: only the Cloud-relay origin is bound, for writes and deletes
 /// alike (enforced SERVER-SIDE in SY.admin's `enforce_cloud_relay_content`, mirrored in io.cloud
@@ -612,6 +615,7 @@ pub const CLOUD_RESERVED_VAULT_KEY_PREFIXES: &[&str] = &[
     "edge_tls",
     "ssh:",
     "edge_fanout_verify:",
+    "acme_account",
 ];
 
 /// True when `key` falls in a hive-infrastructure namespace the Cloud relay may never write
@@ -1045,7 +1049,9 @@ mod tests {
             "edge_tls:motherbee",
             "ssh:motherbee",
             "edge_fanout_verify:ich:14b66389-d425-531c-a140-a591d25e8f39",
+            "acme_account:3f2a9c0d1b4e5f67", // SY.admin's ACME account, one per directory URL
             "  EDGE_CHANNEL_SECRET:ich:abc  ", // stray case/whitespace must not slip past
+            " ACME_ACCOUNT:3f2a9c0d1b4e5f67",
         ] {
             assert!(
                 is_cloud_reserved_vault_key(reserved),
@@ -1057,7 +1063,7 @@ mod tests {
             "slack:auth:bot",
             "openai",
             "bearer_token",
-            "acme:stripe:key",
+            "acme:stripe:key", // a tenant named acme, not the ACME account namespace
             "sshkey_for_tenant", // does not start with the reserved `ssh:` namespace
         ] {
             assert!(

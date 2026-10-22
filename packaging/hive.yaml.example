@@ -33,8 +33,22 @@ admin:
   # Absolute public origin for /public/<key> URLs and the base external clients use.
   # MUST be a DNS HOSTNAME that the edge TLS cert covers (e.g. this hive's opaque
   # hive-<hash>.<domain> name), NEVER a bare IP — an IP fails cert validation and TLS
-  # aborts (handshake eof) for any client that verifies the cert. One per hive.
+  # aborts (handshake eof) for any client that verifies the cert. One per hive. With an
+  # `acme:` section below, its host is also the name SY.admin certifies.
   # public_base_url: "https://hive-<hash>.example.com"
+
+# The edge's certificate from an ACME CA (Let's Encrypt by default), issued and renewed by
+# SY.admin with the TLS-ALPN-01 challenge on the edge's :443 (docs/acme-edge-certificates-v1.md).
+# Needs public_edge_node and public_base_url above, the name's DNS pointing at the ingress, and
+# :443 reachable from the whole internet. Without this section the edge serves a certificate
+# seeded by hand (see `edge:` below) and SY.admin only watches its expiry. Read GET /acme/status.
+# acme:
+#   terms_agreed: true          # required: you accept the CA's terms of service
+#   directory_url: "https://acme-v02.api.letsencrypt.org/directory"                 # default
+#   staging_directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory" # default
+#   profile: "classic"          # optional; the CA's default when absent
+#   contact: "mailto:ops@example.com"   # optional
+#   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # only for a private CA
 
 # Archi's HTTP UI/API. Loopback only: it has no authentication (FINDINGS A-46). Use it on the
 # motherbee itself, or from another machine through an SSH tunnel:
@@ -146,17 +160,21 @@ system_nodes:
       - SY.config.routes
 
 # --- edge: the public ingress door (only used when role: ingress) ---
-# Uncommented on an ingress hive. SY.edge serves the public HTTPS door and
-# fetches its TLS cert from SY.vault at boot (fail-closed: it refuses to bind
-# plaintext once a cert is requested). Seed the cert first via SY.admin:
+# Uncommented on an ingress hive. SY.edge serves the public HTTPS door with the
+# certificate it reads from SY.vault under tls_vault_key (never plaintext once a
+# certificate is requested). Until the secret exists the edge waits: it answers only
+# the ACME challenge and refuses every other connection. With `acme:` on the motherbee,
+# SY.admin issues and stores it; by hand, seed it via SY.admin and then reload:
 #   POST /hives/<vault_hive>/vault/secrets
-#   {key:"edge_tls_fluxbee_ai", value:{cert:"<PEM chain>", key:"<PEM key>"},
+#   {key:"edge_tls", value:{cert:"<PEM chain>", key:"<PEM key>"},
 #    metadata:{resource_type:"tls", owner_node:"SY.edge@<edge_hive>"}}
+#   POST /acme/reload
 # owner_node MUST be the edge's fully-qualified name so the dedicated-owner read
-# authorizes (the edge has no identity SHM; authz is by its deterministic ilk).
+# authorizes (the edge has no identity SHM; authz is by its deterministic ilk). The
+# name must start with "edge_tls".
 # edge:
 #   listen: "0.0.0.0:443"
-#   tls_vault_key: "edge_tls_fluxbee_ai"
+#   tls_vault_key: "edge_tls"
 #   vault_hive: "motherbee"
 #   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
 
@@ -178,4 +196,7 @@ system_nodes:
 #   lan_cidr: "10.10.10.0/24"
 #   lan_iface: "ens19"            # the egress box's INTERNAL nic
 #   wan_iface: "ens18"            # the egress box's UPLINK nic
-#   ipv6: "block"
+#   ipv6: "blocked"
+#   reachability_url: "https://example.com"   # the https URL the internet probe GETs; no default:
+#                                             # without it the probe does not run. add_hive copies
+#                                             # it into new workers and into an egress whose request names none

@@ -58,7 +58,7 @@ LOG_PATH = os.path.join(STATE_DIR, "state", "factory-reset.log")
 # reserved prefix, `ssh:`, held per-spoke SSH recovery keys until D32 removed that mode: nothing
 # writes it now, so a leftover is removed like user data. Anything else -- AI keys included -- is
 # user data.
-INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls")
+INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls", "acme_account")
 INFRA_KEYS = ("storage_postgres_url",)
 SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
 WF_NODE_PREFIX = "WF."

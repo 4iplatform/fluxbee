@@ -498,7 +498,7 @@ while the hive cannot tell (its identity registry still loading), they keep what
 | `error_code` | when |
 |---|---|
 | `KEY_TAKEN` | the key belongs to another tenant. It never moves |
-| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a node in `nodes` that does not exist, is charged to another tenant or is a person, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`) |
+| `INVALID_REQUEST` | key charset/length, value over 1 MiB, missing field, `owner_node` not `IO.*` or not registered, a node in `nodes` that does not exist, is charged to another tenant or is a person, a reserved infrastructure key (`edge_channel_secret:*`, `edge_tls*`, `ssh:*`, `edge_fanout_verify:*`, `acme_account*`) |
 | `INVALID_VALUE` | metadata of the wrong type |
 | `STORAGE_ERROR`, `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE` | the vault |
 

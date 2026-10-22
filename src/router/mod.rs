@@ -33,11 +33,14 @@ use fluxbee_sdk::protocol::{
     LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, MemoryPackage, Message, Meta,
     NodeAnnouncePayload, NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload,
     WanHelloPayload, WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload,
-    WanTimers, MESH_PROTOCOL_VERSION, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
-    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
-    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
-    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WAN_REJECT, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+    WanTimers, MESH_PROTOCOL_VERSION, MSG_EDGE_ACME_CHALLENGE, MSG_EDGE_ACME_CHALLENGE_RESPONSE,
+    MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
+    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_TLS_RELOAD,
+    MSG_EDGE_TLS_RELOAD_RESPONSE, MSG_EDGE_TLS_STATUS, MSG_EDGE_TLS_STATUS_RESPONSE,
+    MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, MSG_WAN_REACHABILITY,
+    MSG_WAN_REJECT, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame, MAX_FRAME_SIZE};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
@@ -1263,7 +1266,7 @@ async fn handle_message(
                     skipped_self += 1;
                     continue;
                 }
-                if !vpn_allows_between(
+                if !vpn_allows_broadcast_between(
                     &msg.meta,
                     &src_handle.name,
                     src_handle.vpn_id,
@@ -3433,7 +3436,7 @@ async fn handle_wan_message(
                 if *uuid == src_uuid {
                     continue;
                 }
-                if !vpn_allows_between(
+                if !vpn_allows_broadcast_between(
                     &msg.meta,
                     &src_info.name,
                     src_info.vpn_id,
@@ -4323,7 +4326,7 @@ async fn handle_peer_message(
                 if *uuid == src_uuid {
                     continue;
                 }
-                if !vpn_allows_between(
+                if !vpn_allows_broadcast_between(
                     &msg.meta,
                     &src_node.name,
                     src_node.vpn_id,
@@ -5907,42 +5910,53 @@ fn is_system_kind(msg_type: &str) -> bool {
     msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
 }
 
+/// The commands SY.admin@motherbee sends an edge: the `edge_service_actions` of
+/// `policy/system.rego` rule (1), all of them in `system_policy::PROTECTED_SYSTEM_ACTIONS`.
+const EDGE_SERVICE_COMMANDS: &[&str] = &[
+    MSG_EDGE_OPEN_URL,
+    MSG_EDGE_CLOSE_URL,
+    MSG_EDGE_LIST_URLS,
+    MSG_EDGE_PUBLISH_BLOB,
+    MSG_EDGE_UNPUBLISH_BLOB,
+    MSG_EDGE_TLS_STATUS,
+    MSG_EDGE_TLS_RELOAD,
+    MSG_EDGE_ACME_CHALLENGE,
+];
+
+/// The edge's answers to `EDGE_SERVICE_COMMANDS`, which go back to SY.admin@motherbee only.
+const EDGE_SERVICE_RESPONSES: &[&str] = &[
+    MSG_EDGE_OPEN_URL_RESPONSE,
+    MSG_EDGE_CLOSE_URL_RESPONSE,
+    MSG_EDGE_LIST_URLS_RESPONSE,
+    MSG_EDGE_PUBLISH_BLOB_RESPONSE,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+    MSG_EDGE_TLS_STATUS_RESPONSE,
+    MSG_EDGE_TLS_RELOAD_RESPONSE,
+    MSG_EDGE_ACME_CHALLENGE_RESPONSE,
+];
+
 fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(dst_name) || !is_system_kind(&meta.msg_type) {
-        return false;
-    }
-    if src_name != system_policy::EDGE_CONTROL_AUTHORITY {
-        return false;
-    }
-    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL
-        || action == MSG_EDGE_CLOSE_URL
-        || action == MSG_EDGE_LIST_URLS
-        || action == MSG_EDGE_PUBLISH_BLOB
-        || action == MSG_EDGE_UNPUBLISH_BLOB)
+    is_edge_service_control_message(meta, dst_name)
+        && src_name == system_policy::EDGE_CONTROL_AUTHORITY
 }
 
 fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(src_name)
-        || dst_name != system_policy::EDGE_CONTROL_AUTHORITY
-        || !is_system_kind(&meta.msg_type)
-    {
-        return false;
-    }
-    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE
-        || action == MSG_EDGE_CLOSE_URL_RESPONSE
-        || action == MSG_EDGE_LIST_URLS_RESPONSE
-        || action == MSG_EDGE_PUBLISH_BLOB_RESPONSE
-        || action == MSG_EDGE_UNPUBLISH_BLOB_RESPONSE)
+    is_edge_node(src_name)
+        && dst_name == system_policy::EDGE_CONTROL_AUTHORITY
+        && is_system_kind(&meta.msg_type)
+        && meta
+            .msg
+            .as_deref()
+            .is_some_and(|action| EDGE_SERVICE_RESPONSES.contains(&action))
 }
 
 fn is_edge_service_control_message(meta: &Meta, dst_name: &str) -> bool {
     is_edge_node(dst_name)
         && is_system_kind(&meta.msg_type)
-        && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL
-            || action == MSG_EDGE_CLOSE_URL
-            || action == MSG_EDGE_LIST_URLS
-            || action == MSG_EDGE_PUBLISH_BLOB
-            || action == MSG_EDGE_UNPUBLISH_BLOB)
+        && meta
+            .msg
+            .as_deref()
+            .is_some_and(|action| EDGE_SERVICE_COMMANDS.contains(&action))
 }
 
 fn edge_data_path_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
@@ -5973,6 +5987,20 @@ fn edge_vault_read_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool 
     }
 }
 
+/// A-78: SY.vault's `VAULT_SECRET_CHANGED` about a secret an edge owns, from `SY.vault@<primary
+/// hive>` (the router-stamped name: the only vault) to an `SY.edge`. Only `vpn_allows_between`, the
+/// gate of an addressed message, admits it: SY.vault sends the edge the notices about its own
+/// secrets as unicasts, while its broadcast names every stored key, its tenant and its owners, and
+/// never reaches the DMZ (`vpn_allows_broadcast_between`).
+fn edge_vault_notice_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
+    is_system_kind(&meta.msg_type)
+        && meta.msg.as_deref() == Some(MSG_VAULT_SECRET_CHANGED)
+        && src_name.split_once('@') == Some(("SY.vault", system_policy::PRIMARY_HIVE_ID))
+        && is_edge_node(dst_name)
+}
+
+/// May `src_name` reach `dst_name` with a message addressed to it: by UUID or by name, resolved by
+/// the user policy, or as a tap copy. A broadcast fan-out asks `vpn_allows_broadcast_between`.
 fn vpn_allows_between(
     meta: &Meta,
     src_name: &str,
@@ -5986,11 +6014,12 @@ fn vpn_allows_between(
         }
         // The control-command case already returned above via the exclusive
         // is_edge_service_control_message gate, so edge_service_control_allowed can never be true
-        // here — the remaining legitimate edge traffic is a control RESPONSE, the data path, or a
-        // vault read.
+        // here — the remaining legitimate edge traffic is a control RESPONSE, the data path, a
+        // vault read, or the vault's notice about the edge's own secret.
         return edge_service_control_response_allowed(meta, src_name, dst_name)
             || edge_data_path_allowed(meta, src_name, dst_name)
-            || edge_vault_read_allowed(meta, src_name, dst_name);
+            || edge_vault_read_allowed(meta, src_name, dst_name)
+            || edge_vault_notice_allowed(meta, src_name, dst_name);
     }
     if is_system_kind(&meta.msg_type) && is_global_scope(meta) {
         return true;
@@ -5999,6 +6028,19 @@ fn vpn_allows_between(
         return true;
     }
     src_vpn == dst_vpn
+}
+
+/// The gate for one copy of a broadcast fan-out (from a local node, a sibling router or the WAN):
+/// `vpn_allows_between` without A-78's unicast, so SY.vault's broadcast never reaches an edge.
+fn vpn_allows_broadcast_between(
+    meta: &Meta,
+    src_name: &str,
+    src_vpn: u32,
+    dst_name: &str,
+    dst_vpn: u32,
+) -> bool {
+    !edge_vault_notice_allowed(meta, src_name, dst_name)
+        && vpn_allows_between(meta, src_name, src_vpn, dst_name, dst_vpn)
 }
 
 fn pattern_match(pattern: &str, name: &str) -> bool {
@@ -7055,6 +7097,197 @@ mod tests {
             "SY.edge@ingress1",
             2
         ));
+    }
+
+    fn system_meta(msg: &str) -> Meta {
+        Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(msg.to_string()),
+            ..Meta::default()
+        }
+    }
+
+    /// The certificate commands (docs/acme-edge-certificates-v1.md §5) ride the edge control gate
+    /// like the URL commands: from SY.admin@motherbee only, and their answers back to it only.
+    /// Without them in the gate the router answers VPN_BLOCKED before the system policy is asked.
+    #[test]
+    fn edge_certificate_commands_ride_the_edge_control_gate() {
+        for (command, response) in [
+            (MSG_EDGE_TLS_STATUS, MSG_EDGE_TLS_STATUS_RESPONSE),
+            (MSG_EDGE_TLS_RELOAD, MSG_EDGE_TLS_RELOAD_RESPONSE),
+            (MSG_EDGE_ACME_CHALLENGE, MSG_EDGE_ACME_CHALLENGE_RESPONSE),
+        ] {
+            let command = system_meta(command);
+            let response = system_meta(response);
+            assert!(vpn_allows_between(
+                &command,
+                "SY.admin@motherbee",
+                0,
+                "SY.edge@ingress1",
+                0
+            ));
+            for rogue in [
+                "SY.admin@ingress1",
+                "SY.orchestrator@motherbee",
+                "SY.vault@motherbee",
+                "IO.cloud@motherbee",
+                "SY.edge@ingress2",
+            ] {
+                assert!(
+                    !vpn_allows_between(&command, rogue, 0, "SY.edge@ingress1", 0),
+                    "{rogue} must not reach the edge with {:?}",
+                    command.msg
+                );
+            }
+            assert!(vpn_allows_between(
+                &response,
+                "SY.edge@ingress1",
+                0,
+                "SY.admin@motherbee",
+                0
+            ));
+            for elsewhere in [
+                "SY.admin@ingress1",
+                "SY.orchestrator@motherbee",
+                "IO.cloud@motherbee",
+            ] {
+                assert!(
+                    !vpn_allows_between(&response, "SY.edge@ingress1", 0, elsewhere, 0),
+                    "{:?} must not go to {elsewhere}",
+                    response.msg
+                );
+            }
+            // Neither turns around: the edge never commands the Admin, nor is it sent an answer.
+            assert!(!vpn_allows_between(
+                &command,
+                "SY.edge@ingress1",
+                0,
+                "SY.admin@motherbee",
+                0
+            ));
+            assert!(!vpn_allows_between(
+                &response,
+                "SY.admin@motherbee",
+                0,
+                "SY.edge@ingress1",
+                0
+            ));
+        }
+    }
+
+    /// A-78: SY.vault's notice reaches the edge only addressed to it, from the primary hive's
+    /// vault. The broadcast, which names every stored key, its tenant and its owners, stays out of
+    /// the DMZ, and so does every other SYSTEM frame.
+    #[test]
+    fn the_vault_notice_reaches_the_edge_only_as_a_unicast_from_the_primary_vault() {
+        let notice = system_meta(MSG_VAULT_SECRET_CHANGED);
+        let broadcast_notice = Meta {
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            ..system_meta(MSG_VAULT_SECRET_CHANGED)
+        };
+        let vault = "SY.vault@motherbee";
+        let edge = "SY.edge@ingress1";
+
+        // The unicast passes, whatever the VPNs, and the kind is matched without case.
+        assert!(vpn_allows_between(&notice, vault, 0, edge, 0));
+        assert!(vpn_allows_between(&notice, vault, 0, edge, 7));
+        assert!(vpn_allows_between(&broadcast_notice, vault, 0, edge, 0));
+        let upper = Meta {
+            msg_type: "SYSTEM".to_string(),
+            ..system_meta(MSG_VAULT_SECRET_CHANGED)
+        };
+        assert!(vpn_allows_between(&upper, vault, 0, edge, 0));
+        assert!(vpn_allows_between(
+            &notice,
+            vault,
+            0,
+            "SY.edge@motherbee",
+            0
+        ));
+
+        // The broadcast does not, with or without its global scope; every other node still gets it.
+        for meta in [&notice, &broadcast_notice] {
+            assert!(!vpn_allows_broadcast_between(meta, vault, 0, edge, 0));
+            assert!(!vpn_allows_broadcast_between(
+                meta,
+                vault,
+                0,
+                "SY.edge@motherbee",
+                0
+            ));
+            assert!(vpn_allows_broadcast_between(
+                meta,
+                vault,
+                0,
+                "SY.storage@motherbee",
+                0
+            ));
+        }
+        assert!(vpn_allows_broadcast_between(
+            &broadcast_notice,
+            vault,
+            0,
+            "AI.chat@worker1",
+            4
+        ));
+
+        // Another source: the router-stamped name must be the primary hive's SY.vault.
+        for source in [
+            "SY.vault@worker1",
+            "SY.vault@ingress1",
+            "SY.vault.relay@motherbee",
+            "SY.vault",
+            "SY.admin@motherbee",
+            "SY.storage@motherbee",
+            "IO.cloud@motherbee",
+            "SY.edge@ingress2",
+        ] {
+            assert!(
+                !vpn_allows_between(&notice, source, 0, edge, 0),
+                "a notice from {source} must not reach the edge"
+            );
+        }
+
+        // Another destination: only an SY.edge is admitted by this rule. The edge never sends one.
+        for destination in [
+            "SY.edge.relay@ingress1",
+            "SY.storage@motherbee",
+            "IO.cloud@motherbee",
+        ] {
+            assert!(
+                !edge_vault_notice_allowed(&notice, vault, destination),
+                "{destination} is not an edge"
+            );
+        }
+        assert!(!vpn_allows_between(&notice, edge, 0, vault, 0));
+        assert!(!vpn_allows_between(&notice, edge, 0, "SY.edge@ingress2", 0));
+
+        // Every other frame from the vault to the edge stays blocked: other SYSTEM verbs, no verb,
+        // and the notice's name on a non-SYSTEM kind.
+        for other in [
+            "VAULT_PUT",
+            "VAULT_LIST_RESPONSE",
+            "VAULT_GET_METADATA_RESPONSE",
+            "NODE_STATUS_GET",
+            "CONFIG_CHANGED",
+            MSG_EDGE_TLS_RELOAD,
+        ] {
+            assert!(
+                !vpn_allows_between(&system_meta(other), vault, 0, edge, 0),
+                "{other} from the vault must not reach the edge"
+            );
+        }
+        let no_verb = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            ..Meta::default()
+        };
+        assert!(!vpn_allows_between(&no_verb, vault, 0, edge, 0));
+        let user_kind = Meta {
+            msg_type: "user".to_string(),
+            msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
+            ..Meta::default()
+        };
+        assert!(!vpn_allows_between(&user_kind, vault, 0, edge, 0));
     }
 
     // ---- Option B: WAN multi-hop reachability (edge-multihop-reachability-spec-v1) ----
@@ -8601,6 +8834,122 @@ mod tests {
                 let delivered = inbox.try_recv().is_ok();
                 let want = reaches_opa_rules && name == "SY.opa.rules@motherbee";
                 assert_eq!(delivered, want, "{sender_name} -> {name}");
+            }
+        }
+    }
+
+    /// A-78 through `handle_message`: SY.vault's broadcast reaches every node but the edge, its
+    /// unicast reaches the edge, and the same unicast from another node, or another verb from the
+    /// vault, does not.
+    #[tokio::test]
+    async fn the_vault_notice_reaches_the_edge_as_a_unicast_and_never_as_a_broadcast() {
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut uuids = HashMap::new();
+        let mut inboxes = HashMap::new();
+        for name in [
+            "SY.vault@motherbee",
+            "SY.storage@motherbee",
+            "SY.edge@motherbee",
+            "AI.chat@motherbee",
+        ] {
+            let uuid = Uuid::new_v4();
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            nodes.lock().await.insert(
+                uuid,
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: if name.starts_with("AI.") { 3 } else { 0 },
+                    sender: tx,
+                    connected_at: 0,
+                },
+            );
+            uuids.insert(name, uuid);
+            inboxes.insert(name, rx);
+        }
+        let route = |src: &str, dst: Destination, msg: &str| Message {
+            routing: Routing {
+                src: uuids[src].to_string(),
+                src_l2_name: None,
+                dst,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                scope: Some(SCOPE_GLOBAL.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({"op": "put", "key": "edge_tls"}),
+        };
+        let edge = Destination::Unicast(uuids["SY.edge@motherbee"].to_string());
+        let cases = [
+            (
+                route(
+                    "SY.vault@motherbee",
+                    Destination::Broadcast,
+                    MSG_VAULT_SECRET_CHANGED,
+                ),
+                vec!["SY.storage@motherbee", "AI.chat@motherbee"],
+            ),
+            (
+                route("SY.vault@motherbee", edge.clone(), MSG_VAULT_SECRET_CHANGED),
+                vec!["SY.edge@motherbee"],
+            ),
+            (
+                route(
+                    "SY.storage@motherbee",
+                    edge.clone(),
+                    MSG_VAULT_SECRET_CHANGED,
+                ),
+                vec![],
+            ),
+            (
+                route("SY.vault@motherbee", edge, "VAULT_LIST_RESPONSE"),
+                vec![],
+            ),
+        ];
+        for (message, receivers) in cases {
+            handle_message(
+                &message,
+                &nodes,
+                &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+                &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+                &Arc::new(Mutex::new(OpaResolver::new())),
+                &Arc::new(Mutex::new(BroadcastCache::new())),
+                &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                &stream::StreamHandle::detached(),
+                "motherbee",
+                "SY.frontdesk.gov@motherbee",
+                Uuid::new_v4(),
+                false,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+                None,
+            )
+            .await
+            .unwrap();
+            let sender = nodes.lock().await[&Uuid::parse_str(&message.routing.src).unwrap()]
+                .name
+                .clone();
+            for (name, inbox) in inboxes.iter_mut() {
+                let mut delivered = false;
+                while let Ok(frame) = inbox.try_recv() {
+                    let frame: Message = serde_json::from_slice(&frame).unwrap();
+                    if frame.meta.msg.as_deref() == message.meta.msg.as_deref() {
+                        delivered = true;
+                    }
+                }
+                assert_eq!(
+                    delivered,
+                    receivers.contains(name),
+                    "{sender} {:?} {:?} -> {name}",
+                    message.routing.dst,
+                    message.meta.msg
+                );
             }
         }
     }

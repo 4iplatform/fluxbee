@@ -199,6 +199,14 @@ LAN leg is in place, and reports what it read (`egress_nat_applied`, `egress_ipv
 `egress_ipv6_blocked`, `egress_lan_leg_ok`); any of them missing fails the join with
 `EGRESS_NAT_NOT_READY` (`EGRESS_NAT_NOT_VERIFIED` when the box cannot be read).
 
+The URL the egress' internet probe GETs is the request's `egress.reachability_url`, else the
+motherbee's own `egress.reachability_url`. It must be an `https://` URL with a host
+(`validate_reachability_url`, checked when the join is accepted). The join writes it into the
+egress' hive.yaml (`render_egress_hive_egress_yaml`) and answers it as `egress_reachability_url`.
+With neither, the egress gets none and does not probe. A worker join copies the motherbee's
+`reachability_url` into the worker's `egress` section along with `gateway_ip`
+(`render_worker_egress_yaml`).
+
 A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
 probe failed and the password seeded the motherbee key) and did not harden SSH says there that
 password logins stay enabled on the box, and how to close them (`add_hive_ssh_warnings`, FINDINGS
@@ -299,6 +307,13 @@ What the code does today:
   drift tick and records an `egress` drift alert (`lan_leg_missing`, `ipv4_forwarding_off`,
   `ipv6_not_blocked`). A worker gets its default route via the egress `gateway_ip`. The motherbee
   is only checked (`EGRESS_MOTHERBEE_BYPASS`).
+- **Internet probe** (`check_internet_reachable`): an HTTPS GET (curl, 5 s) of the hive's own
+  `egress.reachability_url`, on the egress at boot and every drift tick, and at boot on a worker
+  that routes through it and on the motherbee when they declare `gateway_ip`. A failure is a
+  warning in the journal. Without the URL the probe does not run and logs
+  `internet_reachable=not_configured`, as it does after warning about a URL that is not a valid
+  `https://` one: the code names no target of its own. A host without `curl` does not probe
+  either and logs `not_probed` (`run_internet_probe`), never a `false` it did not measure.
 
 ## Watchdog
 
@@ -319,10 +334,30 @@ and it logs `service restart failed` every 5 s until `systemctl unmask`.
 get_storage, set_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
 list_runtimes, get_runtime, run_node, start_node, restart_node, kill_node, remove_node_instance,
 get_node_config, set_node_config, get_node_state, get_node_status, list_deployments,
-get_deployments, list_drift_alerts, get_drift_alerts, list_hives, get_hive, add_hive, remove_hive,
-core_rollback. Anything else answers `NOT_IMPLEMENTED`. Mutating actions are accepted only from
-`SY.admin@<this hive>` (`admin_action_requires_origin`, `is_allowed_admin_source_name`), else
-`FORBIDDEN`.
+get_deployments, list_drift_alerts, get_drift_alerts, record_drift_alert, list_hives, get_hive,
+add_hive, remove_hive, core_rollback. Anything else answers `NOT_IMPLEMENTED`. Mutating actions
+are accepted only from `SY.admin@<this hive>` (`admin_action_requires_origin`,
+`is_allowed_admin_source_name`), else `FORBIDDEN`.
+
+**`record_drift_alert`** is how SY.admin's certificate conditions reach the drift store, which
+only the orchestrator writes ([ACME design §7](../acme-edge-certificates-v1.md)). It is a write
+for the origin check above, and its flow takes it only from `SY.admin@motherbee` as the router
+stamps the sender (`certificate_condition_from_request`), else `FORBIDDEN`. The payload is
+`{category, kind, severity, hive, detail, state}`:
+
+- `category` is `certificate`, and `kind` one of `renewal_failed`, `renewal_overdue`, `expiring`,
+  `name_not_covered`, `foreign_certificate`, `install_refused`, `edge_without_certificate`,
+  `edge_unreachable` (`CERTIFICATE_DRIFT_ALERT_KINDS`);
+- `severity` is `info`, `warning` or `critical`; `state` is `open` or `closed`; `hive` is a hive
+  id; `detail` is not empty.
+
+Anything else answers `INVALID_REQUEST`. The row carries `state`, and a `closed` row is written
+with severity `info`. It goes through the store's dedupe (`drift_alerts_with`): a condition's row
+is not written when the newest row of the same hive, category and kind, from the last hour, has
+the same state. Open → closed → open within the hour writes all three rows; a second open right
+after an open is not written. The detectors' rows keep their rule: any row of the same alert from
+the last hour keeps a new one out. The answer is `{status: "ok", recorded}`, with
+`recorded: false` for such a repeat; a failed write answers `DRIFT_ALERT_WRITE_FAILED`.
 
 **System messages** (`handle_system_message`), mostly between orchestrators: `SYSTEM_UPDATE`,
 `SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`, `KILL_NODE`, `START_NODE`,
@@ -339,7 +374,8 @@ The router delivers these protected actions only from allowed origins (`policy/s
 `RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`enabled`, default
 true; `path`, default `/var/lib/fluxbee/blob`; `sync`, default off, tool `syncthing`, `api_port`
 8384, `data_dir`; `gc`), `dist` (`path`, default `/var/lib/fluxbee/dist`; sync on by default),
-`identity.sync.port` (default 9100), `government`, `system_nodes`, `egress`, `ai`.
+`identity.sync.port` (default 9100), `government`, `system_nodes`, `egress` (with
+`reachability_url`, the internet probe's target; no default), `ai`.
 
 Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
 `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`
