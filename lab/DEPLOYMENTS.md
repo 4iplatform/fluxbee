@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ live | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
+| **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ live | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
+| **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ replaced by 0.1.82 | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
 | **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ replaced by 0.1.81 | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
 | **0.1.79** | 2026-10-17 | `0bc85e3` | motherbee + spokes (core) | ✅ replaced by 0.1.80 | snap `pre-stream3-0-1-79` (all 4 VMs) · `apt install fluxbee=0.1.78` + core-update of the spokes |
 | **0.1.78** | 2026-10-17 | `104fa65` | motherbee + spokes (core) | ✅ replaced by 0.1.79 | snap `pre-stream2b-0-1-78` (all 4 VMs) · `apt install fluxbee=0.1.77` + core-update of the spokes |
@@ -90,6 +91,89 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.82 — The edge's certificate from Let's Encrypt, issued and renewed by SY.admin; the vault's notice reaches the edge (O6, A-78, PB-1)
+
+- **Date:** 2026-10-21 (ART) · **Previous version:** 0.1.81 · **Commit:** `d2980cf`.
+- **Scope:**
+  - motherbee and the three spokes (core update);
+  - `hive.yaml` on the motherbee (`acme:` and `egress.reachability_url`) and on egress1
+    (`egress.reachability_url`);
+  - the certificate PROD's edge serves.
+- **Design:** docs/acme-edge-certificates-v1.md. It was reviewed once as a design (protocol and
+  security, fit with the code, operations) and once as code (the ACME client, the edge, the
+  router/vault/orchestrator).
+- **What changed:**
+  - **SY.admin is the ACME client.**
+    - It uses TLS-ALPN-01 on the edge's :443 with instant-acme 0.8.5.
+    - The name is the host of `admin.public_base_url`. The CA, Let's Encrypt by default, comes
+      from `acme:`.
+    - Renewals happen in the ARI window, else at two thirds of the certificate's lifetime.
+    - Alerts are relative to the lifetime. New actions: `GET /acme/status` and `POST /acme/renew`,
+      `/acme/test`, `/acme/reload`.
+  - **SY.edge:**
+    - It mints the challenge certificate itself.
+    - It swaps its certificate without restarting (PB-1).
+    - It waits for a certificate instead of crash-looping when the secret is missing.
+    - It answers `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD` and `EDGE_ACME_CHALLENGE` from
+      `SY.admin@motherbee` only.
+    - The public door times out silent clients and caps connections.
+  - **A-78:** SY.vault sends its change notice to an owning edge as a unicast, and the router's
+    edge gate admits only that. An edge can no longer read a general secret.
+  - **Smaller changes:**
+    - the certificate alerts go to the drift alerts;
+    - the egress' internet probe takes its URL from `hive.yaml` (no `fluxbee.ai` in code);
+    - the `.deb` depends on ca-certificates and builds `--locked`.
+- **Before the deploy** (the operator's approval, 2026-10-21):
+  - `egress.reachability_url: "https://fluxbee.ai"` was added to the motherbee's and egress1's
+    `hive.yaml`. Backups are `hive.yaml.bak-pre-0182-reachability`.
+  - The chain the edge served (the Sectigo wildcard) was parsed with the new boot checks: 4 of 4
+    certificates, valid, 113 days left, the name covered.
+- **Deploy:**
+  - build of `d2980cf` in 38 min (new crates), deploy in 235 s;
+  - snapshots `pre-acme-0-1-82` on the 4 VMs (`pre-stream3-0-1-79` was deleted);
+  - 0.1.82 on all 4, health clean.
+  - The edge came up serving the wildcard from the vault (version 1), never `awaiting`.
+- **Gate:**
+  - **A-78:** a throwaway secret owned by the edge was put and deleted. Both notices reached the
+    edge (`VAULT_SECRET_CHANGED … origin=SY.vault@motherbee`), the first ever seen there. Nothing
+    reloaded.
+  - **`acme:` added** to the motherbee's `hive.yaml` (`terms_agreed: true`, accepted by the
+    operator; no contact), and SY.admin restarted while idle. Backup:
+    `hive.yaml.bak-pre-0182-acme`. Nothing was replaced, because the wildcard is hand-seeded.
+  - **`POST /acme/test`:** Let's Encrypt staging validated the challenge from the internet and
+    issued a certificate in 8 s. The only refusal was the expected one (`UnknownIssuer`, staging
+    root). Nothing was installed.
+  - **`POST /acme/renew`:** Let's Encrypt production issued and the edge installed in 7 s.
+    - Issuer `Let's Encrypt YE2`, SAN `hive-k3m9x7q2.fluxbee.ai`.
+    - Valid 2026-10-22 → 2027-01-20 (90 days, `classic`); fingerprint `3ebadf52…`.
+    - The vault holds it as version 2, with the wildcard as the previous version.
+  - **Verified strictly** (Python `ssl`, system roots, no AIA fetching) from inside (motherbee →
+    ingress1) and from outside through the public name: TLS 1.3, chain verified, `/healthz` 200.
+  - **Rollback, both ways (PB-1 + A-78 live):** a vault rollback put the wildcard back, and the edge
+    swapped to it on the vault's notice alone, without a restart and without `/acme/reload`. A
+    second rollback brought Let's Encrypt back the same way. sy-edge did not restart after the
+    deploy.
+  - **Conditions:** the 2-min check landed in the 9 s the wildcard was served. It opened
+    `foreign_certificate`, and `POST /acme/reload` re-evaluated and closed it. The drift alerts
+    hold one `open` and one `closed` row.
+  - **Health:**
+    - `failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0` on all 4;
+    - `edge-cert acme=on conditions=none`.
+  - **Internet probe:** egress1 reports `internet_reachable=true` against the URL. The motherbee
+    probes at boot (`true`) and reports `not_probed` on its ticks, where 0.1.81 logged `false`.
+- **Next automatic renewal:** in Let's Encrypt's ARI window, around day 60 (late December 2026).
+  The Sectigo wildcard expires 2027-02-12. After two renewals it is no longer in the vault; its
+  original files stay with the operator.
+- **Upgrading another hive:** none of this turns on by itself.
+  - Without `acme:` the edge serves its seeded certificate and SY.admin only watches its expiry.
+  - Without `egress.reachability_url` the internet probe reports `not_configured`.
+  - The shipped example's old `ipv6: "block"` was a value the code refuses; it is `"blocked"`.
+- **Rollback:**
+  - The certificate: `POST /hives/motherbee/vault/secrets/edge_tls_fluxbee_ai/rollback`. The edge
+    swaps on the notice; `POST /acme/reload` re-evaluates.
+  - The code: snapshot `pre-acme-0-1-82`, or `apt install fluxbee=0.1.81` plus the core update of
+    the spokes. 0.1.81 cannot renew, so roll the certificate back first.
 
 ## 0.1.81 — The open findings closed: agent assets reach the workers, a removed hive is cut off, the Go SDK matches Rust, Archi reconciles what exists (A-72, A-48, A-75, A-24, A-76, A-1, A-2)
 

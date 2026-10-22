@@ -58,7 +58,7 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 ---
 
 <a id="pb-1"></a>
-## PB-1 🟡 FIX BUILT (0.1.82, to validate) — `SY.edge` does not reload the TLS certificate when it rotates in the vault
+## PB-1 ✅ CLOSED and VALIDATED live (0.1.82, 2026-10-21) — `SY.edge` does not reload the TLS certificate when it rotates in the vault
 
 > **0.1.82 (2026-10-21):** the edge swaps its certificate without restarting, on `EDGE_TLS_RELOAD` from
 > SY.admin and on the vault's notice for its own key, which now reaches it as a unicast (FINDINGS A-78:

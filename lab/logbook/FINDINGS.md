@@ -1072,7 +1072,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-78 🔴 CONFIRMED IN CODE AND IN PROD (2026-10-21) — The vault's change notice never reaches the edge
+### A-78 ✅ VALIDATED ON 8.x (0.1.82, 2026-10-21) — The vault's change notice never reaches the edge
+
+- **Validated (0.1.82, `d2980cf`):**
+  - A throwaway secret owned by the edge was put and deleted, and both notices reached the edge,
+    the first ever seen there.
+  - A vault rollback of the edge's certificate made the edge swap to the previous certificate on
+    the notice alone, without a restart and without `/acme/reload`. A second rollback brought the
+    first one back the same way.
 
 - **What happens:**
   - SY.edge reloads its TLS certificate when SY.vault announces a change (`VAULT_SECRET_CHANGED`,

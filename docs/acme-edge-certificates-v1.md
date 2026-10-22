@@ -1,7 +1,8 @@
 # ACME certificates for the public edge (v1)
 
-**Status:** design, 2026-10-21, revised after one review round (protocol and security, fit with the
-code, operations). **Decisions:** the operator's O6 (2026-10-13), D1–D5 and the naming rules
+**Status:** implemented in 0.1.82 (`d2980cf`) and validated on 8.x on 2026-10-21: PROD's edge serves
+a Let's Encrypt certificate (lab/DEPLOYMENTS.md, 0.1.82). Design of 2026-10-21, revised after one
+review round (protocol and security, fit with the code, operations). **Decisions:** the operator's O6 (2026-10-13), D1–D5 and the naming rules
 (2026-10-20). **Findings:** FINDINGS A-78 (new), PENDING-BUGS PB-1.
 
 Each installation's public edge serves its own certificate from an ACME certificate authority, issued
