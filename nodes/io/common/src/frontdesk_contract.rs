@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const FRONTDESK_HANDOFF_PAYLOAD_TYPE: &str = "frontdesk_handoff";
+/// The `meta.msg` its producer stamps on a handoff message: the frontdesk takes a handoff only
+/// with it (docs/control-path-hardening-v1.md §7).
+pub const FRONTDESK_HANDOFF_MSG: &str = "frontdesk_handoff";
 pub const FRONTDESK_SCHEMA_VERSION_V1: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

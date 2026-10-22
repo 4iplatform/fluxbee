@@ -18,7 +18,8 @@ constant named without a path lives in the first one. The design and its decisio
 > `storage_inbox` into their base schema and removed the `storage_migrations` table. A database
 > created before 0.1.81 needs, once, `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` and,
 > after the upgrade, `DROP TABLE storage_migrations;` (`CREATE TABLE IF NOT EXISTS` does not change
-> an existing table).
+> an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`; the release after it drops
+> them (§6.1).
 
 ---
 
@@ -184,7 +185,10 @@ SY.cognition: there, `cognition.turns` has no sink.
   (`ensure_database_exists`).
 - **The schema** is ensured at every boot (`ensure_schema`): it creates the missing tables and
   indexes (`TURNS_SCHEMA_SQL`, `INBOX_SCHEMA_SQL`, `COGNITION_SCHEMA_SQL`, `USAGE_SCHEMA_SQL`).
-  There are no migrations: an existing table is left as it is.
+  Each statement waits at most 5 s for its lock (`lock_timeout`, `SCHEMA_STEPS`); past that the
+  start fails and systemd retries, so a DDL never queues the table's readers and writers behind a
+  long transaction. There are no migrations: an existing table is left as it is, except that
+  `turns.ctx` and `seq` lose their `NOT NULL` (§6.1).
 - **Three connections** (`Storage`):
   - a shared one, for processing and reads;
   - one for ingest, one transaction per batch;
@@ -285,8 +289,9 @@ moment the router appended the record), `attempts`, `processed_at`, `last_error`
 
 ### 6.1 `turns`: the message log
 
-One row per copied message. Columns: `dedupe_key`, `ctx`, `seq`, `ts`, `stored_at`, `from_ilk`,
-`to_ilk`, `ich`, `msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`.
+One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`, `to_ilk`, `ich`,
+`msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`, and `ctx` and `seq`, which
+nothing writes (below).
 
 - **The key** is `dedupe_key`, the same as the inbox's (`idx_turns_dedupe_key`, unique). A response
   shares the `trace_id` of its request and still has its own row.
@@ -298,14 +303,19 @@ One row per copied message. Columns: `dedupe_key`, `ctx`, `seq`, `ts`, `stored_a
   - `content`, the payload; `tags`, those of `payload.tags` or `meta.tags`, sorted and without
     repeats;
   - `message`, the whole message, as the router copied it.
-- **`ctx` and `seq`** come from `meta.ctx` and `meta.ctx_seq` if the message carries them. The
-  protocol no longer has those fields (`Meta` in `crates/fluxbee_sdk/src/protocol.rs`), so today
-  they are `trace:<trace_id>` and a hash of the `trace_id`. Nothing reads them.
+- **`ctx` and `seq`** are not written since 0.1.83; nothing reads them, and the protocol has no
+  such fields (`Meta` in `crates/fluxbee_sdk/src/protocol.rs`). They stay one release as nullable
+  columns so that a rollback to 0.1.82 still starts: its start creates an index on `(ctx, seq)`,
+  and its INSERT writes them. While a table still has their `NOT NULL`, `ensure_schema` drops it;
+  it reads `information_schema.columns` first, so once that is done a start takes no lock on
+  `turns`. The next release drops both columns and that index.
 - **`message`** is required (`NOT NULL`), like `content`.
 - **`ts`** is when the router copied the message (the time of the stream record). **`stored_at`**
   is when SY.storage wrote it: it is the order that a live reader follows, because a batch can
   arrive late.
-- **Indexes:** `(ctx, seq)`, `(ts DESC, dedupe_key DESC)`, `(stored_at, dedupe_key)`, `(thread_id)`.
+- **Indexes:** `(ts DESC, dedupe_key DESC)`, `(stored_at, dedupe_key)`, `(thread_id)`. A database
+  that ran 0.1.82 or earlier also keeps `idx_turns_ctx_seq` on `(ctx, seq)` until the next release
+  drops it.
 - **Who reads it:** the Messages page of Archi (`src/bin/sy_architect/messages_db.rs`).
 - Nothing purges `turns`.
 
@@ -523,7 +533,7 @@ its sink for the window at most (120 s).
 INSERT INTO storage_inbox ... ON CONFLICT (dedupe_key) DO UPDATE SET attempts = ... RETURNING ...;
 
 -- Turns: the same dedupe_key. (ctx, seq) was the key until 0.1.74; a response reuses the
--- trace_id of its request, and it got lost. Today it is only an index.
+-- trace_id of its request, and it got lost. Since 0.1.83 they are not written.
 INSERT INTO turns ... ON CONFLICT (dedupe_key) DO NOTHING;
 
 -- Cognition: each row carries its communication and the turn in which it was written

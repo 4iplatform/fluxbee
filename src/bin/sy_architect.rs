@@ -6754,8 +6754,9 @@ fn protected_architect_system_action_response(action: &str) -> Option<&'static s
 
 /// Whether `src_l2_name` may send `action` here: exactly what the router admits, the system policy
 /// (`policy/system.rego` through `authorize_system`), checked again as SY.orchestrator does (SO-05).
-/// NODE_STATUS_GET comes from SY.admin or SY.vault of this hive and from SY.orchestrator of any
-/// hive (its health probe); CONFIG_GET and CONFIG_SET from SY.admin@motherbee only. Its own
+/// NODE_STATUS_GET comes from SY.admin or SY.vault of this hive and from the motherbee's or this
+/// hive's SY.orchestrator (its health probe; rule (3) has a direction since 0.1.83); CONFIG_GET and
+/// CONFIG_SET from SY.admin@motherbee only. Its own
 /// allowlist had drifted from the policy: it named SY.config-routes, a node that does not exist, and
 /// answered the orchestrator's probe FORBIDDEN.
 fn architect_origin_authorized(action: &str, hive_id: &str, src_l2_name: Option<&str>) -> bool {
@@ -29680,7 +29681,8 @@ mod tests {
     }
 
     /// The gate admits what the router admits (policy/system.rego): the orchestrator's health
-    /// probe from any hive, the vault's from this hive, and node config from the primary admin.
+    /// probe from the motherbee or this hive, the vault's from this hive, and node config from the
+    /// primary admin.
     #[test]
     fn architect_origin_gate_admits_what_the_system_policy_admits() {
         let admitted = |action: &str, origin: &str| {
@@ -29690,10 +29692,11 @@ mod tests {
             "SY.admin@motherbee",
             "SY.vault@motherbee",
             "SY.orchestrator@motherbee",
-            "SY.orchestrator@worker1",
         ] {
             assert!(admitted("NODE_STATUS_GET", origin), "{origin}");
         }
+        // Another hive's orchestrator reads only its own hive (docs/control-path-hardening-v1.md §3).
+        assert!(!admitted("NODE_STATUS_GET", "SY.orchestrator@worker1"));
         for action in ["CONFIG_GET", "CONFIG_SET"] {
             assert!(admitted(action, "SY.admin@motherbee"), "{action}");
             for origin in [

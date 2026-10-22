@@ -368,7 +368,7 @@ This does not exist today and is the core of the egress feature. On startup and 
 
 After applying it, the orchestrator reads back what it set and checks the LAN leg (`serving_problems`, FINDINGS A-1): IPv4 forwarding on, IPv6 disabled, `wan_iface` and `lan_iface` present, `edge_ip` on `lan_iface`. nftables matches interfaces by name, so the table loads without them. Any of them missing fails the boot; after boot each one is a WARN and an `egress` drift alert on every drift tick.
 
-The orchestrator already has a firewall helper pattern (`open_firewall_rules_local` line 3331, `close_firewall_rules_local` line 3391, `ensure_core_firewall_local` line 3473). The egress NAT reconciliation should follow the same idempotent, marked-block approach but target **nftables** directly (§8), not the existing simple `ufw allow <port>` calls.
+The egress NAT reconciliation is idempotent and targets **nftables** directly (§8). The orchestrator's `ufw allow <port>` helpers (`open_firewall_rules_local` and its peers) were removed in 0.1.83 ([control-path hardening](control-path-hardening-v1.md) §6).
 
 ### 6.6 Worker route injection
 
@@ -490,9 +490,9 @@ Defaults shown are sized for a moderate deployment. Document scaling guidance in
 
 ### 8.5 UFW handling
 
-On a `role: egress` host, **nftables is the single firewall backend for both inbound and egress**. The orchestrator does not use `ufw` on egress hosts: the inbound port rules (WAN/identity) that other roles open via `ufw` are instead expressed in the same Fluxbee-owned nftables ruleset on the egress host. This avoids two backends managing forwarding/inbound policy on the same host, and the contradiction of disabling `ufw` while still depending on it for inbound ports.
+On a `role: egress` host, **nftables is the single firewall backend for both inbound and egress**. The orchestrator does not use `ufw` on egress hosts: the inbound port rules (WAN/identity) that other roles opened via `ufw` before 0.1.83 are instead expressed in the same Fluxbee-owned nftables ruleset on the egress host. This avoids two backends managing forwarding/inbound policy on the same host, and the contradiction of disabling `ufw` while still depending on it for inbound ports.
 
-`nft` must be present on an egress host; if absent, provisioning fails loud (no silent fallback to ufw/iptables). Motherbee and worker hosts are unaffected and keep using their existing `ufw`/firewalld inbound path.
+`nft` must be present on an egress host; if absent, provisioning fails loud (no silent fallback to ufw/iptables). Since 0.1.83 no role writes ufw or firewalld rules; when either is active, the orchestrator raises the posture alert `host_firewall_active`, since it may close 9000, 9100, 22000 or 443 ([control-path hardening](control-path-hardening-v1.md) §6).
 
 ---
 

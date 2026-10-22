@@ -1,7 +1,8 @@
 # SY.frontdesk.gov - Technical specification (v2)
 
 Status: current (updated 2026-10-02: the case's tenant, no tenant creation, merge by email,
-nobody registers in the root tenant)
+nobody registers in the root tenant; 2026-10-22: a handoff only from an IO node, and only an
+email the channel vouches for merges, `docs/control-path-hardening-v1.md` §7)
 
 > Deprecation note:
 > `frontdesk_result` is deprecated as the output contract of `SY.frontdesk.gov`.
@@ -81,7 +82,11 @@ Required carrier:
 
 - `meta.src_ilk`
 - `meta.thread_id`
+- `meta.msg = "frontdesk_handoff"`, the producer's mark
 - payload `frontdesk_handoff`
+
+A payload in this shape without the mark is not a handoff: an IO node may relay a payload someone
+else wrote, so it goes to the conversational path (section 4.1), with a warning in the log.
 
 Canonical shape:
 
@@ -109,6 +114,12 @@ Canonical shape:
 
 Rules:
 
+- only an IO node sends it: the sender the router stamps on the message (`routing.src_l2_name`)
+  must start with `IO.`. Any other sender (an `AI.*`, `WF.*` or `SY.*` node, or no stamped name)
+  gets `INVALID_REQUEST`, and nothing is registered or saved;
+- `subject.email` is vouched: the IO node answers for it (io.api's integrator, who holds the
+  bearer; io.cloud, for the login Fluxbee Cloud authenticated). It is the only vouched email
+  (section 7.1);
 - `operation = "complete_registration"` is the only operation settled in this version;
 - `subject.display_name` and `subject.email` are required for that operation;
 - `subject.company_name` is data about the person: it never chooses or creates a tenant;
@@ -199,6 +210,13 @@ Current minimal state:
 (`completed_error`), so a retry keeps reporting it. It is informational: the tenant of each attempt
 is read again from the ILK (section 4.3).
 
+`collected.email` is only ever a claim, whoever wrote it: the LLM writes this state (section 7.1).
+
+The email a handoff vouched for waits apart, in the same store under `vouched_email:<src_ilk>`,
+until the case registers: only the frontdesk's code writes it, and the LLM's state tools, scoped to
+`src_ilk`, never reach it. A registration of the case (the handoff's or the conversation's) takes
+it from there and deletes it once `SY.identity` accepts.
+
 ## 6. Internal working modes
 
 ### 6.1 `register_automatic`
@@ -208,9 +226,12 @@ It is activated when a `frontdesk_handoff` comes in.
 Rule:
 
 - it does not open an unnecessary conversation;
+- it refuses a sender that is not an IO node (section 4.2) before anything else;
 - it first resolves the case's tenant (section 4.3); with no tenant, with one that does not match, or with the
   root tenant (section 4.4), it responds with the error and saves nothing;
-- it merges with the previous state if applicable;
+- it takes what the handoff lacks from the previous state, if any; an email taken from there stays
+  a claim, even when the handoff carries none (section 7.1). An email an earlier handoff of the case
+  vouched for (section 5) stays vouched;
 - if it already has the full minimum, it tries to register;
 - if it is still incomplete, it responds `text` with the corresponding human message.
 
@@ -233,7 +254,6 @@ The node uses the `ilk_register` tool.
 
 Minimal payload:
 
-- `src_ilk`
 - `identity_candidate.name`
 - `identity_candidate.email`
 
@@ -243,8 +263,15 @@ Optional:
 - `identity_candidate.company_name`
 - `identity_candidate.attributes` (free-form data; goes as is to `identification.attributes`)
 
-There are no more fields: the tenant is not a parameter (section 4.3). The case state is indexed by
-`src_ilk` (section 5); the tool does not receive `thread_id`.
+There are no more fields. The ILK is not a parameter: the tool acts only on the case's own, the
+message's `meta.src_ilk`, never on one the model names, and a message without one registers nobody
+(`missing_src_ilk`). Nor is the tenant (section 4.3). The case state is indexed by `src_ilk`
+(section 5); the tool does not receive `thread_id`.
+
+The emails go to `SY.identity` in two keys (section 7.1). `identification.email` is the case's
+vouched email: the handoff's own `subject.email`, or the one an earlier handoff left (section 5).
+`identification.claimed_email` is `identity_candidate.email` when it is another one (typed in the
+conversation, or taken from the state). A key without a value goes as `null`.
 
 Successful response:
 
@@ -259,11 +286,27 @@ Successful response:
 }
 ```
 
-### 7.1 Email already registered: merge
+### 7.1 Vouched and claimed emails; a vouched email already registered merges
 
-The email identifies the person within their tenant. If the registration carries an email that another
-human ILK of the same tenant already has, the person is already registered and the registration does not fail: `SY.identity` does
-the merge inside the same `ILK_REGISTER` (details in `10-identity-v2.md` 6.5):
+Only an email the channel vouches for identifies the person (`docs/control-path-hardening-v1.md`
+§7, A-42):
+
+- **Vouched:** the `subject.email` of a handoff from an IO node (section 4.2), kept for the case
+  until it registers (section 5). It goes in `identification.email`, the person's key within the
+  tenant.
+- **Claimed:** an email typed in the conversation, or one a handoff without an email takes from
+  the state (section 5). It goes in `identification.claimed_email`. `SY.identity` stores and shows
+  it, but never indexes it, looks it up or merges on it: a typed email can neither take over a
+  registered person nor reserve an address for a later merge.
+- **The registration completes either way.** A claimed email is never the reason for a
+  `DUPLICATE_EMAIL` or an `ILK_DELETED`, and when someone already holds it the frontdesk registers
+  a new person anyway. The answer is the same whether or not the email is known (`REGISTERED`,
+  never `MERGED`), so a channel cannot probe which emails are registered. If it is the same
+  person, joining the two ILKs is an explicit step of the operator.
+
+If the registration carries a vouched email that another human ILK of the same tenant already has,
+the person is already registered and the registration does not fail: `SY.identity` does the merge
+inside the same `ILK_REGISTER` (details in `10-identity-v2.md` 6.5):
 
 - the existing ILK keeps its id, its tenant and its `complete` state;
 - the temporary ILK's channels move to that ILK, and the temporary one stays as its alias until
@@ -277,10 +320,6 @@ the merge inside the same `ILK_REGISTER` (details in `10-identity-v2.md` 6.5):
 An explicit update does overwrite: an `ILK_REGISTER` of the already-registered ILK itself (for example a
 repeated `register_human` from Cloud for the same email) replaces its whole `identification`; the last
 one wins.
-
-Without proof that the person owns the email, whoever writes someone else's email gets their channel
-associated with that person's ILK. The verification (for example a one-time code) is
-pending (section 13).
 
 ## 8. Default output
 
@@ -356,11 +395,11 @@ Closed `result_code` values:
 | `result_code` | state | when |
 | --- | --- | --- |
 | `REGISTERED` | `ok` | the temporary ILK became `complete` |
-| `MERGED` | `ok` | the email already belonged to another ILK of the tenant: this channel moved to that ILK (section 7.1); `ilk_id` is that ILK |
+| `MERGED` | `ok` | the vouched email already belonged to another ILK of the tenant: this channel moved to that ILK (section 7.1); `ilk_id` is that ILK. A claimed email never gives it |
 | `ALREADY_COMPLETE` | `ok` | conversational: the thread state already says `completed` |
 | `MISSING_REQUIRED_FIELDS` | `needs_input` | `display_name` and/or `email` are missing |
 | `IN_CONVERSATION` | `needs_input` | conversational turn with no registration (greeting, request for a piece of data) |
-| `INVALID_REQUEST` | `error` | invalid request: unsupported operation, invalid data, `tenant_mismatch`, `INVALID_*` from `SY.identity` |
+| `INVALID_REQUEST` | `error` | invalid request: a handoff from a sender that is not an IO node, unsupported operation, invalid data, `tenant_mismatch`, `INVALID_*` from `SY.identity` |
 | `TENANT_UNRESOLVED` | `error` | there is no tenant for the case (`missing_tenant_id`, section 4.3); nothing was registered or created |
 | `TENANT_NOT_REGISTRABLE` | `error` | the case's tenant is the root tenant (`TENANT_ROOT_NOT_REGISTRABLE`, section 4.4); nothing was registered and the person stays `temporary` |
 | `REGISTER_FAILED` | `error` | `SY.identity` rejected the registration with a final verdict |
@@ -374,7 +413,7 @@ Registration failures (`ILK_REGISTER`):
 - any other code `SY.identity` responds with is a final verdict, not retryable: `INVALID_*` -> `INVALID_REQUEST`; `TENANT_ROOT_NOT_REGISTRABLE` -> `TENANT_NOT_REGISTRABLE` (the same result as when the frontdesk sees it); the rest (`TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_DELETED`, `ILK_DELETED`, `ILK_NOT_FOUND`, `SYSTEM_ILK_PROTECTED`, `DUPLICATE_*`, `UNAUTHORIZED_REGISTRAR`, ...) -> `REGISTER_FAILED`;
 - `error_code` keeps the `SY.identity` code as is (or the tool's: `missing_src_ilk`, `invalid_identity_candidate`, `missing_tenant_id`, `tenant_mismatch`, and `TENANT_ROOT_NOT_REGISTRABLE`, the same code `SY.identity` uses).
 
-`DUPLICATE_EMAIL` is left only for an email that cannot be merged: the registration's ILK is not a
+`DUPLICATE_EMAIL` is left only for a vouched email that cannot be merged: the registration's ILK is not a
 temporary human ILK of the same tenant (for example an ILK that is already `complete` and wants someone else's email).
 
 `missing_fields`:
@@ -463,9 +502,9 @@ which fields came in, never their values.
 
 ## 13. Open items
 
-- Proof that the person owns the email (for example a one-time code) before the merge
-  of section 7.1. Until then, whoever knows someone else's email associates their channel with that
-  person's ILK.
+- A way to turn a claimed email into a vouched one (for example a one-time code sent to it). Until
+  then a typed email stays a claim and never merges (section 7.1), and joining a claimant to the
+  person who holds the email is the operator's explicit step, which SY.admin does not offer yet.
 - The counters of section 12 (G6).
 - Conversational retries: the prompt's "no loop" rule makes a transient error
   terminal (G8).

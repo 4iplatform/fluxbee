@@ -84,9 +84,12 @@ Designs not built yet: [solution-manifest-spec_1](solution-manifest-spec_1.md),
 ## History
 
 [history/](history/) keeps superseded documents as they were written (some in Spanish): the old
-numbered reference (01–12, 14), the first specs of nodes now documented in [nodes/](nodes/), and the
-working notes of 2026 (`history/onworking-coa/`, `history/onworking-noe/`). Read them for context
-only; they describe things that changed.
+numbered reference (01–12, 14), the first specs of nodes now documented in [nodes/](nodes/), the
+working notes of 2026 (`history/onworking-coa/`, `history/onworking-noe/`), and designs overtaken
+before they were built, such as
+[system_node_action_catalogs](history/system_node_action_catalogs.md) and
+[policy_solution_integration_tasks](history/policy_solution_integration_tasks.md). Read them for
+context only; they describe things that changed.
 
 ## The lab
 

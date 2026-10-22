@@ -28,7 +28,10 @@ REMOVED (operator decisions, 2026-09-28):
 KEPT: the installation (package, /etc/fluxbee, vault master key, TLS, mesh and spokes), what
 starts as SYSTEM (SY.* nodes and ILKs, the base nodes of base-nodes.json with their ILK, ICH and
 config -- e.g. the Cloud door stays published), routes/VPNs/taps and the operational history
-(admin command log, deploy history, vault audit).
+(admin command log, deploy history, vault audit). The spokes' host rules are part of the
+installation too: the ingress' SSH table (inet fluxbee_ingress) and the egress' table live on
+those hosts, which this script never reaches, and their orchestrators apply them again on every
+reconcile; remove_hive drops them with the hive (docs/control-path-hardening-v1.md §6).
 
 NOT covered yet (never touched): blobs/publications.
 

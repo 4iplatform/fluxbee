@@ -227,10 +227,6 @@ struct SystemNodesSection {
 #[derive(Debug, Clone, Deserialize)]
 struct RoleSystemNodes {
     nodes: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    // identity does not use wait_for; orchestrator does. Parsed for schema completeness.
-    wait_for: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +304,10 @@ struct IlkRegisterRequest {
     ilk_id: String,
     ilk_type: String,
     tenant_id: String,
+    /// Free JSON. Two keys identify: a node's `node_name`, and `email`, an email the channel
+    /// vouches for, unique within the tenant, where a registered one merges (`merge_registration`).
+    /// `claimed_email`, an email the person only typed, is stored and returned with the ILK but is
+    /// never indexed, looked up or merged on (docs/control-path-hardening-v1.md §7).
     identification: Value,
 }
 
@@ -916,7 +916,8 @@ impl IdentityStore {
     }
 
     /// The ilk of `tenant_id` that holds `email`, which is unique within a tenant (the scope of
-    /// its DB index): the active one, or with `deleted` a marked one that keeps it reserved.
+    /// its DB index): the active one, or with `deleted` a marked one that keeps it reserved. Only
+    /// `identification.email`, the vouched one, holds an email: a `claimed_email` holds nothing.
     fn ilk_holding_email(&self, tenant_id: &str, email: &str, deleted: bool) -> Option<String> {
         let email = email.trim();
         if email.is_empty() {
@@ -1062,6 +1063,7 @@ impl IdentityStore {
             .clone()
             .or_else(|| self.default_tenant_id())
             .ok_or_else(|| "missing default tenant".to_string())?;
+        let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
         if self.tenant_is_deleted(&tenant_id) {
             return Err("TENANT_DELETED".to_string());
         }
@@ -1207,6 +1209,20 @@ impl IdentityStore {
         if self.registers_a_person_into_the_root_tenant(&req) {
             return Err("TENANT_ROOT_NOT_REGISTRABLE".to_string());
         }
+        // Only a person has an email. A node registered with one would hold that address in its
+        // tenant, and the answers would tell which addresses are taken.
+        if req.ilk_type.trim() != "human"
+            && ["email", "claimed_email"].iter().any(|key| {
+                req.identification
+                    .get(*key)
+                    .is_some_and(|value| !identification_value_is_empty(value))
+            })
+        {
+            return Err(lifecycle_error(
+                "INVALID_IDENTIFICATION",
+                "only a person's registration carries an email",
+            ));
+        }
         // Keys of a marked ilk stay reserved until purge, in the scope of their unique index:
         // node_name across the mesh, email within its tenant.
         if let Some(node_name) = identification_str(&req.identification, "node_name") {
@@ -1220,6 +1236,8 @@ impl IdentityStore {
                 return Err("ILK_DELETED".to_string());
             }
         }
+        // Only a vouched email is a key. A `claimed_email` registers as plain data: it neither
+        // merges nor collides, so the person completes whether or not someone holds it.
         if let Some(email) = identification_str(&req.identification, "email").map(str::to_string) {
             match self.ilk_holding_email(&req.tenant_id, &email, false) {
                 // The email is already registered in this tenant: the person is known.
@@ -1459,15 +1477,14 @@ impl IdentityStore {
             owner_l2_name,
             cloud_relay,
         )?;
-        if self
-            .deleted_ilk_holding_channel(&req.channel.channel_type, &req.channel.address, &scope)
-            .is_some()
-        {
-            return Err("ILK_DELETED".to_string());
-        }
-
         let canonical_ilk_id = req.ilk_id.clone();
         let response_ich_id = req.channel.ich_id.clone();
+        // The ILKs this request joins: the target, and a merge's source.
+        let mut joined = vec![canonical_ilk_id.as_str()];
+        joined.extend(req.merge_from_ilk_id.as_deref());
+        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address, &scope);
+        self.check_channel_free(&key, &joined)?;
+
         match self.ilks.get(&canonical_ilk_id) {
             Some(target) if target.deleted_at_ms.is_none() => {}
             _ => return Err("ILK_NOT_FOUND".to_string()),
@@ -1489,15 +1506,12 @@ impl IdentityStore {
                 return Err("CLOUD_CHANNEL_RESERVED".to_string());
             }
         }
-        let mut joined = vec![canonical_ilk_id.as_str()];
-        joined.extend(req.merge_from_ilk_id.as_deref());
         self.check_ich_id_free(&req.channel.ich_id, &joined)?;
         let target = self
             .ilks
             .get_mut(&canonical_ilk_id)
             .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
 
-        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address, &scope);
         self.ich_lookup.insert(key, canonical_ilk_id.clone());
 
         let already = target
@@ -1536,8 +1550,9 @@ impl IdentityStore {
             Some(entry) if entry.deleted_at_ms.is_none() => entry.tenant_id.clone(),
             _ => return Err("ILK_NOT_FOUND".to_string()),
         };
-        // The orchestrator adds a node's own channels: they live in the node's tenant, and a
-        // Fluxbee Cloud account is never one of them. All checked before anything changes.
+        // The orchestrator adds a node's own channels: they live in the node's tenant, a Fluxbee
+        // Cloud account is never one of them, and none is another ILK's. All checked before
+        // anything changes.
         for ch in &req.add_channels {
             validate_channel_input(ch)?;
             if is_cloud_account_channel(&ch.channel_type) {
@@ -1552,6 +1567,10 @@ impl IdentityStore {
                 return Err("INVALID_SCOPE".to_string());
             }
             self.check_ich_id_free(&ch.ich_id, &[req.ilk_id.as_str()])?;
+            self.check_channel_free(
+                &canonical_ich_key(&ch.channel_type, &ch.address, &tenant_id),
+                &[req.ilk_id.as_str()],
+            )?;
         }
 
         let entry = self
@@ -1630,6 +1649,32 @@ impl IdentityStore {
             Some(ilk) if !allowed.contains(&ilk.ilk_id.as_str()) => {
                 Err("ICH_ID_CONFLICT".to_string())
             }
+            _ => Ok(()),
+        }
+    }
+
+    /// A channel key (`canonical_ich_key`) names one ILK, and nothing takes it over: adding it to
+    /// an ILK answers ILK_DELETED while a marked ILK keeps it reserved, and ICH_CONFLICT while an
+    /// active one holds it. `allowed` are the ILKs the request joins (its target, a merge's
+    /// source), which may hold it already.
+    fn check_channel_free(
+        &self,
+        key: &(String, String, String),
+        allowed: &[&str],
+    ) -> Result<(), String> {
+        let reserved = self.ilks.values().any(|ilk| {
+            ilk.deleted_at_ms.is_some()
+                && !allowed.contains(&ilk.ilk_id.as_str())
+                && ilk
+                    .channels
+                    .iter()
+                    .any(|channel| channel_key(channel, &ilk.tenant_id) == *key)
+        });
+        if reserved {
+            return Err("ILK_DELETED".to_string());
+        }
+        match self.ich_lookup.get(key) {
+            Some(holder) if !allowed.contains(&holder.as_str()) => Err("ICH_CONFLICT".to_string()),
             _ => Ok(()),
         }
     }
@@ -2818,12 +2863,12 @@ impl IdentityStore {
                 ilk
             })
             .filter(|ilk| {
-                let acceptable = replica_push_acceptable(ilk, self.ilks.get(&ilk.ilk_id));
+                let acceptable = replica_push_acceptable(ilk, self);
                 if !acceptable {
                     tracing::warn!(
                         ilk_id = %ilk.ilk_id,
                         hive_id = %hive_id,
-                        "replica push ignored: it changes the ILK's tenant, or a node channel names another scope or a Fluxbee Cloud account"
+                        "replica push ignored: an id in another spelling, a change of the ILK's tenant, or a node channel that names another scope, a Fluxbee Cloud account, or a channel another ILK holds"
                     );
                 }
                 acceptable
@@ -2922,7 +2967,8 @@ fn ingest_ilk_type_authorized(ilk: &IlkRecord, publisher_hive: &str) -> bool {
 /// (which carries only an ilk_id) ownership is resolved against the existing ilk
 /// in `store`; an unknown id is rejected, so a replica can neither forge a
 /// `@motherbee`/`@other-hive` ilk nor delete one it does not own. TenantUpsert
-/// is primary-only and never accepted from a replica.
+/// is primary-only and never accepted from a replica. Every id a delta names
+/// must be in its canonical spelling (`parse_prefixed_uuid`).
 fn delta_authorized_for_hive(
     delta: &IdentityDelta,
     publisher_hive: &str,
@@ -2942,7 +2988,7 @@ fn delta_authorized_for_hive(
             if !ingest_ilk_type_authorized(ilk, publisher_hive) {
                 return false;
             }
-            if !replica_push_acceptable(ilk, store.ilks.get(&ilk.ilk_id)) {
+            if !replica_push_acceptable(ilk, store) {
                 return false;
             }
             match store.ilks.get(&ilk.ilk_id) {
@@ -2951,7 +2997,9 @@ fn delta_authorized_for_hive(
             }
         }
         IdentityDelta::IlkDelete { ilk_id } => {
-            store.ilks.get(ilk_id).and_then(ilk_owning_hive).as_deref() == Some(publisher_hive)
+            is_canonical_id(ilk_id, "ilk")
+                && store.ilks.get(ilk_id).and_then(ilk_owning_hive).as_deref()
+                    == Some(publisher_hive)
         }
         // Tenant lifecycle is primary-only, like TenantUpsert.
         IdentityDelta::TenantDelete { .. } => false,
@@ -2971,17 +3019,20 @@ fn delta_authorized_for_hive(
                 return false;
             }
             let owned_by_publisher = |id: &str| {
-                store.ilks.get(id).and_then(ilk_owning_hive).as_deref() == Some(publisher_hive)
+                is_canonical_id(id, "ilk")
+                    && store.ilks.get(id).and_then(ilk_owning_hive).as_deref()
+                        == Some(publisher_hive)
             };
             owned_by_publisher(&alias.old_ilk_id) && owned_by_publisher(&alias.canonical_ilk_id)
         }
         IdentityDelta::AliasDelete { old_ilk_id } => {
-            store
-                .ilks
-                .get(old_ilk_id)
-                .and_then(ilk_owning_hive)
-                .as_deref()
-                == Some(publisher_hive)
+            is_canonical_id(old_ilk_id, "ilk")
+                && store
+                    .ilks
+                    .get(old_ilk_id)
+                    .and_then(ilk_owning_hive)
+                    .as_deref()
+                    == Some(publisher_hive)
         }
         // Tenants are primary-authoritative; never accepted from a replica push.
         IdentityDelta::TenantUpsert { .. } => false,
@@ -3017,6 +3068,8 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_TNT_LIST, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_TNT_GET, vec!["SY.admin@"]);
+        // The orchestrator of any hive registers, updates, deletes and purges the ILKs of the nodes
+        // it runs, and only those: `authorize_orchestrator_ilk_scope` holds it to its own hive's.
         allowed_prefixes.insert(
             MSG_ILK_REGISTER,
             vec!["SY.frontdesk.gov@", "SY.orchestrator@"],
@@ -3323,6 +3376,30 @@ impl IdentityRuntime {
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
         }
+        if let Err(payload) =
+            authorize_orchestrator_ilk_scope(&self.store, action, &msg.payload, src_l2_name)
+        {
+            let ilk_id = msg
+                .payload
+                .get("ilk_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let node_name = msg
+                .payload
+                .get("identification")
+                .and_then(|identification| identification_str(identification, "node_name"))
+                .unwrap_or("");
+            tracing::warn!(
+                action,
+                trace_id = %trace_id,
+                src_l2_name = src_l2_name.unwrap_or("<unknown>"),
+                ilk_id,
+                node_name,
+                "identity refused an orchestrator outside its own hive's nodes"
+            );
+            send_system_response(sender, msg, response_name(action), payload).await?;
+            return Ok(Vec::new());
+        }
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
@@ -3486,7 +3563,7 @@ impl IdentityRuntime {
                                 )
                                 .await
                             }
-                            Err(code) => error_payload(&code, "failed to register ilk"),
+                            Err(code) => op_error_payload(&code, "failed to register ilk"),
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -4203,7 +4280,9 @@ impl IdentityRuntime {
         // lives in system_policy::prefix_allowed_same_hive_scoped — shared with the router's
         // authorize_system rule so the two can't drift; only the per-message allowlist DATA stays
         // here. IO.* (worker IO provisioning against the sole motherbee authority) and
-        // SY.orchestrator@ (cross-hive control plane) are legitimately cross-hive.
+        // SY.orchestrator@ (each hive's orchestrator registers its nodes at the primary) come from
+        // any hive; an orchestrator is then held to its own hive's nodes
+        // (authorize_orchestrator_ilk_scope).
         const SAME_HIVE_ONLY_PREFIXES: [&str; 3] =
             ["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"];
         json_router::router::system_policy::prefix_allowed_same_hive_scoped(
@@ -6939,6 +7018,75 @@ fn authorize_ich_enabled_mutation(
     }
 }
 
+/// An orchestrator acts only on its own hive's nodes (docs/control-path-hardening-v1.md §4). From
+/// `SY.orchestrator@H`:
+/// - `ILK_REGISTER` registers a node of `H`: `identification.node_name` ends in `@H`, the type is
+///   not a person's, and the ILK it lands on (the name's active holder, else the requested id) is a
+///   node of `H` when it exists, so a registration takes no person's ILK and no other hive's;
+/// - `ILK_UPDATE`, `ILK_DELETE` and `ILK_PURGE` act only on a node of `H`.
+///
+/// An ILK that does not exist passes, and its handler answers as before (`ILK_NOT_FOUND`); an id
+/// in another spelling than the canonical one names none of its nodes. Every other caller passes:
+/// the table in `IdentityRuntime::new` already admitted it.
+fn authorize_orchestrator_ilk_scope(
+    store: &IdentityStore,
+    action: &str,
+    payload: &Value,
+    src_l2_name: Option<&str>,
+) -> Result<(), Value> {
+    let Some(caller_hive) = src_l2_name
+        .map(str::trim)
+        .and_then(|caller| caller.strip_prefix("SY.orchestrator@"))
+    else {
+        return Ok(());
+    };
+    let requested_id = payload.get("ilk_id").and_then(Value::as_str);
+    let requested = requested_id.and_then(|ilk_id| store.ilks.get(ilk_id));
+    let canonical = requested_id.is_none_or(|ilk_id| is_canonical_id(ilk_id, "ilk"));
+    let allowed = canonical
+        && match action {
+            MSG_ILK_REGISTER => {
+                let identification = payload.get("identification").unwrap_or(&Value::Null);
+                let ilk_type = payload.get("ilk_type").and_then(Value::as_str);
+                // Where `register_ilk` writes: the ILK that holds the node name, else the
+                // requested id.
+                let lands_on = identification_str(identification, "node_name")
+                    .and_then(|node_name| {
+                        store.find_active_ilk_by_identification_key("node_name", node_name)
+                    })
+                    .and_then(|holder| store.ilks.get(&holder))
+                    .or(requested);
+                names_a_node_of(identification, caller_hive)
+                    && ilk_type.map(str::trim) != Some("human")
+                    && lands_on.is_none_or(|ilk| is_node_of(ilk, caller_hive))
+            }
+            MSG_ILK_UPDATE | MSG_ILK_DELETE | MSG_ILK_PURGE => {
+                requested.is_none_or(|ilk| is_node_of(ilk, caller_hive))
+            }
+            _ => true,
+        };
+    if allowed {
+        return Ok(());
+    }
+    Err(error_payload(
+        "UNAUTHORIZED",
+        "an orchestrator may only register, update, delete or purge its own hive's nodes",
+    ))
+}
+
+/// A node of `hive`: not a person, and its `identification.node_name` ends in `@<hive>`.
+fn is_node_of(ilk: &IlkRecord, hive: &str) -> bool {
+    ilk.ilk_type.trim() != "human" && names_a_node_of(&ilk.identification, hive)
+}
+
+/// Whether `identification.node_name` ends in `@<hive>`.
+fn names_a_node_of(identification: &Value, hive: &str) -> bool {
+    !hive.is_empty()
+        && identification_str(identification, "node_name")
+            .and_then(|node_name| node_name.rsplit_once('@'))
+            .is_some_and(|(_, node_hive)| node_hive == hive)
+}
+
 fn error_payload(error_code: &str, message: &str) -> Value {
     json!({
         "status": "error",
@@ -7194,12 +7342,23 @@ fn is_pending_signup(ilk: &IlkRecord) -> bool {
         && holds_installation_account(ilk)
 }
 
-/// What a replica may push for one of its ILKs: never another tenant for an ILK the primary holds
-/// (a node is born and dies in its tenant, D6), and only channels it may hold (see
-/// `replica_channels_acceptable`).
-fn replica_push_acceptable(incoming: &IlkRecord, existing: Option<&IlkRecord>) -> bool {
-    existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
+/// What a replica may push for one of its ILKs: every id in its canonical spelling (another
+/// spelling would overwrite an existing row in the primary's database), never another tenant for
+/// an ILK the primary holds (a node is born and dies in its tenant, D6), only channels it may hold
+/// (see `replica_channels_acceptable`), and no channel another ILK holds or keeps reserved.
+fn replica_push_acceptable(incoming: &IlkRecord, store: &IdentityStore) -> bool {
+    let existing = store.ilks.get(&incoming.ilk_id);
+    ilk_record_ids_canonical(incoming)
+        && existing.is_none_or(|existing| existing.tenant_id == incoming.tenant_id)
         && replica_channels_acceptable(incoming, existing)
+        && incoming.channels.iter().all(|channel| {
+            store
+                .check_channel_free(
+                    &channel_key(channel, &incoming.tenant_id),
+                    &[incoming.ilk_id.as_str()],
+                )
+                .is_ok()
+        })
 }
 
 /// A replica's ILKs are its nodes': their channels live in their own tenant, and neither the
@@ -7262,14 +7421,36 @@ fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// `<prefix>:<uuid>` in its one canonical spelling: lowercase and hyphenated, with nothing around
+/// it. The store keys every id by its string and the database by its uuid, so another spelling
+/// (uppercase, no hyphens, braces, spaces) would name a second record in memory and an existing
+/// row in the database, which the upsert would then overwrite. Any other spelling answers
+/// INVALID_REQUEST.
 fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
-    let trimmed = value.trim();
-    let expected = format!("{}:", prefix);
-    if !trimmed.starts_with(&expected) {
+    let uuid = value
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .ok_or_else(|| "INVALID_REQUEST".to_string())?;
+    if value != format!("{prefix}:{uuid}") {
         return Err("INVALID_REQUEST".to_string());
     }
-    let raw = &trimmed[expected.len()..];
-    Uuid::parse_str(raw).map_err(|_| "INVALID_REQUEST".to_string())
+    Ok(uuid)
+}
+
+fn is_canonical_id(value: &str, prefix: &str) -> bool {
+    parse_prefixed_uuid(value, prefix).is_ok()
+}
+
+/// Every id an ILK record carries in its canonical spelling: its own, its tenant's, and each
+/// channel's id and scope (empty only in a record from an older peer).
+fn ilk_record_ids_canonical(ilk: &IlkRecord) -> bool {
+    is_canonical_id(&ilk.ilk_id, "ilk")
+        && is_canonical_id(&ilk.tenant_id, "tnt")
+        && ilk.channels.iter().all(|channel| {
+            is_canonical_id(&channel.ich_id, "ich")
+                && (channel.scope.is_empty() || is_canonical_id(&channel.scope, "tnt"))
+        })
 }
 
 /// Validator for `ilk_type` arriving via ILK_REGISTER (frontdesk/orchestrator).
@@ -7982,6 +8163,7 @@ async fn upsert_ilk_rows(
 ) -> Result<(), IdentityError> {
     let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?.to_string();
     let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.to_string();
+    // The indexed column holds the vouched email only; a `claimed_email` stays in the JSONB.
     let email = optional_identification_string(&ilk.identification, "email", 256)?;
     let node_name = optional_identification_string(&ilk.identification, "node_name", 128)?;
     let association = association_json_from_ilk(ilk);
@@ -9095,7 +9277,6 @@ mod tests {
             system_nodes: Some(SystemNodesSection {
                 motherbee: Some(RoleSystemNodes {
                     nodes: vec!["SY.identity".to_string(), "SY.architect".to_string()],
-                    wait_for: vec!["SY.identity".to_string()],
                 }),
                 worker: None,
             }),
@@ -10427,6 +10608,15 @@ mod tests {
         );
     }
 
+    /// A canonical ILK id for a readable test label: the store and its authority checks take ids
+    /// in their canonical spelling only.
+    fn t_ilk(label: &str) -> String {
+        format!(
+            "ilk:{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes())
+        )
+    }
+
     fn ilk_for(node_name: &str, ilk_id: &str) -> IlkRecord {
         let hive = node_name.rsplit_once('@').map(|(_, h)| h).unwrap_or("");
         IlkRecord {
@@ -10448,11 +10638,11 @@ mod tests {
     #[test]
     fn ilk_owning_hive_uses_node_name_suffix_then_hive_id() {
         assert_eq!(
-            ilk_owning_hive(&ilk_for("SY.storage@worker1", "ilk:a")).as_deref(),
+            ilk_owning_hive(&ilk_for("SY.storage@worker1", &t_ilk("a"))).as_deref(),
             Some("worker1")
         );
         // Fallback to identification.hive_id when node_name carries no `@`.
-        let mut ilk = ilk_for("plain", "ilk:b");
+        let mut ilk = ilk_for("plain", &t_ilk("b"));
         ilk.identification = json!({ "node_name": "plain", "hive_id": "motherbee" });
         assert_eq!(ilk_owning_hive(&ilk).as_deref(), Some("motherbee"));
     }
@@ -10463,7 +10653,7 @@ mod tests {
         // A replica may push its own `@hive` ilk.
         assert!(delta_authorized_for_hive(
             &IdentityDelta::IlkUpsert {
-                ilk: ilk_for("SY.storage@worker1", "ilk:w")
+                ilk: ilk_for("SY.storage@worker1", &t_ilk("w"))
             },
             "worker1",
             &store
@@ -10471,14 +10661,14 @@ mod tests {
         // It may NOT forge a `@motherbee` or another hive's ilk.
         assert!(!delta_authorized_for_hive(
             &IdentityDelta::IlkUpsert {
-                ilk: ilk_for("SY.storage@motherbee", "ilk:m")
+                ilk: ilk_for("SY.storage@motherbee", &t_ilk("m"))
             },
             "worker1",
             &store
         ));
         assert!(!delta_authorized_for_hive(
             &IdentityDelta::IlkUpsert {
-                ilk: ilk_for("SY.x@worker2", "ilk:w2")
+                ilk: ilk_for("SY.x@worker2", &t_ilk("w2"))
             },
             "worker1",
             &store
@@ -10504,24 +10694,20 @@ mod tests {
         let mut store2 = IdentityStore::default();
         store2
             .ilks
-            .insert("ilk:w".into(), ilk_for("SY.storage@worker1", "ilk:w"));
+            .insert(t_ilk("w"), ilk_for("SY.storage@worker1", &t_ilk("w")));
         assert!(delta_authorized_for_hive(
-            &IdentityDelta::IlkDelete {
-                ilk_id: "ilk:w".into()
-            },
+            &IdentityDelta::IlkDelete { ilk_id: t_ilk("w") },
             "worker1",
             &store2
         ));
         assert!(!delta_authorized_for_hive(
-            &IdentityDelta::IlkDelete {
-                ilk_id: "ilk:w".into()
-            },
+            &IdentityDelta::IlkDelete { ilk_id: t_ilk("w") },
             "worker2",
             &store2
         ));
         assert!(!delta_authorized_for_hive(
             &IdentityDelta::IlkDelete {
-                ilk_id: "ilk:unknown".into()
+                ilk_id: t_ilk("unknown")
             },
             "worker1",
             &store2
@@ -10531,28 +10717,30 @@ mod tests {
     #[test]
     fn authority_rejects_ilk_id_collision_with_other_hive() {
         let mut store = IdentityStore::default();
-        // motherbee owns ilk_id "ilk:shared".
+        // motherbee owns the ilk_id t_ilk("shared").
         store.ilks.insert(
-            "ilk:shared".into(),
-            ilk_for("SY.storage@motherbee", "ilk:shared"),
+            t_ilk("shared"),
+            ilk_for("SY.storage@motherbee", &t_ilk("shared")),
         );
         // worker1 tries to hijack that ilk_id with a forged `@worker1` node_name.
         let collide = IdentityDelta::IlkUpsert {
-            ilk: ilk_for("SY.evil@worker1", "ilk:shared"),
+            ilk: ilk_for("SY.evil@worker1", &t_ilk("shared")),
         };
         assert!(
             !delta_authorized_for_hive(&collide, "worker1", &store),
             "delta path must reject ilk_id collision"
         );
         // The snapshot/reconcile path must also skip it, leaving motherbee intact.
-        let deltas =
-            store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.evil@worker1", "ilk:shared")]);
+        let deltas = store.reconcile_hive_ilks(
+            "worker1",
+            vec![ilk_for("SY.evil@worker1", &t_ilk("shared"))],
+        );
         assert!(
             deltas.is_empty(),
             "reconcile must not overwrite foreign ilk_id"
         );
         assert_eq!(
-            ilk_owning_hive(store.ilks.get("ilk:shared").unwrap()).as_deref(),
+            ilk_owning_hive(store.ilks.get(&t_ilk("shared")).unwrap()).as_deref(),
             Some("motherbee")
         );
     }
@@ -10561,29 +10749,31 @@ mod tests {
     fn reconcile_and_apply_never_delete_well_known_system_ilk() {
         let mut store = IdentityStore::default();
         // worker1's well-known system ilk (source = hive.system_nodes).
-        let mut sys = ilk_for("SY.identity@worker1", "ilk:sys");
+        let mut sys = ilk_for("SY.identity@worker1", &t_ilk("sys"));
         sys.identification = json!({
             "node_name": "SY.identity@worker1", "hive_id": "worker1", "source": "hive.system_nodes"
         });
-        store.ilks.insert("ilk:sys".into(), sys);
+        store.ilks.insert(t_ilk("sys"), sys);
         // A forged snapshot that OMITS the system ilk must NOT reconcile-delete it
         // (the mesh-DOS the reviewer flagged).
-        let deltas =
-            store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.other@worker1", "ilk:other")]);
+        let deltas = store.reconcile_hive_ilks(
+            "worker1",
+            vec![ilk_for("SY.other@worker1", &t_ilk("other"))],
+        );
         assert!(
-            store.ilks.contains_key("ilk:sys"),
+            store.ilks.contains_key(&t_ilk("sys")),
             "system ilk must survive reconcile"
         );
-        assert!(store.ilks.contains_key("ilk:other"));
+        assert!(store.ilks.contains_key(&t_ilk("other")));
         assert!(!deltas
             .iter()
-            .any(|d| matches!(d, IdentityDelta::IlkDelete { ilk_id } if ilk_id == "ilk:sys")));
+            .any(|d| matches!(d, IdentityDelta::IlkDelete { ilk_id } if *ilk_id == t_ilk("sys"))));
         // apply_delta is the net: a direct IlkDelete of a well-known ilk is a no-op.
         store.apply_delta(IdentityDelta::IlkDelete {
-            ilk_id: "ilk:sys".into(),
+            ilk_id: t_ilk("sys"),
         });
         assert!(
-            store.ilks.contains_key("ilk:sys"),
+            store.ilks.contains_key(&t_ilk("sys")),
             "apply_delta must not remove a system ilk"
         );
     }
@@ -10594,26 +10784,29 @@ mod tests {
         // motherbee's own ilk must survive a worker1 reconcile untouched.
         store
             .ilks
-            .insert("ilk:mb".into(), ilk_for("SY.storage@motherbee", "ilk:mb"));
+            .insert(t_ilk("mb"), ilk_for("SY.storage@motherbee", &t_ilk("mb")));
         // worker1 had two; now publishes one unchanged + one new (the other was
         // hard-deleted on the replica).
         store
             .ilks
-            .insert("ilk:w1a".into(), ilk_for("SY.a@worker1", "ilk:w1a"));
+            .insert(t_ilk("w1a"), ilk_for("SY.a@worker1", &t_ilk("w1a")));
         store
             .ilks
-            .insert("ilk:w1b".into(), ilk_for("SY.b@worker1", "ilk:w1b"));
+            .insert(t_ilk("w1b"), ilk_for("SY.b@worker1", &t_ilk("w1b")));
         let incoming = vec![
-            ilk_for("SY.a@worker1", "ilk:w1a"),
-            ilk_for("SY.c@worker1", "ilk:w1c"),
+            ilk_for("SY.a@worker1", &t_ilk("w1a")),
+            ilk_for("SY.c@worker1", &t_ilk("w1c")),
         ];
         let deltas = store.reconcile_hive_ilks("worker1", incoming);
 
-        assert!(store.ilks.contains_key("ilk:mb"), "other hive untouched");
-        assert!(store.ilks.contains_key("ilk:w1a"));
-        assert!(store.ilks.contains_key("ilk:w1c"), "new ilk added");
         assert!(
-            !store.ilks.contains_key("ilk:w1b"),
+            store.ilks.contains_key(&t_ilk("mb")),
+            "other hive untouched"
+        );
+        assert!(store.ilks.contains_key(&t_ilk("w1a")));
+        assert!(store.ilks.contains_key(&t_ilk("w1c")), "new ilk added");
+        assert!(
+            !store.ilks.contains_key(&t_ilk("w1b")),
             "absent ilk hard-removed"
         );
         // w1a is byte-identical -> no-op skipped; only w1c upsert + w1b delete.
@@ -10631,8 +10824,8 @@ mod tests {
         let again = store.reconcile_hive_ilks(
             "worker1",
             vec![
-                ilk_for("SY.a@worker1", "ilk:w1a"),
-                ilk_for("SY.c@worker1", "ilk:w1c"),
+                ilk_for("SY.a@worker1", &t_ilk("w1a")),
+                ilk_for("SY.c@worker1", &t_ilk("w1c")),
             ],
         );
         assert!(again.is_empty(), "stable state produces no deltas");
@@ -10643,13 +10836,13 @@ mod tests {
         let mut store = IdentityStore::default();
         store
             .ilks
-            .insert("ilk:mb".into(), ilk_for("SY.storage@motherbee", "ilk:mb"));
+            .insert(t_ilk("mb"), ilk_for("SY.storage@motherbee", &t_ilk("mb")));
         store
             .ilks
-            .insert("ilk:w".into(), ilk_for("SY.a@worker1", "ilk:w"));
-        let mut tomb = ilk_for("SY.b@worker1", "ilk:wt");
+            .insert(t_ilk("w"), ilk_for("SY.a@worker1", &t_ilk("w")));
+        let mut tomb = ilk_for("SY.b@worker1", &t_ilk("wt"));
         tomb.deleted_at_ms = Some(123);
-        store.ilks.insert("ilk:wt".into(), tomb);
+        store.ilks.insert(t_ilk("wt"), tomb);
 
         let owned = store.self_owned_ilks("worker1");
         assert_eq!(owned.len(), 2, "active + tombstone, both @worker1");
@@ -10697,7 +10890,7 @@ mod tests {
     fn ingest_system_ilk_type_bound_to_deterministic_shape() {
         // Non-system types are always allowed for an owned ilk.
         assert!(ingest_ilk_type_authorized(
-            &ilk_for("AI.bot@worker1", "ilk:a"),
+            &ilk_for("AI.bot@worker1", &t_ilk("a")),
             "worker1"
         ));
         // A genuine deterministic SY.* system ilk of the publisher is allowed.
@@ -10706,11 +10899,11 @@ mod tests {
         sys.ilk_type = "system".to_string();
         assert!(ingest_ilk_type_authorized(&sys, "worker1"));
         // Relabelling an arbitrary owned (non-SY) ilk as system is rejected.
-        let mut evil = ilk_for("AI.evil@worker1", "ilk:evil");
+        let mut evil = ilk_for("AI.evil@worker1", &t_ilk("evil"));
         evil.ilk_type = "system".to_string();
         assert!(!ingest_ilk_type_authorized(&evil, "worker1"));
         // SY-named but non-deterministic ilk_id is rejected (id must match shape).
-        let mut fake = ilk_for("SY.vault@worker1", "ilk:not-the-real-id");
+        let mut fake = ilk_for("SY.vault@worker1", &t_ilk("not-the-real-id"));
         fake.ilk_type = "system".to_string();
         assert!(!ingest_ilk_type_authorized(&fake, "worker1"));
         // Ownership still required: a deterministic system ilk of ANOTHER hive.
@@ -10724,7 +10917,7 @@ mod tests {
     fn delta_authority_rejects_forged_system_ilk_type() {
         let store = IdentityStore::default();
         // A replica cannot mint a system-typed identity for an arbitrary owned ilk.
-        let mut evil = ilk_for("AI.evil@worker1", "ilk:evil");
+        let mut evil = ilk_for("AI.evil@worker1", &t_ilk("evil"));
         evil.ilk_type = "system".to_string();
         assert!(!delta_authorized_for_hive(
             &IdentityDelta::IlkUpsert { ilk: evil },
@@ -10734,7 +10927,7 @@ mod tests {
         // It CAN push its own agent ilk and its genuine deterministic system ilk.
         assert!(delta_authorized_for_hive(
             &IdentityDelta::IlkUpsert {
-                ilk: ilk_for("AI.ok@worker1", "ilk:ok")
+                ilk: ilk_for("AI.ok@worker1", &t_ilk("ok"))
             },
             "worker1",
             &store
@@ -10755,13 +10948,13 @@ mod tests {
         let mut store = IdentityStore::default();
         store
             .ilks
-            .insert("ilk:mb".into(), ilk_for("SY.vault@motherbee", "ilk:mb"));
+            .insert(t_ilk("mb"), ilk_for("SY.vault@motherbee", &t_ilk("mb")));
         store
             .ilks
-            .insert("ilk:w-old".into(), ilk_for("AI.old@worker1", "ilk:w-old"));
+            .insert(t_ilk("w-old"), ilk_for("AI.old@worker1", &t_ilk("w-old")));
         store.ilks.insert(
-            "ilk:w-canon".into(),
-            ilk_for("AI.canon@worker1", "ilk:w-canon"),
+            t_ilk("w-canon"),
+            ilk_for("AI.canon@worker1", &t_ilk("w-canon")),
         );
         let alias = |old: &str, canon: &str| IdentityDelta::AliasUpsert {
             alias: AliasSnapshotRecord {
@@ -10772,36 +10965,36 @@ mod tests {
         };
         // Legit merge: both endpoints owned by worker1.
         assert!(delta_authorized_for_hive(
-            &alias("ilk:w-old", "ilk:w-canon"),
+            &alias(&t_ilk("w-old"), &t_ilk("w-canon")),
             "worker1",
             &store
         ));
         // Hijack: redirect motherbee's ilk onto a worker1 ilk — old_ilk_id not
         // owned by worker1 => rejected (G-2 core).
         assert!(!delta_authorized_for_hive(
-            &alias("ilk:mb", "ilk:w-canon"),
+            &alias(&t_ilk("mb"), &t_ilk("w-canon")),
             "worker1",
             &store
         ));
         // Unknown source, and canonical-not-owned, both rejected.
         assert!(!delta_authorized_for_hive(
-            &alias("ilk:nope", "ilk:w-canon"),
+            &alias(&t_ilk("nope"), &t_ilk("w-canon")),
             "worker1",
             &store
         ));
         assert!(!delta_authorized_for_hive(
-            &alias("ilk:w-old", "ilk:mb"),
+            &alias(&t_ilk("w-old"), &t_ilk("mb")),
             "worker1",
             &store
         ));
         // Even an OWNED well-known system ilk may not be an alias source.
-        let mut wk = ilk_for("SY.identity@worker1", "ilk:wk");
+        let mut wk = ilk_for("SY.identity@worker1", &t_ilk("wk"));
         wk.identification = json!({
             "node_name": "SY.identity@worker1", "hive_id": "worker1", "source": "hive.system_nodes"
         });
-        store.ilks.insert("ilk:wk".into(), wk);
+        store.ilks.insert(t_ilk("wk"), wk);
         assert!(!delta_authorized_for_hive(
-            &alias("ilk:wk", "ilk:w-canon"),
+            &alias(&t_ilk("wk"), &t_ilk("w-canon")),
             "worker1",
             &store
         ));
@@ -10823,7 +11016,8 @@ mod tests {
         assert!(!runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@worker1")));
         // IO provisioning stays legitimately cross-hive.
         assert!(runtime.is_authorized(MSG_ILK_PROVISION, Some("IO.api@worker1")));
-        // Orchestrator control-plane stays legitimately cross-hive.
+        // The orchestrator passes the table from any hive; authorize_orchestrator_ilk_scope then
+        // holds it to its own hive's nodes.
         assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.orchestrator@worker1")));
         assert!(runtime.is_authorized(MSG_ILK_DELETE, Some("SY.orchestrator@worker1")));
     }
@@ -11695,6 +11889,719 @@ mod tests {
         let mut empty = Value::Null;
         fill_missing_identification(&mut empty, &json!({"email": "ana@acme.com"}));
         assert_eq!(empty, json!({"email": "ana@acme.com"}));
+    }
+
+    // ---- an orchestrator acts only on its own hive's nodes (control-path hardening §4) ----
+
+    const OS_W1_NODE: &str = "ilk:a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+    const OS_W2_NODE: &str = "ilk:a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2";
+    const OS_NEW_ILK: &str = "ilk:a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3";
+    const OS_WORKER1: &str = "SY.orchestrator@worker1";
+
+    /// The ILK_REGISTER an orchestrator sends for a node it runs (`ensure_node_identity_registered`).
+    fn os_node_request(ilk_id: &str, node_name: &str) -> IlkRegisterRequest {
+        IlkRegisterRequest {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "agent".to_string(),
+            tenant_id: LC_TENANT.to_string(),
+            identification: json!({"display_name": node_name, "node_name": node_name,
+                                   "runtime": "ai.generic", "runtime_version": "1.0.0"}),
+        }
+    }
+
+    /// Ana (a person of LC_TENANT), and the node `AI.bot` on worker1 and on worker2.
+    fn os_store() -> (IdentityStore, String) {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        for (ilk_id, node_name) in [
+            (OS_W1_NODE, "AI.bot@worker1"),
+            (OS_W2_NODE, "AI.bot@worker2"),
+        ] {
+            store
+                .register_ilk(os_node_request(ilk_id, node_name), MERGE_TTL_SECS)
+                .expect("node");
+        }
+        (store, ana)
+    }
+
+    fn os_register(ilk_id: &str, ilk_type: &str, identification: Value) -> Value {
+        json!({"ilk_id": ilk_id, "ilk_type": ilk_type, "tenant_id": LC_TENANT,
+               "identification": identification})
+    }
+
+    fn os_check(
+        store: &IdentityStore,
+        action: &str,
+        payload: &Value,
+        caller: &str,
+    ) -> Result<(), Value> {
+        authorize_orchestrator_ilk_scope(store, action, payload, Some(caller))
+    }
+
+    #[test]
+    fn an_orchestrator_registers_only_its_own_hive_nodes() {
+        let (store, ana) = os_store();
+        // A new node of its hive, its respawn, and a requested id its node name overrides: the
+        // registration lands on the name's holder, worker1's node.
+        for payload in [
+            os_register(OS_NEW_ILK, "agent", json!({"node_name": "AI.new@worker1"})),
+            os_register(OS_NEW_ILK, "agent", json!({"node_name": "AI.bot@worker1"})),
+            os_register(OS_W2_NODE, "agent", json!({"node_name": "AI.bot@worker1"})),
+        ] {
+            assert!(
+                os_check(&store, MSG_ILK_REGISTER, &payload, OS_WORKER1).is_ok(),
+                "{payload}"
+            );
+        }
+        let mut written = store.clone();
+        let reply = written
+            .register_ilk(
+                os_node_request(OS_W2_NODE, "AI.bot@worker1"),
+                MERGE_TTL_SECS,
+            )
+            .expect("respawn");
+        assert_eq!(reply["ilk_id"], OS_W1_NODE);
+        assert_eq!(written.ilks[OS_W2_NODE], store.ilks[OS_W2_NODE]);
+
+        for (payload, why) in [
+            (
+                os_register(OS_NEW_ILK, "agent", json!({"node_name": "AI.new@worker2"})),
+                "another hive's node",
+            ),
+            (
+                os_register(OS_NEW_ILK, "agent", json!({"node_name": "AI.new@worker10"})),
+                "a hive whose name only starts like its own",
+            ),
+            (
+                os_register(OS_NEW_ILK, "agent", json!({"node_name": "AI.new"})),
+                "a node name without a hive",
+            ),
+            (
+                os_register(
+                    OS_NEW_ILK,
+                    "agent",
+                    json!({"display_name": "AI.new@worker1"}),
+                ),
+                "no node name",
+            ),
+            (
+                os_register(OS_NEW_ILK, "human", json!({"node_name": "AI.new@worker1"})),
+                "a person's type",
+            ),
+            (
+                os_register(&ana, "agent", json!({"node_name": "AI.taken@worker1"})),
+                "a person's ILK",
+            ),
+            (
+                os_register(
+                    OS_W2_NODE,
+                    "agent",
+                    json!({"node_name": "AI.taken@worker1"}),
+                ),
+                "another hive's node ILK",
+            ),
+        ] {
+            let err = os_check(&store, MSG_ILK_REGISTER, &payload, OS_WORKER1).expect_err(why);
+            assert_eq!(err["error_code"], "UNAUTHORIZED", "{why}");
+        }
+        // What the check stops: on its own, register_ilk writes over the ILK it is given.
+        let mut unchecked = store.clone();
+        unchecked
+            .register_ilk(os_node_request(&ana, "AI.taken@worker1"), MERGE_TTL_SECS)
+            .expect("the store alone takes the person's ILK");
+        assert_eq!(unchecked.ilks[&ana].ilk_type, "agent");
+
+        // Every other caller passes: the table decides for them.
+        let person = os_register(&ana, "human", json!({"email": "ana@acme.com"}));
+        for caller in ["SY.frontdesk.gov@motherbee", "SY.identity@motherbee"] {
+            assert!(
+                os_check(&store, MSG_ILK_REGISTER, &person, caller).is_ok(),
+                "{caller}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_orchestrator_updates_deletes_and_purges_only_its_own_hive_nodes() {
+        let (mut store, ana) = os_store();
+        store
+            .register_ilk(
+                os_node_request(OS_NEW_ILK, "AI.gone@worker1"),
+                MERGE_TTL_SECS,
+            )
+            .expect("node");
+        store.delete_ilk(lc_ilk(OS_NEW_ILK), 5).expect("mark");
+        let missing = "ilk:a4a4a4a4-a4a4-4a4a-8a4a-a4a4a4a4a4a4";
+
+        for action in [MSG_ILK_UPDATE, MSG_ILK_DELETE, MSG_ILK_PURGE] {
+            let check = |ilk_id: &str, caller: &str| {
+                os_check(&store, action, &json!({"ilk_id": ilk_id}), caller)
+            };
+            // Its own nodes, marked or not. An ILK that does not exist goes on to its handler.
+            for ilk_id in [OS_W1_NODE, OS_NEW_ILK, missing] {
+                assert!(check(ilk_id, OS_WORKER1).is_ok(), "{action} {ilk_id}");
+            }
+            for ilk_id in [OS_W2_NODE, ana.as_str()] {
+                let err = check(ilk_id, OS_WORKER1).expect_err(action);
+                assert_eq!(err["error_code"], "UNAUTHORIZED", "{action} {ilk_id}");
+            }
+            assert!(
+                check(OS_W2_NODE, "SY.orchestrator@worker2").is_ok(),
+                "{action}"
+            );
+            // SY.admin keeps its reach: the operator's and Fluxbee Cloud's actions.
+            for ilk_id in [OS_W2_NODE, ana.as_str()] {
+                assert!(
+                    check(ilk_id, "SY.admin@motherbee").is_ok(),
+                    "{action} {ilk_id}"
+                );
+            }
+        }
+        // Not found answers as before.
+        let update = IlkUpdateRequest {
+            ilk_id: missing.to_string(),
+            add_channels: Vec::new(),
+            change_reason: None,
+        };
+        assert_eq!(
+            store.update_ilk(update).expect_err("missing"),
+            "ILK_NOT_FOUND"
+        );
+        assert_eq!(
+            store.delete_ilk(lc_ilk(missing), 6).expect_err("missing"),
+            "ILK_NOT_FOUND"
+        );
+        assert_eq!(
+            lc_code(store.purge_ilk(lc_ilk(missing)).expect_err("missing")),
+            "ILK_NOT_FOUND"
+        );
+    }
+
+    /// The orchestrator's own calls for a node it launches on its hive, as it sends them
+    /// (`ensure_node_identity_registered`, `apply_node_identity_update`, then the spawn rollback
+    /// `delete_node_ilk_for_spawn_rollback`), pass the check and apply.
+    #[test]
+    fn an_orchestrators_spawn_and_its_rollback_on_its_own_hive_pass() {
+        let mut store = rg_store();
+        let register = json!({
+            "ilk_id": OS_NEW_ILK, "ilk_type": "agent", "tenant_id": LC_TENANT,
+            "identification": {"display_name": "AI.support@worker1",
+                               "node_name": "AI.support@worker1",
+                               "runtime": "ai.generic", "runtime_version": "1.0.0"}
+        });
+        assert!(os_check(&store, MSG_ILK_REGISTER, &register, OS_WORKER1).is_ok());
+        let registered = store
+            .register_ilk(
+                serde_json::from_value(register).expect("request"),
+                MERGE_TTL_SECS,
+            )
+            .expect("register");
+        let ilk_id = registered["ilk_id"].as_str().expect("ilk_id").to_string();
+
+        let update = json!({
+            "ilk_id": ilk_id,
+            "add_channels": [{"ich_id": format!("ich:{}", Uuid::new_v4()), "type": "slack",
+                              "address": "UBOT"}],
+            "change_reason": "spawn"
+        });
+        assert!(os_check(&store, MSG_ILK_UPDATE, &update, OS_WORKER1).is_ok());
+        store
+            .update_ilk(serde_json::from_value(update).expect("request"))
+            .expect("update");
+
+        let target = json!({"ilk_id": ilk_id});
+        assert!(os_check(&store, MSG_ILK_DELETE, &target, OS_WORKER1).is_ok());
+        store
+            .delete_ilk(serde_json::from_value(target.clone()).expect("request"), 7)
+            .expect("mark");
+        assert!(os_check(&store, MSG_ILK_PURGE, &target, OS_WORKER1).is_ok());
+        store
+            .purge_ilk(serde_json::from_value(target).expect("request"))
+            .expect("purge");
+        assert!(!store.ilks.contains_key(&ilk_id));
+    }
+
+    // ---- only an email the channel vouches for identifies a person (hardening §7, A-42) ----
+
+    #[test]
+    fn a_claimed_email_completes_without_merging_into_the_person_who_holds_it() {
+        let mut store = rg_store();
+        let ana = rg_with_ana(&mut store);
+        let ana_before = store.ilks[&ana].clone();
+        // Someone writes from WhatsApp and types Ana's email: the frontdesk sends it as claimed.
+        let temp = rg_provision(&mut store, LC_TENANT, "whatsapp", "+5491100000002");
+        let reply = rg_register(
+            &mut store,
+            &temp,
+            LC_TENANT,
+            json!({"display_name": "Not Ana", "email": null, "claimed_email": "ana@acme.com"}),
+        )
+        .expect("a claimed email completes");
+        assert_eq!(reply["ilk_id"], temp.as_str());
+        assert_eq!(reply["merged"], false);
+        assert_eq!(reply["registration_status"], "complete");
+        assert!(reply.get("merged_from_ilk_id").is_none());
+
+        // Ana is untouched, and the email is still hers alone.
+        assert_eq!(store.ilks[&ana], ana_before);
+        assert!(store.aliases.is_empty());
+        assert_eq!(
+            store.ilk_holding_email(LC_TENANT, "ana@acme.com", false),
+            Some(ana)
+        );
+        // The WhatsApp channel stays with the new person, whose claim is stored and returned.
+        let key = canonical_ich_key("whatsapp", "+5491100000002", LC_TENANT);
+        assert_eq!(store.ich_lookup[&key], temp);
+        let read = store.get_ilk_payload(&temp, None).expect("read");
+        assert_eq!(read["ilk"]["registration_status"], "complete");
+        assert_eq!(
+            read["ilk"]["identification"]["claimed_email"],
+            "ana@acme.com"
+        );
+    }
+
+    #[test]
+    fn a_claimed_email_gets_the_same_answer_whether_or_not_someone_holds_it() {
+        let mut store = rg_store();
+        rg_with_ana(&mut store);
+        let known = rg_provision(&mut store, LC_TENANT, "slack", "UKNOWN");
+        let unknown = rg_provision(&mut store, LC_TENANT, "slack", "UUNKNOWN");
+        let mut answer = |ilk_id: &str, claimed: &str| {
+            let mut reply = rg_register(
+                &mut store,
+                ilk_id,
+                LC_TENANT,
+                json!({"display_name": "Someone", "claimed_email": claimed}),
+            )
+            .expect("completes");
+            assert_eq!(reply["ilk_id"], ilk_id);
+            reply["ilk_id"] = Value::Null;
+            reply
+        };
+        let held = answer(&known, "ana@acme.com");
+        let free = answer(&unknown, "nobody@acme.com");
+        assert_eq!(held, free);
+    }
+
+    #[test]
+    fn a_claimed_email_is_neither_unique_nor_reserved() {
+        let mut store = rg_store();
+        // A marked person keeps their vouched email reserved in the tenant...
+        let gone = rg_provision(&mut store, LC_TENANT, "slack", "UGONE");
+        rg_register(
+            &mut store,
+            &gone,
+            LC_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("register");
+        store.delete_ilk(lc_ilk(&gone), 5).expect("mark");
+        // ...which no claim of it runs into, and two people may claim one email.
+        let mut claimants = Vec::new();
+        for address in ["U1", "U2"] {
+            let temp = rg_provision(&mut store, LC_TENANT, "slack", address);
+            rg_register(
+                &mut store,
+                &temp,
+                LC_TENANT,
+                json!({"display_name": address, "claimed_email": "zoe@acme.com"}),
+            )
+            .expect("a claim is never reserved or a duplicate");
+            claimants.push(temp);
+        }
+        // Nor is a claimant held back from a tenant where someone holds the email, or a restore.
+        let bob = rg_provision(&mut store, OTHER_TENANT, "slack", "UBOB");
+        rg_register(
+            &mut store,
+            &bob,
+            OTHER_TENANT,
+            json!({"email": "zoe@acme.com"}),
+        )
+        .expect("bob");
+        let request = IlkSetTenantRequest {
+            ilk_id: claimants[0].clone(),
+            tenant_id: OTHER_TENANT.to_string(),
+            on_behalf_of: None,
+        };
+        store
+            .set_ilk_tenant(&request, "operator")
+            .expect("a claim does not collide");
+        store.delete_ilk(lc_ilk(&claimants[1]), 6).expect("mark");
+        store.restore_ilk(lc_ilk(&claimants[1])).expect("restore");
+    }
+
+    // ---- every id in its one canonical spelling ----
+
+    /// Other spellings of a canonical id that `Uuid::parse_str` would accept, or that differ only
+    /// around it. The database stores each one as the same uuid.
+    fn other_spellings(canonical: &str) -> Vec<String> {
+        let (prefix, uuid) = canonical.split_once(':').expect("prefixed id");
+        [
+            format!("{prefix}:{}", uuid.to_uppercase()),
+            format!("{prefix}:{}", uuid.replace('-', "")),
+            format!("{prefix}:{{{uuid}}}"),
+            format!("{prefix}:urn:uuid:{uuid}"),
+            format!(" {canonical}"),
+            format!("{}:{uuid}", prefix.to_uppercase()),
+        ]
+        .into_iter()
+        .filter(|spelling| spelling != canonical)
+        .collect()
+    }
+
+    #[test]
+    fn an_id_in_another_spelling_names_no_record() {
+        let (mut store, ana) = os_store();
+        let before = store.ilks.clone();
+        // A person, and another hive's node: what such an id would have overwritten in the
+        // database (its upsert normalizes the uuid).
+        for victim in [ana.as_str(), OS_W2_NODE] {
+            for spelling in other_spellings(victim) {
+                assert!(parse_prefixed_uuid(&spelling, "ilk").is_err(), "{spelling}");
+                let err = store
+                    .register_ilk(os_node_request(&spelling, "AI.x@worker1"), MERGE_TTL_SECS)
+                    .expect_err(&spelling);
+                assert_eq!(err, "INVALID_REQUEST", "{spelling}");
+                let update = IlkUpdateRequest {
+                    ilk_id: spelling.clone(),
+                    add_channels: Vec::new(),
+                    change_reason: None,
+                };
+                assert_eq!(
+                    store.update_ilk(update).expect_err(&spelling),
+                    "INVALID_REQUEST"
+                );
+                for err in [
+                    store.delete_ilk(lc_ilk(&spelling), 1).map(|_| ()),
+                    store.purge_ilk(lc_ilk(&spelling)).map(|_| ()),
+                ] {
+                    assert_eq!(lc_code(err.expect_err(&spelling)), "INVALID_REQUEST");
+                }
+                // A merge source too.
+                let merge = IlkAddChannelRequest {
+                    ilk_id: ana.clone(),
+                    channel: ChannelInput {
+                        ich_id: format!("ich:{}", Uuid::new_v4()),
+                        channel_type: "slack".to_string(),
+                        address: format!("U-{spelling}"),
+                        scope: None,
+                    },
+                    merge_from_ilk_id: Some(spelling.clone()),
+                    change_reason: None,
+                };
+                assert_eq!(
+                    store
+                        .add_channel(merge, None, MERGE_TTL_SECS, TEST_CLOUD_RELAY)
+                        .expect_err(&spelling),
+                    "INVALID_REQUEST"
+                );
+                // The orchestrator's gate refuses it before any handler does.
+                let payload = os_register(&spelling, "agent", json!({"node_name": "AI.x@worker1"}));
+                let err =
+                    os_check(&store, MSG_ILK_REGISTER, &payload, OS_WORKER1).expect_err(&spelling);
+                assert_eq!(err["error_code"], "UNAUTHORIZED", "{spelling}");
+            }
+        }
+        assert_eq!(store.ilks, before);
+
+        // A tenant or a channel id in another spelling as well.
+        let tenant = LC_TENANT.replace('-', "");
+        let register = IlkRegisterRequest {
+            tenant_id: tenant.clone(),
+            ..os_node_request(OS_NEW_ILK, "AI.y@worker1")
+        };
+        assert_eq!(
+            store
+                .register_ilk(register, MERGE_TTL_SECS)
+                .expect_err("tenant"),
+            "INVALID_REQUEST"
+        );
+        let canonical_ich = format!("ich:{}", Uuid::new_v4());
+        for (tenant_id, ich_id) in [
+            (tenant, canonical_ich.clone()),
+            (LC_TENANT.to_string(), canonical_ich.to_uppercase()),
+        ] {
+            let provision = IlkProvisionRequest {
+                ich_id,
+                channel_type: "slack".to_string(),
+                address: "USPELL".to_string(),
+                tenant_id: Some(tenant_id),
+                ilk_type: None,
+                scope: None,
+            };
+            let err = store
+                .provision_temporary_ilk(provision, None, TEST_CLOUD_RELAY)
+                .expect_err("spelling");
+            assert_eq!(err, "INVALID_REQUEST");
+        }
+        assert_eq!(store.ilks, before);
+    }
+
+    #[test]
+    fn a_replica_push_with_an_id_in_another_spelling_is_refused() {
+        let (mut store, ana) = os_store();
+        let before = store.ilks.clone();
+        for victim in [ana.as_str(), OS_W2_NODE] {
+            for spelling in other_spellings(victim) {
+                // worker1 pushes "its" node under the other spelling of someone else's id.
+                let mut forged = store.ilks[OS_W1_NODE].clone();
+                forged.ilk_id = spelling.clone();
+                let delta = IdentityDelta::IlkUpsert {
+                    ilk: forged.clone(),
+                };
+                assert!(
+                    !delta_authorized_for_hive(&delta, "worker1", &store),
+                    "{spelling}"
+                );
+                // A snapshot is the hive's whole set: the honest node rides along.
+                let snapshot = vec![store.ilks[OS_W1_NODE].clone(), forged];
+                assert!(store.reconcile_hive_ilks("worker1", snapshot).is_empty());
+                for delta in [
+                    IdentityDelta::IlkDelete {
+                        ilk_id: spelling.clone(),
+                    },
+                    IdentityDelta::AliasDelete {
+                        old_ilk_id: spelling.clone(),
+                    },
+                    IdentityDelta::AliasUpsert {
+                        alias: AliasSnapshotRecord {
+                            old_ilk_id: spelling.clone(),
+                            canonical_ilk_id: OS_W1_NODE.to_string(),
+                            expires_at_ms: u64::MAX,
+                        },
+                    },
+                ] {
+                    assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
+                }
+            }
+        }
+        // A channel id in another spelling.
+        let mut node = store.ilks[OS_W1_NODE].clone();
+        node.channels.push(ChannelRecord {
+            ich_id: "ich:C1C1C1C1-C1C1-4C1C-8C1C-C1C1C1C1C1C1".to_string(),
+            channel_type: "slack".to_string(),
+            address: "UBOT".to_string(),
+            owner_l2_name: None,
+            enabled: false,
+            scope: LC_TENANT.to_string(),
+        });
+        let delta = IdentityDelta::IlkUpsert { ilk: node };
+        assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
+        assert_eq!(store.ilks, before);
+    }
+
+    // ---- a channel names one ILK: nothing takes it over ----
+
+    /// A complete person of LC_TENANT holding (slack, `address`).
+    fn ic_person(store: &mut IdentityStore, address: &str) -> String {
+        let ilk = rg_provision(store, LC_TENANT, "slack", address);
+        rg_register(store, &ilk, LC_TENANT, json!({"display_name": address})).expect("person");
+        ilk
+    }
+
+    fn ic_add(ilk_id: &str, address: &str) -> IlkUpdateRequest {
+        IlkUpdateRequest {
+            ilk_id: ilk_id.to_string(),
+            add_channels: vec![ChannelInput {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: "slack".to_string(),
+                address: address.to_string(),
+                scope: None,
+            }],
+            change_reason: None,
+        }
+    }
+
+    #[test]
+    fn nothing_takes_over_a_channel_another_ilk_holds() {
+        let (mut store, _) = os_store();
+        let ana = ic_person(&mut store, "U_ANA");
+        let key = canonical_ich_key("slack", "U_ANA", LC_TENANT);
+        let bob = ic_person(&mut store, "U_BOB");
+
+        // An orchestrator's node (spawned in Ana's tenant) adds her Slack id, in any letter case.
+        for address in ["U_ANA", "u_ana"] {
+            let err = store
+                .update_ilk(ic_add(OS_W1_NODE, address))
+                .expect_err(address);
+            assert_eq!(err, "ICH_CONFLICT");
+        }
+        // An IO node names it for another person.
+        let add = IlkAddChannelRequest {
+            ilk_id: bob.clone(),
+            channel: ChannelInput {
+                ich_id: format!("ich:{}", Uuid::new_v4()),
+                channel_type: "slack".to_string(),
+                address: "U_ANA".to_string(),
+                scope: None,
+            },
+            merge_from_ilk_id: None,
+            change_reason: None,
+        };
+        let err = store
+            .add_channel(
+                add,
+                Some("IO.slack@worker1"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect_err("held");
+        assert_eq!(err, "ICH_CONFLICT");
+        // A replica pushes it as its node's.
+        let mut pushed = store.ilks[OS_W1_NODE].clone();
+        pushed.channels.push(ChannelRecord {
+            ich_id: format!("ich:{}", Uuid::new_v4()),
+            channel_type: "slack".to_string(),
+            address: "U_ANA".to_string(),
+            owner_l2_name: None,
+            enabled: false,
+            scope: LC_TENANT.to_string(),
+        });
+        let delta = IdentityDelta::IlkUpsert {
+            ilk: pushed.clone(),
+        };
+        assert!(!delta_authorized_for_hive(&delta, "worker1", &store));
+        assert!(store
+            .reconcile_hive_ilks("worker1", vec![pushed])
+            .is_empty());
+        // Provisioning finds the holder, as always.
+        let found = store
+            .provision_temporary_ilk(
+                IlkProvisionRequest {
+                    ich_id: format!("ich:{}", Uuid::new_v4()),
+                    channel_type: "slack".to_string(),
+                    address: "U_ANA".to_string(),
+                    tenant_id: Some(LC_TENANT.to_string()),
+                    ilk_type: None,
+                    scope: None,
+                },
+                Some("IO.slack@worker1"),
+                TEST_CLOUD_RELAY,
+            )
+            .map(|(ok, _)| ok)
+            .expect("provision");
+        assert_eq!(found["ilk_id"], ana.as_str());
+        assert_eq!(found["created"], false);
+        assert_eq!(store.ich_lookup[&key], ana);
+
+        // What still works: a node's own new channel, and adding it again.
+        store
+            .update_ilk(ic_add(OS_W1_NODE, "UBOT"))
+            .expect("its own");
+        let again = IlkUpdateRequest {
+            ilk_id: OS_W1_NODE.to_string(),
+            add_channels: store.ilks[OS_W1_NODE]
+                .channels
+                .iter()
+                .map(|held| ChannelInput {
+                    ich_id: held.ich_id.clone(),
+                    channel_type: held.channel_type.clone(),
+                    address: held.address.clone(),
+                    scope: None,
+                })
+                .collect(),
+            change_reason: None,
+        };
+        store.update_ilk(again).expect("again");
+        let mut pushed = store.ilks[OS_W1_NODE].clone();
+        pushed.channels.push(ChannelRecord {
+            ich_id: format!("ich:{}", Uuid::new_v4()),
+            channel_type: "slack".to_string(),
+            address: "UBOT2".to_string(),
+            owner_l2_name: None,
+            enabled: false,
+            scope: LC_TENANT.to_string(),
+        });
+        let delta = IdentityDelta::IlkUpsert { ilk: pushed };
+        assert!(delta_authorized_for_hive(&delta, "worker1", &store));
+        // The merge of a temporary into a person: the channel the temporary holds moves.
+        let temp = rg_provision(&mut store, LC_TENANT, "whatsapp", "+5491100000003");
+        let held = store.ilks[&temp].channels[0].clone();
+        let merge = IlkAddChannelRequest {
+            ilk_id: ana.clone(),
+            channel: ChannelInput {
+                ich_id: held.ich_id.clone(),
+                channel_type: held.channel_type.clone(),
+                address: held.address.clone(),
+                scope: None,
+            },
+            merge_from_ilk_id: Some(temp.clone()),
+            change_reason: None,
+        };
+        store
+            .add_channel(
+                merge,
+                Some("IO.wapp@worker1"),
+                MERGE_TTL_SECS,
+                TEST_CLOUD_RELAY,
+            )
+            .expect("merge");
+        let moved = canonical_ich_key("whatsapp", "+5491100000003", LC_TENANT);
+        assert_eq!(store.ich_lookup[&moved], ana);
+        assert_eq!(store.ich_lookup[&key], ana);
+    }
+
+    #[test]
+    fn a_marked_ilk_keeps_its_channel_until_purged_and_a_respawn_takes_it_back() {
+        let mut store = rg_store();
+        let first = "ilk:b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1";
+        let respawn = "ilk:b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2";
+        let other = "ilk:b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3";
+        for (ilk_id, node_name) in [(first, "AI.relay@worker1"), (other, "AI.other@worker1")] {
+            store
+                .register_ilk(os_node_request(ilk_id, node_name), MERGE_TTL_SECS)
+                .expect("node");
+        }
+        store
+            .update_ilk(ic_add(first, "URELAY"))
+            .expect("its channel");
+        store.delete_ilk(lc_ilk(first), 5).expect("mark");
+        // Reserved while marked: nobody else takes it.
+        let err = store
+            .update_ilk(ic_add(other, "URELAY"))
+            .expect_err("reserved");
+        assert_eq!(err, "ILK_DELETED");
+        // Purged, the node respawns under a new ILK and takes its channel again.
+        store.purge_ilk(lc_ilk(first)).expect("purge");
+        store
+            .register_ilk(os_node_request(respawn, "AI.relay@worker1"), MERGE_TTL_SECS)
+            .expect("respawn");
+        store
+            .update_ilk(ic_add(respawn, "URELAY"))
+            .expect("the respawn takes it");
+        let key = canonical_ich_key("slack", "URELAY", LC_TENANT);
+        assert_eq!(store.ich_lookup[&key], respawn);
+    }
+
+    // ---- only a person has an email ----
+
+    #[test]
+    fn only_a_persons_registration_carries_an_email() {
+        let mut store = rg_store();
+        for key in ["email", "claimed_email"] {
+            let mut request = os_node_request(OS_NEW_ILK, "AI.squat@worker1");
+            request.identification[key] = json!("ana@acme.com");
+            let err = store.register_ilk(request, MERGE_TTL_SECS).expect_err(key);
+            assert_eq!(lc_code(err.clone()), "INVALID_IDENTIFICATION", "{key}");
+            let reply = op_error_payload(&err, "failed to register ilk");
+            assert_eq!(reply["error_code"], "INVALID_IDENTIFICATION");
+        }
+        assert!(!store.ilks.contains_key(OS_NEW_ILK));
+        // An empty value carries no email, and a person still registers with one.
+        let mut request = os_node_request(OS_NEW_ILK, "AI.fine@worker1");
+        request.identification["email"] = Value::Null;
+        request.identification["claimed_email"] = json!("  ");
+        store
+            .register_ilk(request, MERGE_TTL_SECS)
+            .expect("no email");
+        let ana = rg_provision(&mut store, LC_TENANT, "slack", "U1");
+        rg_register(
+            &mut store,
+            &ana,
+            LC_TENANT,
+            json!({"email": "ana@acme.com"}),
+        )
+        .expect("a person");
     }
 
     type SyncHalves = (

@@ -1,5 +1,5 @@
-//! Canonical Fluxbee Cloud relay vocabulary — the SINGLE source shared by SY.admin (the relay
-//! authorization gate `authorize_cloud_relay`) and IO.cloud (the `op → admin action` translation),
+//! Canonical Fluxbee Cloud relay vocabulary — the SINGLE source shared by SY.admin (the
+//! `IO.cloud@motherbee` row of its mesh allowlist, `authorize_mesh_caller`) and IO.cloud (the `op → admin action` translation),
 //! so the two can never drift. IO.cloud lives in a SEPARATE cargo workspace, so this crate
 //! (`fluxbee_sdk`, a dependency of both) is the only place both can import. See EDGE-06:
 //! advertised == enforced.
@@ -58,8 +58,8 @@ pub const CLOUD_OP_ACTIONS: &[(&str, &str)] = &[
     ("get_usage", "get_llm_usage"),
 ];
 
-/// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces in
-/// `authorize_cloud_relay`. Kept as a `&[&str]` const for ergonomic `.contains()` at the gate; a
+/// The admin actions IO.cloud may relay over the mesh — the security allowlist SY.admin enforces for
+/// `IO.cloud@motherbee` (`authorize_mesh_caller`). Kept as a `&[&str]` const for ergonomic `.contains()` at the gate; a
 /// unit test pins it to be exactly the dedup range of [`CLOUD_OP_ACTIONS`], so the two SDK constants
 /// (and therefore SY.admin's enforcement and IO.cloud's translation) can never diverge.
 pub const CLOUD_EXPOSED_ACTIONS: &[&str] = &[
@@ -105,7 +105,7 @@ pub fn admin_action_for_cloud_op(op: &str) -> Option<&'static str> {
 }
 
 /// Cloud ops IO.cloud handles LOCALLY — it does the work itself instead of relaying to `SY.admin`.
-/// Kept SEPARATE from `CLOUD_OP_ACTIONS` (the admin-relay allowlist that `authorize_cloud_relay`
+/// Kept SEPARATE from `CLOUD_OP_ACTIONS` (the admin-relay allowlist SY.admin
 /// enforces) so a local op can NEVER leak into the relay gate: local ops never send an ADMIN_COMMAND.
 /// - `register_human`: provisions a temporary human ilk (`ILK_PROVISION`, IO-only) and hands the
 ///   frontdesk_handoff to `SY.frontdesk.gov` — admin can do neither the provision nor the register.
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn local_ops_are_disjoint_from_relay_ops() {
-        // A local op must NEVER be a relay op — else it would leak into authorize_cloud_relay's
-        // admin allowlist. is_cloud_local_op and admin_action_for_cloud_op must never both hit.
+        // A local op must NEVER be a relay op — else it would leak into SY.admin's relay
+        // allowlist. is_cloud_local_op and admin_action_for_cloud_op must never both hit.
         for op in CLOUD_LOCAL_OPS {
             assert!(is_cloud_local_op(op));
             assert_eq!(

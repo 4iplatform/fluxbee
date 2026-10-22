@@ -177,9 +177,10 @@ Operators and Fluxbee Cloud write through SY.admin, which adds its own gates in
 `src/bin/sy_admin.rs`: the IO.cloud relay may only put, list, assign and delete inside the
 tenant it claims, never the root tenant, never a reserved key, and never set `metadata.ilk`,
 `owner_ilk` or `owner_l2` (`enforce_cloud_relay_content`); no admin-API caller, the operator
-included, touches an `acme_account*` key (see [Reserved keys](#reserved-keys)). Any hive's `SY.orchestrator` may call
-`vault_list` and `vault_delete` to remove the secrets a node owns when the node is purged
-(`ORCHESTRATOR_TEARDOWN_ACTIONS` in `authorize_cloud_relay`).
+included, touches an `acme_account*` key (see [Reserved keys](#reserved-keys)). When a node is
+purged, its hive's `SY.orchestrator` asks SY.admin for `teardown_node`, which lists the secrets
+dedicated to the node's ILK and deletes each in its own tenant once it has checked the ILK is the
+node's; no orchestrator calls the vault actions itself (the A-62 table in `authorize_mesh_caller`).
 
 ## Messages
 

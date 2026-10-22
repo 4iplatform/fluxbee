@@ -30,8 +30,9 @@ use fluxbee_sdk::{
 };
 use gov_common::{
     frontdesk_contract::{
-        frontdesk_result_payload, parse_frontdesk_handoff_payload, FrontdeskHandoffPayload,
-        FrontdeskResultPayload,
+        frontdesk_handoff_sender_allowed, frontdesk_result_payload, parse_frontdesk_handoff,
+        FrontdeskHandoffPayload, FrontdeskResultPayload, FRONTDESK_HANDOFF_MSG,
+        FRONTDESK_HANDOFF_PAYLOAD_TYPE,
     },
     gov_identity_config_from_env, identity_error_is_transient, identity_error_log_summary,
     identity_error_to_tool_payload, resolve_case_tenant, GovIdentityConfig, CASE_TENANT_MISMATCH,
@@ -91,13 +92,11 @@ Confirmation normalization:
 STRICT NO-LOOP RULE:
 - If status==awaiting_confirmation and user is positive:
   - If register_attempted==false:
-    a) Call ilk_register with:
-       - src_ilk (from context)
-       - identity_candidate {name,email,phone,company_name}
+    a) Call ilk_register with identity_candidate {name,email,phone,company_name}
     b) If tool returns status=ok:
        - set status=completed
        - call thread_state_put
-       - send final success message (if merged=true: the person was already registered with that email, and this channel is now linked to that registration)
+       - send final success message
        - stop (do not ask confirmation again)
     c) If tool returns status=error:
        - set status=completed_error
@@ -124,7 +123,7 @@ ANTI-RECONFIRM RULE:
 - If status==awaiting_confirmation and the user reply is positive, do not restate the collected data and do not ask for confirmation again; call ilk_register immediately.
 - If registration already succeeded or failed terminally in the current turn, stop after the final message.
 
-Do not invent src_ilk.
+The person registered is always the one of this conversation: never name an ILK.
 Keep replies short in Spanish.
 "#;
 
@@ -612,19 +611,29 @@ struct IlkRegisterIdentityCandidate {
     attributes: Option<Value>,
 }
 
-/// What the LLM (or the handoff path) passes. No tenant: it is the case's, never the person's.
+/// What the LLM (or the handoff path) passes: the person's data only. No ILK: the tool acts on the
+/// case's own (`IlkRegisterTool::scoped_src_ilk`). No tenant: it is the case's, never the person's.
 #[derive(Debug, Clone, Deserialize)]
 struct IlkRegisterArgs {
-    src_ilk: String,
     identity_candidate: IlkRegisterIdentityCandidate,
 }
 
 #[derive(Clone)]
 struct IlkRegisterTool {
+    /// The case's own ILK, the message's `src_ilk`: the only ILK the tool registers, never one the
+    /// model names. Without one (a sender with no ILK) it registers nobody.
     scoped_src_ilk: Option<String>,
     /// The tenant a `frontdesk_handoff` informed; it only has to agree with the ILK's tenant.
     /// `None` on the conversational path.
     informed_tenant_id: Option<String>,
+    /// The email an IO node vouched for in a handoff of this case
+    /// (docs/control-path-hardening-v1.md §7). `None` on the conversational path, where the tool
+    /// reads the one the case keeps (`read_vouched_email`). An email the person typed is only
+    /// ever a claim (`person_identification`).
+    vouched_email: Option<String>,
+    /// Where the case's vouched email waits between turns. The tool reads it there and forgets it
+    /// once the case registers.
+    thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     ilk_tenant: IlkTenantLookup,
     identity: GovIdentityConfig,
     bridge: Option<Arc<GovIdentityBridge>>,
@@ -660,6 +669,8 @@ struct FrontdeskThreadState {
 struct FrontdeskCollectedState {
     #[serde(default)]
     name: Option<String>,
+    /// Only ever claimed, wherever it came from: the LLM writes this state, so an email here is
+    /// never registered as vouched.
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
@@ -860,7 +871,7 @@ impl AiNode for GenericAiNode {
         // has no behavior configured — a Cloud register_human cannot depend on an LLM being set up —
         // so it is handled HERE, BEFORE the Configured/behavior gate that guards the LLM path.
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
-            if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
+            if let Some(handoff) = parse_frontdesk_handoff(msg.meta.msg.as_deref(), &msg.payload) {
                 tracing::info!(
                     node_name = %self.node_name,
                     trace_id = %msg.routing.trace_id,
@@ -898,27 +909,22 @@ impl AiNode for GenericAiNode {
                 let payload = invalid_payload_missing_thread_id();
                 return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
             }
-            // A user message that LOOKS like a handoff (type/subject/operation) but did NOT parse
-            // fell through to the conversational path — surface it loudly, else a Cloud register_human
-            // whose shape is off would be silently chatted at by the LLM instead of registered.
-            let looks_like_handoff = msg
-                .payload
-                .as_object()
-                .map(|o| {
-                    o.contains_key("type")
-                        || o.contains_key("subject")
-                        || o.contains_key("operation")
-                })
-                .unwrap_or(false);
-            if looks_like_handoff {
+            // A message that claims to be a handoff (its mark, or its payload type) but is none
+            // fell through to the conversational path. Surface it loudly, else a producer that
+            // forgot the mark or got the shape wrong would be chatted at instead of registered.
+            let claims_handoff = msg.meta.msg.as_deref() == Some(FRONTDESK_HANDOFF_MSG)
+                || msg.payload.get("type").and_then(Value::as_str)
+                    == Some(FRONTDESK_HANDOFF_PAYLOAD_TYPE);
+            if claims_handoff {
                 tracing::warn!(
                     node_name = %self.node_name,
                     trace_id = %msg.routing.trace_id,
+                    meta_msg = ?msg.meta.msg,
                     payload_keys = ?msg
                         .payload
                         .as_object()
                         .map(|o| o.keys().cloned().collect::<Vec<_>>()),
-                    "frontdesk: payload looks like a handoff but did NOT parse → conversational path (check the handoff shape)"
+                    "frontdesk: not a handoff (it needs meta.msg frontdesk_handoff and the handoff shape) → conversational path"
                 );
             }
             let src_ilk_source = src_ilk_source(&msg);
@@ -1371,15 +1377,45 @@ impl GenericAiNode {
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
         // Conversational: the tenant is only the ILK's (the thread state is the LLM's to write).
+        // The email the person types is a claim; one an earlier handoff vouched for comes from the
+        // case's own record (`read_vouched_email`).
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
             informed_tenant_id: None,
+            vouched_email: None,
+            thread_state_store: self.thread_state_store.clone(),
             ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
         };
         registry.register(Arc::new(tool))?;
         Ok(())
+    }
+
+    /// The email an earlier handoff of the case vouched for (`read_vouched_email`).
+    async fn load_vouched_email(
+        &self,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<Option<String>> {
+        let (Some(store), Some(src_ilk)) = (&self.thread_state_store, ctx.src_ilk.as_deref())
+        else {
+            return Ok(None);
+        };
+        read_vouched_email(store.as_ref(), src_ilk).await
+    }
+
+    async fn store_vouched_email(
+        &self,
+        ctx: &BehaviorContext,
+        email: &str,
+    ) -> fluxbee_ai_sdk::Result<()> {
+        let (Some(store), Some(src_ilk)) = (&self.thread_state_store, ctx.src_ilk.as_deref())
+        else {
+            return Ok(());
+        };
+        store
+            .put(&vouched_email_key(src_ilk), json!({ "email": email }), None)
+            .await
     }
 
     async fn load_frontdesk_thread_state(
@@ -1475,6 +1511,17 @@ impl GenericAiNode {
         result.error_detail = Some("Unsupported handoff payload".to_string());
         result.ilk_id = ctx.src_ilk.clone();
 
+        if !frontdesk_handoff_sender_allowed(msg.routing.src_l2_name.as_deref()) {
+            result.error_detail =
+                Some("a frontdesk_handoff is accepted only from an IO node".to_string());
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "frontdesk handoff refused: the sender is not an IO node (not registered)"
+            );
+            return build_frontdesk_result_reply(msg, result);
+        }
         if handoff.operation != "complete_registration" {
             result.human_message = "La operación solicitada no está soportada.".to_string();
             result.error_detail = Some(format!(
@@ -1503,18 +1550,13 @@ impl GenericAiNode {
                     .as_ref()
                     .and_then(|state| state.collected.name.clone())
             });
-        let mut email = handoff
+        let handoff_email = handoff
             .subject
             .email
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                previous_state
-                    .as_ref()
-                    .and_then(|state| state.collected.email.clone())
-            });
+            .map(ToString::to_string);
         let phone = handoff
             .subject
             .phone
@@ -1575,6 +1617,23 @@ impl GenericAiNode {
             }
         };
 
+        // The handoff's email is vouched: the IO node that sent it answers for it. The case keeps
+        // it where only this code writes until it registers, so a later turn (a handoff without
+        // an email, or the conversation) still registers it as vouched. An email from the thread
+        // state, which the LLM writes, stays the person's claim.
+        let vouched_email = match handoff_email {
+            Some(email) => {
+                self.store_vouched_email(ctx, &email).await?;
+                Some(email)
+            }
+            None => self.load_vouched_email(ctx).await?,
+        };
+        let mut email = vouched_email.clone().or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.collected.email.clone())
+        });
+
         // Merge free-form attributes across turns, symmetric with company_name: current handoff
         // wins, else recover from the partial state collected on an earlier (incomplete) turn.
         let attributes = handoff.subject.attributes.clone().or_else(|| {
@@ -1627,6 +1686,8 @@ impl GenericAiNode {
         let tool = IlkRegisterTool {
             scoped_src_ilk: ctx.src_ilk.clone(),
             informed_tenant_id,
+            vouched_email,
+            thread_state_store: self.thread_state_store.clone(),
             ilk_tenant: self.ilk_tenant.clone(),
             identity: self.gov_identity.clone(),
             bridge: self.gov_identity_bridge.clone(),
@@ -1638,7 +1699,6 @@ impl GenericAiNode {
             .clone()
             .expect("validated handoff email should be present");
         let register_arguments = json!({
-            "src_ilk": ctx.src_ilk.clone().unwrap_or_default(),
             "identity_candidate": {
                 "name": registered_name,
                 "email": registered_email,
@@ -2272,12 +2332,11 @@ impl FunctionTool for IlkRegisterTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "ilk_register".to_string(),
-            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The organization (tenant) comes with the case: never ask for one."
+            description: "Register the person of this conversation (its temporary ILK) in SY.identity. The person's ILK and the organization (tenant) come with the case: never name an ILK, and never ask for an organization."
                 .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "properties": {
-                    "src_ilk": { "type": "string", "minLength": 1 },
                     "identity_candidate": {
                         "type": "object",
                         "properties": {
@@ -2291,7 +2350,7 @@ impl FunctionTool for IlkRegisterTool {
                         "additionalProperties": false
                     }
                 },
-                "required": ["src_ilk", "identity_candidate"],
+                "required": ["identity_candidate"],
                 "additionalProperties": false
             }),
         }
@@ -2304,11 +2363,19 @@ impl FunctionTool for IlkRegisterTool {
             ))
         })?;
 
-        let src_ilk_owned = self.scoped_src_ilk.clone().unwrap_or(args.src_ilk);
-        let src_ilk = src_ilk_owned.trim();
-        if src_ilk.is_empty() {
+        // The case's own ILK, never one the model names: a message without one registers nobody.
+        let Some(src_ilk) = self
+            .scoped_src_ilk
+            .as_deref()
+            .map(str::trim)
+            .filter(|ilk| !ilk.is_empty())
+        else {
+            tracing::warn!(
+                op = "ilk_register",
+                "the message carries no src_ilk: ILK_REGISTER not sent, whatever the model names"
+            );
             return Ok(missing_src_ilk_payload());
-        }
+        };
 
         if args.identity_candidate.name.trim().is_empty()
             || args.identity_candidate.email.trim().is_empty()
@@ -2350,17 +2417,20 @@ impl FunctionTool for IlkRegisterTool {
             "dispatching identity registration request"
         );
 
+        // The case's vouched email: the handoff's, else the one the case keeps.
+        let vouched_email = match (&self.vouched_email, &self.thread_state_store) {
+            (Some(email), _) => Some(email.clone()),
+            (None, Some(store)) => read_vouched_email(store.as_ref(), src_ilk).await?,
+            (None, None) => None,
+        };
         let payload = json!({
             "ilk_id": src_ilk,
             "ilk_type": "human",
             "tenant_id": tenant_id,
-            "identification": {
-                "display_name": args.identity_candidate.name,
-                "email": args.identity_candidate.email,
-                "phone": args.identity_candidate.phone,
-                "company_name": args.identity_candidate.company_name,
-                "attributes": args.identity_candidate.attributes,
-            }
+            "identification": person_identification(
+                args.identity_candidate,
+                vouched_email.as_deref(),
+            ),
         });
         // Only non-personal fields: the identification VALUES (name, email, phone, company,
         // attributes) never reach the logs, only which fields are present.
@@ -2405,6 +2475,17 @@ impl FunctionTool for IlkRegisterTool {
                     response_payload = %out.payload,
                     "received ILK_REGISTER response from identity"
                 );
+                // Registered: the case no longer keeps the email it was vouched with.
+                if let (Some(_), Some(store)) = (&vouched_email, &self.thread_state_store) {
+                    if let Err(err) = store.delete(&vouched_email_key(src_ilk)).await {
+                        tracing::warn!(
+                            op = "ilk_register",
+                            ilk_id = %src_ilk,
+                            error = %err,
+                            "the case's vouched email stays after its registration"
+                        );
+                    }
+                }
                 Ok(json!({
                     "status": "ok",
                     "registered": true,
@@ -2427,6 +2508,53 @@ impl FunctionTool for IlkRegisterTool {
             }
         }
     }
+}
+
+/// The identification a person's `ILK_REGISTER` carries (docs/control-path-hardening-v1.md §7).
+/// The vouched email goes in `email`, SY.identity's key for the person, where an email already
+/// registered in the tenant merges. The candidate's email, when it is another one, is what the
+/// person typed: it goes in `claimed_email`, which SY.identity stores and shows but never keys on
+/// or merges, so the answer is the same whether or not that email is known.
+fn person_identification(
+    candidate: IlkRegisterIdentityCandidate,
+    vouched_email: Option<&str>,
+) -> Value {
+    let claimed_email = Some(candidate.email).filter(|typed| {
+        !vouched_email.is_some_and(|vouched| vouched.trim().eq_ignore_ascii_case(typed.trim()))
+    });
+    json!({
+        "display_name": candidate.name,
+        "email": vouched_email,
+        "claimed_email": claimed_email,
+        "phone": candidate.phone,
+        "company_name": candidate.company_name,
+        "attributes": candidate.attributes,
+    })
+}
+
+/// Where a case's vouched email waits between turns: beside its thread state, under a key the
+/// LLM's thread-state tools never reach (they are scoped to the case's `src_ilk` itself). Only a
+/// handoff from an IO node writes it; a registration of the case forgets it.
+fn vouched_email_key(src_ilk: &str) -> String {
+    format!("vouched_email:{src_ilk}")
+}
+
+async fn read_vouched_email(
+    store: &dyn ThreadStateStore,
+    src_ilk: &str,
+) -> fluxbee_ai_sdk::Result<Option<String>> {
+    Ok(store
+        .get(&vouched_email_key(src_ilk))
+        .await?
+        .and_then(|record| {
+            record
+                .data
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .map(ToString::to_string)
+        }))
 }
 
 /// Names of the identification fields that carry a value — what a log may say about the person.
@@ -3841,6 +3969,7 @@ mod tests {
             json!({ "thread_id": "frontdesk-thread-1" }),
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
+        msg.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
         msg.payload = json!({
             "type": "frontdesk_handoff",
             "schema_version": 1,
@@ -3888,6 +4017,7 @@ mod tests {
             }),
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
+        msg.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
         msg.payload = json!({
             "type": "frontdesk_handoff",
             "schema_version": 1,
@@ -3942,6 +4072,7 @@ mod tests {
             }),
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
+        msg.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
         msg.payload = json!({
             "type": "frontdesk_handoff",
             "schema_version": 1,
@@ -4144,7 +4275,8 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
-                src_l2_name: None,
+                // As the router stamps it: the sender's own name.
+                src_l2_name: Some("IO.sim.local@motherbee".to_string()),
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
@@ -4549,6 +4681,8 @@ mod tests {
         IlkRegisterTool {
             scoped_src_ilk: scoped_src_ilk.map(ToString::to_string),
             informed_tenant_id: informed_tenant_id.map(ToString::to_string),
+            vouched_email: None,
+            thread_state_store: None,
             ilk_tenant: test_ilk_tenant(),
             identity: GovIdentityConfig::default(),
             bridge: None,
@@ -4559,6 +4693,14 @@ mod tests {
     fn ilk_register_schema_has_no_thread_id() {
         let schema = test_tool(None, None).definition().parameters_json_schema;
         assert!(schema["properties"].get("thread_id").is_none());
+    }
+
+    #[test]
+    fn ilk_register_schema_takes_no_ilk() {
+        // The ILK is the case's own, never a parameter the model fills.
+        let schema = test_tool(None, None).definition().parameters_json_schema;
+        assert!(schema["properties"].get("src_ilk").is_none());
+        assert_eq!(schema["required"], json!(["identity_candidate"]));
     }
 
     #[test]
@@ -4680,9 +4822,10 @@ mod tests {
         assert!(text.contains("sending ILK_REGISTER to identity"));
         assert!(text.contains(TEST_ILK));
         assert!(text.contains(TEST_TENANT));
+        // Field names are logged; the conversation's email goes as a claim.
         assert!(
-            text.contains("\"email\""),
-            "field names are logged:\n{text}"
+            text.contains("\"claimed_email\"") && !text.contains("\"email\""),
+            "{text}"
         );
     }
 
@@ -4976,6 +5119,7 @@ mod tests {
             }),
             Some(src_ilk),
         );
+        msg.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
         msg.payload = json!({
             "type": "frontdesk_handoff",
             "schema_version": 1,
@@ -5054,6 +5198,7 @@ mod tests {
             json!({ "thread_id": "frontdesk-thread-privacy-1" }),
             Some(TEST_ILK),
         );
+        msg.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
         msg.payload = json!({
             "type": "frontdesk_handoff",
             "schema_version": 1,
@@ -5104,5 +5249,242 @@ mod tests {
         assert_no_personal_data(&text);
         assert!(text.contains("incoming user message"));
         assert!(text.contains("whatsapp"));
+    }
+
+    // ---- only an email the channel vouches for identifies a person (hardening §7, A-42) ----
+
+    #[test]
+    fn a_vouched_email_is_the_persons_email_and_any_other_a_claim() {
+        let candidate = || IlkRegisterIdentityCandidate {
+            name: "Ana".to_string(),
+            email: "ana@example.com".to_string(),
+            phone: None,
+            company_name: None,
+            attributes: None,
+        };
+        let vouched = person_identification(candidate(), Some("Ana@Example.com"));
+        assert_eq!(vouched["email"], "Ana@Example.com");
+        assert!(vouched["claimed_email"].is_null());
+        let claimed = person_identification(candidate(), None);
+        assert!(claimed["email"].is_null());
+        assert_eq!(claimed["claimed_email"], "ana@example.com");
+        assert_eq!(claimed["display_name"], "Ana");
+        // Another email typed beside the vouched one stays a claim.
+        let both = person_identification(candidate(), Some("ana@work.example.com"));
+        assert_eq!(both["email"], "ana@work.example.com");
+        assert_eq!(both["claimed_email"], "ana@example.com");
+    }
+
+    #[tokio::test]
+    async fn a_handoff_is_taken_only_from_an_io_node() {
+        let (node, state) = test_node_with_state();
+        for sender in [
+            None,
+            Some("AI.support@motherbee"),
+            Some("WF.onboarding@motherbee"),
+            Some("SY.admin@motherbee"),
+        ] {
+            let mut msg = structured_handoff(TEST_ILK, None);
+            msg.routing.src_l2_name = sender.map(ToString::to_string);
+            let (logs, _guard) = LogCapture::start();
+            let reply = structured_reply(&node, msg).await;
+            assert_eq!(reply["success"], false, "{sender:?}");
+            assert_eq!(reply["error_code"], "invalid_request", "{sender:?}");
+            let text = logs.text();
+            assert!(text.contains("frontdesk handoff refused"), "{text}");
+            assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+            assert!(state.0.lock().expect("thread state").is_empty());
+        }
+        // From an IO node the same handoff goes on to ILK_REGISTER (here it fails: no bridge).
+        let mut msg = structured_handoff(TEST_ILK, None);
+        msg.routing.src_l2_name = Some("IO.api@motherbee".to_string());
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["error_code"], "identity_unavailable");
+    }
+
+    #[tokio::test]
+    async fn a_handoff_registers_the_email_it_carries_as_vouched() {
+        let (node, _state) = test_node_with_state();
+        let (logs, _guard) = LogCapture::start();
+        let reply = structured_reply(&node, structured_handoff(TEST_ILK, None)).await;
+        assert_eq!(
+            reply["error_code"], "identity_unavailable",
+            "it reached ILK_REGISTER"
+        );
+        let text = logs.text();
+        assert!(text.contains("sending ILK_REGISTER to identity"), "{text}");
+        assert!(
+            text.contains("\"email\"") && !text.contains("claimed_email"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_without_an_email_keeps_a_typed_one_claimed() {
+        // The person typed a name and an email in the conversation, which the LLM kept in the
+        // thread state; then the IO node's first-contact gate hands them over with no email.
+        let (node, state) = test_node_with_state();
+        state.0.lock().expect("thread state").insert(
+            TEST_ILK.to_string(),
+            json!({"status": "collecting",
+                   "collected": {"name": "Ana", "email": "ana@example.com"}}),
+        );
+        let mut msg = structured_handoff(TEST_ILK, None);
+        msg.payload["subject"] = json!({ "attributes": { "channel_type": "slack" } });
+        let (logs, _guard) = LogCapture::start();
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(
+            reply["error_code"], "identity_unavailable",
+            "it reached ILK_REGISTER"
+        );
+        let text = logs.text();
+        assert!(text.contains("sending ILK_REGISTER to identity"), "{text}");
+        assert!(
+            text.contains("\"claimed_email\"") && !text.contains("\"email\""),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_payload_without_its_producers_mark_is_no_handoff() {
+        // An IO node relays a payload someone else wrote in the handoff's shape, unmarked.
+        let (node, state) = test_node_with_state();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = structured_handoff(TEST_ILK, None);
+        msg.meta.msg = None;
+        let (logs, _guard) = LogCapture::start();
+        node.on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("response");
+        let text = logs.text();
+        assert!(text.contains("frontdesk: not a handoff"), "{text}");
+        assert!(!text.contains("deterministic path"), "{text}");
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+        assert!(state.0.lock().expect("thread state").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_vouched_email_waits_for_its_case_where_only_code_writes() {
+        let (node, state) = test_node_with_state();
+        let key = vouched_email_key(TEST_ILK);
+        // An IO node hands the person over with an email but no name: the case waits for it.
+        let mut msg = structured_handoff(TEST_ILK, None);
+        msg.payload["subject"] = json!({ "email": "ana@example.com" });
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(reply["error_code"], "missing_required_fields");
+        let kept = state.0.lock().expect("thread state").get(&key).cloned();
+        assert_eq!(kept.expect("kept")["email"], "ana@example.com");
+
+        // The LLM's state tools write the case's own state, whatever key they are given.
+        let ctx = BehaviorContext {
+            src_ilk: Some(TEST_ILK.to_string()),
+            ..BehaviorContext::default()
+        };
+        let registry = node.build_tool_registry(&ctx).expect("registry");
+        let put = registry.get("thread_state_put").expect("thread_state_put");
+        put.call(json!({
+            "state_key": key,
+            "data": {"status": "collecting",
+                     "collected": {"name": "Ana", "email": "other@example.com"}}
+        }))
+        .await
+        .expect("put");
+        {
+            let records = state.0.lock().expect("thread state");
+            assert_eq!(records[&key]["email"], "ana@example.com");
+            assert_eq!(records[TEST_ILK]["collected"]["email"], "other@example.com");
+        }
+
+        // The conversation registers the vouched email, and the typed one only as a claim.
+        let register = registry.get("ilk_register").expect("ilk_register");
+        let (logs, guard) = LogCapture::start();
+        let out = register
+            .call(json!({
+                "src_ilk": TEST_ILK,
+                "identity_candidate": {"name": "Ana", "email": "other@example.com"}
+            }))
+            .await
+            .expect("tool call");
+        assert_eq!(out["status"], "error", "no identity bridge here");
+        let text = logs.text();
+        drop(guard);
+        assert!(
+            text.contains("\"email\"") && text.contains("\"claimed_email\""),
+            "{text}"
+        );
+
+        // So does a later handoff without an email; a failed registration keeps the record.
+        let mut msg = structured_handoff(TEST_ILK, None);
+        msg.payload["subject"] = json!({ "display_name": "Ana" });
+        let (logs, _guard) = LogCapture::start();
+        let reply = structured_reply(&node, msg).await;
+        assert_eq!(
+            reply["error_code"], "identity_unavailable",
+            "it reached ILK_REGISTER"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("\"email\"") && !text.contains("claimed_email"),
+            "{text}"
+        );
+        assert!(state.0.lock().expect("thread state").contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn the_tools_never_act_on_an_ilk_the_model_names() {
+        // A message without src_ilk (the router sends senders with no ILK here): no state tools,
+        // and ilk_register registers nobody, whatever ILK the model names.
+        let (node, state) = test_node_with_state();
+        state.0.lock().expect("thread state").insert(
+            vouched_email_key(TEST_ILK),
+            json!({ "email": "ana@example.com" }),
+        );
+        let registry = node
+            .build_tool_registry(&BehaviorContext::default())
+            .expect("registry");
+        for name in [
+            "thread_state_get",
+            "thread_state_put",
+            "thread_state_delete",
+        ] {
+            assert!(registry.get(name).is_none(), "{name}");
+        }
+        let register = registry.get("ilk_register").expect("ilk_register");
+        let (logs, guard) = LogCapture::start();
+        let out = register
+            .call(json!({
+                "src_ilk": TEST_ILK,
+                "identity_candidate": {"name": "Ana", "email": "ana@example.com"}
+            }))
+            .await
+            .expect("tool call");
+        let text = logs.text();
+        drop(guard);
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["error_code"], "missing_src_ilk");
+        assert!(!text.contains("sending ILK_REGISTER"), "{text}");
+        assert!(state
+            .0
+            .lock()
+            .expect("thread state")
+            .contains_key(&vouched_email_key(TEST_ILK)));
+
+        // With the case's ILK, the one the model names is ignored: the case's is registered.
+        let tool = test_tool(Some(TEST_ILK), None);
+        let (logs, _guard) = LogCapture::start();
+        tool.call(json!({
+            "src_ilk": UNKNOWN_ILK,
+            "identity_candidate": {"name": "Ana", "email": "ana@example.com"}
+        }))
+        .await
+        .expect("tool call");
+        let text = logs.text();
+        assert!(text.contains("sending ILK_REGISTER to identity"), "{text}");
+        assert!(
+            text.contains(TEST_ILK) && !text.contains(UNKNOWN_ILK),
+            "{text}"
+        );
     }
 }

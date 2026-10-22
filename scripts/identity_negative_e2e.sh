@@ -19,7 +19,7 @@
 #        INVALID_TENANT               ILK_REGISTER into a tenant that does not exist
 #        UNAUTHORIZED_REGISTRAR       TNT_CREATE from the frontdesk (it creates no tenants)
 #        DUPLICATE_EMAIL              a new ILK with an email another ILK of the tenant has
-#        DUPLICATE_ICH                a channel another ILK of the tenant holds
+#        ICH_CONFLICT                 a channel another ILK holds
 #        DUPLICATE_EMAIL              a complete ILK with another one's email (it does not merge)
 #        TENANT_ROOT_NOT_REGISTRABLE  a person registered into the root tenant; the temporary a
 #                                     root-tenant IO node provisioned stays temporary
@@ -124,7 +124,7 @@ expect_code INVALID_REQUEST_CODE INVALID_REQUEST
 expect_code INVALID_TENANT_CODE INVALID_TENANT
 expect_code FRONTDESK_TNT_CREATE_CODE UNAUTHORIZED_REGISTRAR
 expect_code DUPLICATE_EMAIL_CODE DUPLICATE_EMAIL
-expect_code DUPLICATE_ICH_CODE DUPLICATE_ICH
+expect_code ICH_CONFLICT_CODE ICH_CONFLICT
 expect_code COMPLETE_DUPLICATE_EMAIL_CODE DUPLICATE_EMAIL
 expect_code ROOT_TENANT_CODE TENANT_ROOT_NOT_REGISTRABLE
 expect_code ROOT_TEMP_STATUS temporary

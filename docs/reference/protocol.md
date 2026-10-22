@@ -22,9 +22,11 @@ named without a path in §2–§5 lives in `src/router/mod.rs`.
 
 - Each router listens on a Unix stream socket in `/var/run/fluxbee/routers` (`ROUTER_SOCKET_DIR`,
   `src/paths.rs`) named `<router uuid without hyphens>.sock` (`node_socket_path`,
-  `src/config/mod.rs`), mode `0666` (set in `src/router/mod.rs`).
-- The same directory holds `irp-<uuid>.sock` (mode `0600`): sibling routers of a hive talk over it.
-  Nodes never use it.
+  `src/config/mod.rs`), mode `0600` (`listen_local_socket` in `src/router/mod.rs`). A node must
+  run as the router's user, root: the router refuses a connection whose peer uid (`SO_PEERCRED`)
+  is another (`local_peer_admitted`).
+- The same directory holds `irp-<uuid>.sock` (mode `0600`, the same check): sibling routers of a
+  hive talk over it. Nodes never use it.
 - `NodeConfig.router_socket` names one socket or the directory. Given the directory, both SDKs list
   the `*.sock` files, skip `irp-*`, sort them and try them in turn, starting at
   `fnv1a64(<node name without @hive>) % count` (`router_socket_candidates` in `node_client.rs`;
@@ -361,7 +363,8 @@ builders take `ttl` from `NodeConfigEnvelopeOptions` and raise 0 to 1.
 
 The answer (`build_node_config_response_message`) goes to the request's `src` with its
 `trace_id`: `msg` and `meta.action` `CONFIG_RESPONSE`, `meta.target` `node_config_control`. A
-managed node's payload (builders in `crates/fluxbee_sdk/src/managed_control_plane.rs`): `ok`,
+managed node's payload (`build_io_config_*_payload` in `nodes/io/common/src/io_control_plane.rs`
+for the IO nodes; `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` for ai-generic): `ok`,
 `node_name`, `state` (`UNCONFIGURED`, `CONFIGURED` or `FAILED_CONFIG`), `schema_version`,
 `config_version`, `effective_config` (secrets redacted; null unless configured), `error`
 (`{code, message}` or null) and, on CONFIG_GET, `contract`: `required_fields`, `optional_fields`,
@@ -481,7 +484,9 @@ them (`prepare_local_delivery`): the list is `PROTECTED_SYSTEM_ACTIONS`
 | --- | --- | --- |
 | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` | (1) |
 | `CONFIG_GET`, `CONFIG_SET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` | `SY.admin@motherbee` | (2) |
-| `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_GET`, `NODE_CONFIG_SET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@<any hive>`; `SY.admin@<the same hive>` | (3), (4) |
+| `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK` | `SY.orchestrator@motherbee`; `SY.admin@<the same hive>` | (3), (4) |
+| `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`, to another hive only; `SY.admin@<the same hive>`, never on the motherbee | (3), (4) |
+| `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`; `SY.orchestrator@<the same hive>`; `SY.admin@<the same hive>` | (3), (4) |
 | `INVENTORY_REQUEST` | `SY.admin@<the same hive>` | (4) |
 | `NODE_STATUS_GET` (in addition) | `SY.vault@<the same hive>` | (5) |
 

@@ -246,7 +246,7 @@ Operational interpretation:
 }
 ```
 
-> Note: if the Router injects `meta.ctx_window`, the Slack IO **MUST** accept it but must **NEVER** serialize/forward it to Slack (it is internal information).
+> Note: the message carries no context window or sequence (`meta.ctx*` left the protocol). The Slack IO keeps no history: the router copies each turn into its stream, and only an `AI.*` destination receives memory (`meta.memory_package`), so the Slack IO never has internal memory to forward to Slack.
 
 ### payload
 ```json
@@ -447,12 +447,11 @@ This definition replaces any legacy mode or ad-hoc identity logic in the Slack n
 
 
 
-### Clarification - meta.ctx vs meta.context
+### Clarification - meta.thread_id vs meta.context
 
-According to the Router v1.16 specification:
-
-- `meta.ctx` represents the **Conversational Context (CTX)**
-- `meta.context` is reserved exclusively for **additional data evaluated by OPA**
+- `meta.thread_id` carries the communication: `NativeThread` inside a Slack thread, `PersistentChannel` outside one (§2.2)
+- `meta.context` is free JSON for the receiver and the OPA policy; the Slack facts go in `meta.context.io`
+- There is no `meta.ctx`: the router drops every key that is not a field of `Meta` ([protocol](../reference/protocol.md) §3.1)
 
 `meta.context` must **NOT** be used to store history, turns or conversational context.
 `meta.context.thread_id` was removed from the IO pipeline; the valid carrier is `meta.thread_id`.

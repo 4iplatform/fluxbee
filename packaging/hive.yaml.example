@@ -178,6 +178,21 @@ system_nodes:
 #   vault_hive: "motherbee"
 #   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
 
+# --- ingress (root-level section; only used when role: ingress) -----------------------
+# The ingress takes SSH only from loopback, the motherbee (its address in wan.uplinks) and the
+# addresses and networks listed here; all other SSH is dropped, IPv4 and IPv6, on the ports
+# `sshd -T` reports (table inet fluxbee_ingress, loaded at boot by fluxbee-ingress-nft.service;
+# docs/control-path-hardening-v1.md §6). add_hive writes this list from its `ssh_allow_from`
+# parameter; the join refuses to start when the motherbee's own SSH would come from an address
+# outside the set. Nothing else is filtered. Only a complete input set changes the table: a bad
+# entry, an empty set, an uplink that does not resolve or `sshd -T` failing keeps the rules in
+# force and raises a posture alert. Recovery: the hypervisor console, or edit this list and
+# restart sy-orchestrator.
+# ingress:
+#   ssh_allow_from:
+#     - "192.168.8.0/24"     # an operator network
+#     - "fd00:10::5"         # one address
+
 # --- egress (root-level section; NOT the `system_nodes.egress` list above) ------------
 # The managed internet chokepoint. `gateway_ip` means, BY CONTRACT, "where the WORKERS
 # egress": add_hive injects that default route into workers provisioned AFTER it is set.
@@ -200,3 +215,8 @@ system_nodes:
 #   reachability_url: "https://example.com"   # the https URL the internet probe GETs; no default:
 #                                             # without it the probe does not run. add_hive copies
 #                                             # it into new workers and into an egress whose request names none
+#   ssh_from_wan: true            # egress hive only: SSH may arrive on wan_iface (default true, D31).
+#                                 # false drops it in the egress' fluxbee_egress table (the ports
+#                                 # `sshd -T` reports, else the ones it already drops); add_hive's
+#                                 # egress.ssh_from_wan writes it, and refuses a join whose packets
+#                                 # would come in on wan_iface

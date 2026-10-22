@@ -21,8 +21,6 @@ pub struct PackageMetadata {
     pub version: String,
     #[serde(rename = "type")]
     pub package_type: String,
-    #[allow(dead_code)]
-    pub description: Option<String>,
     pub runtime_base: Option<String>,
     pub config_template: Option<String>,
     pub entry_point: Option<String>,

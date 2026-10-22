@@ -35,11 +35,18 @@ envelope in [protocol.md](protocol.md).
   still has a mode with several routers in a hive, which is not supported. What this page says
   about sibling routers and IRP describes that mode; §10 lists its known defects.
 - **Links.**
-  - Nodes connect to `/var/run/fluxbee/routers/<uuid>.sock` (0666; the router UUID, no dashes).
-  - In the several-routers mode, the routers of one hive talk over IRP, `irp-<uuid>.sock` (0600)
-    in the same directory. Every 5 s each router scans `/dev/shm` for router regions of its hive
-    with a fresh heartbeat (`peer_discovery_loop`, `discover_peer_regions`); the router with the
-    lower UUID dials the other (`should_initiate_peer`).
+  - Nodes connect to `/var/run/fluxbee/routers/<uuid>.sock` (0600; the router UUID, no dashes).
+    The router serves a connection only when the peer's uid (`SO_PEERCRED`) is its own, root in
+    production; anyone else is refused with the warning `router refused a local connection`
+    (`listen_local_socket`, `local_peer_admitted`). Every unit, managed node and Go node connects as
+    root. The check also covers the moment between bind and chmod.
+  - In the several-routers mode, the routers of one hive talk over IRP, `irp-<uuid>.sock` (0600,
+    the same peer check) in the same directory. Every 5 s each router scans `/dev/shm` for router
+    regions of its hive with a fresh heartbeat (`peer_discovery_loop`, `discover_peer_regions`); the
+    router with the lower UUID dials the other (`should_initiate_peer`). A region counts only when
+    the router's own user owns it and no group or world write bit is set, checked on the open
+    descriptor (`open_read_only_owned_by`); another is skipped with the warning `router skipped a
+    shared-memory region another user owns or may write`, since its nodes would enter the FIB.
   - Gateways talk over TCP (`wan.listen`, `wan.uplinks`). A gateway sends its LSA every 10 s and
     marks a hive stale after 40 s without one (`DEFAULT_HELLO_INTERVAL_MS`,
     `DEFAULT_DEAD_INTERVAL_MS`; fixed, not read from `hive.yaml`).
@@ -64,15 +71,32 @@ wrote it, never as the sender wrote it.
   the gateway may hand over a node of another hive: then the name comes from the LSA, made
   canonical as below (`remote_source_from_gateway`). An unknown sender is dropped.
 - **Over the WAN (EDGE-01).**
-  - The source UUID is looked up in the LSA (`find_remote_node`), then in the hub's reachability
-    table (`find_reachable_node`, which marks it `via_hub`). Unknown: dropped.
-  - The name becomes `<role>@<hive whose LSA listed the UUID>` (`canonical_wan_src_name`), so a
-    peer can only speak as `role@<itself>`.
+  - The sender is bound to the session. Its UUID is looked up only in the LSA bucket of the peer
+    that sent the frame, then, for a frame the hub relays, among the nodes the hub vouches for, and
+    only when that peer is the vouching hub (`wan_frame_source`; such a sender is `via_hub`).
+    Anything else, a node of another hive sent by its UUID included, is dropped, counted as
+    `foreign_source` and logged, at most every 30 s, as `router dropped a WAN frame: its sender is
+    neither a node of the peer that sent it nor one that peer relays as the hub`. Until 0.1.83 the
+    UUID was looked up in every bucket, so a spoke could send as another spoke's node.
+  - The name becomes `<role>@<that bucket's hive>` (`canonical_wan_src_name`), so a peer can only
+    speak as `role@<itself>`, or, as the hub, as the nodes it relays (data only, §6.3).
   - A peer fills only its own LSA bucket: `apply_lsa_payload` rejects an LSA whose `hive` is not the
     hive of the peer's WAN HELLO (`hive_mismatch`). With mTLS (`wan.mtls: required`, or
     `permissive` with a TLS peer) that HELLO hive must equal the hive in the peer's certificate
     (`handle_wan_connection`). The loader's default for `wan.mtls` is `disabled`; then the bucket
     rests on the HELLO alone.
+  - A peer advertises only its own nodes: from hive P's LSA the router installs only the nodes
+    named `<role>@P`, split at the first `@`. Any other name is dropped, counted under
+    `foreign_node` and logged as `lsa nodes dropped` (`apply_lsa_payload`, `node_is_on_hive`); the
+    rest of the LSA applies. What P's routes and taps may reach is in §3.2 and §8.3.
+  - Nor may a peer take a UUID that is already a node's: what is addressed to a UUID, replies above
+    all, would go to it. A node listed under the UUID of one of this hive's nodes is dropped. One
+    listed under a UUID another hive lists is kept, and that UUID then resolves to neither hive
+    (§3.1), whichever LSA came first: a duplicate claim can make a UUID unreachable, never
+    redirect it. Both count as `duplicate_uuid` and are logged as `lsa nodes with a UUID already
+    taken`. The hub vouches for no UUID that two hives list (`broadcast_reachability`), and a spoke
+    drops a vouched UUID that is already taken, by one of its nodes or a node of an LSA, or that
+    the hub lists twice (`apply_wan_reachability`, counted the same way).
   - The motherbee admits a hive that connects to it only while its hive registry lists it, the
     directory `/var/lib/fluxbee/hives/<hive>/` that `add_hive` creates and `remove_hive` deletes
     (FINDINGS A-48). Any other hive gets `WAN_REJECT` with `HIVE_NOT_REGISTERED`, and an admitted
@@ -80,7 +104,9 @@ wrote it, never as the sender wrote it.
     `hive_unregistered`). The other hives keep no registry, so this check does not apply to them.
 
 Tests: `router_overwrites_spoofed_src_l2_name`,
-`edge01_wan_canonicalization_defeats_cross_hive_name_forgery`.
+`edge01_wan_canonicalization_defeats_cross_hive_name_forgery`,
+`the_motherbee_drops_a_spokes_frame_sent_as_another_spokes_node`,
+`a_hive_cannot_take_another_nodes_uuid_whichever_lsa_comes_first`.
 
 ---
 
@@ -90,7 +116,9 @@ Tests: `router_overwrites_spoofed_src_l2_name`,
 
 When `dst` parses as a UUID the router looks it up directly, in this order: a node on this router,
 a node on a sibling router, a node in the LSA (another hive), a hub-vouched node. Nothing found:
-`UNREACHABLE NODE_NOT_FOUND` (`handle_message`). Routes are not consulted.
+`UNREACHABLE NODE_NOT_FOUND` (`handle_message`). Routes are not consulted. A UUID that two hives
+of the LSA list, this one or a stale one included, resolves to neither (`find_remote_node`, the
+warning `router refused a UUID that several hives list`, at most every 30 s).
 
 ### 3.2 To a name: the FIB
 
@@ -102,8 +130,8 @@ the config region or the LSA change (`rebuild_fib`).
 | `LocalNode` | nodes connected to this router | EXACT name | this router | 0 |
 | `PeerNode` | the sibling routers' regions | EXACT name | that router, over IRP | 0 |
 | `StaticRoute` | this hive's `/jsr-config-<hive>` | the route's kind | `next_hop_hive`, or none | 1 |
-| `LsaNode` | the LSA region: other hives' nodes | EXACT name | that hive | 2 |
-| `LsaRoute` | the LSA region: other hives' routes | the route's kind | `next_hop_hive`, else the hive that advertised it | 2 |
+| `LsaNode` | the LSA region: other hives' nodes, each named `<role>@<its hive>` (§2) | EXACT name | that hive | 2 |
+| `LsaRoute` | the LSA region: other hives' routes, for the advertising hive's names and `name@*` only | the route's kind | `next_hop_hive`, else the hive that advertised it | 2 |
 | `ReachableNode` | nodes the hub vouches for (on a spoke's gateway) | EXACT name | the hub | 3 |
 
 **Order.** Most specific first; then admin distance, `priority`, `metric` and `installed_at`, all
@@ -122,6 +150,8 @@ length EXACT beats PREFIX beats GLOB.
 
 - a node entry: the VPN check (§8.2); allowed, deliver here, hand to the sibling or forward to the
   hive; denied, `UNREACHABLE VPN_BLOCKED`, and the search stops;
+- a route of another hive for a destination it does not apply to (below): skipped, the search
+  goes on;
 - a route with `DROP`: the message is discarded and the sender is not told;
 - a route with `FORWARD` and a next-hop hive: forward to that hive;
 - a route with `FORWARD` and no next hop: skipped, the search goes on;
@@ -134,8 +164,13 @@ length EXACT beats PREFIX beats GLOB.
   `DROP` on `AI.internal.*` does not stop messages to a connected `AI.internal.db@motherbee`; it
   drops names that nobody serves, which would otherwise get `NODE_NOT_FOUND`.
 - For a node of another hive, only an EXACT route on its full name wins (static 1 beats LSA 2).
-- Routes of other hives apply here too (`LsaRoute`). There an empty `next_hop_hive` means "to the
-  hive that advertised it", while on its own hive a `FORWARD` without next hop does nothing.
+- This hive's static routes apply to any name.
+- Routes of another hive apply here only to that hive's names, `<role>@<that hive>`, and to a
+  `name@*` destination (§3.3) (`LsaRoute` carries the advertising hive; `lsa_route_applies`). So a
+  hive can neither redirect nor drop the traffic of another hive's nodes: a spoke's `DROP` on
+  `SY.` or its `FORWARD` on `*` does nothing to `SY.admin@motherbee`. There an empty
+  `next_hop_hive` means "to the hive that advertised it", while on its own hive a `FORWARD` without
+  next hop does nothing.
 - Routes never apply to a destination given as a UUID (§3.1).
 
 ### 3.3 Any hive: `name@*`
@@ -144,7 +179,9 @@ A destination ending in `@*` is tried first as `name@<sender's hive>`; any resul
 `NODE_NOT_FOUND` is final, a `VPN_BLOCKED` included. Otherwise the router takes the first FIB entry
 whose node name before `@` equals `name` (a `*` inside `name` works as a wildcard), or whose route
 pattern matches the literal string `name@*` (`resolve_by_name`, `resolve_by_name_any_hive`). The
-pick follows FIB order: the longer full name first, then admin distance; not the nearest hive.
+pick follows FIB order: the longer full name first, then admin distance; not the nearest hive. In
+the first step another hive's routes count only for a name of their own hive (§3.2); in the second
+they count like this hive's.
 
 ### 3.4 Handing a message to another router
 
@@ -282,14 +319,23 @@ The gate covers system messages (`meta.type` compared without case, `is_system_k
 | --- | --- | --- |
 | (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` |
 | (2) | `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` | `SY.admin@motherbee` |
-| (3) | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_GET`, `NODE_CONFIG_SET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@<any hive>` |
-| (4) | every protected action outside (1) and (2): the (3) list and `INVENTORY_REQUEST` | `SY.admin@<this hive>` |
+| (3) mutations | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`; `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` never on the motherbee itself |
+| (3) reads | `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`, `SY.orchestrator@<this hive>` |
+| (4) | every protected action outside (1) and (2): the (3) lists and `INVENTORY_REQUEST`; never `ADD_HIVE_FINALIZE` or `REMOVE_HIVE_CLEANUP` on the motherbee | `SY.admin@<this hive>` |
 | (5) | `NODE_STATUS_GET` | `SY.vault@<this hive>` |
 | (6) | `WAN_REACHABILITY_VOUCH`: not a message, the router asks it before it accepts a hub's reachability advertisement | `RT.gateway@motherbee` |
 
-- In short: node lifecycle verbs (SPAWN, KILL, …) come from an orchestrator of any hive or from the
-  admin of the same hive; `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_*` and the edge commands come
-  only from `SY.admin@motherbee`.
+- In short: node lifecycle verbs (SPAWN, KILL, …) come from the motherbee's orchestrator or from the
+  admin of the same hive, and the node reads also from the same hive's orchestrator;
+  `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_*` and the edge commands come only from
+  `SY.admin@motherbee`.
+- Rule (3) has a direction (FINDINGS A-20, [control-path-hardening-v1.md](../control-path-hardening-v1.md)
+  §3). Every orchestrator message that crosses hives goes from the motherbee to a spoke, and the
+  watchdog acts locally, so a spoke's orchestrator, the DMZ ingress's included, commands no hive,
+  not even its own. `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` run only on the hive being added
+  or removed: on the motherbee they would restart or stop the core, so neither rule (3) nor rule
+  (4) admits them there, from anyone, and its orchestrator refuses them too
+  (`SPOKE_ONLY_SYSTEM_ACTIONS` in `src/bin/sy_orchestrator.rs`).
 - The origin is split at the first `@` after trimming. The role must match exactly, so
   `SY.orchestrator.relay@h` is not `SY.orchestrator`; an empty name, or one without `@`, matches
   nothing.
@@ -306,7 +352,9 @@ The gate covers system messages (`meta.type` compared without case, `is_system_k
 - A denied message is dropped with the warning `router dropped protected SYSTEM action from
   unauthorized origin`. The sender gets nothing back.
 - A sender known only through a hub's reachability advertisement (`via_hub`) is denied every
-  protected action without evaluating the policy.
+  protected action without evaluating the policy. So is a tap copy (`meta.via_tap`, §8.3): it
+  keeps the original sender's name, but goes to the tap's target, which that sender never
+  addressed.
 - Other system verbs and every other kind pass the gate.
 - Nodes add their own checks: SY.config.routes takes route, VPN and tap changes only from
   `SY.admin@motherbee` (`is_primary_admin_origin`); SY.opa.rules takes `CONFIG_CHANGED` only from
@@ -559,13 +607,20 @@ also goes, as a copy, to `target` (`fanout_taps_for_unicast`).
   router knows for a UUID destination (local, sibling or LSA), or with the name as written: a tap on
   `AI.x@motherbee` does not see a message sent to `AI.x@*`. Resolve and broadcast messages are never
   tapped.
-- The taps of this hive (config region) and of every other hive (LSA) all apply; targets are
-  deduplicated.
+- This hive's taps (config region) apply to any message. Another hive's, from its LSA, apply only
+  to a message that hive is a party to, its sender or its destination being `<role>@<that hive>`,
+  and only with a target on that hive (`lsa_tap_applies`). So a hive cannot copy traffic it does
+  not already see, nor hand a copy to another hive's node: a spoke's tap on `SY.admin@motherbee` to
+  `SY.vault@motherbee` copies nothing, and one on a message to its own orchestrator cannot copy it
+  to another spoke's. Targets are deduplicated.
+- The router evaluates taps, this hive's and the LSA's, only while this hive's config region holds
+  at least one tap (`handle_message`).
 - The copy is the same message with `meta.via_tap: true`, a new `trace_id` and `dst` = `target`,
   resolved like any unicast name. It keeps the original `src` and `src_l2_name`, and never triggers
   taps itself.
-- The target must pass the VPN check against the original sender (§8.2). The system-policy gate
-  applies to the copy.
+- The target must pass the VPN check against the original sender (§8.2). A copy never carries a
+  protected system action, whoever sent the original: the gate drops it at delivery, like a
+  hub-relayed sender's (§6.3).
 - Best effort: a copy that cannot go (unknown target, VPN, TTL, link down) is logged as
   `router tap copy: …` and dropped. The primary delivery does not wait for it.
 
@@ -615,9 +670,12 @@ fixed. With one router per hive none of them applies.
 | --- | --- |
 | `NODE_NOT_FOUND` for a name | the full `role@hive`; the node connected (`GET /hives/{hive}/nodes`); its hive in the LSA and not stale; a `@*` destination |
 | `VPN_BLOCKED` | `GET /hives/{hive}/vpns` on both hives; the `vpn_id` in the node's ANNOUNCE; the edge rules |
-| A message vanished | a `DROP` route on any hive (`GET /hives/{hive}/routes`; other hives' routes apply too); the router log lines in §3.7 and §6.3 |
+| A message vanished | a `DROP` route on a hive the message passed, or on its destination's hive (`GET /hives/{hive}/routes`; another hive's routes apply to its own names and to `name@*`, §3.2); the router log lines in §3.7 and §6.3 |
 | `dst: null` lands on the frontdesk | `meta.src_ilk` absent, or the ILK `temporary` (§5) |
 | `OPA_ERROR` | `GET /hives/{hive}/opa/status` (no policy, or a router in error); the router log `opa resolve failed` |
 | `OPA_NO_TARGET` | the policy gave no string; `data.identity` lacks the sender (§7.3) |
 | A protected verb did nothing | the sender's stamped name against §6.2 |
-| No tap copy | exact names, the destination as written, the VPN, the log `router tap copy:` |
+| No tap copy | exact names, the destination as written, the VPN, the log `router tap copy:`; another hive's tap copies only messages to or from that hive, to its own nodes; a protected system action is never copied (§8.3) |
+| A node of another hive is unknown here | its name must be `<role>@<its hive>`; the log `lsa nodes dropped` (§2) |
+| A message from another hive vanished | its sender must be a node of the peer it came from, or one the hub relays; the log `router dropped a WAN frame` (§2) |
+| `NODE_NOT_FOUND` for a node's UUID | two hives list that UUID: the logs `router refused a UUID that several hives list` and `lsa nodes with a UUID already taken` (§2, §3.1) |

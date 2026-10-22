@@ -1,7 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,15 +89,19 @@ const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
 
 /// The message log (A-70, Q7 of docs/router-stream-v1.md): one row per copied message, keyed by
 /// the record's inbox key (`idx_turns_dedupe_key`, unique). A reply shares its request's
-/// `trace_id`, and so its `ctx` and `seq`, and still gets a row of its own. Each row keeps the
-/// whole message, its thread and its trace, and the time the router copied it (`ts`); `stored_at`
-/// is when SY.storage wrote it, the order a live reader follows, since a stream's batch can arrive
-/// late.
+/// `trace_id` and still gets a row of its own. Each row keeps the whole message, its thread and its
+/// trace, and the time the router copied it (`ts`); `stored_at` is when SY.storage wrote it, the
+/// order a live reader follows, since a stream's batch can arrive late.
+///
+/// `ctx` and `seq` are no longer written. They stay one release, nullable, so a rollback to 0.1.82
+/// still starts (it creates its `(ctx, seq)` index at start); the next release drops both and that
+/// index. A 0.1.82 table loses their `NOT NULL` once: the `DO` block reads the catalog first, so
+/// later starts take no lock on `turns`.
 const TURNS_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS turns (
     dedupe_key  TEXT NOT NULL,
-    ctx         TEXT NOT NULL,
-    seq         BIGINT NOT NULL,
+    ctx         TEXT,
+    seq         BIGINT,
     ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
     stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     from_ilk    TEXT NOT NULL,
@@ -112,8 +114,15 @@ CREATE TABLE IF NOT EXISTS turns (
     trace_id    TEXT,
     message     JSONB NOT NULL
 );
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'turns'
+                  AND column_name IN ('ctx', 'seq') AND is_nullable = 'NO') THEN
+        ALTER TABLE turns ALTER COLUMN ctx DROP NOT NULL, ALTER COLUMN seq DROP NOT NULL;
+    END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
-CREATE INDEX IF NOT EXISTS idx_turns_ctx_seq ON turns (ctx, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);
 CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);
@@ -379,6 +388,19 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_stored ON llm_usage (stored_at, record_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_tenant_stored ON llm_usage (tenant_id, stored_at, record_id);
 "#;
+/// What `ensure_schema` runs at start, in order. Each schema statement waits at most 5 s for its
+/// lock: a DDL queued behind a long transaction would hold every later reader and writer of its
+/// table behind it, so it fails instead, and SY.storage exits and retries
+/// (`exit_without_database`). The reset leaves the shared connection's later statements waiting as
+/// long as they need.
+const SCHEMA_STEPS: [&str; 6] = [
+    "SET lock_timeout = '5s'",
+    TURNS_SCHEMA_SQL,
+    INBOX_SCHEMA_SQL,
+    COGNITION_SCHEMA_SQL,
+    USAGE_SCHEMA_SQL,
+    "RESET lock_timeout",
+];
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
 const STORAGE_METRICS_WARN_AGE_SECS: i64 = 120;
@@ -450,8 +472,6 @@ struct Storage {
 
 #[derive(Debug)]
 struct TurnRecord {
-    ctx: String,
-    seq: i64,
     from_ilk: String,
     to_ilk: Option<String>,
     ich: String,
@@ -773,10 +793,9 @@ impl Storage {
     }
 
     async fn ensure_schema(&self) -> Result<(), StorageError> {
-        self.client.batch_execute(TURNS_SCHEMA_SQL).await?;
-        self.client.batch_execute(INBOX_SCHEMA_SQL).await?;
-        self.client.batch_execute(COGNITION_SCHEMA_SQL).await?;
-        self.client.batch_execute(USAGE_SCHEMA_SQL).await?;
+        for step in SCHEMA_STEPS {
+            self.client.batch_execute(step).await?;
+        }
         Ok(())
     }
 
@@ -1221,22 +1240,20 @@ WHERE dedupe_key = $1
         // here: a turn that waited in a stream keeps its time.
         db.execute(
             r#"
-INSERT INTO turns (dedupe_key, ctx, seq, ts, from_ilk, to_ilk, ich, msg_type, content, tags,
-                   thread_id, trace_id, message)
-VALUES ($1, $2, $3, COALESCE($10, now()), $4, $5, $6, $7, $8, $9, $11, $12, $13)
+INSERT INTO turns (dedupe_key, ts, from_ilk, to_ilk, ich, msg_type, content, tags, thread_id,
+                   trace_id, message)
+VALUES ($1, COALESCE($2, now()), $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (dedupe_key) DO NOTHING
 "#,
             &[
                 &dedupe_key,
-                &turn.ctx,
-                &turn.seq,
+                &source_ts,
                 &turn.from_ilk,
                 &turn.to_ilk,
                 &turn.ich,
                 &turn.msg_type,
                 &turn.content,
                 &turn.tags,
-                &source_ts,
                 &turn.thread_id,
                 &turn.trace_id,
                 &turn.message,
@@ -3161,8 +3178,6 @@ async fn ensure_database_exists(base: &PgConfig, dbname: &str) -> Result<(), Sto
 
 fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
     let trace_id = required_str(&value, &["routing", "trace_id"], "routing.trace_id")?;
-    let ctx = get_str(&value, &["meta", "ctx"]).unwrap_or_else(|| format!("trace:{trace_id}"));
-    let seq = get_i64(&value, &["meta", "ctx_seq"]).unwrap_or_else(|| stable_i64(&trace_id));
     let from_ilk = get_str(&value, &["meta", "src_ilk"])
         .or_else(|| get_str(&value, &["routing", "src"]))
         .ok_or_else(|| missing_field("meta.src_ilk|routing.src"))?;
@@ -3178,8 +3193,6 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
     dedup_sort(&mut tags);
     let thread_id = get_str(&value, &["meta", "thread_id"]);
     Ok(TurnRecord {
-        ctx,
-        seq,
         from_ilk,
         to_ilk,
         ich,
@@ -3265,14 +3278,6 @@ fn get_str(value: &Value, path: &[&str]) -> Option<String> {
     }
 }
 
-fn get_i64(value: &Value, path: &[&str]) -> Option<i64> {
-    let v = get_value(value, path)?;
-    if let Some(i) = v.as_i64() {
-        return Some(i);
-    }
-    v.as_str()?.parse::<i64>().ok()
-}
-
 fn get_string_vec(value: &Value, path: &[&str]) -> Option<Vec<String>> {
     let array = get_value(value, path)?.as_array()?;
     let mut out = Vec::new();
@@ -3290,16 +3295,6 @@ fn get_string_vec(value: &Value, path: &[&str]) -> Option<Vec<String>> {
 fn dedup_sort(values: &mut Vec<String>) {
     values.sort();
     values.dedup();
-}
-
-fn stable_u64(value: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn stable_i64(value: &str) -> i64 {
-    (stable_u64(value) & (i64::MAX as u64)) as i64
 }
 
 fn is_mother_role(role: Option<&str>) -> bool {
@@ -3857,16 +3852,13 @@ mod tests {
 
     #[test]
     fn a_reply_lands_on_a_key_of_its_own() {
-        // The request and its reply share the trace_id, so the old (ctx, seq) key was the same and
-        // the reply was dropped (A-70). The inbox key is not.
+        // The request and its reply share the trace_id, and the old (ctx, seq) key, derived from
+        // it, dropped the reply (A-70). The inbox key tells them apart.
         let request = message("trace-1", "ilk:person", "hola");
         let reply = message("trace-1", "ilk:ai", "hola, en qué te ayudo");
         let request_turn = parse_turn(request.clone()).expect("request parses");
         let reply_turn = parse_turn(reply.clone()).expect("reply parses");
-        assert_eq!(
-            (request_turn.ctx.as_str(), request_turn.seq),
-            (reply_turn.ctx.as_str(), reply_turn.seq)
-        );
+        assert_eq!(request_turn.trace_id, reply_turn.trace_id);
         let key = |value: &Value| {
             message_dedupe_key(SUBJECT_STORAGE_TURNS, &serde_json::to_vec(value).unwrap())
         };
@@ -3887,6 +3879,8 @@ mod tests {
         let turns = &turns[..turns.find(");").unwrap()];
         for column in [
             "dedupe_key  TEXT NOT NULL,",
+            "ctx         TEXT,",
+            "seq         BIGINT,",
             "stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),",
             "thread_id   TEXT,",
             "trace_id    TEXT,",
@@ -3904,7 +3898,40 @@ mod tests {
         ] {
             assert!(TURNS_SCHEMA_SQL.contains(index), "{index}");
         }
+        // ctx and seq, no longer written, lose a 0.1.82 table's NOT NULL once: the ALTER runs only
+        // while the catalog still says NOT NULL, so a later start takes no lock on `turns`. Their
+        // index is no longer created.
+        let guard = &TURNS_SCHEMA_SQL[TURNS_SCHEMA_SQL.find("DO $$").unwrap()..];
+        let guard = &guard[..guard.find("END $$;").unwrap()];
+        assert!(guard.contains("table_schema = current_schema() AND table_name = 'turns'"));
+        assert!(guard.contains("column_name IN ('ctx', 'seq') AND is_nullable = 'NO'"));
+        assert!(guard.contains(
+            "ALTER TABLE turns ALTER COLUMN ctx DROP NOT NULL, ALTER COLUMN seq DROP NOT NULL;"
+        ));
+        assert_eq!(
+            TURNS_SCHEMA_SQL.matches("ALTER TABLE").count(),
+            1,
+            "the ALTER runs only inside the guard"
+        );
+        assert!(!TURNS_SCHEMA_SQL.contains("idx_turns_ctx_seq"));
         assert!(INBOX_SCHEMA_SQL.contains("source_ts    TIMESTAMPTZ,"));
+    }
+
+    #[test]
+    fn every_schema_statement_runs_under_the_lock_timeout() {
+        let (first, rest) = SCHEMA_STEPS.split_first().unwrap();
+        let (last, ddl) = rest.split_last().unwrap();
+        assert_eq!(*first, "SET lock_timeout = '5s'");
+        assert_eq!(*last, "RESET lock_timeout");
+        assert_eq!(
+            ddl,
+            [
+                TURNS_SCHEMA_SQL,
+                INBOX_SCHEMA_SQL,
+                COGNITION_SCHEMA_SQL,
+                USAGE_SCHEMA_SQL
+            ]
+        );
     }
 
     fn record(seq: u64, subject: &str, producer: &str, payload: Value) -> StreamRecord {

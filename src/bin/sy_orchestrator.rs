@@ -28,15 +28,15 @@ use fluxbee_sdk::blob::{
 use fluxbee_sdk::identity::IdentityError;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 #[cfg(not(test))]
-use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
+use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::rpc::{
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
-    RpcError, SystemRpcRequest,
+    AdminCommandResult, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
+    RpcCommandReceiver, RpcError, SystemRpcRequest,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, derive_action_outcome, ActionClass, NodeConfig,
-    NodeSender, NodeUuidMode, StorageMetricsResponse, ADMIN_KIND, MSG_ADMIN_COMMAND,
-    MSG_STORAGE_METRICS_GET, MSG_STORAGE_METRICS_RESPONSE,
+    classify_admin_action, classify_system_message, derive_action_outcome, NodeConfig, NodeSender,
+    NodeUuidMode, StorageMetricsResponse, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_STORAGE_METRICS_GET,
+    MSG_STORAGE_METRICS_RESPONSE,
 };
 use json_router::{
     runtime_manifest::{
@@ -173,7 +173,18 @@ struct HiveFile {
     government: Option<GovernmentSection>,
     system_nodes: Option<SystemNodesSection>,
     egress: Option<EgressSection>,
+    ingress: Option<HiveIngressSection>,
     ai: Option<HiveAiConfig>,
+}
+
+/// The `ingress:` section of an ingress hive's own hive.yaml (docs/control-path-hardening-v1.md
+/// §6): the addresses and networks, besides the motherbee, its SSH is accepted from. add_hive
+/// writes it when the operator passes `ssh_allow_from`; editing it and restarting the
+/// orchestrator is the recovery path.
+#[derive(Debug, Default, Deserialize)]
+struct HiveIngressSection {
+    #[serde(default)]
+    ssh_allow_from: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,6 +219,14 @@ struct EgressSection {
     /// renders the motherbee's into theirs) and the motherbee. There is no default: without it
     /// the probe does not run, and reports `not_configured`.
     reachability_url: Option<String>,
+    /// Whether SSH may arrive on `wan_iface` (docs/control-path-hardening-v1.md §6, D31): the
+    /// operator's decision, true by default. False drops it in the egress' `fluxbee_egress` table.
+    #[serde(default = "default_ssh_from_wan")]
+    ssh_from_wan: bool,
+}
+
+fn default_ssh_from_wan() -> bool {
+    true
 }
 
 impl EgressSection {
@@ -250,6 +269,32 @@ struct IngressSection {
     /// Hive whose SY.vault holds the TLS secret. Defaults (at the edge) to `motherbee`.
     #[serde(default)]
     vault_hive: Option<String>,
+    /// The add_hive request's `ssh_allow_from` (docs/control-path-hardening-v1.md §6): the
+    /// addresses and networks, besides the motherbee, the ingress takes SSH from. The join writes
+    /// them into the ingress' hive.yaml as `ingress.ssh_allow_from`.
+    #[serde(skip)]
+    ssh_allow_from: Vec<SshAllowNet>,
+}
+
+/// The add_hive request's `ssh_allow_from`, ingress only: IP addresses or networks. SY.admin passes
+/// it through checked; it is parsed again here, since it lands in the ingress' hive.yaml and its
+/// nftables rules.
+fn resolve_add_hive_ssh_allow_from(
+    payload: &serde_json::Value,
+) -> Result<Vec<SshAllowNet>, String> {
+    match payload.get("ssh_allow_from") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| {
+                let raw = entry.as_str().ok_or(
+                    "ssh_allow_from must be an array of IP addresses or networks (strings)",
+                )?;
+                SshAllowNet::parse(raw).map_err(|err| format!("ssh_allow_from: {err}"))
+            })
+            .collect(),
+        Some(_) => Err("ssh_allow_from must be an array of IP addresses or networks".to_string()),
+    }
 }
 
 fn resolve_add_hive_ingress_section(
@@ -307,10 +352,12 @@ fn resolve_add_hive_ingress_section(
     if let Some(hive) = vault_hive.as_deref() {
         validate_yaml_scalar(hive, "ingress.vault_hive")?;
     }
+    let ssh_allow_from = resolve_add_hive_ssh_allow_from(payload)?;
     Ok(IngressSection {
         listen: Some(listen),
         tls_vault_key,
         vault_hive,
+        ssh_allow_from,
     })
 }
 
@@ -1064,6 +1111,25 @@ async fn run_admin_worker(
 ) {
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
+        // docs/control-path-hardening-v1.md §3: the admin inbox takes a message, reads included,
+        // only from this hive's own SY.admin, as the router stamps the sender, and before anything
+        // else (the booting answer too). SY.admin addresses only its own hive's orchestrator, so a
+        // spoke's orchestrator takes no admin message at all.
+        if !is_allowed_admin_source_name(&state, msg.routing.src_l2_name.as_deref()) {
+            let action = msg.meta.action.as_deref().unwrap_or("");
+            tracing::warn!(
+                action = action,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "blocked admin message from unauthorized origin"
+            );
+            if let Err(err) =
+                send_admin_forbidden(&sender, &msg, action, "admin action origin not allowed").await
+            {
+                tracing::warn!("admin action error: {err}");
+            }
+            continue;
+        }
         if !state.booted.load(Ordering::Acquire) {
             let action = msg.meta.action.as_deref().unwrap_or("");
             if let Err(err) = send_admin_error(
@@ -1613,7 +1679,12 @@ async fn bootstrap_local(
     tracing::info!("starting rt-gateway");
     start_core_service("rt-gateway", &replaced, &mut upgrade_restart)?;
     wait_for_router_ready(state, socket_dir, Duration::from_secs(30)).await?;
-    ensure_core_firewall_local(state);
+    // docs/control-path-hardening-v1.md §6: an active ufw or firewalld is reported, never written
+    // to; the ingress applies its SSH table (never fatal: the edge serves without it).
+    report_active_host_firewalls(&state.hive_id);
+    if state.role == HiveRole::Ingress {
+        reconcile_ingress_ssh(state);
+    }
     if let Err(err) = reconcile_egress(state) {
         if state.role == HiveRole::Egress {
             // NAT is the egress hive's entire reason to exist; a failure here
@@ -1636,7 +1707,7 @@ async fn bootstrap_local(
     // blob.enabled=false, so `effective_syncthing_runtime_config` turns it on off dist alone).
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
     if !startup_sync.sync_enabled {
-        disable_blob_sync_runtime_local(state.is_motherbee)?;
+        disable_blob_sync_runtime_local()?;
     } else if startup_sync.sync_enabled {
         if let Err(err) =
             ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee, state.role).await
@@ -1647,7 +1718,7 @@ async fn bootstrap_local(
             );
         }
     } else {
-        disable_blob_sync_runtime_local(state.is_motherbee)?;
+        disable_blob_sync_runtime_local()?;
     }
 
     for node_name in &state.system_nodes.nodes {
@@ -2085,18 +2156,15 @@ async fn reconcile_persisted_custom_nodes(
                 &node.node_name,
             ) {
                 Ok(Some((_, ilk))) => {
+                    let ilk_id = canonical_ilk_id_or_raw(&ilk.ilk_id);
                     tracing::warn!(
                         node_name = %node.node_name,
-                        ilk_id = %ilk.ilk_id,
+                        ilk_id = %ilk_id,
                         "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
                     );
-                    let _ = persist_node_ilk_mapping(
-                        state,
-                        &node.node_name,
-                        &ilk.ilk_id,
-                        &ilk.tenant_id,
-                    );
-                    (Some(ilk.ilk_id), Some(ilk.tenant_id))
+                    let _ =
+                        persist_node_ilk_mapping(state, &node.node_name, &ilk_id, &ilk.tenant_id);
+                    (Some(ilk_id), Some(ilk.tenant_id))
                 }
                 _ => (persisted_ilk, persisted_tenant),
             }
@@ -2488,6 +2556,9 @@ async fn watchdog_tick(state: &OrchestratorState) {
     // the admin/system message handlers (#[tokio::main] defaults to multi_thread).
     tokio::task::block_in_place(|| watchdog_egress_reconcile(state));
 
+    // docs/control-path-hardening-v1.md §6: the ingress' SSH table, and an active host firewall.
+    tokio::task::block_in_place(|| watchdog_host_rules(state));
+
     // A-46: report Archi or the admin bound off loopback, whatever bound them there.
     tokio::task::block_in_place(|| watchdog_listener_check(state));
 }
@@ -2495,7 +2566,7 @@ async fn watchdog_tick(state: &OrchestratorState) {
 /// Watchdog tick counter for egress drift correction (F6). Every
 /// `EGRESS_RECONCILE_DRIFT_TICKS` ticks the egress/worker reconcile is re-run
 /// idempotently so partial drift (a flushed chain, an edited rule, sysctl /
-/// conntrack drift that `nft_table_loaded()` cannot see) is corrected within
+/// conntrack drift that `nft_table_loaded` cannot see) is corrected within
 /// ~N tick-intervals instead of only on the next reboot.
 static EGRESS_RECONCILE_TICKS: AtomicU64 = AtomicU64::new(0);
 /// At the 5s watchdog cadence, 12 ticks ≈ 60s between idempotent re-applies —
@@ -2521,7 +2592,7 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
     let periodic = tick % EGRESS_RECONCILE_DRIFT_TICKS == 0;
     match state.role {
         HiveRole::Egress if eg.enabled => {
-            let table_missing = !nft_table_loaded();
+            let table_missing = !nft_table_loaded(EGRESS_NFT_TABLE);
             if table_missing {
                 tracing::warn!("egress nft table missing on watchdog; re-applying NAT");
             }
@@ -2530,7 +2601,7 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
             // chain, an edited rule, sysctl/conntrack drift). reconcile is
             // idempotent (write_file_if_changed + nft delete+apply + sysctl).
             if table_missing || periodic {
-                match reconcile_egress_nat(eg) {
+                match reconcile_egress_nat(eg, &state.hive_id) {
                     Ok(v) => {
                         // FINDINGS A-1: an egress can stop serving its LAN after boot (an
                         // interface renamed or removed, a sysctl reverted). Reported on every
@@ -2738,24 +2809,8 @@ async fn handle_admin(
     let state: &OrchestratorState = state_arc.as_ref();
     let action = msg.meta.action.as_deref().unwrap_or("");
 
-    // F8: gate state-mutating admin actions on an authorized origin. The SY.admin
-    // relay stamps `SY.admin@<hive>` (see send_admin_request); a None or foreign
-    // origin on a mutation is rejected here before any flow runs. Read-only actions
-    // (hive_status, list_*, get_*) are unaffected. This is additive with the
-    // per-action `is_motherbee` gate, which answers a different question (may this
-    // node perform the change) than this one (is the caller authorized to ask).
-    if admin_action_requires_origin(action)
-        && !is_allowed_admin_source_name(state, msg.routing.src_l2_name.as_deref())
-    {
-        tracing::warn!(
-            action = action,
-            src_uuid = %msg.routing.src,
-            src_l2_name = ?msg.routing.src_l2_name,
-            "blocked admin action from unauthorized origin"
-        );
-        return send_admin_forbidden(sender, msg, action, "admin action origin not allowed").await;
-    }
-
+    // The caller is this hive's SY.admin: `run_admin_worker` took nothing else. The per-action
+    // `is_motherbee` gates below answer another question (may this hive perform the change).
     tracing::info!(action = action, trace_id = %msg.routing.trace_id, "admin action received");
     let payload = match action {
         "hive_status" => {
@@ -3165,7 +3220,11 @@ async fn handle_system_message(
                     );
                     refusal
                 }
-                None => remove_hive_cleanup_local_flow(egress_teardown),
+                // docs/control-path-hardening-v1.md §6: the ingress drops the SSH table it
+                // applies, by its own role.
+                None => {
+                    remove_hive_cleanup_local_flow(egress_teardown, state.role == HiveRole::Ingress)
+                }
             };
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
             let _ =
@@ -3177,39 +3236,14 @@ async fn handle_system_message(
     Ok(())
 }
 
-/// F8: an admin action requires origin authorization iff it is state-mutating.
-/// Reuses the canonical `classify_admin_action` so the gate cannot drift as admin
-/// actions are added. `start_node`/`restart_node` are node-lifecycle mutations
-/// handled by this orchestrator but not catalogued by the classifier (it returns
-/// None for them), so they are named explicitly. Read-only and unknown actions
-/// (the latter already fall through to NOT_IMPLEMENTED) stay ungated.
-fn admin_action_requires_origin(action: &str) -> bool {
-    if matches!(action, "start_node" | "restart_node") {
-        return true;
-    }
-    matches!(
-        classify_admin_action(action),
-        Some(
-            ActionClass::Write
-                | ActionClass::SystemConfig
-                | ActionClass::TopologyChange
-                | ActionClass::NodeLifecycle
-                | ActionClass::IdentityChange
-                | ActionClass::ExternalAction
-                | ActionClass::SendMessage
-                | ActionClass::WorkflowStep
-        )
-    )
-}
-
-/// F8: the orchestrator only accepts mutating admin actions relayed by its OWN
-/// hive's SY.admin. Same-hive exact-match on purpose: every admin command routes
-/// `SY.admin@<hive>` -> `SY.orchestrator@<same hive>`
-/// (action_routes_via_local_orchestrator), so there is no legitimate cross-hive or
-/// cross-role admin origin. `src_l2_name` is self-asserted at this layer — this is
-/// defense-in-depth against cross-role/cross-hive mesh injection and against the
-/// un-named (None) shape an unauthorized direct mesh sender would carry, not a
-/// cryptographic boundary (that arrives with transport auth, cf. F4/F15).
+/// The orchestrator takes `msg_type: admin`, reads included, only from its OWN hive's SY.admin
+/// (F8 for mutations; docs/control-path-hardening-v1.md §3 for the rest: a read answered any
+/// caller, and the motherbee's orchestrator forwarded it to other hives under its own name).
+/// Same-hive exact match on purpose: every admin command routes `SY.admin@<hive>` ->
+/// `SY.orchestrator@<same hive>` (action_routes_via_local_orchestrator), so there is no legitimate
+/// cross-hive or cross-role admin origin, and a spoke, which runs no SY.admin, takes none.
+/// `src_l2_name` is the name the router stamps from the sender's connection; an unnamed (None)
+/// sender is refused.
 fn is_allowed_admin_source_name(state: &OrchestratorState, src_l2_name: Option<&str>) -> bool {
     let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
@@ -5501,7 +5535,8 @@ fn render_worker_egress_yaml(egress: Option<&EgressSection>) -> Result<String, O
 }
 
 /// The `egress:` section of an egress hive's hive.yaml (`add_egress_hive_flow`): the NAT it
-/// reconciles, and the URL its internet probe GETs when the join has one.
+/// reconciles, the operator's `ssh_from_wan` (docs/control-path-hardening-v1.md §6), and the URL
+/// its internet probe GETs when the join has one.
 fn render_egress_hive_egress_yaml(
     nat: &EgressNatConfig,
     edge_ip: std::net::Ipv4Addr,
@@ -5509,9 +5544,23 @@ fn render_egress_hive_egress_yaml(
 ) -> Result<String, OrchestratorError> {
     let reachability_url = render_reachability_url_yaml(reachability_url)?;
     Ok(format!(
-        "egress:\n  enabled: true\n  lan_cidr: \"{}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{}\"\n  lan_iface: \"{}\"\n  ipv6: \"blocked\"\n{reachability_url}",
-        nat.lan_cidr, nat.wan_iface, nat.lan_iface,
+        "egress:\n  enabled: true\n  lan_cidr: \"{}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{}\"\n  lan_iface: \"{}\"\n  ssh_from_wan: {}\n  ipv6: \"blocked\"\n{reachability_url}",
+        nat.lan_cidr, nat.wan_iface, nat.lan_iface, nat.ssh_from_wan,
     ))
+}
+
+/// The `ingress:` section of an ingress hive's hive.yaml: the join's `ssh_allow_from`
+/// (docs/control-path-hardening-v1.md §6), nothing when it had none. Each entry is the canonical
+/// form of a parsed address or network, so it is a safe YAML scalar.
+fn render_ingress_ssh_allow_from_yaml(ssh_allow_from: &[SshAllowNet]) -> String {
+    if ssh_allow_from.is_empty() {
+        return String::new();
+    }
+    let mut out = "ingress:\n  ssh_allow_from:\n".to_string();
+    for net in ssh_allow_from {
+        out.push_str(&format!("    - \"{net}\"\n"));
+    }
+    out
 }
 
 /// The `reachability_url` line of a rendered `egress:` section, or nothing when there is no URL:
@@ -6364,185 +6413,669 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn open_firewall_rules_local(rules: &[String], context: &str) {
-    if rules.is_empty() {
-        return;
-    }
+// ===========================================================================
+// SSH on the DMZ hosts and host firewalls — docs/control-path-hardening-v1.md §6 (A-46 stage 4,
+// minimal). The ingress takes SSH only from the motherbee and `ingress.ssh_allow_from`
+// (`table inet fluxbee_ingress`); the egress drops SSH on its WAN interface when
+// `egress.ssh_from_wan` is false (in its `fluxbee_egress` table). Each host applies its rules at
+// boot and on every reconcile, and its boot unit loads them before the network. The orchestrator
+// writes nothing to ufw or firewalld: those rules protected nothing (ufw was inactive on every
+// host), and turning ufw on would lock SSH and :443 out (D25). One that runs is reported.
+// ===========================================================================
 
-    let mut applied = false;
-    if command_exists("ufw") {
-        applied = true;
-        for rule in rules {
-            let mut cmd = Command::new("ufw");
-            cmd.arg("allow").arg(rule);
-            if let Err(err) = run_cmd(cmd, "ufw allow") {
-                tracing::warn!(context = context, rule = %rule, error = %err, "ufw allow failed");
-            }
+/// sshd's privilege-separation directory on Debian and Ubuntu. ssh.service creates it
+/// (`RuntimeDirectory=sshd`: root, 0755) when it starts, and `sshd -T` refuses to run without it:
+/// at boot until ssh.service is up, and on a socket-activated host until the first connection.
+const SSHD_PRIVSEP_DIR: &str = "/run/sshd";
+
+/// The TCP ports sshd listens on, from `sshd -T` (`sshd_ports_from_config`). An error when sshd
+/// cannot say (not installed, no host keys): a caller then keeps the ports its rules already
+/// cover, never a guess that could narrow them.
+fn sshd_listen_ports() -> Result<Vec<u16>, String> {
+    sshd_listen_ports_with(run_sshd_config_test, create_sshd_privsep_dir)
+}
+
+fn run_sshd_config_test() -> Result<String, String> {
+    let mut cmd = Command::new("sshd");
+    cmd.arg("-T");
+    run_cmd_output(cmd, "sshd -T").map_err(|err| err.to_string())
+}
+
+/// Whether `sshd -T` failed only because `SSHD_PRIVSEP_DIR` is missing.
+fn sshd_privsep_dir_missing(error: &str) -> bool {
+    error.contains(&format!(
+        "Missing privilege separation directory: {SSHD_PRIVSEP_DIR}"
+    ))
+}
+
+/// `sshd -T` (`run`), asked once more after creating sshd's privilege-separation directory when
+/// that is all it lacked. Any other failure, or a second one, is the error.
+fn sshd_listen_ports_with(
+    mut run: impl FnMut() -> Result<String, String>,
+    create_privsep_dir: impl FnOnce() -> Result<(), String>,
+) -> Result<Vec<u16>, String> {
+    let output = match run() {
+        Ok(output) => output,
+        Err(err) if sshd_privsep_dir_missing(&err) => {
+            create_privsep_dir()
+                .map_err(|create| format!("{err}; creating {SSHD_PRIVSEP_DIR} failed: {create}"))?;
+            tracing::info!(
+                dir = SSHD_PRIVSEP_DIR,
+                "created sshd's privilege-separation directory to read its ports"
+            );
+            run()?
         }
-    }
+        Err(err) => return Err(err),
+    };
+    Ok(sshd_ports_from_config(&output))
+}
 
-    if command_exists("firewall-cmd") {
-        let mut state_cmd = Command::new("firewall-cmd");
-        state_cmd.arg("--state");
-        if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
-            applied = true;
-            for rule in rules {
-                let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--add-port").arg(rule);
-                if let Err(err) = run_cmd(cmd_now, "firewall-cmd --add-port") {
-                    tracing::warn!(
-                        context = context,
-                        rule = %rule,
-                        error = %err,
-                        "firewalld runtime port rule failed"
-                    );
-                }
-
-                let mut cmd_persistent = Command::new("firewall-cmd");
-                cmd_persistent
-                    .arg("--permanent")
-                    .arg("--add-port")
-                    .arg(rule);
-                if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --add-port") {
-                    tracing::warn!(
-                        context = context,
-                        rule = %rule,
-                        error = %err,
-                        "firewalld permanent port rule failed"
-                    );
-                }
-            }
-        }
-    }
-
-    if !applied {
-        tracing::warn!(
-            context = context,
-            rules = ?rules,
-            "no ufw/firewalld detected; ports must be opened by host firewall policy"
-        );
+/// Creates `SSHD_PRIVSEP_DIR` as ssh.service's `RuntimeDirectory=` would: root's (this process
+/// runs as root), 0755. One that appeared meanwhile is left as it is.
+fn create_sshd_privsep_dir() -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    match fs::DirBuilder::new().mode(0o755).create(SSHD_PRIVSEP_DIR) {
+        Ok(()) => fs::set_permissions(SSHD_PRIVSEP_DIR, fs::Permissions::from_mode(0o755))
+            .map_err(|err| err.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err.to_string()),
     }
 }
 
-fn close_firewall_rules_local(rules: &[String], context: &str) {
-    if rules.is_empty() {
-        return;
+/// The ports in `sshd -T` output: its `port` lines, and the port of each `listenaddress`, which
+/// can name its own (`ListenAddress 0.0.0.0:2222`). 22 when there is none.
+fn sshd_ports_from_config(output: &str) -> Vec<u16> {
+    let mut ports = BTreeSet::new();
+    for line in output.lines() {
+        let mut words = line.split_whitespace();
+        let port = match (words.next(), words.next()) {
+            (Some("port"), Some(port)) => port.parse::<u16>().ok(),
+            (Some("listenaddress"), Some(address)) => address
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok()),
+            _ => None,
+        };
+        ports.extend(port);
+    }
+    if ports.is_empty() {
+        ports.insert(22);
+    }
+    ports.into_iter().collect()
+}
+
+/// An address or a network the ingress takes SSH from, kept as its network address
+/// (`10.0.0.7/24` is `10.0.0.0/24`). An IPv4-mapped IPv6 address is its IPv4 address: netfilter
+/// sees such a client's packets as IPv4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SshAllowNet {
+    network: std::net::IpAddr,
+    prefix: u8,
+}
+
+impl SshAllowNet {
+    fn host(address: std::net::IpAddr) -> Self {
+        let address = canonical_ip(address);
+        Self {
+            network: address,
+            prefix: ip_bits(&address),
+        }
     }
 
-    let mut applied = false;
-    if command_exists("ufw") {
-        applied = true;
-        for rule in rules {
-            let mut cmd = Command::new("ufw");
-            cmd.arg("--force").arg("delete").arg("allow").arg(rule);
-            if let Err(err) = run_cmd(cmd, "ufw delete allow") {
-                tracing::warn!(
-                    context = context,
-                    rule = %rule,
-                    error = %err,
-                    "ufw delete allow failed"
-                );
+    /// `10.0.0.7`, `10.0.0.0/24`, `fd00::1` or `fd00::/64`.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        let invalid = || format!("'{raw}' is not an IP address or an address/prefix network");
+        match raw.split_once('/') {
+            None => raw
+                .parse::<std::net::IpAddr>()
+                .map(Self::host)
+                .map_err(|_| invalid()),
+            Some((address, prefix)) => {
+                let address = address.parse::<std::net::IpAddr>().map_err(|_| invalid())?;
+                let prefix = prefix
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|prefix| *prefix <= ip_bits(&address))
+                    .ok_or_else(invalid)?;
+                Ok(Self::network_of(address, prefix))
             }
         }
     }
 
-    if command_exists("firewall-cmd") {
-        let mut state_cmd = Command::new("firewall-cmd");
-        state_cmd.arg("--state");
-        if run_cmd(state_cmd, "firewall-cmd --state").is_ok() {
-            applied = true;
-            for rule in rules {
-                let mut cmd_now = Command::new("firewall-cmd");
-                cmd_now.arg("--remove-port").arg(rule);
-                if let Err(err) = run_cmd(cmd_now, "firewall-cmd --remove-port") {
-                    tracing::warn!(
-                        context = context,
-                        rule = %rule,
-                        error = %err,
-                        "firewalld runtime port remove failed"
-                    );
-                }
-
-                let mut cmd_persistent = Command::new("firewall-cmd");
-                cmd_persistent
-                    .arg("--permanent")
-                    .arg("--remove-port")
-                    .arg(rule);
-                if let Err(err) = run_cmd(cmd_persistent, "firewall-cmd --permanent --remove-port")
-                {
-                    tracing::warn!(
-                        context = context,
-                        rule = %rule,
-                        error = %err,
-                        "firewalld permanent port remove failed"
-                    );
-                }
+    fn network_of(address: std::net::IpAddr, prefix: u8) -> Self {
+        let network = match address {
+            std::net::IpAddr::V4(v4) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+                std::net::IpAddr::V4((u32::from(v4) & mask).into())
             }
-        }
+            std::net::IpAddr::V6(v6) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+                std::net::IpAddr::V6((u128::from(v6) & mask).into())
+            }
+        };
+        Self { network, prefix }
     }
 
-    if !applied {
-        tracing::warn!(
-            context = context,
-            rules = ?rules,
-            "no ufw/firewalld detected; ports must be removed by host firewall policy"
-        );
+    fn contains(&self, address: std::net::IpAddr) -> bool {
+        let address = canonical_ip(address);
+        address.is_ipv4() == self.network.is_ipv4()
+            && Self::network_of(address, self.prefix).network == self.network
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        self.prefix <= other.prefix && self.contains(other.network)
     }
 }
 
-/// The ports Syncthing needs open on this hive. Every link is TCP to the motherbee's static address
-/// (host posture stages 2 and 3: no link depends on discovery, relays or QUIC), and only the
-/// motherbee accepts: a spoke only dials, and listens on loopback once it has switched
-/// (`syncthing_owned_listen_address`), so it opens nothing.
-fn syncthing_firewall_rules(is_motherbee: bool) -> Vec<String> {
-    if is_motherbee {
-        vec![format!("{SYNCTHING_SYNC_PORT_TCP}/tcp")]
+impl std::fmt::Display for SshAllowNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.prefix == ip_bits(&self.network) {
+            write!(f, "{}", self.network)
+        } else {
+            write!(f, "{}/{}", self.network, self.prefix)
+        }
+    }
+}
+
+fn ip_bits(address: &std::net::IpAddr) -> u8 {
+    if address.is_ipv4() {
+        32
     } else {
-        Vec::new()
+        128
     }
 }
 
-fn ensure_syncthing_firewall_local(is_motherbee: bool) {
-    open_firewall_rules_local(&syncthing_firewall_rules(is_motherbee), "syncthing");
-}
-
-fn disable_syncthing_firewall_local(is_motherbee: bool) {
-    close_firewall_rules_local(&syncthing_firewall_rules(is_motherbee), "syncthing");
-}
-
-fn ensure_core_firewall_local(state: &OrchestratorState) {
-    if state.role == HiveRole::Egress {
-        // D1: on egress hosts nftables is the single firewall backend (see
-        // reconcile_egress_nat). Inbound is owned by the fluxbee_egress table,
-        // not ufw — do not open ports through ufw here.
-        tracing::info!("role=egress: inbound owned by nftables (fluxbee_egress); skipping ufw");
-        return;
+/// An IPv4-mapped IPv6 address (`::ffff:10.0.0.7`, what a dual-stack socket shows) as IPv4.
+fn canonical_ip(address: std::net::IpAddr) -> std::net::IpAddr {
+    match address {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(address),
+        v4 => v4,
     }
-    let mut rules: Vec<String> = Vec::new();
-    if let Some(listen) = state.wan_listen.as_deref() {
-        let listen = listen.trim();
-        if !listen.is_empty() {
-            match parse_host_port(listen) {
-                Ok((_, port)) => rules.push(format!("{port}/tcp")),
-                Err(err) => tracing::warn!(
-                    wan_listen = listen,
-                    error = %err,
-                    "failed to parse wan.listen for firewall setup; skipping WAN port rule"
-                ),
+}
+
+/// The motherbee's addresses, from a hive's `wan.uplinks`: an IP literal as written, a hostname as
+/// `resolve` answers it (IPv4 and IPv6). An uplink that gives no address is a note.
+fn motherbee_uplink_addresses(
+    uplinks: &[WanUplink],
+    resolve: impl Fn(&str, u16) -> Result<Vec<std::net::IpAddr>, String>,
+) -> (Vec<std::net::IpAddr>, Vec<String>) {
+    let mut addresses = Vec::new();
+    let mut notes = Vec::new();
+    for uplink in uplinks {
+        let raw = uplink.address.trim();
+        let (host, port) = match parse_host_port(raw) {
+            Ok(host_port) => host_port,
+            Err(err) => {
+                notes.push(format!("wan uplink '{raw}': {err}"));
+                continue;
             }
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        match host.parse::<std::net::IpAddr>() {
+            Ok(address) => addresses.push(address),
+            Err(_) => match resolve(host, port) {
+                Ok(found) if !found.is_empty() => addresses.extend(found),
+                Ok(_) => notes.push(format!("wan uplink '{raw}' resolves to no address")),
+                Err(err) => notes.push(format!("wan uplink '{raw}' does not resolve: {err}")),
+            },
         }
     }
+    (addresses, notes)
+}
 
-    if state.is_motherbee {
-        rules.push(format!("{}/tcp", state.identity_sync_port));
+/// A hostname's addresses, IPv4 and IPv6, from the system resolver.
+fn resolve_host_addresses(host: &str, port: u16) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs;
+    (host, port)
+        .to_socket_addrs()
+        .map(|found| found.map(|address| address.ip()).collect())
+        .map_err(|err| err.to_string())
+}
+
+/// The ingress' SSH allow set: the motherbee's addresses and `ingress.ssh_allow_from`, sorted,
+/// without duplicates, and without an entry another one covers (an nftables interval set refuses
+/// overlapping elements).
+fn ssh_allow_set(motherbee: &[std::net::IpAddr], extra: &[SshAllowNet]) -> Vec<SshAllowNet> {
+    let mut all: Vec<SshAllowNet> = motherbee
+        .iter()
+        .map(|address| SshAllowNet::host(*address))
+        .chain(extra.iter().copied())
+        .collect();
+    all.sort();
+    all.dedup();
+    all.iter()
+        .filter(|net| !all.iter().any(|other| other != *net && other.covers(net)))
+        .copied()
+        .collect()
+}
+
+/// `table inet fluxbee_ingress` (docs/control-path-hardening-v1.md §6): SSH, on `ssh_ports`, is
+/// accepted from `allow` and from loopback, and dropped from anywhere else, IPv4 and IPv6; nothing
+/// else is filtered. `None` for an empty allow set: a table that drops every SSH is never
+/// rendered. Applied like the egress table (add + flush + define in one `nft -f`, SO-08). The
+/// sources are inline in the rules, never a named set: `flush table` keeps a named set's
+/// elements, so an address taken off the list would stay allowed.
+fn ingress_nft_ruleset(ssh_ports: &[u16], allow: &[SshAllowNet]) -> Option<String> {
+    if allow.is_empty() {
+        return None;
     }
+    let ports = nft_port_set(ssh_ports);
+    let mut accepts = String::new();
+    for (family, v4) in [("ip", true), ("ip6", false)] {
+        let members: Vec<String> = allow
+            .iter()
+            .filter(|net| net.network.is_ipv4() == v4)
+            .map(SshAllowNet::to_string)
+            .collect();
+        if !members.is_empty() {
+            accepts.push_str(&format!(
+                "\t\ttcp dport {ports} {family} saddr {{ {} }} accept\n",
+                members.join(", ")
+            ));
+        }
+    }
+    Some(format!(
+        "#!/usr/sbin/nft -f\n\
+         # BEGIN FLUXBEE INGRESS SSH\n\
+         # docs/control-path-hardening-v1.md §6: SSH only from the motherbee,\n\
+         # ingress.ssh_allow_from and loopback; nothing else is filtered. add + flush +\n\
+         # define in ONE atomic `nft -f` transaction (SO-08). The sources are inline,\n\
+         # never a named set: `flush table` keeps a named set's elements.\n\
+         add table {table}\n\
+         flush table {table}\n\
+         table {table} {{\n\
+         \tchain input {{\n\
+         \t\ttype filter hook input priority 0; policy accept;\n\
+         \t\tiif \"lo\" accept\n\
+         {accepts}\
+         \t\ttcp dport {ports} drop\n\
+         \t}}\n\
+         }}\n\
+         # END FLUXBEE INGRESS SSH\n",
+        table = INGRESS_NFT_TABLE,
+    ))
+}
 
-    if rules.is_empty() {
+/// Why an ingress renders no new SSH rules. The rules it applied before stay in force: an input
+/// that fails or a bad entry never narrows, loosens or drops a working table.
+#[derive(Debug, PartialEq, Eq)]
+enum IngressSshRefusal {
+    /// An input could not be read: hive.yaml, the ports from `sshd -T`, or a `wan.uplinks` host
+    /// that does not resolve.
+    InputFailed(String),
+    /// An `ingress.ssh_allow_from` entry that is no address or network.
+    InvalidAllowFrom(String),
+    /// No motherbee address and no `ingress.ssh_allow_from`: the table would drop every SSH.
+    EmptyAllowSet(String),
+}
+
+impl IngressSshRefusal {
+    /// The posture alert it raises: kind, severity, and what failed.
+    fn alert(&self) -> (&'static str, &'static str, &str) {
+        match self {
+            IngressSshRefusal::InputFailed(why) => ("ingress_ssh_input_failed", "warning", why),
+            IngressSshRefusal::InvalidAllowFrom(why) => ("ingress_ssh_rules_failed", "error", why),
+            IngressSshRefusal::EmptyAllowSet(why) => ("ingress_ssh_allow_set_empty", "error", why),
+        }
+    }
+}
+
+/// What an ingress applies for SSH: its rendered table and allow set.
+#[derive(Debug)]
+struct IngressSshRules {
+    ruleset: String,
+    allow: Vec<SshAllowNet>,
+}
+
+/// The ingress' SSH rules from its hive.yaml (`wan.uplinks`, `ingress.ssh_allow_from`) and the
+/// ports sshd listens on. Only a complete input set renders: an uplink that gives no address
+/// refuses, rather than render a table without the motherbee.
+fn ingress_ssh_rules(
+    uplinks: &[WanUplink],
+    ssh_allow_from: &[String],
+    ssh_ports: &[u16],
+    resolve: impl Fn(&str, u16) -> Result<Vec<std::net::IpAddr>, String>,
+) -> Result<IngressSshRules, IngressSshRefusal> {
+    let extra = ssh_allow_from
+        .iter()
+        .map(|raw| SshAllowNet::parse(raw))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            IngressSshRefusal::InvalidAllowFrom(format!("ingress.ssh_allow_from: {err}"))
+        })?;
+    let (motherbee, notes) = motherbee_uplink_addresses(uplinks, resolve);
+    if !notes.is_empty() {
+        return Err(IngressSshRefusal::InputFailed(notes.join("; ")));
+    }
+    let allow = ssh_allow_set(&motherbee, &extra);
+    let Some(ruleset) = ingress_nft_ruleset(ssh_ports, &allow) else {
+        return Err(IngressSshRefusal::EmptyAllowSet(
+            "hive.yaml names no motherbee in wan.uplinks and no ingress.ssh_allow_from".to_string(),
+        ));
+    };
+    Ok(IngressSshRules { ruleset, allow })
+}
+
+/// What a reconcile does with the ingress' SSH table.
+#[derive(Debug, PartialEq, Eq)]
+enum IngressSshAction {
+    /// Write and load the rendered ruleset: it differs from the saved one.
+    Apply,
+    /// Load the saved ruleset again: the table is gone, and either the rendered ruleset is the
+    /// saved one or nothing could be rendered.
+    LoadSaved,
+    /// Nothing to run: the loaded table is the rendered one, or, with nothing rendered, the rules
+    /// in force stay as they are (or there were none).
+    Nothing,
+}
+
+/// The reconcile's decision, from the ruleset it rendered (`None` when an input failed or the
+/// configuration refused), the saved ruleset, and whether the table is loaded. Only a rendered
+/// ruleset ever replaces the saved one, and an unchanged one is not loaded again while its table is
+/// there.
+fn ingress_ssh_action(
+    rendered: Option<&str>,
+    saved: Option<&str>,
+    table_loaded: bool,
+) -> IngressSshAction {
+    match rendered {
+        Some(rendered) if saved != Some(rendered) => IngressSshAction::Apply,
+        _ if table_loaded => IngressSshAction::Nothing,
+        _ if saved.is_some() => IngressSshAction::LoadSaved,
+        _ => IngressSshAction::Nothing,
+    }
+}
+
+/// The ingress' SSH rules from this host: its hive.yaml, the ports sshd reports, and the resolver.
+fn ingress_ssh_rules_on_host(
+    state: &OrchestratorState,
+) -> Result<IngressSshRules, IngressSshRefusal> {
+    let hive = load_hive(&state.config_dir).map_err(|err| {
+        IngressSshRefusal::InputFailed(format!("hive.yaml could not be read: {err}"))
+    })?;
+    let ssh_ports = sshd_listen_ports().map_err(|err| {
+        IngressSshRefusal::InputFailed(format!("sshd did not report its ports: {err}"))
+    })?;
+    let uplinks = hive.wan.and_then(|wan| wan.uplinks).unwrap_or_default();
+    let allow_from = hive
+        .ingress
+        .map(|ingress| ingress.ssh_allow_from)
+        .unwrap_or_default();
+    ingress_ssh_rules(&uplinks, &allow_from, &ssh_ports, resolve_host_addresses)
+}
+
+/// Whether this ingress' SSH table is loaded after its last reconcile: the watchdog reconciles at
+/// once when a loaded table vanishes.
+static INGRESS_SSH_RULES_APPLIED: AtomicBool = AtomicBool::new(false);
+
+/// The ingress' SSH table, at boot and on every reconcile (`ingress_ssh_action`). A new ruleset is
+/// written and loaded only when it renders from a complete input set and differs from the saved
+/// one; an unchanged one is left alone while its table is loaded, and loaded again from the saved
+/// file when it is gone. What keeps it from rendering, and a failed load, are posture alerts, and
+/// the rules applied before stay in force. Never fatal: the edge serves without it.
+fn reconcile_ingress_ssh(state: &OrchestratorState) {
+    let rendered = ingress_ssh_rules_on_host(state);
+    let saved = fs::read_to_string(INGRESS_NFT_PATH).ok();
+    let table_loaded = nft_table_loaded(INGRESS_NFT_TABLE);
+    let action = ingress_ssh_action(
+        rendered.as_ref().ok().map(|rules| rules.ruleset.as_str()),
+        saved.as_deref(),
+        table_loaded,
+    );
+    let load = match (&action, &rendered, &saved) {
+        (IngressSshAction::Apply, Ok(rules), _) => Some(rules.ruleset.as_str()),
+        (IngressSshAction::LoadSaved, _, Some(saved)) => Some(saved.as_str()),
+        _ => None,
+    };
+    let loaded = match load {
+        None => {
+            if table_loaded && saved.is_some() {
+                if let Err(err) = ensure_nft_boot_unit(&INGRESS_NFT) {
+                    tracing::warn!(error = %err, "ingress SSH: could not write its boot unit");
+                }
+            }
+            table_loaded
+        }
+        Some(ruleset) => {
+            let applied = if command_exists("nft") {
+                apply_nft_table(&INGRESS_NFT, ruleset).map_err(|err| err.to_string())
+            } else {
+                Err("'nft' is not installed".to_string())
+            };
+            match (applied, &rendered) {
+                (Ok(()), Ok(rules)) if action == IngressSshAction::Apply => {
+                    let allow: Vec<String> =
+                        rules.allow.iter().map(SshAllowNet::to_string).collect();
+                    tracing::info!(allow = %allow.join(", "), "ingress SSH rules applied");
+                    true
+                }
+                (Ok(()), _) => {
+                    tracing::warn!(
+                        path = INGRESS_NFT_PATH,
+                        "ingress SSH table was gone; loaded its saved ruleset again"
+                    );
+                    true
+                }
+                (Err(err), _) => {
+                    tracing::error!(error = %err, "ingress SSH rules could not be loaded");
+                    let in_force = nft_table_loaded(INGRESS_NFT_TABLE);
+                    report_ingress_ssh_problem(
+                        state,
+                        "ingress_ssh_rules_failed",
+                        "error",
+                        &format!("the table could not be loaded: {err}"),
+                        in_force,
+                    );
+                    in_force
+                }
+            }
+        }
+    };
+    if let Err(refusal) = &rendered {
+        let (kind, severity, why) = refusal.alert();
+        tracing::warn!(kind = kind, reason = %why, "ingress SSH: no new rules rendered");
+        report_ingress_ssh_problem(state, kind, severity, why, loaded);
+    }
+    INGRESS_SSH_RULES_APPLIED.store(loaded, Ordering::Relaxed);
+}
+
+/// A posture alert for the ingress' SSH rules, saying whether rules stay in force.
+fn report_ingress_ssh_problem(
+    state: &OrchestratorState,
+    kind: &str,
+    severity: &str,
+    why: &str,
+    rules_in_force: bool,
+) {
+    let consequence = if rules_in_force {
+        format!(
+            "The SSH rules this ingress applied before stay in force ({INGRESS_NFT_PATH}); \
+             nothing was narrowed or loosened."
+        )
+    } else {
+        "No SSH rule is in force: SSH on this ingress is not filtered.".to_string()
+    };
+    append_drift_alert(
+        "posture",
+        kind,
+        severity,
+        &state.hive_id,
+        format!(
+            "{why}. {consequence} The motherbee's address comes from wan.uplinks and the other \
+             sources from ingress.ssh_allow_from in /etc/fluxbee/hive.yaml, which add_hive writes."
+        ),
+        None,
+        None,
+        None,
+    );
+}
+
+/// ufw or firewalld, when active: either may close 9000, 9100, 22000 or 443 without anyone seeing
+/// it. ufw's own unit reads active even when ufw is off, so it is asked (`ufw status`); firewalld
+/// is a daemon, active when it runs.
+fn active_host_firewalls() -> Vec<&'static str> {
+    let mut active = Vec::new();
+    if command_exists("ufw") {
+        let mut status = Command::new("ufw");
+        status.arg("status").env("LC_ALL", "C");
+        if run_cmd_output(status, "ufw status").is_ok_and(|output| ufw_status_is_active(&output)) {
+            active.push("ufw");
+        }
+    }
+    if systemd_is_active("firewalld") {
+        active.push("firewalld");
+    }
+    active
+}
+
+/// `ufw status` prints `Status: active` while its rules are loaded, `Status: inactive` otherwise.
+fn ufw_status_is_active(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "Status: active")
+}
+
+/// The `host_firewall_active` posture alert, when ufw or firewalld runs on this host (at boot and
+/// about once a minute; the drift store keeps one an hour).
+fn report_active_host_firewalls(hive_id: &str) {
+    let active = active_host_firewalls();
+    if active.is_empty() {
         return;
     }
-    rules.sort();
-    rules.dedup();
-    open_firewall_rules_local(&rules, "core");
+    let firewalls = active.join(" and ");
+    tracing::warn!(
+        firewalls = %firewalls,
+        "a host firewall is active: it may close 9000, 9100, 22000 or 443"
+    );
+    append_drift_alert(
+        "posture",
+        "host_firewall_active",
+        "warning",
+        hive_id,
+        format!(
+            "{firewalls} is active on this host. It may close 9000 (WAN), 9100 (identity sync), \
+             22000 (Syncthing) or 443 (the edge) without anyone seeing it: Fluxbee writes no rule \
+             to it, and runs only on hosts created for it (D25). Turn it off."
+        ),
+        None,
+        None,
+        None,
+    );
+}
+
+/// Watchdog tick counter for the hosts' own rules: the ingress' SSH table and the host firewall
+/// check, about once a minute like the egress drift re-apply.
+static HOST_RULES_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// docs/control-path-hardening-v1.md §6, about once a minute: the ingress re-applies its SSH table
+/// (at once when an applied table vanished), and every hive reports an active ufw or firewalld.
+fn watchdog_host_rules(state: &OrchestratorState) {
+    let periodic =
+        HOST_RULES_TICKS.fetch_add(1, Ordering::Relaxed) % EGRESS_RECONCILE_DRIFT_TICKS == 0;
+    if state.role == HiveRole::Ingress {
+        let vanished = INGRESS_SSH_RULES_APPLIED.load(Ordering::Relaxed)
+            && !nft_table_loaded(INGRESS_NFT_TABLE);
+        if vanished {
+            tracing::warn!("ingress SSH table missing on watchdog; re-applying");
+        }
+        if periodic || vanished {
+            reconcile_ingress_ssh(state);
+        }
+    }
+    if periodic {
+        report_active_host_firewalls(&state.hive_id);
+    }
+}
+
+/// What a DMZ join runs over the bootstrap session, outside sudo (which drops it), to learn how
+/// the session reached the box: sshd's `SSH_CONNECTION` (client address and port, server address
+/// and port).
+const SSH_CONNECTION_COMMAND: &str = "printf 'ssh-connection %s\\n' \"$SSH_CONNECTION\"";
+
+/// The client and server addresses of the `ssh-connection` line `SSH_CONNECTION_COMMAND` prints.
+fn ssh_connection_addresses(output: &str) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ssh-connection"))?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [client, _, server, _] = fields.as_slice() else {
+        return None;
+    };
+    Some((
+        canonical_ip(client.parse().ok()?),
+        canonical_ip(server.parse().ok()?),
+    ))
+}
+
+/// docs/control-path-hardening-v1.md §6: before an ingress join installs anything, the address
+/// the motherbee's SSH comes from must be in the allow set the ingress will apply (the uplink
+/// address the join writes, and `ssh_allow_from`). Otherwise the table the ingress loads at its
+/// first boot would drop the join's own later steps (the hardening, the key revoke). The refusal
+/// names the address to add.
+fn ingress_join_ssh_source_refusal(ssh_connection: &str, allow: &[SshAllowNet]) -> Option<String> {
+    let Some((source, _)) = ssh_connection_addresses(ssh_connection) else {
+        return Some(format!(
+            "could not read the motherbee's source address on the box (SSH_CONNECTION gave '{}'), \
+             so the join cannot check that the ingress' SSH rules will admit it",
+            ssh_connection.trim()
+        ));
+    };
+    if allow.iter().any(|net| net.contains(source)) {
+        return None;
+    }
+    let allowed: Vec<String> = allow.iter().map(SshAllowNet::to_string).collect();
+    Some(format!(
+        "the motherbee reaches this ingress over SSH from {source}, which the ingress' SSH rules \
+         would refuse (they admit {}): add {source} to add_hive's ssh_allow_from",
+        allowed.join(", ")
+    ))
+}
+
+/// What an egress join reads when `egress.ssh_from_wan` is false: `SSH_CONNECTION`, and the route
+/// the box takes to the client it names, whose `dev` is the interface the join's packets come in on
+/// (no sudo needed). An IPv4-mapped client is asked as IPv4.
+const EGRESS_SSH_ARRIVAL_COMMAND: &str = "printf 'ssh-connection %s\\n' \"$SSH_CONNECTION\"; \
+     set -- $SSH_CONNECTION; [ -n \"$1\" ] && ip -o route get \"${1#::ffff:}\" 2>/dev/null; true";
+
+/// The interface `ip -o route get` names (`10.10.10.10 dev eth1 src 10.10.10.40 uid 0 cache`).
+fn route_get_dev(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        words.find(|word| *word == "dev")?;
+        words.next().map(str::to_string)
+    })
+}
+
+/// docs/control-path-hardening-v1.md §6: with `egress.ssh_from_wan: false` the egress drops SSH
+/// arriving on `iifname wan_iface`, so a join whose packets come in there would lose its own later
+/// steps once the egress' table loads. Refused before anything is installed, naming the client
+/// and the interface: the one the box routes the client through (`EGRESS_SSH_ARRIVAL_COMMAND`),
+/// where its packets arrive.
+fn egress_join_ssh_from_wan_refusal(cfg: &EgressNatConfig, output: &str) -> Option<String> {
+    if cfg.ssh_from_wan {
+        return None;
+    }
+    let unreadable = |what: &str| {
+        Some(format!(
+            "could not read {what}, so the join cannot check that egress.ssh_from_wan: false \
+             leaves it reachable"
+        ))
+    };
+    let Some((client, _)) = ssh_connection_addresses(output) else {
+        return unreadable("this session's client address (SSH_CONNECTION)");
+    };
+    let Some(dev) = route_get_dev(output) else {
+        return unreadable(&format!("the interface the box routes {client} through"));
+    };
+    (dev == cfg.wan_iface).then(|| {
+        format!(
+            "egress.ssh_from_wan is false, and this join's SSH from {client} reaches the egress \
+             through egress.wan_iface '{dev}': the egress would drop the join's own SSH. Join it \
+             through an address the motherbee reaches on another interface, or keep ssh_from_wan \
+             true"
+        )
+    })
 }
 
 // ===========================================================================
@@ -6723,6 +7256,39 @@ const EGRESS_NFT_BOOT_UNIT_PATH: &str = "/etc/systemd/system/fluxbee-egress-nft.
 const EGRESS_CONNTRACK_MAX: u32 = 262_144;
 const EGRESS_CONNTRACK_HASHSIZE: u32 = 65_536;
 
+/// A table Fluxbee owns whole (each file and unit is dedicated): its rendered ruleset file and
+/// the boot unit that loads it before the network comes up (F17).
+struct NftTableFiles {
+    table: &'static str,
+    path: &'static str,
+    boot_unit: &'static str,
+    boot_unit_path: &'static str,
+    /// The boot unit's `Description=`.
+    description: &'static str,
+}
+
+const EGRESS_NFT: NftTableFiles = NftTableFiles {
+    table: EGRESS_NFT_TABLE,
+    path: EGRESS_NFT_PATH,
+    boot_unit: EGRESS_NFT_BOOT_UNIT,
+    boot_unit_path: EGRESS_NFT_BOOT_UNIT_PATH,
+    description: "Fluxbee egress NAT — load inet fluxbee_egress nftables at boot (F17)",
+};
+
+const INGRESS_NFT_PATH: &str = "/etc/nftables.d/fluxbee-ingress.nft";
+const INGRESS_NFT_TABLE: &str = "inet fluxbee_ingress";
+const INGRESS_NFT_BOOT_UNIT: &str = "fluxbee-ingress-nft.service";
+const INGRESS_NFT_BOOT_UNIT_PATH: &str = "/etc/systemd/system/fluxbee-ingress-nft.service";
+
+/// The ingress' SSH table (docs/control-path-hardening-v1.md §6, `ingress_nft_ruleset`).
+const INGRESS_NFT: NftTableFiles = NftTableFiles {
+    table: INGRESS_NFT_TABLE,
+    path: INGRESS_NFT_PATH,
+    boot_unit: INGRESS_NFT_BOOT_UNIT,
+    boot_unit_path: INGRESS_NFT_BOOT_UNIT_PATH,
+    description: "Fluxbee ingress SSH — load inet fluxbee_ingress nftables at boot",
+};
+
 /// Resolved + validated egress NAT parameters for a `role: egress` hive.
 struct EgressNatConfig {
     lan_cidr: String,
@@ -6732,6 +7298,8 @@ struct EgressNatConfig {
     edge_ip: Option<std::net::Ipv4Addr>,
     wan_iface: String,
     lan_iface: String,
+    /// `egress.ssh_from_wan`: false drops SSH arriving on `wan_iface` (`egress_nft_ruleset`).
+    ssh_from_wan: bool,
 }
 
 /// Verification fields reported after reconciliation (spec §9).
@@ -6880,6 +7448,7 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
         edge_ip,
         wan_iface,
         lan_iface,
+        ssh_from_wan: eg.ssh_from_wan,
     })
 }
 
@@ -6945,8 +7514,20 @@ fn egress_conntrack_modprobe_content() -> String {
 /// Self-contained `table inet fluxbee_egress` (spec §8.2, dedicated-table mode,
 /// Open Question #3). Reconcile deletes an existing Fluxbee-owned table before
 /// applying this definition, so re-apply is idempotent and never duplicates
-/// rules.
-fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
+/// rules. With `egress.ssh_from_wan: false` the input chain drops SSH, on
+/// `ssh_ports` (the ports sshd listens on), arriving on `wan_iface`
+/// (docs/control-path-hardening-v1.md §6); it filters nothing else.
+fn egress_nft_ruleset(cfg: &EgressNatConfig, ssh_ports: &[u16]) -> String {
+    let wan_ssh = if cfg.ssh_from_wan {
+        String::new()
+    } else {
+        format!(
+            "\t\t# egress.ssh_from_wan: false (docs/control-path-hardening-v1.md §6).\n\
+             \t\tiifname \"{wan_iface}\" tcp dport {ports} drop\n",
+            wan_iface = cfg.wan_iface,
+            ports = nft_port_set(ssh_ports),
+        )
+    };
     format!(
         "#!/usr/sbin/nft -f\n\
          # BEGIN FLUXBEE EGRESS NAT\n\
@@ -6962,6 +7543,7 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
          \t\t# D1: inbound on egress hosts is owned by this nft table, not ufw.\n\
          \t\t# v1 keeps policy accept (no inbound filtering); a drop-based\n\
          \t\t# policy with explicit allows is future hardening (spec §11).\n\
+         {wan_ssh}\
          \t}}\n\
          \tchain forward {{\n\
          \t\ttype filter hook forward priority 0; policy drop;\n\
@@ -6979,7 +7561,69 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
         lan_iface = cfg.lan_iface,
         wan_iface = cfg.wan_iface,
         lan_cidr = cfg.lan_cidr,
+        wan_ssh = wan_ssh,
     )
+}
+
+/// The ports the egress drops SSH on, on wan_iface, with `ssh_from_wan: false`.
+#[derive(Debug, PartialEq, Eq)]
+enum WanSshPorts {
+    /// What `sshd -T` reported.
+    Reported(Vec<u16>),
+    /// `sshd -T` failed (the error): the ports the saved ruleset already drops, so a re-apply
+    /// never narrows them.
+    Kept(Vec<u16>, String),
+    /// `sshd -T` failed (the error) and no WAN SSH rule is saved: sshd's default port, a guess.
+    Guessed(String),
+}
+
+impl WanSshPorts {
+    fn ports(&self) -> Vec<u16> {
+        match self {
+            WanSshPorts::Reported(ports) | WanSshPorts::Kept(ports, _) => ports.clone(),
+            WanSshPorts::Guessed(_) => vec![22],
+        }
+    }
+}
+
+fn egress_wan_ssh_ports(
+    reported: Result<Vec<u16>, String>,
+    saved_ruleset: &str,
+    wan_iface: &str,
+) -> WanSshPorts {
+    match reported {
+        Ok(ports) => WanSshPorts::Reported(ports),
+        Err(err) => match saved_wan_ssh_ports(saved_ruleset, wan_iface) {
+            Some(ports) => WanSshPorts::Kept(ports, err),
+            None => WanSshPorts::Guessed(err),
+        },
+    }
+}
+
+/// The ports of the saved egress ruleset's WAN SSH drop (`iifname "<wan>" tcp dport { .. } drop`).
+fn saved_wan_ssh_ports(saved: &str, wan_iface: &str) -> Option<Vec<u16>> {
+    let head = format!("iifname \"{wan_iface}\" tcp dport {{");
+    saved.lines().find_map(|line| {
+        let ports = line.trim().strip_prefix(&head)?.strip_suffix("} drop")?;
+        ports
+            .split(',')
+            .map(|port| port.trim().parse::<u16>().ok())
+            .collect::<Option<Vec<u16>>>()
+            .filter(|ports| !ports.is_empty())
+    })
+}
+
+/// An nftables anonymous set of ports, sorted and without duplicates: `{ 22, 2222 }`. Empty is
+/// `{ 22 }`, sshd's default port, so a rendered SSH rule never matches nothing.
+fn nft_port_set(ports: &[u16]) -> String {
+    let mut ports: Vec<u16> = ports.to_vec();
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() {
+        ports.push(22);
+    }
+    let ports: Vec<String> = ports.iter().map(u16::to_string).collect();
+    format!("{{ {} }}", ports.join(", "))
 }
 
 /// SO-08: read a kernel sysctl back from `/proc/sys/<rel>` (path form, e.g.
@@ -7051,13 +7695,46 @@ fn conntrack_max_live() -> Option<u32> {
     None
 }
 
-fn nft_table_loaded() -> bool {
+/// Whether `table` (`<family> <name>`, e.g. `inet fluxbee_egress`) is loaded.
+fn nft_table_loaded(table: &str) -> bool {
     let mut cmd = Command::new("nft");
-    cmd.arg("list")
-        .arg("table")
-        .arg("inet")
-        .arg("fluxbee_egress");
+    cmd.arg("list").arg("table").args(table.split_whitespace());
     run_cmd_output(cmd, "nft list table").is_ok()
+}
+
+/// Loads a dedicated table's ruleset in one `nft -f` (the ruleset adds, flushes and defines its
+/// table in one transaction, SO-08), checks that the table is there, and makes sure its boot unit
+/// loads it at the next boot (F17). A new ruleset is saved only once nft has loaded it: nft
+/// refuses a whole ruleset or takes it, so a refused one leaves the loaded table and the saved
+/// file (what the boot unit loads) as they were.
+fn apply_nft_table(files: &NftTableFiles, ruleset: &str) -> Result<(), OrchestratorError> {
+    let load = |path: &str| -> Result<(), OrchestratorError> {
+        let mut apply = Command::new("nft");
+        apply.arg("-f").arg(path);
+        run_cmd(apply, &format!("nft -f {path}"))
+    };
+    if fs::read_to_string(files.path).is_ok_and(|saved| saved == ruleset) {
+        load(files.path)?;
+    } else {
+        let pending = format!("{}.pending", files.path);
+        if let Some(parent) = Path::new(files.path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&pending, ruleset)?;
+        if let Err(err) = load(&pending) {
+            let _ = fs::remove_file(&pending);
+            return Err(err);
+        }
+        fs::rename(&pending, files.path)?;
+    }
+    if !nft_table_loaded(files.table) {
+        return Err(format!(
+            "nft applied but table {} is not present afterwards",
+            files.table
+        )
+        .into());
+    }
+    ensure_nft_boot_unit(files)
 }
 
 /// Absolute path of an executable on `PATH`, for baking into a systemd unit's
@@ -7086,15 +7763,16 @@ fn resolve_executable_path(name: &str) -> Option<String> {
     None
 }
 
-fn egress_nft_boot_unit_contents(nft_path: &str) -> String {
+fn nft_boot_unit_contents(files: &NftTableFiles, nft_path: &str) -> String {
     // `Before=network-pre.target` + `DefaultDependencies=no` loads the table
     // before any interface is configured, so no packet can be forwarded before
-    // the masquerade / `forward policy drop` rules exist. `ConditionPathExists`
-    // makes the unit a no-op if the ruleset file was removed (e.g. after egress
-    // teardown), so it never fails the boot on a decommissioned host.
+    // the masquerade / `forward policy drop` rules exist, and no SSH reaches an
+    // ingress before its rules do. `ConditionPathExists` makes the unit a no-op
+    // if the ruleset file was removed (e.g. after a remove_hive teardown), so it
+    // never fails the boot on a decommissioned host.
     format!(
         "[Unit]\n\
-         Description=Fluxbee egress NAT — load {table} nftables at boot (F17)\n\
+         Description={description}\n\
          Documentation=man:nft(8)\n\
          DefaultDependencies=no\n\
          Wants=network-pre.target\n\
@@ -7109,46 +7787,48 @@ fn egress_nft_boot_unit_contents(nft_path: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        table = EGRESS_NFT_TABLE,
-        nft_file = EGRESS_NFT_PATH,
+        description = files.description,
+        nft_file = files.path,
         nft = nft_path,
     )
 }
 
-/// Install + enable a boot-time systemd unit that loads the egress nft table
-/// before networking comes up (F17). Without it, after each reboot the host has
+/// Install + enable a boot-time systemd unit that loads a Fluxbee table before
+/// networking comes up (F17). Without it, after each reboot the egress has
 /// `ip_forward=1` (persisted via /etc/sysctl.d) but **no** `fluxbee_egress`
 /// table until the orchestrator's bootstrap reconcile runs — a window with
-/// forwarding on and no masquerade / no `forward policy drop` / no IPv6 drop.
+/// forwarding on and no masquerade / no `forward policy drop` / no IPv6 drop —
+/// and an ingress takes SSH from anywhere until then.
 /// `Before=network-pre.target` guarantees the table is present before any
-/// interface is configured, closing the window. Best-effort: the live NAT is
+/// interface is configured, closing the window. Best-effort: the live table is
 /// already applied by the caller, so a systemd hiccup here only loses boot
 /// persistence (logged), it does not fail reconciliation. A genuine IO failure
 /// writing the unit file still propagates (fail loud).
-fn ensure_egress_nft_boot_unit() -> Result<(), OrchestratorError> {
+fn ensure_nft_boot_unit(files: &NftTableFiles) -> Result<(), OrchestratorError> {
     let Some(nft_path) = resolve_executable_path("nft") else {
         tracing::warn!(
-            "cannot resolve absolute path of 'nft'; skipping egress nft boot unit (table will load via orchestrator bootstrap only)"
+            unit = files.boot_unit,
+            "cannot resolve absolute path of 'nft'; skipping the nft boot unit (the table loads via orchestrator bootstrap only)"
         );
         return Ok(());
     };
-    let contents = egress_nft_boot_unit_contents(&nft_path);
-    let changed = write_file_if_changed(EGRESS_NFT_BOOT_UNIT_PATH, &contents)?;
+    let contents = nft_boot_unit_contents(files, &nft_path);
+    let changed = write_file_if_changed(files.boot_unit_path, &contents)?;
     if changed {
         // Fresh write (first install, or the resolved nft path changed): reload +
         // enable. The enable symlink is durable on disk, so doing this only on
         // change — not on every ~60s watchdog reconcile — avoids a subprocess
         // spawn per tick while still persisting across orchestrator restarts.
-        tracing::info!(unit = EGRESS_NFT_BOOT_UNIT, "wrote egress nft boot unit");
+        tracing::info!(unit = files.boot_unit, "wrote nft boot unit");
         let mut reload = Command::new("systemctl");
         reload.arg("daemon-reload");
-        if let Err(err) = run_cmd(reload, "systemctl daemon-reload (egress nft unit)") {
-            tracing::warn!(error = %err, "systemctl daemon-reload failed after writing egress nft boot unit");
+        if let Err(err) = run_cmd(reload, "systemctl daemon-reload (nft boot unit)") {
+            tracing::warn!(error = %err, unit = files.boot_unit, "systemctl daemon-reload failed after writing an nft boot unit");
         }
         let mut enable = Command::new("systemctl");
-        enable.arg("enable").arg(EGRESS_NFT_BOOT_UNIT);
-        if let Err(err) = run_cmd(enable, "systemctl enable egress nft unit") {
-            tracing::warn!(error = %err, unit = EGRESS_NFT_BOOT_UNIT, "could not enable egress nft boot unit (table still loads via orchestrator bootstrap)");
+        enable.arg("enable").arg(files.boot_unit);
+        if let Err(err) = run_cmd(enable, "systemctl enable nft boot unit") {
+            tracing::warn!(error = %err, unit = files.boot_unit, "could not enable an nft boot unit (the table still loads via orchestrator bootstrap)");
         }
     }
     Ok(())
@@ -7589,7 +8269,10 @@ fn egress_edge_ip_on_host(
 }
 
 /// Reconcile the egress NAT path on a `role: egress` hive.
-fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, OrchestratorError> {
+fn reconcile_egress_nat(
+    eg: &EgressSection,
+    hive_id: &str,
+) -> Result<EgressVerification, OrchestratorError> {
     let cfg = resolve_egress_nat_config(eg)?;
     // FINDINGS A-1: add_hive writes the address lan_iface carries; nothing guesses one here.
     let edge_ip = cfg.edge_ip.ok_or(
@@ -7645,23 +8328,51 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     verification.conntrack_tuned = apply_conntrack_live();
 
     // nftables: write the dedicated table, replace any existing Fluxbee table,
-    // then verify.
-    let ruleset = egress_nft_ruleset(&cfg);
-    write_file_if_changed(EGRESS_NFT_PATH, &ruleset)?;
+    // then verify. docs/control-path-hardening-v1.md §6: with ssh_from_wan false
+    // its input chain drops SSH on wan_iface, on the ports sshd listens on.
+    let wan_ssh_ports = if cfg.ssh_from_wan {
+        Vec::new()
+    } else {
+        let saved = fs::read_to_string(EGRESS_NFT_PATH).unwrap_or_default();
+        let ports = egress_wan_ssh_ports(sshd_listen_ports(), &saved, &cfg.wan_iface);
+        match &ports {
+            WanSshPorts::Reported(_) => {}
+            WanSshPorts::Kept(kept, err) => tracing::warn!(
+                error = %err,
+                ports = ?kept,
+                "sshd -T failed; the egress keeps the WAN SSH ports its rules already drop"
+            ),
+            WanSshPorts::Guessed(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "sshd -T failed and no WAN SSH rule is saved; the egress drops port 22 on its WAN"
+                );
+                append_drift_alert(
+                    "posture",
+                    "egress_ssh_ports_unknown",
+                    "warning",
+                    hive_id,
+                    format!(
+                        "egress.ssh_from_wan is false, but sshd did not report its ports ({err}): \
+                         SSH on {} is dropped on port 22 only until it does",
+                        cfg.wan_iface
+                    ),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+        ports.ports()
+    };
+    let ruleset = egress_nft_ruleset(&cfg, &wan_ssh_ports);
     // SO-08: the ruleset self-flushes atomically (add+flush+define in one
     // transaction), so there is no separate delete step and thus no window where
-    // ip_forward is on but the fluxbee_egress table is absent.
-    let mut apply = Command::new("nft");
-    apply.arg("-f").arg(EGRESS_NFT_PATH);
-    run_cmd(apply, "nft -f fluxbee-egress")?;
-    if !nft_table_loaded() {
-        return Err("nft applied but table inet fluxbee_egress is not present afterwards".into());
-    }
+    // ip_forward is on but the fluxbee_egress table is absent. F17: its boot unit
+    // persists the table across reboots independently of the orchestrator, so the
+    // boot window (ip_forward=1 but no fluxbee_egress table) is closed too.
+    apply_nft_table(&EGRESS_NFT, &ruleset)?;
     verification.nat_applied = true;
-
-    // F17: persist the table across reboots independently of the orchestrator,
-    // so the boot window (ip_forward=1 but no fluxbee_egress table) is closed.
-    ensure_egress_nft_boot_unit()?;
 
     // Without egress.reachability_url, or without curl, there is no probe: nothing is fetched in
     // its place, and nothing is called unreachable.
@@ -7752,7 +8463,7 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
             // FINDINGS A-1: an egress that cannot serve its LAN (its LAN leg, forwarding, the IPv6
             // block) fails the boot like any other egress failure; after boot the watchdog
             // reports it.
-            let problems: Vec<String> = reconcile_egress_nat(eg)?
+            let problems: Vec<String> = reconcile_egress_nat(eg, &state.hive_id)?
                 .serving_problems()
                 .into_iter()
                 .map(|(_, problem)| problem)
@@ -10882,7 +11593,6 @@ async fn ensure_blob_sync_runtime(
     // running Syncthing alone, and it is the one that brings the vendor (review F4).
     let binary_updated = ensure_syncthing_installed()?;
     let unit_changed = ensure_syncthing_unit(&sync)?;
-    ensure_syncthing_firewall_local(is_motherbee);
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
     let stale = syncthing_runs_stale(
@@ -11172,7 +11882,7 @@ fn syncthing_folder_errors(
     Ok((errors.len(), first))
 }
 
-fn disable_blob_sync_runtime_local(is_motherbee: bool) -> Result<(), OrchestratorError> {
+fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
     if systemd_is_active(SYNCTHING_SERVICE_NAME) {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
@@ -11198,7 +11908,6 @@ fn disable_blob_sync_runtime_local(is_motherbee: bool) -> Result<(), Orchestrato
         daemon_reload.arg("daemon-reload");
         run_cmd(daemon_reload, "systemctl daemon-reload")?;
     }
-    disable_syncthing_firewall_local(is_motherbee);
     Ok(())
 }
 
@@ -11219,7 +11928,7 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     if !desired_sync.sync_enabled {
         if changed {
             tracing::info!("blob/dist sync disabled in hive.yaml; reverting syncthing runtime");
-            disable_blob_sync_runtime_local(state.is_motherbee)?;
+            disable_blob_sync_runtime_local()?;
         }
         return Ok(());
     }
@@ -14166,15 +14875,35 @@ sysctl --system >/dev/null 2>&1 || true",
     )
 }
 
+/// docs/control-path-hardening-v1.md §6: an ingress' SSH table and its boot unit go with the hive,
+/// so the removed box takes SSH as it did before its join. Idempotent, like the egress teardown,
+/// and built from the INGRESS_NFT_* constants (no caller input).
+fn ingress_teardown_script() -> String {
+    format!(
+        "nft delete table {table} >/dev/null 2>&1 || true; \
+systemctl disable {boot_unit} >/dev/null 2>&1 || true; \
+rm -f {nft} {boot_unit_path} >/dev/null 2>&1 || true; \
+systemctl daemon-reload >/dev/null 2>&1 || true",
+        table = INGRESS_NFT_TABLE,
+        boot_unit = INGRESS_NFT_BOOT_UNIT,
+        nft = INGRESS_NFT_PATH,
+        boot_unit_path = INGRESS_NFT_BOOT_UNIT_PATH,
+    )
+}
+
 /// Pure (testable) builder for the cleanup script: the mesh credentials first, then, when
 /// `egress_teardown` is set (the removed hive's info.yaml had `role: egress`), the NAT teardown,
-/// then the services and the node state.
-fn remove_hive_cleanup_full_script(egress_teardown: bool) -> String {
+/// then the services and the node state, and last, on an ingress (`ingress_teardown`), its SSH
+/// table: once sy-orchestrator is stopped, so its watchdog cannot load the table again.
+fn remove_hive_cleanup_full_script(egress_teardown: bool, ingress_teardown: bool) -> String {
     let mut steps = vec![REMOVE_HIVE_CREDENTIALS_SCRIPT.to_string()];
     if egress_teardown {
         steps.push(egress_teardown_script());
     }
     steps.push(remove_hive_cleanup_script().to_string());
+    if ingress_teardown {
+        steps.push(ingress_teardown_script());
+    }
     steps.join("; ")
 }
 
@@ -14184,21 +14913,31 @@ fn remove_hive_cleanup_full_script(egress_teardown: bool) -> String {
 /// 100 ms: with systemd's default accuracy of a minute it could fire into a re-join of the same box
 /// and delete what that join had just installed. `unit` is unique, so a repeated request schedules
 /// again instead of failing on a loaded unit.
-fn remove_hive_cleanup_command(unit: &str, egress_teardown: bool) -> Command {
+fn remove_hive_cleanup_command(
+    unit: &str,
+    egress_teardown: bool,
+    ingress_teardown: bool,
+) -> Command {
     let mut cmd = Command::new("systemd-run");
     cmd.args(["--on-active=1s", "--timer-property=AccuracySec=100ms"])
         .arg(format!("--unit={unit}"))
         .args(["--collect", "bash", "-c"])
-        .arg(remove_hive_cleanup_full_script(egress_teardown));
+        .arg(remove_hive_cleanup_full_script(
+            egress_teardown,
+            ingress_teardown,
+        ));
     cmd
 }
 
 /// Answers whether systemd accepted the cleanup unit: `systemd-run` returns once its timer is
 /// loaded, so the motherbee's `remove_hive_flow`, which awaits this answer, learns it.
-fn remove_hive_cleanup_local_flow(egress_teardown: bool) -> serde_json::Value {
+fn remove_hive_cleanup_local_flow(
+    egress_teardown: bool,
+    ingress_teardown: bool,
+) -> serde_json::Value {
     let unit = format!("fluxbee-remove-hive-cleanup-{}", now_epoch_ms());
     match run_cmd(
-        remove_hive_cleanup_command(&unit, egress_teardown),
+        remove_hive_cleanup_command(&unit, egress_teardown, ingress_teardown),
         "schedule the remove_hive cleanup",
     ) {
         Ok(()) => serde_json::json!({
@@ -14450,6 +15189,21 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
              fluxbee-egress.nft and the fluxbee egress/conntrack sysctl/modprobe files"
                 .to_string(),
         );
+    }
+    // docs/control-path-hardening-v1.md §6: an ingress the cleanup did not reach keeps its SSH
+    // table, so SSH to it stays limited to the motherbee and its ingress.ssh_allow_from.
+    let is_ingress = is_ingress_role(
+        hive_info
+            .as_ref()
+            .and_then(|info| info.get("role").and_then(|value| value.as_str())),
+    );
+    if is_ingress && !socket_cleanup_ok {
+        response["warning"] = serde_json::Value::String(format!(
+            "ingress SSH teardown not confirmed (host unreachable): the removed host keeps taking \
+             SSH only from the motherbee and its ingress.ssh_allow_from; from its console: nft \
+             delete table {INGRESS_NFT_TABLE}, systemctl disable {INGRESS_NFT_BOOT_UNIT}, and \
+             remove {INGRESS_NFT_PATH} and {INGRESS_NFT_BOOT_UNIT_PATH}"
+        ));
     }
     response
 }
@@ -15785,7 +16539,7 @@ fn build_node_system_block(
         out["package_path"] = serde_json::Value::String(package_path.to_string());
     }
     if let Some(ilk_id) = ilk_id.filter(|v| !v.trim().is_empty()) {
-        out["ilk_id"] = serde_json::Value::String(ilk_id.to_string());
+        out["ilk_id"] = serde_json::Value::String(canonical_ilk_id_or_raw(ilk_id));
     }
     if let Some(tenant_id) = tenant_id.filter(|v| !v.trim().is_empty()) {
         out["tenant_id"] = serde_json::Value::String(tenant_id.to_string());
@@ -17076,6 +17830,21 @@ fn parse_prefixed_uuid(raw: &str, prefix: &str) -> Result<Uuid, OrchestratorErro
     Ok(uuid)
 }
 
+/// The canonical form of a prefixed id, `<prefix>:<uuid>` with the uuid lowercase and hyphenated,
+/// the only form SY.identity and SY.admin take. `Uuid::parse_str` also reads the simple, braced,
+/// URN and uppercase forms, so an id stored as given could never be torn down
+/// (`ilk:7C9E6679742540DE944BE07FC1F90AE7` is `ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7`).
+fn canonical_prefixed_id(raw: &str, prefix: &str) -> Result<String, OrchestratorError> {
+    let uuid = parse_prefixed_uuid(raw, prefix)?;
+    Ok(format!("{prefix}:{}", uuid.hyphenated()))
+}
+
+/// `canonical_prefixed_id` for an ILK the orchestrator already holds: one that is not a valid id
+/// stays as it is, and whoever receives it refuses it.
+fn canonical_ilk_id_or_raw(raw: &str) -> String {
+    canonical_prefixed_id(raw, "ilk").unwrap_or_else(|_| raw.trim().to_string())
+}
+
 fn node_ilk_map_path(state: &OrchestratorState) -> PathBuf {
     state
         .state_dir
@@ -17110,36 +17879,39 @@ fn resolve_node_ilk_id(
     _node_name: &str,
 ) -> Result<String, OrchestratorError> {
     if let Some(raw) = payload.get("ilk_id").and_then(|v| v.as_str()) {
-        let normalized = raw.trim().to_string();
-        parse_prefixed_uuid(&normalized, "ilk")?;
-        return Ok(normalized);
+        return canonical_prefixed_id(raw, "ilk");
     }
-    Ok(format!("ilk:{}", Uuid::new_v4()))
+    Ok(format!("ilk:{}", Uuid::new_v4().hyphenated()))
 }
 
+/// Records the node's ILK, in its canonical form, and its tenant.
 fn persist_node_ilk_mapping(
     state: &OrchestratorState,
     node_name: &str,
     ilk_id: &str,
     tenant_id: &str,
 ) -> Result<(), OrchestratorError> {
-    parse_prefixed_uuid(ilk_id, "ilk")?;
+    let ilk_id = canonical_prefixed_id(ilk_id, "ilk")?;
     parse_prefixed_uuid(tenant_id, "tnt")?;
     let map_path = node_ilk_map_path(state);
     let mut map = load_identity_node_ilk_map(&map_path);
-    map.nodes.insert(node_name.to_string(), ilk_id.to_string());
+    map.nodes.insert(node_name.to_string(), ilk_id);
     map.tenants
         .insert(node_name.to_string(), tenant_id.to_string());
     save_identity_node_ilk_map(&map_path, &map)
 }
 
+/// The node's ILK and tenant from the identity map. The ILK comes back canonical, whatever form
+/// an older release stored.
 fn load_persisted_node_identity(
     state: &OrchestratorState,
     node_name: &str,
 ) -> (Option<String>, Option<String>) {
     let map = load_identity_node_ilk_map(&node_ilk_map_path(state));
     (
-        map.nodes.get(node_name).cloned(),
+        map.nodes
+            .get(node_name)
+            .map(|ilk_id| canonical_ilk_id_or_raw(ilk_id)),
         map.tenants.get(node_name).cloned(),
     )
 }
@@ -17790,7 +18562,7 @@ async fn ensure_node_identity_registered(
     let resolved_ilk_id = response
         .get("ilk_id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .map(canonical_ilk_id_or_raw)
         .unwrap_or_else(|| requested_ilk_id.clone());
     // FIX-5: a swallowed persist failure silently bricks this node on the NEXT host reboot —
     // reconcile relaunches it from the on-disk map only, so it comes up with no tenant/ilk and every
@@ -17827,7 +18599,7 @@ async fn apply_node_identity_update(
     identity_primary_hive_id: &str,
     ilk_id: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
-    parse_prefixed_uuid(ilk_id, "ilk")?;
+    let ilk_id = canonical_prefixed_id(ilk_id, "ilk")?;
     let add_channels = identity_add_channels_from_payload(payload)?;
     let change_reason = resolve_identity_change_reason(payload);
 
@@ -17840,7 +18612,7 @@ async fn apply_node_identity_update(
     }
 
     let request_payload = serde_json::json!({
-        "ilk_id": ilk_id,
+        "ilk_id": &ilk_id,
         "add_channels": add_channels,
         "change_reason": change_reason,
     });
@@ -20139,12 +20911,19 @@ async fn kill_node_flow(
                 obj.insert("node_name".to_string(), serde_json::json!(name));
             }
         }
-        return match forward_system_action_to_hive(
+        // A purge waits for the spoke's teardown_node (TEARDOWN_FORWARD_TIMEOUT_SECS).
+        let forward_timeout = if purge_instance {
+            Duration::from_secs(TEARDOWN_FORWARD_TIMEOUT_SECS)
+        } else {
+            system_forward_timeout()
+        };
+        return match forward_system_action_to_hive_with_timeout(
             state,
             &target_hive,
             "KILL_NODE",
             "KILL_NODE_RESPONSE",
             forwarded_payload,
+            forward_timeout,
         )
         .await
         {
@@ -20297,7 +21076,6 @@ async fn kill_node_flow(
                             append_optional_teardown_cleanup(
                                 state,
                                 &mut response,
-                                &target_hive,
                                 node_name,
                                 persisted_ilk_id.as_deref(),
                             )
@@ -20333,7 +21111,6 @@ async fn kill_node_flow(
                                 append_optional_teardown_cleanup(
                                     state,
                                     &mut response,
-                                    &target_hive,
                                     node_name,
                                     persisted_ilk_id.as_deref(),
                                 )
@@ -20489,7 +21266,8 @@ async fn remove_node_instance_flow(
     // SO-04: serialize with any concurrent lifecycle op on this node.
     let _node_lock = state.lock_node(&node_name).await;
     if target_hive != state.hive_id {
-        return match forward_system_action_to_hive(
+        // It waits for the spoke's teardown_node (TEARDOWN_FORWARD_TIMEOUT_SECS).
+        return match forward_system_action_to_hive_with_timeout(
             state,
             &target_hive,
             "REMOVE_NODE_INSTANCE",
@@ -20498,6 +21276,7 @@ async fn remove_node_instance_flow(
                 "target": target_hive,
                 "node_name": node_name,
             }),
+            Duration::from_secs(TEARDOWN_FORWARD_TIMEOUT_SECS),
         )
         .await
         {
@@ -20609,7 +21388,6 @@ async fn remove_node_instance_flow(
             append_optional_teardown_cleanup(
                 state,
                 &mut response,
-                &target_hive,
                 &node_name,
                 persisted_ilk_id.as_deref(),
             )
@@ -20642,285 +21420,361 @@ async fn remove_node_instance_flow(
     }
 }
 
-#[cfg(not(test))]
-async fn delete_ilk_for_teardown(
-    state: &OrchestratorState,
-    ilk_id: &str,
-    _target_hive: &str,
-) -> serde_json::Value {
-    let admin_target = teardown_admin_target();
-    let admin_ilk_call = |action: &'static str| {
-        orchestrator_admin_command(
-            state,
-            AdminCommandRequest {
-                admin_target: &admin_target,
-                action,
-                target: Some(PRIMARY_HIVE_ID),
-                params: serde_json::json!({ "ilk_id": ilk_id }),
-                request_id: None,
-                timeout: Duration::from_secs(15),
-            },
-        )
-    };
-    // Mark first (idempotent), then purge: a node torn down with purge_instance must not leave
-    // its identity behind with its node_name reserved.
-    let response = match admin_ilk_call("delete_ilk").await {
-        Ok(resp) if resp.status == "ok" => admin_ilk_call("purge_ilk").await,
-        other => other,
-    };
-
-    match response {
-        Ok(resp) if resp.status == "ok" => serde_json::json!({
-            "status": "ok",
-            "target": admin_target,
-            "ilk_id": ilk_id,
-            "deleted": true,
-            "trace_id": resp.trace_id,
-            "payload": resp.payload,
-        }),
-        Ok(resp) if resp.error_code.as_deref() == Some("ILK_NOT_FOUND") => serde_json::json!({
-            "status": "ok",
-            "target": admin_target,
-            "ilk_id": ilk_id,
-            "deleted": false,
-            "not_found": true,
-            "trace_id": resp.trace_id,
-            "payload": resp.payload,
-        }),
-        Ok(resp) => serde_json::json!({
-            "status": "error",
-            "target": admin_target,
-            "ilk_id": ilk_id,
-            "deleted": false,
-            "trace_id": resp.trace_id,
-            "error_code": resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
-            "error_detail": resp.error_detail.unwrap_or(resp.payload),
-        }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "target": admin_target,
-            "ilk_id": ilk_id,
-            "deleted": false,
-            "error_detail": err.to_string(),
-        }),
-    }
-}
-
-#[cfg(test)]
-async fn delete_ilk_for_teardown(
-    _state: &OrchestratorState,
-    ilk_id: &str,
-    _target_hive: &str,
-) -> serde_json::Value {
-    if let Some(canned) = take_test_ilk_delete_result() {
-        return canned;
-    }
-    serde_json::json!({
-        "status": "ok",
-        "target": teardown_admin_target(),
-        "ilk_id": ilk_id,
-        "deleted": true,
-    })
-}
-
+/// Where a node teardown sends `teardown_node`: the motherbee's SY.admin, whatever hive the node
+/// runs on (the vault and the identity primary are the motherbee's).
 fn teardown_admin_target() -> String {
     ensure_l2_name("SY.admin", PRIMARY_HIVE_ID)
 }
 
+/// How long a teardown waits for `teardown_node`. SY.admin runs several store calls for it (the
+/// vault listing, one delete per secret, the ILK's mark and purge), each of which can take up to
+/// 30 s; past this the outcome is unknown, never "nothing deleted" (`TeardownNodeCall::NoAnswer`).
+const TEARDOWN_NODE_TIMEOUT_SECS: u64 = 120;
+
+/// How long the motherbee waits for a spoke's KILL_NODE with `purge_instance`, or its
+/// REMOVE_NODE_INSTANCE: the timer purge (3 s), then `teardown_node`, with room for the rest.
+const TEARDOWN_FORWARD_TIMEOUT_SECS: u64 = TEARDOWN_NODE_TIMEOUT_SECS + 30;
+
+/// How `teardown_node` went over the wire.
+#[derive(Debug)]
+enum TeardownNodeCall {
+    /// SY.admin answered.
+    Answered(AdminCommandResult),
+    /// It never reached SY.admin (refused before it was sent, or bounced by a router): nothing ran.
+    NotDelivered(String),
+    /// No answer came (a timeout, a lost channel, an answer that could not be read): SY.admin may
+    /// still have run it, wholly or in part.
+    NoAnswer(String),
+}
+
+/// A failed `send_admin_rpc` as the teardown reads it: only a request that never left, or that a
+/// router bounced, is known to have run nothing.
+fn teardown_node_call_failure(err: RpcError) -> TeardownNodeCall {
+    match err {
+        RpcError::InvalidRequest(_)
+        | RpcError::Json(_)
+        | RpcError::Unreachable { .. }
+        | RpcError::TtlExceeded { .. } => TeardownNodeCall::NotDelivered(err.to_string()),
+        other => TeardownNodeCall::NoAnswer(other.to_string()),
+    }
+}
+
+/// docs/control-path-hardening-v1.md §2: one `teardown_node {node_name, ilk_id}` to the
+/// motherbee's SY.admin replaces the four calls a teardown made (delete_ilk, purge_ilk,
+/// vault_list, vault_delete), which SY.admin no longer takes from an orchestrator. SY.admin checks
+/// that the node is on this hive and that the ILK is the node's, deletes the secrets dedicated to
+/// the ILK, then marks and purges the ILK, and reports each step.
+#[cfg(not(test))]
+async fn teardown_node_via_admin(
+    state: &OrchestratorState,
+    node_name: &str,
+    ilk_id: &str,
+) -> TeardownNodeCall {
+    let client = match state.rpc() {
+        Ok(client) => client,
+        Err(err) => return TeardownNodeCall::NotDelivered(err.to_string()),
+    };
+    let admin_target = teardown_admin_target();
+    match client
+        .send_admin_rpc(AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "teardown_node",
+            target: Some(PRIMARY_HIVE_ID),
+            params: serde_json::json!({ "node_name": node_name, "ilk_id": ilk_id }),
+            request_id: None,
+            timeout: Duration::from_secs(TEARDOWN_NODE_TIMEOUT_SECS),
+        })
+        .await
+    {
+        Ok(answer) => TeardownNodeCall::Answered(answer),
+        Err(err) => teardown_node_call_failure(err),
+    }
+}
+
+/// The test seam: the call a test set (`set_test_teardown_node_answer`), else SY.admin's answer
+/// when every step succeeded.
 #[cfg(test)]
-fn test_ilk_delete_slot() -> &'static StdMutex<Option<serde_json::Value>> {
-    static SLOT: OnceLock<StdMutex<Option<serde_json::Value>>> = OnceLock::new();
+async fn teardown_node_via_admin(
+    _state: &OrchestratorState,
+    node_name: &str,
+    ilk_id: &str,
+) -> TeardownNodeCall {
+    if let Some(canned) = test_teardown_node_slot()
+        .lock()
+        .expect("test teardown_node lock")
+        .take()
+    {
+        return canned;
+    }
+    TeardownNodeCall::Answered(test_teardown_node_answer(
+        "ok",
+        None,
+        serde_json::json!({
+            "node_name": node_name,
+            "ilk_id": ilk_id,
+            "ilk_deleted": true,
+            "not_found": false,
+            "vault_secrets_purged": { "status": "ok", "scanned": 0, "deleted": 0, "errors": [] },
+            "ilk_delete": { "status": "ok" },
+        }),
+    ))
+}
+
+#[cfg(test)]
+fn test_teardown_node_slot() -> &'static StdMutex<Option<TeardownNodeCall>> {
+    static SLOT: OnceLock<StdMutex<Option<TeardownNodeCall>>> = OnceLock::new();
     SLOT.get_or_init(|| StdMutex::new(None))
 }
 
 #[cfg(test)]
-fn set_test_ilk_delete_result(value: serde_json::Value) {
-    *test_ilk_delete_slot().lock().expect("test ilk delete lock") = Some(value);
-}
-
-#[cfg(test)]
-fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
-    test_ilk_delete_slot()
+fn set_test_teardown_node_answer(call: TeardownNodeCall) {
+    *test_teardown_node_slot()
         .lock()
-        .expect("test ilk delete lock")
-        .take()
+        .expect("test teardown_node lock") = Some(call);
 }
 
-/// Each secret of a vault listing with the tenant it belongs to: a delete names that tenant, and
-/// SY.vault refuses one in another.
-fn vault_keys_with_tenant(listing: &serde_json::Value) -> Vec<(String, String)> {
-    listing
-        .get("secrets")
-        .and_then(|secrets| secrets.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| {
-                    let key = entry.get("key").and_then(|key| key.as_str())?;
-                    let tenant_id = entry
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("tenant_id"))
-                        .and_then(|tenant| tenant.as_str())?;
-                    Some((key.to_string(), tenant_id.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// SY.admin's answer to `teardown_node`, as `send_admin_rpc` parses it.
+#[cfg(test)]
+fn test_teardown_node_answer(
+    status: &str,
+    error_code: Option<&str>,
+    payload: serde_json::Value,
+) -> AdminCommandResult {
+    AdminCommandResult {
+        status: status.to_string(),
+        action: "teardown_node".to_string(),
+        payload,
+        action_result: None,
+        result_origin: None,
+        error_code: error_code.map(str::to_string),
+        error_detail: None,
+        request_id: None,
+        trace_id: "teardown-node-trace".to_string(),
+    }
 }
 
-/// Routes vault list+delete through the primary Admin to purge every
-/// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
-/// delete requires admin-class privileges (the doomed ILK no longer exists at
-/// teardown time and cannot self-delete), so this helper consistently uses the
-/// admin transport for both calls.
-///
-/// Returns a summary `{ scanned, deleted, errors[] }` where `errors` contains
-/// per-key `{ key, error_code?, error_detail? }` records. Partial failures do
-/// not abort the loop; the caller (NTC-5) surfaces the summary in the teardown
-/// response.
-#[cfg(not(test))]
-async fn purge_vault_secrets_for_ilk(
-    state: &OrchestratorState,
-    ilk_id: &str,
-    _target_hive: &str,
-) -> serde_json::Value {
-    let admin_target = teardown_admin_target();
-    let list_resp = match orchestrator_admin_command(
-        state,
-        AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "vault_list",
-            target: Some(PRIMARY_HIVE_ID),
-            params: serde_json::json!({ "filter": { "ilk": ilk_id } }),
-            request_id: None,
-            timeout: Duration::from_secs(15),
-        },
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "target": admin_target,
-                "ilk_id": ilk_id,
-                "scanned": 0,
-                "deleted": 0,
-                "errors": [
-                    {
-                        "stage": "vault_list",
-                        "error_detail": err.to_string(),
-                    }
-                ],
-            });
+/// What a teardown reports of `teardown_node`, in the response fields it always had.
+#[derive(Debug)]
+struct TeardownNodeReport {
+    /// `None` when the outcome is unknown.
+    ilk_deleted: Option<bool>,
+    /// The ILK step, with the call's target and trace.
+    ilk_delete: serde_json::Value,
+    /// Set when the ILK step is not `ok`: the ILK, or its mark, may stay.
+    ilk_delete_error: Option<String>,
+    vault_secrets_purged: serde_json::Value,
+}
+
+/// docs/control-path-hardening-v1.md §2: `teardown_node` as the teardown reports it. Each step is
+/// SY.admin's own report, and an error never reads as ok:
+/// - no answer: the outcome is unknown (`TEARDOWN_UNKNOWN`, status `unknown`, nothing counted),
+///   since SY.admin may still finish;
+/// - not delivered, or refused before any step (`NODE_ILK_MISMATCH`, `UNAUTHORIZED`,
+///   `INVALID_REQUEST`, or an older SY.admin that does not know the action): both steps are errors
+///   with its code, since neither ran;
+/// - `TEARDOWN_INCOMPLETE`: the steps say which one failed; a step the answer leaves out is an
+///   error, and an error answer whose steps all read ok marks the ILK step with its code;
+/// - `not_found`: the ILK was already gone, so its step had nothing to do.
+fn teardown_node_report(ilk_id: &str, call: &TeardownNodeCall) -> TeardownNodeReport {
+    let answer = match call {
+        TeardownNodeCall::NoAnswer(err) => return teardown_node_unknown(ilk_id, err),
+        TeardownNodeCall::NotDelivered(err) => {
+            return teardown_node_refused(ilk_id, Some("TEARDOWN_NOT_DELIVERED"), err, None)
         }
+        TeardownNodeCall::Answered(answer)
+            if answer.status != "ok"
+                && answer.error_code.as_deref() != Some("TEARDOWN_INCOMPLETE") =>
+        {
+            return teardown_node_refused(
+                ilk_id,
+                answer.error_code.as_deref(),
+                &teardown_answer_detail(answer),
+                Some(&answer.trace_id),
+            )
+        }
+        TeardownNodeCall::Answered(answer) => answer,
     };
-    if list_resp.status != "ok" {
-        return serde_json::json!({
+    let payload = &answer.payload;
+    let ilk_deleted = payload["ilk_deleted"].as_bool().unwrap_or(false);
+    let not_found = payload["not_found"].as_bool().unwrap_or(false);
+    let not_reported = |step: &str| {
+        let mut error = serde_json::json!({
+            "error_detail": format!("teardown_node did not report its {step} step"),
+        });
+        if let Some(code) = &answer.error_code {
+            error["error_code"] = serde_json::json!(code);
+        }
+        error
+    };
+
+    let mut ilk_delete = serde_json::json!({
+        "status": "error",
+        "target": teardown_admin_target(),
+        "ilk_id": ilk_id,
+        "deleted": ilk_deleted,
+        "not_found": not_found,
+        "trace_id": answer.trace_id,
+    });
+    match payload.get("ilk_delete").filter(|step| step.is_object()) {
+        Some(step) => {
+            let status = step["status"].as_str().unwrap_or("error");
+            ilk_delete["status"] = serde_json::json!(if not_found && status != "error" {
+                "ok"
+            } else {
+                status
+            });
+            for field in ["error_code", "error_detail"] {
+                if let Some(value) = step.get(field).filter(|value| !value.is_null()) {
+                    ilk_delete[field] = value.clone();
+                }
+            }
+        }
+        None => {
+            for (field, value) in not_reported("ILK").as_object().expect("an object") {
+                ilk_delete[field] = value.clone();
+            }
+        }
+    }
+
+    let mut vault = match payload
+        .get("vault_secrets_purged")
+        .filter(|vault| vault.is_object())
+    {
+        Some(vault) => vault.clone(),
+        None => serde_json::json!({
             "status": "error",
-            "target": admin_target,
+            "scanned": 0,
+            "deleted": 0,
+            "errors": [not_reported("vault")],
+        }),
+    };
+    if vault["status"].as_str().is_none() {
+        vault["status"] = serde_json::json!("error");
+    }
+    vault["target"] = serde_json::json!(teardown_admin_target());
+    vault["ilk_id"] = serde_json::json!(ilk_id);
+
+    if answer.status != "ok" && ilk_delete["status"] == "ok" && vault["status"] == "ok" {
+        let code = answer.error_code.as_deref().unwrap_or("UNKNOWN");
+        ilk_delete["status"] = serde_json::json!("error");
+        ilk_delete["error_code"] = serde_json::json!(code);
+        ilk_delete["error_detail"] = serde_json::json!(format!(
+            "teardown_node answered {code} although each step reported ok: {}",
+            teardown_answer_detail(answer)
+        ));
+    }
+    if ilk_delete["status"] != "ok" && ilk_delete.get("error_code").is_none() {
+        if let Some(code) = &answer.error_code {
+            ilk_delete["error_code"] = serde_json::json!(code);
+        }
+    }
+    let ilk_delete_error = (ilk_delete["status"] != "ok").then(|| {
+        let detail = ilk_delete["error_detail"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "the ILK step was {}",
+                    ilk_delete["status"].as_str().unwrap_or("error")
+                )
+            });
+        match ilk_delete["error_code"].as_str() {
+            Some(code) => format!("{code}: {detail}"),
+            None => detail,
+        }
+    });
+    TeardownNodeReport {
+        ilk_deleted: Some(ilk_deleted),
+        ilk_delete,
+        ilk_delete_error,
+        vault_secrets_purged: vault,
+    }
+}
+
+/// No answer came from `teardown_node`: SY.admin may have deleted some or all of the node's
+/// secrets, and marked or purged its ILK, or nothing yet. Nothing is counted, and the ILK to check
+/// is named.
+fn teardown_node_unknown(ilk_id: &str, err: &str) -> TeardownNodeReport {
+    let detail = format!(
+        "no answer from SY.admin ({err}); it may still delete the node's secrets and mark and purge \
+         {ilk_id}: check that ILK and its secrets"
+    );
+    TeardownNodeReport {
+        ilk_deleted: None,
+        ilk_delete: serde_json::json!({
+            "status": "unknown",
+            "target": teardown_admin_target(),
+            "ilk_id": ilk_id,
+            "deleted": serde_json::Value::Null,
+            "error_code": "TEARDOWN_UNKNOWN",
+            "error_detail": detail,
+        }),
+        ilk_delete_error: Some(format!("TEARDOWN_UNKNOWN: {detail}")),
+        vault_secrets_purged: serde_json::json!({
+            "status": "unknown",
+            "target": teardown_admin_target(),
+            "ilk_id": ilk_id,
+            "scanned": serde_json::Value::Null,
+            "deleted": serde_json::Value::Null,
+            "errors": [{ "error_code": "TEARDOWN_UNKNOWN", "error_detail": detail }],
+        }),
+    }
+}
+
+/// Neither step of `teardown_node` ran: it was not delivered, or SY.admin refused before its first
+/// step.
+fn teardown_node_refused(
+    ilk_id: &str,
+    error_code: Option<&str>,
+    detail: &str,
+    trace_id: Option<&str>,
+) -> TeardownNodeReport {
+    let mut ilk_delete = serde_json::json!({
+        "status": "error",
+        "target": teardown_admin_target(),
+        "ilk_id": ilk_id,
+        "deleted": false,
+        "error_detail": detail,
+    });
+    let mut vault_error = serde_json::json!({ "error_detail": detail });
+    if let Some(code) = error_code {
+        ilk_delete["error_code"] = serde_json::json!(code);
+        vault_error["error_code"] = serde_json::json!(code);
+    }
+    if let Some(trace_id) = trace_id {
+        ilk_delete["trace_id"] = serde_json::json!(trace_id);
+    }
+    TeardownNodeReport {
+        ilk_deleted: Some(false),
+        ilk_delete,
+        ilk_delete_error: Some(match error_code {
+            Some(code) => format!("{code}: {detail}"),
+            None => detail.to_string(),
+        }),
+        vault_secrets_purged: serde_json::json!({
+            "status": "error",
+            "target": teardown_admin_target(),
             "ilk_id": ilk_id,
             "scanned": 0,
             "deleted": 0,
-            "errors": [
-                {
-                    "stage": "vault_list",
-                    "error_code": list_resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
-                    "error_detail": list_resp.error_detail.unwrap_or(list_resp.payload),
-                }
-            ],
-        });
+            "errors": [vault_error],
+        }),
     }
+}
 
-    let keys = vault_keys_with_tenant(&list_resp.payload);
-
-    let scanned = keys.len();
-    let mut deleted = 0usize;
-    let mut errors: Vec<serde_json::Value> = Vec::new();
-
-    for (key, tenant_id) in keys {
-        let delete_resp = orchestrator_admin_command(
-            state,
-            AdminCommandRequest {
-                admin_target: &admin_target,
-                action: "vault_delete",
-                target: Some(PRIMARY_HIVE_ID),
-                // SY.vault deletes a key only in the tenant it belongs to.
-                params: serde_json::json!({ "key": key, "tenant_id": tenant_id }),
-                request_id: None,
-                timeout: Duration::from_secs(10),
-            },
-        )
-        .await;
-        match delete_resp {
-            Ok(resp) if resp.status == "ok" => {
-                deleted += 1;
-            }
-            Ok(resp) => {
-                errors.push(serde_json::json!({
-                    "stage": "vault_delete",
-                    "key": key,
-                    "error_code": resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
-                    "error_detail": resp.error_detail.unwrap_or(serde_json::Value::Null),
-                }));
-            }
-            Err(err) => {
-                errors.push(serde_json::json!({
-                    "stage": "vault_delete",
-                    "key": key,
-                    "error_detail": err.to_string(),
-                }));
-            }
-        }
+/// What an error answer says about itself: its `error_detail`, else its `message`, else its code.
+fn teardown_answer_detail(answer: &AdminCommandResult) -> String {
+    match &answer.error_detail {
+        Some(serde_json::Value::String(detail)) => detail.clone(),
+        Some(detail) => detail.to_string(),
+        None => answer
+            .payload
+            .get("message")
+            .and_then(|message| message.as_str())
+            .map(str::to_string)
+            .or_else(|| answer.error_code.clone())
+            .unwrap_or_else(|| format!("status {}", answer.status)),
     }
-
-    serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "partial" },
-        "target": admin_target,
-        "ilk_id": ilk_id,
-        "scanned": scanned,
-        "deleted": deleted,
-        "errors": errors,
-    })
-}
-
-#[cfg(test)]
-async fn purge_vault_secrets_for_ilk(
-    _state: &OrchestratorState,
-    ilk_id: &str,
-    _target_hive: &str,
-) -> serde_json::Value {
-    if let Some(canned) = take_test_vault_purge_result() {
-        return canned;
-    }
-    serde_json::json!({
-        "status": "ok",
-        "target": teardown_admin_target(),
-        "ilk_id": ilk_id,
-        "scanned": 0,
-        "deleted": 0,
-        "errors": [],
-    })
-}
-
-#[cfg(test)]
-fn test_vault_purge_slot() -> &'static StdMutex<Option<serde_json::Value>> {
-    static SLOT: OnceLock<StdMutex<Option<serde_json::Value>>> = OnceLock::new();
-    SLOT.get_or_init(|| StdMutex::new(None))
-}
-
-#[cfg(test)]
-fn set_test_vault_purge_result(value: serde_json::Value) {
-    *test_vault_purge_slot()
-        .lock()
-        .expect("test vault purge lock") = Some(value);
-}
-
-#[cfg(test)]
-fn take_test_vault_purge_result() -> Option<serde_json::Value> {
-    test_vault_purge_slot()
-        .lock()
-        .expect("test vault purge lock")
-        .take()
 }
 
 fn teardown_step_status_is_ok(value: &serde_json::Value) -> bool {
@@ -20941,37 +21795,30 @@ fn teardown_error_message(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-#[cfg(not(test))]
-async fn orchestrator_admin_command(
-    state: &OrchestratorState,
-    request: AdminCommandRequest<'_>,
-) -> Result<AdminCommandResult, OrchestratorError> {
-    let client = state.rpc()?;
-    client
-        .send_admin_rpc(request)
-        .await
-        .map_err(|err| OrchestratorError::from(err.to_string()))
-}
-
 async fn append_optional_teardown_cleanup(
     state: &OrchestratorState,
     response: &mut serde_json::Value,
-    target_hive: &str,
     node_name: &str,
     ilk_id: Option<&str>,
 ) {
     if let Some(ilk_id) = ilk_id {
-        let ilk_delete = delete_ilk_for_teardown(state, ilk_id, target_hive).await;
-        response["ilk_deleted"] = serde_json::json!(ilk_delete
-            .get("deleted")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false));
-        if !teardown_step_status_is_ok(&ilk_delete) {
-            response["ilk_delete_error"] = serde_json::json!(teardown_error_message(&ilk_delete));
+        let call = teardown_node_via_admin(state, node_name, ilk_id).await;
+        let report = teardown_node_report(ilk_id, &call);
+        if report.ilk_delete_error.is_some() || report.vault_secrets_purged["status"] != "ok" {
+            tracing::warn!(
+                node_name = %node_name,
+                ilk_id = %ilk_id,
+                ilk_delete = %report.ilk_delete,
+                vault_secrets_purged = %report.vault_secrets_purged,
+                "node teardown left its identity or secrets behind"
+            );
         }
-        response["ilk_delete"] = ilk_delete;
-        response["vault_secrets_purged"] =
-            purge_vault_secrets_for_ilk(state, ilk_id, target_hive).await;
+        response["ilk_deleted"] = serde_json::json!(report.ilk_deleted);
+        if let Some(error) = report.ilk_delete_error {
+            response["ilk_delete_error"] = serde_json::json!(error);
+        }
+        response["ilk_delete"] = report.ilk_delete;
+        response["vault_secrets_purged"] = report.vault_secrets_purged;
     } else {
         response["ilk_deleted"] = serde_json::json!(false);
         response["vault_secrets_purged"] = serde_json::json!({
@@ -21059,10 +21906,10 @@ async fn orchestrator_system_action_for_timer_purge(
 #[cfg(test)]
 type TestTimerPurgeResult = Result<serde_json::Value, String>;
 
-/// Cross-test serialization for the teardown test slots (timer purge, ilk
-/// delete, vault purge). Each slot is process-global state; without this guard
+/// Cross-test serialization for the teardown test slots (timer purge,
+/// teardown_node). Each slot is process-global state; without this guard
 /// concurrent `#[tokio::test]` invocations interleave set/take and corrupt one
-/// another's results. Each test calling `set_test_*_result` should hold this
+/// another's results. Each test calling a `set_test_*` seam should hold this
 /// guard from the set call until the helper invocation returns.
 #[cfg(test)]
 fn teardown_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -22978,6 +23825,14 @@ async fn accept_add_hive(
         Ok(_) => JoinRole::Worker,
         Err(err) => return invalid(err.to_string()),
     };
+    // docs/control-path-hardening-v1.md §6: only an ingress filters SSH by source.
+    if !matches!(role, JoinRole::Ingress(_))
+        && payload
+            .get("ssh_allow_from")
+            .is_some_and(|value| !value.is_null())
+    {
+        return invalid("ssh_allow_from applies only to role=ingress".to_string());
+    }
 
     if !valid_hive_id(&hive_id) {
         return serde_json::json!({
@@ -24602,6 +25457,28 @@ async fn add_egress_hive_flow(
     {
         return payload;
     }
+    // docs/control-path-hardening-v1.md §6: with ssh_from_wan false the egress drops SSH on its
+    // wan_iface, so a join that arrives there is refused before it installs anything.
+    if !nat.ssh_from_wan {
+        match ssh_with_key_output(
+            address,
+            &key_path,
+            EGRESS_SSH_ARRIVAL_COMMAND,
+            creds.user.as_str(),
+        ) {
+            Ok(output) => {
+                if let Some(refusal) = egress_join_ssh_from_wan_refusal(&nat, &output) {
+                    return err_payload("SSH_FROM_WAN_LOCKOUT", refusal);
+                }
+            }
+            Err(err) => {
+                return err_payload(
+                    "SSH_SOURCE_NOT_VERIFIED",
+                    format!("could not read how this join reaches the egress: {err}"),
+                )
+            }
+        }
+    }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
         &key_path,
@@ -25179,6 +26056,7 @@ async fn add_egress_hive_flow(
         "egress_edge_ip": edge_ip.to_string(),
         "egress_wan_iface": nat.wan_iface,
         "egress_lan_iface": nat.lan_iface,
+        "egress_ssh_from_wan": nat.ssh_from_wan,
         "egress_nat_applied": booted.nat_table_loaded,
         "egress_lan_leg_ok": lan_leg_problem.is_none(),
         "egress_ipv4_forwarding": booted.ipv4_forwarding,
@@ -25289,6 +26167,18 @@ async fn add_ingress_hive_flow(
         Ok(tls) => tls,
         Err(payload) => return payload,
     };
+    // The motherbee's address the ingress' hive.yaml names as its uplink: the SSH rules the
+    // ingress applies admit it (docs/control-path-hardening-v1.md §6), so the join checks against
+    // it before it installs anything.
+    let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
+        Ok(value) => value,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("resolve ingress uplink failed: {err}"),
+            )
+        }
+    };
     // SSH bootstrap (key-first probe, password fallback) — identical to egress.
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     if !key_path.exists() {
@@ -25342,6 +26232,34 @@ async fn add_ingress_hive_flow(
     if let Err(payload) = wait_for_host_to_settle(hive_id, address, &key_path, creds.user.as_str())
     {
         return payload;
+    }
+    // docs/control-path-hardening-v1.md §6: before anything is installed, the address this SSH
+    // session comes from must be one the ingress' SSH table will admit (the uplink address and
+    // ssh_allow_from), or the table its first boot loads would drop the join's own later steps.
+    let (uplink_addresses, _) = motherbee_uplink_addresses(
+        &[WanUplink {
+            address: worker_uplink.clone(),
+        }],
+        resolve_host_addresses,
+    );
+    let ssh_allow = ssh_allow_set(&uplink_addresses, &ingress.ssh_allow_from);
+    match ssh_with_key_output(
+        address,
+        &key_path,
+        SSH_CONNECTION_COMMAND,
+        creds.user.as_str(),
+    ) {
+        Ok(output) => {
+            if let Some(refusal) = ingress_join_ssh_source_refusal(&output, &ssh_allow) {
+                return err_payload("SSH_SOURCE_NOT_ALLOWED", refusal);
+            }
+        }
+        Err(err) => {
+            return err_payload(
+                "SSH_SOURCE_NOT_VERIFIED",
+                format!("could not read the motherbee's source address on the box: {err}"),
+            )
+        }
     }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
         address,
@@ -25440,15 +26358,6 @@ async fn add_ingress_hive_flow(
     }
 
     // Build and write the minimal ingress hive.yaml (role: ingress + edge:).
-    let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
-        Ok(value) => value,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("resolve ingress uplink failed: {err}"),
-            )
-        }
-    };
     let mother_syncthing_address = match parse_host_port(&worker_uplink)
         .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))
     {
@@ -25501,7 +26410,7 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{ingress_ssh}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
@@ -25514,6 +26423,7 @@ async fn add_ingress_hive_flow(
         blob_sync_data_dir = state.blob.sync_data_dir.display(),
         edge_listen = edge_listen,
         edge_tls = edge_tls_yaml,
+        ingress_ssh = render_ingress_ssh_allow_from_yaml(&ingress.ssh_allow_from),
         system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
     );
     if let Err(err) = write_remote_file(
@@ -25909,6 +26819,8 @@ async fn add_ingress_hive_flow(
         "address": address,
         "ingress_role": "ingress",
         "ingress_listen": edge_listen,
+        // docs/control-path-hardening-v1.md §6: who the ingress takes SSH from.
+        "ingress_ssh_allow": ssh_allow.iter().map(SshAllowNet::to_string).collect::<Vec<_>>(),
         "harden_ssh": harden_ssh,
         "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
@@ -26233,6 +27145,14 @@ fn resolve_add_hive_egress_section(
             "egress.reachability_url",
         )?),
     };
+    // docs/control-path-hardening-v1.md §6 (D31): SSH on wan_iface stays open unless the operator
+    // closes it here; the join writes the decision into the egress' hive.yaml.
+    let ssh_from_wan = match eg.get("ssh_from_wan") {
+        None | Some(serde_json::Value::Null) => default_ssh_from_wan(),
+        Some(value) => value
+            .as_bool()
+            .ok_or("egress.ssh_from_wan must be boolean")?,
+    };
     let section = EgressSection {
         enabled: true,
         lan_cidr: get_str("lan_cidr"),
@@ -26243,6 +27163,7 @@ fn resolve_add_hive_egress_section(
         gateway_ip: None,
         edge_hive: None,
         reachability_url,
+        ssh_from_wan,
     };
     // Validate eagerly so the operator gets the error at request time (an omitted edge_ip is
     // read on the box by the join, `egress_edge_ip_on_host`).
@@ -26977,7 +27898,7 @@ fn best_effort_revoke_bootstrap(
 
 fn remote_orchestrator_sudoers_contents(user: &str) -> String {
     format!(
-        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /usr/bin/mkdir, /bin/rm, /usr/bin/rm, /bin/cp, /usr/bin/cp, /bin/mv, /usr/bin/mv, /bin/cat, /usr/bin/cat, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
+        "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /usr/bin/mkdir, /bin/rm, /usr/bin/rm, /bin/cp, /usr/bin/cp, /bin/mv, /usr/bin/mv, /bin/cat, /usr/bin/cat, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
         user, user
     )
 }
@@ -27815,34 +28736,6 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn teardown_deletes_each_secret_in_its_own_tenant() {
-        let listing = serde_json::json!({
-            "status": "ok",
-            "count": 2,
-            "secrets": [
-                {"key": "slack:acme:bot", "version": 1, "access_count": 0,
-                 "metadata": {"tenant_id": "tnt:11111111-1111-4111-8111-111111111111", "ilk": "ilk:x"}},
-                {"key": "openai:node", "version": 3, "access_count": 2,
-                 "metadata": {"tenant_id": "tnt:00000000-0000-0000-0000-000000000001", "ilk": "ilk:x"}},
-            ]
-        });
-        assert_eq!(
-            vault_keys_with_tenant(&listing),
-            vec![
-                (
-                    "slack:acme:bot".to_string(),
-                    "tnt:11111111-1111-4111-8111-111111111111".to_string()
-                ),
-                (
-                    "openai:node".to_string(),
-                    "tnt:00000000-0000-0000-0000-000000000001".to_string()
-                ),
-            ]
-        );
-        assert!(vault_keys_with_tenant(&serde_json::json!({})).is_empty());
-    }
-
     fn stamp_generation(
         root: &Path,
         id: &str,
@@ -28327,17 +29220,6 @@ mod tests {
             None,
             None,
         );
-    }
-
-    /// docs/acme-edge-certificates-v1.md §7: `record_drift_alert` writes the drift store, so it
-    /// is a write, and the F8 origin gate runs before its flow.
-    #[test]
-    fn record_drift_alert_is_a_write_behind_the_origin_gate() {
-        assert_eq!(
-            classify_admin_action("record_drift_alert"),
-            Some(ActionClass::Write)
-        );
-        assert!(admin_action_requires_origin("record_drift_alert"));
     }
 
     fn certificate_condition_request(state: &str) -> serde_json::Value {
@@ -29156,6 +30038,7 @@ mod tests {
             gateway_ip: None,
             edge_hive: None,
             reachability_url: None,
+            ssh_from_wan: true,
         }
     }
 
@@ -29337,8 +30220,8 @@ mod tests {
     #[test]
     fn egress_nft_ruleset_is_deterministic_and_substituted() {
         let cfg = resolve_egress_nat_config(&egress_section(true)).unwrap();
-        let a = egress_nft_ruleset(&cfg);
-        let b = egress_nft_ruleset(&cfg);
+        let a = egress_nft_ruleset(&cfg, &[]);
+        let b = egress_nft_ruleset(&cfg, &[]);
         assert_eq!(
             a, b,
             "ruleset must be deterministic for idempotent re-apply"
@@ -29352,6 +30235,734 @@ mod tests {
         assert!(a.contains("ip saddr 192.168.8.0/24 oifname \"eth0\" masquerade"));
         assert!(a.contains("iifname \"eth1\" oifname \"eth0\" ip saddr 192.168.8.0/24 accept"));
         assert!(a.contains("meta nfproto ipv6 drop"));
+    }
+
+    /// docs/control-path-hardening-v1.md §6 (D31): `egress.ssh_from_wan` is true by default and
+    /// filters nothing; false drops SSH, on the ports sshd listens on, arriving on wan_iface only.
+    #[test]
+    fn the_egress_drops_ssh_on_its_wan_only_when_ssh_from_wan_is_false() {
+        let open = resolve_egress_nat_config(&egress_section(true)).unwrap();
+        assert!(open.ssh_from_wan);
+        let ruleset = egress_nft_ruleset(&open, &[22, 2222]);
+        assert!(!ruleset.contains("dport"), "{ruleset}");
+        assert!(!ruleset.contains("ssh_from_wan"), "{ruleset}");
+
+        let mut section = egress_section(true);
+        section.ssh_from_wan = false;
+        let closed = resolve_egress_nat_config(&section).unwrap();
+        let ruleset = egress_nft_ruleset(&closed, &[2222, 22, 22]);
+        let input =
+            &ruleset[ruleset.find("chain input").unwrap()..ruleset.find("chain forward").unwrap()];
+        assert!(
+            input.contains("\t\tiifname \"eth0\" tcp dport { 22, 2222 } drop\n"),
+            "{input}"
+        );
+        assert_eq!(input.matches(" drop\n").count(), 1, "{input}");
+        assert!(input.contains("policy accept;"), "{input}");
+        assert!(!input.contains("eth1"), "the LAN side keeps SSH: {input}");
+        // The rest of the table is the same.
+        assert_eq!(
+            ruleset.replace(
+                "\t\t# egress.ssh_from_wan: false (docs/control-path-hardening-v1.md §6).\n\
+                 \t\tiifname \"eth0\" tcp dport { 22, 2222 } drop\n",
+                ""
+            ),
+            egress_nft_ruleset(&open, &[22])
+        );
+        // No port known: sshd's default.
+        assert!(egress_nft_ruleset(&closed, &[]).contains("iifname \"eth0\" tcp dport { 22 } drop"));
+
+        // The hive.yaml key: true when absent, as the operator wrote it otherwise.
+        let parsed = |yaml: &str| -> EgressSection { serde_yaml::from_str(yaml).expect("egress") };
+        assert!(parsed("enabled: true\n").ssh_from_wan);
+        assert!(!parsed("enabled: true\nssh_from_wan: false\n").ssh_from_wan);
+    }
+
+    /// `sshd -T` names the ports: `port` lines and a `listenaddress` with its own port; 22 when
+    /// it names none.
+    #[test]
+    fn the_ssh_ports_come_from_sshd_t() {
+        let output = "port 22\nport 2222\naddressfamily any\nlistenaddress [::]:22\n\
+                      listenaddress 0.0.0.0:22\nlistenaddress 10.0.0.5:2200\nusepam yes\n";
+        assert_eq!(sshd_ports_from_config(output), vec![22, 2200, 2222]);
+        assert_eq!(sshd_ports_from_config("port 22\n"), vec![22]);
+        assert_eq!(sshd_ports_from_config(""), vec![22]);
+        assert_eq!(
+            sshd_ports_from_config("port abc\nlistenaddress 0.0.0.0\n"),
+            vec![22]
+        );
+        assert_eq!(nft_port_set(&[2222, 22, 22]), "{ 22, 2222 }");
+        assert_eq!(nft_port_set(&[]), "{ 22 }");
+    }
+
+    /// `sshd -T` refuses to run until ssh.service created /run/sshd (at boot, and on a
+    /// socket-activated host until the first connection). Only for that failure the orchestrator
+    /// creates the directory as ssh.service would and asks once more; any other failure is the
+    /// error it was.
+    #[test]
+    fn sshd_t_is_asked_again_once_its_privsep_dir_exists() {
+        let missing = "sshd -T failed (exit=255): stderr=Missing privilege separation directory: \
+                       /run/sshd";
+        assert!(sshd_privsep_dir_missing(missing));
+        for other in [
+            "sshd -T failed (exit=1): stderr=sshd: no hostkeys available -- exiting.",
+            "Missing privilege separation directory: /var/empty",
+            "No such file or directory (os error 2)",
+        ] {
+            assert!(!sshd_privsep_dir_missing(other), "{other}");
+        }
+
+        // A run that answers, in order, from `answers`; how many runs and creates happened.
+        let attempt = |answers: Vec<Result<&str, &str>>, create: Result<(), &str>| {
+            let mut answers = answers.into_iter();
+            let mut runs = 0;
+            let mut creates = 0;
+            let result = sshd_listen_ports_with(
+                || {
+                    runs += 1;
+                    answers
+                        .next()
+                        .expect("no more runs than answers")
+                        .map(str::to_string)
+                        .map_err(str::to_string)
+                },
+                || {
+                    creates += 1;
+                    create.map_err(str::to_string)
+                },
+            );
+            (result, runs, creates)
+        };
+        // It answers at once: no directory is created.
+        assert_eq!(
+            attempt(vec![Ok("port 2222\n")], Ok(())),
+            (Ok(vec![2222]), 1, 0)
+        );
+        // The directory was all it lacked: created, then asked once more.
+        assert_eq!(
+            attempt(vec![Err(missing), Ok("port 22\n")], Ok(())),
+            (Ok(vec![22]), 2, 1)
+        );
+        // Asked once more only: a second failure is the error.
+        assert_eq!(
+            attempt(vec![Err(missing), Err("still failing")], Ok(())),
+            (Err("still failing".to_string()), 2, 1)
+        );
+        // The directory could not be created: the error says both, and nothing is asked again.
+        let (result, runs, creates) = attempt(vec![Err(missing)], Err("read-only file system"));
+        let err = result.unwrap_err();
+        assert!(err.starts_with(missing), "{err}");
+        assert!(
+            err.ends_with("creating /run/sshd failed: read-only file system"),
+            "{err}"
+        );
+        assert_eq!((runs, creates), (1, 1));
+        // Any other failure keeps today's behavior: no directory, no retry.
+        assert_eq!(
+            attempt(vec![Err("no hostkeys available")], Ok(())),
+            (Err("no hostkeys available".to_string()), 1, 0)
+        );
+        // sshd_listen_ports is this decision over the real command and directory.
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src.find("fn sshd_listen_ports(").expect("it")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        assert!(
+            body.contains("sshd_listen_ports_with(run_sshd_config_test, create_sshd_privsep_dir)")
+        );
+        assert_eq!(SSHD_PRIVSEP_DIR, "/run/sshd");
+    }
+
+    /// When `sshd -T` fails (at boot, before ssh.service created /run/sshd), the egress keeps the
+    /// WAN SSH ports its saved ruleset drops: a re-apply never narrows them. With none saved it
+    /// drops sshd's default port and says the ports are a guess.
+    #[test]
+    fn the_egress_keeps_its_wan_ssh_ports_when_sshd_cannot_say() {
+        let mut section = egress_section(true);
+        section.ssh_from_wan = false;
+        let closed = resolve_egress_nat_config(&section).unwrap();
+        let saved = egress_nft_ruleset(&closed, &[2222, 22]);
+        assert_eq!(saved_wan_ssh_ports(&saved, "eth0"), Some(vec![22, 2222]));
+        assert_eq!(saved_wan_ssh_ports(&saved, "eth1"), None);
+        let open = resolve_egress_nat_config(&egress_section(true)).unwrap();
+        assert_eq!(
+            saved_wan_ssh_ports(&egress_nft_ruleset(&open, &[]), "eth0"),
+            None
+        );
+
+        assert_eq!(
+            egress_wan_ssh_ports(Ok(vec![2200]), &saved, "eth0"),
+            WanSshPorts::Reported(vec![2200])
+        );
+        let kept = egress_wan_ssh_ports(Err("no /run/sshd".into()), &saved, "eth0");
+        assert_eq!(
+            kept,
+            WanSshPorts::Kept(vec![22, 2222], "no /run/sshd".to_string())
+        );
+        // Re-rendered with the kept ports, the ruleset is the saved one: nothing narrows.
+        assert_eq!(egress_nft_ruleset(&closed, &kept.ports()), saved);
+        let guessed = egress_wan_ssh_ports(Err("no /run/sshd".into()), "", "eth0");
+        assert_eq!(guessed, WanSshPorts::Guessed("no /run/sshd".to_string()));
+        assert_eq!(guessed.ports(), vec![22]);
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src.find("fn reconcile_egress_nat(").expect("reconcile")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        assert!(body.contains("egress_wan_ssh_ports(sshd_listen_ports(), &saved, &cfg.wan_iface)"));
+        assert!(body.contains("\"egress_ssh_ports_unknown\""));
+    }
+
+    fn uplinks(addresses: &[&str]) -> Vec<WanUplink> {
+        addresses
+            .iter()
+            .map(|address| WanUplink {
+                address: address.to_string(),
+            })
+            .collect()
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn no_resolver(host: &str, _: u16) -> Result<Vec<std::net::IpAddr>, String> {
+        panic!("{host} must not be resolved")
+    }
+
+    /// The input chain of a rendered ingress table.
+    fn ingress_input_chain(ruleset: &str) -> &str {
+        let start = ruleset.find("\tchain input {").expect("an input chain");
+        &ruleset[start..start + ruleset[start..].find("\n\t}\n").expect("its end")]
+    }
+
+    /// docs/control-path-hardening-v1.md §6: with only its uplink, the ingress takes SSH from the
+    /// motherbee alone, on the ports sshd listens on, and drops the rest; nothing else is filtered.
+    #[test]
+    fn the_ingress_takes_ssh_only_from_its_uplink() {
+        let rules = ingress_ssh_rules(&uplinks(&["10.10.10.10:9000"]), &[], &[22], no_resolver)
+            .expect("rules");
+        assert_eq!(rules.allow, [SshAllowNet::parse("10.10.10.10").unwrap()]);
+        let ruleset = &rules.ruleset;
+        assert!(ruleset.starts_with("#!/usr/sbin/nft -f\n"));
+        // SO-08's atomic apply, the egress' machinery: add + flush + define, never a delete.
+        assert!(ruleset.contains(
+            "add table inet fluxbee_ingress\nflush table inet fluxbee_ingress\n\
+             table inet fluxbee_ingress {\n"
+        ));
+        assert!(!ruleset.contains("delete table"));
+        // The sources are inline: a named set would keep a removed address after `flush table`.
+        assert!(!ruleset.contains("set "), "{ruleset}");
+        // Loopback SSH is accepted before the drop.
+        assert_eq!(
+            ingress_input_chain(ruleset),
+            "\tchain input {\n\
+             \t\ttype filter hook input priority 0; policy accept;\n\
+             \t\tiif \"lo\" accept\n\
+             \t\ttcp dport { 22 } ip saddr { 10.10.10.10 } accept\n\
+             \t\ttcp dport { 22 } drop"
+        );
+        // One chain, the input one, with policy accept: nothing but SSH is filtered.
+        assert_eq!(ruleset.matches("chain ").count(), 1);
+        assert_eq!(ruleset.matches(" drop").count(), 1);
+        // Deterministic, so write_file_if_changed and a re-apply change nothing.
+        let again = ingress_ssh_rules(&uplinks(&["10.10.10.10:9000"]), &[], &[22], no_resolver)
+            .expect("rules");
+        assert_eq!(&again.ruleset, ruleset);
+    }
+
+    /// `ingress.ssh_allow_from` adds networks: canonical, sorted, and none inside another (an
+    /// nftables interval set refuses overlaps); every sshd port is covered.
+    #[test]
+    fn the_ingress_allow_set_adds_ssh_allow_from() {
+        let rules = ingress_ssh_rules(
+            &uplinks(&["10.10.10.10:9000"]),
+            &strings(&[
+                "192.168.8.0/24",
+                "192.168.8.7",
+                " 172.16.5.9/16 ",
+                "10.10.10.10/32",
+            ]),
+            &[2222, 22],
+            no_resolver,
+        )
+        .expect("rules");
+        let allow: Vec<String> = rules.allow.iter().map(ToString::to_string).collect();
+        assert_eq!(allow, ["10.10.10.10", "172.16.0.0/16", "192.168.8.0/24"]);
+        assert_eq!(
+            ingress_input_chain(&rules.ruleset),
+            "\tchain input {\n\
+             \t\ttype filter hook input priority 0; policy accept;\n\
+             \t\tiif \"lo\" accept\n\
+             \t\ttcp dport { 22, 2222 } ip saddr { 10.10.10.10, 172.16.0.0/16, 192.168.8.0/24 } accept\n\
+             \t\ttcp dport { 22, 2222 } drop"
+        );
+        // A wider network takes in the motherbee's own address.
+        let rules = ingress_ssh_rules(
+            &uplinks(&["10.10.10.10:9000"]),
+            &strings(&["10.0.0.0/8"]),
+            &[22],
+            no_resolver,
+        )
+        .expect("rules");
+        assert_eq!(rules.allow, [SshAllowNet::parse("10.0.0.0/8").unwrap()]);
+    }
+
+    /// IPv6 gets its own accept, and an IPv4-mapped address is the IPv4 one netfilter sees.
+    #[test]
+    fn the_ingress_allow_set_covers_ipv6() {
+        let rules = ingress_ssh_rules(
+            &uplinks(&["[fd00::10]:9000"]),
+            &strings(&["2001:db8::1/32", "::ffff:192.168.8.9"]),
+            &[22],
+            no_resolver,
+        )
+        .expect("rules");
+        assert_eq!(
+            ingress_input_chain(&rules.ruleset),
+            "\tchain input {\n\
+             \t\ttype filter hook input priority 0; policy accept;\n\
+             \t\tiif \"lo\" accept\n\
+             \t\ttcp dport { 22 } ip saddr { 192.168.8.9 } accept\n\
+             \t\ttcp dport { 22 } ip6 saddr { 2001:db8::/32, fd00::10 } accept\n\
+             \t\ttcp dport { 22 } drop"
+        );
+        // An IPv6-only allow set has no IPv4 accept, and still drops IPv4 SSH.
+        let rules =
+            ingress_ssh_rules(&uplinks(&["[fd00::10]:9000"]), &[], &[22], no_resolver).unwrap();
+        let input = ingress_input_chain(&rules.ruleset);
+        assert!(!input.contains("ip saddr"), "{input}");
+        assert!(input.ends_with("\t\ttcp dport { 22 } drop"), "{input}");
+    }
+
+    /// A hostname uplink is resolved, IPv4 and IPv6. One that does not resolve renders nothing,
+    /// even with ssh_allow_from: a table without the motherbee would lock it out, so the rules
+    /// already applied stay.
+    #[test]
+    fn a_hostname_uplink_is_resolved() {
+        let resolve = |host: &str, port: u16| -> Result<Vec<std::net::IpAddr>, String> {
+            assert_eq!(port, 9000);
+            match host {
+                "mother.lan" => Ok(vec![
+                    "10.10.10.10".parse().unwrap(),
+                    "fd00::10".parse().unwrap(),
+                ]),
+                _ => Err("no such host".to_string()),
+            }
+        };
+        let rules = ingress_ssh_rules(&uplinks(&["mother.lan:9000"]), &[], &[22], resolve).unwrap();
+        let allow: Vec<String> = rules.allow.iter().map(ToString::to_string).collect();
+        assert_eq!(allow, ["10.10.10.10", "fd00::10"]);
+
+        for uplink_set in [
+            vec!["gone.lan:9000"],
+            vec!["mother.lan:9000", "gone.lan:9000"],
+        ] {
+            let refusal = ingress_ssh_rules(
+                &uplinks(&uplink_set),
+                &strings(&["192.168.8.0/24"]),
+                &[22],
+                resolve,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal,
+                IngressSshRefusal::InputFailed(
+                    "wan uplink 'gone.lan:9000' does not resolve: no such host".to_string()
+                ),
+                "{uplink_set:?}"
+            );
+            assert_eq!(refusal.alert().0, "ingress_ssh_input_failed");
+        }
+    }
+
+    /// docs/control-path-hardening-v1.md §6: an empty allow set applies nothing (a table would
+    /// drop every SSH), and a bad entry applies nothing either: what is loaded stays.
+    #[test]
+    fn an_empty_or_invalid_allow_set_applies_nothing() {
+        assert_eq!(ingress_nft_ruleset(&[22], &[]), None);
+        let refusal = ingress_ssh_rules(&[], &[], &[22], no_resolver).unwrap_err();
+        assert_eq!(
+            refusal,
+            IngressSshRefusal::EmptyAllowSet(
+                "hive.yaml names no motherbee in wan.uplinks and no ingress.ssh_allow_from"
+                    .to_string()
+            )
+        );
+        assert_eq!(refusal.alert().0, "ingress_ssh_allow_set_empty");
+        for bad in ["10.0.0.0/33", "fd00::/129", "mother.lan", "10.0.0.1/", ""] {
+            let refusal = ingress_ssh_rules(
+                &uplinks(&["10.10.10.10:9000"]),
+                &strings(&["192.168.8.0/24", bad]),
+                &[22],
+                no_resolver,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(refusal, IngressSshRefusal::InvalidAllowFrom(_)),
+                "{bad:?}"
+            );
+            assert_eq!(refusal.alert().0, "ingress_ssh_rules_failed");
+        }
+    }
+
+    /// docs/control-path-hardening-v1.md §6: only a ruleset rendered from a complete input set
+    /// replaces the saved one; an unchanged one is not loaded again while its table is there; with
+    /// nothing rendered (an input failed, the configuration refused) the rules in force stay, and
+    /// the saved ones are loaded again only when the table is gone.
+    #[test]
+    fn the_ingress_reconcile_never_narrows_a_working_table() {
+        use IngressSshAction::{Apply, LoadSaved, Nothing};
+        let (new, saved) = ("new ruleset", "saved ruleset");
+        for (rendered, saved_file, loaded, expected) in [
+            // A new or changed ruleset is applied, whether or not a table is loaded.
+            (Some(new), Some(saved), true, Apply),
+            (Some(new), Some(saved), false, Apply),
+            (Some(new), None, false, Apply),
+            (Some(new), None, true, Apply),
+            // The rendered ruleset is the saved one: nothing while it is loaded, else load it.
+            (Some(saved), Some(saved), true, Nothing),
+            (Some(saved), Some(saved), false, LoadSaved),
+            // Nothing rendered: keep what is loaded, load the saved one when the table is gone.
+            (None, Some(saved), true, Nothing),
+            (None, Some(saved), false, LoadSaved),
+            (None, None, false, Nothing),
+            (None, None, true, Nothing),
+        ] {
+            assert_eq!(
+                ingress_ssh_action(rendered, saved_file, loaded),
+                expected,
+                "rendered {rendered:?}, saved {saved_file:?}, loaded {loaded}"
+            );
+        }
+        // An input that fails is a warning: the rules in force stay; the configuration's own
+        // errors are errors.
+        assert_eq!(
+            IngressSshRefusal::InputFailed("x".into()).alert(),
+            ("ingress_ssh_input_failed", "warning", "x")
+        );
+        assert_eq!(
+            IngressSshRefusal::InvalidAllowFrom("x".into()).alert().1,
+            "error"
+        );
+        assert_eq!(
+            IngressSshRefusal::EmptyAllowSet("x".into()).alert().1,
+            "error"
+        );
+    }
+
+    /// The reconcile's wiring: sshd's ports and the uplinks feed the render, an input that fails
+    /// keeps the saved rules (`sshd -T` never falls back to a guessed port), and "applied" is
+    /// logged only for a new ruleset.
+    #[test]
+    fn the_ingress_reconcile_takes_only_complete_inputs() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body_of = |name: &str| {
+            let start = src.find(name).expect(name);
+            &src[start..start + src[start..].find("\n}\n").expect("its end")]
+        };
+        let inputs = body_of("fn ingress_ssh_rules_on_host(");
+        assert!(inputs.contains("sshd_listen_ports().map_err("), "{inputs}");
+        assert!(
+            inputs.contains("IngressSshRefusal::InputFailed"),
+            "{inputs}"
+        );
+        let ports = body_of("fn sshd_listen_ports(");
+        assert!(!ports.contains("vec![22]"), "{ports}");
+        let reconcile = body_of("fn reconcile_ingress_ssh(");
+        assert_eq!(
+            reconcile.matches("\"ingress SSH rules applied\"").count(),
+            1
+        );
+        assert!(
+            reconcile.contains("action == IngressSshAction::Apply"),
+            "{reconcile}"
+        );
+        assert_eq!(reconcile.matches("apply_nft_table(").count(), 1);
+        // A refused ruleset never replaces the saved file: it is loaded from a pending file first.
+        let apply = body_of("fn apply_nft_table(");
+        let load = apply.find("load(&pending)").expect("the pending load");
+        let rename = apply
+            .find("fs::rename(&pending, files.path)")
+            .expect("the rename");
+        assert!(load < rename, "{apply}");
+    }
+
+    #[test]
+    fn ssh_allow_nets_parse_and_contain() {
+        let net = |raw: &str| SshAllowNet::parse(raw).unwrap();
+        let ip = |raw: &str| raw.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(net("10.0.0.7/24").to_string(), "10.0.0.0/24");
+        assert_eq!(net("10.0.0.7").to_string(), "10.0.0.7");
+        assert_eq!(net("10.0.0.7/32").to_string(), "10.0.0.7");
+        assert_eq!(net("fd00::1/64").to_string(), "fd00::/64");
+        assert_eq!(net("::ffff:10.0.0.7").to_string(), "10.0.0.7");
+        assert!(net("10.0.0.0/24").contains(ip("10.0.0.200")));
+        assert!(!net("10.0.0.0/24").contains(ip("10.0.1.1")));
+        assert!(net("10.0.0.0/24").contains(ip("::ffff:10.0.0.9")));
+        assert!(net("0.0.0.0/0").contains(ip("203.0.113.9")));
+        assert!(!net("0.0.0.0/0").contains(ip("fd00::1")));
+        assert!(net("::/0").contains(ip("fd00::1")));
+        assert!(net("fd00::/64").contains(ip("fd00::abcd")));
+        assert!(!net("fd00::/64").contains(ip("fd00:0:0:1::1")));
+        for bad in [
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/-1",
+            "10.0.0.0/x",
+            "host",
+            "",
+        ] {
+            assert!(SshAllowNet::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// docs/control-path-hardening-v1.md §6: the join reads the motherbee's source address over
+    /// the bootstrap session and refuses, naming it, when the ingress' rules would not admit it.
+    #[test]
+    fn the_ingress_join_checks_the_motherbees_source_address() {
+        let allow = ssh_allow_set(
+            &["10.10.10.10".parse().unwrap()],
+            &[SshAllowNet::parse("192.168.8.0/24").unwrap()],
+        );
+        let line = |client: &str| format!("ssh-connection {client} 51234 10.10.10.50 22\n");
+        assert_eq!(
+            ingress_join_ssh_source_refusal(&line("10.10.10.10"), &allow),
+            None
+        );
+        assert_eq!(
+            ingress_join_ssh_source_refusal(&line("192.168.8.77"), &allow),
+            None
+        );
+        assert_eq!(
+            ingress_join_ssh_source_refusal(&line("::ffff:10.10.10.10"), &allow),
+            None
+        );
+        let refusal = ingress_join_ssh_source_refusal(&line("172.16.0.5"), &allow)
+            .expect("a source outside the allow set");
+        assert!(
+            refusal.contains("from 172.16.0.5"),
+            "names the address: {refusal}"
+        );
+        assert!(
+            refusal.contains("add 172.16.0.5 to add_hive's ssh_allow_from"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("10.10.10.10, 192.168.8.0/24"), "{refusal}");
+        // Unreadable: refused, never guessed.
+        for unreadable in ["ssh-connection \n", "", "ssh-connection x 1 y 2\n"] {
+            assert!(
+                ingress_join_ssh_source_refusal(unreadable, &allow)
+                    .is_some_and(|refusal| refusal.starts_with("could not read")),
+                "{unreadable:?}"
+            );
+        }
+        // The command runs outside sudo, which would drop SSH_CONNECTION.
+        assert!(!SSH_CONNECTION_COMMAND.contains("sudo"));
+        assert!(SSH_CONNECTION_COMMAND.contains("\"$SSH_CONNECTION\""));
+    }
+
+    /// The check runs in the join before anything is installed (the sudoers grant is the join's
+    /// first install), against the uplink the join writes and the request's ssh_allow_from.
+    #[test]
+    fn the_ingress_join_checks_before_it_installs_anything() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src
+            .find("async fn add_ingress_hive_flow(")
+            .expect("the flow")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let uplink = body
+            .find("resolve_worker_uplink_address(&wan_listen, address)")
+            .expect("the uplink");
+        let check = body
+            .find("ingress_join_ssh_source_refusal(&output, &ssh_allow)")
+            .expect("the check");
+        let install = body
+            .find("ensure_remote_orchestrator_sudoers_with_access(")
+            .expect("the first install");
+        assert!(uplink < check && check < install);
+        assert!(body.contains("ssh_allow_set(&uplink_addresses, &ingress.ssh_allow_from)"));
+        assert!(body.contains("    - address: \\\"{uplink}\\\""));
+        assert!(body.contains("uplink = worker_uplink,"));
+        assert_eq!(body.matches("resolve_worker_uplink_address(").count(), 1);
+    }
+
+    /// add_hive's ssh_allow_from: an array of addresses or networks, ingress only, written into the
+    /// ingress' hive.yaml where its reconcile reads it back.
+    #[test]
+    fn add_hive_takes_ssh_allow_from_for_an_ingress() {
+        let ingress = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({
+                "ingress": { "listen": "0.0.0.0:443", "tls_vault_key": "edge_tls" },
+            });
+            if !extra.is_null() {
+                payload["ssh_allow_from"] = extra;
+            }
+            resolve_add_hive_ingress_section(&payload)
+        };
+        assert!(ingress(serde_json::Value::Null)
+            .unwrap()
+            .ssh_allow_from
+            .is_empty());
+        let section = ingress(serde_json::json!(["192.168.8.7/24", "fd00::1"])).unwrap();
+        let written: Vec<String> = section
+            .ssh_allow_from
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(written, ["192.168.8.0/24", "fd00::1"]);
+        for bad in [
+            serde_json::json!("10.0.0.0/24"),
+            serde_json::json!([7]),
+            serde_json::json!(["10.0.0.0/33"]),
+            serde_json::json!(["mother.lan"]),
+        ] {
+            assert!(ingress(bad.clone()).is_err(), "{bad}");
+        }
+
+        let yaml = render_ingress_ssh_allow_from_yaml(&section.ssh_allow_from);
+        assert_eq!(
+            yaml,
+            "ingress:\n  ssh_allow_from:\n    - \"192.168.8.0/24\"\n    - \"fd00::1\"\n"
+        );
+        assert_eq!(render_ingress_ssh_allow_from_yaml(&[]), "");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let read: HiveIngressSection = serde_yaml::from_value(doc["ingress"].clone()).unwrap();
+        assert_eq!(read.ssh_allow_from, ["192.168.8.0/24", "fd00::1"]);
+        let rules = ingress_ssh_rules(
+            &uplinks(&["10.10.10.10:9000"]),
+            &read.ssh_allow_from,
+            &[22],
+            no_resolver,
+        )
+        .unwrap();
+        assert_eq!(rules.allow.len(), 3);
+    }
+
+    /// Only an ingress filters SSH by source: another role's join refuses ssh_allow_from.
+    #[tokio::test]
+    async fn accept_add_hive_refuses_ssh_allow_from_off_an_ingress() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        for role in ["worker", "egress"] {
+            let mut payload = serde_json::json!({
+                "hive_id": "spoke9",
+                "address": "10.0.0.9",
+                "ssh_user": "admin",
+                "role": role,
+                "ssh_allow_from": ["10.0.0.0/24"],
+            });
+            if role == "egress" {
+                payload["egress"] = serde_json::json!({
+                    "lan_cidr": "10.0.0.0/24", "wan_iface": "eth0", "lan_iface": "eth1",
+                });
+            }
+            let reply = accept_add_hive(&state, &payload).await;
+            assert_eq!(reply["error_code"], "INVALID_REQUEST", "{reply}");
+            assert_eq!(
+                reply["message"], "ssh_allow_from applies only to role=ingress",
+                "{reply}"
+            );
+        }
+        assert!(!state.any_hive_topology_busy());
+    }
+
+    /// docs/control-path-hardening-v1.md §6: with ssh_from_wan false, an egress join that arrives
+    /// on wan_iface is refused before anything is installed; on another interface it goes on.
+    #[test]
+    fn an_egress_join_over_its_wan_is_refused_when_ssh_from_wan_is_false() {
+        let mut section = egress_section(true);
+        section.ssh_from_wan = false;
+        let closed = resolve_egress_nat_config(&section).unwrap();
+        let open = resolve_egress_nat_config(&egress_section(true)).unwrap();
+        // The client from SSH_CONNECTION, then the route the box takes to it, outside sudo.
+        assert!(EGRESS_SSH_ARRIVAL_COMMAND.starts_with(SSH_CONNECTION_COMMAND));
+        assert!(EGRESS_SSH_ARRIVAL_COMMAND.contains("ip -o route get \"${1#::ffff:}\""));
+        assert!(!EGRESS_SSH_ARRIVAL_COMMAND.contains("sudo"));
+
+        // What the box answers: the client, and the interface its packets come in on (the rule
+        // drops on `iifname wan_iface`, whatever address the session reached).
+        let read = |client: &str, dev: &str| {
+            format!(
+                "ssh-connection {client} 51234 10.10.10.40 22\n\
+                 {client} via 192.168.8.1 dev {dev} src 192.168.8.240 uid 1000 \\    cache \n"
+            )
+        };
+        let refusal = egress_join_ssh_from_wan_refusal(&closed, &read("203.0.113.7", "eth0"))
+            .expect("over the WAN");
+        assert!(refusal.contains("from 203.0.113.7"), "{refusal}");
+        assert!(refusal.contains("egress.wan_iface 'eth0'"), "{refusal}");
+        assert!(egress_join_ssh_from_wan_refusal(&closed, &read("2001:db8::7", "eth0")).is_some());
+        assert_eq!(
+            egress_join_ssh_from_wan_refusal(&closed, &read("10.10.10.10", "eth1")),
+            None
+        );
+        assert_eq!(
+            route_get_dev("10.10.10.10 dev eth1 src 10.10.10.40 uid 0 \\    cache "),
+            Some("eth1".to_string())
+        );
+        // Unreadable, either part: refused, never guessed.
+        for unreadable in [
+            String::new(),
+            "ssh-connection 10.10.10.10 51234 10.10.10.40 22\n".to_string(),
+            "ssh-connection \n10.10.10.10 dev eth1\n".to_string(),
+        ] {
+            assert!(
+                egress_join_ssh_from_wan_refusal(&closed, &unreadable)
+                    .is_some_and(|refusal| refusal.starts_with("could not read")),
+                "{unreadable:?}"
+            );
+        }
+        // The default leaves SSH on the WAN: nothing to check.
+        assert_eq!(egress_join_ssh_from_wan_refusal(&open, ""), None);
+
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src
+            .find("async fn add_egress_hive_flow(")
+            .expect("the flow")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let check = body
+            .find("egress_join_ssh_from_wan_refusal(&nat, &output)")
+            .expect("the check");
+        let install = body
+            .find("ensure_remote_orchestrator_sudoers_with_access(")
+            .expect("the first install");
+        assert!(check < install);
+    }
+
+    /// add_hive's `egress.ssh_from_wan`: true unless the operator says false, and written into the
+    /// egress' hive.yaml, where its boot reads it back.
+    #[test]
+    fn add_hive_writes_the_egress_ssh_from_wan() {
+        let payload = |ssh_from_wan: serde_json::Value| {
+            let mut egress = serde_json::json!({
+                "lan_cidr": "192.168.8.0/24", "wan_iface": "eth0", "lan_iface": "eth1",
+            });
+            if !ssh_from_wan.is_null() {
+                egress["ssh_from_wan"] = ssh_from_wan;
+            }
+            serde_json::json!({ "egress": egress })
+        };
+        let default =
+            resolve_add_hive_egress_section(&payload(serde_json::Value::Null), None).unwrap();
+        assert!(default.ssh_from_wan);
+        let closed =
+            resolve_add_hive_egress_section(&payload(serde_json::json!(false)), None).unwrap();
+        assert!(!closed.ssh_from_wan);
+        assert!(resolve_add_hive_egress_section(&payload(serde_json::json!("no")), None).is_err());
+
+        let edge_ip = "192.168.8.1".parse::<std::net::Ipv4Addr>().unwrap();
+        for (section, expected) in [(default, true), (closed, false)] {
+            let nat = resolve_egress_nat_config(&section).unwrap();
+            let yaml = render_egress_hive_egress_yaml(&nat, edge_ip, None).unwrap();
+            assert!(
+                yaml.contains(&format!("  ssh_from_wan: {expected}\n")),
+                "{yaml}"
+            );
+            let egress = rendered_egress_section(&yaml);
+            assert_eq!(egress.ssh_from_wan, expected);
+            assert_eq!(
+                resolve_egress_nat_config(&egress).unwrap().ssh_from_wan,
+                expected
+            );
+        }
     }
 
     /// FINDINGS A-1: `nft -f` loads `iifname "eth1"` whether eth1 exists or not, so the NAT is
@@ -29623,7 +31234,7 @@ mod tests {
 
     #[test]
     fn egress_nft_boot_unit_loads_before_network_and_is_idempotent() {
-        let unit = egress_nft_boot_unit_contents("/usr/sbin/nft");
+        let unit = nft_boot_unit_contents(&EGRESS_NFT, "/usr/sbin/nft");
         // F17: must load before any interface is configured so no packet is
         // forwarded before the masquerade / forward-drop rules exist.
         assert!(unit.contains("DefaultDependencies=no"));
@@ -29635,8 +31246,30 @@ mod tests {
         assert!(unit.contains("Type=oneshot"));
         assert!(unit.contains("RemainAfterExit=yes"));
         assert!(unit.contains("WantedBy=multi-user.target"));
+        // The unit the egress hosts already have: the shared renderer changed no byte of it.
+        assert!(unit.starts_with(
+            "[Unit]\nDescription=Fluxbee egress NAT — load inet fluxbee_egress nftables at boot \
+             (F17)\n"
+        ));
         // Deterministic for write_file_if_changed (no spurious daemon-reloads).
-        assert_eq!(unit, egress_nft_boot_unit_contents("/usr/sbin/nft"));
+        assert_eq!(unit, nft_boot_unit_contents(&EGRESS_NFT, "/usr/sbin/nft"));
+    }
+
+    /// docs/control-path-hardening-v1.md §6: the ingress' SSH table loads at boot through the same
+    /// kind of unit, its own file and name.
+    #[test]
+    fn ingress_nft_boot_unit_loads_its_own_table_before_network() {
+        let unit = nft_boot_unit_contents(&INGRESS_NFT, "/usr/sbin/nft");
+        assert!(unit.contains("Before=network-pre.target"));
+        assert!(unit.contains("ExecStart=/usr/sbin/nft -f /etc/nftables.d/fluxbee-ingress.nft"));
+        assert!(unit.contains("ConditionPathExists=/etc/nftables.d/fluxbee-ingress.nft"));
+        assert!(!unit.contains("egress"));
+        assert_eq!(INGRESS_NFT.boot_unit, "fluxbee-ingress-nft.service");
+        assert_eq!(
+            INGRESS_NFT.boot_unit_path,
+            "/etc/systemd/system/fluxbee-ingress-nft.service"
+        );
+        assert_eq!(INGRESS_NFT.table, "inet fluxbee_ingress");
     }
 
     #[test]
@@ -31869,14 +33502,50 @@ mod tests {
         assert!(apply_syncthing_owned_options_xml("<configuration/>", &listen).is_err());
     }
 
-    /// Only the motherbee accepts Syncthing links, all of them TCP, so it opens the one port its
-    /// listener names; a spoke dials and listens on loopback, and opens nothing.
+    /// Only the motherbee accepts Syncthing links, all of them TCP, on 22000; a spoke dials and
+    /// listens on loopback.
     #[test]
-    fn syncthing_opens_its_port_only_where_it_accepts() {
-        assert_eq!(syncthing_firewall_rules(true), ["22000/tcp"]);
+    fn syncthing_listens_off_loopback_only_where_it_accepts() {
         assert!(syncthing_owned_listen_address(true).ends_with(":22000"));
-        assert!(syncthing_firewall_rules(false).is_empty());
         assert!(syncthing_owned_listen_address(false).starts_with("tcp://127.0.0.1:"));
+    }
+
+    /// docs/control-path-hardening-v1.md §6: the orchestrator writes no rule to ufw or firewalld
+    /// (no ufw or firewall-cmd program anywhere outside the tests, the join's sudoers included);
+    /// an active one is a `host_firewall_active` posture alert.
+    #[test]
+    fn no_ufw_or_firewalld_rule_is_written_and_an_active_one_is_reported() {
+        let full = include_str!("sy_orchestrator.rs");
+        let src = &full[..full.find("\nmod tests {").expect("tests module")];
+        assert!(!src.contains("Command::new(\"firewall-cmd\")"));
+        assert!(!src.contains("firewall-cmd"));
+        assert_eq!(src.matches("Command::new(\"ufw\")").count(), 1);
+        assert!(!src.contains("/usr/sbin/ufw"));
+        let check = &src[src.find("fn active_host_firewalls(").expect("the check")..];
+        let check = &check[..check.find("\n}\n").expect("its end")];
+        assert!(check.contains("status.arg(\"status\")"), "{check}");
+        assert!(!check.contains("allow"), "{check}");
+
+        assert!(ufw_status_is_active("Status: active\n\nTo Action From\n"));
+        assert!(!ufw_status_is_active("Status: inactive\n"));
+        assert!(!ufw_status_is_active(""));
+
+        let report = &src[src
+            .find("fn report_active_host_firewalls(")
+            .expect("the report")..];
+        let report = &report[..report.find("\n}\n").expect("its end")];
+        assert!(report.contains("\"posture\""));
+        assert!(report.contains("\"host_firewall_active\""));
+        for port in ["9000", "9100", "22000", "443"] {
+            assert!(report.contains(port), "{port}");
+        }
+        // At boot and on the watchdog's periodic tick.
+        let boot = &src[src.find("async fn bootstrap_local(").expect("boot")..];
+        let boot = &boot[..boot.find("\n}\n").expect("its end")];
+        assert!(boot.contains("report_active_host_firewalls(&state.hive_id);"));
+        let watchdog = &src[src.find("fn watchdog_host_rules(").expect("watchdog")..];
+        let watchdog = &watchdog[..watchdog.find("\n}\n").expect("its end")];
+        assert!(watchdog.contains("report_active_host_firewalls(&state.hive_id);"));
     }
 
     fn st3_versions_reply(section: Option<serde_json::Value>) -> serde_json::Value {
@@ -32783,19 +34452,62 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     /// FINDINGS A-48: the removed box loses its mesh credentials before anything else.
     #[test]
     fn remove_hive_cleanup_takes_the_mesh_credentials_first() {
-        for egress_teardown in [false, true] {
-            assert!(remove_hive_cleanup_full_script(egress_teardown).starts_with(
-                "rm -rf /var/lib/fluxbee/tls /var/lib/fluxbee/identity/keys >/dev/null 2>&1 || \
-                 true; "
-            ));
+        for (egress_teardown, ingress_teardown) in [(false, false), (true, false), (false, true)] {
+            assert!(
+                remove_hive_cleanup_full_script(egress_teardown, ingress_teardown).starts_with(
+                    "rm -rf /var/lib/fluxbee/tls /var/lib/fluxbee/identity/keys >/dev/null 2>&1 \
+                     || true; "
+                )
+            );
         }
+    }
+
+    /// docs/control-path-hardening-v1.md §6: a removed ingress drops its SSH table and boot unit,
+    /// after its services (sy-orchestrator included) are stopped, so nothing loads it again. Every
+    /// other role's cleanup leaves no trace of it.
+    #[test]
+    fn remove_hive_cleanup_drops_the_ingress_ssh_table_last() {
+        let worker = remove_hive_cleanup_full_script(false, false);
+        assert!(!worker.contains("fluxbee_ingress"), "{worker}");
+        assert!(!worker.contains("fluxbee-ingress"), "{worker}");
+        assert!(!remove_hive_cleanup_full_script(true, false).contains("fluxbee_ingress"));
+
+        let ingress = remove_hive_cleanup_full_script(false, true);
+        assert!(ingress.ends_with(&ingress_teardown_script()), "{ingress}");
+        let teardown = ingress_teardown_script();
+        assert!(teardown.contains("nft delete table inet fluxbee_ingress"));
+        assert!(teardown.contains("systemctl disable fluxbee-ingress-nft.service"));
+        assert!(teardown.contains(
+            "rm -f /etc/nftables.d/fluxbee-ingress.nft /etc/systemd/system/fluxbee-ingress-nft.service"
+        ));
+        assert!(teardown.contains("systemctl daemon-reload"));
+        // Every step tolerates a host without the table or the unit.
+        assert_eq!(
+            teardown.matches("|| true").count(),
+            teardown.split("; ").count()
+        );
+        let stop = ingress.find("sy-orchestrator").expect("the services stop");
+        assert!(
+            stop < ingress
+                .find("nft delete table inet fluxbee_ingress")
+                .unwrap()
+        );
+        assert!(!ingress.contains("fluxbee_egress"));
+
+        // The spoke decides by its own role.
+        let src = include_str!("sy_orchestrator.rs");
+        let arm = &src[src
+            .find("Some(\"REMOVE_HIVE_CLEANUP\") => {")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("send_system_action_response").expect("its answer")];
+        assert!(arm.contains("state.role == HiveRole::Ingress"), "{arm}");
     }
 
     /// The cleanup stops sy-orchestrator, so it runs in a transient unit of its own, never as the
     /// orchestrator's child: the whole script runs to its end.
     #[test]
     fn remove_hive_cleanup_runs_in_its_own_transient_unit() {
-        let cmd = remove_hive_cleanup_command("fluxbee-remove-hive-cleanup-1", true);
+        let cmd = remove_hive_cleanup_command("fluxbee-remove-hive-cleanup-1", true, false);
         assert_eq!(cmd.get_program(), "systemd-run");
         let args: Vec<String> = cmd
             .get_args()
@@ -32812,7 +34524,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
                 "-c"
             ]
         );
-        assert_eq!(args[6], remove_hive_cleanup_full_script(true));
+        assert_eq!(args[6], remove_hive_cleanup_full_script(true, false));
         assert_eq!(args.len(), 7);
     }
 
@@ -32888,7 +34600,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     #[test]
     fn f11_remove_hive_cleanup_appends_egress_teardown_only_for_egress() {
         // Non-egress (worker) removal: NO NAT teardown, only the base cleanup.
-        let worker = remove_hive_cleanup_full_script(false);
+        let worker = remove_hive_cleanup_full_script(false, false);
         assert!(worker.contains("/var/lib/fluxbee/nodes/*"));
         assert!(!worker.contains("fluxbee_egress"));
         assert!(!worker.contains("99-fluxbee-egress"));
@@ -32896,7 +34608,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
 
         // Egress removal: base cleanup PLUS idempotent NAT teardown of the live
         // nft table + all four persistent /etc files + a sysctl reload.
-        let egress = remove_hive_cleanup_full_script(true);
+        let egress = remove_hive_cleanup_full_script(true, false);
         assert!(egress.contains("/var/lib/fluxbee/nodes/*")); // base preserved
         assert!(egress.contains("nft delete table inet fluxbee_egress"));
         assert!(egress.contains("/etc/nftables.d/fluxbee-egress.nft"));
@@ -33557,6 +35269,7 @@ blob:
         }
         // A node on another hive is checked here before the request goes there: a hive whose core
         // predates the check would act without it.
+        // (A purge's KILL_NODE forwards with the teardown's longer window: the prefix matches both.)
         for name in [
             "async fn kill_node_flow(",
             "async fn start_or_restart_node_flow(",
@@ -33566,7 +35279,7 @@ blob:
                 name,
                 &[
                     "remote_node_requirements_refusal(",
-                    "forward_system_action_to_hive(",
+                    "forward_system_action_to_hive",
                 ],
             );
         }
@@ -34776,45 +36489,100 @@ blob:
         assert_eq!(payload["deleted_count"], serde_json::json!(2));
     }
 
+    /// docs/control-path-hardening-v1.md §3: a spoke runs no SY.admin, so its orchestrator takes no
+    /// admin message at all, not even from the motherbee's SY.admin.
     #[test]
-    fn f8_admin_action_requires_origin_classifies_mutations() {
-        // Mutating admin actions must be gated.
-        for action in [
-            "add_hive",
-            "remove_hive",
-            "kill_node",
-            "run_node",
-            "start_node",   // not catalogued by classify_admin_action; named explicitly
-            "restart_node", // idem
-            "set_node_config",
-            "set_storage",
-            "remove_node_instance",
+    fn a_spokes_orchestrator_takes_no_admin_message() {
+        let mut state = sample_orchestrator_state_for_tests();
+        state.hive_id = "worker1".to_string();
+        state.is_motherbee = false;
+        state.role = HiveRole::Worker;
+        for origin in [
+            Some("SY.admin@motherbee"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.orchestrator@worker1"),
+            None,
         ] {
             assert!(
-                admin_action_requires_origin(action),
-                "{action} must require origin auth"
+                !is_allowed_admin_source_name(&state, origin),
+                "{origin:?} must be refused on a spoke"
             );
         }
-        // Read-only and unknown actions stay ungated.
-        for action in [
-            "hive_status",
-            "get_storage",
-            "list_nodes",
-            "list_hives",
-            "get_hive",
-            "get_node_status",
-            "get_node_config",
-            "list_versions",
-            "get_versions",
-            "list_deployments",
-            "get_drift_alerts",
-            "totally_unknown_action",
+        // Its own hive's SY.admin would be the one origin, and no spoke runs one.
+        assert!(is_allowed_admin_source_name(
+            &state,
+            Some("SY.admin@worker1")
+        ));
+    }
+
+    /// docs/control-path-hardening-v1.md §3: reads are gated like mutations. Before, `list_nodes`
+    /// or `get_versions` answered any caller, and the motherbee forwarded them to other hives under
+    /// its own name.
+    #[tokio::test]
+    async fn the_admin_inbox_refuses_a_read_from_a_foreign_caller() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        for (trace, action, origin) in [
+            ("read-orch", "list_nodes", Some("SY.orchestrator@ingress1")),
+            (
+                "read-orch-local",
+                "hive_status",
+                Some("SY.orchestrator@motherbee"),
+            ),
+            ("read-spoke-admin", "get_versions", Some("SY.admin@worker1")),
+            ("read-io", "list_hives", Some("IO.cloud@motherbee")),
+            ("read-unnamed", "get_node_status", None),
         ] {
-            assert!(
-                !admin_action_requires_origin(action),
-                "{action} must NOT require origin auth"
+            harness
+                .inject(test_admin_command_with_origin(
+                    trace,
+                    action,
+                    serde_json::json!({ "node_name": "AI.demo@motherbee" }),
+                    origin,
+                ))
+                .await
+                .expect("inject admin command");
+            let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+                .await
+                .expect("forbidden reply emitted")
+                .expect("reply message");
+            assert_eq!(reply.routing.trace_id, trace);
+            assert_eq!(reply.meta.action.as_deref(), Some(action));
+            assert_eq!(
+                reply.payload.get("error_code").and_then(|v| v.as_str()),
+                Some("FORBIDDEN"),
+                "{action} from {origin:?} must be FORBIDDEN, got {:?}",
+                reply.payload
             );
         }
+
+        // This hive's SY.admin is admitted: the read answers.
+        harness
+            .inject(test_admin_command(
+                "read-admin",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject admin command");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("reply emitted")
+            .expect("reply message");
+        assert_eq!(reply.routing.trace_id, "read-admin");
+        assert_eq!(reply.payload["status"], "ok", "{:?}", reply.payload);
+        assert_eq!(reply.payload["hive_id"], "motherbee");
     }
 
     #[test]
@@ -37315,40 +39083,48 @@ blob:
         assert_eq!(summary.taps[2].target, "AI.demo@motherbee");
     }
 
+    /// docs/control-path-hardening-v1.md §2: the teardown reports `teardown_node`'s steps in its
+    /// cleanup fields, and the routing references beside them.
     #[tokio::test]
     async fn optional_teardown_cleanup_surfaces_ilk_and_vault_summaries() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
-        set_test_ilk_delete_result(serde_json::json!({
-            "status": "error",
-            "deleted": false,
-            "error_code": "TRANSPORT_ERROR",
-            "error_detail": "identity unreachable"
-        }));
-        set_test_vault_purge_result(serde_json::json!({
-            "status": "partial",
-            "scanned": 2,
-            "deleted": 1,
-            "errors": [{"key":"demo","error_detail":"delete failed"}]
-        }));
+        set_test_teardown_node_answer(TeardownNodeCall::Answered(test_teardown_node_answer(
+            "error",
+            Some("TEARDOWN_INCOMPLETE"),
+            serde_json::json!({
+                "node_name": "AI.demo@motherbee",
+                "ilk_id": "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "ilk_deleted": false,
+                "not_found": false,
+                "vault_secrets_purged": {
+                    "status": "error",
+                    "scanned": 2,
+                    "deleted": 1,
+                    "errors": [{"key": "demo", "error_code": "VAULT_UNAVAILABLE"}],
+                },
+                "ilk_delete": { "status": "skipped" },
+            }),
+        )));
         let mut response = serde_json::json!({"status":"ok"});
 
         append_optional_teardown_cleanup(
             &state,
             &mut response,
-            "motherbee",
             "AI.demo@motherbee",
             Some("ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
         )
         .await;
 
         assert_eq!(response["ilk_deleted"], serde_json::json!(false));
+        assert_eq!(response["ilk_delete"]["status"], "skipped");
         assert_eq!(
             response["ilk_delete_error"],
-            serde_json::json!("identity unreachable")
+            serde_json::json!("TEARDOWN_INCOMPLETE: the ILK step was skipped")
         );
-        assert_eq!(response["vault_secrets_purged"]["status"], "partial");
+        assert_eq!(response["vault_secrets_purged"]["status"], "error");
         assert_eq!(response["vault_secrets_purged"]["scanned"], 2);
+        assert_eq!(response["vault_secrets_purged"]["deleted"], 1);
         assert_eq!(
             response["routing_references"]["routes"],
             serde_json::json!([])
@@ -37363,17 +39139,412 @@ blob:
         );
     }
 
+    /// A teardown on any hive asks the motherbee's SY.admin, once.
     #[tokio::test]
-    async fn worker_teardown_uses_primary_admin_for_identity_and_vault() {
+    async fn a_teardown_asks_the_motherbees_admin_once() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
-        let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let mut response = serde_json::json!({"status": "ok"});
+        append_optional_teardown_cleanup(
+            &state,
+            &mut response,
+            "AI.demo@worker1",
+            Some("ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        )
+        .await;
+        assert_eq!(response["ilk_delete"]["target"], "SY.admin@motherbee");
+        assert_eq!(
+            response["vault_secrets_purged"]["target"],
+            "SY.admin@motherbee"
+        );
+        assert_eq!(response["ilk_deleted"], true);
+        assert!(response.get("ilk_delete_error").is_none());
 
-        let ilk_delete = delete_ilk_for_teardown(&state, ilk_id, "worker1").await;
-        let vault_purge = purge_vault_secrets_for_ilk(&state, ilk_id, "worker1").await;
+        // No ILK recorded: nothing to ask, and the vault step says it was skipped.
+        let mut response = serde_json::json!({"status": "ok"});
+        append_optional_teardown_cleanup(&state, &mut response, "AI.demo@worker1", None).await;
+        assert_eq!(response["ilk_deleted"], false);
+        assert_eq!(response["vault_secrets_purged"]["status"], "skipped");
+        assert!(response.get("ilk_delete").is_none());
 
-        assert_eq!(ilk_delete["target"], "SY.admin@motherbee");
-        assert_eq!(vault_purge["target"], "SY.admin@motherbee");
+        // The call itself: one teardown_node with the node and its ILK, to the primary hive.
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("#[cfg(not(test))]\nasync fn teardown_node_via_admin(")
+            .expect("teardown_node_via_admin");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("its end")];
+        assert!(body.contains("action: \"teardown_node\""));
+        assert!(body.contains("target: Some(PRIMARY_HIVE_ID)"));
+        assert!(body.contains("\"node_name\": node_name, \"ilk_id\": ilk_id"));
+        assert_eq!(body.matches("send_admin_rpc(").count(), 1);
+        assert!(body.contains("timeout: Duration::from_secs(TEARDOWN_NODE_TIMEOUT_SECS)"));
+    }
+
+    fn teardown_node_payload(
+        ilk_deleted: bool,
+        not_found: bool,
+        vault: serde_json::Value,
+        ilk_delete: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "node_name": "AI.demo@worker1",
+            "ilk_id": "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "ilk_deleted": ilk_deleted,
+            "not_found": not_found,
+            "vault_secrets_purged": vault,
+            "ilk_delete": ilk_delete,
+        })
+    }
+
+    /// docs/control-path-hardening-v1.md §2: every step ok reads ok, with what was deleted.
+    #[test]
+    fn teardown_node_ok_maps_into_the_cleanup_fields() {
+        let ilk = "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let answer = test_teardown_node_answer(
+            "ok",
+            None,
+            teardown_node_payload(
+                true,
+                false,
+                serde_json::json!({"status": "ok", "scanned": 2, "deleted": 2, "errors": []}),
+                serde_json::json!({"status": "ok"}),
+            ),
+        );
+        let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+        assert_eq!(report.ilk_deleted, Some(true));
+        assert_eq!(report.ilk_delete_error, None);
+        assert_eq!(report.ilk_delete["status"], "ok");
+        assert_eq!(report.ilk_delete["deleted"], true);
+        assert_eq!(report.ilk_delete["not_found"], false);
+        assert_eq!(report.ilk_delete["target"], "SY.admin@motherbee");
+        assert_eq!(report.ilk_delete["ilk_id"], ilk);
+        assert_eq!(report.ilk_delete["trace_id"], "teardown-node-trace");
+        assert_eq!(
+            report.vault_secrets_purged,
+            serde_json::json!({
+                "status": "ok",
+                "scanned": 2,
+                "deleted": 2,
+                "errors": [],
+                "target": "SY.admin@motherbee",
+                "ilk_id": ilk,
+            })
+        );
+    }
+
+    /// The ILK was already gone: nothing left to delete is no error, and nothing reads deleted.
+    #[test]
+    fn teardown_node_not_found_reads_ok_with_nothing_deleted() {
+        let ilk = "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        for step in ["ok", "skipped"] {
+            let answer = test_teardown_node_answer(
+                "ok",
+                None,
+                teardown_node_payload(
+                    false,
+                    true,
+                    serde_json::json!({"status": "ok", "scanned": 0, "deleted": 0, "errors": []}),
+                    serde_json::json!({ "status": step }),
+                ),
+            );
+            let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+            assert_eq!(report.ilk_deleted, Some(false), "{step}");
+            assert_eq!(report.ilk_delete["status"], "ok", "{step}");
+            assert_eq!(report.ilk_delete["not_found"], true, "{step}");
+            assert_eq!(report.ilk_delete["deleted"], false, "{step}");
+            assert_eq!(report.ilk_delete_error, None, "{step}");
+            assert_eq!(report.vault_secrets_purged["status"], "ok", "{step}");
+        }
+    }
+
+    /// An error answer never reads ok: an incomplete teardown names its failed step; a refusal
+    /// before any step, or no answer at all, is an error on both steps.
+    #[test]
+    fn teardown_node_errors_say_so_in_the_cleanup_fields() {
+        let ilk = "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+        // The ILK step failed after the secrets went.
+        let answer = test_teardown_node_answer(
+            "error",
+            Some("TEARDOWN_INCOMPLETE"),
+            teardown_node_payload(
+                false,
+                false,
+                serde_json::json!({"status": "ok", "scanned": 1, "deleted": 1, "errors": []}),
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "IDENTITY_UNAVAILABLE",
+                    "error_detail": "SY.identity did not answer",
+                }),
+            ),
+        );
+        let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+        assert_eq!(report.ilk_deleted, Some(false));
+        assert_eq!(report.ilk_delete["status"], "error");
+        assert_eq!(report.ilk_delete["error_code"], "IDENTITY_UNAVAILABLE");
+        assert_eq!(
+            report.ilk_delete_error.as_deref(),
+            Some("IDENTITY_UNAVAILABLE: SY.identity did not answer")
+        );
+        assert_eq!(report.vault_secrets_purged["status"], "ok");
+        assert_eq!(report.vault_secrets_purged["deleted"], 1);
+
+        // A step left out of an incomplete answer is an error, with the answer's code.
+        let answer = test_teardown_node_answer(
+            "error",
+            Some("TEARDOWN_INCOMPLETE"),
+            serde_json::json!({"ilk_deleted": false, "not_found": false}),
+        );
+        let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+        assert_eq!(report.ilk_delete["status"], "error");
+        assert_eq!(report.ilk_delete["error_code"], "TEARDOWN_INCOMPLETE");
+        assert_eq!(report.vault_secrets_purged["status"], "error");
+        assert_eq!(
+            report.vault_secrets_purged["errors"][0]["error_code"],
+            "TEARDOWN_INCOMPLETE"
+        );
+
+        // An error answer whose steps all read ok still says error.
+        let answer = test_teardown_node_answer(
+            "error",
+            Some("TEARDOWN_INCOMPLETE"),
+            teardown_node_payload(
+                true,
+                false,
+                serde_json::json!({"status": "ok", "scanned": 0, "deleted": 0, "errors": []}),
+                serde_json::json!({"status": "ok"}),
+            ),
+        );
+        let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+        assert_eq!(report.ilk_delete["status"], "error");
+        assert!(report
+            .ilk_delete_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("TEARDOWN_INCOMPLETE: ")));
+
+        // Refused before any step, whatever the payload's step fields say: neither ran.
+        for code in [
+            "NODE_ILK_MISMATCH",
+            "UNAUTHORIZED",
+            "INVALID_REQUEST",
+            "UNKNOWN_ACTION",
+        ] {
+            let mut answer = test_teardown_node_answer(
+                "error",
+                Some(code),
+                teardown_node_payload(
+                    false,
+                    false,
+                    serde_json::json!({"status": "ok", "scanned": 0, "deleted": 0, "errors": []}),
+                    serde_json::json!({"status": "skipped"}),
+                ),
+            );
+            answer.error_detail = Some(serde_json::json!("refused"));
+            let report = teardown_node_report(ilk, &TeardownNodeCall::Answered(answer.clone()));
+            assert_eq!(report.ilk_deleted, Some(false), "{code}");
+            assert_eq!(report.ilk_delete["status"], "error", "{code}");
+            assert_eq!(report.ilk_delete["error_code"], code, "{code}");
+            assert_eq!(report.ilk_delete["trace_id"], "teardown-node-trace");
+            assert_eq!(report.ilk_delete_error, Some(format!("{code}: refused")));
+            assert_eq!(report.vault_secrets_purged["status"], "error", "{code}");
+            assert_eq!(report.vault_secrets_purged["scanned"], 0, "{code}");
+            assert_eq!(
+                report.vault_secrets_purged["errors"],
+                serde_json::json!([{ "error_code": code, "error_detail": "refused" }]),
+                "{code}"
+            );
+        }
+
+        // Never delivered (a router bounced it, or it never left): nothing ran, said as such.
+        let report = teardown_node_report(
+            ilk,
+            &TeardownNodeCall::NotDelivered("transport unreachable".to_string()),
+        );
+        assert_eq!(report.ilk_deleted, Some(false));
+        assert_eq!(report.ilk_delete["status"], "error");
+        assert_eq!(report.ilk_delete["error_code"], "TEARDOWN_NOT_DELIVERED");
+        assert_eq!(
+            report.ilk_delete_error.as_deref(),
+            Some("TEARDOWN_NOT_DELIVERED: transport unreachable")
+        );
+        assert_eq!(report.vault_secrets_purged["status"], "error");
+        assert_eq!(report.vault_secrets_purged["deleted"], 0);
+    }
+
+    /// docs/control-path-hardening-v1.md §2: with no answer SY.admin may still finish, so the
+    /// outcome is unknown, never "nothing deleted": no count, no `ilk_deleted`, the ILK to check.
+    #[test]
+    fn teardown_node_without_an_answer_is_unknown() {
+        let ilk = "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let report = teardown_node_report(
+            ilk,
+            &TeardownNodeCall::NoAnswer("timeout waiting response".to_string()),
+        );
+        assert_eq!(report.ilk_deleted, None);
+        assert_eq!(report.ilk_delete["status"], "unknown");
+        assert_eq!(report.ilk_delete["error_code"], "TEARDOWN_UNKNOWN");
+        assert_eq!(report.ilk_delete["ilk_id"], ilk);
+        assert!(report.ilk_delete["deleted"].is_null());
+        let error = report.ilk_delete_error.as_deref().expect("an error");
+        assert!(error.starts_with("TEARDOWN_UNKNOWN: "), "{error}");
+        assert!(error.contains(ilk), "{error}");
+        let vault = &report.vault_secrets_purged;
+        assert_eq!(vault["status"], "unknown");
+        assert!(
+            vault["scanned"].is_null() && vault["deleted"].is_null(),
+            "{vault}"
+        );
+        assert_eq!(vault["errors"][0]["error_code"], "TEARDOWN_UNKNOWN");
+        assert_eq!(vault["ilk_id"], ilk);
+
+        // Only a request that never left, or that a router bounced, is known to have run nothing.
+        let not_delivered = [
+            RpcError::InvalidRequest("x".into()),
+            RpcError::Unreachable {
+                reason: "no route".into(),
+                original_dst: "SY.admin@motherbee".into(),
+            },
+            RpcError::TtlExceeded {
+                original_dst: "SY.admin@motherbee".into(),
+                last_hop: "motherbee".into(),
+            },
+        ];
+        for err in not_delivered {
+            assert!(
+                matches!(
+                    teardown_node_call_failure(err),
+                    TeardownNodeCall::NotDelivered(_)
+                ),
+                "not delivered"
+            );
+        }
+        let no_answer = [
+            RpcError::Timeout {
+                trace_id: "t".into(),
+                target: "SY.admin@motherbee".into(),
+                request_msg: "ADMIN_COMMAND".into(),
+                response_msg: "ADMIN_COMMAND_RESPONSE".into(),
+                timeout_ms: 120_000,
+            },
+            RpcError::InvalidResponse("missing status".into()),
+            RpcError::ResponseChannelClosed {
+                trace_id: "t".into(),
+            },
+            RpcError::Disconnected,
+        ];
+        for err in no_answer {
+            assert!(
+                matches!(
+                    teardown_node_call_failure(err),
+                    TeardownNodeCall::NoAnswer(_)
+                ),
+                "no answer"
+            );
+        }
+        // SY.admin's store calls can each take up to 30 s: the teardown waits long enough, and a
+        // spoke's purge is waited for longer still.
+        assert_eq!(TEARDOWN_NODE_TIMEOUT_SECS, 120);
+        assert!(TEARDOWN_FORWARD_TIMEOUT_SECS > TEARDOWN_NODE_TIMEOUT_SECS + 3);
+        let src = include_str!("sy_orchestrator.rs");
+        let body_of = |name: &str| {
+            let start = src.find(name).expect(name);
+            &src[start..start + src[start..].find("\n}\n").expect("its end")]
+        };
+        for flow in [
+            "async fn kill_node_flow(",
+            "async fn remove_node_instance_flow(",
+        ] {
+            assert!(
+                body_of(flow).contains("Duration::from_secs(TEARDOWN_FORWARD_TIMEOUT_SECS)"),
+                "{flow}"
+            );
+        }
+    }
+
+    /// SY.identity and SY.admin take an ILK only as `ilk:<uuid>`, lowercase and hyphenated, so the
+    /// orchestrator canonicalizes every form `Uuid::parse_str` reads where it takes or stores one.
+    #[test]
+    fn ilk_ids_are_taken_and_stored_canonical() {
+        let canonical = "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        for raw in [
+            "ilk:7c9e6679-7425-40de-944b-e07fc1f90ae7",
+            " ilk:7C9E6679-7425-40DE-944B-E07FC1F90AE7 ",
+            "ilk:7c9e6679742540de944be07fc1f90ae7",
+            "ilk:{7c9e6679-7425-40de-944b-e07fc1f90ae7}",
+            "ilk:urn:uuid:7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        ] {
+            assert_eq!(
+                canonical_prefixed_id(raw, "ilk").unwrap(),
+                canonical,
+                "{raw:?}"
+            );
+            assert_eq!(canonical_ilk_id_or_raw(raw), canonical, "{raw:?}");
+            let state = sample_orchestrator_state_for_tests();
+            assert_eq!(
+                resolve_node_ilk_id(
+                    &state,
+                    &serde_json::json!({ "ilk_id": raw }),
+                    "AI.x@motherbee"
+                )
+                .unwrap(),
+                canonical,
+                "{raw:?}"
+            );
+        }
+        for bad in [
+            "ilk:not-a-uuid",
+            "tnt:7c9e6679-7425-40de-944b-e07fc1f90ae7",
+            "",
+        ] {
+            assert!(canonical_prefixed_id(bad, "ilk").is_err(), "{bad:?}");
+        }
+        // One that is no id at all is kept as it is, for whoever receives it to refuse.
+        assert_eq!(canonical_ilk_id_or_raw(" ilk:x "), "ilk:x");
+        // A fresh one is canonical too.
+        let state = sample_orchestrator_state_for_tests();
+        let fresh = resolve_node_ilk_id(&state, &serde_json::json!({}), "AI.x@motherbee").unwrap();
+        assert_eq!(canonical_prefixed_id(&fresh, "ilk").unwrap(), fresh);
+
+        // The identity map stores the canonical form, and an older map's form is read canonical.
+        let dir = ilk_map_tmp_dir("ilk-canonical");
+        let mut state = sample_orchestrator_state_for_tests();
+        state.state_dir = dir.clone();
+        persist_node_ilk_mapping(
+            &state,
+            "AI.a@motherbee",
+            "ilk:7C9E6679742540DE944BE07FC1F90AE7",
+            "tnt:00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        let stored = load_identity_node_ilk_map(&node_ilk_map_path(&state));
+        assert_eq!(stored.nodes["AI.a@motherbee"], canonical);
+        let mut older = stored;
+        older.nodes.insert(
+            "AI.b@motherbee".to_string(),
+            "ilk:{7C9E6679-7425-40DE-944B-E07FC1F90AE7}".to_string(),
+        );
+        save_identity_node_ilk_map(&node_ilk_map_path(&state), &older).unwrap();
+        assert_eq!(
+            load_persisted_node_identity(&state, "AI.b@motherbee")
+                .0
+                .as_deref(),
+            Some(canonical)
+        );
+        // The node's config carries it canonical as well.
+        let block = build_node_system_block(
+            "AI.a@motherbee",
+            "motherbee",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("ilk:7C9E6679742540DE944BE07FC1F90AE7"),
+            None,
+            1,
+        );
+        assert_eq!(block["ilk_id"], canonical);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn ilk_map_tmp_dir(label: &str) -> PathBuf {

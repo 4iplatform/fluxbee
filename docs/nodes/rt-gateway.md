@@ -50,7 +50,8 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
 
 ## What it listens on
 
-- **Node socket** `/var/run/fluxbee/routers/<uuid hex>.sock`, mode 0666. Frames are a 4-byte
+- **Node socket** `/var/run/fluxbee/routers/<uuid hex>.sock`, mode 0600; a peer whose uid is not
+  the router's own (root in production) is refused (`local_peer_admitted`). Frames are a 4-byte
   big-endian length plus JSON, at most 128 KiB (`MAX_FRAME_SIZE` in
   `crates/fluxbee_sdk/src/socket/connection.rs`). The first frame must be a `HELLO` whose
   `payload.uuid` equals `routing.src`. `RT.*` names are accepted only from the router's own
@@ -130,7 +131,9 @@ At local delivery the router asks the baked `policy/system.wasm` whether the sen
 the action (`authorize_system`); a denial drops the message with
 `router dropped protected SYSTEM action from unauthorized origin`. The rules
 (`policy/system.rego`): edge commands and node control only from `SY.admin@motherbee`; the
-orchestrator actions from any hive's `SY.orchestrator`; every other protected action from the
+orchestrator's mutating actions only from `SY.orchestrator@motherbee` (`ADD_HIVE_FINALIZE` and
+`REMOVE_HIVE_CLEANUP` never on the motherbee itself), its reads also from the same hive's
+`SY.orchestrator`; every other protected action from the
 same hive's `SY.admin`; `NODE_STATUS_GET` also from the same hive's `SY.vault`. The policy is
 compiled into the binary (`include_bytes!`) and changes only with a new build.
 

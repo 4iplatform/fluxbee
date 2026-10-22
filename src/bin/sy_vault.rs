@@ -167,7 +167,6 @@ impl Drop for LockGuard {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct SecretRecord {
     key: String,

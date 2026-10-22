@@ -147,8 +147,8 @@ The boot (`bootstrap_local`, then `finish_bootstrap`):
    (`ensure_motherbee_ssh_key`, `ensure_motherbee_mesh_tls`), and lay out one core tree per spoke
    role under `dist/core/<role>/` (`materialize_role_core_trees`).
 3. Start `rt-gateway` and wait for a fresh heartbeat in its shared memory (`wait_for_router_ready`).
-   Open the firewall ports (`ensure_core_firewall_local`, §9), apply the egress setup
-   (`reconcile_egress`) and start Syncthing.
+   Report an active ufw or firewalld, apply the ingress' SSH table (`reconcile_ingress_ssh`, §9),
+   apply the egress setup (`reconcile_egress`) and start Syncthing.
 4. Start the `system_nodes.<role>.nodes` units in order, then wait up to 60 s for the `wait_for`
    nodes to register with the router (`wait_for_lifecycle_nodes`).
 5. Attach to the router as `SY.orchestrator@<hive>`. Admin commands get `ORCHESTRATOR_BOOTING` until
@@ -208,8 +208,9 @@ policies judge that name. A router's own UUID lives in
 
 ### 3.3 Attaching to the router
 
-- Each router listens on `/var/run/fluxbee/routers/<router uuid>.sock` (mode 0666) for nodes and on
-  `irp-<router uuid>.sock` (mode 0600) for its sibling routers (`Router::run`).
+- Each router listens on `/var/run/fluxbee/routers/<router uuid>.sock` for nodes and on
+  `irp-<router uuid>.sock` for its sibling routers, both mode 0600, and serves a connection only
+  when the peer's uid is its own, root (`Router::run`, `local_peer_admitted`).
 - A frame is a 4-byte big-endian length followed by JSON, at most 128 KiB (`MAX_FRAME_SIZE` in
   `crates/fluxbee_sdk/src/socket/connection.rs`). The WAN uses the same framing.
 - A message is `{routing, meta, payload}` (`Message` in `crates/fluxbee_sdk/src/protocol.rs`).
@@ -387,7 +388,10 @@ nodes, its siblings' nodes, static routes, VPN assignments and taps (`build_loca
 receiver drops an LSA whose `hive` is not the peer's authenticated hive (`apply_lsa_payload`), keeps
 the rest in `/jsr-lsa-<hive>` (`write_lsa_state`), and marks a hive stale after `dead_interval`
 (40 s) without one (`lsa_stale_loop`). An LSA only describes its sender's hive, so a spoke learns the
-motherbee's nodes but not the other spokes'.
+motherbee's nodes but not the other spokes'. From hive P's LSA the receiver installs only the nodes
+named `<role>@P`, applies P's routes only to P's names and to `name@*`, and P's taps only to a
+message to or from P, so a hive can neither take, redirect nor copy traffic it does not already see
+([routing-and-policy.md](routing-and-policy.md) §2, §3.2, §8.3).
 
 Spoke-to-spoke traffic goes through the motherbee (design: Option B in
 [edge-multihop-reachability-spec-v1.md](../edge-multihop-reachability-spec-v1.md)). A gateway with
@@ -466,8 +470,9 @@ mesh. Cloud posts `{op, tenant_id, params}` to `https://<public host>/e/<ich>` w
 SY.edge checks the token and forwards the request to IO.cloud. IO.cloud accepts traffic only from the
 SY.edge it trusts (`config.io.edge_node`), answers the identity reads in `CLOUD_LOCAL_OPS` itself,
 and relays the operations in `CLOUD_OP_ACTIONS` (`crates/fluxbee_sdk/src/cloud.rs`) to SY.admin as
-`ADMIN_COMMAND`s. SY.admin checks each relayed action again (`authorize_cloud_relay`,
-`enforce_cloud_relay_content`). The admin action `publish_cloud_endpoint` opens the door. The
+`ADMIN_COMMAND`s. SY.admin admits from IO.cloud only those actions (the A-62 table,
+`authorize_mesh_caller`) and checks what each carries again (`enforce_cloud_relay_content`). The
+admin action `publish_cloud_endpoint` opens the door. The
 contract for Cloud developers is [io-cloud-api.md](../io-cloud-api.md).
 
 ## 7. The control plane
@@ -481,12 +486,16 @@ SY.admin (`src/bin/sy_admin.rs`) runs on the motherbee only. It has two doors:
   (`LOOPBACK_ONLY_PROCESSES`). `GET /admin/actions` lists every action and its route
   (`admin_action_path_patterns`), for example `POST /hives/{hive}/nodes` for `run_node`.
 - **`ADMIN_COMMAND`** messages over the mesh (`meta.type: "admin"`).
-  `dispatch_internal_admin_command` authorizes each caller per action (for example
-  `authorize_wf_rules_caller`, `authorize_cloud_relay`). Archi, IO.cloud and SY.wf-rules use it.
+  `dispatch_internal_admin_command` admits a mesh caller only by the A-62 table
+  (`authorize_mesh_caller`): Archi for every action, IO.cloud for the Cloud-exposed ones, and
+  SY.wf-rules, the orchestrators and the IO, AI and WF nodes each for their own few; a caller on an
+  ingress or egress hive for nothing. The HTTP API and the executor are trusted by their entry
+  point ([SY.admin](../nodes/sy-admin.md#who-may-call-what)).
 
 SY.admin does the work by messages. Node lifecycle goes to `SY.orchestrator@motherbee` as
-`ADMIN_COMMAND`s (`action_routes_via_local_orchestrator`); the orchestrator accepts mutating ones
-only from `SY.admin@<its hive>` (`is_allowed_admin_source_name`). Updates go to
+`ADMIN_COMMAND`s (`action_routes_via_local_orchestrator`); the orchestrator accepts admin messages,
+reads included, only from `SY.admin@<its hive>` (`is_allowed_admin_source_name`), so a spoke's
+orchestrator takes none. Updates go to
 `SY.orchestrator@<hive>` as `SYSTEM_UPDATE`; secrets to SY.vault; identity changes to SY.identity;
 edge rows to SY.edge.
 
@@ -518,8 +527,8 @@ The rules of `fluxbee/system/allow`:
 | --- | --- | --- |
 | 1 | `SY.admin@motherbee` | edge commands: `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` |
 | 2 | `SY.admin@motherbee` | to any hive: `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` |
-| 3 | `SY.orchestrator@<any hive>` | the node lifecycle and inspection actions it forwards, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` |
-| 4 | `SY.admin@<same hive>` | every other protected action |
+| 3 | `SY.orchestrator@motherbee`; for the reads also `SY.orchestrator@<same hive>` | the node lifecycle and inspection actions it forwards, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, and to another hive `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` |
+| 4 | `SY.admin@<same hive>` | every other protected action; `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` never on the motherbee |
 | 5 | `SY.vault@<same hive>` | `NODE_STATUS_GET` |
 | 6 | `RT.gateway@motherbee` | `WAN_REACHABILITY_VOUCH` (§5.2) |
 
@@ -575,13 +584,17 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
 | 3000/tcp | motherbee, 127.0.0.1 | SY.architect (Archi) | no authentication |
 | 8384/tcp | every hive that runs Syncthing, 127.0.0.1 | Syncthing GUI and REST API | used by the orchestrator |
 | 5432/tcp | motherbee | PostgreSQL | the URL `fluxbee-firstboot` stores points at `127.0.0.1:5432` |
-| 22/tcp | a box being joined | sshd | the motherbee uses it only while `add_hive` runs, then revokes its access |
+| 22/tcp | a box being joined | sshd | the motherbee uses it only while `add_hive` runs, then revokes its access; an ingress takes it only from loopback, the motherbee and `ingress.ssh_allow_from` |
 
-Nodes and routers inside a hive talk over Unix sockets and shared memory, never TCP. Where ufw or
-firewalld is installed, the orchestrator opens the WAN port, 9100/tcp on the motherbee
-(`ensure_core_firewall_local`), and 22000/tcp for Syncthing on the motherbee only
-(`syncthing_firewall_rules`): every Syncthing link is TCP and a spoke only dials. On an egress
-hive nftables owns inbound traffic instead (`inet fluxbee_egress`, `reconcile_egress_nat`).
+Nodes and routers inside a hive talk over Unix sockets and shared memory, never TCP. Every
+Syncthing link is TCP and a spoke only dials. The orchestrator writes no rule to ufw or firewalld;
+an active one is a `host_firewall_active` posture alert, since it may close 9000, 9100, 22000 or
+443. The DMZ hosts filter SSH with tables of their own ([control-path hardening
+§6](../control-path-hardening-v1.md)): the ingress accepts it only from loopback, the motherbee's
+address in its `wan.uplinks` and `ingress.ssh_allow_from` (`inet fluxbee_ingress`,
+`reconcile_ingress_ssh`; an input that fails keeps the rules in force), and the egress drops it on
+`wan_iface` when `egress.ssh_from_wan` is false, in the table that owns its NAT
+(`inet fluxbee_egress`, `reconcile_egress_nat`).
 
 ## 10. Limits to know
 
@@ -589,8 +602,6 @@ hive nftables owns inbound traffic instead (`inet fluxbee_egress`, `reconcile_eg
   revocation list and no pinning (`MeshTlsMaterial::server_config`, `tls_accept`). The motherbee's
   hive registry (§5.1) stands in for revocation: a removed hive's leaf stays valid, but the hive is
   no longer admitted.
-- Rule 3 of the system policy has no direction: any hive's orchestrator, the ingress's included, may
-  send those actions to any hive (comment above `orchestrator_actions` in `policy/system.rego`).
 - Hub-vouched reachability exists only on a spoke's gateway router, so a frame relayed spoke to
   motherbee to spoke cannot reach a node on that spoke's non-gateway router
   (`remote_source_from_gateway`).

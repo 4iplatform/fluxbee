@@ -45,7 +45,9 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       deletes the identity keys of hives the registry does not have
       (`sweep_orphan_identity_keys`);
    4. starts `rt-gateway` and waits up to 30 s for it and its SHM (`wait_for_router_ready`; fatal);
-   5. opens the core firewall ports and reconciles egress (fatal only on the egress role);
+   5. reports an active ufw or firewalld (`report_active_host_firewalls`), applies the ingress'
+      SSH table on the ingress role (`reconcile_ingress_ssh`, never fatal), and reconciles egress
+      (fatal only on the egress role);
    6. starts Syncthing if blob or dist sync is enabled (a failure only warns);
    7. starts each `system_nodes.<role>.nodes` service in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
@@ -68,9 +70,10 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
 ### ORCHESTRATOR_BOOTING
 
 From step 4 to step 7 the orchestrator is on its router but not ready. `run_admin_worker` answers
-every admin command with `ORCHESTRATOR_BOOTING`, "the orchestrator is still booting; retry
-shortly", until `booted` is set. System messages are handled during that time. SY.admin passes
-the code through to its caller (over HTTP it arrives as a 500).
+every admin command from its own hive's SY.admin with `ORCHESTRATOR_BOOTING`, "the orchestrator is
+still booting; retry shortly", until `booted` is set (any other caller gets `FORBIDDEN` first, see
+[Messages](#messages)). System messages are handled during that time. SY.admin passes the code
+through to its caller (over HTTP it arrives as a 500).
 
 ## System nodes per role
 
@@ -140,6 +143,11 @@ same way, with `managed: false`.
 `requested_runtime_version` (default `current`), `launched_by`, and when known `runtime`,
 `runtime_version`, `runtime_base`, `package_path`, `ilk_id`, `tenant_id`.
 
+An ILK id is taken and stored in its canonical form, `ilk:<uuid>` lowercase and hyphenated
+(`canonical_prefixed_id`), the only form SY.identity and SY.admin take: the request's `ilk_id`, the
+one SY.identity answers, the identity map (an older map's other forms are read canonical), and
+`_system.ilk_id`.
+
 - **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false`; `start_node` and
   `restart_node` set it `true` (`set_node_relaunch_on_boot`). A crash does not change it.
 - **`launched_by`** is the request's `launched_by` (up to 128 characters of `[A-Za-z0-9._-@]`),
@@ -154,7 +162,23 @@ same way, with `managed: false`.
   names (FINDINGS A-39).
 - **Stop and removal.** `kill_node` runs `systemctl stop` and `reset-failed` on the unit. With
   `purge_instance`, and in `remove_node_instance` (refused while the node runs), it also removes
-  the instance directory and asks SY.admin to delete the node's ILK and the secrets it owns.
+  the instance directory and sends one `teardown_node {node_name, ilk_id}` to
+  `SY.admin@motherbee` (`teardown_node_via_admin`, 120 s, since each of SY.admin's store calls can
+  take 30 s; [control-path hardening §2](../control-path-hardening-v1.md)). SY.admin checks that
+  the node is on the caller's hive and that the ILK is the node's, deletes the secrets dedicated to
+  the ILK, then marks and purges the ILK. The answer reports each step in `ilk_deleted`,
+  `ilk_delete` (with `ilk_delete_error` when that step is not `ok`) and `vault_secrets_purged`
+  (`teardown_node_report`). An error answer never reads `ok`: a refusal before any step
+  (`NODE_ILK_MISMATCH`, `UNAUTHORIZED`, `INVALID_REQUEST`, an older SY.admin), or a request that
+  never reached SY.admin (`TEARDOWN_NOT_DELIVERED`), makes both steps errors with its code;
+  `TEARDOWN_INCOMPLETE` names the step that failed; `not_found` (the ILK was already gone) is an
+  `ok` ILK step with nothing deleted. With no answer (a timeout above all) the outcome is unknown,
+  never "nothing deleted": both steps read `unknown` with `TEARDOWN_UNKNOWN`, `ilk_deleted` and the
+  counts are null, and the error names the ILK to check (`teardown_node_unknown`). The motherbee
+  waits 150 s for a spoke's purging `KILL_NODE` or `REMOVE_NODE_INSTANCE`
+  (`TEARDOWN_FORWARD_TIMEOUT_SECS`). The node's identity-map entry is already gone by then, so a
+  retry of the purge does not find the ILK again: the answer's `ilk_delete.ilk_id` is what to clean
+  up by hand.
 
 ## Hives: add_hive and remove_hive
 
@@ -199,6 +223,23 @@ LAN leg is in place, and reports what it read (`egress_nat_applied`, `egress_ipv
 `egress_ipv6_blocked`, `egress_lan_leg_ok`); any of them missing fails the join with
 `EGRESS_NAT_NOT_READY` (`EGRESS_NAT_NOT_VERIFIED` when the box cannot be read).
 
+**SSH on the DMZ hosts** ([control-path hardening §6](../control-path-hardening-v1.md)). An
+ingress join takes `ssh_allow_from` (an array of IP addresses or networks, ingress only;
+`resolve_add_hive_ssh_allow_from`; any other role refuses it with `INVALID_REQUEST`) and writes it
+into the ingress' hive.yaml as `ingress.ssh_allow_from`. Before it installs anything (once the box
+has settled, before the sudoers grant), it reads the motherbee's source address over the
+bootstrap session (`SSH_CONNECTION_COMMAND`, outside sudo) and checks it against the allow set the
+ingress will apply: the uplink address the join writes, plus `ssh_allow_from`
+(`ingress_join_ssh_source_refusal`). An address outside it fails the join with
+`SSH_SOURCE_NOT_ALLOWED`, naming the address to add through `ssh_allow_from`
+(`SSH_SOURCE_NOT_VERIFIED` when it cannot be read), so the join's later SSH steps (hardening, key
+revoke) always come from an allowed address. The answer lists the set as `ingress_ssh_allow`. An
+egress join takes `egress.ssh_from_wan` (default true) and writes it into the egress' hive.yaml;
+with `false` it refuses, with `SSH_FROM_WAN_LOCKOUT`, a join whose packets come in on `wan_iface`:
+the interface the box routes the session's client through, as `ip -o route get <client>` names it
+(`EGRESS_SSH_ARRIVAL_COMMAND`, `egress_join_ssh_from_wan_refusal`). It answers
+`egress_ssh_from_wan`.
+
 The URL the egress' internet probe GETs is the request's `egress.reachability_url`, else the
 motherbee's own `egress.reachability_url`. It must be an `https://` URL with a host
 (`validate_reachability_url`, checked when the join is accepted). The join writes it into the
@@ -218,9 +259,12 @@ spoke's orchestrator (8 s), unlinks the spoke from Syncthing and deletes
 runs one second later (timer accuracy 100 ms) in a transient unit of its own
 (`remove_hive_cleanup_command`, `systemd-run` like the orchestrator's self-restart), so stopping
 sy-orchestrator does not cut it short: it deletes the spoke's TLS material and identity key first,
-then stops its core services, Syncthing and the managed nodes, and clears the node state. A spoke
+then stops its core services, Syncthing and the managed nodes, and clears the node state. An
+ingress, by its own role, then drops its SSH table and `fluxbee-ingress-nft.service`
+(`ingress_teardown_script`), once its orchestrator is stopped and cannot load them again. A spoke
 takes `REMOVE_HIVE_CLEANUP` only from `SY.orchestrator@motherbee`, as its router stamps the
-sender. There is no SSH fallback: an offline spoke is cleaned up locally only.
+sender. There is no SSH fallback: an offline spoke is cleaned up locally only, and the answer's
+`warning` says what stays on a removed egress or ingress the cleanup did not reach.
 `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` are refused on the motherbee
 (`spoke_only_action_refusal`).
 
@@ -261,8 +305,8 @@ and waits until it is idle: default 30 s, at most 300 s.
 The orchestrator runs Syncthing as `fluxbee-syncthing.service` (`syncthing_unit_contents`):
 user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the GUI and API on
 `127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. Every link
-is TCP to the motherbee's static address, so only the motherbee opens a port, 22000/tcp; a spoke
-only dials and opens none (`syncthing_firewall_rules`).
+is TCP to the motherbee's static address, so only the motherbee listens off loopback, on
+22000/tcp; a spoke only dials (`syncthing_owned_listen_address`).
 
 | Folder | Holds | Who gets it |
 | --- | --- | --- |
@@ -290,10 +334,37 @@ there and renamed into `blob/agent-assets` is never sent half-written.
 
 What the code does today:
 
-- **Firewall ports** (`ensure_core_firewall_local`): the `wan.listen` port, and on the motherbee
-  the identity sync port (9100). Rules go through `ufw allow` and `firewall-cmd` when present
-  (`open_firewall_rules_local`); with neither, it only warns. FINDINGS A-46 notes ufw is inactive
-  on the hives, so these rules have no effect there. The egress role skips this.
+- **SSH on the ingress** (`reconcile_ingress_ssh`, [control-path hardening
+  §6](../control-path-hardening-v1.md)): a `table inet fluxbee_ingress` whose input chain accepts
+  SSH, on the ports `sshd -T` reports (`port` lines and each `listenaddress`'s port), from loopback
+  and from the allow set only, and drops all other SSH, IPv4 and IPv6; nothing else is filtered
+  (`ingress_nft_ruleset`). The allow set is the motherbee's address from the hive's own
+  `wan.uplinks` (a hostname is resolved, IPv4 and IPv6) plus `ingress.ssh_allow_from`,
+  deduplicated and without an entry another one covers (`ssh_allow_set`). It is reconciled at
+  boot and about every 60 s (at once when a loaded table vanished), like the egress table: add +
+  flush + define in one `nft -f`, saved in `/etc/nftables.d/fluxbee-ingress.nft` once nft has
+  loaded it, and loaded at boot by `fluxbee-ingress-nft.service` (`apply_nft_table`,
+  `ensure_nft_boot_unit`). The sources are inline, never a named set: `flush table` keeps a named
+  set's elements. Only a complete input set renders a new table (`ingress_ssh_action`), and an
+  unchanged one is neither loaded again nor logged while its table is there. When `sshd -T` fails
+  only because `/run/sshd` is missing (at boot before ssh.service is up, or on a socket-activated
+  host before its first connection), the orchestrator creates it as ssh.service would (root, 0755)
+  and asks once more (`sshd_listen_ports_with`). An input that fails (hive.yaml, `sshd -T`, an
+  uplink that does not resolve), an invalid `ssh_allow_from` entry or an empty allow set never
+  narrows or loosens the table: the rules in
+  force stay, the saved ruleset is loaded again if the table is gone, and a `posture` alert is
+  recorded (`ingress_ssh_input_failed`, a warning; `ingress_ssh_rules_failed`;
+  `ingress_ssh_allow_set_empty`); a failed load records `ingress_ssh_rules_failed`. Recovery: the
+  hypervisor console, or `ingress.ssh_allow_from` in the ingress' hive.yaml and an orchestrator
+  restart.
+- **SSH on the egress' WAN**: with `egress.ssh_from_wan: false` (default true, D31) the
+  `fluxbee_egress` table's input chain drops SSH, on the same ports, arriving on `wan_iface`
+  (`egress_nft_ruleset`). When `sshd -T` cannot say, it keeps the ports the saved ruleset drops
+  (`egress_wan_ssh_ports`); with none saved it drops port 22 and records `egress_ssh_ports_unknown`.
+- **Host firewalls** (`report_active_host_firewalls`): the orchestrator writes no rule to ufw or
+  firewalld. At boot and about once a minute it records a `posture` alert `host_firewall_active`
+  when `ufw status` says `Status: active` or the `firewalld` unit runs, since either may close
+  9000, 9100, 22000 or 443 without anyone seeing it.
 - **Loopback check** (`watchdog_listener_check`): about once a minute it runs `ss -H -tlnp` and,
   if `sy-admin` or `sy-architect` listens off loopback, logs a warning and records a `posture`
   drift alert. It changes nothing.
@@ -321,7 +392,8 @@ Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every servi
 `system_nodes` list with `systemctl is-active`, and runs `systemctl start` on any that is not
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
 the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
-egress, and runs the loopback check.
+egress and the ingress' SSH table, reports an active host firewall (`watchdog_host_rules`), and runs
+the loopback check.
 
 To keep a core unit stopped, for a test or a repair, mask it for this boot and stop it:
 `systemctl mask --runtime <unit>` (the lab notes in `lab/DEPLOYMENTS.md` and
@@ -335,14 +407,17 @@ get_storage, set_storage, list_nodes, list_tenant_nodes, list_versions, get_vers
 list_runtimes, get_runtime, run_node, start_node, restart_node, kill_node, remove_node_instance,
 get_node_config, set_node_config, get_node_state, get_node_status, list_deployments,
 get_deployments, list_drift_alerts, get_drift_alerts, record_drift_alert, list_hives, get_hive,
-add_hive, remove_hive, core_rollback. Anything else answers `NOT_IMPLEMENTED`. Mutating actions
-are accepted only from `SY.admin@<this hive>` (`admin_action_requires_origin`,
-`is_allowed_admin_source_name`), else `FORBIDDEN`.
+add_hive, remove_hive, core_rollback. Anything else answers `NOT_IMPLEMENTED`. Every admin
+message, reads included, is accepted only from `SY.admin@<this hive>` as the router stamps the
+sender (`is_allowed_admin_source_name`, checked first in `run_admin_worker`), else `FORBIDDEN` and
+a warning in the log ([control-path hardening §3](../control-path-hardening-v1.md)). SY.admin
+addresses only its own hive's orchestrator, and a spoke runs no SY.admin, so a spoke's
+orchestrator takes no admin message at all.
 
 **`record_drift_alert`** is how SY.admin's certificate conditions reach the drift store, which
-only the orchestrator writes ([ACME design §7](../acme-edge-certificates-v1.md)). It is a write
-for the origin check above, and its flow takes it only from `SY.admin@motherbee` as the router
-stamps the sender (`certificate_condition_from_request`), else `FORBIDDEN`. The payload is
+only the orchestrator writes ([ACME design §7](../acme-edge-certificates-v1.md)). Past the inbox
+check above, its flow takes it only from `SY.admin@motherbee` as the router stamps the sender
+(`certificate_condition_from_request`), else `FORBIDDEN`. The payload is
 `{category, kind, severity, hive, detail, state}`:
 
 - `category` is `certificate`, and `kind` one of `renewal_failed`, `renewal_overdue`, `expiring`,
@@ -364,8 +439,9 @@ the last hour keeps a new one out. The answer is `{status: "ok", recorded}`, wit
 `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `NODE_STATE_GET`,
 `NODE_STATUS_GET`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
 `INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`. `RUNTIME_UPDATE` is refused.
-The router delivers these protected actions only from allowed origins (`policy/system.rego`: any
-`SY.orchestrator@<hive>` for the node and handshake actions, rule (3); `SY.admin@motherbee` for
+The router delivers these protected actions only from allowed origins (`policy/system.rego`:
+`SY.orchestrator@motherbee` for the node and handshake actions, and also this hive's own
+orchestrator for the reads, rule (3); `SY.admin@motherbee` for
 `SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)).
 
 ## Config
@@ -375,7 +451,8 @@ The router delivers these protected actions only from allowed origins (`policy/s
 true; `path`, default `/var/lib/fluxbee/blob`; `sync`, default off, tool `syncthing`, `api_port`
 8384, `data_dir`; `gc`), `dist` (`path`, default `/var/lib/fluxbee/dist`; sync on by default),
 `identity.sync.port` (default 9100), `government`, `system_nodes`, `egress` (with
-`reachability_url`, the internet probe's target; no default), `ai`.
+`reachability_url`, the internet probe's target, no default; and `ssh_from_wan`, default true),
+`ingress.ssh_allow_from` (the ingress' extra SSH sources), `ai`.
 
 Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
 `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`
@@ -393,6 +470,7 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 | `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees |
 | `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
 | `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |
+| `/etc/nftables.d/fluxbee-egress.nft`, `/etc/nftables.d/fluxbee-ingress.nft` | the egress' and the ingress' tables, loaded at boot by `fluxbee-egress-nft.service` and `fluxbee-ingress-nft.service` |
 | `/var/lib/fluxbee/syncthing/` | the Syncthing home |
 
 ## Failure behavior

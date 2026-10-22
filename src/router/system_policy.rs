@@ -24,7 +24,7 @@
 //!
 //! Composition contract: `final_allow = system_allow AND user_allow`, and a SYSTEM deny is
 //! FINAL — the user layer may only narrow, never broaden, and can never sever the cross-hive
-//! control plane (`SY.orchestrator@<any-hive>`).
+//! control plane (`SY.orchestrator@motherbee` toward every hive, rule (3)).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -384,16 +384,20 @@ mod tests {
     fn authorize_system_enforces_role_and_hive_scope() {
         let hive = "motherbee";
         let act = "SPAWN_NODE"; // a mutation, strict scope
-                                // SY.orchestrator: any hive (cross-hive forwards).
+                                // SY.orchestrator: only the motherbee's (rule (3) has a direction).
         assert!(authorize_system(
             act,
             Some("SY.orchestrator@motherbee"),
             hive
         ));
-        assert!(authorize_system(act, Some("SY.orchestrator@worker1"), hive));
         assert!(authorize_system(
             act,
-            Some("  SY.orchestrator@worker1  "),
+            Some("  SY.orchestrator@motherbee  "),
+            hive
+        ));
+        assert!(!authorize_system(
+            act,
+            Some("SY.orchestrator@worker1"),
             hive
         ));
         // Exact role label (rejects relay/sub-name spoof) + non-empty hive.
@@ -534,40 +538,49 @@ mod tests {
         }
     }
 
+    /// Rule (3)'s mutations other than the join/leave handshake (`orchestrator_mutations` in
+    /// `policy/system.rego`).
+    const ORCHESTRATOR_MUTATIONS: [&str; 7] = [
+        "SPAWN_NODE",
+        "KILL_NODE",
+        "START_NODE",
+        "RESTART_NODE",
+        "REMOVE_NODE_INSTANCE",
+        "NODE_CONFIG_SET",
+        "SYSTEM_CORE_ROLLBACK",
+    ];
+
+    /// The join/leave handshake: mutations that run only on the hive being added or removed.
+    const SPOKE_ONLY_ACTIONS: [&str; 2] = ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
+
+    /// Rule (3)'s reads (`orchestrator_reads`).
+    const ORCHESTRATOR_READS: [&str; 7] = [
+        "NODE_CONFIG_GET",
+        "NODE_STATE_GET",
+        "NODE_STATUS_GET",
+        "LIST_NODES",
+        "GET_VERSIONS",
+        "GET_RUNTIMES",
+        "GET_RUNTIME",
+    ];
+
     /// Rule (3) grants an orchestrator exactly what it forwards to another hive's orchestrator
     /// (node lifecycle and inspection, the hive join/leave handshake) — verified against
-    /// sy_orchestrator on 2026-10-01 — and nothing else.
+    /// sy_orchestrator on 2026-10-01 — and nothing else. Who may send each of them where is
+    /// `rule_3_has_a_direction`.
     #[test]
     fn orchestrators_get_exactly_what_they_forward() {
-        let forwarded = [
-            "SPAWN_NODE",
-            "KILL_NODE",
-            "START_NODE",
-            "RESTART_NODE",
-            "REMOVE_NODE_INSTANCE",
-            "NODE_CONFIG_GET",
-            "NODE_CONFIG_SET",
-            "NODE_STATE_GET",
-            "NODE_STATUS_GET",
-            "LIST_NODES",
-            "GET_VERSIONS",
-            "GET_RUNTIMES",
-            "GET_RUNTIME",
-            "SYSTEM_CORE_ROLLBACK",
-            "ADD_HIVE_FINALIZE",
-            "REMOVE_HIVE_CLEANUP",
-        ];
-        for action in forwarded {
-            for (orchestrator, receiving_hive) in [
-                ("SY.orchestrator@motherbee", "worker1"),
-                ("SY.orchestrator@worker1", "motherbee"),
-                ("SY.orchestrator@ingress1", "ingress1"),
-            ] {
-                assert!(
-                    authorize_system(action, Some(orchestrator), receiving_hive),
-                    "{orchestrator} must be admitted for {action} on {receiving_hive}"
-                );
-            }
+        let forwarded: Vec<&str> = ORCHESTRATOR_MUTATIONS
+            .iter()
+            .chain(SPOKE_ONLY_ACTIONS.iter())
+            .chain(ORCHESTRATOR_READS.iter())
+            .copied()
+            .collect();
+        for action in &forwarded {
+            assert!(
+                authorize_system(action, Some("SY.orchestrator@motherbee"), "worker1"),
+                "SY.orchestrator@motherbee must be admitted for {action} on worker1"
+            );
         }
         let never_sent = [
             "CONFIG_SET",
@@ -592,11 +605,17 @@ mod tests {
             .chain(edge.iter())
             .chain(["WAN_REACHABILITY_VOUCH"].iter())
         {
-            for receiving_hive in ["motherbee", "worker1", "ingress1"] {
-                assert!(
-                    !authorize_system(action, Some("SY.orchestrator@ingress1"), receiving_hive),
-                    "an orchestrator must not be admitted for {action} on {receiving_hive}"
-                );
+            for orchestrator in [
+                "SY.orchestrator@motherbee",
+                "SY.orchestrator@worker1",
+                "SY.orchestrator@ingress1",
+            ] {
+                for receiving_hive in ["motherbee", "worker1", "ingress1"] {
+                    assert!(
+                        !authorize_system(action, Some(orchestrator), receiving_hive),
+                        "{orchestrator} must not be admitted for {action} on {receiving_hive}"
+                    );
+                }
             }
         }
         // Completeness: every protected action is placed on purpose — forwarded by orchestrators,
@@ -611,6 +630,103 @@ mod tests {
         let mut all = PROTECTED_SYSTEM_ACTIONS.to_vec();
         all.sort_unstable();
         assert_eq!(placed, all);
+    }
+
+    /// Rule (3) has a direction (FINDINGS A-20, docs/control-path-hardening-v1.md §3 and §10):
+    /// every orchestrator message that crosses hives goes from the motherbee to a spoke. A
+    /// mutation comes only from the motherbee's orchestrator, never from a spoke's, not even on its
+    /// own hive; a read comes from the motherbee's orchestrator or from the answering hive's own;
+    /// the join/leave handshake is never admitted on the motherbee itself.
+    #[test]
+    fn rule_3_has_a_direction() {
+        // The cases the design names.
+        assert!(!authorize_system(
+            "SPAWN_NODE",
+            Some("SY.orchestrator@ingress1"),
+            "motherbee"
+        ));
+        assert!(!authorize_system(
+            "NODE_CONFIG_SET",
+            Some("SY.orchestrator@worker1"),
+            "worker1"
+        ));
+        assert!(authorize_system(
+            "NODE_STATUS_GET",
+            Some("SY.orchestrator@worker1"),
+            "worker1"
+        ));
+        assert!(!authorize_system(
+            "LIST_NODES",
+            Some("SY.orchestrator@ingress1"),
+            "motherbee"
+        ));
+        assert!(!authorize_system(
+            "ADD_HIVE_FINALIZE",
+            Some("SY.orchestrator@motherbee"),
+            "motherbee"
+        ));
+        assert!(authorize_system(
+            "SYSTEM_CORE_ROLLBACK",
+            Some("SY.orchestrator@motherbee"),
+            "ingress1"
+        ));
+        // The whole table: every action of rule (3), from every hive's orchestrator to every hive.
+        let hives = ["motherbee", "worker1", "ingress1", "egress1"];
+        for receiving_hive in hives {
+            for sending_hive in hives {
+                let orchestrator = format!("SY.orchestrator@{sending_hive}");
+                let from_motherbee = sending_hive == "motherbee";
+                let on_a_spoke = receiving_hive != "motherbee";
+                let same_hive = sending_hive == receiving_hive;
+                let mut expected: Vec<(&str, bool)> = Vec::new();
+                expected.extend(ORCHESTRATOR_MUTATIONS.map(|action| (action, from_motherbee)));
+                expected.extend(
+                    SPOKE_ONLY_ACTIONS.map(|action| (action, from_motherbee && on_a_spoke)),
+                );
+                expected
+                    .extend(ORCHESTRATOR_READS.map(|action| (action, from_motherbee || same_hive)));
+                for (action, admitted) in expected {
+                    assert_eq!(
+                        authorize_system(action, Some(&orchestrator), receiving_hive),
+                        admitted,
+                        "{orchestrator} sending {action} to {receiving_hive}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The join/leave handshake is never admitted on the motherbee, from anyone: neither rule (3)
+    /// nor rule (4) grants it there, where it would restart or stop the core. On a spoke it comes
+    /// from the motherbee's orchestrator (3) or the spoke's own admin (4).
+    #[test]
+    fn the_join_leave_handshake_is_never_admitted_on_the_motherbee() {
+        let hives = ["motherbee", "worker1", "ingress1"];
+        for receiving_hive in hives {
+            for sending_hive in hives {
+                for role in ["SY.orchestrator", "SY.admin"] {
+                    let sender = format!("{role}@{sending_hive}");
+                    let admitted = receiving_hive != "motherbee"
+                        && match role {
+                            "SY.orchestrator" => sending_hive == "motherbee",
+                            _ => sending_hive == receiving_hive,
+                        };
+                    for action in SPOKE_ONLY_ACTIONS {
+                        assert_eq!(
+                            authorize_system(action, Some(&sender), receiving_hive),
+                            admitted,
+                            "{sender} sending {action} to {receiving_hive}"
+                        );
+                    }
+                }
+            }
+        }
+        // Rule (4) keeps every other protected action of the motherbee's admin there.
+        assert!(authorize_system(
+            "SPAWN_NODE",
+            Some("SY.admin@motherbee"),
+            "motherbee"
+        ));
     }
 
     #[test]

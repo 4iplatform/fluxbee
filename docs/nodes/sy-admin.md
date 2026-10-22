@@ -108,7 +108,8 @@ before any reply was built is answered `INTERNAL_ERROR` (`handle_internal_admin_
 - Every command runs in its own task (`run_internal_admin_loop`). A handler that calls SY.admin
   back (a node teardown, a workflow deploy, an executor plan) would otherwise wait for itself
   (FINDINGS A-67, A-68).
-- The caller is the router-stamped `msg.routing.src_l2_name`, never a field of the payload.
+- The caller is the router-stamped `msg.routing.src_l2_name`, never a field of the payload. The
+  A-62 table admits it or not before anything runs ([Who may call what](#who-may-call-what)).
 - The SDK side is `RouterDispatcher::send_admin_rpc` (named in the request contract of the
   mesh-only actions, `admin_action_request_contract`).
 
@@ -118,25 +119,52 @@ Five commands exist only over the mesh and are not in the catalog: `externalize`
 
 ## Who may call what
 
-The HTTP API and the executor are trusted paths: they reach `dispatch_internal_admin_command`
-with no caller (`None`), and every gate below lets `None` through except `publish_artifact`,
-which needs a producer (and so has no HTTP route). Over the mesh the gates are:
+Every command reaches `dispatch_internal_admin_command` with its origin (`AdminOrigin`): the HTTP
+API on loopback, the executor running the steps of a plan already approved, or the mesh with the
+router-stamped caller. The first two are trusted by their entry point, never by a missing caller.
+A mesh caller is admitted only by the A-62 table ([control-path hardening
+§2](../control-path-hardening-v1.md)), checked before anything else (`authorize_mesh_caller`).
+Anything else answers `403 UNAUTHORIZED` and logs one warning, `mesh caller refused`, naming the
+caller and the action; a command with no stamped caller is refused too.
 
-| Caller | May | Code |
+| Caller | May ask for | Checked in |
 | --- | --- | --- |
-| `IO.cloud@motherbee` | only `CLOUD_EXPOSED_ACTIONS`, plus `externalize`/`unexternalize` of its own channel; payload rules apply (next section) | `authorize_cloud_relay`, `enforce_cloud_relay_content`, `stamp_relay_facts` |
-| `SY.architect@motherbee` | every action, including the Cloud-exposed ones and `get_llm_usage` of all tenants | `authorize_cloud_relay`, `authorize_llm_usage_scope` |
-| `SY.orchestrator@<any hive>` | `delete_ilk`, `vault_list`, `vault_delete` (node teardown), besides the open ones | `ORCHESTRATOR_TEARDOWN_ACTIONS` |
-| `SY.wf-rules@<hive>` | `run_node` although Cloud-exposed; the node actions `run_node`, `restart_node`, `kill_node`, `set_node_config`, `get_node_config`, `get_node_status` only on `WF.*@<its hive>`, with runtime `wf.<name>` on `wf.engine` | `authorize_wf_rules_caller` |
-| `IO.*` node | `externalize`/`unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
-| `AI.*`, `IO.*`, `WF.*` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication); `unpublish_artifact` of its own publications | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
-| any other mesh node | every action not exposed to Cloud, plus `CLOUD_SHARED_ACTIONS` (`get_tenant`, `list_tenants`, `list_tenant_nodes`, `get_node_status`, `start_node`, `kill_node`) | none |
+| any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included | `authorize_llm_usage_scope` |
+| `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
+| `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
+| `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
+| `IO.*@H` (IO.cloud included) | `externalize` and `unexternalize` of a channel it owns; `list_externalized` shows only its rows | `authorize_channel_command`, `filter_externalized_channels_for_caller` |
+| `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact` (the caller needs a complete identity registration; its tenant owns the publication); `AI.*@H` also `unpublish_artifact` of its own publications | `authorize_artifact_publisher`, `resolve_artifact_publisher`, `handle_unpublish_artifact` |
 
-The last row is FINDINGS A-62 (parked on cost/benefit): any node on the router may ask for
-`add_hive`, `vault_get`, `kill_node`, the `opa_*` writes, `publish_cloud_endpoint` and the rest.
-That includes `executor_execute_plan`, and the executor then runs every step as the operator
-(`AdminExecutorStepTool::call` passes `None`), so a one-step plan reaches even the actions the
-gates above reserve.
+- **The table lives next to the catalog.** `mesh_access`, right after `INTERNAL_ACTION_REGISTRY`,
+  gives every action of the catalog and every mesh command off it its row. An action it does not
+  list is closed to the whole mesh, Archi included, and the unit test
+  `every_action_has_a_mesh_decision` fails until it is listed.
+- **A hive's role comes from the hive registry**, `/var/lib/fluxbee/hives/<hive>/info.yaml`
+  (`caller_hive_role`): `status: connected`, its join done, and `role` worker, ingress or egress.
+  It fails closed: no entry, no role, a hive still joining or a removed one gets nothing. The
+  local hive is the motherbee. At start SY.admin logs the role of each registered hive, and a
+  warning for each one that gets none (`log_registry_caller_roles`).
+- **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
+  `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
+- **SY.wf-rules@H's packages**, with only the fields its deploys and deletes send
+  (`go/sy-wf-rules/node/admin.go`):
+  - `publish_runtime_package` `{source: {kind, files}, set_current}`: only an inline package
+    whose `package.json` (read with the publisher's own `PackageMetadata`) says `type: workflow`,
+    `runtime_base: wf.engine` and `name: wf.<x>`, never `wf.engine` itself; so no `sync_to`,
+    `update_to` or bundle upload, and each file under one plain path;
+  - `remove_runtime_version` `{runtime, runtime_version}`: a version of a `wf.<x>`, named in
+    lowercase. A `test_hold_ms` would hold the manifest lock every publish and deploy waits for;
+  - both are refused while a `WF.<x>` is connected on another hive (`workflow_nodes_elsewhere`):
+    the package is the same on every hive. SY.admin reads the connected nodes from shared memory,
+    asking no one (`connected_nodes_from_shm`): the motherbee's own from the regions of its
+    routers, every other hive's from the LSA, as the router reaches them. Regions that cannot be
+    read answer `503 INVENTORY_UNAVAILABLE`, to retry, never `UNAUTHORIZED`;
+  - `sync_hint` `{channel, folder_id, wait_for_idle, timeout_ms}`: only a scan of
+    `fluxbee-dist-runtimes` (channel `dist`) on the motherbee, as a worker's deploy asks for one
+    (`announceRuntimes`), with `timeout_ms` given and at most 5000. A longer wait would hold the
+    motherbee orchestrator's system worker, which takes one message at a time.
 
 Other checks:
 
@@ -144,11 +172,8 @@ Other checks:
   `SY.admin@motherbee` (`admin_origin_authorized`), otherwise `FORBIDDEN`. The router delivers
   them from no one else (rule (2) of `policy/system.rego`), so what reaches SY.admin is its own
   `node_control_config_get`/`node_control_config_set` on `SY.admin@motherbee`, which reads and
-  sets the executor catalog.
-- Over the mesh only `SY.architect@motherbee` may have SY.admin send itself a `CONFIG_SET`:
-  `node_control_config_set`, or `send_node_message` with `msg: CONFIG_SET`, aimed at SY.admin by
-  name or by router UUID. Any other caller gets `UNAUTHORIZED` (`authorize_admin_config_set`).
-  The HTTP API and the executor have no caller and pass; `CONFIG_GET` stays open.
+  sets the executor catalog. Over the mesh only Archi asks for those two and for
+  `send_node_message`.
 - Fanout `externalize` (with `fanout_family`) is operator-only (`handle_externalize`).
 - The HTTP route `POST /artifacts/unpublish` may revoke any tenant's publication
   (`handle_unpublish_artifact` with no caller).
@@ -161,10 +186,11 @@ Other checks:
 
 Fluxbee Cloud reaches SY.admin through `IO.cloud@motherbee` (Cloud → SY.edge → IO.cloud →
 SY.admin). `CLOUD_EXPOSED_ACTIONS` is the one list that both `list_cloud_actions` advertises and
-`authorize_cloud_relay` enforces: `create_tenant`, `vault_put`, `run_node`, `get_ilk`,
-`delete_ilk`, `restore_ilk`, `delete_tenant`, `restore_tenant`, `vault_list`, `vault_delete`,
-`update_tenant`, `set_ilk_tenant`, `vault_assign`, `get_tenant`, `list_tenants`,
-`list_tenant_nodes`, `get_node_status`, `start_node`, `kill_node`, `get_llm_usage`.
+the A-62 table admits from IO.cloud (`authorize_mesh_caller`): `create_tenant`, `vault_put`,
+`run_node`, `get_ilk`, `delete_ilk`, `restore_ilk`, `delete_tenant`, `restore_tenant`,
+`vault_list`, `vault_delete`, `update_tenant`, `set_ilk_tenant`, `vault_assign`, `get_tenant`,
+`list_tenants`, `list_tenant_nodes`, `get_node_status`, `start_node`, `kill_node`,
+`get_llm_usage`.
 
 `enforce_cloud_relay_content` re-checks what IO.cloud sends, so a compromised relay cannot widen
 it:
@@ -201,6 +227,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
 | identity actions | `SY.identity@<hive>` | `ILK_*`, `TNT_*` (`handle_identity_command`, `handle_identity_query`) |
 | vault actions | `SY.vault@motherbee`; another hive is refused with `400 INVALID_REQUEST` ("SY.vault runs only on the motherbee") | `VAULT_*` (`handle_vault_command`) |
+| `teardown_node` | `SY.identity@motherbee`, then `SY.vault@motherbee`, then SY.identity again | `ILK_GET`, `VAULT_LIST`, `VAULT_DELETE`, `ILK_DELETE`, `ILK_PURGE` ([Node teardown](#node-teardown)) |
 | `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core or vendor; default runtime), `SYSTEM_SYNC_HINT` |
 | `opa_*` writes | `SY.opa.rules@motherbee`, then waits for every hive's answer | `CONFIG_CHANGED`, subsystem `opa` (`send_opa_config_changed`) |
 | `opa_check` | `SY.opa.rules@motherbee` only; nothing is announced | `CONFIG_CHANGED`, action `check`, `version: 0` (a check takes no number from the counter); the answer is matched on the `config.check_id` it echoes (`send_opa_check`) |
@@ -217,6 +244,8 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
 (`JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS`; the join itself runs in the background), `update` 60,
 `sync_hint` 45, `core_rollback` 300, `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
+`kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
+orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
 catalog/help/timer/`hive_status`/`list_streams` 5 (`JSR_ADMIN_TIMEOUT_SECS`), everything else 30
 (`JSR_ADMIN_ORCH_TIMEOUT_SECS`).
 
@@ -227,6 +256,47 @@ answers every admin command with `ORCHESTRATOR_BOOTING` ("the orchestrator is st
 retry shortly", `run_admin_worker` in `src/bin/sy_orchestrator.rs`). SY.admin passes the code
 through unchanged. The code is not in `error_code_to_http_status`, so over HTTP it arrives as a
 500. Retry after a few seconds.
+
+## Node teardown
+
+`teardown_node {node_name, ilk_id}` removes what a purged node leaves in the stores
+(`handle_teardown_node`). `SY.orchestrator@H` asks for it for a node of H when `kill_node` runs
+with `purge_instance`; the operator (`POST /hives/{hive}/nodes/{node_name}/teardown`, body
+`{"ilk_id": "ilk:<uuid>"}`, a bare node name being a node of the path's hive), Archi and the
+executor may ask for it too. In order:
+
+1. **The request**: a node `<role>@<hive>` of the kind run_node launches (never `SY.*` or
+   `RT.*`) and its ILK as `ilk:<uuid>` in canonical form, else `400 INVALID_REQUEST`. **A node
+   still connected is alive**: only its own orchestrator, whose call follows its kill, tears it
+   down then. Anyone else gets `409 NODE_STILL_CONNECTED` while the shared-memory regions list
+   the node, or `503 INVENTORY_UNAVAILABLE` when they cannot be read, and nothing is removed
+   (`teardown_live_node_refusal`). Otherwise a node redeployed onto the ILK of a teardown that
+   failed half-way could be purged alive.
+2. **The ILK is the node's**: `ILK_GET` to SY.identity, whose `identification.node_name` must be
+   the node, else `409 NODE_ILK_MISMATCH` and nothing is removed. An ILK SY.identity does not
+   hold is reported `not_found` and skips step 4. Over the mesh it skips step 3 too, since
+   nothing ties those secrets to the node any more; the operator's teardown (HTTP, the executor)
+   still deletes them.
+3. **Its secrets**: `VAULT_LIST` with `filter.ilk`, then `VAULT_DELETE` of each in its own tenant,
+   through `handle_vault_command` like every admin vault call.
+4. **The ILK**: `ILK_DELETE` (the mark), then `ILK_PURGE`; `ILK_NOT_FOUND` counts as done.
+
+The secrets go first because the ILK is what ties them to the node: when one cannot be deleted,
+step 4 does not run, so a retry can still prove which secrets are the node's. The payload is the
+same whatever happened:
+
+```json
+{
+  "node_name": "AI.sales@worker1", "ilk_id": "ilk:...", "ilk_deleted": true, "not_found": false,
+  "vault_secrets_purged": { "status": "ok", "scanned": 2, "deleted": 2, "errors": [] },
+  "ilk_delete": { "status": "ok" }
+}
+```
+
+`status` is `ok` only when every step was done. Otherwise it is `502 TEARDOWN_INCOMPLETE` with the
+same payload: a step that failed says `error` with `error_code` and `error_detail` (per key in
+`errors`, or on `vault_secrets_purged` itself when the listing failed), and one that did not run
+says `skipped`.
 
 ## The executor
 
@@ -298,7 +368,7 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s.
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
-  hive, origin (`http`, `l2:<caller>`, `internal` or `executor`), redacted params (cut at 2048
+  hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048
   bytes), status, error code, HTTP status and duration. The file rotates every 100 entries and
   keeps 3 rotations. `GET /hives/{hive}/commands` (`list_recent_commands`) reads it: default 50,
   max 500, filters `action`, `status`, `since_ms`. Not logged: `update` and `sync_hint` (comment
@@ -480,7 +550,8 @@ The list of hives is not in hive.yaml: it is the hive registry, `/var/lib/fluxbe
 which `add_hive` creates and `remove_hive` deletes (FINDINGS A-48). The hives a policy write
 waits for, and the ones an OPA read reports as expected (`expected_hives_policy`), are the
 motherbee plus every registry entry whose `info.yaml` says `status: connected`
-(`opa_rollout_hives`, `expected_hive_sets`).
+(`opa_rollout_hives`, `expected_hive_sets`). The A-62 table reads a mesh caller's hive role from
+the same entries (`caller_hive_role`).
 
 ## State on disk
 
@@ -522,7 +593,7 @@ motherbee plus every registry entry whose `info.yaml` says `status: connected`
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 14, 104 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 15, 105 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -534,8 +605,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `list_cloud_actions` | — (no HTTP route) | List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset. |
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
-| `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller becomes the publication owner. |
-| `unpublish_artifact` | — (mesh only) | Revoke a public artifact owned by the calling producer. Mesh-only and identity-bound. |
+| `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
+| `unpublish_artifact` | — (mesh only) | Revoke a public artifact the calling AI.* producer published. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
@@ -562,6 +633,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `restart_node` | `POST /hives/{hive}/nodes/{node_name}/restart` | Restart an existing managed node instance in a hive. |
 | `kill_node` | `DELETE /hives/{hive}/nodes/{node_name}` | Stop a node in a hive. Optional purge_instance also removes its persisted instance directory. |
 | `remove_node_instance` | `DELETE /hives/{hive}/nodes/{node_name}/instance` | Delete a node instance from disk/runtime state. |
+| `teardown_node` | `POST /hives/{hive}/nodes/{node_name}/teardown` | Remove what a torn-down node leaves in the stores: the secrets dedicated to its ILK, then the ILK itself (marked, then purged). |
 | `get_node_config` | `GET /hives/{hive}/nodes/{node_name}/config` | Read the stored effective config.json payload for a managed node. |
 | `set_node_config` | `PUT /hives/{hive}/nodes/{node_name}/config` | Persist node config changes. |
 | `get_node_state` | `GET /hives/{hive}/nodes/{node_name}/state` | Read the persisted state payload of one node. |
@@ -664,4 +736,5 @@ Served by `handle_http`, `handle_hive_paths` and `handle_modules_paths` but not 
 - [IO.cloud API](../io-cloud-api.md): the Cloud side of the relay.
 - [ILK and tenant model](../ilk-tenant-model-v1.md): tenants, Cloud rules.
 - [Host posture spec](../host-posture-and-exposure-spec-v1.md): why SY.admin stays on loopback.
+- [Control-path hardening](../control-path-hardening-v1.md): the A-62 table and `teardown_node`.
 - `lab/logbook/FINDINGS.md`: A-46 (no HTTP auth), A-62 (mesh callers), A-68 (one task per command).

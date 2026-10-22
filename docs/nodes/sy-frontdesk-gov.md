@@ -72,7 +72,20 @@ none), else `SY.frontdesk.gov@<hive>` (`src/config/mod.rs`).
   (`build_frontdesk_handoff_request` in `nodes/io/io-api/src/main.rs`; target
   `IO_API_FRONTDESK_TARGET`, default `SY.frontdesk.gov@motherbee`).
 - IO nodes that use the shared gate (`gate_then_forward` in `nodes/io/common/src/frontdesk_gate.rs`,
-  off unless `io.frontdesk.enabled`).
+  off unless `io.frontdesk.enabled`). Its handoff carries no email, only the channel in
+  `subject.attributes`.
+
+A handoff is a `user` message its producer marks as one, `meta.msg` = `frontdesk_handoff`, whose
+payload parses as one (`parse_frontdesk_handoff` in `nodes/gov/common/src/frontdesk_contract.rs`).
+The payload's shape alone is not enough, since an IO node may relay a payload someone else wrote:
+an unmarked one goes to the conversation, and the log says `frontdesk: not a handoff`.
+
+A handoff is taken only from an IO node: the router-stamped `routing.src_l2_name` must start with
+`IO.` (`frontdesk_handoff_sender_allowed`). Any other sender (an AI or WF node, an SY node, a
+message without a stamped name) gets `INVALID_REQUEST`, nothing is registered or stored, and the
+log says `frontdesk handoff refused: the sender is not an IO node`. The IO node answers for the
+subject it sends, its email included ([control-path hardening](../control-path-hardening-v1.md)
+§7).
 
 ## Handling a message
 
@@ -80,7 +93,8 @@ none), else `SY.frontdesk.gov@<hive>` (`src/config/mod.rs`).
 
 1. `VAULT_SECRET_CHANGED`: re-resolve the AI key (a delete sets `UNCONFIGURED`).
 2. Control plane (`msg_type` `system` or `admin`): `handle_control_plane` (see Config).
-3. A `user` message whose payload parses as a `frontdesk_handoff`: the deterministic path.
+3. A `user` message marked and shaped as a `frontdesk_handoff` (above): the deterministic path,
+   refused unless the sender is an IO node.
 4. A `user` message of a root-tenant case: a final answer (see Case tenant rules).
 5. Everything else is the conversation. A `user` message needs the node `CONFIGURED`, else it
    gets `{"type":"error","code":"node_not_configured","message":"AI node is not configured yet. Retry later.","retryable":true,...}`
@@ -93,9 +107,14 @@ none), else `SY.frontdesk.gov@<hive>` (`src/config/mod.rs`).
   confirmo, correcto, asi es, de acuerdo, dale"), calls `ilk_register` once, and stops. A failed
   registration ends as `completed_error` and is not retried ("STRICT NO-LOOP RULE"). Replies are
   "short in Spanish".
+- The email the person types is only their claim: `ilk_register` sends it as
+  `identification.claimed_email` (see ILK_REGISTER). So a conversation never merges into a
+  registered person on what was typed, and its outcome is the same whether or not that email is
+  known. An email an earlier handoff of the case vouched for goes as `identification.email`.
 - Tools (`build_tool_registry`): `thread_state_get`, `thread_state_put`, `thread_state_delete`,
-  scoped to the sender's `src_ilk` (registered only when there is one), and `ilk_register`, whose
-  description says the tenant "comes with the case: never ask for one".
+  scoped to the sender's `src_ilk` (registered only when there is one), and `ilk_register`. No
+  tool takes an ILK from the model: `ilk_register`'s only parameter is the person's data, and its
+  description says the ILK and the tenant come with the case.
 - Memory: the immediate memory is off (`ImmediateMemorySection::default`, `enabled: false`) and
   CONFIG_SET changes nothing, so what the model keeps between turns is the thread state, one JSON
   file per `src_ilk`. The baked config carries no other `runtime` setting: timeouts, workers and
@@ -113,11 +132,18 @@ The contract (`frontdesk_contract.rs`):
 
 `handle_frontdesk_handoff` runs it with no LLM, no `CONFIGURED` state and no `thread_id`:
 
+- The sender must be an IO node (above), else `INVALID_REQUEST`.
 - `operation` must be `complete_registration`, else `INVALID_REQUEST`.
 - The case tenant is checked first (next section).
+- A field the handoff lacks is taken from the case's thread state, but an email taken that way
+  stays a claim, since the thread state is the LLM's to write. The handoff's own `subject.email` is
+  vouched, and the case keeps it apart until it registers, under `vouched_email:<src_ilk>` in the
+  same store. The LLM's state tools never reach that key (they are scoped to `src_ilk`), so a
+  later turn (a handoff without an email, or the conversation) still registers it as vouched.
 - Missing name or email: `needs_input` / `MISSING_REQUIRED_FIELDS`, and the partial data is kept.
-- Otherwise it calls `ilk_register`. Success: `REGISTERED` (or `MERGED`) and the thread state is
-  deleted. Failure: the state is kept as `completed_error`; sending the handoff again retries.
+- Otherwise it calls `ilk_register`. Success: `REGISTERED` (or `MERGED`, which only a vouched
+  email can give) and the thread state is deleted. Failure: the state is kept as
+  `completed_error`; sending the handoff again retries.
 
 **`register_human` from Fluxbee Cloud.** Cloud → SY.edge → `IO.cloud` (`handle_register_human`
 in `nodes/io/io-cloud/src/main.rs`). It is a local IO.cloud operation that never goes through
@@ -162,24 +188,34 @@ if ilk_tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
 
 ## ILK_REGISTER
 
-`IlkRegisterTool::call` checks a non-empty `src_ilk`, a name and an email, and the case tenant,
-then sends:
+`IlkRegisterTool::call` acts only on the case's own ILK, the message's `src_ilk`
+(`scoped_src_ilk`), never on one the model names: a message without one registers nobody
+(`missing_src_ilk`). It checks a name and an email, and the case tenant, then sends:
 
 ```json
 { "ilk_id": "<src_ilk>", "ilk_type": "human", "tenant_id": "<case tenant>",
-  "identification": { "display_name": "...", "email": "...", "phone": "...", "company_name": "...", "attributes": {} } }
+  "identification": { "display_name": "...", "email": "<vouched or null>", "claimed_email": "<claimed or null>",
+                      "phone": "...", "company_name": "...", "attributes": {} } }
 ```
 
 as `msg_type: system`, `msg: ILK_REGISTER` to `SY.identity@motherbee` (`GovIdentityConfig`:
 `GOV_IDENTITY_TARGET` / `IDENTITY_TARGET`, timeout 10 s, `GOV_IDENTITY_TIMEOUT_MS`). The answer
 is `ILK_REGISTER_RESPONSE`.
 
+The email goes in exactly one of the two keys (`person_identification`, with the tool's
+`email_vouched`):
+
+| Path | Key |
+| --- | --- |
+| A handoff's own `subject.email` (io.api, IO.cloud's `register_human`), or the one an earlier handoff of the case left (`read_vouched_email`) | `email`: vouched. SY.identity merges it into a person of the tenant who already has it. |
+| An email typed in the conversation, or one a handoff takes from the thread state, when it is not the vouched one | `claimed_email`: stored and shown, never indexed, looked up or merged. |
+
 On the identity side `ILK_REGISTER` is accepted only from names starting with
-`SY.frontdesk.gov@` or `SY.orchestrator@`, plus the configured frontdesk name
-(`src/bin/sy_identity.rs`; otherwise `UNAUTHORIZED_REGISTRAR`). SY.identity's own error code is
-kept. The frontdesk maps outcomes to `REGISTERED`, `MERGED`, `IDENTITY_UNAVAILABLE` (transport
-errors), `TENANT_UNRESOLVED`, `TENANT_NOT_REGISTRABLE`, `INVALID_REQUEST` or `REGISTER_FAILED`.
-Logs show which fields were present, never their values.
+`SY.frontdesk.gov@` or `SY.orchestrator@` (an orchestrator only for its own hive's nodes), plus
+the configured frontdesk name (`src/bin/sy_identity.rs`; otherwise `UNAUTHORIZED_REGISTRAR`).
+SY.identity's own error code is kept. The frontdesk maps outcomes to `REGISTERED`, `MERGED`,
+`IDENTITY_UNAVAILABLE` (transport errors), `TENANT_UNRESOLVED`, `TENANT_NOT_REGISTRABLE`,
+`INVALID_REQUEST` or `REGISTER_FAILED`. Logs show which fields were present, never their values.
 
 ## LLM, key and usage records
 
@@ -216,7 +252,9 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 
 - `/var/lib/fluxbee/state/ai-nodes/SY.frontdesk.gov_<hive>/lancedb/threads/`: one JSON file per
   person (`src_ilk`) in registration (`LanceDbThreadStateStore::path_for_node`). It holds the
-  collected name, email, phone and company until a handoff succeeds.
+  collected name, email, phone and company until a handoff succeeds. An email kept there is only
+  ever registered as a claim. Beside it, `vouched_email:<src_ilk>` keeps the email a handoff
+  vouched for until the case registers; only the frontdesk's code writes it.
 - `/var/lib/fluxbee/state/nodes/`: the node UUID.
 - Reads `/etc/fluxbee/hive.yaml` and the identity SHM.
 
@@ -251,6 +289,7 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 - [SY.orchestrator](sy-orchestrator.md): starts it; writes `government.identity_frontdesk` on workers.
 - [SY.vault](sy-vault.md): where its AI key lives.
 - [SY.identity](sy-identity.md): `ILK_REGISTER`, temporary ILKs, merges.
+- [Control-path hardening](../control-path-hardening-v1.md) §7: vouched and claimed emails (A-42).
 - [The router](rt-gateway.md): the forced route to the frontdesk.
 - [ILK and tenant model](../ilk-tenant-model-v1.md): temporary ILKs, tenants as cost centers.
 - [Frontdesk spec](../ai-frontdesk-gov-spec.md): the design.

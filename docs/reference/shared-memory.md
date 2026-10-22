@@ -467,6 +467,6 @@ No service removes a region for good; a writer unlinks one only to create it aga
 | `FLAG_ACTIVE`, `FLAG_DELETED`, `FLAG_STALE`, `FLAG_FROZEN`, `HIVE_FLAG_SELF` | 0x1, 0x2, 0x4, 0x8, 0x10 |
 | `ICH_MAP_FLAG_OCCUPIED`, `ICH_MAP_FLAG_TOMBSTONE` | 0x1, 0x2 |
 | `OPA_STATUS_OK`, `OPA_STATUS_ERROR`, `OPA_STATUS_LOADING` | 0, 1, 2 |
-| `HEARTBEAT_INTERVAL_MS`, `HEARTBEAT_STALE_MS` | 5,000, 30,000 |
+| `HEARTBEAT_STALE_MS` | 30,000 |
 | `SHM_NAME_MAX_LEN` (`SHM_NAME_LIMIT`) | 64 |
 | `SEQLOCK_READ_TIMEOUT_MS` (private) | 5 |

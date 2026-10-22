@@ -174,7 +174,7 @@ What is defined here is the **`text/v1` contract**: the standard structure for c
 ```json
 {
   "routing": { "src": "io.whatsapp@isla1", "dst": "ai.openai@isla1", "ttl": 16, "trace_id": "..." },
-  "meta": { "type": "user", "src_ilk": "io", "ich": "ch-001", "ctx": "ctx-abc", "ctx_seq": 47 },
+  "meta": { "type": "user", "src_ilk": "ilk:<uuid>", "ich": "whatsapp://<entrypoint id>", "thread_id": "thread:sha256:<hex>" },
   "payload": {
     "type": "text",
     "content": "Mirá esta factura",

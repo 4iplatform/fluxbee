@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const FRONTDESK_HANDOFF_PAYLOAD_TYPE: &str = "frontdesk_handoff";
+/// The `meta.msg` its producer stamps on a handoff message.
+pub const FRONTDESK_HANDOFF_MSG: &str = "frontdesk_handoff";
 pub const FRONTDESK_RESULT_PAYLOAD_TYPE: &str = "frontdesk_result";
 pub const FRONTDESK_SCHEMA_VERSION_V1: u32 = 1;
 
@@ -23,6 +25,9 @@ pub struct FrontdeskHandoffPayload {
 pub struct FrontdeskHandoffSubject {
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Vouched: the IO node that sends the handoff answers for it (the integrator holding io.api's
+    /// bearer, the login Fluxbee Cloud authenticated). The frontdesk registers it as the person's
+    /// `identification.email`, where an email already registered in the tenant merges.
     #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
@@ -61,6 +66,28 @@ pub fn parse_frontdesk_handoff_payload(payload: &Value) -> Option<FrontdeskHando
         return None;
     }
     serde_json::from_value(payload.clone()).ok()
+}
+
+/// A handoff is a message its producer marks as one (`meta.msg` is `frontdesk_handoff`) whose
+/// payload parses as one. The payload alone never makes a handoff: an IO node may relay a payload
+/// someone else wrote.
+pub fn parse_frontdesk_handoff(
+    meta_msg: Option<&str>,
+    payload: &Value,
+) -> Option<FrontdeskHandoffPayload> {
+    if meta_msg != Some(FRONTDESK_HANDOFF_MSG) {
+        return None;
+    }
+    parse_frontdesk_handoff_payload(payload)
+}
+
+/// Only an IO node hands a person over, since it vouches for the subject's email
+/// (docs/control-path-hardening-v1.md §7). `src_l2_name` is the sender the router stamped on the
+/// message, never anything the payload says.
+pub fn frontdesk_handoff_sender_allowed(src_l2_name: Option<&str>) -> bool {
+    src_l2_name
+        .map(str::trim)
+        .is_some_and(|sender| sender.starts_with("IO."))
 }
 
 pub fn frontdesk_result_payload(
@@ -111,6 +138,49 @@ mod tests {
         assert_eq!(parsed.operation, "complete_registration");
         assert_eq!(parsed.subject.display_name.as_deref(), Some("Juan Perez"));
         assert_eq!(parsed.tenant_id.as_deref(), Some("tnt:acme"));
+    }
+
+    #[test]
+    fn a_handoff_needs_its_producers_mark() {
+        let payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": { "display_name": "Juan Perez", "email": "juan@example.com" }
+        });
+        assert!(parse_frontdesk_handoff(Some(FRONTDESK_HANDOFF_MSG), &payload).is_some());
+        // The same payload relayed without the mark, or under another message name.
+        for meta_msg in [None, Some(""), Some("text"), Some("FRONTDESK_HANDOFF")] {
+            assert!(
+                parse_frontdesk_handoff(meta_msg, &payload).is_none(),
+                "{meta_msg:?}"
+            );
+        }
+        // The mark without a handoff payload.
+        let text = json!({ "type": "text", "content": "hola" });
+        assert!(parse_frontdesk_handoff(Some(FRONTDESK_HANDOFF_MSG), &text).is_none());
+    }
+
+    #[test]
+    fn only_an_io_node_sends_a_handoff() {
+        for sender in [
+            "IO.api@motherbee",
+            "IO.cloud@motherbee",
+            "IO.slack.support@worker1",
+        ] {
+            assert!(frontdesk_handoff_sender_allowed(Some(sender)), "{sender}");
+        }
+        for sender in [
+            None,
+            Some(""),
+            Some("AI.support@motherbee"),
+            Some("WF.onboarding@motherbee"),
+            Some("SY.admin@motherbee"),
+            Some("SY.frontdesk.gov@motherbee"),
+            Some("io.api@motherbee"),
+        ] {
+            assert!(!frontdesk_handoff_sender_allowed(sender), "{sender:?}");
+        }
     }
 
     #[test]

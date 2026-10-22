@@ -40,8 +40,8 @@
 - `meta.ich` must not be used to represent the external interlocutor or its remote handle.
 
 🧩 **Current state of the core:**
-- `ctx_seq/ctx_window` are not part of the repo's canonical happy path.
-- if they show up in old payloads, they must be treated as legacy/opaque metadata.
+- The message carries no `ctx`, `ctx_seq` or `ctx_window`: they left both SDKs, and the router drops every key that is not a field of `Meta` ([protocol](../reference/protocol.md) §3.1, §3.6).
+- Conversational continuity is `meta.thread_id` alone.
 
 
 
@@ -545,18 +545,23 @@ Normative pipeline:
 
 ---
 
-### Context (`ctx_window`)
+### Conversational context
 
-`ctx_window` is injected by the Router. IO may receive it, but must not forward it to the external channel.
+The router injects no context window into what an IO node receives, and the message carries no
+sequence. The router copies every turn into its stream: SY.storage writes it to the message log
+(`turns`), and when an `AI.*` node sends or receives it, SY.cognition keeps the memory of that
+communication, `(thread_id, the agent)`. The router attaches that memory only to what it delivers
+to the agent (`meta.memory_package`). See [storage](../reference/storage.md) and
+[cognition](../reference/cognition.md).
 
 ---
 
-### Protocol (`meta.ctx` vs `meta.context`)
+### Protocol (`meta.thread_id` vs `meta.context`)
 
-- `meta.ctx`: conversational context
+- `meta.thread_id`: the communication, only there (not in `meta.context.thread_id`)
 - `meta.context`: additional metadata (OPA + temporary carrier for untyped fields)
 - IO channel metadata under `meta.context.io.*`
-- `thread_id`: only in `meta.thread_id` (not in `meta.context.thread_id`)
+- There is no `meta.ctx`.
 
 ---
 

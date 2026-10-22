@@ -1,7 +1,7 @@
 pub mod stream;
 pub mod system_policy;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -22,10 +22,10 @@ use crate::shm::{
     sha256_bytes_to_hex, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader, LsaRegionReader,
     LsaRegionWriter, LsaSnapshot, MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader,
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
-    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
-    ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
-    OPA_STATUS_OK,
+    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, ShmError, TapEntry, VpnAssignment,
+    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE,
+    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
+    OPA_STATUS_LOADING, OPA_STATUS_OK,
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
@@ -96,6 +96,14 @@ const LSA_REJECT_HIVE_MISMATCH: &str = "hive_mismatch";
 const LSA_REJECT_STALE_SEQ: &str = "stale_seq";
 const LSA_REJECT_PARSE_ERROR: &str = "parse_error";
 const LSA_REJECT_NOT_REGISTERED: &str = "not_registered";
+/// A node an LSA lists under another hive's name: dropped, the rest of the LSA applies.
+const LSA_REJECT_FOREIGN_NODE: &str = "foreign_node";
+/// A node an LSA, or the hub's reachability, lists under a UUID that is already taken: by a node of
+/// this hive (dropped) or by another hive's node (then no hive resolves that UUID).
+const LSA_REJECT_DUPLICATE_UUID: &str = "duplicate_uuid";
+/// A WAN frame whose sender is neither a node of the peer that sent it nor one that peer relays as
+/// the hub: dropped.
+const LSA_REJECT_FOREIGN_SOURCE: &str = "foreign_source";
 impl Router {
     pub fn new(cfg: RouterConfig) -> Self {
         let shm = RouterRegionWriter::open_or_create(
@@ -175,10 +183,9 @@ impl Router {
         // source of truth. Refuse to start rather than silently degrade.
         system_policy::ensure_system_policy_loaded().map_err(RouterError::Startup)?;
 
-        ensure_parent_dir(&self.cfg.node_socket_path)?;
-        let _ = std::fs::remove_file(&self.cfg.node_socket_path);
-        let listener = UnixListener::bind(&self.cfg.node_socket_path)?;
-        set_socket_mode(&self.cfg.node_socket_path, 0o666)?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own_uid = unsafe { nix::libc::geteuid() };
+        let listener = listen_local_socket(&self.cfg.node_socket_path)?;
         // The stream joins this router as a node once it listens; never awaited here, since the
         // router accepts nodes only at the end of `run` (§2.1).
         if let Some(runtime) = self
@@ -196,10 +203,7 @@ impl Router {
         );
 
         let irp_path = peer_socket_path(&self.cfg.node_socket_dir, self.cfg.router_uuid);
-        ensure_parent_dir(&irp_path)?;
-        let _ = std::fs::remove_file(&irp_path);
-        let irp_listener = UnixListener::bind(&irp_path)?;
-        set_socket_mode(&irp_path, 0o600)?;
+        let irp_listener = listen_local_socket(&irp_path)?;
         tracing::info!(
             router = %self.cfg.router_l2_name,
             socket = %irp_path.display(),
@@ -355,6 +359,9 @@ impl Router {
                         continue;
                     }
                 };
+                if !local_peer_admitted(&stream, own_uid) {
+                    continue;
+                }
                 let peers = Arc::clone(&peers);
                 let peer_nodes = Arc::clone(&peer_nodes);
                 let peer_routers = Arc::clone(&peer_routers);
@@ -515,6 +522,9 @@ impl Router {
 
         loop {
             let (stream, _) = listener.accept().await?;
+            if !local_peer_admitted(&stream, own_uid) {
+                continue;
+            }
             tracing::info!("incoming connection accepted");
             let shm = Arc::clone(&self.shm);
             let router_name = self.cfg.router_l2_name.clone();
@@ -1446,7 +1456,10 @@ async fn handle_message(
 /// Fire-and-forget tap fanout for one inbound unicast message. For every
 /// installed `TapEntry` where (match_src, match_dst) equals the message's
 /// `(src_l2_name, dst label)`, build a copy with `meta.via_tap = true` and
-/// dispatch it through the normal name-based resolution path. Failures
+/// dispatch it through the normal name-based resolution path. Another hive's
+/// taps, from the LSA, count only when that hive is the message's source or
+/// destination and the target is one of its nodes (`lsa_tap_applies`). A copy
+/// never carries a protected SYSTEM action (`prepare_local_delivery`). Failures
 /// (target unknown, VPN mismatch, remote unreachable) increment per-tap
 /// log lines and drop the copy — they NEVER bubble up to the primary path.
 ///
@@ -1537,6 +1550,9 @@ async fn fanout_taps_for_unicast(
             let tap_src = bytes_to_string(&tap.match_src, tap.match_src_len as usize);
             let tap_dst = bytes_to_string(&tap.match_dst, tap.match_dst_len as usize);
             if tap_src != src_name || tap_dst != dst_name_owned {
+                continue;
+            }
+            if !lsa_tap_applies(snapshot, tap, src_name, &dst_name_owned) {
                 continue;
             }
             let tap_target = bytes_to_string(&tap.target, tap.target_len as usize);
@@ -2107,13 +2123,32 @@ async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
     if peers.len() < 2 {
         return Ok(()); // only a hub (>=2 peers) can relay between spokes
     }
-    let state: Vec<(String, Vec<LsaNode>)> = {
+    let (state, contested) = {
         let guard = ctx.lsa_state.lock().await;
-        guard
+        // A UUID that two hives list resolves to neither here (`find_remote_node`); it is not
+        // vouched for either, so no spoke routes it to one of them.
+        let mut listed_by: HashMap<Uuid, usize> = HashMap::new();
+        for st in guard.values() {
+            let uuids: HashSet<Uuid> = st
+                .nodes
+                .iter()
+                .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
+                .collect();
+            for uuid in uuids {
+                *listed_by.entry(uuid).or_default() += 1;
+            }
+        }
+        let contested: HashSet<Uuid> = listed_by
+            .into_iter()
+            .filter(|(_, hives)| *hives > 1)
+            .map(|(uuid, _)| uuid)
+            .collect();
+        let state: Vec<(String, Vec<LsaNode>)> = guard
             .iter()
             .filter(|(_, st)| st.flags & FLAG_STALE == 0)
             .map(|(hive, st)| (hive.clone(), st.nodes.clone()))
-            .collect()
+            .collect();
+        (state, contested)
     };
     let seq = now_epoch_ms();
     for (target_hive, peer) in peers.iter() {
@@ -2123,6 +2158,9 @@ async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
                 continue; // split-horizon: the target learns its own nodes via its own LSA
             }
             for node in nodes {
+                if Uuid::parse_str(&node.uuid).is_ok_and(|uuid| contested.contains(&uuid)) {
+                    continue;
+                }
                 entries.push(WanReachabilityEntry {
                     uuid: node.uuid.clone(),
                     name: node.name.clone(),
@@ -2179,6 +2217,17 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
         );
         return;
     }
+    // A vouched UUID that is already taken, by a node of this hive or one this router learns from an
+    // LSA, or that the advertisement lists twice, is dropped: a vouch never takes a node's traffic.
+    let mut taken = local_node_uuids(&ctx.nodes, &ctx.peer_nodes).await;
+    taken.extend(lsa_listed_uuids(&*ctx.lsa_snapshot.lock().await));
+    let mut listed: HashMap<Uuid, usize> = HashMap::new();
+    for entry in &payload.entries {
+        if let Ok(uuid) = Uuid::parse_str(&entry.uuid) {
+            *listed.entry(uuid).or_default() += 1;
+        }
+    }
+    let mut duplicate_uuids = Vec::new();
     let now = now_epoch_ms();
     {
         let mut table = ctx.reachability.lock().await;
@@ -2193,6 +2242,10 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
             if entry.hive_id == ctx.hive_id || entry.hive_id == peer_hive || entry.name.is_empty() {
                 continue;
             }
+            if taken.contains(&uuid) || listed.get(&uuid).is_some_and(|count| *count > 1) {
+                duplicate_uuids.push(entry.name);
+                continue;
+            }
             table.insert(
                 uuid,
                 ReachabilityEntry {
@@ -2205,6 +2258,17 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
             );
         }
     }
+    if !duplicate_uuids.is_empty() {
+        let reject_count =
+            count_lsa_rejects(ctx, LSA_REJECT_DUPLICATE_UUID, duplicate_uuids.len() as u64).await;
+        tracing::warn!(
+            reason = LSA_REJECT_DUPLICATE_UUID,
+            peer_hive = %peer_hive,
+            nodes = ?duplicate_uuids,
+            reject_count = reject_count,
+            "WAN_REACHABILITY entries dropped: their UUID is already taken"
+        );
+    }
     rebuild_fib(
         &ctx.fib,
         &ctx.nodes,
@@ -2215,6 +2279,16 @@ async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message
     )
     .await;
     tracing::debug!(peer_hive = %peer_hive, "WAN_REACHABILITY applied");
+}
+
+/// Every node UUID the LSA region lists, under any hive, this one and a stale one included.
+fn lsa_listed_uuids(snapshot: &Option<LsaSnapshot>) -> HashSet<Uuid> {
+    snapshot
+        .iter()
+        .flat_map(|snapshot| snapshot.nodes.iter())
+        .filter(|node| node.name_len != 0)
+        .map(|node| Uuid::from_bytes(node.uuid))
+        .collect()
 }
 
 async fn broadcast_lsa_direct(
@@ -2267,7 +2341,12 @@ async fn broadcast_lsa_direct(
 
 #[derive(Debug)]
 enum LsaApplyResult {
-    Applied,
+    /// Applied, without the nodes it listed under another hive's name. `duplicate_uuids` names the
+    /// nodes it listed under a UUID already taken (`apply_lsa_payload`).
+    Applied {
+        foreign_nodes: Vec<String>,
+        duplicate_uuids: Vec<String>,
+    },
     Rejected {
         reason: &'static str,
         payload_hive: String,
@@ -2278,14 +2357,29 @@ enum LsaApplyResult {
 }
 
 async fn bump_lsa_reject_counter(ctx: &WanContext, reason: &'static str) -> u64 {
+    count_lsa_rejects(ctx, reason, 1).await
+}
+
+async fn count_lsa_rejects(ctx: &WanContext, reason: &'static str, count: u64) -> u64 {
     let mut guard = ctx.lsa_reject_counters.lock().await;
     let value = guard.entry(reason.to_string()).or_insert(0);
-    *value = value.saturating_add(1);
+    *value = value.saturating_add(count);
     *value
+}
+
+/// The UUIDs of this hive's nodes: this router's and its siblings'.
+async fn local_node_uuids(
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
+) -> HashSet<Uuid> {
+    let mut uuids: HashSet<Uuid> = nodes.lock().await.keys().copied().collect();
+    uuids.extend(peer_nodes.lock().await.keys().copied());
+    uuids
 }
 
 async fn apply_lsa_payload(
     lsa_state: &Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
+    local_uuids: &HashSet<Uuid>,
     expected_hive: &str,
     peer_router_uuid: Uuid,
     peer_router_name: &str,
@@ -2303,6 +2397,13 @@ async fn apply_lsa_payload(
     }
 
     let mut state_guard = lsa_state.lock().await;
+    // The UUIDs the other hives' LSAs list, a stale one's included.
+    let listed_elsewhere: HashSet<Uuid> = state_guard
+        .iter()
+        .filter(|(hive, _)| hive.as_str() != expected_hive)
+        .flat_map(|(_, state)| state.nodes.iter())
+        .filter_map(|node| Uuid::parse_str(&node.uuid).ok())
+        .collect();
     let entry = state_guard.entry(expected_hive.to_string()).or_default();
     if entry.session_epoch != session_epoch {
         entry.session_epoch = session_epoch;
@@ -2342,11 +2443,42 @@ async fn apply_lsa_payload(
     } else {
         payload.router_name.clone()
     };
-    entry.nodes = payload.nodes;
+    // A hive advertises only its own nodes. A node it names for another hive (`SY.admin@motherbee`
+    // in a spoke's LSA) would draw the traffic routed to that name to the advertising hive
+    // (docs/control-path-hardening-v1.md §5). Routes and taps are kept as they come and limited
+    // where they apply (`lsa_route_applies`, `lsa_tap_applies`).
+    //
+    // Nor may it take a UUID that is a node's already: the traffic addressed to that UUID, replies
+    // above all, would go to it. One of this hive's nodes: dropped. One another hive lists: kept,
+    // so both claims stay in the region and `find_remote_node` resolves that UUID to neither hive.
+    // Dropping the later claim would give the UUID to whichever hive listed it first, which a hive
+    // can arrange: right after this router restarts, or while the owner's LSA is stale.
+    let mut nodes = Vec::new();
+    let mut foreign_nodes = Vec::new();
+    let mut duplicate_uuids = Vec::new();
+    for node in payload.nodes {
+        if !node_is_on_hive(&node.name, expected_hive) {
+            foreign_nodes.push(node.name);
+            continue;
+        }
+        let uuid = Uuid::parse_str(&node.uuid).ok();
+        if uuid.is_some_and(|uuid| local_uuids.contains(&uuid)) {
+            duplicate_uuids.push(node.name);
+            continue;
+        }
+        if uuid.is_some_and(|uuid| listed_elsewhere.contains(&uuid)) {
+            duplicate_uuids.push(node.name.clone());
+        }
+        nodes.push(node);
+    }
+    entry.nodes = nodes;
     entry.routes = payload.routes;
     entry.vpns = payload.vpns;
     entry.taps = payload.taps;
-    LsaApplyResult::Applied
+    LsaApplyResult::Applied {
+        foreign_nodes,
+        duplicate_uuids,
+    }
 }
 
 async fn write_lsa_state(ctx: &WanContext) {
@@ -3153,8 +3285,10 @@ async fn handle_wan_message(
                     return Ok(());
                 }
             };
+            let local_uuids = local_node_uuids(&ctx.nodes, &ctx.peer_nodes).await;
             match apply_lsa_payload(
                 &ctx.lsa_state,
+                &local_uuids,
                 peer_hive,
                 peer_router_uuid,
                 peer_router_name,
@@ -3163,7 +3297,42 @@ async fn handle_wan_message(
             )
             .await
             {
-                LsaApplyResult::Applied => {
+                LsaApplyResult::Applied {
+                    foreign_nodes,
+                    duplicate_uuids,
+                } => {
+                    if !foreign_nodes.is_empty() {
+                        let reject_count = count_lsa_rejects(
+                            ctx,
+                            LSA_REJECT_FOREIGN_NODE,
+                            foreign_nodes.len() as u64,
+                        )
+                        .await;
+                        tracing::warn!(
+                            reason = LSA_REJECT_FOREIGN_NODE,
+                            peer_hive = %peer_hive,
+                            nodes = ?foreign_nodes,
+                            session_epoch = session_epoch,
+                            reject_count = reject_count,
+                            "lsa nodes dropped: a hive advertises only nodes named <role>@<itself>"
+                        );
+                    }
+                    if !duplicate_uuids.is_empty() {
+                        let reject_count = count_lsa_rejects(
+                            ctx,
+                            LSA_REJECT_DUPLICATE_UUID,
+                            duplicate_uuids.len() as u64,
+                        )
+                        .await;
+                        tracing::warn!(
+                            reason = LSA_REJECT_DUPLICATE_UUID,
+                            peer_hive = %peer_hive,
+                            nodes = ?duplicate_uuids,
+                            session_epoch = session_epoch,
+                            reject_count = reject_count,
+                            "lsa nodes with a UUID already taken: one of this hive's nodes is dropped, one another hive lists resolves to neither hive"
+                        );
+                    }
                     write_lsa_state(ctx).await;
                 }
                 LsaApplyResult::Rejected {
@@ -3215,36 +3384,38 @@ async fn handle_wan_message(
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    let src_info = {
-        let snapshot = ctx.lsa_snapshot.lock().await;
-        find_remote_node(&snapshot, src_uuid)
-    };
-    // Option B (multi-hop): a frame relayed via the hub carries the ORIGIN spoke's src, which is
-    // not in this router's directly-authenticated LSA snapshot. Fall back to the hub-vouched
-    // reachability table so the terminal gate ADMITS it for DATA delivery instead of silently
-    // dropping (the EDGE-H4 failure). The resulting src_info is `via_hub`, and SYSTEM authority is
-    // denied for it downstream in serialize_for_local_delivery — so this relaxation is data-plane
-    // only and cannot smuggle cross-hive control-plane authority.
-    let src_info = match src_info {
-        Some(info) => info,
-        None => {
-            let reach = ctx.reachability.lock().await;
-            match find_reachable_node(&reach, src_uuid) {
-                Some(info) => info,
-                None => return Ok(()),
-            }
+    // EDGE-01: the sender is bound to this session. Its UUID resolves only in the LSA bucket of the
+    // peer the frame came from, which apply_lsa_payload lets a peer fill with its own nodes only,
+    // named `role@<its cert-bound hive>`. Option B (multi-hop): a frame the hub relays carries the
+    // ORIGIN spoke's src, which is not in that bucket; it resolves among the nodes the hub vouches
+    // for, and only when this peer is the vouching hub, so the terminal gate ADMITS it for DATA
+    // delivery (the EDGE-H4 failure). That src_info is `via_hub`, denied SYSTEM authority downstream
+    // in serialize_for_local_delivery. Any other sender is dropped: until 0.1.83 the UUID resolved
+    // in every bucket, so a spoke could send as another spoke's node by its UUID
+    // (docs/control-path-hardening-v1.md §5).
+    let Some(src_info) =
+        wan_frame_source(&ctx.lsa_snapshot, &ctx.reachability, src_uuid, peer_hive).await
+    else {
+        let reject_count = bump_lsa_reject_counter(ctx, LSA_REJECT_FOREIGN_SOURCE).await;
+        let now = now_epoch_ms();
+        let last = FOREIGN_SOURCE_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= FOREIGN_SOURCE_LOG_INTERVAL_MS {
+            FOREIGN_SOURCE_LAST_LOG_MS.store(now, Ordering::Relaxed);
+            tracing::warn!(
+                reason = LSA_REJECT_FOREIGN_SOURCE,
+                peer_hive = %peer_hive,
+                src = %src_uuid,
+                src_l2_name = ?msg.routing.src_l2_name,
+                reject_count = reject_count,
+                "router dropped a WAN frame: its sender is neither a node of the peer that sent it nor one that peer relays as the hub"
+            );
         }
+        return Ok(());
     };
     let src_via_hub = src_info.via_hub;
 
-    // EDGE-01: bind the origin-hive to the mTLS-authenticated LSA bucket, not the
-    // self-asserted node name. `src_info.hive_id` is the bucket the src UUID resolved in,
-    // and apply_lsa_payload only lets a peer write nodes into its OWN (cert-bound) bucket,
-    // so a hive authenticated as P can only assert identities of the form `role@P`. Rewrite
-    // any name whose `@hive` suffix disagrees with the bucket: a forged "SY.admin@motherbee"
-    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authorize_system denies.
-    // Legitimate names (suffix already == bucket) are unchanged. Correct-and-continue + warn
-    // (availability over fail-closed; the origin gate still denies the forged identity).
+    // The name is `role@<the bucket hive>`: the peer's own, or the origin the hub vouches for. A
+    // node name the LSA filter let through already ends that way, so this rewrite is a guard.
     let canonical_src_name = canonical_wan_src_name(&src_info.name, &src_info.hive_id);
     if canonical_src_name != src_info.name {
         tracing::warn!(
@@ -3690,11 +3861,21 @@ fn should_initiate_peer(self_uuid: Uuid, peer_uuid: Uuid) -> bool {
     self_uuid.as_u128() < peer_uuid.as_u128()
 }
 
+/// At most one log line per interval about router regions another user could have written.
+const UNTRUSTED_REGION_LOG_INTERVAL_MS: u64 = 30_000;
+static UNTRUSTED_REGION_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The sibling routers of this hive, from their regions in `/dev/shm`. A region counts only when
+/// this router's user owns it and nobody else may write it: the sockets take only that user
+/// (`local_peer_admitted`), and a region anyone made would otherwise put its nodes in this router's
+/// FIB (docs/control-path-hardening-v1.md §5).
 fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, hive_id: &str) -> Vec<PeerRegion> {
     let mut regions = Vec::new();
     let Ok(entries) = fs::read_dir("/dev/shm") else {
         return regions;
     };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let own_uid = unsafe { nix::libc::geteuid() };
     for entry in entries.flatten() {
         let name_os = entry.file_name();
         let name = name_os.to_string_lossy();
@@ -3708,8 +3889,23 @@ fn discover_peer_regions(self_uuid: Uuid, self_shm_name: &str, hive_id: &str) ->
         if shm_name == self_shm_name {
             continue;
         }
-        let reader = match RouterRegionReader::open_read_only(&shm_name) {
+        let reader = match RouterRegionReader::open_read_only_owned_by(&shm_name, own_uid) {
             Ok(reader) => reader,
+            Err(ShmError::Untrusted { uid, mode }) => {
+                let now = now_epoch_ms();
+                let last = UNTRUSTED_REGION_LAST_LOG_MS.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= UNTRUSTED_REGION_LOG_INTERVAL_MS {
+                    UNTRUSTED_REGION_LAST_LOG_MS.store(now, Ordering::Relaxed);
+                    tracing::warn!(
+                        region = %shm_name,
+                        owner_uid = uid,
+                        mode = %format_args!("{mode:o}"),
+                        router_uid = own_uid,
+                        "router skipped a shared-memory region another user owns or may write"
+                    );
+                }
+                continue;
+            }
             Err(_) => continue,
         };
         let Some(snapshot) = reader.read_snapshot() else {
@@ -4472,13 +4668,14 @@ fn normalize_name(name: &str, hive_id: &str) -> String {
 }
 
 /// EDGE-01: canonicalize a WAN-resolved src name to `role@bucket_hive`, where `bucket_hive`
-/// is the mTLS-authenticated LSA bucket the src UUID resolved in (`find_remote_node` derives
-/// it from the node's hive_index, and `apply_lsa_payload` rejects any LSA whose `hive` != the
-/// cert-bound peer_hive — so the bucket is authenticated). The role is the substring before the
-/// first `@` (role labels like `SY.admin`/`IO.cloud` never contain `@`); the self-asserted
-/// `@hive` suffix carried inside the LSA node name is discarded. A peer authenticated as hive
-/// `P` can therefore only assert an origin identity of the form `role@P` and cannot forge a
-/// specific-hive identity (e.g. `SY.admin@motherbee`) unless it genuinely is that hive.
+/// is the mTLS-authenticated LSA bucket the src UUID resolved in: the bucket of the peer that sent
+/// the frame (`wan_frame_source`), which `apply_lsa_payload` fills only from an LSA whose `hive`
+/// is that cert-bound peer_hive, or the origin the hub vouches for. The role is the substring
+/// before the first `@` (role labels like `SY.admin`/`IO.cloud` never contain `@`); the
+/// self-asserted `@hive` suffix carried inside the LSA node name is discarded. A peer
+/// authenticated as hive `P` can therefore only assert an origin identity of the form `role@P`
+/// and cannot forge a specific-hive identity (e.g. `SY.admin@motherbee`) unless it genuinely is
+/// that hive.
 fn canonical_wan_src_name(name: &str, bucket_hive: &str) -> String {
     let role = name.split_once('@').map(|(r, _)| r).unwrap_or(name).trim();
     format!("{}@{}", role, bucket_hive)
@@ -4512,8 +4709,95 @@ struct ReachabilityEntry {
     last_updated: u64,
 }
 
+/// At most one log line per interval about WAN frames whose sender is not bound to their session.
+const FOREIGN_SOURCE_LOG_INTERVAL_MS: u64 = 30_000;
+static FOREIGN_SOURCE_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// At most one log line per interval about UUIDs that several hives list.
+const CONTESTED_UUID_LOG_INTERVAL_MS: u64 = 30_000;
+static CONTESTED_UUID_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The sender of a frame that came in from the WAN peer `peer_hive`, by its UUID: a node of that
+/// peer's own LSA bucket, or a node the hub vouches for when that peer is the vouching hub. A peer
+/// speaks for its own nodes and, as the hub, for the ones it relays; any other UUID, another hive's
+/// node above all, gives None (docs/control-path-hardening-v1.md §5).
+async fn wan_frame_source(
+    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
+    src_uuid: Uuid,
+    peer_hive: &str,
+) -> Option<RemoteNodeInfo> {
+    let own = {
+        let snapshot = lsa_snapshot.lock().await;
+        find_node_of_hive(&snapshot, src_uuid, peer_hive)
+    };
+    if own.is_some() {
+        return own;
+    }
+    let reachability = reachability.lock().await;
+    find_reachable_node(&reachability, src_uuid)
+        .filter(|relayed| relayed.next_hop_hive == peer_hive)
+}
+
+/// A node of `hive`'s own LSA bucket, by its UUID: `find_remote_node` limited to one hive, which
+/// another hive listing the same UUID does not change.
+fn find_node_of_hive(
+    snapshot: &Option<LsaSnapshot>,
+    uuid: Uuid,
+    hive: &str,
+) -> Option<RemoteNodeInfo> {
+    let snapshot = snapshot.as_ref()?;
+    let hive_index = snapshot.hives.iter().position(|entry| {
+        entry.hive_id_len != 0
+            && entry.flags & (HIVE_FLAG_SELF | FLAG_STALE) == 0
+            && bytes_to_string(&entry.hive_id, entry.hive_id_len as usize) == hive
+    })?;
+    let node = snapshot.nodes.iter().find(|node| {
+        usize::from(node.hive_index) == hive_index
+            && node.name_len != 0
+            && node.flags & (FLAG_DELETED | FLAG_STALE) == 0
+            && Uuid::from_bytes(node.uuid) == uuid
+    })?;
+    Some(RemoteNodeInfo {
+        name: bytes_to_string(&node.name, node.name_len as usize).to_string(),
+        vpn_id: node.vpn_id,
+        hive_id: hive.to_string(),
+        next_hop_hive: hive.to_string(),
+        via_hub: false,
+    })
+}
+
+/// Whether more than one hive of the snapshot lists `uuid`, this hive and a stale one included.
+fn uuid_listed_by_several_hives(snapshot: &LsaSnapshot, uuid: Uuid) -> bool {
+    let mut listed_by = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.name_len != 0 && Uuid::from_bytes(node.uuid) == uuid)
+        .map(|node| node.hive_index);
+    let Some(first) = listed_by.next() else {
+        return false;
+    };
+    listed_by.any(|hive_index| hive_index != first)
+}
+
 fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<RemoteNodeInfo> {
     let snapshot = snapshot.as_ref()?;
+    // A UUID that two hives list is neither's: a hive could otherwise take the traffic addressed to
+    // another hive's node, replies above all, by listing its UUID, and the region's order (hives by
+    // name) would pick the first. Refused, a contested UUID is at worst unreachable, never
+    // redirected (docs/control-path-hardening-v1.md §5).
+    if uuid_listed_by_several_hives(snapshot, uuid) {
+        let now = now_epoch_ms();
+        let last = CONTESTED_UUID_LAST_LOG_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= CONTESTED_UUID_LOG_INTERVAL_MS {
+            CONTESTED_UUID_LAST_LOG_MS.store(now, Ordering::Relaxed);
+            tracing::warn!(
+                uuid = %uuid,
+                "router refused a UUID that several hives list: no hive receives what is addressed to it"
+            );
+        }
+        return None;
+    }
     let mut hives: HashMap<u16, String> = HashMap::new();
     for (idx, hive) in snapshot.hives.iter().enumerate() {
         if hive.hive_id_len == 0 {
@@ -4581,6 +4865,34 @@ fn set_socket_mode(path: &Path, mode: u32) -> io::Result<()> {
     let mut perms = fs::metadata(path)?.permissions();
     perms.set_mode(mode & 0o777);
     fs::set_permissions(path, perms)
+}
+
+/// Binds one of this router's Unix sockets, the nodes' or the IRP one, with mode 0600: only the
+/// router's own user connects (docs/control-path-hardening-v1.md §5). Every accepted connection is
+/// checked as well (`local_peer_admitted`), which covers the moment between bind and chmod.
+fn listen_local_socket(path: &Path) -> io::Result<UnixListener> {
+    ensure_parent_dir(path)?;
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    set_socket_mode(path, 0o600)?;
+    Ok(listener)
+}
+
+/// Whether a connection accepted on one of this router's sockets comes from the router's own user,
+/// `own_uid`, by the peer's credentials (`SO_PEERCRED`). That is root in production: every unit,
+/// managed node and Go node connects as root. Another user, or a peer whose credentials cannot be
+/// read, is refused with one log line.
+fn local_peer_admitted(stream: &UnixStream, own_uid: u32) -> bool {
+    let peer_uid = stream.peer_cred().ok().map(|cred| cred.uid());
+    if peer_uid == Some(own_uid) {
+        return true;
+    }
+    tracing::warn!(
+        peer_uid = ?peer_uid,
+        router_uid = own_uid,
+        "router refused a local connection: its peer is not the router's own user"
+    );
+    false
 }
 
 struct NodeHandle {
@@ -4706,7 +5018,10 @@ enum FibSource {
     PeerNode,
     StaticRoute,
     LsaNode,
-    LsaRoute,
+    /// A route of another hive's LSA. It applies only where `lsa_route_applies` says.
+    LsaRoute {
+        advertised_by: String,
+    },
     /// Hub-vouched multi-hop reachability (Option B): forwards toward the vouching hub next-hop.
     ReachableNode,
 }
@@ -5821,7 +6136,9 @@ async fn rebuild_fib(
                 pattern: prefix,
                 match_kind: route.match_kind,
                 vpn_id: 0,
-                source: FibSource::LsaRoute,
+                source: FibSource::LsaRoute {
+                    advertised_by: hive_id,
+                },
                 next_hop,
                 admin_distance: ADMIN_DISTANCE_LSA,
                 priority: route.priority,
@@ -6148,7 +6465,12 @@ async fn resolve_by_name_inner(
                 }
                 _ => continue,
             },
-            FibSource::LsaRoute => match entry.action {
+            FibSource::LsaRoute { ref advertised_by }
+                if !lsa_route_applies(advertised_by, target) =>
+            {
+                continue
+            }
+            FibSource::LsaRoute { .. } => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
                     if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
@@ -6209,14 +6531,15 @@ async fn resolve_by_name_any_hive(
     meta: &Meta,
 ) -> Result<ResolvedRoute, RouterError> {
     let fib_guard = fib.lock().await;
+    // Routes see the destination as written, `name@*`.
+    let target = format!("{}@*", base);
     for entry in fib_guard.iter() {
         let matched = match entry.source {
             FibSource::LocalNode
             | FibSource::PeerNode
             | FibSource::LsaNode
             | FibSource::ReachableNode => match_any_hive(base, &entry.pattern),
-            FibSource::StaticRoute | FibSource::LsaRoute => {
-                let target = format!("{}@*", base);
+            FibSource::StaticRoute | FibSource::LsaRoute { .. } => {
                 pattern_match_kind(entry.match_kind, &entry.pattern, &target)
             }
         };
@@ -6234,7 +6557,12 @@ async fn resolve_by_name_any_hive(
                 }
                 _ => continue,
             },
-            FibSource::LsaRoute => match entry.action {
+            FibSource::LsaRoute { ref advertised_by }
+                if !lsa_route_applies(advertised_by, &target) =>
+            {
+                continue
+            }
+            FibSource::LsaRoute { .. } => match entry.action {
                 ACTION_DROP => return Ok(ResolvedRoute::Drop),
                 ACTION_FORWARD => {
                     if let Some(FibNextHop::Hive(hive)) = &entry.next_hop {
@@ -6287,6 +6615,46 @@ async fn resolve_by_name_any_hive(
 
 fn extract_hive(name: &str) -> Option<&str> {
     name.split_once('@').map(|(_, hive)| hive)
+}
+
+/// Whether `name` is a node of `hive`: `<role>@<hive>` with neither part empty, split at the first
+/// `@` like `extract_hive` and the system policy.
+fn node_is_on_hive(name: &str, hive: &str) -> bool {
+    !hive.is_empty()
+        && name
+            .split_once('@')
+            .is_some_and(|(role, name_hive)| !role.is_empty() && name_hive == hive)
+}
+
+/// Whether a route that hive `advertised_by` put in its LSA applies to `target`: only to a
+/// destination on that hive, or to an `@*` one, so a hive can neither redirect nor drop the traffic
+/// of another hive's nodes (docs/control-path-hardening-v1.md §5). Its `next_hop_hive` works as
+/// before.
+fn lsa_route_applies(advertised_by: &str, target: &str) -> bool {
+    target.ends_with("@*") || node_is_on_hive(target, advertised_by)
+}
+
+/// Whether a tap of the LSA applies to a message from `src_name` to `dst_name`. This hive's own taps
+/// always do. Another hive's apply only to a message that hive is a party to, as its source or its
+/// destination, and only with a target on that hive: so a hive cannot copy traffic it does not
+/// already see, nor hand a copy to another hive's node (docs/control-path-hardening-v1.md §5). A
+/// tap of a hive the snapshot does not list applies to nothing.
+fn lsa_tap_applies(
+    snapshot: &LsaSnapshot,
+    tap: &RemoteTapEntry,
+    src_name: &str,
+    dst_name: &str,
+) -> bool {
+    let Some(hive) = snapshot.hives.get(usize::from(tap.hive_index)) else {
+        return false;
+    };
+    if hive.flags & HIVE_FLAG_SELF != 0 {
+        return true;
+    }
+    let advertised_by = bytes_to_string(&hive.hive_id, hive.hive_id_len as usize);
+    let target = bytes_to_string(&tap.target, tap.target_len as usize);
+    node_is_on_hive(target, advertised_by)
+        && (node_is_on_hive(src_name, advertised_by) || node_is_on_hive(dst_name, advertised_by))
 }
 
 fn match_any_hive(base: &str, full_name: &str) -> bool {
@@ -6513,8 +6881,12 @@ fn prepare_local_delivery(hive_id: &str, msg: &Message, src_via_hub: bool) -> Op
             // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
             // authority — it is denied here WITHOUT consulting the allow policy at all, so a
             // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
-            // A directly-authenticated src still goes through the normal authority gate.
+            // A tap copy (`via_tap`) is denied the same way: it keeps the original sender's name,
+            // but goes to the tap's target, which that sender never addressed
+            // (docs/control-path-hardening-v1.md §5). A directly-authenticated src still goes
+            // through the normal authority gate.
             let authorized = !src_via_hub
+                && !msg.meta.via_tap
                 && system_policy::authorize_system(
                     action,
                     msg.routing.src_l2_name.as_deref(),
@@ -6526,6 +6898,7 @@ fn prepare_local_delivery(hive_id: &str, msg: &Message, src_via_hub: bool) -> Op
                     src_uuid = %msg.routing.src,
                     src_l2_name = ?msg.routing.src_l2_name,
                     src_via_hub = src_via_hub,
+                    via_tap = msg.meta.via_tap,
                     "router dropped protected SYSTEM action from unauthorized origin"
                 );
                 return None;
@@ -6669,6 +7042,7 @@ mod tests {
 
         let result = apply_lsa_payload(
             &lsa_state,
+            &HashSet::new(),
             "worker-220",
             peer_router_uuid,
             "RT.gateway@worker-220",
@@ -6700,6 +7074,7 @@ mod tests {
 
         let first = apply_lsa_payload(
             &lsa_state,
+            &HashSet::new(),
             expected_hive,
             peer_router_uuid,
             peer_router_name,
@@ -6712,10 +7087,11 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(first, LsaApplyResult::Applied));
+        assert!(matches!(first, LsaApplyResult::Applied { .. }));
 
         let stale_same_session = apply_lsa_payload(
             &lsa_state,
+            &HashSet::new(),
             expected_hive,
             peer_router_uuid,
             peer_router_name,
@@ -6738,6 +7114,7 @@ mod tests {
 
         let after_reconnect = apply_lsa_payload(
             &lsa_state,
+            &HashSet::new(),
             expected_hive,
             peer_router_uuid,
             peer_router_name,
@@ -6750,7 +7127,7 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(after_reconnect, LsaApplyResult::Applied));
+        assert!(matches!(after_reconnect, LsaApplyResult::Applied { .. }));
 
         let guard = lsa_state.lock().await;
         let entry = guard.get(expected_hive).expect("missing hive state");
@@ -6767,6 +7144,7 @@ mod tests {
 
         let result = apply_lsa_payload(
             &lsa_state,
+            &HashSet::new(),
             expected_hive,
             peer_router_uuid,
             peer_router_name,
@@ -6774,12 +7152,637 @@ mod tests {
             lsa_payload(expected_hive, 1, "", ""),
         )
         .await;
-        assert!(matches!(result, LsaApplyResult::Applied));
+        assert!(matches!(result, LsaApplyResult::Applied { .. }));
 
         let guard = lsa_state.lock().await;
         let entry = guard.get(expected_hive).expect("missing hive state");
         assert_eq!(entry.router_uuid, *peer_router_uuid.as_bytes());
         assert_eq!(entry.router_name, peer_router_name);
+    }
+
+    fn lsa_node(name: &str) -> LsaNode {
+        LsaNode {
+            uuid: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            vpn_id: 0,
+        }
+    }
+
+    /// An LSA installs only the nodes named `<role>@<the hive that sent it>`; the others are
+    /// returned to be counted (docs/control-path-hardening-v1.md §5).
+    #[tokio::test]
+    async fn an_lsa_installs_only_the_nodes_of_the_hive_that_sent_it() {
+        let lsa_state = Arc::new(Mutex::new(HashMap::<String, RemoteHiveState>::new()));
+        let peer_router_uuid = Uuid::new_v4();
+        let names = [
+            ("AI.sales@worker1", true),
+            ("SY.orchestrator@worker1", true),
+            ("SY.admin@motherbee", false),
+            ("SY.vault@motherbee", false),
+            ("AI.sales@worker10", false),
+            ("AI.sales@worker1@motherbee", false),
+            ("AI.sales@motherbee@worker1", false),
+            ("SY.orchestrator", false),
+            ("@worker1", false),
+        ];
+        let mut payload = lsa_payload(
+            "worker1",
+            1,
+            &peer_router_uuid.to_string(),
+            "RT.gateway@worker1",
+        );
+        payload.nodes = names.iter().map(|(name, _)| lsa_node(name)).collect();
+
+        let result = apply_lsa_payload(
+            &lsa_state,
+            &HashSet::new(),
+            "worker1",
+            peer_router_uuid,
+            "RT.gateway@worker1",
+            1,
+            payload,
+        )
+        .await;
+
+        let LsaApplyResult::Applied { foreign_nodes, .. } = result else {
+            panic!("the LSA applies: {result:?}");
+        };
+        let kept: Vec<&str> = names
+            .iter()
+            .filter(|(_, kept)| *kept)
+            .map(|(name, _)| *name)
+            .collect();
+        let dropped: Vec<&str> = names
+            .iter()
+            .filter(|(_, kept)| !*kept)
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(foreign_nodes, dropped);
+        let guard = lsa_state.lock().await;
+        let installed: Vec<&str> = guard["worker1"]
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(installed, kept);
+    }
+
+    /// The hive `name` in an LSA snapshot, with `flags`.
+    fn lsa_hive(name: &str, flags: u16) -> RemoteHiveEntry {
+        let mut entry = RemoteHiveEntry {
+            hive_id: [0u8; 64],
+            hive_id_len: 0,
+            router_uuid: [0u8; 16],
+            router_name: [0u8; 64],
+            router_name_len: 0,
+            last_lsa_seq: 1,
+            last_updated: 0,
+            flags,
+            node_count: 0,
+            route_count: 0,
+            vpn_count: 0,
+            tap_count: 0,
+        };
+        entry.hive_id_len = copy_bytes_with_len(&mut entry.hive_id, name) as u16;
+        entry
+    }
+
+    /// A route that the hive at `hive_index` of the snapshot advertised.
+    fn lsa_route(
+        prefix: &str,
+        match_kind: u8,
+        action: u8,
+        next_hop_hive: &str,
+        hive_index: u16,
+    ) -> RemoteRouteEntry {
+        let mut entry = RemoteRouteEntry {
+            prefix: [0u8; 256],
+            prefix_len: 0,
+            match_kind,
+            action,
+            next_hop_hive: [0u8; 32],
+            next_hop_hive_len: 0,
+            _pad: [0u8; 3],
+            metric: 0,
+            priority: 0,
+            flags: FLAG_ACTIVE,
+            hive_index,
+            _reserved: [0u8; 14],
+        };
+        entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, prefix) as u16;
+        entry.next_hop_hive_len =
+            copy_bytes_with_len(&mut entry.next_hop_hive, next_hop_hive) as u8;
+        entry
+    }
+
+    /// A tap that the hive at `hive_index` of the snapshot advertised.
+    fn lsa_tap(match_src: &str, match_dst: &str, target: &str, hive_index: u16) -> RemoteTapEntry {
+        let mut entry = RemoteTapEntry {
+            match_src: [0u8; 256],
+            match_src_len: 0,
+            _pad0: [0u8; 6],
+            match_dst: [0u8; 256],
+            match_dst_len: 0,
+            _pad1: [0u8; 6],
+            target: [0u8; 256],
+            target_len: 0,
+            _pad2: [0u8; 6],
+            mode: 0,
+            enabled: 1,
+            flags: FLAG_ACTIVE,
+            hive_index,
+            _reserved: [0u8; 38],
+        };
+        entry.match_src_len = copy_bytes_with_len(&mut entry.match_src, match_src) as u16;
+        entry.match_dst_len = copy_bytes_with_len(&mut entry.match_dst, match_dst) as u16;
+        entry.target_len = copy_bytes_with_len(&mut entry.target, target) as u16;
+        entry
+    }
+
+    /// The motherbee's LSA snapshot: itself at index 0, worker1 at index 1.
+    fn motherbee_lsa(routes: Vec<RemoteRouteEntry>, taps: Vec<RemoteTapEntry>) -> LsaSnapshot {
+        LsaSnapshot {
+            header: crate::shm::LsaHeaderSnapshot {
+                hive_count: 2,
+                total_node_count: 0,
+                total_route_count: routes.len() as u32,
+                total_vpn_count: 0,
+                total_tap_count: taps.len() as u32,
+                heartbeat: 0,
+            },
+            hives: vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            nodes: Vec::new(),
+            routes,
+            vpns: Vec::new(),
+            taps,
+        }
+    }
+
+    fn route_outcome(route: ResolvedRoute) -> String {
+        match route {
+            ResolvedRoute::Drop => "drop".to_string(),
+            ResolvedRoute::Unreachable(reason) => format!("unreachable {reason}"),
+            ResolvedRoute::Deliver(_) => "deliver".to_string(),
+            ResolvedRoute::ForwardRouter(_) => "router".to_string(),
+            ResolvedRoute::ForwardHive(hive) => format!("hive {hive}"),
+        }
+    }
+
+    /// Another hive's routes apply only to destinations on that hive, or to `name@*`
+    /// (docs/control-path-hardening-v1.md §5); its `next_hop_hive` and this hive's static routes
+    /// work as before.
+    #[tokio::test]
+    async fn another_hives_routes_apply_only_to_its_own_nodes_and_any_hive_names() {
+        let lsa_snapshot = Arc::new(Mutex::new(Some(motherbee_lsa(
+            vec![
+                lsa_route("*", MATCH_GLOB, ACTION_FORWARD, "", 1),
+                lsa_route("SY.admin", MATCH_PREFIX, ACTION_DROP, "", 1),
+                lsa_route("AI.y@worker1", MATCH_EXACT, ACTION_FORWARD, "egress1", 1),
+            ],
+            Vec::new(),
+        ))));
+        let static_routes = Arc::new(Mutex::new(vec![StaticRoute {
+            pattern: "SY.vault".to_string(),
+            match_kind: MATCH_PREFIX,
+            action: ACTION_DROP,
+            next_hop_hive: String::new(),
+            priority: 100,
+            metric: 0,
+            installed_at: 0,
+        }]));
+        let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+        rebuild_fib(
+            &fib,
+            &Arc::new(Mutex::new(HashMap::<Uuid, NodeHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &static_routes,
+            &lsa_snapshot,
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+        )
+        .await;
+        let (sender, _receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let src = NodeHandle {
+            name: "IO.slack@motherbee".to_string(),
+            vpn_id: 0,
+            sender,
+            connected_at: 0,
+        };
+        let nodes = HashMap::new();
+        let meta = Meta {
+            msg_type: "user".to_string(),
+            ..Meta::default()
+        };
+        for (target, expected) in [
+            // The motherbee's names, and another spoke's: worker1's routes neither take nor drop
+            // them.
+            ("SY.admin@motherbee", "unreachable NODE_NOT_FOUND"),
+            ("AI.x@motherbee", "unreachable NODE_NOT_FOUND"),
+            ("AI.x@egress1", "unreachable NODE_NOT_FOUND"),
+            // worker1's names: its routes apply, next_hop_hive included.
+            ("AI.x@worker1", "hive worker1"),
+            ("SY.admin@worker1", "drop"),
+            ("AI.y@worker1", "hive egress1"),
+            // Any hive.
+            ("AI.x@*", "hive worker1"),
+            // This hive's static routes, on any name.
+            ("SY.vault@motherbee", "drop"),
+            ("SY.vault@worker1", "drop"),
+        ] {
+            let route = resolve_by_name(target, &src, &nodes, &fib, &meta)
+                .await
+                .expect("resolve");
+            assert_eq!(route_outcome(route), expected, "{target}");
+        }
+    }
+
+    #[test]
+    fn another_hives_tap_applies_only_to_a_message_it_is_a_party_to() {
+        let snapshot = motherbee_lsa(Vec::new(), Vec::new());
+        let own = lsa_tap(
+            "SY.admin@motherbee",
+            "SY.vault@motherbee",
+            "IO.x@motherbee",
+            0,
+        );
+        let worker1s = lsa_tap(
+            "SY.admin@motherbee",
+            "SY.vault@motherbee",
+            "IO.x@worker1",
+            1,
+        );
+        // worker1 is a party to what it taps, but the copy would go to another hive's node.
+        let to_worker2 = lsa_tap(
+            "SY.admin@motherbee",
+            "SY.orchestrator@worker1",
+            "SY.orchestrator@worker2",
+            1,
+        );
+        let to_motherbee = lsa_tap(
+            "SY.admin@motherbee",
+            "SY.orchestrator@worker1",
+            "IO.x@motherbee",
+            1,
+        );
+        let unlisted = lsa_tap("SY.admin@motherbee", "AI.x@worker1", "IO.x@worker1", 7);
+        for (tap, src, dst, applies) in [
+            (&own, "SY.admin@motherbee", "SY.vault@motherbee", true),
+            (&worker1s, "SY.admin@motherbee", "SY.vault@motherbee", false),
+            (&worker1s, "SY.admin@motherbee", "AI.x@egress1", false),
+            (&worker1s, "SY.admin@motherbee", "AI.x@worker1", true),
+            (&worker1s, "AI.x@worker1", "SY.vault@motherbee", true),
+            (&worker1s, "SY.admin@motherbee", "AI.x@*", false),
+            (
+                &worker1s,
+                "SY.admin@motherbee",
+                "AI.x@worker1@motherbee",
+                false,
+            ),
+            (
+                &to_worker2,
+                "SY.admin@motherbee",
+                "SY.orchestrator@worker1",
+                false,
+            ),
+            (
+                &to_motherbee,
+                "SY.admin@motherbee",
+                "SY.orchestrator@worker1",
+                false,
+            ),
+            (&unlisted, "SY.admin@motherbee", "AI.x@worker1", false),
+        ] {
+            assert_eq!(
+                lsa_tap_applies(&snapshot, tap, src, dst),
+                applies,
+                "tap of hive index {} on {src} -> {dst}",
+                tap.hive_index
+            );
+        }
+    }
+
+    /// The design's example, end to end on the motherbee's gateway: a spoke's tap on SY.admin's
+    /// VAULT_PUT to the vault, both on the motherbee, copies nothing. A spoke's tap copies a message
+    /// to one of its nodes, and only to one of its own nodes; the motherbee's own taps copy anything
+    /// to anyone; and no copy carries a protected SYSTEM action.
+    #[tokio::test]
+    async fn the_tap_fanout_copies_for_another_hive_only_what_it_is_a_party_to() {
+        let admin = Uuid::new_v4();
+        let (admin_tx, _admin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (vault_tx, _vault_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (audit_tx, mut audit_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        for (uuid, name, sender) in [
+            (admin, "SY.admin@motherbee", admin_tx),
+            (Uuid::new_v4(), "SY.vault@motherbee", vault_tx),
+            (Uuid::new_v4(), "IO.audit@motherbee", audit_tx),
+        ] {
+            nodes.lock().await.insert(
+                uuid,
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender,
+                    connected_at: 0,
+                },
+            );
+        }
+        let peer_nodes = Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new()));
+        // worker1's link: a copy for IO.audit@worker1 goes there.
+        let (worker1_tx, mut worker1_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let wan_peers = Arc::new(Mutex::new(HashMap::from([(
+            "worker1".to_string(),
+            WanPeer {
+                sender: worker1_tx,
+                router_uuid: Uuid::new_v4(),
+            },
+        )])));
+        let src_handle = nodes.lock().await[&admin].clone();
+        let config = ConfigSnapshot {
+            header: crate::shm::ConfigHeaderSnapshot {
+                static_route_count: 0,
+                vpn_assignment_count: 0,
+                config_version: 1,
+                heartbeat: 0,
+                tap_count: 0,
+            },
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps: Vec::new(),
+        };
+        for (hive_index, action, dst, target, copied_here, copied_to_worker1) in [
+            // worker1 is not a party: no copy.
+            (
+                1,
+                "VAULT_PUT",
+                "SY.vault@motherbee",
+                "IO.audit@worker1",
+                false,
+                false,
+            ),
+            // worker1 is the destination's hive: a copy, to its own node.
+            (
+                1,
+                "VAULT_PUT",
+                "AI.x@worker1",
+                "IO.audit@worker1",
+                false,
+                true,
+            ),
+            // ... and never to another hive's.
+            (
+                1,
+                "VAULT_PUT",
+                "AI.x@worker1",
+                "IO.audit@motherbee",
+                false,
+                false,
+            ),
+            // The motherbee's own tap: any message, any target.
+            (
+                0,
+                "VAULT_PUT",
+                "SY.vault@motherbee",
+                "IO.audit@motherbee",
+                true,
+                false,
+            ),
+            // A protected SYSTEM action, though its sender may send it: no copy.
+            (
+                0,
+                "SPAWN_NODE",
+                "SY.orchestrator@motherbee",
+                "IO.audit@motherbee",
+                false,
+                false,
+            ),
+        ] {
+            let mut lsa = motherbee_lsa(
+                Vec::new(),
+                vec![lsa_tap("SY.admin@motherbee", dst, target, hive_index)],
+            );
+            lsa.nodes
+                .push(lsa_node_entry(Uuid::new_v4(), "IO.audit@worker1", 1));
+            let lsa_snapshot = Arc::new(Mutex::new(Some(lsa)));
+            let fib = Arc::new(Mutex::new(Vec::<FibEntry>::new()));
+            rebuild_fib(
+                &fib,
+                &nodes,
+                &peer_nodes,
+                &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+                &lsa_snapshot,
+                &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            )
+            .await;
+            let msg = Message {
+                routing: Routing {
+                    src: admin.to_string(),
+                    src_l2_name: Some("SY.admin@motherbee".to_string()),
+                    dst: Destination::Unicast(dst.to_string()),
+                    ttl: 16,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(action.to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::json!({}),
+            };
+            fanout_taps_for_unicast(
+                &msg,
+                dst,
+                &config,
+                &src_handle,
+                &nodes,
+                &fib,
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+                &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+                &peer_nodes,
+                &wan_peers,
+                &lsa_snapshot,
+                &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+                "motherbee",
+                Uuid::new_v4(),
+                true,
+            )
+            .await;
+            let case = format!("tap of hive index {hive_index} on {action} to {dst}, for {target}");
+            for (copy, expected) in [
+                (audit_rx.try_recv().ok(), copied_here),
+                (worker1_rx.try_recv().ok(), copied_to_worker1),
+            ] {
+                assert_eq!(copy.is_some(), expected, "{case}");
+                if let Some(copy) = copy {
+                    let copy: Message = serde_json::from_slice(&copy).expect("a message");
+                    assert!(copy.meta.via_tap, "{case}");
+                }
+            }
+        }
+    }
+
+    /// A node of the LSA snapshot, listed by the hive at `hive_index`.
+    fn lsa_node_entry(uuid: Uuid, name: &str, hive_index: u16) -> RemoteNodeEntry {
+        let mut entry = RemoteNodeEntry {
+            uuid: *uuid.as_bytes(),
+            name: [0u8; 256],
+            name_len: 0,
+            vpn_id: 0,
+            hive_index,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 6],
+        };
+        entry.name_len = copy_bytes_with_len(&mut entry.name, name) as u16;
+        entry
+    }
+
+    /// An LSA snapshot of `hives`, listing `nodes`.
+    fn lsa_of(hives: Vec<RemoteHiveEntry>, nodes: Vec<RemoteNodeEntry>) -> LsaSnapshot {
+        LsaSnapshot {
+            header: crate::shm::LsaHeaderSnapshot {
+                hive_count: hives.len() as u32,
+                total_node_count: nodes.len() as u32,
+                total_route_count: 0,
+                total_vpn_count: 0,
+                total_tap_count: 0,
+                heartbeat: 0,
+            },
+            hives,
+            nodes,
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps: Vec::new(),
+        }
+    }
+
+    /// R3: a tap copy never carries a protected SYSTEM action, whoever sent the original; any other
+    /// copy passes (docs/control-path-hardening-v1.md §5).
+    #[test]
+    fn a_tap_copy_never_carries_a_protected_system_action() {
+        let message = |action: &str, via_tap: bool| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@worker1".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(action.to_string()),
+                via_tap,
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        assert!(prepare_local_delivery("worker1", &message("SPAWN_NODE", false), false).is_some());
+        assert!(prepare_local_delivery("worker1", &message("SPAWN_NODE", true), false).is_none());
+        assert!(prepare_local_delivery("worker1", &message("VAULT_PUT", true), false).is_some());
+    }
+
+    /// R1: a WAN frame's sender is bound to its session: a node of the peer's own LSA bucket, or,
+    /// on a spoke, a node the hub relays when that peer is the hub
+    /// (docs/control-path-hardening-v1.md §5).
+    #[tokio::test]
+    async fn a_wan_frame_speaks_only_for_the_peer_that_sent_it() {
+        let wf_rules = Uuid::new_v4();
+        let ingress_node = Uuid::new_v4();
+        // The motherbee's view: two spokes' buckets.
+        let motherbee_lsa = Arc::new(Mutex::new(Some(lsa_of(
+            vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("ingress1", FLAG_ACTIVE),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            vec![
+                lsa_node_entry(ingress_node, "IO.x@ingress1", 1),
+                lsa_node_entry(wf_rules, "SY.wf-rules@worker1", 2),
+            ],
+        ))));
+        let no_relays = Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new()));
+        for (peer, src, expected) in [
+            ("worker1", wf_rules, Some("SY.wf-rules@worker1")),
+            // Another spoke's node, by its UUID.
+            ("ingress1", wf_rules, None),
+            ("ingress1", ingress_node, Some("IO.x@ingress1")),
+            ("worker1", Uuid::new_v4(), None),
+        ] {
+            let source = wan_frame_source(&motherbee_lsa, &no_relays, src, peer).await;
+            assert_eq!(
+                source.as_ref().map(|info| info.name.as_str()),
+                expected,
+                "{src} from {peer}"
+            );
+        }
+
+        // A spoke's view: the hub's bucket, and a node the hub relays.
+        let relayed = Uuid::new_v4();
+        let spoke_lsa = Arc::new(Mutex::new(Some(lsa_of(
+            vec![
+                lsa_hive("worker2", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("motherbee", FLAG_ACTIVE),
+            ],
+            Vec::new(),
+        ))));
+        let relays = Arc::new(Mutex::new(HashMap::from([(
+            relayed,
+            ReachabilityEntry {
+                name: "AI.y@worker1".to_string(),
+                origin_hive: "worker1".to_string(),
+                next_hop_hive: "motherbee".to_string(),
+                vpn_id: 0,
+                last_updated: 0,
+            },
+        )])));
+        let from_hub = wan_frame_source(&spoke_lsa, &relays, relayed, "motherbee")
+            .await
+            .expect("the hub relays it");
+        assert!(from_hub.via_hub);
+        assert_eq!(from_hub.hive_id, "worker1");
+        assert!(
+            wan_frame_source(&spoke_lsa, &relays, relayed, "ingress1")
+                .await
+                .is_none(),
+            "only the hub that vouches for it relays it"
+        );
+    }
+
+    /// R2: a UUID that two hives list resolves to neither, whatever their order in the region; one
+    /// that a single hive lists resolves to it.
+    #[test]
+    fn a_uuid_that_two_hives_list_resolves_to_neither() {
+        let shared = Uuid::new_v4();
+        let local = Uuid::new_v4();
+        let own = Uuid::new_v4();
+        let snapshot = Some(lsa_of(
+            vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("ingress1", FLAG_ACTIVE),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            vec![
+                lsa_node_entry(local, "SY.vault@motherbee", 0),
+                lsa_node_entry(shared, "IO.x@ingress1", 1),
+                lsa_node_entry(local, "IO.y@ingress1", 1),
+                lsa_node_entry(shared, "AI.sales@worker1", 2),
+                lsa_node_entry(own, "AI.support@worker1", 2),
+            ],
+        ));
+        assert!(
+            find_remote_node(&snapshot, shared).is_none(),
+            "ingress1 comes first by name and still does not get it"
+        );
+        assert!(
+            find_remote_node(&snapshot, local).is_none(),
+            "a node of this hive, listed by another"
+        );
+        let resolved = find_remote_node(&snapshot, own).expect("one hive lists it");
+        assert_eq!(
+            (resolved.name.as_str(), resolved.hive_id.as_str()),
+            ("AI.support@worker1", "worker1")
+        );
     }
 
     #[test]
@@ -7324,14 +8327,14 @@ mod tests {
     #[tokio::test]
     async fn via_hub_src_is_denied_system_authority_but_direct_src_is_allowed() {
         // The security invariant: a transitively hub-vouched origin, even bearing an authoritative
-        // name (SY.orchestrator@<hive> is normally the cross-hive control plane), must NOT pass the
+        // name (SY.orchestrator@motherbee is the cross-hive control plane), must NOT pass the
         // protected-SYSTEM gate. The SAME frame from a directly-authenticated src is admitted.
         let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
         let msg = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
-                src_l2_name: Some("SY.orchestrator@worker1".to_string()),
-                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@worker1".to_string()),
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
             },
@@ -7344,10 +8347,10 @@ mod tests {
         };
         let direct = serialize_for_local_delivery(
             &memory_reader,
-            "motherbee",
+            "worker1",
             &msg,
             false,
-            "SY.orchestrator@motherbee",
+            "SY.orchestrator@worker1",
         )
         .await
         .unwrap();
@@ -7357,10 +8360,10 @@ mod tests {
         );
         let vouched = serialize_for_local_delivery(
             &memory_reader,
-            "motherbee",
+            "worker1",
             &msg,
             true,
-            "SY.orchestrator@motherbee",
+            "SY.orchestrator@worker1",
         )
         .await
         .unwrap();
@@ -7410,12 +8413,13 @@ mod tests {
             "forged SY.admin@motherbee from an attacker bucket must be denied"
         );
 
-        // Same forgery against the SY.orchestrator skeleton key: the hive label is forced to
-        // the true origin bucket (SY.orchestrator@<any> stays allowed by design, but it is now
-        // truthfully attributed to the attacker hive, not motherbee).
-        assert_eq!(
-            canonical_wan_src_name("SY.orchestrator@motherbee", "attacker"),
-            "SY.orchestrator@attacker"
+        // Same forgery against the orchestrators' control plane: the hive label is forced to the
+        // true origin bucket, and rule (3) admits a mutation only from SY.orchestrator@motherbee.
+        let forged_orch = canonical_wan_src_name("SY.orchestrator@motherbee", "attacker");
+        assert_eq!(forged_orch, "SY.orchestrator@attacker");
+        assert!(
+            !authorize_system("SPAWN_NODE", Some(&forged_orch), receiving_hive),
+            "forged SY.orchestrator@motherbee from an attacker bucket must be denied"
         );
 
         // PRESERVATION: the legitimate admin->edge command (SY.admin resolved in the motherbee
@@ -7428,13 +8432,19 @@ mod tests {
             receiving_hive
         ));
 
-        // PRESERVATION: a legitimate cross-hive orchestrator (resolved in its own bucket) is
-        // still authorized for a protected action.
-        let legit_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
-        assert_eq!(legit_orch, "SY.orchestrator@worker1");
+        // PRESERVATION: the motherbee's orchestrator (resolved in its own bucket) is still
+        // authorized for a protected action on a spoke; a spoke's orchestrator is not.
+        let legit_orch = canonical_wan_src_name("SY.orchestrator@motherbee", "motherbee");
+        assert_eq!(legit_orch, "SY.orchestrator@motherbee");
         assert!(authorize_system(
             "SPAWN_NODE",
             Some(&legit_orch),
+            receiving_hive
+        ));
+        let spoke_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
+        assert!(!authorize_system(
+            "SPAWN_NODE",
+            Some(&spoke_orch),
             receiving_hive
         ));
     }
@@ -9278,6 +10288,65 @@ mod tests {
         ));
     }
 
+    /// The router's sockets are created 0600, replacing whatever was at the path, and a
+    /// connection is served only when its peer is the router's own user: root in production, this
+    /// test's user here (docs/control-path-hardening-v1.md §5).
+    #[tokio::test]
+    async fn the_routers_sockets_are_0600_and_serve_only_its_own_user() {
+        let dir = std::env::temp_dir().join(format!(
+            "fbsock-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let path = dir.join("router.sock");
+        fs::create_dir_all(&dir).expect("socket dir");
+        fs::write(&path, b"stale").expect("a stale file at the path");
+
+        let listener = listen_local_socket(&path).expect("listen");
+        let mode = fs::metadata(&path).expect("socket").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _client = UnixStream::connect(&path).await.expect("connect");
+        let (accepted, _) = listener.accept().await.expect("accept");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own_uid = unsafe { nix::libc::geteuid() };
+        assert!(local_peer_admitted(&accepted, own_uid));
+        assert!(
+            !local_peer_admitted(&accepted, own_uid.wrapping_add(1)),
+            "a peer of another user is refused"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the callers: both accept loops of `Router::run` check the peer before they serve it,
+    /// and both sockets are made by `listen_local_socket`.
+    #[test]
+    fn both_accept_loops_check_the_peer_before_serving_it() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("    pub async fn run(&self)")
+            .expect("Router::run");
+        let end = start
+            + src[start..]
+                .find("\n    }\n}\n")
+                .expect("end of Router::run");
+        let body = &src[start..end];
+        assert_eq!(body.matches("listen_local_socket(").count(), 2);
+        for (accept, serve) in [
+            ("irp_listener.accept()", "handle_peer_incoming("),
+            ("listener.accept().await?", "handle_node("),
+        ] {
+            let at = body.find(accept).expect(accept);
+            let check = body[at..]
+                .find("local_peer_admitted(&stream, own_uid)")
+                .expect("the peer is checked");
+            let served = body[at..].find(serve).expect(serve);
+            assert!(
+                check < served,
+                "{accept}: the check must come before {serve}"
+            );
+        }
+    }
+
     async fn deliver_from_peer(peer_is_gateway: bool) -> Option<Message> {
         use nix::sys::mman::shm_unlink;
         use std::ffi::CString;
@@ -9759,11 +10828,16 @@ mod tests {
 
     /// The motherbee gateway's WAN context, with no nodes, peers or TLS.
     fn test_wan_context(hive_registry: Option<HiveRegistry>) -> Arc<WanContext> {
+        wan_context_of("motherbee", hive_registry)
+    }
+
+    /// `hive`'s gateway WAN context, with no nodes, peers or TLS.
+    fn wan_context_of(hive: &str, hive_registry: Option<HiveRegistry>) -> Arc<WanContext> {
         Arc::new(WanContext {
             router_uuid: Uuid::new_v4(),
-            router_name: "RT.gateway@motherbee".to_string(),
-            hive_id: "motherbee".to_string(),
-            identity_frontdesk_node_name: "SY.frontdesk.gov@motherbee".to_string(),
+            router_name: format!("RT.gateway@{hive}"),
+            hive_id: hive.to_string(),
+            identity_frontdesk_node_name: format!("SY.frontdesk.gov@{hive}"),
             hello_interval_ms: 10_000,
             dead_interval_ms: 40_000,
             hive_registry,
@@ -10031,5 +11105,415 @@ mod tests {
             .expect("session task")
             .expect("session result");
         assert!(established.load(Ordering::Relaxed));
+    }
+
+    /// The motherbee counts the nodes a spoke's LSA lists under another hive's name, and applies the
+    /// rest of that LSA.
+    #[tokio::test]
+    async fn the_foreign_nodes_of_an_lsa_are_counted_and_the_rest_applies() {
+        let ctx = test_wan_context(None);
+        let peer_router_uuid = Uuid::new_v4();
+        let mut payload = lsa_payload(
+            "worker1",
+            1,
+            &peer_router_uuid.to_string(),
+            "RT.gateway@worker1",
+        );
+        payload.nodes = vec![
+            lsa_node("AI.sales@worker1"),
+            lsa_node("SY.admin@motherbee"),
+            lsa_node("SY.vault@motherbee"),
+        ];
+        payload.routes = vec![LsaRoute {
+            prefix: "AI.".to_string(),
+            match_kind: "PREFIX".to_string(),
+            action: "FORWARD".to_string(),
+            next_hop_hive: String::new(),
+            metric: 0,
+        }];
+        payload.taps = vec![LsaTap {
+            match_src: "AI.sales@worker1".to_string(),
+            match_dst: "SY.admin@motherbee".to_string(),
+            target: "IO.audit@worker1".to_string(),
+            mode: "best_effort".to_string(),
+            enabled: true,
+        }];
+        let msg = build_lsa(
+            &peer_router_uuid.to_string(),
+            &ctx.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            payload,
+        );
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        handle_wan_message(
+            &msg,
+            &tx,
+            &ctx,
+            "worker1",
+            peer_router_uuid,
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("the LSA is handled");
+
+        assert_eq!(
+            ctx.lsa_reject_counters
+                .lock()
+                .await
+                .get(LSA_REJECT_FOREIGN_NODE),
+            Some(&2)
+        );
+        let state = ctx.lsa_state.lock().await;
+        let worker1 = state.get("worker1").expect("worker1's LSA applies");
+        let installed: Vec<&str> = worker1
+            .nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect();
+        assert_eq!(installed, ["AI.sales@worker1"]);
+        assert_eq!(worker1.routes.len(), 1);
+        assert_eq!(worker1.taps.len(), 1);
+    }
+
+    /// R1 end to end: on the motherbee, a frame from ingress1 carrying the UUID of a worker1 node is
+    /// dropped and counted; the same frame from worker1 is delivered under that node's name.
+    #[tokio::test]
+    async fn the_motherbee_drops_a_spokes_frame_sent_as_another_spokes_node() {
+        let ctx = test_wan_context(None);
+        let wf_rules = Uuid::new_v4();
+        *ctx.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("motherbee", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("ingress1", FLAG_ACTIVE),
+                lsa_hive("worker1", FLAG_ACTIVE),
+            ],
+            vec![lsa_node_entry(wf_rules, "SY.wf-rules@worker1", 2)],
+        ));
+        let receiver = Uuid::new_v4();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        ctx.nodes.lock().await.insert(
+            receiver,
+            NodeHandle {
+                name: "SY.admin@motherbee".to_string(),
+                vpn_id: 0,
+                sender: receiver_tx,
+                connected_at: 0,
+            },
+        );
+        let frame = Message {
+            routing: Routing {
+                src: wf_rules.to_string(),
+                src_l2_name: Some("SY.wf-rules@worker1".to_string()),
+                dst: Destination::Unicast(receiver.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        handle_wan_message(
+            &frame,
+            &tx,
+            &ctx,
+            "ingress1",
+            Uuid::new_v4(),
+            "RT.gateway@ingress1",
+            1,
+        )
+        .await
+        .expect("handled");
+        assert!(
+            receiver_rx.try_recv().is_err(),
+            "ingress1 cannot send as worker1's node"
+        );
+        assert_eq!(
+            ctx.lsa_reject_counters
+                .lock()
+                .await
+                .get(LSA_REJECT_FOREIGN_SOURCE),
+            Some(&1)
+        );
+
+        handle_wan_message(
+            &frame,
+            &tx,
+            &ctx,
+            "worker1",
+            Uuid::new_v4(),
+            "RT.gateway@worker1",
+            1,
+        )
+        .await
+        .expect("handled");
+        let delivered = receiver_rx
+            .try_recv()
+            .expect("worker1's own node is delivered");
+        let delivered: Message = serde_json::from_slice(&delivered).expect("a message");
+        assert_eq!(
+            delivered.routing.src_l2_name.as_deref(),
+            Some("SY.wf-rules@worker1")
+        );
+    }
+
+    /// The LSA message `hive` sends with `nodes`, as `(uuid, name)`.
+    fn lsa_message(hive: &str, seq: u64, nodes: &[(Uuid, &str)], to: Uuid) -> Message {
+        let router_id = Uuid::new_v4().to_string();
+        let mut payload = lsa_payload(hive, seq, &router_id, &format!("RT.gateway@{hive}"));
+        payload.nodes = nodes
+            .iter()
+            .map(|(uuid, name)| LsaNode {
+                uuid: uuid.to_string(),
+                name: name.to_string(),
+                vpn_id: 0,
+            })
+            .collect();
+        build_lsa(
+            &router_id,
+            &to.to_string(),
+            &Uuid::new_v4().to_string(),
+            payload,
+        )
+    }
+
+    /// R2 end to end on the motherbee: ingress1 lists a worker1 node's UUID, and the UUID of the
+    /// motherbee's vault. Whichever LSA comes first, worker1's node UUID resolves to neither hive,
+    /// the vault's claim is dropped, and both claims are counted.
+    #[tokio::test]
+    async fn a_hive_cannot_take_another_nodes_uuid_whichever_lsa_comes_first() {
+        for ingress1_first in [false, true] {
+            let ctx = test_wan_context(None);
+            let lsa_name = format!("/lsa-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            unlink_test_shm(&lsa_name);
+            *ctx.lsa_writer.lock().await = Some(
+                LsaRegionWriter::open_or_create(&lsa_name, ctx.router_uuid, "motherbee")
+                    .expect("lsa region"),
+            );
+            let vault = Uuid::new_v4();
+            let (vault_tx, _vault_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            ctx.nodes.lock().await.insert(
+                vault,
+                NodeHandle {
+                    name: "SY.vault@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: vault_tx,
+                    connected_at: 0,
+                },
+            );
+            let sales = Uuid::new_v4();
+            let worker1 = lsa_message(
+                "worker1",
+                1,
+                &[(sales, "AI.sales@worker1")],
+                ctx.router_uuid,
+            );
+            let ingress1 = lsa_message(
+                "ingress1",
+                1,
+                &[(sales, "IO.x@ingress1"), (vault, "IO.y@ingress1")],
+                ctx.router_uuid,
+            );
+            let order = if ingress1_first {
+                [("ingress1", &ingress1), ("worker1", &worker1)]
+            } else {
+                [("worker1", &worker1), ("ingress1", &ingress1)]
+            };
+            let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            for (hive, lsa) in order {
+                handle_wan_message(
+                    lsa,
+                    &tx,
+                    &ctx,
+                    hive,
+                    Uuid::new_v4(),
+                    &format!("RT.gateway@{hive}"),
+                    1,
+                )
+                .await
+                .expect("handled");
+            }
+
+            let snapshot = ctx.lsa_snapshot.lock().await;
+            assert!(
+                find_remote_node(&snapshot, sales).is_none(),
+                "ingress1 first: {ingress1_first}"
+            );
+            assert!(find_remote_node(&snapshot, vault).is_none());
+            let ingress1_nodes: Vec<String> = ctx.lsa_state.lock().await["ingress1"]
+                .nodes
+                .iter()
+                .map(|node| node.name.clone())
+                .collect();
+            assert_eq!(
+                ingress1_nodes,
+                ["IO.x@ingress1"],
+                "the vault's UUID is dropped"
+            );
+            assert_eq!(
+                ctx.lsa_reject_counters
+                    .lock()
+                    .await
+                    .get(LSA_REJECT_DUPLICATE_UUID),
+                Some(&2)
+            );
+            unlink_test_shm(&lsa_name);
+        }
+    }
+
+    /// R2 on a spoke: the hub's reachability cannot vouch for a UUID that is already taken, by one of
+    /// the spoke's nodes or a node it learns from an LSA, nor list one twice.
+    #[tokio::test]
+    async fn the_hub_cannot_vouch_for_a_uuid_already_taken() {
+        let ctx = wan_context_of("worker1", None);
+        let local = Uuid::new_v4();
+        let hub_node = Uuid::new_v4();
+        let twice = Uuid::new_v4();
+        let fine = Uuid::new_v4();
+        let (local_tx, _local_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        ctx.nodes.lock().await.insert(
+            local,
+            NodeHandle {
+                name: "AI.sales@worker1".to_string(),
+                vpn_id: 0,
+                sender: local_tx,
+                connected_at: 0,
+            },
+        );
+        *ctx.lsa_snapshot.lock().await = Some(lsa_of(
+            vec![
+                lsa_hive("worker1", FLAG_ACTIVE | HIVE_FLAG_SELF),
+                lsa_hive("motherbee", FLAG_ACTIVE),
+            ],
+            vec![lsa_node_entry(hub_node, "SY.admin@motherbee", 1)],
+        ));
+        let entry = |uuid: Uuid, name: &str| WanReachabilityEntry {
+            uuid: uuid.to_string(),
+            name: name.to_string(),
+            hive_id: "worker2".to_string(),
+            vpn_id: 0,
+        };
+        let msg = build_wan_reachability(
+            &Uuid::new_v4().to_string(),
+            &ctx.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            WanReachabilityPayload {
+                origin_hive: "motherbee".to_string(),
+                router_id: String::new(),
+                router_name: String::new(),
+                seq: 1,
+                timestamp: "1".to_string(),
+                entries: vec![
+                    entry(local, "IO.a@worker2"),
+                    entry(hub_node, "IO.b@worker2"),
+                    entry(twice, "IO.c@worker2"),
+                    entry(twice, "IO.d@worker2"),
+                    entry(fine, "IO.e@worker2"),
+                ],
+            },
+        );
+
+        apply_wan_reachability(&ctx, "motherbee", &msg).await;
+
+        let vouched: Vec<String> = ctx
+            .reachability
+            .lock()
+            .await
+            .values()
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(vouched, ["IO.e@worker2"]);
+        assert_eq!(
+            ctx.lsa_reject_counters
+                .lock()
+                .await
+                .get(LSA_REJECT_DUPLICATE_UUID),
+            Some(&4)
+        );
+    }
+
+    /// R2 on the hub: a UUID that two spokes list is vouched for to no spoke.
+    #[tokio::test]
+    async fn the_hub_vouches_for_no_uuid_that_two_spokes_list() {
+        let ctx = test_wan_context(None);
+        let shared = Uuid::new_v4();
+        let support = Uuid::new_v4();
+        let lsa_nodes = |nodes: &[(Uuid, &str)]| -> Vec<LsaNode> {
+            nodes
+                .iter()
+                .map(|(uuid, name)| LsaNode {
+                    uuid: uuid.to_string(),
+                    name: name.to_string(),
+                    vpn_id: 0,
+                })
+                .collect()
+        };
+        {
+            let mut state = ctx.lsa_state.lock().await;
+            state.insert(
+                "worker1".to_string(),
+                RemoteHiveState {
+                    nodes: lsa_nodes(&[
+                        (shared, "AI.sales@worker1"),
+                        (support, "AI.support@worker1"),
+                    ]),
+                    ..RemoteHiveState::default()
+                },
+            );
+            state.insert(
+                "ingress1".to_string(),
+                RemoteHiveState {
+                    nodes: lsa_nodes(&[(shared, "IO.x@ingress1")]),
+                    ..RemoteHiveState::default()
+                },
+            );
+        }
+        let mut worker2_rx = None;
+        for hive in ["worker1", "ingress1", "worker2"] {
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            ctx.wan_peers.lock().await.insert(
+                hive.to_string(),
+                WanPeer {
+                    sender: tx,
+                    router_uuid: Uuid::new_v4(),
+                },
+            );
+            if hive == "worker2" {
+                worker2_rx = Some(rx);
+            }
+        }
+
+        broadcast_reachability(&ctx).await.expect("broadcast");
+
+        let frame = worker2_rx
+            .expect("worker2's link")
+            .try_recv()
+            .expect("worker2 hears of the other spokes");
+        let msg: Message = serde_json::from_slice(&frame).expect("a message");
+        let payload: WanReachabilityPayload =
+            serde_json::from_value(msg.payload).expect("a reachability payload");
+        let vouched: Vec<&str> = payload
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(vouched, ["AI.support@worker1"]);
+    }
+
+    /// R4, the caller: sibling routers' regions are read only through the ownership check.
+    #[test]
+    fn sibling_regions_are_read_only_through_the_ownership_check() {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find("fn discover_peer_regions(")
+            .expect("discover_peer_regions");
+        let end = start + src[start..].find("\n}\n").expect("its end");
+        let body = &src[start..end];
+        assert!(body.contains("RouterRegionReader::open_read_only_owned_by(&shm_name, own_uid)"));
+        assert!(!body.contains("RouterRegionReader::open_read_only(&"));
     }
 }

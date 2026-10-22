@@ -4,6 +4,7 @@ mod acme;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,11 +60,12 @@ use json_router::runtime_manifest::{
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
 };
 use json_router::runtime_package::{
-    install_validated_package_with_options, validate_package, DIST_RUNTIME_MANIFEST_PATH,
-    DIST_RUNTIME_ROOT_DIR,
+    install_validated_package_with_options, validate_package, PackageMetadata,
+    DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
 };
 use json_router::shm::{
-    now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
+    now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RouterRegionReader,
+    FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF,
 };
 use sha2::{Digest, Sha256};
 
@@ -319,7 +321,12 @@ struct AdminContext {
     command_log_lock: Arc<std::sync::Mutex<()>>,
     /// The public edge's certificate (docs/acme-edge-certificates-v1.md §6, §7).
     acme: Arc<acme::AcmeService>,
+    /// The nodes connected now, given this hive (`connected_nodes_from_shm`).
+    connected_nodes: ConnectedNodes,
 }
+
+/// Reads the nodes connected now, `<name>@<hive>`, given this admin's hive.
+type ConnectedNodes = Arc<dyn Fn(&str) -> Result<Vec<String>, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -673,7 +680,9 @@ async fn main() -> Result<(), AdminError> {
         runtime_manifest_lock: Arc::new(Mutex::new(())),
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
         acme: acme_service,
+        connected_nodes: Arc::new(connected_nodes_from_shm),
     };
+    log_registry_caller_roles(&http_ctx.hive_id, &hives_registry_root(&http_ctx));
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
     let sweep_ctx = http_ctx.clone();
@@ -902,15 +911,6 @@ fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntr
     }
 }
 
-/// Audit origin string for the command log: the router-stamped caller when the command arrived over
-/// L2 (`l2:<src>`), else the trusted internal path (operator HTTP / executor). Single source for both
-/// the `InternalActionRoute::Command` seam and the direct-dispatch actions below.
-fn command_log_origin(caller_l2_name: Option<&str>) -> String {
-    caller_l2_name
-        .map(|src| format!("l2:{src}"))
-        .unwrap_or_else(|| "internal".to_string())
-}
-
 /// Command-log append for an action that bypasses `handle_admin_command` — publish/unpublish/
 /// externalize/unexternalize go STRAIGHT through `dispatch_internal_admin_command` (they would time
 /// out if shipped to SY.config.routes), so the single append point in `handle_admin_command` never
@@ -920,7 +920,7 @@ fn command_log_origin(caller_l2_name: Option<&str>) -> String {
 fn append_internal_dispatch_log(
     ctx: &AdminContext,
     action: &str,
-    caller_l2_name: Option<&str>,
+    origin: AdminOrigin<'_>,
     logged_params: serde_json::Value,
     started: Instant,
     result: &Result<InternalAdminDispatchResult, AdminError>,
@@ -951,7 +951,7 @@ fn append_internal_dispatch_log(
         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         action: action.to_string(),
         hive: Some(ctx.hive_id.clone()),
-        origin: command_log_origin(caller_l2_name),
+        origin: origin.audit_label(),
         params: logged_params,
         status,
         error_code,
@@ -1949,7 +1949,7 @@ async fn run_internal_admin_loop(
     while let Some(msg) = rx.recv().await {
         // Every command runs in its own task, as the operator's HTTP requests do (one task per
         // connection). A handler that calls this admin back must never wait behind its own
-        // caller: a node teardown (delete_ilk, vault_delete), SY.wf-rules publishing and launching
+        // caller: a node teardown (teardown_node), SY.wf-rules publishing and launching
         // a workflow, an executor plan. Run inline, each deadlocked until a timeout: Cloud's
         // delete_node (0.1.68 gate, A-67) and every workflow deploy from Archi (A-68).
         let (ctx, client) = (ctx.clone(), client.clone());
@@ -2021,7 +2021,7 @@ impl FunctionTool for AdminExecutorStepTool {
             &self.step.action,
             target.as_deref(),
             params,
-            None, // executor/architect path — trusted internal origin
+            AdminOrigin::Executor,
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
@@ -2077,7 +2077,7 @@ impl FunctionTool for AdminExecutorHelpTool {
                 "action": requested_action,
                 "action_name": requested_action
             }),
-            None, // read-only help lookup — trusted internal origin
+            AdminOrigin::Executor,
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
@@ -2484,7 +2484,7 @@ async fn execute_admin_executor_step_fallback(
         &step.action,
         params,
         target,
-        "executor",
+        AdminOrigin::Executor,
     )
     .await
     {
@@ -2708,7 +2708,16 @@ async fn read_joining_hive(
             "error_detail": detail,
         })
     };
-    match handle_admin_command_inner(ctx, client, "get_hive", payload, None).await {
+    match handle_admin_command_inner(
+        ctx,
+        client,
+        "get_hive",
+        payload,
+        None,
+        AdminOrigin::Executor,
+    )
+    .await
+    {
         Ok((_, body)) => serde_json::from_str(&body)
             .unwrap_or_else(|err| transport_error(format!("invalid get_hive answer: {err}"))),
         Err(err) => transport_error(err.to_string()),
@@ -3260,8 +3269,9 @@ async fn handle_internal_admin_command(
         parsed.target.as_deref(),
         parsed.params,
         // The node's un-forgeable identity, stamped by the router (mod.rs:975 local / peer path
-        // cross-hive). This is the authz origin — never the payload.
-        msg.routing.src_l2_name.as_deref(),
+        // cross-hive), which the A-62 table admits or not — never the payload. A command with no
+        // stamped name is a mesh command all the same, and the table refuses it.
+        AdminOrigin::Mesh(msg.routing.src_l2_name.as_deref().unwrap_or_default()),
     )
     .await
     {
@@ -3434,8 +3444,10 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "14";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "15";
 
+/// The action catalog. Every action in it also names who on the mesh may ask for it, in
+/// `mesh_access` right below: one without an entry is closed to the mesh.
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "hive_status",
@@ -3638,6 +3650,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "remove_node_instance",
         route: InternalActionRoute::Command("remove_node_instance"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "teardown_node",
+        route: InternalActionRoute::Command("teardown_node"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4063,6 +4081,744 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
 ];
+
+/// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
+/// API and the executor are not mesh callers and reach every action. Over the mesh,
+/// `SY.architect@motherbee` (Archi, the operator's agent) may ask for every action listed in
+/// `mesh_access`, `IO.cloud@motherbee` for each of `CLOUD_EXPOSED_ACTIONS`, and the access of the
+/// action names who else may. A caller on an ingress or egress hive may ask for nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeshAccess {
+    /// Archi alone.
+    Archi,
+    /// `SY.wf-rules@H`, on the `WF.*@H` nodes (`authorize_wf_rules_node`).
+    WorkflowNode,
+    /// `SY.wf-rules@H`, on the packages of its workflows (`authorize_wf_rules_package`).
+    WorkflowPackage,
+    /// `SY.orchestrator@H`, for a node of `H` (`authorize_orchestrator_teardown`).
+    NodeTeardown,
+    /// `IO.*@H`, on its own channels (`authorize_channel_command` and
+    /// `filter_externalized_channels_for_caller` in the handlers).
+    OwnChannel,
+    /// `AI.*@H`, `IO.*@H` and `WF.*@H`, the producers (`authorize_artifact_publisher` in the
+    /// handler).
+    Publisher,
+    /// `AI.*@H`, on its own publications (`handle_unpublish_artifact`).
+    AiPublisher,
+}
+
+/// The mesh decision of each action of the catalog and of each mesh command off it. `None`, an
+/// action nobody listed, is closed to the whole mesh, Archi included, until it is listed
+/// (`every_action_has_a_mesh_decision`).
+fn mesh_access(action: &str) -> Option<MeshAccess> {
+    let access = match action {
+        "run_node" | "restart_node" | "kill_node" | "get_node_config" | "set_node_config"
+        | "get_node_status" => MeshAccess::WorkflowNode,
+        "publish_runtime_package" | "remove_runtime_version" | "sync_hint" => {
+            MeshAccess::WorkflowPackage
+        }
+        "teardown_node" => MeshAccess::NodeTeardown,
+        "externalize" | "unexternalize" | "list_externalized" => MeshAccess::OwnChannel,
+        "publish_artifact" => MeshAccess::Publisher,
+        "unpublish_artifact" => MeshAccess::AiPublisher,
+        // Off the catalog: the executor, which runs every step as the operator.
+        "executor_validate_plan" | "executor_execute_plan" => MeshAccess::Archi,
+        "hive_status"
+        | "list_hives"
+        | "list_admin_actions"
+        | "list_cloud_actions"
+        | "get_admin_action_help"
+        | "list_versions"
+        | "get_versions"
+        | "list_runtimes"
+        | "get_runtime"
+        | "list_routes"
+        | "list_vpns"
+        | "list_nodes"
+        | "list_streams"
+        | "get_llm_usage"
+        | "get_storage"
+        | "add_hive"
+        | "get_hive"
+        | "remove_hive"
+        | "add_route"
+        | "delete_route"
+        | "add_vpn"
+        | "delete_vpn"
+        | "list_taps"
+        | "add_tap"
+        | "delete_tap"
+        | "start_node"
+        | "remove_node_instance"
+        | "get_node_state"
+        | "list_tenant_nodes"
+        | "send_node_message"
+        | "list_recent_commands"
+        | "node_control_config_get"
+        | "node_control_config_set"
+        | "list_ilks"
+        | "get_ilk"
+        | "set_ilk_definition"
+        | "delete_ilk"
+        | "restore_ilk"
+        | "set_ilk_tenant"
+        | "purge_ilk"
+        | "delete_tenant"
+        | "restore_tenant"
+        | "purge_tenant"
+        | "list_tenants"
+        | "get_tenant"
+        | "create_tenant"
+        | "update_tenant"
+        | "set_tenant_sponsor"
+        | "vault_list"
+        | "vault_put"
+        | "vault_get_metadata"
+        | "vault_get"
+        | "vault_delete"
+        | "vault_rotate"
+        | "vault_assign"
+        | "vault_rollback"
+        | "core_rollback"
+        | "list_deployments"
+        | "get_deployments"
+        | "list_drift_alerts"
+        | "get_drift_alerts"
+        | "set_storage"
+        | "update"
+        | "publish_cloud_endpoint"
+        | "inventory"
+        | "opa_compile_apply"
+        | "opa_compile"
+        | "opa_apply"
+        | "opa_rollback"
+        | "opa_clear"
+        | "opa_check"
+        | "opa_get_policy"
+        | "opa_get_status"
+        | "wf_rules_compile_apply"
+        | "wf_rules_compile"
+        | "wf_rules_apply"
+        | "wf_rules_rollback"
+        | "wf_rules_delete"
+        | "wf_rules_get_workflow"
+        | "wf_rules_get_status"
+        | "wf_rules_list_workflows"
+        | "timer_help"
+        | "timer_get"
+        | "timer_list"
+        | "timer_now"
+        | "timer_now_in"
+        | "timer_convert"
+        | "timer_parse"
+        | "timer_format"
+        | "acme_status"
+        | "acme_renew"
+        | "acme_test"
+        | "acme_reload" => MeshAccess::Archi,
+        _ => return None,
+    };
+    Some(access)
+}
+
+/// The role of the hive a mesh caller is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallerHive {
+    Motherbee,
+    Worker,
+    Ingress,
+    Egress,
+}
+
+/// The role of `hive`, a mesh caller's hive. This admin's own hive is the motherbee; any other is
+/// what the hive registry records (`<hive>/info.yaml`, written by the orchestrator: the registry
+/// of A-48), once its join is done (`status: connected` and no join phase but `done`). Fails
+/// closed: no entry, no role, an entry for another hive, a join in flight or a removed hive is
+/// `None`, which the A-62 table admits to nothing.
+fn caller_hive_role(admin_hive: &str, registry_root: &Path, hive: &str) -> Option<CallerHive> {
+    if hive == admin_hive {
+        return Some(CallerHive::Motherbee);
+    }
+    if !plain_hive_id(hive) {
+        return None;
+    }
+    let raw = fs::read_to_string(registry_root.join(hive).join("info.yaml")).ok()?;
+    let info = serde_yaml::from_str::<serde_json::Value>(&raw).ok()?;
+    let field = |key: &str| {
+        info.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+    };
+    let join_done = info
+        .get("join")
+        .and_then(|join| join.get("phase"))
+        .is_none_or(|phase| phase.as_str() == Some("done"));
+    if field("hive_id") != Some(hive) || field("status") != Some("connected") || !join_done {
+        return None;
+    }
+    match field("role")?.to_ascii_lowercase().as_str() {
+        "worker" => Some(CallerHive::Worker),
+        "ingress" => Some(CallerHive::Ingress),
+        "egress" => Some(CallerHive::Egress),
+        _ => None,
+    }
+}
+
+/// Each entry of the hive registry with the role the A-62 table gives its nodes
+/// (`caller_hive_role`), in name order.
+fn registry_caller_roles(
+    admin_hive: &str,
+    registry_root: &Path,
+) -> Vec<(String, Option<CallerHive>)> {
+    let mut roles: Vec<(String, Option<CallerHive>)> = fs::read_dir(registry_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .map(|hive| {
+            let role = caller_hive_role(admin_hive, registry_root, &hive);
+            (hive, role)
+        })
+        .collect();
+    roles.sort_by(|a, b| a.0.cmp(&b.0));
+    roles
+}
+
+/// At start, the role each registered hive's nodes have over the mesh, so that a hive the table
+/// refuses for a reason of the registry (no role, a join not done) shows at once.
+fn log_registry_caller_roles(admin_hive: &str, registry_root: &Path) {
+    for (hive, role) in registry_caller_roles(admin_hive, registry_root) {
+        match role {
+            Some(role) => {
+                tracing::info!(hive = %hive, role = ?role, "mesh caller role from the hive registry")
+            }
+            None => tracing::warn!(
+                hive = %hive,
+                "the hive registry gives this hive no role: SY.admin refuses its nodes over the mesh"
+            ),
+        }
+    }
+}
+
+/// A hive id as a join accepts one (1 to 64 of `[A-Za-z0-9_-]`): a directory of the registry,
+/// never a path.
+fn plain_hive_id(hive: &str) -> bool {
+    !hive.is_empty()
+        && hive.len() <= 64
+        && hive
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `name` (the part of a node name before `@`) is a node of `family` (`AI`, `IO`, `WF`).
+fn node_of_family(name: &str, family: &str) -> bool {
+    name.strip_prefix(family)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// What the A-62 table admits.
+#[derive(Debug, PartialEq, Eq)]
+enum MeshAdmission {
+    Admitted,
+    /// SY.wf-rules@`hive` on the package `wf.<workflow>`. A package is one for every hive, so it
+    /// is admitted only while no `WF.<workflow>` is connected on another hive
+    /// (`workflow_nodes_elsewhere`).
+    WorkflowPackage {
+        workflow: String,
+        hive: String,
+    },
+}
+
+/// A-62: may this mesh caller ask for `action` (docs/control-path-hardening-v1.md §2)? Checked
+/// first in `dispatch_internal_admin_command`. `caller` is the router-stamped `src_l2_name`,
+/// never a field of the params, and `caller_hive` the role of its hive (`caller_hive_role`). In
+/// order: a caller on an ingress or egress hive, or on a hive the registry does not hold, gets
+/// nothing; Archi gets every listed action; IO.cloud the Cloud-exposed ones; then the action's own
+/// `MeshAccess`.
+fn authorize_mesh_caller(
+    caller: &str,
+    caller_hive: Option<CallerHive>,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+    admin_hive: &str,
+) -> Result<MeshAdmission, String> {
+    let Some((name, hive)) = caller
+        .rsplit_once('@')
+        .filter(|(name, hive)| !name.is_empty() && !hive.is_empty())
+    else {
+        return Err(if caller.is_empty() {
+            "the router stamped no caller on this command".to_string()
+        } else {
+            format!("caller '{caller}' is not a node name")
+        });
+    };
+    match caller_hive {
+        Some(CallerHive::Motherbee | CallerHive::Worker) => {}
+        Some(CallerHive::Ingress | CallerHive::Egress) => {
+            return Err(format!(
+                "{caller} is on an ingress or egress hive, which may ask SY.admin for nothing"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{caller}: hive '{hive}' is not a hive of the registry with its join done"
+            ));
+        }
+    }
+    let Some(access) = mesh_access(action) else {
+        return Err(format!("'{action}' is open to no mesh caller"));
+    };
+    if caller == format!("SY.architect@{admin_hive}")
+        || (caller == format!("IO.cloud@{admin_hive}")
+            && IO_CLOUD_EXPOSED_ACTIONS.contains(&action))
+    {
+        return Ok(MeshAdmission::Admitted);
+    }
+    match access {
+        MeshAccess::WorkflowNode if name == "SY.wf-rules" => {
+            authorize_wf_rules_node(caller, hive, action, target, params)?;
+            Ok(MeshAdmission::Admitted)
+        }
+        MeshAccess::WorkflowPackage if name == "SY.wf-rules" => {
+            authorize_wf_rules_package(caller, hive, action, target, params, admin_hive)
+        }
+        MeshAccess::NodeTeardown if name == "SY.orchestrator" => {
+            authorize_orchestrator_teardown(caller, hive, params)?;
+            Ok(MeshAdmission::Admitted)
+        }
+        MeshAccess::OwnChannel if node_of_family(name, "IO") => Ok(MeshAdmission::Admitted),
+        MeshAccess::Publisher
+            if ["AI", "IO", "WF"]
+                .iter()
+                .any(|family| node_of_family(name, family)) =>
+        {
+            Ok(MeshAdmission::Admitted)
+        }
+        MeshAccess::AiPublisher if node_of_family(name, "AI") => Ok(MeshAdmission::Admitted),
+        _ => Err(format!("{caller} may not ask for '{action}' over the mesh")),
+    }
+}
+
+/// The base runtime every workflow package runs on: the WF engine's code.
+const WF_ENGINE_RUNTIME: &str = "wf.engine";
+
+/// The Syncthing folder of the motherbee's `dist/runtimes`, which a worker's deploy has scanned so
+/// the package it just published reaches the worker at once (`announceRuntimes` in
+/// go/sy-wf-rules/node/deploy.go).
+const RUNTIMES_SYNC_FOLDER: &str = "fluxbee-dist-runtimes";
+
+/// The longest wait a worker's SY.wf-rules asks of that scan: the 5 s of its deploy
+/// (`s.announceRuntimes(ctx, 5000)` in go/sy-wf-rules/node/deploy.go; its nudges ask for 1 s).
+const WF_RULES_SYNC_HINT_MAX_TIMEOUT_MS: u64 = 5_000;
+
+/// SY.wf-rules@`caller_hive` on the WF nodes of its hive (docs/wf-standard-path-v1.md): the node
+/// name and, when given, the target must both name its hive (the router-stamped name, never the
+/// params), and what it binds or launches is the node's own workflow package on the WF engine.
+fn authorize_wf_rules_node(
+    caller: &str,
+    caller_hive: &str,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let node_name = params
+        .get("node_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let refusal = || {
+        Err(format!(
+            "{caller} may act only on the WF.* nodes of hive '{caller_hive}', not '{action}' on '{node_name}'"
+        ))
+    };
+    let Some((local, node_hive)) = node_name.rsplit_once('@') else {
+        return refusal();
+    };
+    if !node_of_family(local, "WF") || node_hive.trim() != caller_hive {
+        return refusal();
+    }
+    let targets = [
+        normalize_internal_target_hive(target),
+        normalize_internal_target_hive(params.get("target").and_then(|value| value.as_str())),
+    ];
+    if targets.iter().flatten().any(|hive| hive != caller_hive) {
+        return refusal();
+    }
+    // What it binds or launches is the node's own workflow package, on the WF engine: never
+    // another runtime under a WF.* name.
+    let workflow_runtime = format!("wf.{}", &local["WF.".len()..]);
+    let field = |key: &str| {
+        params
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+    };
+    let runtime_ok = match field("runtime") {
+        Some(runtime) => runtime == workflow_runtime,
+        None => action != "run_node",
+    };
+    let base_ok = field("runtime_base").is_none_or(|base| base == WF_ENGINE_RUNTIME);
+    let package_ok = field("package_path").is_none_or(|path| {
+        let root = format!("{DIST_RUNTIME_ROOT_DIR}/{workflow_runtime}/");
+        path.starts_with(&root) && !path.contains("..")
+    });
+    if !(runtime_ok && base_ok && package_ok) {
+        return Err(format!(
+            "{caller} may bind or launch only {workflow_runtime} on {WF_ENGINE_RUNTIME} for '{node_name}'"
+        ));
+    }
+    Ok(())
+}
+
+/// SY.wf-rules@`caller_hive` on the packages of its workflows, with only the fields its deploys
+/// and deletes send (go/sy-wf-rules/node/admin.go):
+/// - `publish_runtime_package` {`source` {`kind`, `files`}, `set_current`}: an inline package
+///   whose package.json says `type: workflow`, `runtime_base: wf.engine` and `name: wf.<x>`
+///   (never `wf.engine` itself, whose code every workflow runs);
+/// - `remove_runtime_version` {`runtime`, `runtime_version`}: a version of a `wf.<x>` (a
+///   `test_hold_ms` would hold the manifest lock every publish and deploy waits for);
+/// - `sync_hint` {`channel`, `folder_id`, `wait_for_idle`, `timeout_ms`}: a scan of the
+///   motherbee's runtimes folder, waiting at most `WF_RULES_SYNC_HINT_MAX_TIMEOUT_MS` (a longer
+///   wait would hold the motherbee orchestrator's system worker, which takes one message at a
+///   time).
+///
+/// The first two also wait for the connected nodes (`MeshAdmission::WorkflowPackage`).
+fn authorize_wf_rules_package(
+    caller: &str,
+    caller_hive: &str,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+    admin_hive: &str,
+) -> Result<MeshAdmission, String> {
+    let workflow = match action {
+        "publish_runtime_package" => published_workflow(params).map_err(|detail| {
+            format!("{caller} may publish only a workflow's own package: {detail}")
+        })?,
+        "remove_runtime_version" => {
+            only_fields(params, &["runtime", "runtime_version"]).map_err(|detail| {
+                format!("{caller} may remove a version only as its deletes do: {detail}")
+            })?;
+            let runtime = params
+                .get("runtime")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            workflow_of_runtime(runtime).ok_or_else(|| {
+                format!("{caller} may remove only versions of a workflow package wf.<name>, not '{runtime}'")
+            })?
+        }
+        "sync_hint" => {
+            only_fields(
+                params,
+                &["channel", "folder_id", "wait_for_idle", "timeout_ms"],
+            )
+            .map_err(|detail| {
+                format!("{caller} may ask for a scan only as its deploys do: {detail}")
+            })?;
+            let field = |key: &str| {
+                params
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+            };
+            let hive = resolve_internal_action_hive(action, target, params);
+            // Required: without it the orchestrator waits its default of 30 s.
+            let timeout_ok = params
+                .get("timeout_ms")
+                .and_then(|value| value.as_u64())
+                .is_some_and(|ms| ms <= WF_RULES_SYNC_HINT_MAX_TIMEOUT_MS);
+            if hive.as_deref() != Some(admin_hive)
+                || !field("channel").is_some_and(|channel| channel.eq_ignore_ascii_case("dist"))
+                || field("folder_id") != Some(RUNTIMES_SYNC_FOLDER)
+                || !timeout_ok
+            {
+                return Err(format!(
+                    "{caller} may ask only for a scan of {RUNTIMES_SYNC_FOLDER} (channel dist) on {admin_hive}, with a timeout_ms of at most {WF_RULES_SYNC_HINT_MAX_TIMEOUT_MS}"
+                ));
+            }
+            return Ok(MeshAdmission::Admitted);
+        }
+        _ => return Err(format!("{caller} may not ask for '{action}' over the mesh")),
+    };
+    Ok(MeshAdmission::WorkflowPackage {
+        workflow,
+        hive: caller_hive.to_string(),
+    })
+}
+
+/// A field of the request object `value` that is not in `allowed`, as a refusal.
+fn only_fields(value: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
+    match value
+        .as_object()
+        .and_then(|fields| fields.keys().find(|key| !allowed.contains(&key.as_str())))
+    {
+        Some(field) => Err(format!("'{field}' is not accepted (only {allowed:?})")),
+        None => Ok(()),
+    }
+}
+
+/// The workflow `x` an inline workflow package `wf.<x>` publishes, or why the request is not one
+/// SY.wf-rules sends: no `sync_to` or `update_to`, no bundle. The package.json is read with the
+/// publisher's own `PackageMetadata`, so both read the same fields.
+fn published_workflow(params: &serde_json::Value) -> Result<String, String> {
+    only_fields(params, &["source", "set_current"])?;
+    let source = params.get("source").unwrap_or(&serde_json::Value::Null);
+    only_fields(source, &["kind", "files"])?;
+    if source.get("kind").and_then(|kind| kind.as_str()) != Some("inline_package") {
+        return Err("only an inline_package source is accepted".to_string());
+    }
+    let files = source
+        .get("files")
+        .and_then(|files| files.as_object())
+        .ok_or("source.files is missing")?;
+    // One plain path per file, so the package.json read here is the one the publisher writes:
+    // a key it would read differently (blanks, `.`, empty segments) could name the same file and
+    // replace it.
+    if let Some(path) = files.keys().find(|path| !plain_package_path(path)) {
+        return Err(format!("'{path}' is not a plain relative path"));
+    }
+    let raw = files
+        .get("package.json")
+        .and_then(|value| value.as_str())
+        .ok_or("package.json is missing")?;
+    let metadata = serde_json::from_str::<PackageMetadata>(raw)
+        .map_err(|err| format!("package.json does not parse: {err}"))?;
+    if metadata.package_type != "workflow"
+        || metadata.runtime_base.as_deref() != Some(WF_ENGINE_RUNTIME)
+    {
+        return Err(format!(
+            "package.json must say type workflow on runtime_base {WF_ENGINE_RUNTIME}, not type '{}' on {:?}",
+            metadata.package_type, metadata.runtime_base
+        ));
+    }
+    workflow_of_runtime(&metadata.name)
+        .ok_or_else(|| format!("'{}' is not a workflow package wf.<name>", metadata.name))
+}
+
+/// A relative path the inline publisher writes as given: no segment empty, `.`, `..` or with
+/// blanks around it.
+fn plain_package_path(path: &str) -> bool {
+    path.split('/').all(|segment| {
+        !segment.is_empty() && segment != "." && segment != ".." && segment.trim() == segment
+    })
+}
+
+/// The workflow `x` of a workflow package `wf.<x>` as SY.wf-rules names them (lowercase: the
+/// manifest finds a runtime whatever its case), never the engine `wf.engine` itself.
+fn workflow_of_runtime(runtime: &str) -> Option<String> {
+    let workflow = runtime.strip_prefix("wf.")?;
+    let plain = runtime
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    (plain && !workflow.is_empty() && runtime != WF_ENGINE_RUNTIME).then(|| workflow.to_string())
+}
+
+/// The `WF.<workflow>` nodes connected on hives other than `hive`, as a refusal: a package is
+/// the same on every hive, and their node would run what this hive publishes.
+fn workflow_nodes_elsewhere(nodes: &[String], workflow: &str, hive: &str) -> Result<(), String> {
+    let node = format!("WF.{workflow}");
+    let elsewhere: Vec<&str> = nodes
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            name.rsplit_once('@').is_some_and(|(local, node_hive)| {
+                local.eq_ignore_ascii_case(&node) && node_hive != hive
+            })
+        })
+        .collect();
+    if elsewhere.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "wf.{workflow} is also the package of {}: only that hive's SY.wf-rules may change it",
+        elsewhere.join(", ")
+    ))
+}
+
+/// The shared-memory regions that are not a router's: every other `jsr-*` region is.
+const NON_ROUTER_REGIONS: &[&str] = &[
+    "jsr-config-",
+    "jsr-lsa-",
+    "jsr-opa-",
+    "jsr-identity-",
+    "jsr-memory-",
+];
+
+/// The nodes connected now, `<name>@<hive>`, read from shared memory with no message to anyone
+/// (a busy orchestrator never holds it up): this hive's from the regions of its routers, every
+/// other hive's from the LSA. An error when the regions cannot be read.
+fn connected_nodes_from_shm(admin_hive: &str) -> Result<Vec<String>, String> {
+    let lsa = LsaRegionReader::open_read_only(&format!("/jsr-lsa-{admin_hive}"))
+        .map_err(|err| format!("the LSA region cannot be read: {err}"))?
+        .read_snapshot()
+        .ok_or("the LSA region gave no consistent snapshot")?;
+    let local_nodes = local_router_nodes(admin_hive)?;
+    Ok(connected_node_names(
+        admin_hive,
+        &local_nodes,
+        &lsa,
+        now_epoch_ms(),
+    ))
+}
+
+/// The nodes in the regions of this hive's routers, found as a router finds its peers'
+/// (`discover_peer_regions` in src/router/mod.rs): each `jsr-*` region of /dev/shm that is a
+/// router region of this hive with a fresh heartbeat. None is an error: no router is up.
+fn local_router_nodes(admin_hive: &str) -> Result<Vec<NodeEntry>, String> {
+    let entries =
+        fs::read_dir("/dev/shm").map_err(|err| format!("/dev/shm cannot be read: {err}"))?;
+    let now = now_epoch_ms();
+    let mut routers = 0usize;
+    let mut nodes = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("jsr-")
+            || NON_ROUTER_REGIONS
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let Some(snapshot) = RouterRegionReader::open_read_only(&format!("/{name}"))
+            .ok()
+            .and_then(|reader| reader.read_snapshot())
+        else {
+            continue;
+        };
+        if snapshot.header.hive_id != admin_hive
+            || now.saturating_sub(snapshot.header.heartbeat) > HEARTBEAT_STALE_MS
+        {
+            continue;
+        }
+        routers += 1;
+        nodes.extend(snapshot.nodes);
+    }
+    if routers == 0 {
+        return Err(format!(
+            "no router region of {admin_hive} has a fresh heartbeat"
+        ));
+    }
+    Ok(nodes)
+}
+
+/// The nodes connected now, `<name>@<hive>`, as the router reaches them (`find_remote_node`):
+/// this hive's from its routers' regions (`local_nodes`), every other hive's from the LSA. A node
+/// marked stale or deleted, or one of a hive the LSA holds as stale, is not connected.
+fn connected_node_names(
+    admin_hive: &str,
+    local_nodes: &[NodeEntry],
+    lsa: &LsaSnapshot,
+    now: u64,
+) -> Vec<String> {
+    let usable =
+        |name_len: u16, flags: u16| name_len > 0 && flags & (FLAG_DELETED | FLAG_STALE) == 0;
+    let mut names: Vec<String> = local_nodes
+        .iter()
+        .filter(|node| usable(node.name_len, node.flags))
+        .map(|node| qualified_node_name(&shm_node_name(&node.name, node.name_len), admin_hive))
+        .collect();
+    for node in &lsa.nodes {
+        if !usable(node.name_len, node.flags) {
+            continue;
+        }
+        let Some(entry) = lsa.hives.get(node.hive_index as usize) else {
+            continue;
+        };
+        let Some(hive) = remote_hive_name(entry) else {
+            continue;
+        };
+        if hive == admin_hive
+            || entry.flags & HIVE_FLAG_SELF != 0
+            || remote_hive_is_stale(entry, now)
+        {
+            continue;
+        }
+        names.push(qualified_node_name(
+            &shm_node_name(&node.name, node.name_len),
+            &hive,
+        ));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A node name of a shared-memory entry, its recorded length clamped to the buffer.
+fn shm_node_name(name: &[u8], name_len: u16) -> String {
+    let len = (name_len as usize).min(name.len());
+    String::from_utf8_lossy(&name[..len]).into_owned()
+}
+
+/// `name` as `<name>@<hive>`: a name with its hive stays as it is.
+fn qualified_node_name(name: &str, hive: &str) -> String {
+    if name.contains('@') {
+        name.to_string()
+    } else {
+        format!("{name}@{hive}")
+    }
+}
+
+/// SY.orchestrator@`caller_hive` tears down the nodes of its own hive, never another's.
+fn authorize_orchestrator_teardown(
+    caller: &str,
+    caller_hive: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let request =
+        TeardownNodeRequest::from_params(params).map_err(|detail| format!("{caller}: {detail}"))?;
+    if request.hive != caller_hive {
+        return Err(format!(
+            "{caller} may tear down only the nodes of hive '{caller_hive}', not {}",
+            request.node_name
+        ));
+    }
+    Ok(())
+}
+
+/// Why a mesh command does not run.
+#[derive(Debug, PartialEq, Eq)]
+enum MeshRefusal {
+    /// The A-62 table refuses the caller: 403 `UNAUTHORIZED`.
+    Unauthorized(String),
+    /// The table needs the connected nodes and the shared-memory regions cannot be read: 503
+    /// `INVENTORY_UNAVAILABLE`, worth a retry.
+    InventoryUnavailable(String),
+}
+
+/// A-62 for one mesh command: the table, then the connected nodes it leaves to shared memory.
+fn admit_mesh_caller(
+    ctx: &AdminContext,
+    caller: &str,
+    action: &str,
+    target: Option<&str>,
+    params: &serde_json::Value,
+) -> Result<(), MeshRefusal> {
+    let hive = caller
+        .rsplit_once('@')
+        .map(|(_, hive)| hive)
+        .unwrap_or_default();
+    let role = caller_hive_role(&ctx.hive_id, &hives_registry_root(ctx), hive);
+    match authorize_mesh_caller(caller, role, action, target, params, &ctx.hive_id)
+        .map_err(MeshRefusal::Unauthorized)?
+    {
+        MeshAdmission::Admitted => Ok(()),
+        MeshAdmission::WorkflowPackage { workflow, hive } => {
+            let nodes = (ctx.connected_nodes)(&ctx.hive_id).map_err(|detail| {
+                MeshRefusal::InventoryUnavailable(format!(
+                    "whether WF.{workflow} runs on another hive cannot be read: {detail}"
+                ))
+            })?;
+            workflow_nodes_elsewhere(&nodes, &workflow, &hive).map_err(|detail| {
+                MeshRefusal::Unauthorized(format!(
+                    "{caller} may not change wf.{workflow}: {detail}"
+                ))
+            })
+        }
+    }
+}
 
 async fn handle_publish_artifact(
     ctx: &AdminContext,
@@ -5514,30 +6270,66 @@ fn filter_externalized_channels_for_caller(
         .collect())
 }
 
+/// Where an admin command came from (docs/control-path-hardening-v1.md §2). Trust goes by the
+/// entry point, never by a missing caller: the HTTP API on loopback and the executor running the
+/// steps of a plan already approved are trusted; a mesh caller is admitted only by the A-62 table
+/// (`authorize_mesh_caller`).
+#[derive(Clone, Copy, Debug)]
+enum AdminOrigin<'a> {
+    /// The operator's HTTP API on loopback.
+    Http,
+    /// The executor, running a step of a plan already approved.
+    Executor,
+    /// An `ADMIN_COMMAND` over the mesh, with the router-stamped `src_l2_name` of its caller (empty
+    /// when the router stamped none).
+    Mesh(&'a str),
+}
+
+impl<'a> AdminOrigin<'a> {
+    /// The router-stamped caller of a mesh command, `None` on the trusted paths: what the handlers
+    /// act on behalf of (a channel's owner, a publication's, the launcher of a node).
+    fn caller(self) -> Option<&'a str> {
+        match self {
+            AdminOrigin::Mesh(caller) => Some(caller),
+            AdminOrigin::Http | AdminOrigin::Executor => None,
+        }
+    }
+
+    /// The command audit log's `origin`: `http`, `executor` or `l2:<caller>`.
+    fn audit_label(self) -> String {
+        match self {
+            AdminOrigin::Http => "http".to_string(),
+            AdminOrigin::Executor => "executor".to_string(),
+            AdminOrigin::Mesh(caller) => format!("l2:{caller}"),
+        }
+    }
+}
+
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     action: &str,
     target: Option<&str>,
     params: serde_json::Value,
-    // The router-stamped, un-forgeable L2 name of the ORIGINATING node (`msg.routing.src_l2_name`),
-    // or `None` for trusted internal paths (HTTP operator / executor). Used to authorize
-    // self-service actions like `externalize` (v6 §11.1). Do NOT trust anything in `params` for authz.
-    caller_l2_name: Option<&str>,
+    origin: AdminOrigin<'_>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
-    // EDGE-06 (scoped to the Fluxbee Cloud relay): the provisioning actions IO.cloud relays are
-    // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
-    // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
-    if let Err(detail) = authorize_wf_rules_caller(caller_l2_name, action, target, &params) {
-        return Ok(internal_unauthorized(action, &detail));
+    // A-62: a mesh caller is admitted by the table before anything else runs.
+    if let AdminOrigin::Mesh(caller) = origin {
+        match admit_mesh_caller(ctx, caller, action, target, &params) {
+            Ok(()) => {}
+            Err(MeshRefusal::Unauthorized(detail)) => {
+                tracing::warn!(caller = %caller, action = %action, detail = %detail, "mesh caller refused");
+                return Ok(internal_unauthorized(action, &detail));
+            }
+            Err(MeshRefusal::InventoryUnavailable(detail)) => {
+                tracing::warn!(caller = %caller, action = %action, detail = %detail, "mesh caller held: the connected nodes cannot be read");
+                return Ok(internal_inventory_unavailable(action, &detail));
+            }
+        }
     }
-    let admin_uuid = client.sender_snapshot().uuid().to_string();
-    if let Err(detail) = authorize_admin_config_set(caller_l2_name, action, &params, &admin_uuid) {
-        return Ok(internal_unauthorized(action, &detail));
-    }
-    if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
-        return Ok(internal_unauthorized(action, &detail));
-    }
+    // What a handler does on a mesh caller's behalf goes by its router-stamped name, never by
+    // anything in `params`; the trusted paths have none.
+    let caller_l2_name = origin.caller();
     // FIX-2: server-side re-enforcement of io.cloud's translate content restrictions (do not trust
     // the bypassable relay to have sanitized its own payload).
     if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params)
@@ -5556,14 +6348,7 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_publish_artifact(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(
-                ctx,
-                action,
-                caller_l2_name,
-                logged_params,
-                started,
-                &result,
-            );
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
         "unpublish_artifact" => {
@@ -5576,14 +6361,7 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(
-                ctx,
-                action,
-                caller_l2_name,
-                logged_params,
-                started,
-                &result,
-            );
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
         "executor_validate_plan" => {
@@ -5627,14 +6405,7 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_externalize(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(
-                ctx,
-                action,
-                caller_l2_name,
-                logged_params,
-                started,
-                &result,
-            );
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
         // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
@@ -5645,28 +6416,14 @@ async fn dispatch_internal_admin_command(
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_publish_cloud_endpoint(ctx, client, params).await;
-            append_internal_dispatch_log(
-                ctx,
-                action,
-                caller_l2_name,
-                logged_params,
-                started,
-                &result,
-            );
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
         "unexternalize" => {
             let logged_params = admin_command_log_params(&params);
             let started = Instant::now();
             let result = handle_unexternalize(ctx, client, params, caller_l2_name).await;
-            append_internal_dispatch_log(
-                ctx,
-                action,
-                caller_l2_name,
-                logged_params,
-                started,
-                &result,
-            );
+            append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             return result;
         }
         "list_externalized" => {
@@ -5768,10 +6525,7 @@ async fn dispatch_internal_admin_command(
                 ));
             }
             {
-                // Audit origin: the router-stamped caller when the command came over L2 (e.g.
-                // SY.architect), else the trusted internal path.
-                let origin = command_log_origin(caller_l2_name);
-                handle_admin_command_with_origin(ctx, client, canonical, params, hive, &origin)
+                handle_admin_command_with_origin(ctx, client, canonical, params, hive, origin)
                     .await?
             }
         }
@@ -5874,14 +6628,7 @@ async fn dispatch_internal_admin_command(
                     http_status: status,
                     envelope: parse_internal_response_envelope(action, status, &body),
                 });
-                append_internal_dispatch_log(
-                    ctx,
-                    action,
-                    caller_l2_name,
-                    logged_params,
-                    started,
-                    &result,
-                );
+                append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
             }
             (status, body)
         }
@@ -6138,6 +6885,21 @@ fn internal_unauthorized(action: &str, detail: &str) -> InternalAdminDispatchRes
     }
 }
 
+/// The connected nodes a decision needs cannot be read from shared memory: worth a retry, and never
+/// a refusal of the caller.
+fn internal_inventory_unavailable(action: &str, detail: &str) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 503,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "INVENTORY_UNAVAILABLE",
+            "error_detail": detail,
+        }),
+    }
+}
+
 fn internal_service_error(
     action: &str,
     error_code: &str,
@@ -6155,10 +6917,6 @@ fn internal_service_error(
     }
 }
 
-/// Authorize a node-originated channel service command (`externalize`/`unexternalize`, v6 §11.1):
-/// the caller must be an `IO.*` node (I1) and may only act on ITS OWN channel (I8: the identity-
-/// resolved `owner_l2_name` must equal the router-stamped, un-forgeable caller). A `None` caller is
-/// a trusted internal path (HTTP operator / architect executor) and is allowed. Pure — unit-tested.
 /// Mint a strong entry token for a shared-secret channel (§8): 256 bits of randomness as
 /// URL-safe hex (two v4 UUIDs). Stronger than a caller-chosen secret and safe in a Bearer header.
 fn mint_entry_token() -> String {
@@ -6188,11 +6946,10 @@ fn validate_fanout_family_glob(fanout_family: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Channel commands a node may issue for ITSELF. Gated by `authorize_channel_command`, which
-/// enforces `IO.*` origin and `channel owner == router-stamped caller` — so this list widens WHO
-/// may ask, never WHAT they may reach: a node still cannot act on someone else's channel.
-const CHANNEL_SELF_SERVICE_ACTIONS: &[&str] = &["externalize", "unexternalize"];
-
+/// Authorize a node-originated channel service command (`externalize`/`unexternalize`, v6 §11.1):
+/// the caller must be an `IO.*` node (I1) and may only act on ITS OWN channel (I8: the identity-
+/// resolved `owner_l2_name` must equal the router-stamped, un-forgeable caller). A `None` caller is
+/// a trusted internal path (HTTP operator / architect executor) and is allowed. Pure — unit-tested.
 fn authorize_channel_command(
     caller_l2_name: Option<&str>,
     owner_l2_name: &str,
@@ -6213,230 +6970,7 @@ fn authorize_channel_command(
     Ok(())
 }
 
-/// What an orchestrator's node teardown calls from the Cloud surface: the node's ILK and the
-/// secrets it owns.
-const ORCHESTRATOR_TEARDOWN_ACTIONS: &[&str] = &["delete_ilk", "vault_list", "vault_delete"];
-
-/// Actions Fluxbee Cloud relays since stage 4 (docs/ilk-tenant-model-v1.md §2.4) that every other
-/// mesh caller could already call, or reads like them: putting them on the Cloud surface must not
-/// take them away from anyone else (the stage-4 review found the lab's diagnostic nodes cut off).
-/// For IO.cloud they stay bounded by enforce_cloud_relay_content and stamp_relay_facts.
-const CLOUD_SHARED_ACTIONS: &[&str] = &[
-    "get_tenant",
-    "list_tenants",
-    "list_tenant_nodes",
-    "get_node_status",
-    "start_node",
-    "kill_node",
-];
-
-/// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
-/// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
-/// originate from IO.cloud in this admin's hive — the internal relay. `caller==None`
-/// is a trusted internal path (the operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
-/// closes the EDGE-06 confused-deputy for the relay: the SAME `IO_CLOUD_EXPOSED_ACTIONS` the
-/// `list_cloud_actions` capability query advertises is what this gate enforces (advertised ==
-/// permitted). `caller` is the router-stamped, un-forgeable src_l2_name — never trusted from params.
-fn authorize_cloud_relay(
-    caller_l2_name: Option<&str>,
-    action: &str,
-    admin_hive: &str,
-) -> Result<(), String> {
-    let expected = format!("IO.cloud@{admin_hive}");
-    // FIX-1 (HIGH): IO.cloud is the internet-facing provisioning relay and the node this gate exists
-    // to CONTAIN. It may relay ONLY the exposed provisioning actions — DEFAULT-DENY everything else,
-    // so a compromised IO.cloud cannot become a confused deputy for vault_get / vault_list /
-    // delete_ilk / add_route / kill_node / add_hive / … (all of which the generic dispatch would
-    // otherwise run under admin's own privileged ilk). Previously the gate only guarded the 3
-    // exposed actions and let IO.cloud relay ANY OTHER action unchecked.
-    if caller_l2_name == Some(expected.as_str()) {
-        if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
-            return Ok(());
-        }
-        // RELAYING is not the same as ACTING ON ONE'S OWN CHANNEL, and this gate must only
-        // contain the first.
-        //
-        // The allowlist above bounds what IO.cloud may relay ON BEHALF OF Fluxbee Cloud — that is
-        // the confused-deputy this gate exists to prevent. A channel command is a different thing:
-        // the node acting for ITSELF, on a resource it owns. It has its own gate,
-        // `authorize_channel_command`, which requires the caller to be an `IO.*` node (I1) AND the
-        // channel's owner to equal the caller (I8) — with the owner read from IDENTITY and the
-        // caller stamped by the ROUTER, so neither is forgeable from params.
-        //
-        // Denying these here was blocking IO.cloud from publishing its OWN endpoint at boot, which
-        // is the documented self-service path (io-cloud/src/main.rs:118-123, spec v6 §11.1). The
-        // node created its ICH, asked to externalize it, and was refused by the very gate meant to
-        // contain its relaying — leaving Fluxbee Cloud unreachable until an operator published the
-        // channel by hand on every install (U-11).
-        //
-        // Letting them through does NOT widen the relay: `authorize_channel_command` still runs in
-        // the handler, and a compromised IO.cloud still cannot touch a channel it does not own,
-        // nor relay anything outside the allowlist.
-        if CHANNEL_SELF_SERVICE_ACTIONS.contains(&action) {
-            return Ok(());
-        }
-        return Err(format!(
-            "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
-        ));
-    }
-    // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
-    // trusted internal paths apply), and neither is one Cloud shares with everyone else. The
-    // exposed provisioning actions may originate over the mesh ONLY from IO.cloud (handled above),
-    // apart from an orchestrator's node teardown (below).
-    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) || CLOUD_SHARED_ACTIONS.contains(&action) {
-        return Ok(());
-    }
-    let Some(caller) = caller_l2_name else {
-        return Ok(());
-    };
-    // The system nodes that call some of these actions themselves. Adding an action to the Cloud
-    // surface must not take it away from them (it did twice: delete_ilk on 2026-09-28, which left
-    // orphan node identities behind, and the vault and tenant actions on 2026-10-13). Router-stamped
-    // names, never params.
-    //
-    // Node teardown (kill_node / remove_node_instance with purge_instance) marks the node's ILK
-    // through delete_ilk and deletes the secrets that ILK owns (vault_list + vault_delete). ANY
-    // hive's orchestrator: a spoke tears down its own nodes. Never vault_put: the per-spoke SSH
-    // recovery key it stored is gone with key_only_persist (D32).
-    if ORCHESTRATOR_TEARDOWN_ACTIONS.contains(&action) && caller.starts_with("SY.orchestrator@") {
-        return Ok(());
-    }
-    // Archi is the operator's own agent, next to admin; its commands reach these actions over the
-    // mesh like every other admin action it runs.
-    if caller == format!("SY.architect@{admin_hive}") {
-        return Ok(());
-    }
-    // SY.wf-rules launches the WF nodes of its own hive when a workflow is deployed;
-    // authorize_wf_rules_caller bounds it to them.
-    if action == "run_node" && caller.starts_with(WF_RULES_ROLE_PREFIX) {
-        return Ok(());
-    }
-    Err(format!(
-        "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
-    ))
-}
-
-/// The node actions SY.wf-rules runs to deploy, restart and delete the WF nodes of its hive
-/// (docs/wf-standard-path-v1.md).
-const WF_RULES_NODE_ACTIONS: &[&str] = &[
-    "run_node",
-    "restart_node",
-    "kill_node",
-    "set_node_config",
-    "get_node_config",
-    "get_node_status",
-];
-
 const WF_RULES_ROLE_PREFIX: &str = "SY.wf-rules@";
-
-/// CONFIG_SET on SY.admin rewrites the executor's catalog. The router delivers it to SY.admin only
-/// from SY.admin itself (`admin_origin_authorized`), so the way in over the mesh is to have this
-/// admin relay one: `node_control_config_set`, or `send_node_message` with `msg: CONFIG_SET`, aimed
-/// at SY.admin by name or by router UUID. Of the mesh callers only SY.architect@motherbee may; the
-/// operator's HTTP API and the executor have no caller and pass. CONFIG_GET stays open.
-fn authorize_admin_config_set(
-    caller_l2_name: Option<&str>,
-    action: &str,
-    params: &serde_json::Value,
-    admin_uuid: &str,
-) -> Result<(), String> {
-    let Some(caller) = caller_l2_name.map(str::trim) else {
-        return Ok(());
-    };
-    let sets_config = match action {
-        "node_control_config_set" => true,
-        "send_node_message" => params
-            .get("msg")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|msg| msg.trim().eq_ignore_ascii_case(MSG_CONFIG_SET)),
-        _ => false,
-    };
-    let node_name = params
-        .get("node_name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    let role = node_name
-        .split_once('@')
-        .map_or(node_name, |(role, _)| role)
-        .trim();
-    let targets_admin =
-        role.eq_ignore_ascii_case("SY.admin") || node_name.eq_ignore_ascii_case(admin_uuid);
-    if !sets_config || !targets_admin || caller == format!("SY.architect@{PRIMARY_HIVE_ID}") {
-        return Ok(());
-    }
-    Err(format!(
-        "only SY.architect@{PRIMARY_HIVE_ID} and the operator may change SY.admin's config; caller={caller}"
-    ))
-}
-
-/// SY.wf-rules goes through the admin like every other launcher, and the admin lets it act only on
-/// the `WF.*` nodes of its own hive: the node name and, when given, the target must both name the
-/// caller's hive (the router-stamped name, never the params). Other actions and other callers are
-/// not this gate's business.
-fn authorize_wf_rules_caller(
-    caller_l2_name: Option<&str>,
-    action: &str,
-    target: Option<&str>,
-    params: &serde_json::Value,
-) -> Result<(), String> {
-    let Some(caller) = caller_l2_name else {
-        return Ok(());
-    };
-    let Some(caller_hive) = caller.strip_prefix(WF_RULES_ROLE_PREFIX) else {
-        return Ok(());
-    };
-    if !WF_RULES_NODE_ACTIONS.contains(&action) {
-        return Ok(());
-    }
-    let node_name = params
-        .get("node_name")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    let refusal = || {
-        Err(format!(
-            "{caller} may act only on the WF.* nodes of hive '{caller_hive}', not '{action}' on '{node_name}'"
-        ))
-    };
-    let Some((local, node_hive)) = node_name.rsplit_once('@') else {
-        return refusal();
-    };
-    if !local.starts_with("WF.") || local.len() <= "WF.".len() || node_hive.trim() != caller_hive {
-        return refusal();
-    }
-    let targets = [
-        normalize_internal_target_hive(target),
-        normalize_internal_target_hive(params.get("target").and_then(|value| value.as_str())),
-    ];
-    if targets.iter().flatten().any(|hive| hive != caller_hive) {
-        return refusal();
-    }
-    // What it binds or launches is the node's own workflow package, on the WF engine: never
-    // another runtime under a WF.* name.
-    let workflow_runtime = format!("wf.{}", &local["WF.".len()..]);
-    let field = |key: &str| {
-        params
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-    };
-    let runtime_ok = match field("runtime") {
-        Some(runtime) => runtime == workflow_runtime,
-        None => action != "run_node",
-    };
-    let base_ok = field("runtime_base").is_none_or(|base| base == "wf.engine");
-    let package_ok = field("package_path").is_none_or(|path| {
-        let root = format!("{DIST_RUNTIME_ROOT_DIR}/{workflow_runtime}/");
-        path.starts_with(&root) && !path.contains("..")
-    });
-    if !(runtime_ok && base_ok && package_ok) {
-        return Err(format!(
-            "{caller} may bind or launch only {workflow_runtime} on wf.engine for '{node_name}'"
-        ));
-    }
-    Ok(())
-}
 
 /// Who launched a node, as the admin records it in `_system.launched_by`: `cloud` for the Fluxbee
 /// Cloud relay, `archi`, `operator` for the operator and the executor, else the caller's name.
@@ -6531,8 +7065,9 @@ fn stamp_relay_facts(
 /// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
 /// live first inside io.cloud, which a compromised relay bypasses; admin must not trust the relay
 /// to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
-/// (caller=None) and every other caller are unaffected. Runs right after `authorize_cloud_relay`
-/// (so it only ever sees the exposed actions from this origin).
+/// (caller=None) and every other caller are unaffected. Runs right after the A-62 table
+/// (`authorize_mesh_caller`), so it only ever sees what IO.cloud may ask for: the exposed actions
+/// and its own channel.
 ///
 /// Rule 3 of the Cloud contract, held here: every action on a tenant names the tenant Cloud
 /// claims (canonical, never the root tenant, which holds the system), and the stores refuse
@@ -7379,20 +7914,26 @@ async fn handle_http(
                 handle_admin_command(ctx, client, "publish_runtime_package", payload, None).await?;
             respond_json(stream, status, &resp).await?;
         }
-        // F4a: operator surface for the edge-channel (externalize) family. Localhost-only, and
-        // caller_l2_name=None is the established trusted-internal operator semantics — the SAME
-        // 127.0.0.1 surface already exposes stronger None-privileged mutations (add_hive, run_node,
-        // vault_put). MUST go through dispatch_internal_admin_command directly: handle_admin_command
-        // would ship these to SY.config.routes (which does not implement them) and time out silently.
+        // F4a: operator surface for the edge-channel (externalize) family. Localhost-only, and the
+        // HTTP origin is the trusted operator — the SAME 127.0.0.1 surface already exposes stronger
+        // mutations (add_hive, run_node, vault_put). MUST go through dispatch_internal_admin_command
+        // directly: handle_admin_command would ship these to SY.config.routes (which does not
+        // implement them) and time out silently.
         ("POST", "/channels/externalize") => {
             let payload: serde_json::Value = if body.is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::from_slice(&body)?
             };
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None)
-                    .await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "externalize",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("POST", "/channels/unexternalize") => {
@@ -7401,12 +7942,18 @@ async fn handle_http(
             } else {
                 serde_json::from_slice(&body)?
             };
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None)
-                    .await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "unexternalize",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
-        // Operator revoke of a public artifact (D2). caller_l2_name = None routes to
+        // Operator revoke of a public artifact (D2). The HTTP origin has no caller, which routes to
         // handle_unpublish_artifact's operator escape hatch: the localhost HTTP path may
         // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
         // Body: {"publication_id":"pub:<uuid>"}.
@@ -7422,7 +7969,7 @@ async fn handle_http(
                 "unpublish_artifact",
                 None,
                 payload,
-                None,
+                AdminOrigin::Http,
             )
             .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
@@ -7439,7 +7986,7 @@ async fn handle_http(
                 "list_externalized",
                 None,
                 payload,
-                None,
+                AdminOrigin::Http,
             )
             .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
@@ -7470,30 +8017,48 @@ async fn handle_http(
                 "acme_status",
                 None,
                 serde_json::json!({}),
-                None,
+                AdminOrigin::Http,
             )
             .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("POST", "/acme/renew") => {
             let payload = acme_http_body(&body);
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "acme_renew", None, payload, None)
-                    .await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "acme_renew",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("POST", "/acme/test") => {
             let payload = acme_http_body(&body);
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "acme_test", None, payload, None)
-                    .await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "acme_test",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("POST", "/acme/reload") => {
             let payload = acme_http_body(&body);
-            let internal =
-                dispatch_internal_admin_command(ctx, client, "acme_reload", None, payload, None)
-                    .await?;
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "acme_reload",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/versions") => {
@@ -7921,6 +8486,41 @@ async fn handle_hive_paths(
             let (status, resp) =
                 handle_admin_command(ctx, client, "remove_node_instance", payload, Some(hive))
                     .await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "teardown"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let Some(fields) = payload.as_object_mut() else {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "teardown_node",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            };
+            // A bare node name is a node of the hive in the path, as on every other node route.
+            let node_name = match fields.get("node_name") {
+                None => Some(decode_percent(name)),
+                Some(serde_json::Value::String(given)) => Some(given.clone()),
+                Some(_) => None,
+            };
+            if let Some(node_name) = node_name {
+                fields.insert(
+                    "node_name".to_string(),
+                    serde_json::Value::String(qualified_node_name(&node_name, &hive)),
+                );
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "teardown_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["nodes", name, "config"]) => {
@@ -8540,16 +9140,16 @@ async fn handle_hive_paths(
             } else {
                 serde_json::from_slice(body)?
             };
-            // Operator path (caller=None). This route calls the handler directly (it does NOT go
-            // through dispatch_internal_admin_command), so it carries its own audit append to match
-            // the mesh arm — a token mint must always leave a command-log entry.
+            // Operator path. This route calls the handler directly (it does NOT go through
+            // dispatch_internal_admin_command), so it carries its own audit append to match the
+            // mesh arm — a token mint must always leave a command-log entry.
             let logged_params = admin_command_log_params(&payload);
             let started = Instant::now();
             let result = handle_publish_cloud_endpoint(ctx, client, payload).await;
             append_internal_dispatch_log(
                 ctx,
                 "publish_cloud_endpoint",
-                None,
+                AdminOrigin::Http,
                 logged_params,
                 started,
                 &result,
@@ -9071,6 +9671,11 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     if code == "TIMEOUT" || code == "WAN_TIMEOUT" || code == "SSH_TIMEOUT" {
         return 504;
     }
+    // A join whose own session the new SSH rules would refuse (docs/control-path-hardening-v1.md
+    // §6): the request has to change (ssh_allow_from, ssh_from_wan), not the transport.
+    if code == "SSH_SOURCE_NOT_ALLOWED" || code == "SSH_FROM_WAN_LOCKOUT" {
+        return 409;
+    }
     if code.starts_with("SSH_") {
         return 502;
     }
@@ -9134,6 +9739,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "TENANT_DELETED"
         | "ILK_NOT_DELETED"
         | "ILK_KEY_CONFLICT"
+        // teardown_node: the ILK named is not the node's, or the node is still connected; nothing
+        // was removed.
+        | "NODE_ILK_MISMATCH"
+        | "NODE_STILL_CONNECTED"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -9163,12 +9772,16 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // add_hive could not check whether the box had settled (A-52); not about settling.
         | "HOST_SETTLE_CHECK_FAILED"
         // add_hive could not push the spoke's mesh TLS material (D32); fatal for the join.
-        | "TLS_PUSH_FAILED" => 502,
+        | "TLS_PUSH_FAILED"
+        // teardown_node: a store did not do its step; the report says which.
+        | "TEARDOWN_INCOMPLETE" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"
         | "IDENTITY_UNAVAILABLE"
         | "VAULT_UNAVAILABLE"
+        // The connected nodes cannot be read from shared memory: retry.
+        | "INVENTORY_UNAVAILABLE"
         | "MASTER_KEY_NOT_AVAILABLE" => 503,
         _ => 500,
     }
@@ -10442,6 +11055,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "restart_node"
             | "kill_node"
             | "remove_node_instance"
+            | "teardown_node"
             | "remove_runtime_version"
             | "set_node_config"
             | "node_control_config_set"
@@ -10481,6 +11095,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "delete_tap"
             | "kill_node"
             | "remove_node_instance"
+            | "teardown_node"
             | "remove_runtime_version"
             | "set_ilk_definition"
             | "delete_ilk"
@@ -10525,10 +11140,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
         "publish_cloud_endpoint" => "Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). The token cannot be read back afterwards: if it is lost, publish again to rotate.",
         "publish_artifact" => {
-            "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller becomes the publication owner."
+            "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner."
         }
         "unpublish_artifact" => {
-            "Revoke a public artifact owned by the calling producer. Mesh-only and identity-bound."
+            "Revoke a public artifact the calling AI.* producer published. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish."
         }
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
@@ -10626,6 +11241,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "restart_node" => "Restart an existing managed node instance in a hive.",
         "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory.",
         "remove_node_instance" => "Delete a node instance from disk/runtime state.",
+        "teardown_node" => "Remove what a torn-down node leaves in the stores: the secrets dedicated to its ILK, then the ILK itself (marked, then purged). The ILK must be the node's; every step is reported.",
         "send_node_message" => "Send a system message to a node.",
         "set_node_config" => "Persist node config changes.",
         "set_storage" => "Persist storage configuration changes.",
@@ -10859,6 +11475,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "restart_node" => vec!["POST /hives/{hive}/nodes/{node_name}/restart"],
         "kill_node" => vec!["DELETE /hives/{hive}/nodes/{node_name}"],
         "remove_node_instance" => vec!["DELETE /hives/{hive}/nodes/{node_name}/instance"],
+        "teardown_node" => vec!["POST /hives/{hive}/nodes/{node_name}/teardown"],
         "send_node_message" => vec!["POST /hives/{hive}/nodes/{node_name}/messages"],
         "set_node_config" => vec!["PUT /hives/{hive}/nodes/{node_name}/config"],
         "set_storage" => vec!["PUT /config/storage"],
@@ -11005,6 +11622,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "get_node_config"
         | "kill_node"
         | "remove_node_instance"
+        | "teardown_node"
         | "send_node_message"
         | "node_control_config_get"
         | "node_control_config_set"
@@ -11124,6 +11742,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "run_node"
             | "start_node"
             | "restart_node"
+            | "teardown_node"
             | "add_route"
             | "add_vpn"
             | "add_tap"
@@ -11200,6 +11819,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "node_name",
             "string",
             "Fully-qualified node name to start.",
+        )],
+        "teardown_node" => vec![admin_action_body_field(
+            "ilk_id",
+            "string",
+            "The node's ILK, ilk:<uuid>: SY.identity must hold it as this node's (identification.node_name), or the teardown removes nothing (NODE_ILK_MISMATCH).",
         )],
         "add_route" => vec![
             admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.sales or tenant.acme."),
@@ -11437,12 +12061,17 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "egress",
                 "object",
-                "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional: when absent it is read at join from the one address lan_iface carries inside lan_cidr, and none or several fail the join; when given it must be inside lan_cidr and assigned to lan_iface), reachability_url (optional https URL the internet probe GETs; when absent the motherbee's egress.reachability_url is inherited; there is no default, and without one the probe does not run), ipv6 (optional, only \"blocked\" is supported).",
+                "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional: when absent it is read at join from the one address lan_iface carries inside lan_cidr, and none or several fail the join; when given it must be inside lan_cidr and assigned to lan_iface), reachability_url (optional https URL the internet probe GETs; when absent the motherbee's egress.reachability_url is inherited; there is no default, and without one the probe does not run), ipv6 (optional, only \"blocked\" is supported), ssh_from_wan (optional bool, default true: false drops SSH arriving on wan_iface, and the join refuses with SSH_FROM_WAN_LOCKOUT when its own session arrives there).",
             ),
             admin_action_body_field(
                 "ingress",
                 "object",
                 "Required when role=ingress (ignored otherwise). Public edge parameters: listen (required host:port), tls_vault_key and vault_hive for HTTPS, or allow_plaintext=true only for an explicit non-443 development listener.",
+            ),
+            admin_action_body_field(
+                "ssh_allow_from",
+                "string[]",
+                "Only with role=ingress (INVALID_REQUEST otherwise). The networks besides the motherbee that may reach SSH on the ingress host: each an IPv4 or IPv6 address, or a CIDR with its host bits clear (192.168.8.0/24, 2001:db8::/32). Passed to the orchestrator as given, which keeps them as ingress.ssh_allow_from; without it only the motherbee reaches SSH there.",
             ),
             admin_action_body_field(
                 "harden_ssh",
@@ -11916,6 +12545,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "force": false,
             "purge_instance": true
         }),
+        "teardown_node" => serde_json::json!({
+            "node_name": "AI.sales@worker-220",
+            "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000"
+        }),
         "add_route" => serde_json::json!({
             "prefix": "AI.sales.",
             "action": "FORWARD",
@@ -12211,6 +12844,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_node_instance" => {
             "curl -X DELETE /hives/motherbee/nodes/AI.sales@motherbee/instance"
         }
+        "teardown_node" => {
+            r#"curl -X POST /hives/worker-220/nodes/AI.sales@worker-220/teardown -d '{"ilk_id":"ilk:550e8400-e29b-41d4-a716-446655440000"}'"#
+        }
         "list_recent_commands" => {
             "curl -X GET '/hives/motherbee/commands?limit=20&status=error'"
         }
@@ -12386,7 +13022,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
-            "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node. The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
+            "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node on a worker or the motherbee (A-62: a node of an ingress or egress hive asks SY.admin for nothing). The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
+            "Over the mesh only an AI.* producer may unpublish: an IO.* or WF.* publication ends at its expiry or by the operator (POST /artifacts/unpublish).",
             "Call RouterDispatcher::send_admin_rpc with target=None. Do not send tenant_id, publisher_l2_name, path, public key, sha256, raw headers or CSP.",
             "blob_ref must already identify promoted active content available to IO.blob; bytes never travel in ADMIN_COMMAND.",
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
@@ -12395,13 +13032,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "list_recent_commands" => vec![
             "Reads the local admin command audit log (state/sy-admin/command-log/, JSONL, rotates every ~100 entries; oldest rotations are dropped).",
-            "Records every admin command that flows through the admin command handler — creates/mutations/queries (run_node, vault_*, config, taps, routes, hives, nodes, ...) — with `origin` = 'http' (operator), 'l2:<src_l2_name>' (router-stamped mesh caller, e.g. SY.architect), 'executor' (executor-plan step) or 'internal'.",
+            "Records every admin command that flows through the admin command handler — creates/mutations/queries (run_node, vault_*, config, taps, routes, hives, nodes, ...) — with `origin` = 'http' (operator), 'l2:<src_l2_name>' (router-stamped mesh caller, e.g. SY.architect) or 'executor' (executor-plan step).",
             "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
             "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
             "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
         ],
         "unpublish_artifact" => vec![
-            "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor unpublish endpoint.",
+            "Mesh-only producer operation for AI.* nodes (A-62); the operator revokes any publication with POST /artifacts/unpublish, and there is no SCMD or admin-executor unpublish.",
             "Only the same router-stamped producer L2 name that created the publication may revoke it.",
             "Call RouterDispatcher::send_admin_rpc with target=None and the publication_id returned by publish_artifact.",
             "The operation is idempotent after a completed unpublish and waits for edge removal before returning success.",
@@ -12459,6 +13096,15 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
             "Without purge_instance it is a stop that lasts: the boot and periodic relaunches leave the node down (relaunch_on_boot false) until start_node or restart_node. A node that dies on its own is still relaunched.",
             "With purge_instance it is the full teardown: its timers, the secrets it owns and its identity go, and the name is free again.",
+        ],
+        "teardown_node" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP; over the mesh, from node_name. Body: {\"ilk_id\": \"ilk:<uuid>\"} (node_name from the path when the body has none; a bare name is a node of the path's hive).",
+            "Callers: the operator's HTTP API, Archi and the executor, and SY.orchestrator@<hive> for a node of its own hive, which calls it when a node is purged (kill_node with purge_instance).",
+            "A node still connected is alive: only its own orchestrator, right after its kill, tears it down then. Anyone else gets NODE_STILL_CONNECTED (409), or INVENTORY_UNAVAILABLE (503, retry) when the connected nodes cannot be read from shared memory; nothing is removed.",
+            "Steps, in order: SY.identity must hold the ILK as this node's (identification.node_name), else NODE_ILK_MISMATCH and nothing is removed; then every SY.vault secret dedicated to the ILK is deleted in its own tenant; then the ILK is marked (ILK_DELETE) and purged (ILK_PURGE). An ILK SY.identity does not hold is reported not_found: the operator's HTTP API and the executor still delete its leftover secrets, a mesh caller (the orchestrator, Archi) leaves them.",
+            "The payload is the same on success and on failure: node_name, ilk_id, ilk_deleted, not_found, vault_secrets_purged {status, scanned, deleted, errors[{key, error_code, error_detail}]} and ilk_delete {status ok|error|skipped, error_code, error_detail}. A step that did not run says skipped.",
+            "status ok only when every step was done; otherwise TEARDOWN_INCOMPLETE with the same payload. When a secret cannot be deleted the ILK is left in place, so a retry can still tie the remaining secrets to the node.",
+            "SY.* and RT.* nodes are never torn down: run_node does not launch them.",
         ],
         "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -14287,7 +14933,7 @@ async fn handle_remove_runtime_version(
 
 /// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
 /// directly (origin "http"); the internal L2 dispatch and the executor call
-/// `handle_admin_command_with_origin` with their identity. Every call is appended to the command
+/// `handle_admin_command_with_origin` with their origin. Every call is appended to the command
 /// audit log (redacted) so `list_recent_commands` can answer "what was done to this backend lately".
 async fn handle_admin_command(
     ctx: &AdminContext,
@@ -14296,7 +14942,7 @@ async fn handle_admin_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    handle_admin_command_with_origin(ctx, client, action, payload, hive, "http").await
+    handle_admin_command_with_origin(ctx, client, action, payload, hive, AdminOrigin::Http).await
 }
 
 async fn handle_admin_command_with_origin(
@@ -14305,7 +14951,7 @@ async fn handle_admin_command_with_origin(
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
-    origin: &str,
+    origin: AdminOrigin<'_>,
 ) -> Result<(u16, String), AdminError> {
     // The audit-log reader is handled locally (the log lives on THIS admin; every hive's commands
     // flow through it) — `hive` acts as a filter, not routing.
@@ -14355,7 +15001,8 @@ async fn handle_admin_command_with_origin(
 
     let started = Instant::now();
     let logged_params = admin_command_log_params(&payload);
-    let result = handle_admin_command_inner(ctx, client, action, payload, hive.clone()).await;
+    let result =
+        handle_admin_command_inner(ctx, client, action, payload, hive.clone(), origin).await;
 
     // Audit append — never fails the command; a hard AdminError is logged as status=error too.
     let (http_status, status, error_code) = match &result {
@@ -14382,7 +15029,7 @@ async fn handle_admin_command_with_origin(
         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         action: action.to_string(),
         hive,
-        origin: origin.to_string(),
+        origin: origin.audit_label(),
         params: logged_params,
         status,
         error_code,
@@ -14405,6 +15052,7 @@ async fn handle_admin_command_inner(
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
+    origin: AdminOrigin<'_>,
 ) -> Result<(u16, String), AdminError> {
     if matches!(action, "get_admin_action_help") {
         let action_name = payload
@@ -14422,6 +15070,9 @@ async fn handle_admin_command_inner(
     }
     if matches!(action, "send_node_message") {
         return handle_send_node_message(ctx, client, payload, hive).await;
+    }
+    if matches!(action, "teardown_node") {
+        return handle_teardown_node(ctx, client, payload, hive, origin).await;
     }
     if matches!(
         action,
@@ -15098,6 +15749,413 @@ fn default_vault_request_tenant(mut payload: serde_json::Value) -> serde_json::V
         }
     }
     payload
+}
+
+/// What `teardown_node` takes (docs/control-path-hardening-v1.md §2): a node `<role>@<hive>` of
+/// the kind run_node launches (never SY.* or RT.*) and its ILK, `ilk:<uuid>` in canonical form.
+#[derive(Debug, PartialEq, Eq)]
+struct TeardownNodeRequest {
+    node_name: String,
+    hive: String,
+    ilk_id: String,
+}
+
+impl TeardownNodeRequest {
+    fn from_params(params: &serde_json::Value) -> Result<Self, String> {
+        let field = |key: &str| {
+            params
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+        };
+        let node_name = field("node_name");
+        let (role, hive) = node_name
+            .rsplit_once('@')
+            .filter(|(role, hive)| {
+                !role.is_empty()
+                    && role
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                    && plain_hive_id(hive)
+            })
+            .ok_or_else(|| format!("node_name must be <role>@<hive>, not '{node_name}'"))?;
+        if role.starts_with("SY.") || role.starts_with("RT.") {
+            return Err(format!(
+                "{node_name} is a system node: teardown_node is for the nodes run_node launches"
+            ));
+        }
+        let ilk_id = field("ilk_id");
+        let canonical = ilk_id
+            .strip_prefix("ilk:")
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .map(|uuid| format!("ilk:{}", uuid.hyphenated()));
+        if canonical.as_deref() != Some(ilk_id) {
+            return Err(format!("ilk_id must be ilk:<uuid>, not '{ilk_id}'"));
+        }
+        Ok(Self {
+            node_name: node_name.to_string(),
+            hive: hive.to_string(),
+            ilk_id: ilk_id.to_string(),
+        })
+    }
+}
+
+/// The report of a `teardown_node`, the same whether it ended well or not.
+struct TeardownReport {
+    node_name: String,
+    ilk_id: String,
+    /// This teardown marked and purged the ILK.
+    ilk_deleted: bool,
+    /// SY.identity did not hold the ILK.
+    not_found: bool,
+    vault_secrets_purged: serde_json::Value,
+    ilk_delete: serde_json::Value,
+}
+
+impl TeardownReport {
+    fn new(request: &TeardownNodeRequest) -> Self {
+        Self {
+            node_name: request.node_name.clone(),
+            ilk_id: request.ilk_id.clone(),
+            ilk_deleted: false,
+            not_found: false,
+            vault_secrets_purged: serde_json::json!({
+                "status": "skipped",
+                "scanned": 0,
+                "deleted": 0,
+                "errors": [],
+            }),
+            ilk_delete: serde_json::json!({ "status": "skipped" }),
+        }
+    }
+
+    /// The answer: `ok` when `error` is `None`, else the error with the same report.
+    fn answer(&self, error: Option<(u16, &str, String)>) -> (u16, String) {
+        let (http_status, error_code, error_detail) = match &error {
+            Some((http_status, code, detail)) => (
+                *http_status,
+                serde_json::json!(code),
+                serde_json::json!(detail),
+            ),
+            None => (200, serde_json::Value::Null, serde_json::Value::Null),
+        };
+        (
+            http_status,
+            serde_json::json!({
+                "status": if error.is_none() { "ok" } else { "error" },
+                "action": "teardown_node",
+                "payload": {
+                    "node_name": self.node_name,
+                    "ilk_id": self.ilk_id,
+                    "ilk_deleted": self.ilk_deleted,
+                    "not_found": self.not_found,
+                    "vault_secrets_purged": self.vault_secrets_purged,
+                    "ilk_delete": self.ilk_delete,
+                },
+                "error_code": error_code,
+                "error_detail": error_detail,
+            })
+            .to_string(),
+        )
+    }
+}
+
+/// `teardown_node` (docs/control-path-hardening-v1.md §2): what a node's teardown leaves in the
+/// stores, removed in this order.
+/// 1. The request: the node and its ILK. A node still connected is alive: only its own
+///    orchestrator, whose call follows its kill, tears it down then (`teardown_live_node_refusal`).
+/// 2. The ILK is that node's: SY.identity's `identification.node_name` for it (`ILK_GET`) must be
+///    the node, else `NODE_ILK_MISMATCH` and nothing is touched. An ILK SY.identity does not hold
+///    is reported `not_found` and skips step 4; over the mesh it skips step 3 too, since nothing
+///    ties its secrets to the node any more.
+/// 3. The secrets dedicated to the ILK, each deleted in its own tenant.
+/// 4. The ILK marked (`ILK_DELETE`), then purged (`ILK_PURGE`); `ILK_NOT_FOUND` counts as done.
+///
+/// The secrets go first because the ILK is what ties them to the node: when step 3 fails, step 4
+/// does not run, so a retry can still prove which secrets are the node's. Every step is reported;
+/// the status is `ok` only when all of them were done, else `TEARDOWN_INCOMPLETE` with the same
+/// report.
+async fn handle_teardown_node(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    payload: serde_json::Value,
+    hive: Option<String>,
+    origin: AdminOrigin<'_>,
+) -> Result<(u16, String), AdminError> {
+    let invalid = |detail: &str| {
+        (
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "teardown_node",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        )
+    };
+    let request = match TeardownNodeRequest::from_params(&payload) {
+        Ok(request) => request,
+        Err(detail) => return Ok(invalid(&detail)),
+    };
+    if let Some(hive) = hive.filter(|hive| *hive != request.hive) {
+        return Ok(invalid(&format!(
+            "node_name {} is not on hive '{hive}'",
+            request.node_name
+        )));
+    }
+    let ilk_id = request.ilk_id.as_str();
+    let mut report = TeardownReport::new(&request);
+    if let Some(refusal) =
+        teardown_live_node_refusal(&request, origin, || (ctx.connected_nodes)(&ctx.hive_id))
+    {
+        return Ok(report.answer(Some(refusal)));
+    }
+
+    // 2. The ILK must be the node's.
+    let read = admin_step_envelope(
+        handle_identity_command(
+            ctx,
+            client,
+            "get_ilk",
+            serde_json::json!({ "ilk_id": ilk_id }),
+            None,
+        )
+        .await,
+    );
+    match admin_step_outcome(&read) {
+        Ok(()) => {
+            let owner = read
+                .pointer("/payload/ilk/identification/node_name")
+                .and_then(|value| value.as_str())
+                .map(str::trim);
+            if owner != Some(request.node_name.as_str()) {
+                let detail = format!(
+                    "{ilk_id} is the ILK of {}, not of {}: nothing was removed",
+                    owner.unwrap_or("no node"),
+                    request.node_name
+                );
+                return Ok(report.answer(Some((409, "NODE_ILK_MISMATCH", detail))));
+            }
+        }
+        Err((code, _)) if matches!(code.as_str(), "NOT_FOUND" | "ILK_NOT_FOUND") => {
+            report.not_found = true;
+            // Nothing ties the secrets of an ILK SY.identity does not hold to this node: over the
+            // mesh they stay; the operator's own teardown (HTTP, the executor) clears leftovers.
+            if origin.caller().is_some() {
+                return Ok(report.answer(None));
+            }
+        }
+        Err((code, detail)) => {
+            report.ilk_delete = teardown_step_error(&code, &detail);
+            let detail =
+                format!("SY.identity did not answer for {ilk_id} ({code}): nothing was removed");
+            return Ok(report.answer(Some((502, "TEARDOWN_INCOMPLETE", detail))));
+        }
+    }
+
+    // 3. Its secrets, each in its own tenant.
+    report.vault_secrets_purged = purge_teardown_secrets(ctx, client, ilk_id).await;
+    if report
+        .vault_secrets_purged
+        .get("status")
+        .and_then(|v| v.as_str())
+        != Some("ok")
+    {
+        let detail = format!(
+            "the secrets of {ilk_id} were not all deleted; its ILK stays for a retry to finish"
+        );
+        return Ok(report.answer(Some((502, "TEARDOWN_INCOMPLETE", detail))));
+    }
+
+    // 4. Mark, then purge.
+    if !report.not_found {
+        for action in ["delete_ilk", "purge_ilk"] {
+            let answer = admin_step_envelope(
+                handle_identity_command(
+                    ctx,
+                    client,
+                    action,
+                    serde_json::json!({ "ilk_id": ilk_id }),
+                    None,
+                )
+                .await,
+            );
+            match admin_step_outcome(&answer) {
+                Ok(()) => {}
+                // Gone since the read: someone else removed it, or it was purged after our mark.
+                Err((code, _)) if code == "ILK_NOT_FOUND" => {
+                    report.not_found = action == "delete_ilk";
+                    break;
+                }
+                Err((code, detail)) => {
+                    report.ilk_delete = teardown_step_error(&code, &detail);
+                    let detail = format!("{action} of {ilk_id} failed ({code})");
+                    return Ok(report.answer(Some((502, "TEARDOWN_INCOMPLETE", detail))));
+                }
+            }
+        }
+        report.ilk_deleted = !report.not_found;
+        report.ilk_delete = serde_json::json!({ "status": "ok" });
+    }
+    Ok(report.answer(None))
+}
+
+/// A teardown that must not run because its node is still connected: every caller but the node's
+/// own orchestrator, whose call follows its kill, is held to it. Otherwise a node redeployed onto
+/// the ILK of a teardown that failed half-way could be purged alive. `connected` reads the nodes
+/// connected now; when it cannot, the teardown waits (`INVENTORY_UNAVAILABLE`).
+fn teardown_live_node_refusal(
+    request: &TeardownNodeRequest,
+    origin: AdminOrigin<'_>,
+    connected: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Option<(u16, &'static str, String)> {
+    let orchestrator = format!("SY.orchestrator@{}", request.hive);
+    if origin.caller() == Some(orchestrator.as_str()) {
+        return None;
+    }
+    match connected() {
+        Ok(nodes) if nodes.contains(&request.node_name) => Some((
+            409,
+            "NODE_STILL_CONNECTED",
+            format!(
+                "{} is still connected: stop it (kill_node) before tearing it down; nothing was removed",
+                request.node_name
+            ),
+        )),
+        Ok(_) => None,
+        Err(detail) => Some((
+            503,
+            "INVENTORY_UNAVAILABLE",
+            format!(
+                "whether {} is still connected cannot be read: {detail}; nothing was removed",
+                request.node_name
+            ),
+        )),
+    }
+}
+
+/// Step 3 of a teardown: every secret dedicated to the ILK, each deleted in the tenant it belongs
+/// to (SY.vault refuses a delete in another), through the vault handler every admin caller uses.
+async fn purge_teardown_secrets(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    ilk_id: &str,
+) -> serde_json::Value {
+    let listing = admin_step_envelope(
+        handle_vault_command(
+            ctx,
+            client,
+            "vault_list",
+            serde_json::json!({ "filter": { "ilk": ilk_id, "limit": 1000 } }),
+            None,
+        )
+        .await,
+    );
+    if let Err((code, detail)) = admin_step_outcome(&listing) {
+        return serde_json::json!({
+            "status": "error",
+            "scanned": 0,
+            "deleted": 0,
+            "errors": [],
+            "error_code": code,
+            "error_detail": detail,
+        });
+    }
+    let secrets = vault_secrets_with_tenant(listing.get("payload").unwrap_or(&listing));
+    let mut deleted = 0usize;
+    let mut errors = Vec::new();
+    for (key, tenant_id) in &secrets {
+        let answer = admin_step_envelope(
+            handle_vault_command(
+                ctx,
+                client,
+                "vault_delete",
+                serde_json::json!({ "key": key, "tenant_id": tenant_id }),
+                None,
+            )
+            .await,
+        );
+        match admin_step_outcome(&answer) {
+            Ok(()) => deleted += 1,
+            Err((code, detail)) => errors.push(serde_json::json!({
+                "key": key,
+                "error_code": code,
+                "error_detail": detail,
+            })),
+        }
+    }
+    serde_json::json!({
+        "status": if errors.is_empty() { "ok" } else { "error" },
+        "scanned": secrets.len(),
+        "deleted": deleted,
+        "errors": errors,
+    })
+}
+
+/// Each secret of a vault listing with the tenant it belongs to: a delete names that tenant.
+fn vault_secrets_with_tenant(listing: &serde_json::Value) -> Vec<(String, String)> {
+    listing
+        .get("secrets")
+        .and_then(|secrets| secrets.as_array())
+        .map(|secrets| {
+            secrets
+                .iter()
+                .filter_map(|entry| {
+                    let key = entry.get("key").and_then(|key| key.as_str())?;
+                    let tenant_id = entry
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("tenant_id"))
+                        .and_then(|tenant| tenant.as_str())?;
+                    Some((key.to_string(), tenant_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The envelope one of this admin's handlers answered, read back for a step of a composite action.
+fn admin_step_envelope(answer: Result<(u16, String), AdminError>) -> serde_json::Value {
+    let failed = |detail: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "TRANSPORT_ERROR",
+            "error_detail": detail,
+        })
+    };
+    match answer {
+        Ok((_, body)) => serde_json::from_str(&body)
+            .unwrap_or_else(|err| failed(format!("invalid answer envelope: {err}"))),
+        Err(err) => failed(err.to_string()),
+    }
+}
+
+/// Whether a step's envelope says it was done; else its error code and detail.
+fn admin_step_outcome(envelope: &serde_json::Value) -> Result<(), (String, String)> {
+    if envelope.get("status").and_then(|value| value.as_str()) == Some("ok") {
+        return Ok(());
+    }
+    let code = envelope
+        .get("error_code")
+        .and_then(|value| value.as_str())
+        .unwrap_or("SERVICE_FAILED")
+        .to_string();
+    let detail = match envelope.get("error_detail") {
+        Some(serde_json::Value::String(detail)) => detail.clone(),
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(other) => other.to_string(),
+    };
+    Err((code, detail))
+}
+
+/// A teardown step that failed, as the report shows it.
+fn teardown_step_error(code: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": code,
+        "error_detail": detail,
+    })
 }
 
 /// Normalize a vault_put HTTP payload to the Model D' contract before
@@ -15951,6 +17009,10 @@ fn admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
+        // A purge waits for the node's teardown: the orchestrator gives teardown_node 120 s on the
+        // node's hive, and the motherbee gives a spoke's purging KILL_NODE or REMOVE_NODE_INSTANCE
+        // 150 s. A shorter window answers TIMEOUT while the work finishes.
+        "kill_node" | "remove_node_instance" => Duration::from_secs(180),
         // Restores binaries and then restarts up to 8 services behind a 30 s health gate each.
         // Deliberately generous: if this window is shorter than the work, the caller gets an
         // outer TIMEOUT instead of the inner layer's real error (the U-8b shape).
@@ -16156,10 +17218,14 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "get_node_state"
             | "get_node_status"
             | "send_node_message"
+            | "teardown_node"
     )
 }
 
 fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Option<String> {
+    if action == "add_hive" {
+        return add_hive_ssh_allow_from_error(payload);
+    }
     let legacy = match action {
         "run_node" => {
             if payload.get("name").is_some() {
@@ -16180,6 +17246,69 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
             "legacy field '{}' is not supported; use '{}'",
             field, canonical
         )
+    })
+}
+
+/// `ssh_allow_from` of add_hive (docs/control-path-hardening-v1.md §6): the networks besides the
+/// motherbee that may reach SSH on an ingress host. Only with `role: ingress`; an array of IPv4 or
+/// IPv6 addresses or CIDRs, which the orchestrator receives exactly as given.
+fn add_hive_ssh_allow_from_error(payload: &serde_json::Value) -> Option<String> {
+    let allow_from = payload
+        .get("ssh_allow_from")
+        .filter(|value| !value.is_null())?;
+    let ingress = payload
+        .get("role")
+        .and_then(|role| role.as_str())
+        .is_some_and(|role| role.trim().eq_ignore_ascii_case("ingress"));
+    if !ingress {
+        return Some("ssh_allow_from applies only to role ingress".to_string());
+    }
+    let Some(entries) = allow_from.as_array() else {
+        return Some(
+            "ssh_allow_from must be an array of IPv4 or IPv6 addresses or CIDRs".to_string(),
+        );
+    };
+    entries.iter().find_map(|entry| match entry.as_str() {
+        Some(network) => ssh_allow_from_entry_error(network),
+        None => Some(format!("ssh_allow_from entries are strings, not {entry}")),
+    })
+}
+
+/// Why `network` is not an IPv4 or IPv6 address, or a CIDR whose host bits are clear.
+fn ssh_allow_from_entry_error(network: &str) -> Option<String> {
+    let (address, prefix) = match network.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (network, None),
+    };
+    let Ok(ip) = address.parse::<IpAddr>() else {
+        return Some(format!(
+            "ssh_allow_from: '{network}' is not an IPv4 or IPv6 address or CIDR"
+        ));
+    };
+    let prefix = prefix?;
+    let width = if ip.is_ipv4() { 32 } else { 128 };
+    let canonical = prefix == "0" || (!prefix.starts_with('0') && prefix.len() <= 3);
+    let Some(bits) = prefix
+        .parse::<u32>()
+        .ok()
+        .filter(|bits| canonical && prefix.bytes().all(|b| b.is_ascii_digit()) && *bits <= width)
+    else {
+        return Some(format!(
+            "ssh_allow_from: '{network}' needs a prefix length from 0 to {width}"
+        ));
+    };
+    let network_address = match ip {
+        IpAddr::V4(v4) => {
+            let host = u32::MAX.checked_shr(bits).unwrap_or(0);
+            (u32::from(v4) & host != 0).then(|| IpAddr::V4(Ipv4Addr::from(u32::from(v4) & !host)))
+        }
+        IpAddr::V6(v6) => {
+            let host = u128::MAX.checked_shr(bits).unwrap_or(0);
+            (u128::from(v6) & host != 0).then(|| IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !host)))
+        }
+    };
+    network_address.map(|address| {
+        format!("ssh_allow_from: '{network}' has host bits set; the network is {address}/{bits}")
     })
 }
 
@@ -16825,55 +17954,372 @@ mod tests {
     use tokio::sync::broadcast;
     use zip::write::FileOptions;
 
+    /// The mesh commands `dispatch_internal_admin_command` answers before the catalog.
+    const MESH_COMMANDS_OFF_CATALOG: &[&str] = &[
+        "externalize",
+        "unexternalize",
+        "list_externalized",
+        "executor_validate_plan",
+        "executor_execute_plan",
+    ];
+
+    /// Every action the A-62 table decides: the catalog and the mesh commands off it.
+    fn every_mesh_action() -> Vec<&'static str> {
+        INTERNAL_ACTION_REGISTRY
+            .iter()
+            .map(|spec| spec.action)
+            .chain(MESH_COMMANDS_OFF_CATALOG.iter().copied())
+            .collect()
+    }
+
+    /// A test caller's hive, by name: the motherbee, then `worker*`, `ingress*` and `egress*` as
+    /// connected hives of the registry; any other is not in it.
+    fn test_caller_hive(caller: &str) -> Option<CallerHive> {
+        let hive = caller.rsplit_once('@').map(|(_, hive)| hive)?;
+        if hive == PRIMARY_HIVE_ID {
+            Some(CallerHive::Motherbee)
+        } else if hive.starts_with("worker") {
+            Some(CallerHive::Worker)
+        } else if hive.starts_with("ingress") {
+            Some(CallerHive::Ingress)
+        } else if hive.starts_with("egress") {
+            Some(CallerHive::Egress)
+        } else {
+            None
+        }
+    }
+
+    /// The A-62 table for a test caller.
+    fn mesh_admits(
+        caller: &str,
+        action: &str,
+        target: Option<&str>,
+        params: &Value,
+    ) -> Result<MeshAdmission, String> {
+        authorize_mesh_caller(
+            caller,
+            test_caller_hive(caller),
+            action,
+            target,
+            params,
+            PRIMARY_HIVE_ID,
+        )
+    }
+
+    const TEST_ILK: &str = "ilk:550e8400-e29b-41d4-a716-446655440000";
+
+    fn teardown_params(node_name: &str) -> Value {
+        json!({ "node_name": node_name, "ilk_id": TEST_ILK })
+    }
+
+    /// A-62: every action of the catalog, and every mesh command off it, has its mesh decision next
+    /// to the catalog; an action without one is closed to the whole mesh, Archi included.
     #[test]
-    fn cloud_relay_gate_lets_every_orchestrator_mark_node_ilks_for_teardown() {
-        for caller in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
-            // The node's ILK and the secrets it owns (purge_vault_secrets_for_ilk).
-            for teardown in ["delete_ilk", "vault_list", "vault_delete"] {
-                assert!(
-                    authorize_cloud_relay(Some(caller), teardown, "motherbee").is_ok(),
-                    "{caller} {teardown}"
-                );
+    fn every_action_has_a_mesh_decision() {
+        for action in every_mesh_action() {
+            assert!(
+                mesh_access(action).is_some(),
+                "'{action}' has no mesh decision: list it in mesh_access"
+            );
+        }
+        for command in MESH_COMMANDS_OFF_CATALOG {
+            assert!(resolve_internal_action_spec(command).is_err(), "{command}");
+        }
+        assert_eq!(mesh_access("a_new_action"), None);
+        assert!(mesh_admits("SY.architect@motherbee", "a_new_action", None, &json!({})).is_err());
+    }
+
+    /// Archi, the operator's agent on the motherbee, may ask for every listed action; Archi's name
+    /// on another hive is no one's agent.
+    #[test]
+    fn archi_on_the_motherbee_may_ask_for_every_listed_action() {
+        for action in every_mesh_action() {
+            assert_eq!(
+                mesh_admits("SY.architect@motherbee", action, None, &json!({})),
+                Ok(MeshAdmission::Admitted),
+                "{action}"
+            );
+            assert!(
+                mesh_admits("SY.architect@worker1", action, None, &json!({})).is_err(),
+                "{action}"
+            );
+        }
+    }
+
+    /// A caller on an ingress or egress hive may ask for nothing, before any other row; nor may a
+    /// caller of a hive the registry does not hold. The same callers on a worker are admitted.
+    #[test]
+    fn a_caller_on_an_ingress_or_egress_hive_may_ask_for_nothing() {
+        // What each row's caller asks for on its own hive.
+        let params = |action: &str, hive: &str| match action {
+            "teardown_node" => teardown_params(&format!("AI.sales@{hive}")),
+            "run_node" => {
+                json!({ "node_name": format!("WF.invoice@{hive}"), "runtime": "wf.invoice" })
             }
-            // ...but nothing else from the Cloud surface
-            for other in [
-                "delete_tenant",
-                "create_tenant",
-                "vault_put",
-                "update_tenant",
-                "run_node",
-            ] {
+            _ => json!({}),
+        };
+        for (name, action) in [
+            ("SY.orchestrator", "teardown_node"),
+            ("SY.wf-rules", "run_node"),
+            ("IO.api.sales", "externalize"),
+            ("AI.support", "publish_artifact"),
+            ("AI.support", "unpublish_artifact"),
+        ] {
+            let admitted = mesh_admits(
+                &format!("{name}@worker1"),
+                action,
+                None,
+                &params(action, "worker1"),
+            );
+            assert_eq!(admitted, Ok(MeshAdmission::Admitted), "{name} {action}");
+            for hive in ["ingress1", "egress1", "joining1"] {
+                let caller = format!("{name}@{hive}");
                 assert!(
-                    authorize_cloud_relay(Some(caller), other, "motherbee").is_err(),
-                    "{caller} {other}"
+                    mesh_admits(&caller, action, None, &params(action, hive)).is_err(),
+                    "{caller} {action}"
                 );
             }
         }
-        assert!(
-            authorize_cloud_relay(Some("AI.chat@motherbee"), "delete_ilk", "motherbee").is_err()
-        );
-        assert!(
-            authorize_cloud_relay(Some("AI.chat@motherbee"), "vault_delete", "motherbee").is_err()
-        );
-    }
-
-    #[test]
-    fn cloud_relay_gate_keeps_archi_actions_on_the_cloud_surface() {
-        // Archi's commands reach admin over the mesh: putting an action on the Cloud surface must
-        // not take it from Archi (vault_list and update_tenant were Archi's before 2026-10-13).
-        for action in IO_CLOUD_EXPOSED_ACTIONS {
-            assert!(
-                authorize_cloud_relay(Some("SY.architect@motherbee"), action, "motherbee").is_ok(),
-                "{action}"
-            );
-            // Only the admin hive's Archi, but for what Cloud shares with every mesh caller.
-            if !CLOUD_SHARED_ACTIONS.contains(action) {
+        for caller in [
+            "SY.architect@ingress1",
+            "IO.cloud@egress1",
+            "SY.edge@ingress1",
+        ] {
+            for action in every_mesh_action() {
                 assert!(
-                    authorize_cloud_relay(Some("SY.architect@worker1"), action, "motherbee")
-                        .is_err(),
-                    "{action}"
+                    mesh_admits(caller, action, None, &json!({})).is_err(),
+                    "{caller} {action}"
                 );
             }
+        }
+    }
+
+    /// IO.cloud@motherbee relays the Cloud-exposed actions (the one list `list_cloud_actions`
+    /// advertises), acts on its own channel and publishes as an IO node; nothing else. IO.cloud on
+    /// another hive is an IO node like any other.
+    #[test]
+    fn iocloud_on_the_motherbee_relays_only_the_cloud_surface() {
+        let relay = "IO.cloud@motherbee";
+        let own = [
+            "externalize",
+            "unexternalize",
+            "list_externalized",
+            "publish_artifact",
+        ];
+        for action in every_mesh_action() {
+            let admitted = mesh_admits(relay, action, None, &json!({})).is_ok();
+            let expected = IO_CLOUD_EXPOSED_ACTIONS.contains(&action) || own.contains(&action);
+            assert_eq!(admitted, expected, "{relay} {action}");
+        }
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            assert!(
+                mesh_admits("IO.cloud@worker1", action, None, &json!({})).is_err(),
+                "{action}"
+            );
+        }
+        for action in own {
+            assert!(mesh_admits("IO.cloud@worker1", action, None, &json!({})).is_ok());
+        }
+    }
+
+    /// The executor and the Cloud door are Archi's alone over the mesh (the HTTP API is not a
+    /// mesh caller).
+    #[test]
+    fn executor_actions_and_the_cloud_door_are_archis_alone() {
+        for action in [
+            "executor_validate_plan",
+            "executor_execute_plan",
+            "publish_cloud_endpoint",
+        ] {
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            for caller in [
+                "IO.cloud@motherbee",
+                "SY.wf-rules@motherbee",
+                "SY.orchestrator@motherbee",
+                "IO.api.sales@motherbee",
+                "AI.support@motherbee",
+                "WF.invoice@motherbee",
+                "SY.frontdesk.gov@motherbee",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, None, &json!({})).is_err(),
+                    "{caller} {action}"
+                );
+            }
+        }
+    }
+
+    /// SY.orchestrator@H asks for one thing, the teardown of a node of H; the four calls a teardown
+    /// made before (delete_ilk, purge_ilk, vault_list, vault_delete) are refused.
+    #[test]
+    fn an_orchestrator_tears_down_only_the_nodes_of_its_hive() {
+        for hive in ["motherbee", "worker1"] {
+            let caller = format!("SY.orchestrator@{hive}");
+            assert_eq!(
+                mesh_admits(
+                    &caller,
+                    "teardown_node",
+                    None,
+                    &teardown_params(&format!("AI.sales@{hive}"))
+                ),
+                Ok(MeshAdmission::Admitted)
+            );
+            for node in ["AI.sales@worker2", "IO.api.x@ingress1", "WF.invoice"] {
+                assert!(
+                    mesh_admits(&caller, "teardown_node", None, &teardown_params(node)).is_err(),
+                    "{caller} {node}"
+                );
+            }
+            let other = if hive == "motherbee" {
+                "worker1"
+            } else {
+                "motherbee"
+            };
+            assert!(mesh_admits(
+                &caller,
+                "teardown_node",
+                Some(hive),
+                &teardown_params(&format!("AI.sales@{other}"))
+            )
+            .is_err());
+            for action in every_mesh_action()
+                .into_iter()
+                .filter(|action| *action != "teardown_node")
+            {
+                let params = json!({ "ilk_id": TEST_ILK, "node_name": format!("AI.sales@{hive}") });
+                assert!(
+                    mesh_admits(&caller, action, Some(hive), &params).is_err(),
+                    "{caller} {action}"
+                );
+            }
+        }
+    }
+
+    /// IO.* acts on its own channels (the handlers check the owner) and publishes; AI.* publishes
+    /// and unpublishes; WF.* publishes. Nothing else, and never another system node.
+    #[test]
+    fn producers_publish_and_io_nodes_act_on_their_channels() {
+        let admitted = |caller: &str| -> Vec<&'static str> {
+            every_mesh_action()
+                .into_iter()
+                .filter(|action| mesh_admits(caller, action, None, &json!({})).is_ok())
+                .collect()
+        };
+        assert_eq!(
+            admitted("IO.api.sales@worker1"),
+            vec![
+                "publish_artifact",
+                "externalize",
+                "unexternalize",
+                "list_externalized"
+            ]
+        );
+        assert_eq!(
+            admitted("AI.support@worker1"),
+            vec!["publish_artifact", "unpublish_artifact"]
+        );
+        assert_eq!(admitted("WF.invoice@motherbee"), vec!["publish_artifact"]);
+        for caller in [
+            "SY.frontdesk.gov@motherbee",
+            "SY.storage@motherbee",
+            "SY.cognition@worker1",
+            "IO.@worker1",
+            "AI@worker1",
+            "RT.gw.stream@worker1",
+        ] {
+            assert!(admitted(caller).is_empty(), "{caller}");
+        }
+        // A command the router stamped no name on, or a name with no hive.
+        let refused = mesh_admits("", "list_externalized", None, &json!({}));
+        assert!(refused.unwrap_err().contains("no caller"));
+        assert!(authorize_mesh_caller(
+            "IO.api.sales",
+            Some(CallerHive::Worker),
+            "externalize",
+            None,
+            &json!({}),
+            PRIMARY_HIVE_ID
+        )
+        .is_err());
+    }
+
+    fn write_registry_entry(root: &Path, dir: &str, info: &str) {
+        fs::create_dir_all(root.join(dir)).unwrap();
+        fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+    }
+
+    /// A caller's hive role comes from the hive registry, and fails closed.
+    #[test]
+    fn a_callers_hive_role_comes_from_the_registry() {
+        let root = test_temp_dir("mesh-caller-hive");
+        let done = "join:\n  phase: done\n";
+        for (dir, info) in [
+            (
+                "worker1",
+                format!("hive_id: worker1\nstatus: connected\nrole: worker\n{done}"),
+            ),
+            (
+                "ingress1",
+                format!("hive_id: ingress1\nstatus: connected\nrole: ingress\n{done}"),
+            ),
+            (
+                "egress1",
+                format!("hive_id: egress1\nstatus: connected\nrole: EGRESS\n{done}"),
+            ),
+            (
+                "old1",
+                "hive_id: old1\nstatus: connected\nrole: worker\n".to_string(),
+            ),
+            (
+                "joining1",
+                "hive_id: joining1\nstatus: joining\nrole: worker\njoin:\n  phase: accepted\n"
+                    .to_string(),
+            ),
+            (
+                "failed1",
+                "hive_id: failed1\nstatus: failed\nrole: worker\n".to_string(),
+            ),
+            (
+                "tail1",
+                "hive_id: tail1\nstatus: connected\nrole: ingress\njoin:\n  phase: harden_ssh\n"
+                    .to_string(),
+            ),
+            (
+                "norole1",
+                format!("hive_id: norole1\nstatus: connected\n{done}"),
+            ),
+            (
+                "mother1",
+                format!("hive_id: mother1\nstatus: connected\nrole: motherbee\n{done}"),
+            ),
+            (
+                "other1",
+                format!("hive_id: worker9\nstatus: connected\nrole: worker\n{done}"),
+            ),
+            ("garbled1", ": not yaml : [".to_string()),
+        ] {
+            write_registry_entry(&root, dir, &info);
+        }
+        let role = |hive: &str| caller_hive_role(PRIMARY_HIVE_ID, &root, hive);
+        assert_eq!(role(PRIMARY_HIVE_ID), Some(CallerHive::Motherbee));
+        assert_eq!(role("worker1"), Some(CallerHive::Worker));
+        assert_eq!(role("old1"), Some(CallerHive::Worker));
+        assert_eq!(role("ingress1"), Some(CallerHive::Ingress));
+        assert_eq!(role("egress1"), Some(CallerHive::Egress));
+        for hive in [
+            "joining1",
+            "failed1",
+            "tail1",
+            "norole1",
+            "mother1",
+            "other1",
+            "garbled1",
+            "gone1",
+            "../worker1",
+            "",
+            "worker1/..",
+        ] {
+            assert_eq!(role(hive), None, "{hive}");
         }
     }
 
@@ -17206,18 +18652,34 @@ mod tests {
     #[test]
     fn wf_rules_acts_only_on_the_wf_nodes_of_its_hive() {
         let node = |name: &str| serde_json::json!({ "node_name": name });
-        for action in WF_RULES_NODE_ACTIONS {
+        let node_actions: Vec<&str> = every_mesh_action()
+            .into_iter()
+            .filter(|action| mesh_access(action) == Some(MeshAccess::WorkflowNode))
+            .collect();
+        assert_eq!(
+            node_actions,
+            [
+                "run_node",
+                "restart_node",
+                "kill_node",
+                "get_node_config",
+                "set_node_config",
+                "get_node_status"
+            ]
+        );
+        for action in &node_actions {
             for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
                 let hive = caller.trim_start_matches(WF_RULES_ROLE_PREFIX);
                 let mut own = node(&format!("WF.invoice@{hive}"));
                 if *action == "run_node" {
                     own["runtime"] = serde_json::json!("wf.invoice");
                 }
-                assert!(
-                    authorize_wf_rules_caller(Some(caller), action, Some(hive), &own).is_ok(),
+                assert_eq!(
+                    mesh_admits(caller, action, Some(hive), &own),
+                    Ok(MeshAdmission::Admitted),
                     "{caller} {action} on its own WF node"
                 );
-                assert!(authorize_wf_rules_caller(Some(caller), action, None, &own).is_ok());
+                assert!(mesh_admits(caller, action, None, &own).is_ok());
                 for (target, params) in [
                     (Some(hive), node(&format!("IO.slack.a@{hive}"))),
                     (Some(hive), node(&format!("AI.chat@{hive}"))),
@@ -17233,31 +18695,24 @@ mod tests {
                     ),
                 ] {
                     assert!(
-                        authorize_wf_rules_caller(Some(caller), action, target, &params).is_err(),
+                        mesh_admits(caller, action, target, &params).is_err(),
                         "{caller} {action} {target:?} {params}"
                     );
                 }
             }
         }
         // What it binds or launches is the node's own workflow package, on the WF engine.
-        let caller = Some("SY.wf-rules@worker1");
+        let caller = "SY.wf-rules@worker1";
         let package = format!("{DIST_RUNTIME_ROOT_DIR}/wf.invoice/3");
         let launch = |runtime: &str| serde_json::json!({"node_name": "WF.invoice@worker1", "runtime": runtime, "runtime_version": "3"});
-        assert!(authorize_wf_rules_caller(
-            caller,
-            "run_node",
-            Some("worker1"),
-            &launch("wf.invoice")
-        )
-        .is_ok());
+        assert!(mesh_admits(caller, "run_node", Some("worker1"), &launch("wf.invoice")).is_ok());
         for runtime in ["io.slack", "wf.other", "ai.generic", "wf.engine"] {
             assert!(
-                authorize_wf_rules_caller(caller, "run_node", Some("worker1"), &launch(runtime))
-                    .is_err(),
+                mesh_admits(caller, "run_node", Some("worker1"), &launch(runtime)).is_err(),
                 "{runtime}"
             );
         }
-        assert!(authorize_wf_rules_caller(
+        assert!(mesh_admits(
             caller,
             "run_node",
             Some("worker1"),
@@ -17274,7 +18729,7 @@ mod tests {
                 "package_path": path,
             })
         };
-        assert!(authorize_wf_rules_caller(
+        assert!(mesh_admits(
             caller,
             "set_node_config",
             Some("worker1"),
@@ -17291,7 +18746,7 @@ mod tests {
             ("wf.engine", "/tmp/wf.invoice/3".to_string()),
         ] {
             assert!(
-                authorize_wf_rules_caller(
+                mesh_admits(
                     caller,
                     "set_node_config",
                     Some("worker1"),
@@ -17301,38 +18756,377 @@ mod tests {
                 "{base} {path}"
             );
         }
-        // Its other actions, and every other caller, are other gates' business.
-        assert!(authorize_wf_rules_caller(
-            Some("SY.wf-rules@motherbee"),
-            "publish_runtime_package",
-            None,
-            &serde_json::json!({})
-        )
-        .is_ok());
-        for caller in [
-            None,
-            Some("SY.architect@motherbee"),
-            Some("IO.cloud@motherbee"),
-        ] {
-            assert!(authorize_wf_rules_caller(
-                caller,
-                "run_node",
-                None,
-                &node("IO.slack.a@motherbee")
-            )
-            .is_ok());
+        // Archi and the Cloud relay are not held to the WF rows; a WF node runs no other WF node.
+        for other in ["SY.architect@motherbee", "IO.cloud@motherbee"] {
+            assert!(mesh_admits(other, "run_node", None, &node("IO.slack.a@motherbee")).is_ok());
         }
-        // The Cloud relay gate lets SY.wf-rules launch (bounded above), and nothing else of the
-        // Cloud surface.
+        assert!(mesh_admits(
+            "WF.invoice@worker1",
+            "run_node",
+            None,
+            &node("WF.invoice@worker1")
+        )
+        .is_err());
+        // Nothing of the rest: not the Cloud surface, not the stores, not another hive's teardown.
         for caller in ["SY.wf-rules@motherbee", "SY.wf-rules@worker1"] {
-            assert!(authorize_cloud_relay(Some(caller), "run_node", "motherbee").is_ok());
-            for cloud_only in ["vault_put", "create_tenant", "delete_ilk", "set_ilk_tenant"] {
+            for action in [
+                "vault_put",
+                "vault_get",
+                "create_tenant",
+                "delete_ilk",
+                "set_ilk_tenant",
+                "start_node",
+                "add_hive",
+                "teardown_node",
+                "wf_rules_compile_apply",
+            ] {
                 assert!(
-                    authorize_cloud_relay(Some(caller), cloud_only, "motherbee").is_err(),
-                    "{caller} {cloud_only}"
+                    mesh_admits(caller, action, None, &json!({})).is_err(),
+                    "{caller} {action}"
                 );
             }
         }
+    }
+
+    /// One inline workflow package, as SY.wf-rules builds it (`buildWorkflowPackageFiles` in
+    /// go/sy-wf-rules/node/package_publish.go).
+    fn workflow_package(package_json: Value) -> Value {
+        json!({
+            "source": {
+                "kind": "inline_package",
+                "files": {
+                    "package.json": package_json.to_string(),
+                    "flow/definition.json": "{}",
+                    "config/default-config.json": "{}",
+                },
+            },
+            "set_current": true,
+        })
+    }
+
+    fn workflow_package_json(name: &str, kind: &str, base: Option<&str>) -> Value {
+        json!({
+            "name": name,
+            "version": "0.0.3",
+            "type": kind,
+            "description": "Workflow package",
+            "runtime_base": base,
+        })
+    }
+
+    /// SY.wf-rules publishes and removes only its workflows' packages, on the WF engine and never
+    /// the engine itself, and asks only for a scan of the motherbee's runtimes folder: as its
+    /// deploys send them (go/sy-wf-rules/node/admin.go).
+    #[test]
+    fn wf_rules_changes_only_its_workflows_packages() {
+        let caller = "SY.wf-rules@worker1";
+        let package = |name: &str| {
+            workflow_package(workflow_package_json(name, "workflow", Some("wf.engine")))
+        };
+        assert_eq!(
+            mesh_admits(
+                caller,
+                "publish_runtime_package",
+                None,
+                &package("wf.invoice")
+            ),
+            Ok(MeshAdmission::WorkflowPackage {
+                workflow: "invoice".to_string(),
+                hive: "worker1".to_string(),
+            })
+        );
+        assert_eq!(
+            mesh_admits(
+                "SY.wf-rules@motherbee",
+                "publish_runtime_package",
+                None,
+                &package("wf.billing.monthly")
+            ),
+            Ok(MeshAdmission::WorkflowPackage {
+                workflow: "billing.monthly".to_string(),
+                hive: "motherbee".to_string(),
+            })
+        );
+        let mut refused = vec![
+            package("wf.engine"),
+            package("wf."),
+            package("ai.support"),
+            package("WF.invoice"),
+            workflow_package(workflow_package_json("wf.invoice", "full_runtime", None)),
+            workflow_package(workflow_package_json(
+                "wf.invoice",
+                "config_only",
+                Some("wf.engine"),
+            )),
+            workflow_package(workflow_package_json(
+                "wf.invoice",
+                "workflow",
+                Some("ai.generic"),
+            )),
+            workflow_package(workflow_package_json(
+                "wf.invoice",
+                "workflow",
+                Some(" wf.engine"),
+            )),
+            workflow_package(workflow_package_json("wf.invoice", "workflow", None)),
+            json!({ "source": { "kind": "bundle_upload", "blob_path": "packages/wf.zip" } }),
+            json!({ "source": { "kind": "inline_package", "files": { "flow/definition.json": "{}" } } }),
+            json!({ "source": { "kind": "inline_package", "files": { "package.json": "{not json" } } }),
+            json!({}),
+        ];
+        for follow_up in ["sync_to", "update_to"] {
+            let mut with_follow_up = package("wf.invoice");
+            with_follow_up[follow_up] = json!([]);
+            refused.push(with_follow_up);
+        }
+        // A second key the publisher writes to the same package.json would replace the one read.
+        for odd in [
+            "package.json ",
+            " package.json",
+            "./package.json",
+            "flow//definition.json",
+            "/etc/x",
+            "flow/../package.json",
+        ] {
+            let mut twin = package("wf.invoice");
+            twin["source"]["files"][odd] =
+                json!(workflow_package_json("wf.engine", "full_runtime", None).to_string());
+            refused.push(twin);
+        }
+        for params in refused {
+            assert!(
+                mesh_admits(caller, "publish_runtime_package", None, &params).is_err(),
+                "{params}"
+            );
+        }
+
+        let remove = |runtime: &str| json!({ "runtime": runtime, "runtime_version": "0.0.2" });
+        assert_eq!(
+            mesh_admits(
+                caller,
+                "remove_runtime_version",
+                Some("motherbee"),
+                &remove("wf.invoice")
+            ),
+            Ok(MeshAdmission::WorkflowPackage {
+                workflow: "invoice".to_string(),
+                hive: "worker1".to_string(),
+            })
+        );
+        for runtime in [
+            "wf.engine",
+            "WF.ENGINE",
+            "wf.Engine",
+            " wf.engine",
+            "wf.engine ",
+            "wf.",
+            "ai.generic",
+            "",
+        ] {
+            assert!(
+                mesh_admits(
+                    caller,
+                    "remove_runtime_version",
+                    Some("motherbee"),
+                    &remove(runtime)
+                )
+                .is_err(),
+                "{runtime:?}"
+            );
+        }
+
+        let scan = |channel: &str, folder: &str| json!({ "channel": channel, "folder_id": folder, "wait_for_idle": true, "timeout_ms": 5000 });
+        assert_eq!(
+            mesh_admits(
+                caller,
+                "sync_hint",
+                Some("motherbee"),
+                &scan("dist", RUNTIMES_SYNC_FOLDER)
+            ),
+            Ok(MeshAdmission::Admitted)
+        );
+        for (target, params) in [
+            (Some("worker1"), scan("dist", RUNTIMES_SYNC_FOLDER)),
+            (None, scan("dist", RUNTIMES_SYNC_FOLDER)),
+            (Some("motherbee"), scan("blob", RUNTIMES_SYNC_FOLDER)),
+            (Some("motherbee"), scan("dist", "fluxbee-dist")),
+            (Some("motherbee"), scan("dist", "fluxbee-blob")),
+            (Some("motherbee"), json!({ "channel": "dist" })),
+            (
+                Some("motherbee"),
+                json!({ "folder_id": RUNTIMES_SYNC_FOLDER }),
+            ),
+        ] {
+            assert!(
+                mesh_admits(caller, "sync_hint", target, &params).is_err(),
+                "{target:?} {params}"
+            );
+        }
+        // Nobody else but Archi asks for these.
+        for other in [
+            "IO.cloud@motherbee",
+            "SY.orchestrator@worker1",
+            "WF.invoice@worker1",
+        ] {
+            assert!(mesh_admits(
+                other,
+                "publish_runtime_package",
+                None,
+                &package("wf.invoice")
+            )
+            .is_err());
+            assert!(mesh_admits(
+                other,
+                "sync_hint",
+                Some("motherbee"),
+                &scan("dist", RUNTIMES_SYNC_FOLDER)
+            )
+            .is_err());
+        }
+    }
+
+    /// The connected nodes' half of SY.wf-rules' package row: a WF.<workflow> connected on another
+    /// hive keeps this hive's SY.wf-rules from its package.
+    #[test]
+    fn a_workflow_running_on_another_hive_keeps_its_package() {
+        let nodes = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(workflow_nodes_elsewhere(&nodes(&[]), "invoice", "worker1").is_ok());
+        assert!(workflow_nodes_elsewhere(
+            &nodes(&[
+                "WF.invoice@worker1",
+                "WF.billing@worker2",
+                "WF.invoice.v2@worker2"
+            ]),
+            "invoice",
+            "worker1"
+        )
+        .is_ok());
+        for elsewhere in [
+            "WF.invoice@worker2",
+            "WF.invoice@motherbee",
+            "WF.INVOICE@worker2",
+        ] {
+            let refusal = workflow_nodes_elsewhere(
+                &nodes(&["WF.invoice@worker1", elsewhere]),
+                "invoice",
+                "worker1",
+            )
+            .unwrap_err();
+            assert!(refusal.contains(elsewhere), "{refusal}");
+        }
+    }
+
+    fn shm_bytes<const N: usize>(text: &str) -> ([u8; N], u16) {
+        let mut buffer = [0u8; N];
+        buffer[..text.len()].copy_from_slice(text.as_bytes());
+        (buffer, text.len() as u16)
+    }
+
+    fn router_node(name: &str, flags: u16) -> NodeEntry {
+        let (name, name_len) = shm_bytes::<256>(name);
+        NodeEntry {
+            uuid: [0; 16],
+            name,
+            name_len,
+            vpn_id: 0,
+            flags,
+            connected_at: 0,
+            _reserved: [0; 32],
+        }
+    }
+
+    fn lsa_hive(hive: &str, flags: u16, last_updated: u64) -> RemoteHiveEntry {
+        let (hive_id, hive_id_len) = shm_bytes::<64>(hive);
+        RemoteHiveEntry {
+            hive_id,
+            hive_id_len,
+            router_uuid: [0; 16],
+            router_name: [0; 64],
+            router_name_len: 0,
+            last_lsa_seq: 0,
+            last_updated,
+            flags,
+            node_count: 0,
+            route_count: 0,
+            vpn_count: 0,
+            tap_count: 0,
+        }
+    }
+
+    fn lsa_node(name: &str, hive_index: u16, flags: u16) -> json_router::shm::RemoteNodeEntry {
+        let (name, name_len) = shm_bytes::<256>(name);
+        json_router::shm::RemoteNodeEntry {
+            uuid: [0; 16],
+            name,
+            name_len,
+            vpn_id: 0,
+            hive_index,
+            flags,
+            _reserved: [0; 6],
+        }
+    }
+
+    /// The connected nodes come from this hive's router regions and, for every other hive, from
+    /// the LSA as the router reaches them: never the LSA's own entry for this hive, a hive it holds
+    /// as stale, or a node it marks stale or deleted.
+    #[test]
+    fn connected_nodes_come_from_the_routers_and_the_lsa() {
+        let now = 1_000_000;
+        let local = [
+            router_node("SY.admin@motherbee", 0),
+            router_node("WF.invoice@motherbee", 0),
+            router_node("AI.bare", 0),
+            router_node("AI.gone@motherbee", FLAG_STALE),
+            router_node("", 0),
+        ];
+        let lsa = LsaSnapshot {
+            header: json_router::shm::LsaHeaderSnapshot {
+                hive_count: 6,
+                total_node_count: 8,
+                total_route_count: 0,
+                total_vpn_count: 0,
+                total_tap_count: 0,
+                heartbeat: now,
+            },
+            hives: vec![
+                lsa_hive("motherbee", HIVE_FLAG_SELF, now),
+                lsa_hive("worker1", 0, now - 1_000),
+                lsa_hive("worker2", FLAG_STALE, now),
+                lsa_hive("worker3", 0, now - HEARTBEAT_STALE_MS - 1),
+                lsa_hive("worker4", FLAG_DELETED, now),
+                lsa_hive("ingress1", 0, now),
+            ],
+            nodes: vec![
+                lsa_node("WF.self@motherbee", 0, 0),
+                lsa_node("WF.invoice@worker1", 1, 0),
+                lsa_node("IO.bare", 1, 0),
+                lsa_node("AI.deleted@worker1", 1, FLAG_DELETED),
+                lsa_node("WF.away@worker2", 2, 0),
+                lsa_node("WF.quiet@worker3", 3, 0),
+                lsa_node("WF.removed@worker4", 4, 0),
+                lsa_node("SY.edge@ingress1", 5, 0),
+                lsa_node("WF.nowhere@worker9", 9, 0),
+            ],
+            routes: Vec::new(),
+            vpns: Vec::new(),
+            taps: Vec::new(),
+        };
+        assert_eq!(
+            connected_node_names("motherbee", &local, &lsa, now),
+            [
+                "AI.bare@motherbee",
+                "IO.bare@worker1",
+                "SY.admin@motherbee",
+                "SY.edge@ingress1",
+                "WF.invoice@motherbee",
+                "WF.invoice@worker1",
+            ]
+        );
     }
 
     /// A workflow deploy launches its node for whoever asked: the admin stamps the requester on
@@ -17363,10 +19157,7 @@ mod tests {
 
     #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
-        // A non-exposed action is untouched for a NON-io.cloud caller.
-        assert!(
-            authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
-        );
+        let relay = "IO.cloud@motherbee";
         // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed set — a compromised relay
         // cannot be a confused deputy for these privileged actions. (delete_ilk left this list on
         // 2026-09-28: it now only MARKS and is tenant-scoped; the physical purges stay denied.
@@ -17386,94 +19177,42 @@ mod tests {
             "add_hive",
             "set_node_config",
             "list_nodes",
+            "teardown_node",
+            "publish_cloud_endpoint",
+            "executor_execute_plan",
+            "sync_hint",
+            "unpublish_artifact",
         ] {
             assert!(
-                authorize_cloud_relay(Some("IO.cloud@motherbee"), evil, "motherbee").is_err(),
+                mesh_admits(relay, evil, None, &json!({})).is_err(),
                 "IO.cloud must be denied non-exposed action '{evil}'"
             );
         }
-        // U-11: a channel command is NOT a relay — it is the node acting for ITSELF. The gate
-        // must let it reach `authorize_channel_command`, which enforces owner == caller. Without
-        // this, IO.cloud could not publish its own endpoint at boot and Fluxbee Cloud stayed
-        // unreachable until an operator externalized the channel by hand on every install.
-        for self_service in CHANNEL_SELF_SERVICE_ACTIONS {
+        // U-11: a channel command is NOT a relay — it is the node acting for ITSELF, and the
+        // handler's `authorize_channel_command` enforces owner == caller.
+        for self_service in ["externalize", "unexternalize", "list_externalized"] {
             assert!(
-                authorize_cloud_relay(Some("IO.cloud@motherbee"), self_service, "motherbee")
-                    .is_ok(),
+                mesh_admits(relay, self_service, None, &json!({})).is_ok(),
                 "IO.cloud must reach the channel gate for its own '{self_service}'"
             );
         }
-        // …and letting them through must NOT have widened the relay: everything outside the
-        // allowlist plus the two channel commands is still denied. `list_nodes` above already
-        // covers a privileged read; these pin the boundary itself.
-        for still_denied in ["add_hive", "vault_get", "publish_artifact", "sync_hint"] {
-            assert!(
-                authorize_cloud_relay(Some("IO.cloud@motherbee"), still_denied, "motherbee")
-                    .is_err(),
-                "the channel exception must not open '{still_denied}'"
-            );
-        }
-        // The actions Cloud shares since stage 4 stay open to the other mesh callers, as before;
-        // the rest of the Cloud surface stays IO.cloud's.
-        for shared in CLOUD_SHARED_ACTIONS {
-            assert!(
-                authorize_cloud_relay(
-                    Some("WF.admin.internal.diag@motherbee"),
-                    shared,
-                    "motherbee"
-                )
-                .is_ok(),
-                "{shared} must stay open to the other mesh callers"
-            );
-            assert!(IO_CLOUD_EXPOSED_ACTIONS.contains(shared), "{shared}");
-        }
-        for cloud_only in [
-            "run_node",
-            "vault_put",
-            "create_tenant",
-            "update_tenant",
-            "delete_tenant",
-        ] {
-            assert!(
-                authorize_cloud_relay(
-                    Some("WF.admin.internal.diag@motherbee"),
-                    cloud_only,
-                    "motherbee"
-                )
-                .is_err(),
-                "{cloud_only}"
-            );
-        }
-        // A channel command from a NON-IO caller is not this gate's business (it has no relay
-        // privilege to contain) — `authorize_channel_command` rejects it downstream on the I1 rule.
-        assert!(
-            authorize_cloud_relay(Some("AI.worker@motherbee"), "externalize", "motherbee").is_ok()
-        );
-
-        // What Cloud shares with every mesh caller is checked above.
-        for action in IO_CLOUD_EXPOSED_ACTIONS
-            .iter()
-            .filter(|action| !CLOUD_SHARED_ACTIONS.contains(*action))
-        {
-            // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
-            assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
-            // Over the mesh, ONLY IO.cloud in the admin's hive may relay it.
-            assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action, "motherbee").is_ok());
-            assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action, "motherbee").is_err());
-            // Any other mesh caller is denied — this is the EDGE-06 close for the relay.
-            assert!(
-                authorize_cloud_relay(Some("IO.slack@motherbee"), action, "motherbee").is_err()
-            );
-            assert!(
-                authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
-            );
-            // An orchestrator only for its node teardown. Never vault_put: the per-spoke SSH
-            // recovery key it stored is gone with key_only_persist (D32).
-            for orchestrator in ["SY.orchestrator@motherbee", "SY.orchestrator@worker1"] {
-                assert_eq!(
-                    authorize_cloud_relay(Some(orchestrator), action, "motherbee").is_ok(),
-                    ORCHESTRATOR_TEARDOWN_ACTIONS.contains(action),
-                    "{orchestrator} on '{action}'"
+        // EDGE-06: the exposed provisioning actions come over the mesh from IO.cloud in the admin's
+        // hive and from Archi; from nobody else, the orchestrators and the lab's diagnostic nodes
+        // included. (SY.wf-rules launches, restarts and reads its own WF nodes through its rows.)
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            assert!(mesh_admits(relay, action, None, &json!({})).is_ok());
+            assert!(mesh_admits("SY.architect@motherbee", action, None, &json!({})).is_ok());
+            for other in [
+                "IO.cloud@worker1",
+                "IO.slack@motherbee",
+                "AI.worker@motherbee",
+                "WF.admin.internal.diag@motherbee",
+                "SY.orchestrator@motherbee",
+                "SY.orchestrator@worker1",
+            ] {
+                assert!(
+                    mesh_admits(other, action, None, &json!({})).is_err(),
+                    "{other} on '{action}'"
                 );
             }
         }
@@ -17712,19 +19451,11 @@ mod tests {
             &every
         )
         .is_ok());
-        // A Cloud-only action: over the mesh, IO.cloud and Archi, nobody else.
-        assert!(!CLOUD_SHARED_ACTIONS.contains(&"get_llm_usage"));
-        assert!(authorize_cloud_relay(io, "get_llm_usage", "motherbee").is_ok());
-        assert!(authorize_cloud_relay(
-            Some("SY.architect@motherbee"),
-            "get_llm_usage",
-            "motherbee"
-        )
-        .is_ok());
-        assert!(
-            authorize_cloud_relay(Some("AI.sales@motherbee"), "get_llm_usage", "motherbee")
-                .is_err()
-        );
+        // Over the mesh, IO.cloud and Archi, nobody else.
+        for caller in ["IO.cloud@motherbee", "SY.architect@motherbee"] {
+            assert!(mesh_admits(caller, "get_llm_usage", None, &json!({})).is_ok());
+        }
+        assert!(mesh_admits("AI.sales@motherbee", "get_llm_usage", None, &json!({})).is_err());
     }
 
     /// Every tenant's usage at once is the operator's and Archi's; any other mesh caller names one
@@ -18386,6 +20117,7 @@ mod tests {
             runtime_manifest_lock: Arc::new(Mutex::new(())),
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
             acme: acme::tests::inert_service(&state_dir),
+            connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
         };
         (ctx, harness)
     }
@@ -21017,45 +22749,41 @@ mod tests {
         assert_eq!(protected_admin_system_action_response(""), None);
     }
 
-    /// Over the mesh only SY.architect@motherbee may have SY.admin send itself a CONFIG_SET, by name
-    /// or by UUID, through node_control_config_set or send_node_message; the operator and the
-    /// executor (no caller) may too, CONFIG_GET and other nodes stay open.
+    /// Over the mesh only SY.architect@motherbee may have SY.admin send a CONFIG_SET, to SY.admin
+    /// itself or to any node, through node_control_config_set or send_node_message: the A-62 table
+    /// refuses every other caller whatever the node. The operator and the executor are not mesh
+    /// callers.
     #[test]
     fn only_archi_and_the_operator_may_set_the_admins_own_config() {
         let uuid = "11111111-2222-4333-8444-555555555555";
-        let set = |node: &str| json!({ "node_name": node, "config": {} });
-        let relay = |msg: &str| json!({ "node_name": "SY.admin@motherbee", "msg": msg });
-        let (io, ai) = (Some("IO.slack@motherbee"), Some("AI.support@motherbee"));
-        let (archi, remote_archi) = (Some("SY.architect@motherbee"), Some("SY.architect@worker1"));
-        let (config_set, config_get) = ("node_control_config_set", "node_control_config_get");
-        let message = "send_node_message";
-        let refused = [
-            (io, config_set, set("SY.admin@motherbee")),
-            (io, config_set, set("SY.admin")),
-            (io, config_set, set(" SY.admin@worker1 ")),
-            (io, config_set, set(uuid)),
-            (ai, message, relay("CONFIG_SET")),
-            (remote_archi, config_set, set("SY.admin@motherbee")),
-        ];
-        for (caller, action, params) in &refused {
-            assert!(
-                authorize_admin_config_set(*caller, action, params, uuid).is_err(),
-                "{caller:?} {action} {params}"
-            );
-        }
-        let allowed = [
-            (archi, config_set, set("SY.admin@motherbee")),
-            (archi, message, relay("CONFIG_SET")),
-            (None, config_set, set("SY.admin@motherbee")),
-            (io, config_get, set("SY.admin@motherbee")),
-            (io, message, relay("CONFIG_GET")),
-            (io, config_set, set("AI.support@motherbee")),
-        ];
-        for (caller, action, params) in &allowed {
-            assert!(
-                authorize_admin_config_set(*caller, action, params, uuid).is_ok(),
-                "{caller:?} {action} {params}"
-            );
+        let set = |node: &str| json!({ "node_name": node, "config": {}, "msg": "CONFIG_SET" });
+        for action in [
+            "node_control_config_set",
+            "node_control_config_get",
+            "send_node_message",
+        ] {
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            for node in ["SY.admin@motherbee", uuid, "AI.support@motherbee"] {
+                assert!(mesh_admits(
+                    "SY.architect@motherbee",
+                    action,
+                    Some(PRIMARY_HIVE_ID),
+                    &set(node)
+                )
+                .is_ok());
+                for caller in [
+                    "IO.slack@motherbee",
+                    "AI.support@motherbee",
+                    "SY.architect@worker1",
+                    "SY.wf-rules@motherbee",
+                    "IO.cloud@motherbee",
+                ] {
+                    assert!(
+                        mesh_admits(caller, action, Some(PRIMARY_HIVE_ID), &set(node)).is_err(),
+                        "{caller} {action} {node}"
+                    );
+                }
+            }
         }
     }
 
@@ -21074,7 +22802,7 @@ mod tests {
             "node_control_config_set",
             Some(PRIMARY_HIVE_ID),
             params.clone(),
-            Some("IO.slack@motherbee"),
+            AdminOrigin::Mesh("IO.slack@motherbee"),
         )
         .await
         .expect("dispatch");
@@ -21091,7 +22819,7 @@ mod tests {
             "node_control_config_set",
             Some(PRIMARY_HIVE_ID),
             params,
-            Some("SY.architect@motherbee"),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
         );
         let drive = async {
             let sent = harness
@@ -21379,18 +23107,18 @@ mod tests {
             assert_eq!(body["error_code"], "RESERVED_KEY", "{action}");
         }
         // Over the mesh, as Archi or Cloud would ask.
-        for caller in [Some("SY.architect@motherbee"), Some("IO.cloud@motherbee")] {
+        for caller in ["SY.architect@motherbee", "IO.cloud@motherbee"] {
             let refused = dispatch_internal_admin_command(
                 &ctx,
                 &ctx.rpc,
                 "vault_put",
                 Some("motherbee"),
                 json!({"key": key, "value": {"id": "x"}, "metadata": {"resource_type": "acme_account", "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID}}),
-                caller,
+                AdminOrigin::Mesh(caller),
             )
             .await
             .expect("answered");
-            assert_eq!(refused.http_status, 403, "{caller:?}: {}", refused.envelope);
+            assert_eq!(refused.http_status, 403, "{caller}: {}", refused.envelope);
         }
         assert!(
             harness
@@ -21436,7 +23164,7 @@ mod tests {
             assert_eq!(admin_methods_allowed_for_path(path), vec![method]);
         }
         assert_eq!(admin_action_timeout("acme_reload"), Duration::from_secs(90));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "14");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "15");
     }
 
     #[tokio::test]
@@ -21461,5 +23189,995 @@ mod tests {
         assert_eq!(acme_http_body(b""), json!({}));
         assert_eq!(acme_http_body(b"{}"), json!({}));
         assert!(!acme_http_body(b"not json").is_object());
+    }
+
+    /// An admin wired to the test dispatcher whose registry holds worker1 (a worker) and ingress1
+    /// (an ingress), both joined.
+    fn mesh_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
+        let (ctx, harness) = opa_test_admin(prefix);
+        let registry = hives_registry_root(&ctx);
+        for (hive, role) in [("worker1", "worker"), ("ingress1", "ingress")] {
+            write_registry_entry(
+                &registry,
+                hive,
+                &format!(
+                    "hive_id: {hive}\nstatus: connected\nrole: {role}\njoin:\n  phase: done\n"
+                ),
+            );
+        }
+        (ctx, harness)
+    }
+
+    /// The table runs first in the mesh dispatch: a refused caller gets 403 UNAUTHORIZED and
+    /// nothing is sent. The executor and the HTTP API are not mesh callers.
+    #[tokio::test]
+    async fn a_refused_mesh_caller_gets_unauthorized_and_nothing_is_sent() {
+        let (ctx, mut harness) = mesh_test_admin("mesh-refusals");
+        for (caller, action, params) in [
+            // The calls a teardown made before teardown_node.
+            (
+                "SY.orchestrator@worker1",
+                "delete_ilk",
+                json!({ "ilk_id": TEST_ILK }),
+            ),
+            (
+                "SY.orchestrator@worker1",
+                "vault_list",
+                json!({ "filter": { "ilk": TEST_ILK } }),
+            ),
+            ("", "vault_get", json!({ "key": "edge_tls" })),
+            (
+                "IO.api.sales@ingress1",
+                "externalize",
+                json!({ "ich": "ich:x" }),
+            ),
+            (
+                "SY.orchestrator@ingress1",
+                "teardown_node",
+                teardown_params("IO.x@ingress1"),
+            ),
+            (
+                "SY.wf-rules@joining1",
+                "run_node",
+                json!({ "node_name": "WF.invoice@joining1", "runtime": "wf.invoice" }),
+            ),
+            (
+                "IO.cloud@motherbee",
+                "add_hive",
+                json!({ "hive_id": "worker9" }),
+            ),
+            ("WF.invoice@worker1", "executor_execute_plan", json!({})),
+        ] {
+            let refused = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                action,
+                Some(PRIMARY_HIVE_ID),
+                params,
+                AdminOrigin::Mesh(caller),
+            )
+            .await
+            .expect("answered");
+            assert_eq!(refused.http_status, 403, "{caller} {action}");
+            assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // The executor runs a step of a plan already approved: it reaches SY.vault.
+        let step = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "vault_list",
+            Some(PRIMARY_HIVE_ID),
+            json!({ "filter": { "ilk": TEST_ILK } }),
+            AdminOrigin::Executor,
+        );
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the vault list");
+            assert_eq!(sent.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+            let done = reply_to(
+                &sent,
+                MSG_VAULT_LIST_RESPONSE,
+                json!({ "status": "ok", "secrets": [] }),
+            );
+            harness.inject(done).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(step, drive);
+        assert_eq!(result.expect("dispatch").http_status, 200);
+    }
+
+    /// SY.wf-rules@H publishes wf.<x> only while no WF.<x> is connected on another hive, which
+    /// SY.admin reads from shared memory without asking anyone. Regions that cannot be read answer
+    /// a retryable 503, never a refusal of the caller.
+    #[tokio::test]
+    async fn a_wf_rules_package_reads_the_connected_nodes_from_shared_memory() {
+        let (mut ctx, mut harness) = mesh_test_admin("mesh-wf-package");
+        let params = workflow_package(workflow_package_json(
+            "wf.invoice",
+            "workflow",
+            Some("wf.engine"),
+        ));
+        let caller = AdminOrigin::Mesh("SY.wf-rules@worker1");
+
+        let held = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_runtime_package",
+            None,
+            params.clone(),
+            caller,
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(held.http_status, 503, "{}", held.envelope);
+        assert_eq!(held.envelope["error_code"], json!("INVENTORY_UNAVAILABLE"));
+        assert_eq!(error_code_to_http_status("INVENTORY_UNAVAILABLE"), 503);
+
+        ctx.connected_nodes = Arc::new(|_| {
+            Ok(vec![
+                "WF.invoice@worker1".to_string(),
+                "WF.invoice@worker2".to_string(),
+            ])
+        });
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_runtime_package",
+            None,
+            params.clone(),
+            caller,
+        )
+        .await
+        .expect("dispatch");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+
+        ctx.connected_nodes = Arc::new(|_| {
+            Ok(vec![
+                "WF.invoice@worker1".to_string(),
+                "WF.billing@worker2".to_string(),
+            ])
+        });
+        // Admitted: the publisher answers for itself (the tests have no runtime manifest).
+        let admitted = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "publish_runtime_package",
+            None,
+            params,
+            caller,
+        )
+        .await
+        .expect("dispatch");
+        for code in ["UNAUTHORIZED", "INVENTORY_UNAVAILABLE"] {
+            assert_ne!(
+                admitted.envelope["error_code"],
+                json!(code),
+                "{}",
+                admitted.envelope
+            );
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// SY.wf-rules sends only its own fields: a `test_hold_ms` (which holds the manifest lock every
+    /// publish and deploy waits for), a follow-up or a bundle is refused. Archi is not held to it.
+    #[test]
+    fn wf_rules_sends_only_the_fields_of_its_deploys() {
+        let caller = "SY.wf-rules@worker1";
+        let package = || {
+            workflow_package(workflow_package_json(
+                "wf.invoice",
+                "workflow",
+                Some("wf.engine"),
+            ))
+        };
+        let remove = json!({ "runtime": "wf.invoice", "runtime_version": "0.0.2" });
+        assert!(mesh_admits(caller, "publish_runtime_package", None, &package()).is_ok());
+        assert!(mesh_admits(caller, "remove_runtime_version", Some("motherbee"), &remove).is_ok());
+        let mut refused = Vec::new();
+        for (field, value) in [
+            ("test_hold_ms", json!(600_000)),
+            ("sync_to", json!(["worker2"])),
+            ("update_to", json!([])),
+            ("target", json!("motherbee")),
+        ] {
+            let mut publish = package();
+            publish[field] = value.clone();
+            refused.push(("publish_runtime_package", publish));
+            let mut removal = remove.clone();
+            removal[field] = value;
+            refused.push(("remove_runtime_version", removal));
+        }
+        let mut blob = package();
+        blob["source"]["blob_path"] = json!("packages/wf.zip");
+        refused.push(("publish_runtime_package", blob));
+        for (action, params) in &refused {
+            assert!(
+                mesh_admits(caller, action, Some("motherbee"), params).is_err(),
+                "{action} {params}"
+            );
+        }
+        for (action, params) in &refused {
+            assert!(
+                mesh_admits("SY.architect@motherbee", action, Some("motherbee"), params).is_ok(),
+                "{action} {params}"
+            );
+        }
+    }
+
+    /// SY.wf-rules asks only for the scan its deploys send (go/sy-wf-rules/node/admin.go), waiting
+    /// at most 5 s: a longer wait, a missing one (the orchestrator's 30 s) or another field would
+    /// let a worker hold the motherbee orchestrator's one-at-a-time system worker. Archi is not
+    /// held to it.
+    #[test]
+    fn wf_rules_sync_hint_waits_at_most_five_seconds() {
+        let caller = "SY.wf-rules@worker1";
+        let scan = |wait_for_idle: bool, timeout_ms: Value| {
+            json!({
+                "channel": "dist",
+                "folder_id": RUNTIMES_SYNC_FOLDER,
+                "wait_for_idle": wait_for_idle,
+                "timeout_ms": timeout_ms,
+            })
+        };
+        // The deploy's wait and its nudge, as SyncRuntimes sends them.
+        for params in [scan(true, json!(5000)), scan(false, json!(1000))] {
+            assert_eq!(
+                mesh_admits(caller, "sync_hint", Some("motherbee"), &params),
+                Ok(MeshAdmission::Admitted),
+                "{params}"
+            );
+        }
+        let mut refused = vec![
+            scan(true, json!(5001)),
+            scan(true, json!(300_000)),
+            scan(true, json!("5000")),
+            scan(true, json!(-1)),
+            json!({ "channel": "dist", "folder_id": RUNTIMES_SYNC_FOLDER, "wait_for_idle": true }),
+        ];
+        for (field, value) in [
+            ("test_hold_ms", json!(1)),
+            ("target", json!("motherbee")),
+            ("category", json!("runtime")),
+        ] {
+            let mut extra = scan(true, json!(1000));
+            extra[field] = value;
+            refused.push(extra);
+        }
+        for params in &refused {
+            assert!(
+                mesh_admits(caller, "sync_hint", Some("motherbee"), params).is_err(),
+                "{params}"
+            );
+            assert!(
+                mesh_admits(
+                    "SY.architect@motherbee",
+                    "sync_hint",
+                    Some("motherbee"),
+                    params
+                )
+                .is_ok(),
+                "{params}"
+            );
+        }
+    }
+
+    /// A purge (kill_node or remove_node_instance with the instance) waits for the node's
+    /// teardown: SY.admin's window outlasts the orchestrator's 120 s for teardown_node and the
+    /// motherbee's 150 s for a spoke's purge, so the caller gets the outcome, not a TIMEOUT while
+    /// the work finishes.
+    #[test]
+    fn a_purge_outlasts_the_orchestrators_teardown_window() {
+        for action in ["kill_node", "remove_node_instance"] {
+            assert_eq!(
+                admin_action_timeout(action),
+                Duration::from_secs(180),
+                "{action}"
+            );
+            assert!(admin_action_timeout(action) > Duration::from_secs(150));
+        }
+    }
+
+    fn ilk_of(node_name: &str) -> Value {
+        json!({
+            "status": "ok",
+            "ilk_id": TEST_ILK,
+            "ilk": {
+                "ilk_id": TEST_ILK,
+                "ilk_type": "agent",
+                "identification": { "node_name": node_name },
+            },
+        })
+    }
+
+    /// Answers each call of a teardown in turn, checking that it is the next one expected, and
+    /// returns them as they were sent.
+    async fn answer_teardown(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        replies: Vec<(&str, Value)>,
+    ) -> Vec<Message> {
+        let mut sent = Vec::new();
+        for (expected, answer) in replies {
+            let request = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|| panic!("{expected} was not sent"));
+            assert_eq!(request.meta.msg.as_deref(), Some(expected));
+            let done = reply_to(&request, &format!("{expected}_RESPONSE"), answer);
+            harness.inject(done).await.unwrap();
+            sent.push(request);
+        }
+        sent
+    }
+
+    /// `teardown_node` of `node_name` as its hive's orchestrator asks for it over the mesh.
+    async fn teardown_of(
+        ctx: &AdminContext,
+        node_name: &str,
+    ) -> Result<InternalAdminDispatchResult, AdminError> {
+        let caller = format!(
+            "SY.orchestrator@{}",
+            node_name.rsplit_once('@').map(|(_, hive)| hive).unwrap()
+        );
+        dispatch_internal_admin_command(
+            ctx,
+            &ctx.rpc,
+            "teardown_node",
+            None,
+            teardown_params(node_name),
+            AdminOrigin::Mesh(&caller),
+        )
+        .await
+    }
+
+    /// teardown_node, in order: the ILK read (it must be the node's), the secrets dedicated to it,
+    /// each in its own tenant, then the ILK marked and purged; the report shows every step.
+    #[tokio::test]
+    async fn teardown_node_removes_the_secrets_then_the_ilk() {
+        let (ctx, mut harness) = mesh_test_admin("teardown-order");
+        let (t1, t2) = (
+            "tnt:11111111-1111-4111-8111-111111111111",
+            "tnt:22222222-2222-4222-8222-222222222222",
+        );
+        let teardown = teardown_of(&ctx, "AI.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", ilk_of("AI.sales@worker1")),
+                (
+                    MSG_VAULT_LIST,
+                    json!({ "status": "ok", "secrets": [
+                        { "key": "slack:sales:bot", "metadata": { "tenant_id": t1 } },
+                        { "key": "slack:sales:app", "metadata": { "tenant_id": t2 } },
+                    ] }),
+                ),
+                (MSG_VAULT_DELETE, json!({ "status": "ok" })),
+                (MSG_VAULT_DELETE, json!({ "status": "ok" })),
+                ("ILK_DELETE", json!({ "status": "ok", "state": "deleted" })),
+                ("ILK_PURGE", json!({ "status": "ok", "state": "purged" })),
+            ],
+        );
+        let (result, sent) = tokio::join!(teardown, drive);
+        let identity = json!(format!("SY.identity@{PRIMARY_HIVE_ID}"));
+        let vault = json!(format!("SY.vault@{PRIMARY_HIVE_ID}"));
+        let calls: Vec<(Value, Value)> = sent
+            .iter()
+            .map(|message| (dst_of(message), message.payload.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (identity.clone(), json!({ "ilk_id": TEST_ILK })),
+                (
+                    vault.clone(),
+                    json!({ "filter": { "ilk": TEST_ILK, "limit": 1000 } })
+                ),
+                (
+                    vault.clone(),
+                    json!({ "key": "slack:sales:bot", "tenant_id": t1 })
+                ),
+                (vault, json!({ "key": "slack:sales:app", "tenant_id": t2 })),
+                (identity.clone(), json!({ "ilk_id": TEST_ILK })),
+                (identity, json!({ "ilk_id": TEST_ILK })),
+            ]
+        );
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(result.envelope["status"], json!("ok"));
+        assert_eq!(
+            result.envelope["payload"],
+            json!({
+                "node_name": "AI.sales@worker1",
+                "ilk_id": TEST_ILK,
+                "ilk_deleted": true,
+                "not_found": false,
+                "vault_secrets_purged": { "status": "ok", "scanned": 2, "deleted": 2, "errors": [] },
+                "ilk_delete": { "status": "ok" },
+            })
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// An ILK that is not the node's: nothing is removed, and the answer says whose it is.
+    #[tokio::test]
+    async fn teardown_node_refuses_an_ilk_that_is_not_the_nodes() {
+        let (ctx, mut harness) = mesh_test_admin("teardown-mismatch");
+        let person = json!({ "status": "ok", "ilk": { "ilk_id": TEST_ILK, "ilk_type": "human", "identification": { "email": "a@b.c" } } });
+        for (answer, owner) in [
+            (ilk_of("AI.sales@worker2"), "AI.sales@worker2"),
+            (person, "no node"),
+        ] {
+            let teardown = teardown_of(&ctx, "AI.sales@worker1");
+            let drive = answer_teardown(&mut harness, vec![("ILK_GET", answer)]);
+            let (result, _) = tokio::join!(teardown, drive);
+            let result = result.expect("dispatch");
+            assert_eq!(result.http_status, 409);
+            assert_eq!(result.envelope["status"], json!("error"));
+            assert_eq!(result.envelope["error_code"], json!("NODE_ILK_MISMATCH"));
+            let detail = result.envelope["error_detail"].as_str().unwrap();
+            assert!(detail.contains(owner), "{detail}");
+            let payload = &result.envelope["payload"];
+            assert_eq!(payload["ilk_deleted"], json!(false));
+            assert_eq!(payload["vault_secrets_purged"]["status"], json!("skipped"));
+            assert_eq!(payload["ilk_delete"], json!({ "status": "skipped" }));
+            assert!(harness
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none());
+        }
+    }
+
+    /// An ILK SY.identity does not hold: nothing ties its secrets to the node any more, so over the
+    /// mesh they stay and the teardown is done; the operator's own teardown clears them. One that
+    /// disappears between the read and the mark counts as done.
+    #[tokio::test]
+    async fn teardown_node_of_an_ilk_already_gone() {
+        let (mut ctx, mut harness) = mesh_test_admin("teardown-not-found");
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let not_found =
+            json!({ "status": "error", "error_code": "NOT_FOUND", "message": "failed to get ilk" });
+
+        let teardown = teardown_of(&ctx, "IO.slack.sales@worker1");
+        let drive = answer_teardown(&mut harness, vec![("ILK_GET", not_found.clone())]);
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(
+            result.envelope["payload"],
+            json!({
+                "node_name": "IO.slack.sales@worker1",
+                "ilk_id": TEST_ILK,
+                "ilk_deleted": false,
+                "not_found": true,
+                "vault_secrets_purged": { "status": "skipped", "scanned": 0, "deleted": 0, "errors": [] },
+                "ilk_delete": { "status": "skipped" },
+            })
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // The operator, once the node is gone: the leftover secrets go.
+        ctx.connected_nodes = Arc::new(|_| Ok(vec!["IO.other@worker1".to_string()]));
+        let teardown = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "teardown_node",
+            teardown_params("IO.slack.sales@worker1"),
+            Some("worker1".to_string()),
+        );
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", not_found),
+                (
+                    MSG_VAULT_LIST,
+                    json!({ "status": "ok", "secrets": [
+                        { "key": "slack:sales:bot", "metadata": { "tenant_id": tenant } },
+                    ] }),
+                ),
+                (MSG_VAULT_DELETE, json!({ "status": "ok" })),
+            ],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let (status, body) = result.expect("answered");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["payload"]["not_found"], json!(true));
+        assert_eq!(
+            body["payload"]["vault_secrets_purged"],
+            json!({ "status": "ok", "scanned": 1, "deleted": 1, "errors": [] })
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let teardown = teardown_of(&ctx, "IO.slack.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", ilk_of("IO.slack.sales@worker1")),
+                (MSG_VAULT_LIST, json!({ "status": "ok", "secrets": [] })),
+                (
+                    "ILK_DELETE",
+                    json!({ "status": "error", "error_code": "ILK_NOT_FOUND", "message": "gone" }),
+                ),
+            ],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(
+            result.envelope["status"],
+            json!("ok"),
+            "{}",
+            result.envelope
+        );
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["not_found"], json!(true));
+        assert_eq!(payload["ilk_deleted"], json!(false));
+        assert_eq!(payload["ilk_delete"], json!({ "status": "ok" }));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A node still connected is torn down only by its own orchestrator, right after its kill:
+    /// the operator, Archi and the executor wait until shared memory no longer lists it.
+    #[test]
+    fn a_connected_node_is_torn_down_only_by_its_own_orchestrator() {
+        let request =
+            TeardownNodeRequest::from_params(&teardown_params("AI.sales@worker1")).unwrap();
+        let own = AdminOrigin::Mesh("SY.orchestrator@worker1");
+        assert_eq!(
+            teardown_live_node_refusal(&request, own, || -> Result<Vec<String>, String> {
+                panic!("the orchestrator's own teardown reads nothing")
+            }),
+            None
+        );
+        for origin in [
+            AdminOrigin::Http,
+            AdminOrigin::Executor,
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+            AdminOrigin::Mesh("SY.orchestrator@worker2"),
+        ] {
+            let code = |connected: Result<Vec<String>, String>| {
+                teardown_live_node_refusal(&request, origin, || connected)
+                    .map(|(status, code, _)| (status, code))
+            };
+            assert_eq!(
+                code(Ok(vec!["AI.sales@worker1".to_string()])),
+                Some((409, "NODE_STILL_CONNECTED")),
+                "{origin:?}"
+            );
+            assert_eq!(code(Ok(vec!["AI.sales@worker2".to_string()])), None);
+            assert_eq!(
+                code(Err("no regions".to_string())),
+                Some((503, "INVENTORY_UNAVAILABLE"))
+            );
+        }
+        assert_eq!(error_code_to_http_status("NODE_STILL_CONNECTED"), 409);
+    }
+
+    /// Over HTTP: a connected node is refused before anything is sent, a box whose regions cannot
+    /// be read waits, and a bare node name in the path is a node of the path's hive.
+    #[tokio::test]
+    async fn the_http_teardown_waits_for_the_node_to_be_gone() {
+        let (mut ctx, mut harness) = mesh_test_admin("teardown-http");
+        let ilk = serde_json::to_vec(&json!({ "ilk_id": TEST_ILK })).unwrap();
+        let query = HashMap::new();
+        let path = "/hives/worker1/nodes/WF.invoice/teardown";
+
+        let (status, body) = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc)
+            .await
+            .expect("answered")
+            .expect("routed");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error_code"], json!("INVENTORY_UNAVAILABLE"));
+        assert_eq!(body["payload"]["node_name"], json!("WF.invoice@worker1"));
+
+        ctx.connected_nodes = Arc::new(|_| Ok(vec!["WF.invoice@worker1".to_string()]));
+        let (status, body) = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc)
+            .await
+            .expect("answered")
+            .expect("routed");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("NODE_STILL_CONNECTED"));
+        assert_eq!(
+            body["payload"]["vault_secrets_purged"]["status"],
+            json!("skipped")
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // Gone: the teardown runs, for the node of the path's hive.
+        ctx.connected_nodes = Arc::new(|_| Ok(Vec::new()));
+        let teardown = handle_hive_paths("POST", path, &query, &ilk, &ctx, &ctx.rpc);
+        let drive = answer_teardown(&mut harness, vec![("ILK_GET", ilk_of("WF.other@worker1"))]);
+        let (result, _) = tokio::join!(teardown, drive);
+        let (status, body) = result.expect("answered").expect("routed");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("NODE_ILK_MISMATCH"));
+        assert_eq!(body["payload"]["node_name"], json!("WF.invoice@worker1"));
+    }
+
+    /// At start SY.admin logs the role each registered hive's nodes have over the mesh; these are
+    /// the roles it logs.
+    #[test]
+    fn the_registry_roles_logged_at_start_are_the_tables() {
+        let root = test_temp_dir("mesh-registry-roles");
+        for (dir, info) in [
+            (
+                "worker1",
+                "hive_id: worker1\nstatus: connected\nrole: worker\n",
+            ),
+            (
+                "ingress1",
+                "hive_id: ingress1\nstatus: connected\nrole: ingress\n",
+            ),
+            (
+                "joining1",
+                "hive_id: joining1\nstatus: joining\nrole: worker\njoin:\n  phase: accepted\n",
+            ),
+        ] {
+            write_registry_entry(&root, dir, info);
+        }
+        fs::write(root.join("stray-file"), "not a hive").unwrap();
+        assert_eq!(
+            registry_caller_roles(PRIMARY_HIVE_ID, &root),
+            vec![
+                ("ingress1".to_string(), Some(CallerHive::Ingress)),
+                ("joining1".to_string(), None),
+                ("worker1".to_string(), Some(CallerHive::Worker)),
+            ]
+        );
+        assert!(registry_caller_roles(PRIMARY_HIVE_ID, &root.join("absent")).is_empty());
+    }
+
+    /// A step that fails makes the teardown TEARDOWN_INCOMPLETE with the same report; a secret not
+    /// deleted keeps the ILK for a retry, and nothing runs after an ILK read that failed.
+    #[tokio::test]
+    async fn teardown_node_reports_the_step_that_failed() {
+        let (ctx, mut harness) = mesh_test_admin("teardown-failures");
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let failed = |code: &str, message: &str| json!({ "status": "error", "error_code": code, "message": message });
+
+        // A secret SY.vault does not delete: the ILK stays.
+        let teardown = teardown_of(&ctx, "AI.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", ilk_of("AI.sales@worker1")),
+                (
+                    MSG_VAULT_LIST,
+                    json!({ "status": "ok", "secrets": [
+                        { "key": "a", "metadata": { "tenant_id": tenant } },
+                        { "key": "b", "metadata": { "tenant_id": tenant } },
+                    ] }),
+                ),
+                (MSG_VAULT_DELETE, json!({ "status": "ok" })),
+                (MSG_VAULT_DELETE, failed("STORAGE_ERROR", "disk full")),
+            ],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 502);
+        assert_eq!(result.envelope["error_code"], json!("TEARDOWN_INCOMPLETE"));
+        assert_eq!(
+            result.envelope["payload"]["vault_secrets_purged"],
+            json!({
+                "status": "error",
+                "scanned": 2,
+                "deleted": 1,
+                "errors": [{ "key": "b", "error_code": "STORAGE_ERROR", "error_detail": "disk full" }],
+            })
+        );
+        assert_eq!(
+            result.envelope["payload"]["ilk_delete"],
+            json!({ "status": "skipped" })
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // A listing SY.vault refuses.
+        let teardown = teardown_of(&ctx, "AI.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", ilk_of("AI.sales@worker1")),
+                (MSG_VAULT_LIST, failed("VAULT_UNAVAILABLE", "sealed")),
+            ],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.envelope["error_code"], json!("TEARDOWN_INCOMPLETE"));
+        let vault = &result.envelope["payload"]["vault_secrets_purged"];
+        assert_eq!(vault["status"], json!("error"));
+        assert_eq!(vault["error_code"], json!("VAULT_UNAVAILABLE"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        // A purge SY.identity refuses: the ILK stays marked.
+        let teardown = teardown_of(&ctx, "AI.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![
+                ("ILK_GET", ilk_of("AI.sales@worker1")),
+                (MSG_VAULT_LIST, json!({ "status": "ok", "secrets": [] })),
+                ("ILK_DELETE", json!({ "status": "ok", "state": "deleted" })),
+                ("ILK_PURGE", failed("ILK_NOT_DELETED", "not marked")),
+            ],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.envelope["error_code"], json!("TEARDOWN_INCOMPLETE"));
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["ilk_deleted"], json!(false));
+        assert_eq!(payload["vault_secrets_purged"]["status"], json!("ok"));
+        assert_eq!(
+            payload["ilk_delete"],
+            json!({ "status": "error", "error_code": "ILK_NOT_DELETED", "error_detail": "not marked" })
+        );
+
+        // An ILK read that fails: nothing is removed.
+        let teardown = teardown_of(&ctx, "AI.sales@worker1");
+        let drive = answer_teardown(
+            &mut harness,
+            vec![("ILK_GET", failed("DB_NOT_READY", "no database"))],
+        );
+        let (result, _) = tokio::join!(teardown, drive);
+        let result = result.expect("dispatch");
+        assert_eq!(result.http_status, 502);
+        assert_eq!(result.envelope["error_code"], json!("TEARDOWN_INCOMPLETE"));
+        let payload = &result.envelope["payload"];
+        assert_eq!(payload["vault_secrets_purged"]["status"], json!("skipped"));
+        assert_eq!(payload["ilk_delete"]["error_code"], json!("DB_NOT_READY"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// What teardown_node takes: a node of the kind run_node launches and its ILK in canonical
+    /// form; over HTTP, a node of the hive in the path. Refused before anything is sent.
+    #[tokio::test]
+    async fn teardown_node_validates_its_request_first() {
+        let request =
+            TeardownNodeRequest::from_params(&teardown_params("WF.billing.monthly@worker-2"))
+                .expect("valid");
+        assert_eq!(
+            request,
+            TeardownNodeRequest {
+                node_name: "WF.billing.monthly@worker-2".to_string(),
+                hive: "worker-2".to_string(),
+                ilk_id: TEST_ILK.to_string(),
+            }
+        );
+        let (ctx, mut harness) = mesh_test_admin("teardown-invalid");
+        for params in [
+            teardown_params("SY.admin@motherbee"),
+            teardown_params("RT.gw@worker1"),
+            teardown_params("AI.sales"),
+            teardown_params("@worker1"),
+            teardown_params(" AI.sales@worker1"),
+            teardown_params("AI.sales@worker1@x"),
+            teardown_params("AI.sales@../x"),
+            json!({ "node_name": "AI.sales@worker1" }),
+            json!({ "node_name": "AI.sales@worker1", "ilk_id": "ilk:not-a-uuid" }),
+            json!({ "node_name": "AI.sales@worker1", "ilk_id": TEST_ILK.to_uppercase() }),
+            json!({ "node_name": "AI.sales@worker1", "ilk_id": TEST_ILK.trim_start_matches("ilk:") }),
+            json!({ "node_name": "AI.sales@worker1", "ilk_id": format!("{TEST_ILK} ") }),
+        ] {
+            let (status, body) =
+                handle_admin_command(&ctx, &ctx.rpc, "teardown_node", params.clone(), None)
+                    .await
+                    .expect("answered");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(status, 400, "{params}: {body}");
+            assert_eq!(body["error_code"], json!("INVALID_REQUEST"));
+        }
+        // The path's hive must be the node's.
+        let (status, _) = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "teardown_node",
+            teardown_params("AI.sales@worker1"),
+            Some("worker2".to_string()),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 400);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// teardown_node in the catalog: a mutation behind a confirmation, with its route, the hive
+    /// taken from the node, and Archi and the executor able to call it.
+    #[test]
+    fn teardown_node_is_in_the_catalog() {
+        let spec = resolve_internal_action_spec("teardown_node").expect("registered");
+        assert!(spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["POST /hives/{hive}/nodes/{node_name}/teardown"])
+        );
+        assert_ne!(doc["summary"], json!("Admin action."));
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(schema["required"], json!(["hive", "node_name", "ilk_id"]));
+        assert!(admin_action_example_scmd("teardown_node").is_some());
+        assert!(!admin_action_request_notes("teardown_node").is_empty());
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/worker1/nodes/AI.sales@worker1/teardown"),
+            vec!["POST"]
+        );
+        assert_eq!(
+            resolve_internal_action_hive("teardown_node", None, &teardown_params("AI.x@worker1")),
+            Some("worker1".to_string())
+        );
+        assert_eq!(error_code_to_http_status("NODE_ILK_MISMATCH"), 409);
+        assert_eq!(error_code_to_http_status("TEARDOWN_INCOMPLETE"), 502);
+    }
+
+    /// `ssh_allow_from` on add_hive: only with role ingress, an array of IPv4 or IPv6 addresses or
+    /// CIDRs with their host bits clear.
+    #[test]
+    fn add_hive_takes_ssh_allow_from_only_for_an_ingress() {
+        let add = |role: Option<&str>, allow: Value| {
+            let mut payload =
+                json!({ "hive_id": "ingress2", "address": "10.0.0.9", "ssh_user": "admin" });
+            if let Some(role) = role {
+                payload["role"] = json!(role);
+            }
+            payload["ssh_allow_from"] = allow;
+            payload
+        };
+        for allow in [
+            json!([]),
+            json!(["192.168.8.0/24"]),
+            json!(["10.0.0.7", "10.1.0.0/16", "0.0.0.0/0", "203.0.113.5/32"]),
+            json!([
+                "2001:db8::/32",
+                "fe80::1",
+                "::/0",
+                "2001:db8::1/128",
+                "::ffff:10.0.0.0/104"
+            ]),
+        ] {
+            for role in ["ingress", " Ingress "] {
+                assert_eq!(
+                    admin_payload_contract_error("add_hive", &add(Some(role), allow.clone())),
+                    None,
+                    "{role} {allow}"
+                );
+            }
+        }
+        // Absent or null: nothing to check, whatever the role.
+        let mut worker = add(None, json!(null));
+        assert_eq!(admin_payload_contract_error("add_hive", &worker), None);
+        worker.as_object_mut().unwrap().remove("ssh_allow_from");
+        assert_eq!(admin_payload_contract_error("add_hive", &worker), None);
+        // Only for an ingress.
+        for role in [None, Some("worker"), Some("egress")] {
+            let refusal =
+                admin_payload_contract_error("add_hive", &add(role, json!(["10.0.0.0/8"])))
+                    .expect("refused");
+            assert!(refusal.contains("role ingress"), "{refusal}");
+        }
+        for allow in [
+            json!("10.0.0.0/8"),
+            json!([10]),
+            json!(["10.0.0.0/33"]),
+            json!(["10.0.0.0/"]),
+            json!(["10.0.0.0/08"]),
+            json!(["10.0.0.0/+8"]),
+            json!(["2001:db8::/129"]),
+            json!(["10.0.0.1/8"]),
+            json!(["2001:db8::1/32"]),
+            json!(["10.0.0.256"]),
+            json!([" 10.0.0.0/8"]),
+            json!(["10.0.0.0/8 "]),
+            json!(["host.example"]),
+            json!(["10.0.0.0/8; drop"]),
+            json!(["[::1]"]),
+            json!(["fe80::1%eth0"]),
+        ] {
+            assert!(
+                admin_payload_contract_error("add_hive", &add(Some("ingress"), allow.clone()))
+                    .is_some(),
+                "{allow}"
+            );
+        }
+        let refusal = admin_payload_contract_error(
+            "add_hive",
+            &add(Some("ingress"), json!(["192.168.8.10/24"])),
+        )
+        .unwrap();
+        assert!(refusal.contains("192.168.8.0/24"), "{refusal}");
+    }
+
+    /// The add_hive the admin forwards to the orchestrator carries `ssh_allow_from` exactly as
+    /// given; a refused one is never forwarded.
+    #[tokio::test]
+    async fn add_hive_passes_ssh_allow_from_through_unchanged() {
+        let (ctx, mut harness) = opa_test_admin("add-hive-ssh-allow-from");
+        let allow = json!(["192.168.8.0/24", "2001:db8::/32", "10.0.0.7"]);
+        let payload = json!({
+            "hive_id": "ingress2",
+            "address": "10.0.0.9",
+            "ssh_user": "admin",
+            "role": "ingress",
+            "ingress": { "listen": "0.0.0.0:443" },
+            "ssh_allow_from": allow,
+        });
+        let add = handle_admin_command(&ctx, &ctx.rpc, "add_hive", payload, None);
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the add_hive");
+            assert_eq!(sent.meta.msg_type, "admin");
+            assert_eq!(sent.meta.action.as_deref(), Some("add_hive"));
+            assert_eq!(
+                dst_of(&sent),
+                json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(sent.payload["ssh_allow_from"], allow);
+            let mut answer = reply_to(
+                &sent,
+                "",
+                json!({ "status": "accepted", "hive_id": "ingress2" }),
+            );
+            answer.meta.msg_type = "admin".to_string();
+            answer.meta.msg = None;
+            harness.inject(answer).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(add, drive);
+        let (status, _) = result.expect("answered");
+        assert_eq!(status, 202);
+
+        let refused = json!({
+            "hive_id": "worker9",
+            "address": "10.0.0.10",
+            "ssh_user": "admin",
+            "ssh_allow_from": ["10.0.0.0/8"],
+        });
+        let (status, body) = handle_admin_command(&ctx, &ctx.rpc, "add_hive", refused, None)
+            .await
+            .expect("answered");
+        assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 }

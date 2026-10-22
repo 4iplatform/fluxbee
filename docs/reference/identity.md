@@ -1,6 +1,6 @@
 # Identity (SY.identity): reference
 
-**Status:** the live contract as built in 0.1.79 (2026-10-17).
+**Status:** the live contract as built in 0.1.83 (2026-10-22).
 **Audience:** developers of IO, AI, SY nodes, the router and Fluxbee Cloud.
 
 This page describes what the code does today. Every statement names the code that backs it.
@@ -25,8 +25,12 @@ named without a path lives there. The SHM is in `src/shm/mod.rs` and its reader 
   Slack user id, an email). It lives inside the ILK record (`IlkRecord.channels`).
 - **Alias**: an old ILK id that points to the ILK it was merged into, for a limited time.
 
-Ids are always prefixed strings in messages and JSON. `parse_prefixed_uuid` refuses anything else
-with `INVALID_REQUEST`. The SHM stores the raw 16 bytes; PostgreSQL stores `UUID` columns.
+Ids are always prefixed strings in messages and JSON, in one spelling: the prefix, a colon, and
+the uuid lowercase and hyphenated, with nothing around it. `parse_prefixed_uuid` refuses anything
+else with `INVALID_REQUEST`, whatever field carries it, and a replica's push with such an id is
+refused (§5.4). The store keys records by the string, while PostgreSQL stores `UUID` columns, so
+another spelling (uppercase, no hyphens, braces, spaces) would name a second record in memory and
+an existing row in the database. The SHM stores the raw 16 bytes.
 
 Where identity lives:
 
@@ -51,7 +55,7 @@ Where identity lives:
 | `ilk_type` | `human`, `agent` or `system` (§2.2). |
 | `registration_status` | `temporary` or `complete` (§2.3). |
 | `tenant_id` | The tenant it is charged to. |
-| `identification` | Free JSON. The keys the code reads: `node_name`, `email`, `display_name`. |
+| `identification` | Free JSON. The keys the code reads: `node_name`, `email` (an email the channel vouches for, §2.7), `display_name`. A person's `claimed_email`, an email they only typed, is stored and returned but never read as a key. |
 | `definition` | An agent's cognitive definition (§4). `{}` for any other type. |
 | `channels` | Its ICHs (`ChannelRecord`, §2.5). |
 | `deleted_at_ms`, `deleted_reason` | The delete mark (§2.8). The only reason written is `direct`. |
@@ -63,6 +67,9 @@ Two identification keys are unique, and the database enforces both
   (`idx_identity_ilks_node_name`).
 - `email`: unique per tenant among unmarked ILKs (`idx_identity_ilks_email` on
   `(email, tenant_id)`).
+
+`claimed_email` is neither: it has no column and no index, and lives only in the
+`identification` JSONB (`upsert_ilk_rows`).
 
 ### 2.2 Types
 
@@ -109,6 +116,8 @@ The router reads this status: a message to `Destination::Resolve` whose `src_ilk
   from the request (`payload.tenant_id`, then `payload.config.tenant_id`, then
   `ORCH_DEFAULT_TENANT_ID`). A node name that already has an active ILK keeps it
   (`register_ilk` looks the name up first).
+- An orchestrator registers, updates, marks and purges only its own hive's nodes (§7.1). A launch
+  on another hive is forwarded to that hive's orchestrator, which registers the node itself.
 - The orchestrator injects the result into the node's unit as `FLUXBEE_NODE_ILK_ID` and
   `FLUXBEE_NODE_TENANT_ID` (`ENV_SELF_ILK_ID`, `ENV_SELF_TENANT_ID` in the SDK).
 - If the launch fails after a new registration, the orchestrator marks and purges that ILK
@@ -142,6 +151,12 @@ tenant moves no key.
 
 **Other rules:**
 
+- A channel key names one ILK, and nothing takes it over (`check_channel_free`). `ILK_UPDATE`,
+  `ILK_ADD_CHANNEL` and a replica's push answer `ICH_CONFLICT` for a key another active ILK holds
+  (in any letter case), and `ILK_DELETED` for one a marked ILK keeps reserved. The ILKs a request
+  joins may hold it already: its target, and the temporary an `ILK_ADD_CHANNEL` merges. Provisioning
+  answers the ILK that holds the key, as always. A node respawned after its ILK was purged takes its
+  channels again.
 - A new channel's `ich_id` must be nobody else's (`check_ich_id_free`, `ICH_ID_CONFLICT`). IO
   nodes derive it from the channel type, the address and the scope (the tenant when no scope is
   named) with `stable_ich_id` (`crates/fluxbee_sdk/src/identity.rs`,
@@ -178,6 +193,12 @@ tenant moves no key.
      (`identity_shm_ilk_tenant`, `case_tenant_of`). The frontdesk never creates a tenant.
    - Two methods. A structured `frontdesk_handoff` runs deterministically, with no model call. A
      person chatting is the conversational method, driven by the frontdesk's LLM.
+   - A handoff is taken only from an IO node: the router-stamped `src_l2_name` must start with
+     `IO.` (`frontdesk_handoff_sender_allowed` in `nodes/gov/common/src/frontdesk_contract.rs`).
+   - Its `subject.email` is vouched (the IO node answers for it) and goes in
+     `identification.email`. An email the person typed in the conversation is a claim and goes in
+     `identification.claimed_email`, also when a later handoff brings no email
+     (`person_identification`).
    - A case of the root tenant is answered at once: nobody registers there
      (`TENANT_ROOT_NOT_REGISTRABLE`), and the ILK stays temporary.
 5. **SY.identity registers** (`register_ilk`):
@@ -188,7 +209,12 @@ tenant moves no key.
    - A registration never changes an existing ILK's tenant (`INVALID_TENANT_TRANSITION`).
    - A `node_name` or an email that a marked ILK holds answers `ILK_DELETED`.
    - Registering an existing ILK replaces its `identification` whole and sets it `complete`.
-   - An email another person of the same tenant already holds triggers a merge (§2.7).
+   - Only a person's registration carries an email: a non-`human` one with `email` or
+     `claimed_email` answers `INVALID_IDENTIFICATION`, so a node can neither hold an address nor
+     learn which addresses are taken.
+   - An `identification.email` another person of the same tenant already holds triggers a merge
+     (§2.7). A `claimed_email` never does: the registration completes, with the same answer
+     whether or not someone holds that email.
 
 **Fluxbee Cloud's `register_human`** (`handle_register_human` in `nodes/io/io-cloud/src/main.rs`)
 runs the same steps without a conversation:
@@ -207,8 +233,15 @@ left ambiguous answers `ACCOUNT_AMBIGUOUS` (`ambiguous_account_emails`, `report_
 
 ### 2.7 Merge by email
 
-Only an email joins two ILKs, and only within one tenant.
+Only an email the channel vouches for joins two ILKs, and only within one tenant
+([control-path hardening](../control-path-hardening-v1.md) §7, A-42).
 
+- **Vouched or claimed.** A vouched email is `identification.email`: the IO node's handoff
+  (io.api, whose integrator holds the bearer; IO.cloud, for the login Fluxbee Cloud
+  authenticated). An email a person typed is `identification.claimed_email`. A claim is stored and
+  shown, never indexed, looked up or merged: a typed email can neither take over a registered
+  person nor reserve an address for a later merge. If the claimant is the same person, joining
+  the two ILKs is the operator's explicit step; SY.admin has no merge action yet.
 - **`ILK_REGISTER` with a known email** (`merge_registration`): when another active `human` ILK
   of the same tenant holds the email, the temporary being registered merges into it. Conditions:
   - the request says `human`;
@@ -519,8 +552,9 @@ converges to the union of the mesh.
 - The primary applies a delta only if the replica owns the ILK (`delta_authorized_for_hive`).
   - A replica may claim `system` only for a deterministic `SY.*` ILK of its own hive
     (`ingest_ilk_type_authorized`).
-  - It may not change an ILK's tenant, nor push a `cloud` channel or another scope
-    (`replica_push_acceptable`).
+  - It may not change an ILK's tenant, nor push a `cloud` channel, another scope, a channel
+    another ILK holds or keeps reserved, or any id in another spelling (`replica_push_acceptable`,
+    §2.5, §1). An `IlkDelete` or alias delta with such an id is refused too.
   - Tenant deltas from a replica are refused.
   - A publish that claims the primary's own hive is refused.
 - A snapshot reconciles that hive's ILKs to exactly the pushed set (`reconcile_hive_ilks`). Well-known
@@ -598,14 +632,14 @@ All are system messages to `SY.identity@<hive>`. SY.identity checks the router-s
 | Message | Allowed callers |
 | --- | --- |
 | `ILK_PROVISION` | `IO.*`, any hive |
-| `ILK_REGISTER` | `SY.frontdesk.gov@` (same hive), `SY.orchestrator@`, the configured frontdesk, `SY.identity@<hive>` |
+| `ILK_REGISTER` | `SY.frontdesk.gov@` (same hive), `SY.orchestrator@` (its own hive's nodes), the configured frontdesk, `SY.identity@<hive>` |
 | `ILK_ADD_CHANNEL` | `IO.*`, `SY.frontdesk.gov@` (same hive), the configured frontdesk |
-| `ILK_UPDATE` | `SY.orchestrator@`, `SY.identity@<hive>` |
+| `ILK_UPDATE` | `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` |
 | `ILK_SET_DEFINITION` | `SY.admin@`, `SY.architect@` (same hive), `SY.identity@<hive>` |
 | `ILK_SET_TENANT` | `SY.admin@`, `SY.architect@` (same hive) |
-| `ILK_DELETE` | `SY.admin@` (same hive), `SY.orchestrator@`, `SY.identity@<hive>` |
+| `ILK_DELETE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` |
 | `ILK_RESTORE` | `SY.admin@` (same hive) |
-| `ILK_PURGE` | `SY.admin@` (same hive), `SY.orchestrator@` |
+| `ILK_PURGE` | `SY.admin@` (same hive), `SY.orchestrator@` (its own hive's nodes) |
 | `ICH_SET_ENABLED` | `IO.*` (its own channel only), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@` (same hive), the configured frontdesk |
 | `ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET` | `SY.admin@` (same hive) |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` (same hive) |
@@ -616,6 +650,19 @@ All are system messages to `SY.identity@<hive>`. SY.identity checks the router-s
 The configured frontdesk is `hive.yaml` `government.identity_frontdesk`, made a full L2 name
 (`configured_identity_frontdesk_node_name`). Each answer is `<MESSAGE>_RESPONSE`
 (`response_name`); an error carries `status: "error"`, `error_code` and `message`.
+
+**An orchestrator acts only on its own hive's nodes** (`authorize_orchestrator_ilk_scope`,
+[control-path hardening](../control-path-hardening-v1.md) §4). The table admits
+`SY.orchestrator@` from any hive; then, from `SY.orchestrator@H`:
+
+- `ILK_REGISTER` is accepted only for a node of `H`: `identification.node_name` ends in `@H`,
+  the type is not `human`, and the ILK it lands on (the node name's active holder, else the
+  requested `ilk_id`), when it exists, is a node of `H`. So it takes no person's ILK and no other
+  hive's.
+- `ILK_UPDATE`, `ILK_DELETE` and `ILK_PURGE` are accepted only on an ILK whose `node_name` ends
+  in `@H`.
+- Anything else answers `UNAUTHORIZED`, with the warning `identity refused an orchestrator outside
+  its own hive's nodes`. An ILK that does not exist answers as before (`ILK_NOT_FOUND`).
 
 ### 7.2 SY.admin (the operator)
 
@@ -676,17 +723,19 @@ SY.admin re-checks every relayed request (`enforce_cloud_relay_content`, `stamp_
 
 | Code | Meaning |
 | --- | --- |
-| `INVALID_REQUEST` | A malformed id or payload; unknown fields are refused (`deny_unknown_fields`). |
+| `INVALID_REQUEST` | A malformed id or payload, or an id in another spelling than its canonical one (§1); unknown fields are refused (`deny_unknown_fields`). |
+| `INVALID_IDENTIFICATION` | A non-`human` registration carries `email` or `claimed_email` (§2.6). |
 | `NOT_PRIMARY` | A write sent to a replica. |
 | `DB_NOT_READY` | A write on a primary without a database. |
 | `UNAUTHORIZED_REGISTRAR` | The caller may not send this message. |
+| `UNAUTHORIZED` | The caller may send this message, but not for that object: an IO node's channel it does not own (§2.5), or an ILK outside an orchestrator's own hive's nodes (§7.1). |
 | `ILK_NOT_FOUND`, `NOT_FOUND`, `TENANT_NOT_FOUND` | Not found (a marked ILK counts as not found for most writes). |
 | `ILK_DELETED` | A marked ILK holds that key. |
 | `TENANT_DELETED`, `TENANT_PENDING`, `TENANT_SUSPENDED`, `TENANT_NOT_ACTIVE` | The tenant's state refuses the operation. |
 | `TENANT_ROOT_PROTECTED`, `TENANT_ROOT_NOT_REGISTRABLE` | The root tenant is not editable, and takes no person. |
 | `SYSTEM_ILK_PROTECTED` | A system ILK. |
-| `DUPLICATE_EMAIL` | The email is taken in that tenant and no merge applies. |
-| `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). |
+| `DUPLICATE_EMAIL` | The vouched email (`identification.email`) is taken in that tenant and no merge applies. A `claimed_email` never answers it. |
+| `CLOUD_CHANNEL_RESERVED`, `INVALID_SCOPE`, `ICH_ID_CONFLICT`, `ICH_CONFLICT`, `ACCOUNT_AMBIGUOUS` | Channel and scope rules (§2.5, §2.6). `ICH_CONFLICT`: another ILK holds the channel. |
 | `TENANT_HAS_CHILDREN`, `TENANT_HAS_NODES`, `TENANT_HAS_PEOPLE`, `TENANT_HAS_SECRETS` | A tenant lifecycle guard (§3.6). |
 
 Database errors map to their own codes (`map_db_write_error_code`). Their message never echoes

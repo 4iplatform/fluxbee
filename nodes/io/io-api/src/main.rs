@@ -24,8 +24,8 @@ use fluxbee_sdk::{
     PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcRequestLabels,
 };
 use io_common::frontdesk_contract::{
-    FrontdeskHandoffPayload, FrontdeskHandoffSubject, FRONTDESK_HANDOFF_PAYLOAD_TYPE,
-    FRONTDESK_SCHEMA_VERSION_V1,
+    FrontdeskHandoffPayload, FrontdeskHandoffSubject, FRONTDESK_HANDOFF_MSG,
+    FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
 };
 use io_common::frontdesk_gate::frontdesk_response_contract;
 use io_common::identity::{
@@ -1599,7 +1599,7 @@ async fn request_frontdesk_handoff(
     )
     .map_err(|err| ApiIngressError::new("invalid_response_contract", err.to_string()))?;
     let sender = state.dispatcher.sender_snapshot();
-    let message = io_common::router_message::build_user_message(
+    let mut message = io_common::router_message::build_user_message(
         sender.uuid(),
         Some(request.dst_node.clone()),
         16,
@@ -1609,6 +1609,7 @@ async fn request_frontdesk_handoff(
         context,
         serde_json::to_value(request.payload).expect("frontdesk handoff payload"),
     );
+    message.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
     let reply = state
         .dispatcher
         .send_with_matcher(

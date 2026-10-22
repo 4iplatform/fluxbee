@@ -30,7 +30,6 @@ use crate::node_secret::NodeSecretDescriptor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tracing_subscriber::EnvFilter;
 
 /// Default root under which the orchestrator writes managed node instance dirs.
 pub const DEFAULT_MANAGED_NODES_ROOT: &str = "/var/lib/fluxbee/nodes";
@@ -144,22 +143,6 @@ pub trait ManagedNodeConfigContract: Send + Sync {
     fn secret_descriptors(&self, _effective: Option<&Value>) -> Vec<NodeSecretDescriptor> {
         Vec::new()
     }
-}
-
-/// Self-describing contract payload for a `CONFIG_GET` reply / autohelp.
-pub fn build_contract_payload(
-    contract: &dyn ManagedNodeConfigContract,
-    effective: Option<&Value>,
-) -> Value {
-    json!({
-        "node_family": contract.node_family(),
-        "node_kind": contract.node_kind(),
-        "supports": ["CONFIG_GET", "CONFIG_SET"],
-        "required_fields": contract.required_fields(),
-        "optional_fields": contract.optional_fields(),
-        "secrets": contract.secret_descriptors(effective),
-        "notes": contract.notes(),
-    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -351,66 +334,6 @@ fn write_json_atomic(path: &Path, content: &str) -> Result<(), ControlPlaneError
     Ok(())
 }
 
-/// `CONFIG_GET` reply payload.
-pub fn build_config_get_response_payload(
-    node_name: &str,
-    state: &ManagedControlPlaneState,
-    contract: &dyn ManagedNodeConfigContract,
-) -> Value {
-    let ok = state.effective_config.is_some();
-    let redacted = state
-        .effective_config
-        .as_ref()
-        .map(|cfg| contract.redact_effective_config(cfg));
-    json!({
-        "ok": ok,
-        "node_name": node_name,
-        "state": state.current_state.as_str(),
-        "schema_version": state.schema_version,
-        "config_version": state.config_version,
-        "effective_config": redacted,
-        "contract": build_contract_payload(contract, state.effective_config.as_ref()),
-        "error": if ok { Value::Null } else { json!({"code":"node_not_configured","message":"No effective config available"}) },
-    })
-}
-
-pub fn build_config_set_ok_payload(
-    node_name: &str,
-    state: &ManagedControlPlaneState,
-    contract: &dyn ManagedNodeConfigContract,
-) -> Value {
-    let redacted = state
-        .effective_config
-        .as_ref()
-        .map(|cfg| contract.redact_effective_config(cfg));
-    json!({
-        "ok": true,
-        "node_name": node_name,
-        "state": state.current_state.as_str(),
-        "schema_version": state.schema_version,
-        "config_version": state.config_version,
-        "effective_config": redacted,
-        "error": Value::Null,
-    })
-}
-
-pub fn build_config_set_error_payload(
-    node_name: &str,
-    state: &ManagedControlPlaneState,
-    code: &str,
-    message: impl Into<String>,
-) -> Value {
-    json!({
-        "ok": false,
-        "node_name": node_name,
-        "state": state.current_state.as_str(),
-        "schema_version": state.schema_version,
-        "config_version": state.config_version,
-        "effective_config": Value::Null,
-        "error": {"code": code, "message": message.into()},
-    })
-}
-
 /// Health state derived from the config-plane lifecycle: a node that failed to load its config, or
 /// was never configured, refuses work and is NOT healthy. Fixes the class of bug where a node
 /// reported HEALTHY while silently rejecting every request. DEGRADED is a soft signal (it does not,
@@ -441,19 +364,6 @@ pub fn build_node_status_response_payload(
         payload["last_error"] = json!(last_error);
     }
     payload
-}
-
-/// Initialize tracing for a managed node so it actually logs to journald. Managed nodes are launched
-/// by transient systemd units that do NOT set `RUST_LOG`, and `EnvFilter::from_default_env()` with an
-/// unset `RUST_LOG` emits NOTHING — which turned every misconfiguration into a blind debug. Default to
-/// INFO; `RUST_LOG` still overrides when set. Idempotent-safe to call once at startup.
-pub fn init_managed_node_logging(default_directives: &str) {
-    let _ = crate::logging::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(default_directives)),
-        )
-        .try_init();
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 # Control-path hardening (v1)
 
-**Status:** design, 2026-10-22, after its review round (security and operations). **Findings:**
+**Status:** implemented for 0.1.83 (2026-10-22), after one design review (security and operations)
+and one code review round (security, operations, correctness). The code review's fixes are in
+FINDINGS A-79. **Findings:**
 A-62, A-20, A-22 (partial), A-46 stage 4 (minimal), A-55 (a switch), A-42, and three found by the
 review (§3–§5). **Decisions:** the operator, 2026-10-22: the batch, the A-62 table, D-2 un-parked,
 A-42 rule (b), SSH on the DMZ hosts, the technical debt in the same release. After the review: the
@@ -50,7 +52,7 @@ types a registered person's email is merged into that person.
 - **The table lives next to the action catalog,** so a new action is closed until it is listed.
 
 | Caller | Admitted |
-|---|---|
+| --- | --- |
 | any caller on an ingress or egress hive | nothing (checked before every row below) |
 | `SY.architect@motherbee` | everything (the operator's agent) |
 | `IO.cloud@motherbee` | the Cloud-exposed actions; externalize, unexternalize and list for its own channel |
@@ -60,6 +62,7 @@ types a registered person's email is merged into that person.
 | `AI.*@H`, `IO.*@H`, `WF.*@H` | `publish_artifact`, and `unpublish_artifact` for `AI.*` (checked in the handler, as today) |
 
 **The `SY.wf-rules@H` row in detail:**
+
 - **Node actions:** `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`
   and `get_node_status`, only for `WF.*@H`.
 - **`publish_runtime_package`:**
@@ -72,12 +75,14 @@ types a registered person's email is merged into that person.
   deploy sends it.
 
 **Callers and roles:**
+
 - **Only from Archi and the HTTP API:** `executor_*` and `publish_cloud_endpoint`.
 - **A hive's role comes from the registry** (`hives/<id>/info.yaml`). It fails closed: no file, no
   role, a hive still joining, or a removed one gets nothing. The local hive is the motherbee.
 
 **`teardown_node {node_name, ilk_id}`** replaces the four calls a node teardown makes today:
 `delete_ilk`, `purge_ilk`, `vault_list`, `vault_delete`.
+
 - **Why:** today the ILK is purged first, so the vault calls can no longer be tied to a hive.
 - **What SY.admin does:**
   1. checks that the node is on the caller's hive and that the ILK is that node's;
@@ -86,14 +91,17 @@ types a registered person's email is merged into that person.
 - **What it reports:** each step. `status: error` when any step fails. Today a teardown answers
   `ok` over partial failures.
 - **During the update:** a spoke not yet updated still sends the old calls. They are refused, so a
-  teardown in those minutes leaves the ILK and its secrets, and says so. Its retry after the update
-  works.
+  teardown in those minutes leaves the ILK and its secrets, and says so.
+- **Finishing a failed teardown:** the node's identity-map entry is gone by then, so purging the
+  node again cannot find the ILK. The answer carries its `ilk_id`; `teardown_node` run again with
+  it (HTTP `POST /hives/{hive}/nodes/{node_name}/teardown`) finishes the cleanup.
 
 ---
 
 ## 3. A-20 and the orchestrator's admin inbox
 
 **Rule (3) gets a direction.** This is `policy/system.rego`; both wasm files are rebuilt.
+
 - **Mutating orchestrator actions come only from `SY.orchestrator@motherbee`:** `SPAWN_NODE`,
   `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`,
   `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP`. The last two are never
@@ -113,6 +121,7 @@ spoke's orchestrator takes no admin messages at all.
 ## 4. SY.identity: an orchestrator acts only on its own hive's nodes
 
 From `SY.orchestrator@H`:
+
 - `ILK_REGISTER` is accepted only for a node: `identification.node_name` ends in `@H`, and the ILK
   type is never a person's.
 - `ILK_UPDATE`, `ILK_DELETE` and `ILK_PURGE` are accepted only on an ILK whose `node_name` ends in
@@ -126,12 +135,15 @@ Spawn and its rollback stay on their own hive, so they keep working. Teardown go
 ## 5. The router: who may connect, and what other hives may advertise
 
 **Local socket:**
+
 - created `0600`;
-- a connection whose peer is not uid 0 is refused (`SO_PEERCRED`), which also covers the moment
-  between bind and chmod;
+- a connection whose peer uid is not the router's own (root in production) is refused
+  (`SO_PEERCRED`), which also covers the moment between bind and chmod; the sibling-router (IRP)
+  socket gets the same check;
 - every unit, managed node, Go node, e2e script and lab path connects as root (verified).
 
 **From hive P's LSA:**
+
 - **Nodes:** only those named `*@P` are installed. Others are dropped and counted.
 - **Routes:** apply only to destinations on P, or to an `@*` destination.
 - **Taps:** apply only to a message P is a party to, either as its source or its destination.
@@ -151,11 +163,13 @@ a boot unit, the same machinery as the egress's table. No hand edits.
 
 **The ingress.** A `table inet fluxbee_ingress` accepts SSH (the ports `sshd -T` reports, IPv4 and
 IPv6) only from:
+
 - the motherbee's address, the one in the hive's own uplink configuration;
 - the networks listed in `ingress.ssh_allow_from`, which add_hive writes when the operator passes
   them.
 
 All other SSH is dropped. This works the same with one NIC or several.
+
 - **The join checks this before installing anything.** Over the bootstrap session it reads the
   motherbee's source address (`SSH_CONNECTION`). If that address is not allowed, the join stops and
   says which address to add.
@@ -183,12 +197,14 @@ Full default-deny on every role stays parked.
 ## 7. A-42: only an email the channel vouches for identifies a person
 
 **The frontdesk:**
+
 - accepts a handoff only from a router-stamped `IO.*` sender;
 - treats the handoff's `subject.email` as vouched;
 - treats an email typed in the conversation as claimed;
 - never upgrades a typed email to vouched when a handoff arrives without one.
 
 **SY.identity:**
+
 - **A vouched email** goes in `identification.email`. It stays the unique key, and the merge with an
   existing person works as today. This covers:
   - the IO node's handoff;
@@ -201,7 +217,9 @@ Full default-deny on every role stays parked.
   temporary.
 - **When a claimed email matches someone,** the frontdesk registers a new person anyway. Its reply is
   the same whether or not the email is known, so a channel cannot probe which emails are
-  registered. If it is the same person, the operator merges the two explicitly through SY.admin.
+  registered. If it is the same person, the two records stay separate for now. An explicit merge by
+  the operator is not offered yet: today's merge takes only a temporary ILK, and joining two
+  complete people needs its own design.
 - **Records in PROD stay as they are.**
 
 ---
@@ -209,6 +227,7 @@ Full default-deny on every role stays parked.
 ## 8. Technical debt in the same release
 
 **Separate files, built alongside the items above:**
+
 - **rcgen 0.14 and x509-parser 0.18** for the whole workspace.
   - **Test:** take a CA certificate and key made by today's code as a fixture; the new code must
     issue a leaf from it that verifies.
@@ -227,6 +246,7 @@ Full default-deny on every role stays parked.
 - **Dead code** the compiler does not flag.
 
 **Last, alone, once the rest is merged:**
+
 - `cargo clippy --fix` and the trivial fixes;
 - the remaining Spanish comments translated;
 - a clippy gate in CI (`-D warnings`, allowing the structural lints such as `too_many_arguments`).
@@ -248,12 +268,16 @@ These remain after the batch and are recorded, not fixed:
 - **On the motherbee, a local non-root user can call the loopback HTTP APIs** (SY.admin :8080,
   Archi :3000).
 - **A node name is not bound to its process** on its own hive. That waits for A-60.
+- **A workflow's next version can come from another hive** when its nodes are stopped or run under
+  another name. The check reads the live node lists, so it only catches a workflow whose nodes are
+  running. Recording the publishing hive in the runtime manifest would close it.
 
 ---
 
 ## 10. Tests and gate
 
 **Unit tests:**
+
 - **A-62:** every row of the table, and the refusal of everything else, including a caller on the
   ingress and `wf.engine` from wf-rules.
 - **teardown_node:** its order of steps and its report.
@@ -271,6 +295,7 @@ These remain after the batch and are recorded, not fixed:
 - **The rcgen fixture.**
 
 **Live gate on 8.x:**
+
 - **Refusals:** from a process on ingress1,
   - an `ADMIN_COMMAND` to SY.admin is refused;
   - a SPAWN on the motherbee is refused;

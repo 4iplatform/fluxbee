@@ -77,7 +77,14 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
 - **ICH:** `(ich_id, channel_type, address, scope, owner, enabled)`. The lookup key is
   `(channel_type, address, scope)`, lowercased (`canonical_ich_key`). The scope is normally the
   tenant; only `IO.cloud@<hive>` may use the installation-wide scope, and only for the `cloud`
-  channel type (`resolve_channel_scope`).
+  channel type (`resolve_channel_scope`). A key names one ILK and nothing takes it over:
+  `ILK_UPDATE`, `ILK_ADD_CHANNEL` and a replica's push answer `ICH_CONFLICT` for a key another
+  ILK holds and `ILK_DELETED` for one a marked ILK keeps reserved (`check_channel_free`); the
+  temporary an `ILK_ADD_CHANNEL` merges may hold it, and provisioning answers its holder.
+- **Ids** (`ilk:`, `tnt:`, `ich:`) have one spelling: the uuid lowercase and hyphenated, nothing
+  around it (`parse_prefixed_uuid`). Any other answers `INVALID_REQUEST`: the store keys records
+  by the string and the database by the uuid, so another spelling would name a second record in
+  memory and overwrite an existing row.
 - **Aliases:** when a registration merges a temporary ILK into an existing one, an alias points
   from the old id to the kept one for `merge_alias_ttl_secs` (default 3600 s). When it expires,
   the GC marks the temporary ILK deleted (`gc_expired_aliases`).
@@ -94,8 +101,12 @@ Identity is created in two steps:
    frontdesk (`frontdesk_route` in `policy/system.rego`, `apply_identity_pre_resolve` in
    `src/router/mod.rs`). The frontdesk, or the orchestrator for the nodes it launches, sends
    `ILK_REGISTER {ilk_id, ilk_type, tenant_id, identification}`, which makes the ILK `complete`
-   (`register_ilk`). A registration whose email another ILK of the same tenant already holds
-   merges into that ILK.
+   (`register_ilk`). A registration whose `identification.email` another person of the same
+   tenant already holds merges into that person. That key carries only an email the channel
+   vouches for. An email the person only typed travels as `identification.claimed_email`: it is
+   stored and returned with the ILK, but never indexed, looked up or merged on, so the
+   registration completes whether or not someone holds that email
+   ([control-path hardening](../control-path-hardening-v1.md) §7).
 
 ## The identity SHM region
 
@@ -146,7 +157,8 @@ Identity is created in two steps:
   (`node_name` ending in `@<its hive>`), as a full snapshot every 30 s
   (`IDENTITY_PUBLISH_RECONCILE_SECS`, `push_local_deltas_upstream`), and only once it holds a
   baseline from the primary. The primary accepts a publish only for the authenticated hive and
-  only ILKs that hive owns (`delta_authorized_for_hive`), stores them and passes them on.
+  only ILKs that hive owns (`delta_authorized_for_hive`), with every id in its canonical spelling
+  and no channel another ILK holds (`replica_push_acceptable`), stores them and passes them on.
 - Limits: 64 concurrent sync connections, 256 delta subscribers, 1024 queued frames per
   subscriber (a slow one is dropped and resyncs).
 
@@ -155,20 +167,21 @@ Identity is created in two steps:
 Requests are `SYSTEM` messages; answers are `<MSG>_RESPONSE` (`response_name`). The check is
 `IdentityRuntime::is_authorized` on the router-stamped `routing.src_l2_name`. Prefixes
 `SY.admin@`, `SY.architect@` and `SY.frontdesk.gov@` count only from the same hive
-(`prefix_allowed_same_hive_scoped`); `IO.` and `SY.orchestrator@` count from any hive. A refused
+(`prefix_allowed_same_hive_scoped`); `IO.` and `SY.orchestrator@` count from any hive, and an
+orchestrator then acts only on its own hive's nodes (`authorize_orchestrator_ilk_scope`). A refused
 request gets `UNAUTHORIZED_REGISTRAR`.
 
 | Message | Allowed senders | Primary only |
 | --- | --- | --- |
 | `ILK_PROVISION` | `IO.*` | yes |
-| `ILK_REGISTER` | `SY.frontdesk.gov@`, `SY.orchestrator@`, the configured `government.identity_frontdesk`, `SY.identity@<hive>` | yes |
+| `ILK_REGISTER` | `SY.frontdesk.gov@`, `SY.orchestrator@` (its own hive's nodes), the configured `government.identity_frontdesk`, `SY.identity@<hive>` | yes |
 | `ILK_ADD_CHANNEL` | `IO.*`, `SY.frontdesk.gov@`, the configured frontdesk | yes |
-| `ILK_UPDATE` | `SY.orchestrator@`, `SY.identity@<hive>` | yes |
+| `ILK_UPDATE` | `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` | yes |
 | `ILK_SET_DEFINITION` | `SY.admin@`, `SY.architect@`, `SY.identity@<hive>` | yes |
 | `ILK_SET_TENANT` | `SY.admin@`, `SY.architect@` | yes |
-| `ILK_DELETE` | `SY.admin@`, `SY.orchestrator@`, `SY.identity@<hive>` | yes |
+| `ILK_DELETE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes), `SY.identity@<hive>` | yes |
 | `ILK_RESTORE` | `SY.admin@` | yes |
-| `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` | yes |
+| `ILK_PURGE` | `SY.admin@`, `SY.orchestrator@` (its own hive's nodes) | yes |
 | `ICH_SET_ENABLED` | `IO.*` (only for an ICH it owns), `SY.admin@`, `SY.architect@`, `SY.frontdesk.gov@`, the configured frontdesk | yes |
 | `TNT_CREATE`, `TNT_UPDATE`, `TNT_SET_SPONSOR` | `SY.admin@`, `SY.architect@` | yes |
 | `TNT_APPROVE`, `TNT_DELETE`, `TNT_RESTORE`, `TNT_PURGE` | `SY.admin@` | yes |
@@ -176,6 +189,20 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 | `CONFIG_GET`, `CONFIG_SET` | `SY.admin@` (the router also allows only `SY.admin@motherbee`) | no |
 | `IDENTITY_METRICS`, `PING`, `STATUS` | anyone | no |
 
+- **An orchestrator acts only on its own hive's nodes** (`authorize_orchestrator_ilk_scope`,
+  [control-path hardening](../control-path-hardening-v1.md) §4). From `SY.orchestrator@H`:
+  - `ILK_REGISTER` only for a node of `H`: `identification.node_name` ends in `@H`, the type is
+    not `human`, and the ILK it lands on (the node name's holder, else the requested `ilk_id`),
+    if it exists, is a node of `H` too, so it can take no person's ILK and no other hive's;
+  - `ILK_UPDATE`, `ILK_DELETE` and `ILK_PURGE` only on an ILK whose `node_name` ends in `@H`.
+
+  Anything else answers `UNAUTHORIZED` and logs `identity refused an orchestrator outside its own
+  hive's nodes`. An ILK that does not exist answers as before (`ILK_NOT_FOUND`). The orchestrator
+  registers a node only on the node's own hive (a launch elsewhere is forwarded to that hive's
+  orchestrator), so its launches and their rollbacks pass.
+- **Only a person's registration carries an email:** a non-`human` `ILK_REGISTER` with `email`
+  or `claimed_email` answers `INVALID_IDENTIFICATION`, so a node can neither hold an address nor
+  learn which are taken.
 - A replica answers every primary-only message with `NOT_PRIMARY`; it does not forward it
   (`action_requires_primary`). A primary without a database answers `DB_NOT_READY`.
 - Because `SY.admin@` counts only from the same hive, a worker's replica refuses SY.admin's
@@ -185,7 +212,9 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 
 The callers in the code: IO nodes provision against `SY.identity@motherbee`
 (`nodes/io/common/src/provision.rs`); the orchestrator registers the ILK of each node it
-launches as type `agent` and deletes and purges it on teardown (`src/bin/sy_orchestrator.rs`);
+launches as type `agent`, and marks and purges it when the launch fails; on teardown it asks
+SY.admin's `teardown_node`, which deletes the node's secrets, then marks and purges the ILK
+(`src/bin/sy_orchestrator.rs`);
 SY.admin sends the operator's and Fluxbee Cloud's tenant and ILK operations
 (`handle_identity_command` in `src/bin/sy_admin.rs`).
 

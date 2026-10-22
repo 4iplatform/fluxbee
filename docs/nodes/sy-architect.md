@@ -272,7 +272,8 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
 - **System channel**: `NODE_STATUS_GET`, `CONFIG_GET` and `CONFIG_SET` are answered only to the
   origins the router admits, checked again against the same system policy
   (`architect_origin_authorized` → `authorize_system`, `policy/system.rego`): `NODE_STATUS_GET`
-  from SY.admin or SY.vault of the same hive and from SY.orchestrator of any hive, `CONFIG_GET`
+  from SY.admin or SY.vault of the same hive and from the motherbee's or the same hive's
+  SY.orchestrator, `CONFIG_GET`
   and `CONFIG_SET` from `SY.admin@motherbee`. Anything else gets `FORBIDDEN`.
   `VAULT_SECRET_CHANGED` is not gated.
 - **Incoming channel**: `user`, `chat` and `text` messages, stored to an impersonation session.

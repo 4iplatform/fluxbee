@@ -663,7 +663,6 @@ mod tests {
                 name: "sy.frontdesk.gov".to_string(),
                 version: "1.0.0".to_string(),
                 package_type: "full_runtime".to_string(),
-                description: None,
                 runtime_base: None,
                 config_template: None,
                 entry_point: None,

@@ -50,9 +50,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # build deps light (no aws-lc-rs/cmake). See docs/history/onworking-coa/wan-mtls-peer-auth.md.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# The rcgen and x509-parser that instant-acme brings, so the workspace builds one of each.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 rustls-pemfile = "2"
-x509-parser = "0.16"
+x509-parser = "0.18"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "client-legacy", "http1", "http2"] }
 # SY.admin's ACME client for the public edge's certificate (docs/acme-edge-certificates-v1.md §6).

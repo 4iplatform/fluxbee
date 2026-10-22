@@ -8,8 +8,10 @@
 # per entrypoint), and commits all three files:
 #   sy-opa-rules compile-file policy/system.rego fluxbee/system/allow           policy/system.wasm
 #   sy-opa-rules compile-file policy/system.rego fluxbee/system/frontdesk_route policy/system_route.wasm
-# (The Go tool is Linux-only, but the OPA v0.68.0 compile path is pure Go and reproducible on any
-# host — only an embedded source-path annotation, never the code section, is host-specific.)
+# (The Go tool is Linux-only; elsewhere, run it in the golang:1.25 image with the repository
+# mounted. The OPA v0.68.0 compile path is pure Go and reproducible: only the random temp path of
+# the rego, embedded as a source annotation, changes between builds, and the data offsets in the
+# code with it when its length does.)
 # The router BAKES each wasm via `include_bytes!` and evaluates it through a lazy singleton
 # resolver. There is NO SHM region / runtime writer for the system layer (the future "OPA-dual
 # Phase 4" would add one, changing only HOW the resolver is fed, not this policy). Non-user-editable
@@ -52,18 +54,35 @@ node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SY
 # What an orchestrator sends to another hive's orchestrator: the node lifecycle and inspection it
 # forwards for the Admin, and the hive join/leave handshake (verified in sy_orchestrator,
 # 2026-10-01). Nothing else: no node live config (CONFIG_SET/GET), no CONFIG_CHANGED, no
-# SYSTEM_UPDATE. The list has no direction: an orchestrator of any hive, the DMZ ingress included,
-# may still send every action here to any hive, the mutating ones too (NODE_CONFIG_SET, SPAWN/KILL,
-# SYSTEM_CORE_ROLLBACK). Limiting that is part of the postponed security work (FINDINGS A-22).
-orchestrator_actions := {
+# SYSTEM_UPDATE. Every one that crosses hives goes from the motherbee to a spoke, and the watchdog
+# acts locally (verified 2026-10-22), so rule (3) has a direction: a spoke's orchestrator, the DMZ
+# ingress's included, commands no hive (FINDINGS A-20, docs/control-path-hardening-v1.md §3).
+#
+# The mutations: only from the motherbee's orchestrator.
+orchestrator_mutations := {
 	"SPAWN_NODE", "KILL_NODE", "START_NODE", "RESTART_NODE", "REMOVE_NODE_INSTANCE",
-	"NODE_CONFIG_GET", "NODE_CONFIG_SET", "NODE_STATE_GET", "NODE_STATUS_GET", "LIST_NODES",
-	"GET_VERSIONS", "GET_RUNTIMES", "GET_RUNTIME", "SYSTEM_CORE_ROLLBACK",
-	"ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP",
+	"NODE_CONFIG_SET", "SYSTEM_CORE_ROLLBACK", "ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP",
+}
+
+# The join/leave handshake runs only on the hive being added or removed, never on the motherbee,
+# where ADD_HIVE_FINALIZE would restart the core and REMOVE_HIVE_CLEANUP stop it (its orchestrator
+# refuses them too: SPOKE_ONLY_SYSTEM_ACTIONS in sy_orchestrator). No rule admits them there, from
+# anyone: rules (3) and (4) both exclude spoke_only_action_on_motherbee.
+spoke_only_actions := {"ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"}
+
+spoke_only_action_on_motherbee if {
+	input.action in spoke_only_actions
+	input.hive_id == "motherbee"
+}
+
+# The reads: from the motherbee's orchestrator, or from the orchestrator of the hive that answers.
+orchestrator_reads := {
+	"NODE_CONFIG_GET", "NODE_STATE_GET", "NODE_STATUS_GET", "LIST_NODES",
+	"GET_VERSIONS", "GET_RUNTIMES", "GET_RUNTIME",
 }
 
 # Option B (WAN multi-hop reachability): router-internal vouch action, decided ONLY by rule (6)
-# below. Never granted to SY.orchestrator (not in orchestrator_actions) nor by rule (4) — only
+# below. Never granted to SY.orchestrator (not in rule (3)'s lists) nor by rule (4) — only
 # the primary hub's gateway router may vouch.
 reachability_actions := {"WAN_REACHABILITY_VOUCH"}
 
@@ -99,22 +118,33 @@ allow if {
 	parsed.hive == "motherbee"
 }
 
-# (3) SY.orchestrator@<any non-empty hive> — the cross-hive control plane, limited to what it
-# forwards (orchestrator_actions).
+# (3) The orchestrators' cross-hive control plane, limited to what they forward and with a
+# direction. A mutation comes only from SY.orchestrator@motherbee, and the spoke-only handshake
+# never lands on the motherbee itself.
 allow if {
-	input.action in orchestrator_actions
+	input.action in orchestrator_mutations
 	parsed.role == "SY.orchestrator"
-	parsed.hive != ""
+	parsed.hive == "motherbee"
+	not spoke_only_action_on_motherbee
 }
 
-# (4) The Admin, same hive: every other protected action. It is the only node that acts on other
-# nodes for a user (every action goes through SY.admin). SY.wf-rules goes through it for its WF
-# nodes, and the E2E name WF.orch.diag is gone: a workflow named "orch.diag" would have been
-# WF.orch.diag@<hive>, with this authority (docs/wf-standard-path-v1.md, FINDINGS A-68).
+# A read comes from SY.orchestrator@motherbee, or from SY.orchestrator@<the hive that answers>.
+allow if {
+	input.action in orchestrator_reads
+	parsed.role == "SY.orchestrator"
+	parsed.hive in {"motherbee", input.hive_id}
+}
+
+# (4) The Admin, same hive: every other protected action, but the join/leave handshake on the
+# motherbee. It is the only node that acts on other nodes for a user (every action goes through
+# SY.admin). SY.wf-rules goes through it for its WF nodes, and the E2E name WF.orch.diag is gone: a
+# workflow named "orch.diag" would have been WF.orch.diag@<hive>, with this authority
+# (docs/wf-standard-path-v1.md, FINDINGS A-68).
 allow if {
 	not input.action in edge_service_actions
 	not input.action in node_control_actions
 	not input.action in reachability_actions
+	not spoke_only_action_on_motherbee
 	parsed.hive == input.hive_id
 	parsed.role == "SY.admin"
 }

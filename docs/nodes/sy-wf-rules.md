@@ -8,7 +8,7 @@ derived from it.
 
 Source: `go/sy-wf-rules/` (`main.go`, `node/*.go`). Definition validation: `go/pkg/wfcel`. The
 engine: `go/nodes/wf/wf-generic/`. Admin side: `handle_wf_rules_http`,
-`authorize_wf_rules_caller` in `src/bin/sy_admin.rs`.
+`authorize_wf_rules_node` and `authorize_wf_rules_package` in `src/bin/sy_admin.rs`.
 
 | | |
 | --- | --- |
@@ -154,13 +154,23 @@ The origin check is `fromAdmin`: the router-stamped sender must be `SY.admin@mot
 `UNAUTHORIZED`. For `CONFIG_GET`/`CONFIG_SET` the router's system policy already allows only that
 sender (rule 2 of `policy/system.rego`).
 
-In the other direction, SY.admin bounds what SY.wf-rules may ask of it
-(`authorize_wf_rules_caller`): the node actions `run_node`, `restart_node`, `kill_node`,
-`set_node_config`, `get_node_config` and `get_node_status` are accepted from
-`SY.wf-rules@<hive>` only for a `WF.*` node of that same hive, and only to bind or launch
-`wf.<that workflow>` on base `wf.engine` with a package path under
-`/var/lib/fluxbee/dist/runtimes/wf.<workflow>/`. This is the standard path of A-68 (see
-`docs/wf-standard-path-v1.md`): SY.wf-rules acts on nodes only through SY.admin.
+In the other direction, SY.admin's A-62 table bounds what `SY.wf-rules@<hive>` may ask of it
+(`authorize_mesh_caller`; nothing at all from an ingress or egress hive):
+
+- the node actions `run_node`, `restart_node`, `kill_node`, `set_node_config`,
+  `get_node_config` and `get_node_status`, only for a `WF.*` node of that same hive, and only to
+  bind or launch `wf.<that workflow>` on base `wf.engine` with a package path under
+  `/var/lib/fluxbee/dist/runtimes/wf.<workflow>/` (`authorize_wf_rules_node`);
+- `publish_runtime_package` of the inline package it builds (`type: workflow`,
+  `runtime_base: wf.engine`, `name: wf.<workflow>`, never `wf.engine` itself) and
+  `remove_runtime_version` of a `wf.<workflow>`, each with only the fields SY.wf-rules sends, and
+  both refused while a `WF.<workflow>` is connected on another hive, which SY.admin reads from
+  shared memory (`authorize_wf_rules_package`, `workflow_nodes_elsewhere`);
+- `sync_hint` of `fluxbee-dist-runtimes` on the motherbee (`announceRuntimes`), with only its own
+  fields and a `timeout_ms` of at most 5000.
+
+This is the standard path of A-68 (see `docs/wf-standard-path-v1.md`): SY.wf-rules acts on nodes
+only through SY.admin.
 
 ## SY.admin HTTP routes
 

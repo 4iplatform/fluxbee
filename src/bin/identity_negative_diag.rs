@@ -193,7 +193,8 @@ async fn main() -> Result<(), DynError> {
     )
     .await?;
 
-    // Case 6: duplicate ICH (channel_type + address + tenant_id) => DUPLICATE_ICH.
+    // Case 6: a channel another ILK holds => ICH_CONFLICT (checked before the database's unique
+    // index, docs/control-path-hardening-v1.md §4).
     let second_unique_human_register = json!({
         "ilk_id": format!("ilk:{}", Uuid::new_v4()),
         "ilk_type": "human",
@@ -248,14 +249,14 @@ async fn main() -> Result<(), DynError> {
         },
         "change_reason": "identity negative duplicate ich conflict",
     });
-    let duplicate_ich_code = run_case_expect_error(
+    let ich_conflict_code = run_case_expect_error(
         &frontdesk_name,
         &target,
         fallback_target.as_deref(),
         MSG_ILK_ADD_CHANNEL,
         second_add_channel,
         timeout,
-        "DUPLICATE_ICH",
+        "ICH_CONFLICT",
     )
     .await?;
 
@@ -388,7 +389,7 @@ async fn main() -> Result<(), DynError> {
     println!("INVALID_TENANT_CODE={}", invalid_tenant_code);
     println!("FRONTDESK_TNT_CREATE_CODE={}", frontdesk_tnt_create_code);
     println!("DUPLICATE_EMAIL_CODE={}", duplicate_email_code);
-    println!("DUPLICATE_ICH_CODE={}", duplicate_ich_code);
+    println!("ICH_CONFLICT_CODE={}", ich_conflict_code);
     println!(
         "COMPLETE_DUPLICATE_EMAIL_CODE={}",
         complete_duplicate_email_code

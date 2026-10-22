@@ -7,8 +7,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, SerialNumber,
+    BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, SerialNumber,
 };
 
 const NAME: &str = "hive-1.example.com";
@@ -41,21 +41,19 @@ fn set_validity(params: &mut CertificateParams, not_before: i64, not_after: i64)
 pub(super) struct TestPki {
     root_der: CertificateDer<'static>,
     root_pem: String,
-    intermediate: rcgen::Certificate,
-    intermediate_key: KeyPair,
+    intermediate: CertifiedIssuer<'static, KeyPair>,
     serial: AtomicI64,
 }
 
 impl TestPki {
     pub(super) fn new(label: &str) -> Self {
-        let root_key = KeyPair::generate().expect("root key");
         let mut root = CertificateParams::new(Vec::<String>::new()).expect("root params");
         root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         root.distinguished_name = DistinguishedName::new();
         root.distinguished_name
             .push(DnType::CommonName, format!("{label} Root"));
-        let root = root.self_signed(&root_key).expect("root");
-        let intermediate_key = KeyPair::generate().expect("intermediate key");
+        let root = CertifiedIssuer::self_signed(root, KeyPair::generate().expect("root key"))
+            .expect("root");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.distinguished_name = DistinguishedName::new();
@@ -63,14 +61,16 @@ impl TestPki {
             .distinguished_name
             .push(DnType::CommonName, format!("{label} Intermediate"));
         params.use_authority_key_identifier_extension = true;
-        let intermediate = params
-            .signed_by(&intermediate_key, &root, &root_key)
-            .expect("intermediate");
+        let intermediate = CertifiedIssuer::signed_by(
+            params,
+            KeyPair::generate().expect("intermediate key"),
+            &root,
+        )
+        .expect("intermediate");
         Self {
             root_der: root.der().clone(),
             root_pem: root.pem(),
             intermediate,
-            intermediate_key,
             serial: AtomicI64::new(1),
         }
     }
@@ -89,9 +89,7 @@ impl TestPki {
         request.params.use_authority_key_identifier_extension = true;
         request.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         request.params.serial_number = Some(self.next_serial());
-        let leaf = request
-            .signed_by(&self.intermediate, &self.intermediate_key)
-            .expect("the leaf");
+        let leaf = request.signed_by(&self.intermediate).expect("the leaf");
         format!("{}{}", leaf.pem(), self.intermediate.pem())
     }
 
@@ -106,9 +104,7 @@ impl TestPki {
         params.use_authority_key_identifier_extension = true;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.serial_number = Some(self.next_serial());
-        let leaf = params
-            .signed_by(&key, &self.intermediate, &self.intermediate_key)
-            .expect("leaf");
+        let leaf = params.signed_by(&key, &self.intermediate).expect("leaf");
         (
             format!("{}{}", leaf.pem(), self.intermediate.pem()),
             key.serialize_pem(),

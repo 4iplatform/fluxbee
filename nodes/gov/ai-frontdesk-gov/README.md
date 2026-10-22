@@ -15,7 +15,9 @@ registers them in SY.identity (`ILK_REGISTER`).
   - `CONFIG_SET` accepts no config fields: it only re-reads the key from the vault.
 - **Two inputs:**
   - `frontdesk_handoff`: data that is already structured, for example `register_human` from io.cloud. It works
-    without an LLM, even when the key is missing.
+    without an LLM, even when the key is missing. It is a message its producer marks with
+    `meta.msg = "frontdesk_handoff"`, never a payload shape alone, and it is taken only from an IO node (the
+    sender the router stamps must start with `IO.`); any other sender gets `INVALID_REQUEST`.
   - conversational: the LLM gathers the data and calls the `ilk_register` tool.
 - **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
   frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
@@ -26,9 +28,13 @@ registers them in SY.identity (`ILK_REGISTER`).
   or the LLM, and the person stays temporary. SY.identity rejects the same for any caller.
   Only io.cloud and io.blob run in the root tenant, and neither of them provisions people there (operator
   decision 2026-10-02): this answer stays as defense in depth.
-- **Email already registered:** if the email already belongs to another person of the tenant, SY.identity does the merge
-  (the channel moves to that ILK and only the data it was missing is filled in) and the frontdesk answers
-  `MERGED`.
+- **Vouched and claimed emails** (`docs/control-path-hardening-v1.md` §7): only a handoff's own
+  `subject.email` is vouched, and it goes in `identification.email`; the case keeps it, out of the LLM's reach,
+  until it registers. If it already belongs to another person of
+  the tenant, SY.identity does the merge (the channel moves to that ILK and only the data it was missing is
+  filled in) and the frontdesk answers `MERGED`. An email typed in the conversation, or one a handoff without an
+  email takes from the thread state, goes in `identification.claimed_email`: SY.identity stores it but never
+  merges on it, so the registration completes with the same answer whether or not the email is known.
 - What is shared with other `.gov` components lives in `nodes/gov/common` (`gov-common`).
 - The logs carry no personal data: from a registration it logs `ilk_id`, `tenant_id` and which fields
   came in, never their values.
@@ -47,8 +53,9 @@ To run it you need a router and a `hive.yaml` (it takes its name from there,
 
 ## Pending
 
-- Prove that the person owns the email (for example with a one-time code) before the merge:
-  today whoever types someone else's email links their own channel to that person's ILK.
+- A way to turn a claimed email into a vouched one (for example a one-time code). Until then a typed email
+  never merges, and joining a claimant to the person who holds the email is the operator's explicit step,
+  which SY.admin does not offer yet.
 - The spec counters (§12) and the conversational retries.
 
 The full contract is in `docs/ai-frontdesk-gov-spec.md`.

@@ -3,7 +3,7 @@
 **Status:** planning / pre-implementation  
 **Date:** 2026-04-05  
 **Source docs reviewed:**
-- [`fluxbee_identity_claims_normative_model.md`](fluxbee_identity_claims_normative_model.md)
+- [`fluxbee_identity_claims_normative_model.md`](../future_implementations/fluxbee_identity_claims_normative_model.md)
 - [`sy-policy-beta.md`](../history/sy-policy-beta.md)
 - [`solution-manifest-spec_1.md`](../solution-manifest-spec_1.md)
 

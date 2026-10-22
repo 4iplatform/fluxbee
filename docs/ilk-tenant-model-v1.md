@@ -370,8 +370,13 @@ that is, wrote to its WhatsApp, its Slack or its API. The channel, each company'
   email means one person and a merge; anything else (a phone, a Slack ID) leaves two people.
   *"Dependiendo de la info que tenemos se disparan triggers para mergear, mientras se convive con dos
   ilks distintos."*
-  - **Today, within one tenant:** an `ILK_REGISTER` whose email a person of that tenant already
-    holds merges the temporary into that person, who keeps an alias of it (2026-10-02).
+  - **Only an email the channel vouches for (A-42, 0.1.83):** the `subject.email` of a handoff
+    from an IO node (io.api's integrator, IO.cloud for a login Cloud authenticated), registered as
+    `identification.email`. An email a person types is a claim, `identification.claimed_email`:
+    stored and shown, never a key and never merged, so typing someone's email takes over nobody
+    (`docs/control-path-hardening-v1.md` §7).
+  - **Today, within one tenant:** an `ILK_REGISTER` whose vouched email a person of that tenant
+    already holds merges the temporary into that person, who keeps an alias of it (2026-10-02).
   - **Today, across tenants:** nothing joins them. A customer of A who gives A's frontdesk the email
     of their Cloud account (charged to B) stays a second ILK in A, with the same email.
   - **Open, not to build now:** the cross-tenant merge on an email, and what triggers it. Until then
@@ -518,7 +523,7 @@ Every stage goes through:
 | D10 | Only the core (SY.\*, RT.\*, the core IO runtimes) is born in the genesis tenant; the orchestrator defines the core. | Decided 2026-10-14 |
 | D11 | A pending signup is readable as such (`pending_signup`), wherever it is charged. | Decided 2026-10-14 |
 | D12 | io.api `by_ilk` acts for the people the tenant knows: charged to it, or holding a channel in its scope. | Decided 2026-10-14, stage 3 (0.1.67) |
-| D13 | A contact is charged to the company it wrote to. Only an email joins two ILKs: the same email means a merge, triggered by what the person provides; until then two ILKs coexist. | Direction set 2026-10-15. Within one tenant the merge by email exists (2026-10-02); across tenants it is open, not designed |
+| D13 | A contact is charged to the company it wrote to. Only an email joins two ILKs: the same email means a merge, triggered by what the person provides; until then two ILKs coexist. | Direction set 2026-10-15. Within one tenant the merge by email exists (2026-10-02), and since 0.1.83 only an email the channel vouches for merges (A-42); across tenants it is open, not designed |
 | D14 | Cloud is the business layer: tenants (everything but the genesis tenant), people, credentials (all but reading a value) and the IO nodes it launched (start, stop, delete). The infrastructure is the operator's, through Archi. Every Cloud op is an admin action. | Decided 2026-10-15 |
 
 ## 5. Related

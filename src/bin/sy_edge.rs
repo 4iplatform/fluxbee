@@ -1496,7 +1496,6 @@ struct EndpointEntry {
     previous_secret: Option<String>,
     previous_secret_expires_at_ms: Option<u64>,
     methods: Option<Vec<String>>,
-    #[allow(dead_code)]
     tenant_id: Option<String>,
     /// Fanout L2 glob (e.g. `IO.wapp.*@motherbee`); `Some` = this is a fanout endpoint.
     fanout_family: Option<String>,
@@ -4752,11 +4751,11 @@ mod tests {
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Edge Test CA");
-        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert");
         let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
         let leaf = rcgen::CertificateParams::new(vec![EDGE.to_string()])
             .expect("leaf")
-            .signed_by(&leaf_key, &ca, &ca_key)
+            .signed_by(&leaf_key, &ca)
             .expect("leaf cert");
         (leaf.pem(), ca.pem(), leaf_key.serialize_pem())
     }

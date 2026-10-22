@@ -497,7 +497,7 @@ For now, the target is:
   - Operator/system commands for `SY.config.routes` and `SY.opa.rules` are canonically issued through `SY.admin`.
   - Any direct node-local admin/command/query surface that remains is treated as implementation compatibility, not as the primary operator contract.
 - [x] SYS-ALIGN-S4-T2. Ensure both nodes expose explicit, documented action catalogs that `SY.admin` can rely on.
-  - Canonical action catalogs are documented in [system_node_action_catalogs.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/TODO/system_node_action_catalogs.md).
+  - Canonical action catalogs are documented in [system_node_action_catalogs.md](../system_node_action_catalogs.md).
 - [x] SYS-ALIGN-S4-T3. Ensure `SY.orchestrator` only depends on stable service lifecycle contracts, not node-specific reply quirks.
   - Audit result: `SY.orchestrator` interacts with `SY.config.routes` and `SY.opa.rules` through systemd/unit management, router SHM visibility, remote file deployment, and generic `CONFIG_CHANGED` dispatch.
   - It does **not** parse node-specific `CONFIG_RESPONSE` payloads from those nodes to manage their lifecycle.

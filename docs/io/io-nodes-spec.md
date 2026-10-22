@@ -45,9 +45,8 @@ This strategy provides:
 ## 4. Context Model
 
 IO nodes:
-- Produce `meta.ich` as the **local/system-owned channel** operated by that concrete IO instance
-- Consume `ctx_seq` only as legacy-compatible metadata when it appears
-- Accept `ctx_window` only as legacy-compatible metadata when it appears
+- Produce `meta.ich` as the **local/system-owned channel** operated by that concrete IO instance: `<channel>://<entrypoint id>`, from `meta.context.io` (`build_user_message`, `nodes/io/common/src/router_message.rs`)
+- Produce `meta.thread_id`, the communication (`thread:sha256:<hex>`), computed from the channel's own material with `compute_thread_id` (`nodes/io/common/src/io_context.rs`)
 - Never persist or forward history externally
 
 Important:
@@ -55,17 +54,21 @@ Important:
 - `ich` is **not** the external user's identity
 - remote handles and external identities must be represented by the corresponding identity/contact mechanisms, not by `ich`
 
-The Router is the **sole owner** of conversational history.
+IO nodes keep no conversational history. The router copies every turn into its stream: SY.storage
+writes it to the message log (`turns`), and when an `AI.*` node sends or receives it, SY.cognition
+keeps the memory of that communication, `(thread_id, the agent)`. The router attaches that memory
+to what it delivers to the agent (`meta.memory_package`). See [storage](../reference/storage.md)
+and [cognition](../reference/cognition.md).
 
 ---
 
 ## 5. Protocol Alignment
 
-IO nodes **MUST follow Router v1.16 protocol** exactly.
+IO nodes **MUST follow the protocol** exactly ([protocol](../reference/protocol.md)).
 
 Notably:
-- `thread_id` is the active canonical carrier for conversational continuity in the current repo (the message carries no sequence)
-- `meta.ctx` belongs to historical/legacy context semantics and must not be reintroduced as the primary carrier in new IO paths
+- `meta.thread_id` is the carrier of conversational continuity (the message carries no sequence)
+- `meta.ctx`, `meta.ctx_seq` and `meta.ctx_window` no longer exist: no SDK has them, and the router drops every key that is not a field of `Meta` ([protocol](../reference/protocol.md) §3.1, §3.6)
 - `meta.context` is reserved for OPA input and extra metadata
 - `meta.ich` identifies the local/system channel of the IO node, not the remote external handle
 - No duplication of context fields
@@ -95,33 +98,20 @@ IO nodes explicitly do NOT:
 ---
 
 
-### Clarification - meta.ctx vs meta.context
+### Clarification - meta.thread_id vs meta.context
 
-According to the Router v1.16 specification:
-
-- `meta.ctx` represents the **Conversational Context (CTX)**
-- `meta.context` is reserved exclusively for **additional data evaluated by OPA**
-- `meta.thread_id` is the canonical thread carrier (cognition v2)
+- `meta.thread_id` carries the communication (`thread:sha256:<hex>`, computed by the IO node)
+- `meta.context` is free JSON for the receiver and the OPA policy; IO nodes put the channel facts in `meta.context.io`
 
 `meta.context` must **NOT** be used to store history, turns or conversational context.
-`meta.context.thread_id` is deprecated/removed in IO and must not be emitted.
+`meta.context.thread_id` is removed from the IO pipeline (`build_user_message` drops it) and must not be emitted.
 
 
-## Temporary adaptation (canonical spec vs current core)
+## Conversational fields
 
-✅ **Canonical (Fluxbee protocol)**:
-- `user` messages must include identity and canonical conversational material.
-- In the current repo, `ich` must be read as the **local/systemic channel** and `thread_id` as the active conversational carrier.
-
-⚠️ **Current state (core/SDK)**:
-- `ctx_window` is not guaranteed at runtime today; `ctx_seq` may be missing in some flows.
-
-✅ **NORMATIVE (TODAY)**:
-- IO Nodes **MUST** tolerate missing `ctx_window` and `ctx_seq` without failing.
-- those fields are no longer part of the repo's active canonical carrier.
-
-🧩 **TO BE SPECIFIED**:
-- if they are kept in the protocol, they remain only for historical compatibility; there is no active plan to make them mandatory.
+✅ **NORMATIVE**:
+- `user` messages carry the identity and the communication: `meta.src_ilk` (or `null`), `meta.ich` (the **local/systemic channel**) and `meta.thread_id`.
+- The message carries no context window and no sequence. The order of a communication is the turn number SY.cognition assigns, and an `AI.*` destination receives the memory of its communication in `meta.memory_package`, which only the router sets.
 
 
 ## Lifecycle & configuration (model unified with AI Nodes)

@@ -84,7 +84,6 @@ pub const HIVE_FLAG_SELF: u16 = 0x0010;
 pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;
 
-pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const HEARTBEAT_STALE_MS: u64 = 30_000;
 
 pub const SHM_NAME_MAX_LEN: usize = 64;
@@ -110,6 +109,8 @@ pub enum ShmError {
     ValueTooLong { len: usize, max: usize },
     #[error("shared memory slot full")]
     SlotFull,
+    #[error("shared memory region not trusted: owner uid {uid}, mode {mode:o}")]
+    Untrusted { uid: u32, mode: u32 },
 }
 
 #[repr(C)]
@@ -1067,6 +1068,37 @@ impl RouterRegionReader {
         Ok(Self { mmap, layout })
     }
 
+    /// `open_read_only` for another router's region, which only `owner_uid` may own and write:
+    /// `ShmError::Untrusted` otherwise, checked on the open descriptor before anything is mapped.
+    /// A region another user made could feed a router nodes (docs/control-path-hardening-v1.md §5).
+    pub fn open_read_only_owned_by(name: &str, owner_uid: u32) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let layout = layout_router();
+        let cstr = CString::new(name).map_err(|_| ShmError::NameTooLong)?;
+        let fd = shm_open(
+            cstr.as_c_str(),
+            OFlag::O_RDONLY,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        let stat = fstat(fd.as_raw_fd())?;
+        let mode = u32::from(stat.st_mode) & 0o777;
+        if !region_owner_trusted(stat.st_uid, mode, owner_uid) {
+            return Err(ShmError::Untrusted {
+                uid: stat.st_uid,
+                mode,
+            });
+        }
+        let mmap = unsafe {
+            MmapOptions::new()
+                .len(layout.total_len)
+                .map(fd.as_raw_fd())?
+        };
+        if !is_region_valid(mmap.as_ref()) {
+            return Err(ShmError::InvalidHeader);
+        }
+        Ok(Self { mmap, layout })
+    }
+
     pub fn read_snapshot(&self) -> Option<ShmSnapshot> {
         let header = self.header_ref()?;
         read_router_snapshot(header, self.mmap.as_ref(), &self.layout)
@@ -1796,28 +1828,6 @@ impl IdentityRegionWriter {
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
         Ok(())
-    }
-
-    pub fn append_ich_entries(&mut self, entries: &[IchEntry]) -> Result<u32, ShmError> {
-        let (header, _tenants, _ilks, ichs, _mappings, _aliases, _vocabulary) =
-            identity_header_and_entries_mut(&mut self.mmap, &self.layout)
-                .ok_or(ShmError::InvalidHeader)?;
-        let used = header.ich_count as usize;
-        let max_ichs = self.layout.limits.max_ichs() as usize;
-        if used > max_ichs {
-            return Err(ShmError::InvalidHeader);
-        }
-        if used + entries.len() > max_ichs {
-            return Err(ShmError::SlotFull);
-        }
-        let _write_guard = SeqlockWriteGuard::new(&header.seq);
-        for (offset, entry) in entries.iter().enumerate() {
-            ichs[used + offset] = *entry;
-        }
-        header.ich_count = header.ich_count.saturating_add(entries.len() as u32);
-        header.updated_at = now_epoch_ms();
-        header.heartbeat = header.updated_at;
-        Ok(used as u32)
     }
 
     pub fn provision_temporary_ilk(
@@ -2554,6 +2564,12 @@ where
             }
         }
     }
+}
+
+/// Whether a region whose owner is `uid` and permission bits `mode` is `owner_uid`'s alone to
+/// write: its owner, and no group or world write bit.
+fn region_owner_trusted(uid: u32, mode: u32, owner_uid: u32) -> bool {
+    uid == owner_uid && mode & 0o022 == 0
 }
 
 fn open_read_only_region(name: &str, len: usize) -> Result<Mmap, ShmError> {
@@ -4830,5 +4846,37 @@ mod tests {
         assert!(reopened.read_snapshot().is_some());
 
         cleanup_shm(&name);
+    }
+
+    /// Another router's region is read only when the router's own user owns it and nobody else may
+    /// write it (docs/control-path-hardening-v1.md §5).
+    #[test]
+    fn a_router_region_is_read_only_when_the_routers_user_alone_may_write_it() {
+        let (name, _writer) = router_region_for_test("jsr-owner");
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own_uid = unsafe { nix::libc::geteuid() };
+        assert!(RouterRegionReader::open_read_only_owned_by(&name, own_uid).is_ok());
+        let other = RouterRegionReader::open_read_only_owned_by(&name, own_uid.wrapping_add(1));
+        assert!(
+            matches!(other, Err(ShmError::Untrusted { uid, .. }) if uid == own_uid),
+            "a region of another user is refused"
+        );
+        cleanup_shm(&name);
+
+        for (uid, mode, trusted) in [
+            (0, 0o600, true),
+            (0, 0o644, true),
+            (0, 0o400, true),
+            (0, 0o620, false),
+            (0, 0o602, false),
+            (0, 0o666, false),
+            (1000, 0o600, false),
+        ] {
+            assert_eq!(
+                region_owner_trusted(uid, mode, 0),
+                trusted,
+                "owner {uid}, mode {mode:o}"
+            );
+        }
     }
 }

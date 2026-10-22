@@ -117,8 +117,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "sync_hint"
         | "update"
         | "set_storage"
-        // Swaps /usr/bin binaries and restarts the core. Without this arm
-        // `admin_action_requires_origin` returns false and the F8 origin gate never runs.
+        // Swaps /usr/bin binaries and restarts the core.
         | "core_rollback"
         | "remove_runtime_version" => Some(ActionClass::SystemConfig),
         "add_hive" | "remove_hive" => Some(ActionClass::TopologyChange),

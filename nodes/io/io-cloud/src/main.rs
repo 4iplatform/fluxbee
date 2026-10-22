@@ -47,7 +47,9 @@ use fluxbee_sdk::{
     OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
     RpcCommandReceiver, RpcRequestLabels, FLUXBEE_NODE_NAME_ENV,
 };
-use io_common::frontdesk_contract::{FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1};
+use io_common::frontdesk_contract::{
+    FRONTDESK_HANDOFF_MSG, FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
+};
 use io_common::frontdesk_gate::{
     frontdesk_response_contract, DEFAULT_FRONTDESK_TARGET, FRONTDESK_OPERATION_REGISTER,
 };
@@ -2134,7 +2136,7 @@ async fn handle_register_human(
             )
         }
     };
-    let message = build_user_message(
+    let mut message = build_user_message(
         sender.uuid(),
         Some(DEFAULT_FRONTDESK_TARGET.to_string()),
         DEFAULT_TTL,
@@ -2144,6 +2146,7 @@ async fn handle_register_human(
         context,
         handoff,
     );
+    message.meta.msg = Some(FRONTDESK_HANDOFF_MSG.to_string());
     let reply = match state
         .dispatcher
         .send_with_matcher(

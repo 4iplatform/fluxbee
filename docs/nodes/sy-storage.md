@@ -30,8 +30,9 @@ Source: `src/bin/sy_storage.rs`. Data model and table details: [docs/reference/s
   backend`): stream batches are not acknowledged, so the streams keep them and resend.
 - It creates its missing tables and indexes at every start (`ensure_schema`): `turns`,
   `storage_inbox`, the `cognition_*` tables (threads, contexts, reasons, cooccurrences, scopes,
-  scope_instances, memories, episodes) and `llm_usage`. It runs no migrations: an existing table
-  is left as it is.
+  scope_instances, memories, episodes) and `llm_usage`, each statement waiting at most 5 s for its
+  lock. It runs no migrations: an existing table is left as it is, except that `turns.ctx` and
+  `seq`, no longer written, lose their `NOT NULL` ([storage](../reference/storage.md) §6.1).
 - The motherbee's orchestrator waits for it at boot: the unit active within 30 s, then a
   successful `STORAGE_METRICS_GET` over the mesh within 30 s (`finish_bootstrap`,
   `wait_for_storage_db_ready` in `src/bin/sy_orchestrator.rs`). Until then every admin action

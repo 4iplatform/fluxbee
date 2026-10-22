@@ -9,7 +9,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -69,8 +69,9 @@ pub struct LeafBundle {
 /// The mesh CA (motherbee only): the CA key + cert used to issue per-hive leaf
 /// certs. Generated once, persisted to disk, reloaded on restart.
 pub struct MeshCa {
-    ca_key: KeyPair,
-    ca_cert: rcgen::Certificate,
+    /// The CA's subject and key, as read back from its certificate: a leaf's
+    /// issuer name is the CA certificate's subject, so the leaf chains to it.
+    issuer: Issuer<'static, KeyPair>,
     ca_cert_pem: String,
     ca_key_pem: String,
 }
@@ -89,26 +90,18 @@ impl MeshCa {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        let ca_cert = params.self_signed(&ca_key)?;
-        let ca_cert_pem = ca_cert.pem();
-        let ca_key_pem = ca_key.serialize_pem();
-        Ok(MeshCa {
-            ca_key,
-            ca_cert,
-            ca_cert_pem,
-            ca_key_pem,
-        })
+        let ca_cert_pem = params.self_signed(&ca_key)?.pem();
+        // Issue through the reload path, so a fresh CA and a persisted one issue alike.
+        Self::from_pem(&ca_cert_pem, &ca_key.serialize_pem())
     }
 
     /// Reload a CA from its persisted PEM (cert + key) so it can keep issuing
     /// leaves that chain to the same (already-distributed) CA cert.
     pub fn from_pem(ca_cert_pem: &str, ca_key_pem: &str) -> Result<MeshCa, MeshTlsError> {
         let ca_key = KeyPair::from_pem(ca_key_pem)?;
-        let params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
-        let ca_cert = params.self_signed(&ca_key)?;
+        let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
         Ok(MeshCa {
-            ca_key,
-            ca_cert,
+            issuer,
             ca_cert_pem: ca_cert_pem.to_string(),
             ca_key_pem: ca_key_pem.to_string(),
         })
@@ -134,7 +127,7 @@ impl MeshCa {
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
-        let leaf = params.signed_by(&leaf_key, &self.ca_cert, &self.ca_key)?;
+        let leaf = params.signed_by(&leaf_key, &self.issuer)?;
         Ok(LeafBundle {
             cert_pem: leaf.pem(),
             key_pem: leaf_key.serialize_pem(),
@@ -304,6 +297,133 @@ fn key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>, MeshTlsError> {
 mod tests {
     use super::*;
 
+    /// A mesh CA and a worker1 leaf made by the 0.1.82 code (rcgen 0.13), as a motherbee and a
+    /// spoke hold them before their update.
+    const FIXTURE_CA_CRT: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/ca.crt");
+    const FIXTURE_CA_KEY: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/ca.key");
+    const FIXTURE_WORKER1_CRT: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/worker1.crt");
+    const FIXTURE_WORKER1_KEY: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/worker1.key");
+
+    /// One mutual-TLS handshake over the WAN configs, then a byte each way: (the hive the server
+    /// saw, the hive the client saw).
+    async fn mtls_round_trip(
+        server: &MeshTlsMaterial,
+        client: &MeshTlsMaterial,
+    ) -> (String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        let acceptor = TlsAcceptor::from(server.server_config().unwrap());
+        let connector = TlsConnector::from(client.client_config().unwrap());
+        let (client_io, server_io) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await.expect("server handshake");
+            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+            let hive = peer_hive_from_cert(&certs[0]).unwrap();
+            // Post-handshake ping/pong over the encrypted channel keeps both
+            // streams alive through the full handshake and proves data flows.
+            let mut buf = [0u8; 1];
+            tls.read_exact(&mut buf).await.unwrap();
+            tls.write_all(b"y").await.unwrap();
+            hive
+        });
+        let client = tokio::spawn(async move {
+            // CA-only verifier ignores the server name; any valid DNS name works.
+            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
+            let mut tls = connector
+                .connect(name, client_io)
+                .await
+                .expect("client handshake");
+            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+            let hive = peer_hive_from_cert(&certs[0]).unwrap();
+            tls.write_all(b"x").await.unwrap();
+            let mut buf = [0u8; 1];
+            tls.read_exact(&mut buf).await.unwrap();
+            hive
+        });
+        (server.await.unwrap(), client.await.unwrap())
+    }
+
+    /// The update's gate: the updated motherbee reloads the CA the 0.1.82 code made and issues its
+    /// leaf with the new code, and a spoke still on 0.1.82 reconnects. The new leaf carries the
+    /// extensions the old code wrote, since such a spoke parses it with x509-parser 0.16, and it
+    /// verifies against the distributed `ca.crt` both ways: as a server (the client's CA-only
+    /// verifier) and as a client (the server's webpki client verifier).
+    #[tokio::test]
+    async fn a_ca_made_by_the_previous_code_issues_leaves_its_spokes_accept() {
+        install_crypto_provider();
+        let ca = MeshCa::from_pem(FIXTURE_CA_CRT, FIXTURE_CA_KEY).expect("loads the 0.1.82 CA");
+        assert_eq!(
+            ca.ca_cert_pem(),
+            FIXTURE_CA_CRT,
+            "the distributed CA certificate is never reissued"
+        );
+        let leaf = ca.issue_leaf("motherbee").expect("issues a leaf");
+        let leaf_der = certs_from_pem(&leaf.cert_pem).unwrap();
+        let old_leaf_der = certs_from_pem(FIXTURE_WORKER1_CRT).unwrap();
+        let ca_der = certs_from_pem(FIXTURE_CA_CRT).unwrap();
+        {
+            use x509_parser::prelude::{FromDer, X509Certificate};
+            fn parse<'a>(der: &'a CertificateDer<'_>) -> X509Certificate<'a> {
+                X509Certificate::from_der(der.as_ref()).unwrap().1
+            }
+            let (new_leaf, old_leaf) = (parse(&leaf_der[0]), parse(&old_leaf_der[0]));
+            assert_eq!(
+                new_leaf.issuer().as_raw(),
+                parse(&ca_der[0]).subject().as_raw(),
+                "the leaf names its issuer with the CA's subject, byte for byte"
+            );
+
+            // Each extension's OID and criticality, as a set.
+            let extensions = |cert: &X509Certificate<'_>| {
+                let mut set: Vec<(String, bool)> = cert
+                    .extensions()
+                    .iter()
+                    .map(|ext| (ext.oid.to_id_string(), ext.critical))
+                    .collect();
+                set.sort();
+                set
+            };
+            assert_eq!(
+                extensions(&old_leaf),
+                [
+                    ("2.5.29.15".to_string(), true),  // key usage
+                    ("2.5.29.17".to_string(), false), // subject alternative name
+                    ("2.5.29.37".to_string(), false), // extended key usage
+                ]
+            );
+            assert_eq!(extensions(&new_leaf), extensions(&old_leaf));
+            // The same key usages, not the same bytes: rcgen 0.13 wrote nine bits, which leaves a
+            // trailing zero byte that DER forbids, and rcgen 0.14 writes the minimal string.
+            // x509-parser 0.16 reads both as the same flags.
+            let key_usage =
+                |cert: &X509Certificate<'_>| cert.key_usage().unwrap().unwrap().value.flags;
+            assert_eq!(key_usage(&new_leaf), key_usage(&old_leaf));
+            // The extended key usage, which does not name the hive either, is the same bytes.
+            let extended_key_usage = |cert: &X509Certificate<'_>| {
+                cert.extensions()
+                    .iter()
+                    .find(|ext| ext.oid.to_id_string() == "2.5.29.37")
+                    .map(|ext| ext.value.to_vec())
+            };
+            assert_eq!(extended_key_usage(&new_leaf), extended_key_usage(&old_leaf));
+        }
+
+        let motherbee =
+            MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, FIXTURE_CA_CRT).unwrap();
+        let worker1 =
+            MeshTlsMaterial::from_pem(FIXTURE_WORKER1_CRT, FIXTURE_WORKER1_KEY, FIXTURE_CA_CRT)
+                .unwrap();
+        assert_eq!(
+            mtls_round_trip(&motherbee, &worker1).await,
+            ("worker1".to_string(), "motherbee".to_string())
+        );
+        assert_eq!(
+            mtls_round_trip(&worker1, &motherbee).await,
+            ("motherbee".to_string(), "worker1".to_string())
+        );
+    }
+
     #[test]
     fn ca_issues_leaf_with_hive_identity_and_builds_configs() {
         install_crypto_provider();
@@ -336,8 +456,6 @@ mod tests {
 
     #[tokio::test]
     async fn mtls_handshake_round_trips_and_exposes_peer_identity() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio_rustls::{TlsAcceptor, TlsConnector};
         install_crypto_provider();
         let ca = MeshCa::generate().unwrap();
         let mb = ca.issue_leaf("motherbee").unwrap();
@@ -346,47 +464,11 @@ mod tests {
             MeshTlsMaterial::from_pem(&mb.cert_pem, &mb.key_pem, ca.ca_cert_pem()).unwrap();
         let client_mat =
             MeshTlsMaterial::from_pem(&w1.cert_pem, &w1.key_pem, ca.ca_cert_pem()).unwrap();
-        let acceptor = TlsAcceptor::from(server_mat.server_config().unwrap());
-        let connector = TlsConnector::from(client_mat.client_config().unwrap());
-        let (client_io, server_io) = tokio::io::duplex(8192);
-
-        let server = tokio::spawn(async move {
-            let mut tls = acceptor.accept(server_io).await.expect("server handshake");
-            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
-            let hive = peer_hive_from_cert(&certs[0]).unwrap();
-            // Post-handshake ping/pong over the encrypted channel keeps both
-            // streams alive through the full handshake and proves data flows.
-            let mut buf = [0u8; 1];
-            tls.read_exact(&mut buf).await.unwrap();
-            tls.write_all(b"y").await.unwrap();
-            hive
-        });
-        let client = tokio::spawn(async move {
-            // CA-only verifier ignores the server name; any valid DNS name works.
-            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
-            let mut tls = connector
-                .connect(name, client_io)
-                .await
-                .expect("client handshake");
-            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
-            let hive = peer_hive_from_cert(&certs[0]).unwrap();
-            tls.write_all(b"x").await.unwrap();
-            let mut buf = [0u8; 1];
-            tls.read_exact(&mut buf).await.unwrap();
-            hive
-        });
+        let (server_saw, client_saw) = mtls_round_trip(&server_mat, &client_mat).await;
 
         // mutual auth succeeded; each side sees the OTHER's hive identity.
-        assert_eq!(
-            server.await.unwrap(),
-            "worker1",
-            "server sees the client hive"
-        );
-        assert_eq!(
-            client.await.unwrap(),
-            "motherbee",
-            "client sees the server hive"
-        );
+        assert_eq!(server_saw, "worker1", "server sees the client hive");
+        assert_eq!(client_saw, "motherbee", "client sees the server hive");
     }
 
     #[tokio::test]
