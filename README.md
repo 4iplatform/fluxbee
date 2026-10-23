@@ -268,10 +268,8 @@ development: APIs and docs still change. This section describes version 0.1.79.
 
 ### Next
 
-- Let's Encrypt certificates for the edge. Today the operator loads the TLS certificate into
-  SY.vault.
-- Archi and `io.web` reachable through Fluxbee Cloud. `io.web` is a design today
-  ([docs/history/io-web-spec-beta-v1.md](docs/history/io-web-spec-beta-v1.md)).
+- Archi and `io.web` reachable through Fluxbee Cloud, with the edge as reverse proxy
+  ([docs/io-web-v2.md](docs/io-web-v2.md): direction agreed, not built).
 
 ### Known limits
 

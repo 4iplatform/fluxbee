@@ -1064,6 +1064,9 @@ and `nosniff`.
 
 ### 4.3 Operator access (shape; the final form depends on O5)
 
+*Superseded on 2026-10-23 by [io-web-v2](io-web-v2.md) §4–§5: the edge terminates TLS for
+`archi.<id>` and proxies to io.web, which owns the sessions; there is no SNI passthrough.*
+
 1. The operator is logged into Cloud. Cloud asks Admin, through IO.cloud, for an operator mint.
    - Under O5(a) the request is signed and the code comes back encrypted.
 2. Admin mints a one-time code (≤120 s, `aud` = the Archi host, `jti` stored durably) and logs it.
@@ -1094,6 +1097,9 @@ and `nosniff`.
   | anything else | 404 |
 
 ### 4.5 Artifacts (D14)
+
+*Continued in [io-web-v2](io-web-v2.md) §7: served by the edge from its copy of `public/`, managed
+by IO.blob with SY.admin.*
 
 IO.web will serve artifacts for isolation and sharing; today they are `/public/<key>`. Designed in
 io.web v2.

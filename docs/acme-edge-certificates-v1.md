@@ -11,7 +11,8 @@ CA is Let's Encrypt unless configured otherwise. Nothing in the code names a dom
 the names and the CA come from `hive.yaml`, so the open-source package works under any domain.
 
 Out of scope for v1:
-- `cloud.<id>` and `archi.<id>`: SNI passthrough (O5a); they will reuse this machinery.
+- `archi.<id>`: since 2026-10-23 the edge terminates it and proxies to io.web
+  ([io-web-v2](io-web-v2.md)), so this client issues that name too; `cloud.<id>` is not planned.
 - More than one edge per installation (O7).
 - DNS automation and wildcard certificates.
 - External Account Binding, for CAs that need it.

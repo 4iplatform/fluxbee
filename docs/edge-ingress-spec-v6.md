@@ -46,6 +46,9 @@ the normal admin command plane, with **no inbound path into the mesh control pla
 - **I6 — The edge is outside the identity frontier.** It holds no `ilk`, no identity SHM, and never
   resolves `ilk`/`ICH`. It routes on `ICH → owner_l2_name` (a value handed to it) and stamps the
   `ICH` verbatim.
+- *(2026-10-23) The edge gets a third surface, a reverse proxy to one fixed internal upstream
+  (io.web) over mutual TLS: [io-web-v2](io-web-v2.md). I1 holds (io.web is an IO node); I7 now
+  counts three behaviors: channels, static artifacts, the proxy.*
 - **I7 — Special cases live on the IO side, never on the edge.** The edge has one behavior and
   never grows; new capabilities are absorbed by IO nodes.
 - **I8 — Externalize is self-service by the owning IO node.** The node that owns a channel `ICH`

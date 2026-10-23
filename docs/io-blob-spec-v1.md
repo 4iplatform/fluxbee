@@ -1,5 +1,8 @@
 # IO.blob / public artifacts - Specification v1
 
+*What comes next for artifacts is in [io-web-v2](io-web-v2.md) §7 (2026-10-23); this spec still
+describes the circuit that runs today.*
+
 **Status:** alpha contract implemented and validated on Linux/Proxmox on 2026-07-17: curator,
 admin authority, clean ingress install, public replica, `/public` serving and teardown are
 operational. What remains is the product smoke with a real AI/IO going through publish/expiry/unpublish.

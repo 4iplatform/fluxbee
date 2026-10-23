@@ -1078,6 +1078,53 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-86 🔴 OPEN (found 2026-10-22) — Stalled readers can block the edge's downloads
+
+- **What happens:** `/public` streams with no write timeout, so 128 readers that stop reading hold
+  every download slot (`PUBLIC_BUSY` for everyone), and every route shares one 4,096-connection cap.
+- **Fix:** a minimum rate, an idle deadline, a per-IP cap, and download slots kept apart from
+  `/e/` (with the edge's work in [io-web-v2](../../docs/io-web-v2.md)).
+
+### A-85 🔴 OPEN (found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
+
+- **What happens:** `download_private_file` (nodes/io/io-slack/src/main.rs) uses a client with no
+  timeout, reads the whole body into memory and checks the size only afterwards.
+- **Fix:** stream to staging under a byte cap, with a connect timeout, a total deadline and a
+  minimum rate; HTTPS only, no redirects, no non-global addresses.
+
+### A-84 🔴 OPEN (found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
+
+- **What happens:** `runtime_package_safe_blob_rel_path` (src/bin/sy_admin.rs) refuses only
+  absolute paths and `..`, and the file is opened following symlinks; Syncthing replicates symlinks
+  from the workers into `active/`. `materialize_bundle_runtime_package` has no size or count caps
+  and keeps the zip's mode bits.
+- **Fix:** `O_NOFOLLOW` at each step, regular files only, a path under a root-only directory, and
+  an extraction with caps that sets its own modes.
+
+### A-83 🔴 OPEN (found 2026-10-22) — The edge answers an empty 200 when it cannot build a response
+
+- **What happens:** three places in src/bin/sy_edge.rs fall back to
+  `Response::new(Body::empty())` when a response cannot be built (for example an invalid header
+  value): a 200 with no body and no security headers.
+- **Fix:** answer 500 with the security headers.
+
+### A-82 🔴 OPEN (found 2026-10-22) — The edge logs capability keys
+
+- **What happens:** src/bin/sy_edge.rs logs `key = %row.key` when it publishes a public artifact
+  and when it drops an expired one; those records leave the DMZ through the router stream, and the
+  keys sit in plaintext on the edge's disk.
+- **Fix:** the edge stores and logs only `SHA-256(key)`.
+
+### A-81 🔴 OPEN (found 2026-10-22) — An agent on a worker cannot publish a page
+
+- **What happens:** ai.generic's `publish_html_page` promotes the blob on its worker and calls
+  `publish_artifact` at once; IO.blob opens the motherbee's `active/` with no wait, before
+  Syncthing has brought the file (~10 s), and answers `BLOB_NOT_FOUND`, which the model receives
+  as final. PROD's agents run on worker1.
+- **Fix:** before taking its publication lock, SY.admin sends the producer's hive a `sync_hint`
+  on `fluxbee-blob` (`wait_for_idle: false`) and waits up to 30 s for the file in the motherbee's
+  `active/`; IO.blob never waits in its message loop; any curate error releases what was curated.
+
 ### A-80 🟡 OPEN (found 2026-10-22) — A restore is refused when another tenant holds the same email
 
 - **What happens:** `check_ilk_restorable` (src/bin/sy_identity.rs) looks the person's vouched
