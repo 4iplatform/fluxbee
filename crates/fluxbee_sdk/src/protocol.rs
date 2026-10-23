@@ -559,6 +559,11 @@ pub const MSG_EDGE_TLS_RELOAD: &str = "EDGE_TLS_RELOAD";
 pub const MSG_EDGE_TLS_RELOAD_RESPONSE: &str = "EDGE_TLS_RELOAD_RESPONSE";
 pub const MSG_EDGE_ACME_CHALLENGE: &str = "EDGE_ACME_CHALLENGE";
 pub const MSG_EDGE_ACME_CHALLENGE_RESPONSE: &str = "EDGE_ACME_CHALLENGE_RESPONSE";
+// The edge's web hosts (SY.admin -> SY.edge; docs/io-web-v2.md §11): the full set of hosts the
+// edge serves only through io.web, never through `/e/` or `/public/`. SY.admin pushes it every
+// minute; the edge keeps it on disk.
+pub const MSG_EDGE_WEB_ROUTES: &str = "EDGE_WEB_ROUTES";
+pub const MSG_EDGE_WEB_ROUTES_RESPONSE: &str = "EDGE_WEB_ROUTES_RESPONSE";
 
 // IO.blob curator worker plane (SY.admin -> IO.blob). These commands never publish a URL and
 // carry no external bytes: admin has already authorized the producer and resolved its tenant;

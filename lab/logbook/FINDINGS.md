@@ -1078,6 +1078,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-88 🔴 OPEN (found 2026-10-23) — An `/e/` error hands internal detail to the internet
+
+- **What happens:** when the handler's reply fails, `/e/` answers with `err.to_string()`
+  (src/bin/sy_edge.rs ~3717), which can carry a timeout's `trace_id` and the request's message
+  family.
+- **Fix (io-web-v2 §11.1):** a fixed error body per code, the detail only in the edge's log.
+
+### A-87 🔴 OPEN (found 2026-10-23) — One byte holds an edge connection forever
+
+- **What happens:** the edge serves every connection with hyper-util's `auto::Builder` and
+  `serve_connection_with_upgrades` (src/bin/sy_edge.rs ~2734-2744), which sniffs for the HTTP/2
+  preface. The sniff has no timeout after the first byte (hyper-util ignores `http1_only()`
+  there), and hyper's h2 server has no idle timeout. The 4,096 connection permits are taken at
+  accept, so 4,096 connections that each send one byte refuse every later client: Cloud's `/e/`,
+  the webhooks, `/public`, and Let's Encrypt's validation. No credential is needed.
+- **Fix (io-web-v2 §11.1):** hyper's HTTP/1 builder with its head-read timeout, which starts before
+  the first byte; no protocol sniffing and no HTTP/2 (reachable today only by prior knowledge);
+  tests for one byte and for an h2 preface.
+
 ### A-86 🔴 OPEN (found 2026-10-22) — Stalled readers can block the edge's downloads
 
 - **What happens:** `/public` streams with no write timeout, so 128 readers that stop reading hold

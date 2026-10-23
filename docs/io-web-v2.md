@@ -282,3 +282,171 @@ A proposal to discuss with the operator before any code:
    - only by host (`archi.<id>` → io.web);
    - or also by path on the main host;
    - and who may declare them: SY.admin only, from configuration.
+
+---
+
+## 11. Stage 1: the skeleton (design, reviewed 2026-10-23)
+
+**Goal.** From a browser outside, `https://archi.<id>/` answers a page served by io.web on the
+motherbee, through the edge, with a valid certificate. Archi stays out until sessions exist
+(stage 2). This answers §10.5 for now: routes by host only, declared by SY.admin from
+configuration.
+
+**One review round** (fit with the code, security) split it into two releases. The certificate
+for two names goes first, alone with the door's own fixes, because it is the piece that can take
+PROD's `/e/` down.
+
+**DNS (done, 2026-10-23):** `archi.hive-k3m9x7q2.fluxbee.ai` is a CNAME of `hive-k3m9x7q2.fluxbee.ai`
+(71.182.182.80). The domain has no CAA record.
+
+### 11.1 Release 0.1.84: the door ready for a second host
+
+1. **The declaration.** The motherbee's `hive.yaml` gets `web: {archi: true}`.
+   - It needs at least one key: a bare `web:` reads as absent.
+   - The host is derived: `archi.` + the host of `admin.public_base_url`. The domain never comes
+     from code.
+   - SY.admin reads it at boot and logs the declared host.
+2. **One certificate for both names** (SY.admin's ACME client).
+   - **What changes in the client:**
+     - the settings hold a list of names;
+     - one order carries every identifier, and every authorization is armed, readied, polled and
+       cleared (the edge already keeps challenges per name);
+     - the CSR carries every name, and coverage and chain checks run per name;
+     - the status lists the names.
+   - **`acme.json` keeps parsing,** with its `name` fields read as a one-name list. This is tested
+     against PROD's file, so an upgrade never starts from an empty state.
+   - **The transition is explicit,** as in 0.1.82, since a served certificate that misses a name
+     only raises an alert and the issuance cap holds automatic orders:
+     1. add `web:`;
+     2. restart SY.admin;
+     3. run `POST /acme/test`;
+     4. run `POST /acme/renew`, which is forced and bypasses the cap.
+
+     Removing `web:` takes effect at the next renewal.
+   - **The main name is never held hostage.** When a combined order fails only on the added name,
+     or the renewal is overdue, the client orders the main name alone. It keeps
+     `name_not_covered` open, so the operator sees it.
+   - **The public page will not show io.web's version:** Certificate Transparency logs publish
+     `archi.<id>` anyway.
+3. **The edge serves by host.**
+   - **One canonical host per request:**
+     - taken from the absolute-form authority if there is one, otherwise from the single Host;
+     - two Hosts, or a Host that disagrees with the authority, gets 400;
+     - lowercase, one trailing dot and `:443` stripped; other ports never match a route.
+   - **Dispatch by host comes before any path route:**
+     - a declared web host never gets `/e/` or `/public/` (D13). In this release it answers 404,
+       with the security headers;
+     - any other host keeps today's routes. Unknown hosts may move to 404 (host-posture §4.4) once
+       nothing calls the edge by IP.
+   - **Routing is per request,** never by SNI. With one certificate for both names, a different
+     SNI gains nothing.
+4. **The web routes reach the edge, and survive it.**
+   - `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}]}` carries the full set. The edge
+     accepts no other upstream.
+   - SY.admin pushes it from its own 60 s loop, not the ACME loop, which runs every 6 h.
+   - The edge keeps the set on disk, as it keeps its endpoints, so a restart serves it at once.
+   - It travels on the edge's `tls` command channel, since the system loop can be held 60 s by a
+     publication.
+   - It is admitted only from `SY.admin@motherbee`. That means the router's edge command and
+     response lists, `PROTECTED_SYSTEM_ACTIONS` and the policy's edge service actions, with both
+     wasm files rebuilt.
+5. **The door's own fixes:**
+   - **A-87:** a single byte must not hold a connection forever. Connections are served with
+     hyper's HTTP/1 builder and its head-read timeout, which starts before the first byte. There
+     is no protocol sniffing and no HTTP/2: today h2 is reachable only by prior knowledge, and
+     nothing uses it.
+   - **A-86:** a minimum rate and an idle deadline, in a wrapper around every connection's
+     stream, covering `/public`, `/e/` bodies and later the proxy. The peer address is kept, for
+     the logs and for X-Forwarded-For later.
+   - **A-88:** an `/e/` error never returns internal detail to the internet.
+   - **A-83:** a response that cannot be built is a 500 with the security headers.
+   - **A-82:** the edge stores and logs `SHA-256(key)`. Its `publications.json` is converted
+     once, and the conversion is reported.
+6. **In the same release:**
+   - `turns.ctx`/`seq` and their index are dropped (step 2 of 2);
+   - **A-81:** before taking its publication lock, SY.admin asks the producer's hive to send its
+     blob folder (`sync_hint`, without waiting for idle), and waits up to 30 s for the file in the
+     motherbee's `active/`. Any curate error releases what was curated.
+
+**Gate:**
+
+- **The certificate:**
+  - `POST /acme/test`, then `/acme/renew`;
+  - the served certificate names both hosts, and `/acme/status` lists both.
+- **Hosts:**
+  - `https://archi.<id>/` and `/e/…` on it answer 404, with a valid certificate;
+  - on the main host, `/e/` (IO.cloud) and `/public` work as before.
+- **Connections:**
+  - a connection sending one byte, and one sending an h2 preface, are closed at the header
+    timeout;
+  - a restarted edge still answers 404 for the Archi host.
+- **The rest:**
+  - the columns are gone;
+  - an agent on worker1 publishes a page.
+
+### 11.2 Release 0.1.85: the proxy and io.web
+
+1. **One shared module in the SDK** (behind a feature): the mesh TLS material and one reader of
+   the hive registry. The router, SY.admin, the edge and io.web use it; today it is spread between
+   the router library and the SY.admin binary.
+2. **The edge proxies a web host to io.web.**
+   - **The upstream:**
+     - the host the ingress's router dials, on the port of one SDK constant shared with io.web
+       (never 8443, which the handbook documents as the edge's old port);
+     - its certificate is verified inside the handshake, with rustls' WebPki verifier over the
+       mesh CA and the server name `motherbee`.
+   - **Per-route policy:** in this stage, GET and HEAD only, with no body.
+   - **Framing and headers:**
+     - the framing is rebuilt: `Content-Length`, `Transfer-Encoding` and `Expect` are never
+       copied, and any TE other than `chunked` is refused;
+     - hop-by-hop headers, and the ones `Connection` lists, are stripped first;
+     - the edge then sets its own `X-Forwarded-*`, `Forwarded` and `X-Request-Id`, replacing any
+       the client sent (with `X-Real-IP`, `True-Client-IP`, `X-Original-URL`, `X-Rewrite-URL`);
+     - Upgrade, CONNECT and TRACE are refused;
+     - hop-by-hop headers are stripped from responses too.
+   - **Errors and limits:**
+     - an upstream failure is a fixed 502 with the request id;
+     - a cap on in-flight proxied requests answers a quick 503;
+     - the upstream connect and response-head have timeouts.
+3. **io.web:** a new managed IO runtime, a first-class citizen (§6).
+   - **Where it runs:** crate `nodes/io/io-web`, the motherbee only (a fail-closed self-check),
+     the root tenant.
+   - **Its configuration:** the common IO control plane, CONFIG_GET/SET. The port comes from the
+     shared constant.
+   - **How it starts.** `base-nodes.json` lists it with `boot: false`, so it runs only where the
+     operator starts it: `run_node IO.web@motherbee` in the root tenant, one explicit step that
+     the ledger records, as for any new runtime on an existing hive.
+   - **TLS:**
+     - its server certificate is the motherbee's mesh leaf;
+     - a client verifier admits only a certificate whose hive the registry lists, live, with the
+       role `ingress`;
+     - connections from a hive that leaves the registry are cut, as the router does.
+   - **What it serves:**
+     - `GET /`: a minimal page, with no version and nothing internal, carrying
+       `frame-ancestors 'none'`, `nosniff` and a strict CSP;
+     - `GET /healthz`;
+     - everything else is 404.
+   - **Like any node:** NODE_STATUS_GET, logs on the router stream, inventory, upgrades with the
+     core.
+4. **The operator:**
+   - `GET /web/status` (`web_status`) shows the host, the certificate's names, the route the edge
+     acknowledged, and io.web's state;
+   - `ops.py health` prints a `web` line.
+
+**Gate:**
+
+- the page is served from outside;
+- worker1 is refused at io.web's handshake;
+- a POST is refused at the edge;
+- the restart and route checks of 0.1.84 still pass.
+
+### 11.3 Before stage 2 (sessions)
+
+These come from the security review:
+
+- a `__Host-` session cookie;
+- CSRF by exact Origin against `https://archi.<id>`, never against the Host header;
+- the edge passes only `__Host-` cookies on the proxy, and none on the main host;
+- proxy logs carry paths without their query, so the exchange code never reaches a journal;
+- io.web answers 401 from the headers before reading any body;
+- large bodies only on upload paths, counted on the bytes streamed.
