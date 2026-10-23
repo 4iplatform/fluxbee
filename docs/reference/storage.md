@@ -18,8 +18,8 @@ constant named without a path lives in the first one. The design and its decisio
 > `storage_inbox` into their base schema and removed the `storage_migrations` table. A database
 > created before 0.1.81 needs, once, `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` and,
 > after the upgrade, `DROP TABLE storage_migrations;` (`CREATE TABLE IF NOT EXISTS` does not change
-> an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`; the release after it drops
-> them (§6.1).
+> an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`; 0.1.84 drops them and their
+> index, once (§6.1).
 
 ---
 
@@ -187,8 +187,8 @@ SY.cognition: there, `cognition.turns` has no sink.
   indexes (`TURNS_SCHEMA_SQL`, `INBOX_SCHEMA_SQL`, `COGNITION_SCHEMA_SQL`, `USAGE_SCHEMA_SQL`).
   Each statement waits at most 5 s for its lock (`lock_timeout`, `SCHEMA_STEPS`); past that the
   start fails and systemd retries, so a DDL never queues the table's readers and writers behind a
-  long transaction. There are no migrations: an existing table is left as it is, except that
-  `turns.ctx` and `seq` lose their `NOT NULL` (§6.1).
+  long transaction. There are no migrations: an existing table is left as it is, except that a
+  `turns` that still has `ctx` and `seq` loses them, once (§6.1).
 - **Three connections** (`Storage`):
   - a shared one, for processing and reads;
   - one for ingest, one transaction per batch;
@@ -290,8 +290,7 @@ moment the router appended the record), `attempts`, `processed_at`, `last_error`
 ### 6.1 `turns`: the message log
 
 One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`, `to_ilk`, `ich`,
-`msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`, and `ctx` and `seq`, which
-nothing writes (below).
+`msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`.
 
 - **The key** is `dedupe_key`, the same as the inbox's (`idx_turns_dedupe_key`, unique). A response
   shares the `trace_id` of its request and still has its own row.
@@ -303,19 +302,27 @@ nothing writes (below).
   - `content`, the payload; `tags`, those of `payload.tags` or `meta.tags`, sorted and without
     repeats;
   - `message`, the whole message, as the router copied it.
-- **`ctx` and `seq`** are not written since 0.1.83; nothing reads them, and the protocol has no
-  such fields (`Meta` in `crates/fluxbee_sdk/src/protocol.rs`). They stay one release as nullable
-  columns so that a rollback to 0.1.82 still starts: its start creates an index on `(ctx, seq)`,
-  and its INSERT writes them. While a table still has their `NOT NULL`, `ensure_schema` drops it;
-  it reads `information_schema.columns` first, so once that is done a start takes no lock on
-  `turns`. The next release drops both columns and that index.
+- **`ctx` and `seq`**, the key until 0.1.74, are gone; the protocol has no such fields (`Meta` in
+  `crates/fluxbee_sdk/src/protocol.rs`). 0.1.83 stopped writing them and kept them one release,
+  nullable, so that a rollback to 0.1.82 still started. A table that still has them loses both
+  once, with their index, in a step of `ensure_schema` (`drop_turns_ctx_seq`):
+  - it reads `information_schema.columns` first (`TURNS_CTX_SEQ_COLUMNS_SQL`), so a start with
+    nothing to drop takes no lock on `turns` for it;
+  - only while a column shows up, it runs `DROP INDEX IF EXISTS idx_turns_ctx_seq;` and
+    `ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq;` in one transaction,
+    under the same 5 s `lock_timeout`;
+  - then it logs `dropped the turns columns nothing writes since 0.1.83, and any index on them`,
+    with the columns it found.
+
+  A rollback to 0.1.83 still starts: it drops a `NOT NULL` only where it finds one, and writes
+  neither column. One to 0.1.82 does not: its start creates `idx_turns_ctx_seq` and exits without
+  the columns, until they are added back
+  (`ALTER TABLE turns ADD COLUMN ctx TEXT, ADD COLUMN seq BIGINT;`).
 - **`message`** is required (`NOT NULL`), like `content`.
 - **`ts`** is when the router copied the message (the time of the stream record). **`stored_at`**
   is when SY.storage wrote it: it is the order that a live reader follows, because a batch can
   arrive late.
-- **Indexes:** `(ts DESC, dedupe_key DESC)`, `(stored_at, dedupe_key)`, `(thread_id)`. A database
-  that ran 0.1.82 or earlier also keeps `idx_turns_ctx_seq` on `(ctx, seq)` until the next release
-  drops it.
+- **Indexes:** `(ts DESC, dedupe_key DESC)`, `(stored_at, dedupe_key)`, `(thread_id)`.
 - **Who reads it:** the Messages page of Archi (`src/bin/sy_architect/messages_db.rs`).
 - Nothing purges `turns`.
 
@@ -533,7 +540,7 @@ its sink for the window at most (120 s).
 INSERT INTO storage_inbox ... ON CONFLICT (dedupe_key) DO UPDATE SET attempts = ... RETURNING ...;
 
 -- Turns: the same dedupe_key. (ctx, seq) was the key until 0.1.74; a response reuses the
--- trace_id of its request, and it got lost. Since 0.1.83 they are not written.
+-- trace_id of its request, and it got lost. 0.1.84 drops both columns.
 INSERT INTO turns ... ON CONFLICT (dedupe_key) DO NOTHING;
 
 -- Cognition: each row carries its communication and the turn in which it was written

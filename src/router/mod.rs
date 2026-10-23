@@ -38,9 +38,10 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_TLS_RELOAD,
     MSG_EDGE_TLS_RELOAD_RESPONSE, MSG_EDGE_TLS_STATUS, MSG_EDGE_TLS_STATUS_RESPONSE,
-    MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, MSG_WAN_REACHABILITY,
-    MSG_WAN_REJECT, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_EDGE_WEB_ROUTES,
+    MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, MSG_WAN_REACHABILITY, MSG_WAN_REJECT, MSG_WITHDRAW,
+    SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame, MAX_FRAME_SIZE};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
@@ -6216,6 +6217,7 @@ const EDGE_SERVICE_COMMANDS: &[&str] = &[
     MSG_EDGE_TLS_STATUS,
     MSG_EDGE_TLS_RELOAD,
     MSG_EDGE_ACME_CHALLENGE,
+    MSG_EDGE_WEB_ROUTES,
 ];
 
 /// The edge's answers to `EDGE_SERVICE_COMMANDS`, which go back to SY.admin@motherbee only.
@@ -6228,6 +6230,7 @@ const EDGE_SERVICE_RESPONSES: &[&str] = &[
     MSG_EDGE_TLS_STATUS_RESPONSE,
     MSG_EDGE_TLS_RELOAD_RESPONSE,
     MSG_EDGE_ACME_CHALLENGE_RESPONSE,
+    MSG_EDGE_WEB_ROUTES_RESPONSE,
 ];
 
 fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
@@ -8154,6 +8157,98 @@ mod tests {
                 0
             ));
         }
+    }
+
+    /// The web routes (docs/io-web-v2.md §11.1) ride the edge control gate like the other edge
+    /// commands: from SY.admin@motherbee only, whatever the VPNs, and the answer back to it only.
+    /// At the edge's router the delivery gate then asks the system policy, which admits the same
+    /// single sender (rule (1)).
+    #[test]
+    fn the_web_routes_reach_the_edge_only_from_the_primary_admin() {
+        let command = system_meta(MSG_EDGE_WEB_ROUTES);
+        let response = system_meta(MSG_EDGE_WEB_ROUTES_RESPONSE);
+        let admin = system_policy::EDGE_CONTROL_AUTHORITY;
+        let edge = "SY.edge@ingress1";
+        let rogues = [
+            "SY.admin@ingress1",
+            "SY.admin@worker1",
+            "SY.orchestrator@motherbee",
+            "SY.orchestrator@ingress1",
+            "IO.web@motherbee",
+            "IO.cloud@motherbee",
+            "SY.edge@ingress1",
+            "SY.edge@ingress2",
+            "SY.vault@motherbee",
+        ];
+
+        assert!(vpn_allows_between(&command, admin, 0, edge, 0));
+        assert!(vpn_allows_between(&command, admin, 0, edge, 7));
+        for rogue in rogues {
+            assert!(
+                !vpn_allows_between(&command, rogue, 0, edge, 0),
+                "{rogue} must not send the web routes to the edge"
+            );
+        }
+        assert!(vpn_allows_between(&response, edge, 0, admin, 0));
+        for elsewhere in [
+            "SY.admin@ingress1",
+            "SY.orchestrator@motherbee",
+            "IO.web@motherbee",
+            "SY.edge@ingress2",
+        ] {
+            assert!(
+                !vpn_allows_between(&response, edge, 0, elsewhere, 0),
+                "the edge's answer must not go to {elsewhere}"
+            );
+        }
+        // Neither turns around: the edge never sends the routes, nor is it sent the answer.
+        assert!(!vpn_allows_between(&command, edge, 0, admin, 0));
+        assert!(!vpn_allows_between(&response, admin, 0, edge, 0));
+
+        let delivery = |sender: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(sender.to_string()),
+                dst: Destination::Unicast(edge.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: system_meta(MSG_EDGE_WEB_ROUTES),
+            payload: serde_json::json!({
+                "routes": [{"host": "archi.example.test", "upstream": "io.web"}]
+            }),
+        };
+        assert!(prepare_local_delivery("ingress1", &delivery(admin), false).is_some());
+        for rogue in rogues {
+            assert!(
+                prepare_local_delivery("ingress1", &delivery(rogue), false).is_none(),
+                "the system policy must refuse the web routes from {rogue}"
+            );
+        }
+    }
+
+    /// The edge gate and the system policy list the same edge commands. A command missing from the
+    /// gate is answered VPN_BLOCKED before the policy is asked; one missing from the protected
+    /// actions reaches the edge without the policy. Every command has its answer in the gate.
+    #[test]
+    fn the_edge_gate_lists_every_protected_edge_command() {
+        let mut gate = EDGE_SERVICE_COMMANDS.to_vec();
+        gate.sort_unstable();
+        let mut protected: Vec<&str> = system_policy::PROTECTED_SYSTEM_ACTIONS
+            .iter()
+            .copied()
+            .filter(|action| action.starts_with("EDGE_"))
+            .collect();
+        protected.sort_unstable();
+        assert_eq!(gate, protected);
+        let mut responses = EDGE_SERVICE_RESPONSES.to_vec();
+        responses.sort_unstable();
+        let mut expected: Vec<String> = gate
+            .iter()
+            .map(|command| format!("{command}_RESPONSE"))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(responses, expected);
     }
 
     /// A-78: SY.vault's notice reaches the edge only addressed to it, from the primary hive's

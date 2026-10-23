@@ -31,7 +31,7 @@ use fluxbee_ai_sdk::{
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ModelSettings, UsageRecorder,
     UsageWork,
 };
-use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
+use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
@@ -39,8 +39,8 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
     MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
     MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
-    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL,
-    SYSTEM_KIND,
+    MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -80,6 +80,21 @@ const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
 /// publications whose `expires_at` has passed. 10 min — coarse on purpose: TTLs are ≥60s but
 /// measured in hours/days, so a late reap is harmless and a tight loop would only add churn.
 const PUBLICATION_EXPIRY_SWEEP_SECS: u64 = 600;
+/// One `publish_artifact` in all, under the 120 s ai.generic waits for its answer: each step
+/// (the wait for the blob, the publication lock, the curate, the edge's publish) gets what is
+/// left, up to its own limit.
+const PUBLISH_ARTIFACT_BUDGET: Duration = Duration::from_secs(110);
+/// How long `publish_artifact` waits for a producer's blob in the motherbee's `active/`
+/// (FINDINGS A-81): Syncthing brings a worker's blob in about 10 s.
+const PUBLISH_BLOB_ARRIVAL_WAIT: Duration = Duration::from_secs(30);
+/// IO.blob's curate of one publication.
+const PUBLISH_CURATE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The edge's publish of one publication.
+const PUBLISH_EDGE_TIMEOUT: Duration = Duration::from_secs(75);
+/// The scan of the producer's blob folder answers without waiting for idle.
+const PUBLISH_SYNC_HINT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The Syncthing folder of `active/` blobs, on every hive that has one.
+const PUBLISH_BLOB_SYNC_FOLDER: &str = "fluxbee-blob";
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -156,6 +171,9 @@ struct HiveFile {
     /// The ACME client's section (docs/acme-edge-certificates-v1.md §3), read as raw YAML: a
     /// section that cannot work turns ACME off with a reason, it never fails the boot.
     acme: Option<serde_yaml::Value>,
+    /// The web hosts (docs/io-web-v2.md §11.1), read as raw YAML like `acme:`: a section that
+    /// cannot work declares nothing, it never fails the boot.
+    web: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,9 +644,14 @@ async fn main() -> Result<(), AdminError> {
                 .map(|value| value.trim().trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty())
         });
+    // The web hosts (docs/io-web-v2.md §11.1): the edge serves them only through io.web, and the
+    // edge's certificate carries them after the main name. Like `acme:`, never a boot failure.
+    let web = WebConfig::from_hive(hive.web.as_ref(), public_base_url.as_deref());
+    web.log();
     // The ACME client (docs/acme-edge-certificates-v1.md §6, §7). Its configuration never fails
     // the boot: a section that cannot work turns ACME off, and the log and /acme/status say why.
-    let acme_config = acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref());
+    let acme_config =
+        acme::AcmeConfig::from_hive(hive.acme.as_ref(), public_base_url.as_deref(), &web.hosts);
     match &acme_config {
         acme::AcmeConfig::Off { .. } => tracing::error!("{}", acme_config.describe()),
         _ => tracing::info!("{}", acme_config.describe()),
@@ -638,6 +661,7 @@ async fn main() -> Result<(), AdminError> {
         let hives_root = hives_registry_root_for(&state_dir);
         Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &hives_root))
     };
+    let web_routes = Arc::new(WebRoutes::new(web.hosts, Arc::clone(&acme_edge)));
     let acme_ca = Arc::new(acme::InstantAcmeCa::new(
         &acme_config.trust_anchor_roots(),
         acme::platform_roots,
@@ -662,6 +686,7 @@ async fn main() -> Result<(), AdminError> {
         hive_id.clone(),
     );
     tokio::spawn(Arc::clone(&acme_service).run());
+    tokio::spawn(web_routes.run(Arc::clone(&router_client)));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -763,6 +788,284 @@ fn configured_blob_root(hive: &HiveFile) -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_BLOB_ROOT))
+}
+
+// --- The web hosts (docs/io-web-v2.md §11.1) -----------------------------------------------
+
+/// The keys `web:` knows: each the label of one web host, declared with `true`.
+const WEB_HOST_LABELS: &[&str] = &["archi"];
+/// How often SY.admin pushes the web routes to the public edge: its own loop, since the ACME
+/// check runs every 6 h.
+const WEB_ROUTES_PUSH_INTERVAL: Duration = Duration::from_secs(60);
+/// One EDGE_WEB_ROUTES waits as long as one EDGE_TLS_STATUS (`acme::Timings::edge_call`).
+const WEB_ROUTES_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// The one upstream the edge accepts for a web host.
+const WEB_ROUTES_UPSTREAM: &str = "io.web";
+
+/// The motherbee's `web:` section: the hosts the public edge serves only through io.web, never
+/// through `/e/` or `/public/`. Each is a label before the host of `admin.public_base_url`
+/// (`archi: true` declares `archi.<that host>`), so the domain never comes from code. A bare
+/// `web:`, or one with no key set, declares nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct WebConfig {
+    /// The declared hosts, lowercase, in the order of `WEB_HOST_LABELS`.
+    hosts: Vec<String>,
+    /// Why a section with keys declares nothing.
+    error: Option<String>,
+}
+
+impl WebConfig {
+    fn from_hive(section: Option<&serde_yaml::Value>, public_base_url: Option<&str>) -> Self {
+        let refused = |error: String| Self {
+            hosts: Vec::new(),
+            error: Some(error),
+        };
+        let map = match section {
+            None | Some(serde_yaml::Value::Null) => return Self::default(),
+            Some(serde_yaml::Value::Mapping(map)) => map,
+            Some(_) => return refused("the web section is not a mapping".to_string()),
+        };
+        let mut declared = Vec::new();
+        for (key, value) in map {
+            let key = key.as_str().unwrap_or("?");
+            if !WEB_HOST_LABELS.contains(&key) {
+                return refused(format!(
+                    "web.{key} is not a setting (known: {})",
+                    WEB_HOST_LABELS.join(", ")
+                ));
+            }
+            match value.as_bool() {
+                Some(true) => declared.push(key),
+                Some(false) => {}
+                None => return refused(format!("web.{key} is not true or false")),
+            }
+        }
+        if declared.is_empty() {
+            return Self::default();
+        }
+        let main = match acme::certified_name(public_base_url) {
+            Ok(main) => main,
+            Err(reason) => return refused(format!("no web host can be derived: {reason}")),
+        };
+        let hosts: Vec<String> = WEB_HOST_LABELS
+            .iter()
+            .filter(|label| declared.contains(*label))
+            .map(|label| format!("{label}.{main}"))
+            .collect();
+        if let Some(host) = hosts.iter().find(|host| host.len() > 253) {
+            return refused(format!("the web host {host} is longer than a DNS name"));
+        }
+        Self { hosts, error: None }
+    }
+
+    /// The boot log line: the declared hosts, or why a section declares nothing.
+    fn log(&self) {
+        match (&self.error, self.hosts.as_slice()) {
+            (Some(error), _) => {
+                tracing::error!(error = %error, "the web section declares no host")
+            }
+            (None, []) => {
+                tracing::info!("no web host declared: the edge gets an empty set of web routes")
+            }
+            (None, hosts) => tracing::info!(
+                hosts = %hosts.join(", "),
+                "web hosts declared: the edge serves them only through io.web"
+            ),
+        }
+    }
+}
+
+/// The web routes SY.admin pushes to the public edge every minute, and the edge's last answer.
+/// Each push carries the full set, an empty one when `web:` declares nothing, so a host taken out
+/// of `web:` leaves the edge at the first push after the restart. It goes to the edge ACME
+/// addresses, and the edge takes it on its TLS command channel, beside its system loop.
+struct WebRoutes {
+    hosts: Vec<String>,
+    edge: acme::EdgeResolver,
+    timeout: Duration,
+    last: std::sync::Mutex<Option<WebRoutesPush>>,
+}
+
+/// How the edge answered a push.
+#[derive(Debug, Clone, PartialEq)]
+enum WebRoutesOutcome {
+    Acknowledged,
+    /// The edge answered with an error.
+    Refused(String),
+    /// No answer in time, or the router answered UNREACHABLE (an edge older than 0.1.84 too).
+    NoAnswer(String),
+    /// No edge resolves: no `admin.public_edge_node` and not exactly one connected ingress.
+    NoEdge(String),
+}
+
+/// The last push, kept in memory.
+#[derive(Debug, Clone, PartialEq)]
+struct WebRoutesPush {
+    edge: Option<String>,
+    outcome: WebRoutesOutcome,
+    /// Since when the edge answers this way (Unix seconds).
+    since: i64,
+    /// When the edge last acknowledged the set.
+    acknowledged_at: Option<i64>,
+}
+
+impl WebRoutes {
+    fn new(hosts: Vec<String>, edge: acme::EdgeResolver) -> Self {
+        Self {
+            hosts,
+            edge,
+            timeout: WEB_ROUTES_CALL_TIMEOUT,
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A push at once, then one every minute.
+    async fn run(self: Arc<Self>, client: Arc<RouterDispatcher>) {
+        let mut ticker = tokio::time::interval(WEB_ROUTES_PUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            self.push_once(&client).await;
+        }
+    }
+
+    /// `EDGE_WEB_ROUTES {routes: [{host, upstream}]}`.
+    fn payload(&self) -> serde_json::Value {
+        let routes: Vec<serde_json::Value> = self
+            .hosts
+            .iter()
+            .map(|host| serde_json::json!({ "host": host, "upstream": WEB_ROUTES_UPSTREAM }))
+            .collect();
+        serde_json::json!({ "routes": routes })
+    }
+
+    /// One push. Only a change (another edge, or another answer) is logged; returns the push and
+    /// whether it changed.
+    async fn push_once(&self, client: &RouterDispatcher) -> (WebRoutesPush, bool) {
+        let now = Utc::now().timestamp();
+        let (edge, outcome) = match (self.edge)() {
+            Err(reason) => (None, WebRoutesOutcome::NoEdge(reason)),
+            Ok(edge) => {
+                let answer = send_system_request_with_meta(
+                    client,
+                    &edge,
+                    MSG_EDGE_WEB_ROUTES,
+                    MSG_EDGE_WEB_ROUTES_RESPONSE,
+                    self.payload(),
+                    16,
+                    None,
+                    None,
+                    Some(edge.clone()),
+                    None,
+                    None,
+                    self.timeout,
+                )
+                .await;
+                let outcome = match answer {
+                    Ok(payload) if payload_is_ok(&payload) => WebRoutesOutcome::Acknowledged,
+                    Ok(payload) => WebRoutesOutcome::Refused(
+                        payload_error_detail(&payload).unwrap_or_else(|| payload.to_string()),
+                    ),
+                    // A timeout's text names its own trace: stated without it, a repeated one
+                    // is the same answer.
+                    Err(err) => WebRoutesOutcome::NoAnswer(
+                        match err.downcast_ref::<fluxbee_sdk::RpcError>() {
+                            Some(rpc) if rpc.is_timeout() => {
+                                format!("no answer in {:?}", self.timeout)
+                            }
+                            _ => err.to_string(),
+                        },
+                    ),
+                };
+                (Some(edge), outcome)
+            }
+        };
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = last.take();
+        let same = previous
+            .as_ref()
+            .is_some_and(|previous| previous.edge == edge && previous.outcome == outcome);
+        let push = WebRoutesPush {
+            since: match &previous {
+                Some(previous) if same => previous.since,
+                _ => now,
+            },
+            acknowledged_at: if outcome == WebRoutesOutcome::Acknowledged {
+                Some(now)
+            } else {
+                previous
+                    .as_ref()
+                    .and_then(|previous| previous.acknowledged_at)
+            },
+            edge,
+            outcome,
+        };
+        if !same {
+            self.log_change(&push, previous.as_ref());
+        }
+        *last = Some(push.clone());
+        (push, !same)
+    }
+
+    fn log_change(&self, push: &WebRoutesPush, previous: Option<&WebRoutesPush>) {
+        let edge = push.edge.as_deref().unwrap_or("none");
+        let hosts = if self.hosts.is_empty() {
+            "none".to_string()
+        } else {
+            self.hosts.join(", ")
+        };
+        let rfc3339 = |at: i64| {
+            chrono::DateTime::from_timestamp(at, 0)
+                .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .unwrap_or_else(|| at.to_string())
+        };
+        let before = previous.map_or_else(
+            || "the first push".to_string(),
+            |previous| format!("{:?} since {}", previous.outcome, rfc3339(previous.since)),
+        );
+        let acknowledged = push
+            .acknowledged_at
+            .map_or_else(|| "never".to_string(), rfc3339);
+        match &push.outcome {
+            WebRoutesOutcome::Acknowledged => tracing::info!(
+                edge = %edge,
+                hosts = %hosts,
+                before = %before,
+                "the edge acknowledged its web routes"
+            ),
+            WebRoutesOutcome::Refused(detail) => tracing::warn!(
+                edge = %edge,
+                hosts = %hosts,
+                detail = %detail,
+                last_acknowledged = %acknowledged,
+                before = %before,
+                "the edge refused its web routes; pushed again every minute"
+            ),
+            WebRoutesOutcome::NoAnswer(detail) => tracing::warn!(
+                edge = %edge,
+                hosts = %hosts,
+                detail = %detail,
+                last_acknowledged = %acknowledged,
+                before = %before,
+                "the edge did not answer its web routes; pushed again every minute"
+            ),
+            // With no host declared there is nothing the edge misses.
+            WebRoutesOutcome::NoEdge(reason) if self.hosts.is_empty() => tracing::info!(
+                reason = %reason,
+                before = %before,
+                "no public edge to push the (empty) web routes to"
+            ),
+            WebRoutesOutcome::NoEdge(reason) => tracing::warn!(
+                reason = %reason,
+                hosts = %hosts,
+                before = %before,
+                "no public edge to push the web routes to"
+            ),
+        }
+    }
 }
 
 fn default_admin_executor_schema_version() -> u32 {
@@ -4827,6 +5130,7 @@ async fn handle_publish_artifact(
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "publish_artifact";
+    let deadline = tokio::time::Instant::now() + PUBLISH_ARTIFACT_BUDGET;
     let caller = match authorize_artifact_publisher(caller_l2_name) {
         Ok(caller) => caller,
         Err(detail) => return Ok(internal_unauthorized(action, &detail)),
@@ -4862,6 +5166,30 @@ async fn handle_publish_artifact(
             Ok(policy) => policy,
             Err(detail) => return Ok(internal_invalid_request(action, &detail)),
         };
+    let out_of_time = |step: &str| {
+        internal_service_error(
+            action,
+            "TIMEOUT",
+            &format!(
+                "publish_artifact used its {}s before {step}",
+                PUBLISH_ARTIFACT_BUDGET.as_secs()
+            ),
+        )
+    };
+    // Outside the publication lock, which a wait of 30 s would hold against every other
+    // publication. IO.blob's curate stays the verdict on whether the blob is there.
+    let producer_hive = caller
+        .rsplit_once('@')
+        .map(|(_, hive)| hive)
+        .unwrap_or_default();
+    await_producer_blob(
+        ctx,
+        client,
+        producer_hive,
+        &request.blob_ref,
+        time_left(deadline, PUBLISH_BLOB_ARRIVAL_WAIT).unwrap_or_default(),
+    )
+    .await;
     let expires_in_secs = request
         .expires_in_secs
         .unwrap_or(PUBLICATION_DEFAULT_EXPIRES_SECS)
@@ -4870,48 +5198,28 @@ async fn handle_publish_artifact(
     let expires_at = now.saturating_add(expires_in_secs);
     let publication_id = format!("pub:{}", Uuid::new_v4());
     let key = mint_public_capability();
-    let _publication_guard = ctx.publication_lock.lock().await;
-
-    let curate = send_system_request_with_meta(
+    let Ok(_publication_guard) =
+        tokio::time::timeout_at(deadline, ctx.publication_lock.lock()).await
+    else {
+        return Ok(out_of_time("the publication lock was free"));
+    };
+    let Some(curate_limit) = time_left(deadline, PUBLISH_CURATE_TIMEOUT) else {
+        return Ok(out_of_time("the curate"));
+    };
+    let curate = match curate_publication_blob(
+        ctx,
         client,
-        &format!("IO.blob@{}", ctx.hive_id),
-        MSG_BLOB_CURATE,
-        MSG_BLOB_CURATE_RESPONSE,
-        serde_json::json!({
-            "publication_id": publication_id,
-            "tenant_id": tenant_id,
-            "publisher_l2_name": publisher_l2_name,
-            "blob_ref": request.blob_ref,
-        }),
-        16,
-        None,
-        None,
-        Some(format!("IO.blob@{}", ctx.hive_id)),
-        None,
-        None,
-        Duration::from_secs(30),
+        &publication_id,
+        &tenant_id,
+        &publisher_l2_name,
+        &request.blob_ref,
+        curate_limit,
     )
-    .await;
-    let curate = match curate {
-        Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {
-            payload
-        }
-        Ok(payload) => {
-            return Ok(internal_service_error(
-                action,
-                payload
-                    .get("error_code")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("BLOB_CURATE_FAILED"),
-                &format!("IO.blob rejected publication: {payload}"),
-            ))
-        }
-        Err(err) => {
-            return Ok(internal_service_error(
-                action,
-                "BLOB_CURATE_FAILED",
-                &format!("IO.blob unavailable: {err}"),
-            ))
+    .await
+    {
+        Ok(curate) => curate,
+        Err((error_code, detail)) => {
+            return Ok(internal_service_error(action, &error_code, &detail))
         }
     };
     let public_name = curate
@@ -4970,6 +5278,12 @@ async fn handle_publish_artifact(
         return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
     }
 
+    let Some(edge_limit) = time_left(deadline, PUBLISH_EDGE_TIMEOUT) else {
+        let _ = release_curated_blob(client, ctx, &publication_id).await;
+        ledger.publications.remove(&publication_id);
+        let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
+        return Ok(out_of_time("the edge's publish"));
+    };
     let edge_result = send_system_request_with_meta(
         client,
         &edge_node,
@@ -4992,7 +5306,7 @@ async fn handle_publish_artifact(
         Some(edge_node.clone()),
         None,
         None,
-        Duration::from_secs(75),
+        edge_limit,
     )
     .await;
     match edge_result {
@@ -5415,6 +5729,165 @@ fn persist_admin_publication_ledger(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// What is left of `deadline`, up to `limit`; none once it has passed. A mesh call is never given
+/// zero: the dispatcher reads it as its own default.
+fn time_left(deadline: tokio::time::Instant, limit: Duration) -> Option<Duration> {
+    let left = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(limit);
+    (!left.is_zero()).then_some(left)
+}
+
+/// FINDINGS A-81: a producer on another hive promotes its blob there, and Syncthing brings it to
+/// the motherbee's `active/` about 10 s later, while IO.blob reads it at once. Unless the blob is
+/// here already, the producer's hive is asked to scan its blob folder (its orchestrator, the
+/// writer; without waiting for idle), in a task of its own, while the blob is looked for every
+/// half second for up to `wait`. A producer on the motherbee wrote here itself: no scan, only the
+/// looks. Returns whether the blob arrived; either way the curate that follows answers for it.
+async fn await_producer_blob(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    producer_hive: &str,
+    blob_ref: &BlobRef,
+    wait: Duration,
+) -> bool {
+    let toolkit = match BlobToolkit::new(BlobConfig {
+        blob_root: ctx.blob_root.clone(),
+        ..BlobConfig::default()
+    }) {
+        Ok(toolkit) => toolkit,
+        Err(err) => {
+            tracing::warn!(error = %err, "the blob root cannot be read: the curate answers for the blob");
+            return false;
+        }
+    };
+    if toolkit.exists(blob_ref) {
+        return true;
+    }
+    if producer_hive != ctx.hive_id && !wait.is_zero() {
+        // Not awaited: the looks start at once, and end as soon as the blob is here.
+        let client = Arc::clone(client);
+        let hive = producer_hive.to_string();
+        let limit = PUBLISH_SYNC_HINT_TIMEOUT.min(wait);
+        tokio::spawn(async move { scan_producer_blob_folder(&client, &hive, limit).await });
+    }
+    // A steady look every half second: the SDK's doubling delay, made for 5 s, would leave
+    // gaps of 13 s within these 30.
+    let retry = ResolveRetryConfig {
+        max_wait_ms: wait.as_millis() as u64,
+        initial_delay_ms: 500,
+        backoff_factor: 1.0,
+    };
+    match toolkit.resolve_with_retry(blob_ref, retry).await {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(
+                hive = %producer_hive,
+                blob = %blob_ref.blob_name,
+                error = %err,
+                wait_secs = wait.as_secs(),
+                "the blob did not reach the motherbee's active/ in time: IO.blob answers for it"
+            );
+            false
+        }
+    }
+}
+
+/// Ask the producer's hive to scan its blob folder, without waiting for idle. A nudge: a refusal
+/// or no answer is only logged, and the blob is looked for all the same.
+async fn scan_producer_blob_folder(client: &RouterDispatcher, hive: &str, limit: Duration) {
+    let scan = send_system_request(
+        client,
+        &format!("SY.orchestrator@{hive}"),
+        "SYSTEM_SYNC_HINT",
+        "SYSTEM_SYNC_HINT_RESPONSE",
+        serde_json::json!({
+            "channel": "blob",
+            "folder_id": PUBLISH_BLOB_SYNC_FOLDER,
+            "wait_for_idle": false,
+        }),
+        limit,
+    )
+    .await;
+    match scan {
+        Ok(payload)
+            if matches!(
+                payload.get("status").and_then(|status| status.as_str()),
+                Some("ok" | "sync_pending")
+            ) => {}
+        Ok(payload) => tracing::warn!(
+            hive = %hive,
+            answer = %payload,
+            "the producer's hive did not scan its blob folder: the blob is looked for all the same"
+        ),
+        Err(err) => tracing::warn!(
+            hive = %hive,
+            error = %err,
+            "the producer's hive did not answer the blob folder scan: the blob is looked for all the same"
+        ),
+    }
+}
+
+/// BLOB_CURATE of one publication's blob, within `limit`. Any error releases what IO.blob may
+/// have curated: an answer lost on the way can follow a curate that went through (FINDINGS A-81).
+/// The error is `(error_code, detail)`.
+async fn curate_publication_blob(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    publication_id: &str,
+    tenant_id: &str,
+    publisher_l2_name: &str,
+    blob_ref: &BlobRef,
+    limit: Duration,
+) -> Result<serde_json::Value, (String, String)> {
+    let target = format!("IO.blob@{}", ctx.hive_id);
+    let curate = send_system_request_with_meta(
+        client,
+        &target,
+        MSG_BLOB_CURATE,
+        MSG_BLOB_CURATE_RESPONSE,
+        serde_json::json!({
+            "publication_id": publication_id,
+            "tenant_id": tenant_id,
+            "publisher_l2_name": publisher_l2_name,
+            "blob_ref": blob_ref,
+        }),
+        16,
+        None,
+        None,
+        Some(target.clone()),
+        None,
+        None,
+        limit,
+    )
+    .await;
+    let refusal = match curate {
+        Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {
+            return Ok(payload)
+        }
+        Ok(payload) => (
+            payload
+                .get("error_code")
+                .and_then(|value| value.as_str())
+                .unwrap_or("BLOB_CURATE_FAILED")
+                .to_string(),
+            format!("IO.blob rejected publication: {payload}"),
+        ),
+        Err(err) => (
+            "BLOB_CURATE_FAILED".to_string(),
+            format!("IO.blob unavailable: {err}"),
+        ),
+    };
+    if let Err(err) = release_curated_blob(client, ctx, publication_id).await {
+        tracing::warn!(
+            publication_id = %publication_id,
+            error = %err,
+            "the release after a failed curate did not go through"
+        );
+    }
+    Err(refusal)
 }
 
 async fn release_curated_blob(
@@ -11274,7 +11747,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "wf_rules_delete" => "Delete a managed workflow through SY.wf-rules.",
         "acme_status" => "Read the ACME client of the public edge's certificate: its configuration (and why it is off), the terms URL, the accounts, the edge's live status, the order in flight, the last attempt and test, the next check and renewal point, the last issued certificates and the open certificate conditions.",
         "acme_renew" => "Order the public edge's certificate now (forced: no backoff, no cap). Replaces a hand-seeded or foreign certificate, certifies a new name, and lifts an install_refused hold. Answers 202; progress in GET /acme/status.",
-        "acme_test" => "Run a test order against the staging directory with the real name: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
+        "acme_test" => "Run a test order against the staging directory with the real names: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
         "acme_reload" => "Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback.",
         _ => "Admin action.",
     }
@@ -13367,13 +13840,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "acme_status" => vec![
             "Motherbee-only: SY.admin is the ACME client (docs/acme-edge-certificates-v1.md).",
             "config.state is on, off (with the reason) or absent; without an acme section nothing is ordered and the expiry checks still run.",
-            "The certified name is the host of admin.public_base_url; the edge is admin.public_edge_node, else the one connected ingress (edge.not_configured otherwise).",
+            "The main certified name is the host of admin.public_base_url, followed by the web hosts the web section declares (config.names); the edge is admin.public_edge_node, else the one connected ingress (edge.not_configured otherwise).",
             "edge.live is a fresh EDGE_TLS_STATUS; edge.last_seen is what the last check judged by.",
             "conditions are the open certificate conditions; each wrote one drift alert when it opened and writes an info row when it closes (GET /drift-alerts).",
         ],
         "acme_renew" => vec![
             "Confirm with the operator first: it spends an order at the CA.",
-            "Takes no body: the name comes from admin.public_base_url and the CA from the acme section.",
+            "Takes no body: the names come from admin.public_base_url and the web section, the CA from the acme section.",
             "409 ACME_BUSY while another ACME run is in flight (one at a time); 409 ACME_OFF, EDGE_NOT_CONFIGURED, ACME_RATE_LIMITED, CERTIFICATE_NOT_SERVED (POST /acme/reload first) or ROLLBACK_PENDING when it cannot start.",
             "Forced: ignores the failure backoff and the issuance cap, never the CA's rate limit. It is the operator's act that lifts an install_refused hold.",
             "Puts the certificate in the edge's secret (the previous version stays for rollback) and reloads the edge; the result is in GET /acme/status (last_attempt).",
@@ -13381,7 +13854,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "acme_test" => vec![
             "Confirm with the operator first: it arms the edge's challenge and may create the staging account.",
             "Takes no body: it orders from acme.staging_directory_url, refused (409 ACME_TEST_SAME_DIRECTORY) when that equals acme.directory_url.",
-            "Runs steps 1-5 of the order flow with the real name and no replaces; nothing is stored or installed. A staging chain is reported as untrusted, as expected.",
+            "Runs steps 1-5 of the order flow with the real names and no replaces; nothing is stored or installed. A staging chain is reported as untrusted, as expected.",
             "The result is in GET /acme/status (last_test).",
         ],
         "acme_reload" => vec![
@@ -24175,6 +24648,446 @@ mod tests {
             .await
             .expect("answered");
         assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    // --- The web hosts (docs/io-web-v2.md §11.1) ------------------------------------------
+
+    const WEB_BASE_URL: &str = "https://hive-1.example.com";
+    const WEB_ARCHI: &str = "archi.hive-1.example.com";
+
+    fn web_section(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).expect("yaml")
+    }
+
+    #[test]
+    fn web_declares_archi_before_the_host_of_the_public_base_url() {
+        let web = WebConfig::from_hive(Some(&web_section("archi: true")), Some(WEB_BASE_URL));
+        assert_eq!(
+            web,
+            WebConfig {
+                hosts: vec![WEB_ARCHI.to_string()],
+                error: None
+            }
+        );
+        // The certified name's host: lowercase, with no trailing dot and no port.
+        let web = WebConfig::from_hive(
+            Some(&web_section("archi: true")),
+            Some("https://Hive-1.Example.com.:443/base"),
+        );
+        assert_eq!(web.hosts, vec![WEB_ARCHI.to_string()]);
+    }
+
+    /// `web:` needs one key set: a bare `web:` reads as absent, as do `{}` and `archi: false`.
+    #[test]
+    fn a_bare_web_section_declares_nothing() {
+        for text in [
+            "hive_id: motherbee\nweb:\n",
+            "hive_id: motherbee\nweb: {}\n",
+            "hive_id: motherbee\nweb:\n  archi: false\n",
+            "hive_id: motherbee\n",
+        ] {
+            let hive: HiveFile = serde_yaml::from_str(text).expect("hive.yaml");
+            let web = WebConfig::from_hive(hive.web.as_ref(), Some(WEB_BASE_URL));
+            assert_eq!(web, WebConfig::default(), "{text}");
+        }
+        let hive: HiveFile =
+            serde_yaml::from_str("hive_id: motherbee\nweb:\n  archi: true\n").expect("hive.yaml");
+        assert_eq!(
+            WebConfig::from_hive(hive.web.as_ref(), Some(WEB_BASE_URL)).hosts,
+            vec![WEB_ARCHI.to_string()]
+        );
+        assert_eq!(
+            WebConfig::from_hive(Some(&serde_yaml::Value::Null), Some(WEB_BASE_URL)),
+            WebConfig::default()
+        );
+    }
+
+    #[test]
+    fn a_web_section_that_cannot_work_declares_nothing_and_says_why() {
+        for (text, base, why) in [
+            (
+                "archie: true",
+                Some(WEB_BASE_URL),
+                "web.archie is not a setting",
+            ),
+            ("archi: \"yes\"", Some(WEB_BASE_URL), "not true or false"),
+            ("[archi]", Some(WEB_BASE_URL), "not a mapping"),
+            ("archi: true", None, "admin.public_base_url is missing"),
+            ("archi: true", Some("https://203.0.113.7"), "IP literal"),
+        ] {
+            let web = WebConfig::from_hive(Some(&web_section(text)), base);
+            assert!(web.hosts.is_empty(), "{text}");
+            let error = web.error.expect("a reason");
+            assert!(error.contains(why), "{text}: {error}");
+        }
+    }
+
+    fn web_routes(hosts: &[&str], edge: Result<&str, &str>) -> WebRoutes {
+        let edge = edge.map(str::to_string).map_err(str::to_string);
+        WebRoutes {
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            edge: Arc::new(move || edge.clone()),
+            timeout: Duration::from_secs(5),
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Each push carries the full set to the edge ACME addresses, and the edge's answer is kept:
+    /// a refusal later keeps the time of the last acknowledgement.
+    #[tokio::test]
+    async fn the_web_routes_carry_the_full_set_and_the_edge_answer_is_kept() {
+        let (ctx, mut harness) = opa_test_admin("web-routes");
+        let routes = web_routes(&[WEB_ARCHI], Ok("SY.edge@ingress1"));
+        let wait = Duration::from_secs(5);
+        let drive = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the push");
+            assert_eq!(sent.meta.msg.as_deref(), Some(MSG_EDGE_WEB_ROUTES));
+            assert_eq!(dst_of(&sent), json!("SY.edge@ingress1"));
+            assert_eq!(sent.meta.target.as_deref(), Some("SY.edge@ingress1"));
+            assert_eq!(
+                sent.payload,
+                json!({ "routes": [{ "host": WEB_ARCHI, "upstream": "io.web" }] })
+            );
+            let ok = reply_to(
+                &sent,
+                MSG_EDGE_WEB_ROUTES_RESPONSE,
+                json!({ "status": "ok" }),
+            );
+            harness.inject(ok).await.unwrap();
+        };
+        let ((first, changed), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        assert!(changed, "the first answer is news");
+        assert_eq!(first.outcome, WebRoutesOutcome::Acknowledged);
+        assert_eq!(first.edge.as_deref(), Some("SY.edge@ingress1"));
+        assert_eq!(first.acknowledged_at, Some(first.since));
+
+        let drive = async {
+            let sent = harness.next_outgoing_within(wait).await.expect("the push");
+            let refused = reply_to(
+                &sent,
+                MSG_EDGE_WEB_ROUTES_RESPONSE,
+                json!({ "status": "error", "error_code": "INVALID_REQUEST", "message": "unknown upstream" }),
+            );
+            harness.inject(refused).await.unwrap();
+        };
+        let ((second, _), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        assert_eq!(
+            second.outcome,
+            WebRoutesOutcome::Refused("unknown upstream".to_string())
+        );
+        assert_eq!(second.acknowledged_at, first.acknowledged_at);
+    }
+
+    /// The whole answer is compared: the same refusal again is no news, another one is; a
+    /// timeout is stated without its trace, so a repeated one is no news either.
+    #[tokio::test]
+    async fn only_a_change_of_answer_is_news() {
+        let (ctx, mut harness) = opa_test_admin("web-routes-news");
+        let routes = web_routes(&[WEB_ARCHI], Ok("SY.edge@ingress1"));
+        let wait = Duration::from_secs(5);
+        let mut news = Vec::new();
+        for message in [
+            "unknown upstream",
+            "unknown upstream",
+            "the routes file is read-only",
+        ] {
+            let drive = async {
+                let sent = harness.next_outgoing_within(wait).await.expect("the push");
+                let refused = reply_to(
+                    &sent,
+                    MSG_EDGE_WEB_ROUTES_RESPONSE,
+                    json!({ "status": "error", "message": message }),
+                );
+                harness.inject(refused).await.unwrap();
+            };
+            let ((_, changed), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+            news.push(changed);
+        }
+        assert_eq!(news, vec![true, false, true]);
+
+        let silent = WebRoutes {
+            timeout: Duration::from_millis(50),
+            ..web_routes(&[WEB_ARCHI], Ok("SY.edge@ingress1"))
+        };
+        let (first, changed) = silent.push_once(&ctx.rpc).await;
+        assert!(changed);
+        assert_eq!(
+            first.outcome,
+            WebRoutesOutcome::NoAnswer("no answer in 50ms".to_string())
+        );
+        let (_, changed) = silent.push_once(&ctx.rpc).await;
+        assert!(!changed, "a second timeout is the same answer");
+        while harness
+            .next_outgoing_within(Duration::from_millis(50))
+            .await
+            .is_some()
+        {}
+    }
+
+    /// Without `web:` the set is empty, so a host taken out of `web:` leaves the edge; an edge
+    /// that cannot take it is no answer, and no edge at all sends nothing.
+    #[tokio::test]
+    async fn without_web_the_edge_gets_an_empty_set() {
+        let (ctx, mut harness) = opa_test_admin("web-routes-empty");
+        let routes = web_routes(&[], Ok("SY.edge@ingress1"));
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the push");
+            assert_eq!(sent.payload, json!({ "routes": [] }));
+            let blocked = reply_to(
+                &sent,
+                MSG_UNREACHABLE,
+                json!({ "reason": "VPN_BLOCKED", "original_dst": "SY.edge@ingress1" }),
+            );
+            harness.inject(blocked).await.unwrap();
+        };
+        let ((push, _), ()) = tokio::join!(routes.push_once(&ctx.rpc), drive);
+        assert!(
+            matches!(&push.outcome, WebRoutesOutcome::NoAnswer(detail) if detail.contains("VPN_BLOCKED")),
+            "{push:?}"
+        );
+        assert_eq!(push.acknowledged_at, None);
+
+        let nowhere = web_routes(&[WEB_ARCHI], Err("no connected ingress hive"));
+        let (push, _) = nowhere.push_once(&ctx.rpc).await;
+        assert_eq!(
+            push.outcome,
+            WebRoutesOutcome::NoEdge("no connected ingress hive".to_string())
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    // --- A-81: a producer's blob reaches the motherbee before its curate -------------------
+
+    fn page_blob_ref() -> BlobRef {
+        BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "page_0123456789abcdef.html".to_string(),
+            size: 3,
+            mime: "text/html".to_string(),
+            filename_original: "page.html".to_string(),
+            spool_day: "2026-10-23".to_string(),
+        }
+    }
+
+    /// What Syncthing does on the motherbee: the blob appears in `active/`.
+    fn land_blob(ctx: &AdminContext, blob_ref: &BlobRef) {
+        let dir = ctx
+            .blob_root
+            .join("active")
+            .join(BlobToolkit::prefix(&blob_ref.blob_name));
+        fs::create_dir_all(&dir).expect("active dir");
+        fs::write(dir.join(&blob_ref.blob_name), b"<p>").expect("blob");
+    }
+
+    #[tokio::test]
+    async fn a_blob_from_a_worker_is_asked_for_and_awaited() {
+        let (ctx, mut harness) = opa_test_admin("a81-worker");
+        let blob_ref = page_blob_ref();
+        let wait = await_producer_blob(
+            &ctx,
+            &ctx.rpc,
+            "worker1",
+            &blob_ref,
+            Duration::from_secs(10),
+        );
+        let drive = async {
+            let scan = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the scan");
+            assert_eq!(scan.meta.msg.as_deref(), Some("SYSTEM_SYNC_HINT"));
+            assert_eq!(dst_of(&scan), json!("SY.orchestrator@worker1"));
+            assert_eq!(
+                scan.payload,
+                json!({ "channel": "blob", "folder_id": "fluxbee-blob", "wait_for_idle": false })
+            );
+            let pending = reply_to(
+                &scan,
+                "SYSTEM_SYNC_HINT_RESPONSE",
+                json!({ "status": "sync_pending" }),
+            );
+            harness.inject(pending).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            land_blob(&ctx, &blob_ref);
+        };
+        let (arrived, ()) = tokio::join!(wait, drive);
+        assert!(arrived);
+    }
+
+    /// The scan runs beside the looks: a blob that lands while the producer's orchestrator has
+    /// not answered ends the wait at once.
+    #[tokio::test]
+    async fn the_looks_do_not_wait_for_the_scan() {
+        let (ctx, mut harness) = opa_test_admin("a81-concurrent");
+        let blob_ref = page_blob_ref();
+        let started = Instant::now();
+        let wait = await_producer_blob(
+            &ctx,
+            &ctx.rpc,
+            "worker1",
+            &blob_ref,
+            Duration::from_secs(20),
+        );
+        let drive = async {
+            let scan = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the scan");
+            assert_eq!(scan.meta.msg.as_deref(), Some("SYSTEM_SYNC_HINT"));
+            land_blob(&ctx, &blob_ref);
+        };
+        let (arrived, ()) = tokio::join!(wait, drive);
+        assert!(arrived);
+        assert!(
+            started.elapsed() < PUBLISH_SYNC_HINT_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn each_publication_step_gets_what_is_left_of_the_budget() {
+        let now = tokio::time::Instant::now();
+        let left = time_left(now + Duration::from_secs(10), Duration::from_secs(30)).unwrap();
+        assert!(left <= Duration::from_secs(10) && left > Duration::from_secs(9));
+        assert_eq!(
+            time_left(now + Duration::from_secs(100), Duration::from_secs(30)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(time_left(now, Duration::from_secs(30)), None);
+    }
+
+    /// The scan is a nudge: a worker that does not take it still gets its blob awaited.
+    #[tokio::test]
+    async fn a_scan_that_fails_still_awaits_the_blob() {
+        let (ctx, mut harness) = opa_test_admin("a81-scan-fails");
+        let blob_ref = page_blob_ref();
+        let wait = await_producer_blob(
+            &ctx,
+            &ctx.rpc,
+            "worker1",
+            &blob_ref,
+            Duration::from_millis(400),
+        );
+        let drive = async {
+            let scan = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the scan");
+            let blocked = reply_to(&scan, MSG_UNREACHABLE, json!({ "reason": "NO_ROUTE" }));
+            harness.inject(blocked).await.unwrap();
+        };
+        let (arrived, ()) = tokio::join!(wait, drive);
+        assert!(!arrived, "the blob never came: the curate answers for it");
+    }
+
+    #[tokio::test]
+    async fn a_blob_on_the_motherbee_needs_no_scan() {
+        let (ctx, mut harness) = opa_test_admin("a81-local");
+        let blob_ref = page_blob_ref();
+        let quick = Duration::from_millis(300);
+        assert!(!await_producer_blob(&ctx, &ctx.rpc, PRIMARY_HIVE_ID, &blob_ref, quick).await);
+        land_blob(&ctx, &blob_ref);
+        assert!(await_producer_blob(&ctx, &ctx.rpc, PRIMARY_HIVE_ID, &blob_ref, quick).await);
+        // Already here: a worker's blob needs no scan either.
+        assert!(await_producer_blob(&ctx, &ctx.rpc, "worker1", &blob_ref, quick).await);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// A lost answer can follow a curate that went through: every error releases.
+    #[tokio::test]
+    async fn any_curate_error_releases_what_was_curated() {
+        let (ctx, mut harness) = opa_test_admin("a81-curate");
+        let blob_ref = page_blob_ref();
+        let publication_id = format!("pub:{}", Uuid::new_v4());
+        let tenant = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
+        let wait = Duration::from_secs(5);
+        for (answer_msg, answer, expected) in [
+            (
+                MSG_UNREACHABLE,
+                json!({ "reason": "NODE_NOT_FOUND" }),
+                "BLOB_CURATE_FAILED",
+            ),
+            (
+                MSG_BLOB_CURATE_RESPONSE,
+                json!({ "status": "error", "error_code": "BLOB_NOT_FOUND" }),
+                "BLOB_NOT_FOUND",
+            ),
+        ] {
+            let curate = curate_publication_blob(
+                &ctx,
+                &ctx.rpc,
+                &publication_id,
+                tenant,
+                "AI.sales@worker1",
+                &blob_ref,
+                PUBLISH_CURATE_TIMEOUT,
+            );
+            let drive = async {
+                let sent = harness
+                    .next_outgoing_within(wait)
+                    .await
+                    .expect("the curate");
+                assert_eq!(sent.meta.msg.as_deref(), Some(MSG_BLOB_CURATE));
+                assert_eq!(dst_of(&sent), json!(format!("IO.blob@{PRIMARY_HIVE_ID}")));
+                harness
+                    .inject(reply_to(&sent, answer_msg, answer.clone()))
+                    .await
+                    .unwrap();
+                let release = harness
+                    .next_outgoing_within(wait)
+                    .await
+                    .expect("the release");
+                assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+                assert_eq!(release.payload, json!({ "publication_id": publication_id }));
+                let released = reply_to(
+                    &release,
+                    MSG_BLOB_RELEASE_RESPONSE,
+                    json!({ "status": "ok", "released": false }),
+                );
+                harness.inject(released).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(curate, drive);
+            let (error_code, _) = result.expect_err("a failed curate");
+            assert_eq!(error_code, expected);
+        }
+        // A curate that goes through releases nothing.
+        let curate = curate_publication_blob(
+            &ctx,
+            &ctx.rpc,
+            &publication_id,
+            tenant,
+            "AI.sales@worker1",
+            &blob_ref,
+            PUBLISH_CURATE_TIMEOUT,
+        );
+        let drive = async {
+            let sent = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the curate");
+            let curated = reply_to(
+                &sent,
+                MSG_BLOB_CURATE_RESPONSE,
+                json!({ "status": "ok", "public_name": "ab".repeat(32) }),
+            );
+            harness.inject(curated).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(curate, drive);
+        assert_eq!(result.expect("curated")["status"], "ok");
         assert!(harness
             .next_outgoing_within(Duration::from_millis(200))
             .await

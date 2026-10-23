@@ -1,16 +1,20 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::{Read, SeekFrom, Write};
+use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::{Path as AxumPath, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::body::{to_bytes, Body, Bytes, HttpBody};
+use axum::extract::{ConnectInfo, Path as AxumPath, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -21,8 +25,8 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
     MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_TLS_RELOAD, MSG_EDGE_TLS_RELOAD_RESPONSE,
     MSG_EDGE_TLS_STATUS, MSG_EDGE_TLS_STATUS_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
-    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED,
-    SYSTEM_KIND,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -35,7 +39,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -100,7 +104,8 @@ mod http_ingress {
 }
 
 const RPC_CH_SYSTEM: &str = "system";
-/// The three TLS commands, taken off the system channel so the sequential loop never delays them.
+/// The door's own commands (the three TLS ones and `EDGE_WEB_ROUTES`), taken off the system
+/// channel so the sequential loop never delays them.
 const RPC_CH_TLS: &str = "tls";
 
 /// Request headers the edge forwards INWARD — a strict ALLOWLIST (fail-closed, §7.5/M2).
@@ -125,6 +130,10 @@ const ALLOWED_REQUEST_HEADERS: &[&str] = &[
 const DEFAULT_MAX_INFLIGHT: usize = 1024;
 const DEFAULT_PUBLIC_MAX_INFLIGHT: usize = 128;
 const DEFAULT_PUBLIC_READY_TIMEOUT_MS: u64 = 60_000;
+/// A-86: the connections one peer address may hold at once, of the door's 4096 (0: no cap).
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
+/// A-86: the downloads one peer address may hold at once, of `public_max_inflight` (0: no cap).
+const DEFAULT_PUBLIC_MAX_INFLIGHT_PER_IP: usize = 8;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -145,8 +154,14 @@ struct Config {
     /// live URLs then arrive one at a time via `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` (§7).
     endpoints_path: Option<PathBuf>,
     publications_path: PathBuf,
+    /// The web hosts SY.admin declared (`EDGE_WEB_ROUTES`), kept so a restart serves them at once.
+    web_routes_path: PathBuf,
     blob_public_root: PathBuf,
+    /// Connections one peer address may hold at once (0: no cap).
+    max_connections_per_ip: usize,
     public_max_inflight: usize,
+    /// Downloads one peer address may hold at once (0: no cap).
+    public_max_inflight_per_ip: usize,
     public_ready_timeout_ms: u64,
     /// Public TLS material from disk. When both are `Some` the frontend serves HTTPS.
     tls_cert: Option<PathBuf>,
@@ -238,6 +253,9 @@ async fn main() -> Result<(), SyEdgeError> {
     ));
     let public_registry: Arc<RwLock<HashMap<String, PublicArtifactRow>>> =
         Arc::new(RwLock::new(load_public_registry(&config.publications_path)));
+    // The web hosts (io-web-v2 §11.1): from disk, so a restart answers them at once, before
+    // SY.admin's next push.
+    let web_routes = Arc::new(WebRouteTable::load(config.web_routes_path.clone()));
 
     // Warm-start step 2 (§8): rows reloaded from disk carry only a `secret_ref` (never the
     // secret value). Re-fetch each secret from vault now, so shared-secret channels come back
@@ -264,6 +282,7 @@ async fn main() -> Result<(), SyEdgeError> {
             listen = %listen,
             endpoints = registry.read().map(|r| r.len()).unwrap_or(0),
             publications = public_registry.read().map(|r| r.len()).unwrap_or(0),
+            web_hosts = web_routes.snapshot().routes.len(),
             "sy-edge starting public HTTP frontend"
         );
         let state = Arc::new(FrontendState {
@@ -277,6 +296,9 @@ async fn main() -> Result<(), SyEdgeError> {
             timeout: Duration::from_millis(config.handler_timeout_ms),
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             public_inflight: Arc::new(Semaphore::new(config.public_max_inflight)),
+            public_peer_slots: PeerSlots::new(config.public_max_inflight_per_ip),
+            refused_downloads: std::sync::Mutex::new(RefusedConnections::default()),
+            body_timeout: INLINE_BODY_TIMEOUT,
         });
         // TLS: vault-sourced (preferred), on-disk PEM, or explicit plaintext. FAIL-CLOSED: a TLS
         // configuration that cannot work never falls back to plaintext on the public listener.
@@ -318,15 +340,25 @@ async fn main() -> Result<(), SyEdgeError> {
             }
         };
         edge_tls = Some(Arc::clone(&tls));
+        // The web hosts were read before any certificate: now the edge can tell its main name,
+        // which a web host never is (an awaiting edge tells it at each request, `host_route`).
+        if let Some(served) = tls.served() {
+            web_routes.forget_main_name(&served.leaf.names);
+        }
+        let door_web_routes = Arc::clone(&web_routes);
+        let max_connections_per_ip = config.max_connections_per_ip;
         tokio::spawn(async move {
-            if let Err(err) = run_frontend(listen, state, tls).await {
+            if let Err(err) =
+                run_frontend(listen, state, tls, door_web_routes, max_connections_per_ip).await
+            {
                 tracing::error!(error = %err, "sy-edge public frontend exited");
             }
         });
     }
 
-    // The TLS commands answer beside the sequential loop below (§4): EDGE_PUBLISH_BLOB can hold
-    // that loop for a minute, and SY.admin's ACME order must not wait behind it.
+    // The door's commands answer beside the sequential loop below (§4): EDGE_PUBLISH_BLOB can
+    // hold that loop for a minute, and neither SY.admin's ACME order nor its push of the web hosts
+    // may wait behind it.
     let tls_commands = dispatcher
         .take_command_receiver(RPC_CH_TLS)
         .await
@@ -335,6 +367,7 @@ async fn main() -> Result<(), SyEdgeError> {
         tls_commands,
         sender.clone(),
         edge_tls.clone(),
+        Arc::clone(&web_routes),
         config.ttl,
     ));
 
@@ -358,25 +391,7 @@ async fn main() -> Result<(), SyEdgeError> {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let snapshot = {
-                    let mut guard = match reaper_registry.write() {
-                        Ok(guard) => guard,
-                        Err(_) => continue,
-                    };
-                    let before = guard.len();
-                    guard.retain(|_, row| row.expires_at > now);
-                    if guard.len() == before {
-                        continue; // nothing expired
-                    }
-                    tracing::info!(
-                        removed = before - guard.len(),
-                        "sy-edge reaper: dropped expired public artifacts"
-                    );
-                    guard.clone()
-                };
-                if let Err(err) = persist_public_registry(&reaper_path, &snapshot) {
-                    tracing::warn!(error = %err, "sy-edge reaper: persist pruned ledger failed");
-                }
+                reap_public_registry(&reaper_registry, &reaper_path, now);
             }
         });
     }
@@ -583,7 +598,7 @@ fn build_sy_edge_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_SYSTEM)
         .command_channel(RPC_CH_TLS)
-        // The TLS commands get their own channel, consumed beside the sequential system loop
+        // The door's commands get their own channel, consumed beside the sequential system loop
         // (`run_tls_commands`). Commands, never responses: they go before any pending waiter.
         .pre_pending_rule(
             RouteMatch::one_of(
@@ -592,6 +607,7 @@ fn build_sy_edge_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
                     MSG_EDGE_TLS_STATUS,
                     MSG_EDGE_TLS_RELOAD,
                     MSG_EDGE_ACME_CHALLENGE,
+                    MSG_EDGE_WEB_ROUTES,
                 ],
             ),
             RouteTarget::Command(RPC_CH_TLS),
@@ -745,10 +761,15 @@ async fn apply_list_urls(
     send_edge_reply(sender, msg, MSG_EDGE_LIST_URLS_RESPONSE, payload, ttl).await;
 }
 
+/// One public artifact as the edge keeps it, in memory and in `publications.json`. Of the
+/// capability key SY.admin sends (`EDGE_PUBLISH_BLOB`) it keeps only the SHA-256, and a GET looks
+/// the hash of the key it is asked for up (A-82): neither the disk nor a log line of the DMZ holds
+/// a key.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct PublicArtifactRow {
-    key: String,
+    /// SHA-256 of the capability key, lowercase hex.
+    key_sha256: String,
     publication_id: String,
     public_name: String,
     sha256: String,
@@ -765,6 +786,32 @@ struct PublicArtifactsFile {
     publications: Vec<PublicArtifactRow>,
 }
 
+/// SHA-256 of `text`, lowercase hex.
+fn sha256_hex(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// A row that carries the capability `key` itself (an `EDGE_PUBLISH_BLOB`, or `publications.json`
+/// before 0.1.84) gets `key_sha256` in its place, the form the edge keeps (A-82). `Ok(true)` when
+/// the row carried a key; `Ok(false)` when it had none.
+fn hash_capability_key(row: &mut Value) -> Result<bool, String> {
+    let fields = row
+        .as_object_mut()
+        .ok_or_else(|| "a public artifact row must be an object".to_string())?;
+    let Some(key) = fields.remove("key") else {
+        return Ok(false);
+    };
+    let key = key
+        .as_str()
+        .filter(|key| is_lower_hex_64(key))
+        .ok_or_else(|| "key must be 64 lowercase hex characters".to_string())?;
+    if fields.contains_key("key_sha256") {
+        return Err("a public artifact row carries both key and key_sha256".to_string());
+    }
+    fields.insert("key_sha256".to_string(), json!(sha256_hex(key)));
+    Ok(true)
+}
+
 async fn apply_publish_blob(
     sender: &NodeSender,
     registry: &Arc<RwLock<HashMap<String, PublicArtifactRow>>>,
@@ -774,9 +821,19 @@ async fn apply_publish_blob(
     ttl: u8,
     ready_timeout: Duration,
 ) {
-    let outcome: Result<PublicArtifactRow, String> = async {
+    let outcome: Result<(PublicArtifactRow, String), String> = async {
         authorize_edge_service_command(msg, MSG_EDGE_PUBLISH_BLOB)?;
-        let row: PublicArtifactRow = serde_json::from_value(msg.payload.clone())
+        // The answer still names the key's URL, to SY.admin, which holds the key; the edge keeps
+        // only its hash (A-82).
+        let url = format!(
+            "/public/{}",
+            msg.payload.get("key").and_then(Value::as_str).unwrap_or("")
+        );
+        let mut payload = msg.payload.clone();
+        if !hash_capability_key(&mut payload)? {
+            return Err("invalid EDGE_PUBLISH_BLOB payload: missing field `key`".to_string());
+        }
+        let row: PublicArtifactRow = serde_json::from_value(payload)
             .map_err(|err| format!("invalid EDGE_PUBLISH_BLOB payload: {err}"))?;
         validate_public_artifact_row(&row)?;
         wait_for_public_artifact_ready(public_root, &row, ready_timeout).await?;
@@ -784,44 +841,45 @@ async fn apply_publish_blob(
             let mut guard = registry
                 .write()
                 .map_err(|_| "public registry lock poisoned".to_string())?;
-            if let Some(existing) = guard.get(&row.key) {
+            if let Some(existing) = guard.get(&row.key_sha256) {
                 if existing != &row {
                     return Err("public capability already exists with different facts".to_string());
                 }
             }
             if guard.values().any(|existing| {
-                existing.publication_id == row.publication_id && existing.key != row.key
+                existing.publication_id == row.publication_id
+                    && existing.key_sha256 != row.key_sha256
             }) {
                 return Err("publication_id already exists with a different capability".to_string());
             }
-            let previous = guard.insert(row.key.clone(), row.clone());
+            let previous = guard.insert(row.key_sha256.clone(), row.clone());
             if let Err(err) = persist_public_registry(publications_path, &guard) {
                 match previous {
                     Some(previous) => {
-                        guard.insert(row.key.clone(), previous);
+                        guard.insert(row.key_sha256.clone(), previous);
                     }
                     None => {
-                        guard.remove(&row.key);
+                        guard.remove(&row.key_sha256);
                     }
                 }
                 return Err(err);
             }
         }
-        Ok(row)
+        Ok((row, url))
     }
     .await;
     let payload = match outcome {
-        Ok(row) => {
+        Ok((row, url)) => {
             tracing::info!(
                 publication_id = %row.publication_id,
-                key = %row.key,
+                key_sha256 = %row.key_sha256,
                 public_name = %row.public_name,
                 "sy-edge published public artifact after local readiness verification"
             );
             json!({
                 "status": "ok",
                 "publication_id": row.publication_id,
-                "url": format!("/public/{}", row.key),
+                "url": url,
                 "ready": true,
             })
         }
@@ -853,16 +911,18 @@ async fn apply_unpublish_blob(
         let mut guard = registry
             .write()
             .map_err(|_| "public registry lock poisoned".to_string())?;
-        let key = guard
+        let key_sha256 = guard
             .iter()
             .find(|(_, row)| row.publication_id == publication_id)
-            .map(|(key, _)| key.clone());
-        let removed_row = key.as_ref().and_then(|key| guard.remove(key));
+            .map(|(key_sha256, _)| key_sha256.clone());
+        let removed_row = key_sha256
+            .as_ref()
+            .and_then(|key_sha256| guard.remove(key_sha256));
         let removed = removed_row.is_some();
         if removed {
             if let Err(err) = persist_public_registry(publications_path, &guard) {
-                if let (Some(key), Some(row)) = (key, removed_row) {
-                    guard.insert(key, row);
+                if let (Some(key_sha256), Some(row)) = (key_sha256, removed_row) {
+                    guard.insert(key_sha256, row);
                 }
                 return Err(err);
             }
@@ -880,8 +940,8 @@ async fn apply_unpublish_blob(
 }
 
 fn validate_public_artifact_row(row: &PublicArtifactRow) -> Result<(), String> {
-    if !is_lower_hex_64(&row.key) {
-        return Err("key must be 64 lowercase hex characters".to_string());
+    if !is_lower_hex_64(&row.key_sha256) {
+        return Err("key_sha256 must be 64 lowercase hex characters".to_string());
     }
     if !valid_prefixed_uuid(&row.publication_id, "pub") {
         return Err("publication_id must be pub:<uuid>".to_string());
@@ -1014,6 +1074,17 @@ fn verify_public_artifact_file(
     Ok(())
 }
 
+/// `publications.json` as read: each row stays raw until `hash_capability_key` has seen it.
+#[derive(Debug, Deserialize)]
+struct StoredPublicArtifacts {
+    #[serde(default)]
+    publications: Vec<Value>,
+}
+
+/// The public table as `publications.json` left it, keyed by `key_sha256`, without its invalid
+/// or expired rows. A file written before 0.1.84 holds the capability keys themselves: they are
+/// hashed here, the file is rewritten without them, and one line says how many rows carried one
+/// (A-82). The next start finds none.
 fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifactRow> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
@@ -1023,7 +1094,7 @@ fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifac
             return HashMap::new();
         }
     };
-    let parsed: PublicArtifactsFile = match serde_json::from_slice(&raw) {
+    let parsed: StoredPublicArtifacts = match serde_json::from_slice(&raw) {
         Ok(parsed) => parsed,
         Err(err) => {
             tracing::error!(path = %path.display(), error = %err, "sy-edge public registry invalid; starting empty");
@@ -1034,41 +1105,101 @@ fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifac
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    parsed
-        .publications
-        .into_iter()
-        .filter(|row| validate_public_artifact_row(row).is_ok())
-        .filter(|row| {
-            // FIX-6: drop already-expired rows at load. They are un-servable (the serve path
-            // rejects expires_at <= now) but were previously re-residented into the registry on
-            // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. This
-            // bounds the edge's in-memory registry; the active reaper (part 2, below) also prunes
-            // the on-disk ledger on a live edge. Reclaiming the public/ BYTES + retiring the
-            // authoritative admin ledger is SY.admin's job — its expiry sweep drives the same
-            // MSG_EDGE_UNPUBLISH_BLOB + MSG_BLOB_RELEASE path at TTL (run_publication_expiry_sweep).
-            if row.expires_at <= now {
-                tracing::info!(key = %row.key, "sy-edge: dropping expired public artifact row at load");
-                false
-            } else {
-                true
+    let mut carried_keys = 0_usize;
+    let mut invalid = 0_usize;
+    let mut registry = HashMap::new();
+    for mut stored in parsed.publications {
+        match hash_capability_key(&mut stored) {
+            Ok(true) => carried_keys += 1,
+            Ok(false) => {}
+            Err(_) => {
+                invalid += 1;
+                continue;
             }
-        })
-        .map(|row| (row.key.clone(), row))
-        .collect()
+        }
+        let row = match serde_json::from_value::<PublicArtifactRow>(stored) {
+            Ok(row) if validate_public_artifact_row(&row).is_ok() => row,
+            _ => {
+                invalid += 1;
+                continue;
+            }
+        };
+        // FIX-6: drop already-expired rows at load. They are un-servable (the serve path
+        // rejects expires_at <= now) but were previously re-residented into the registry on
+        // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. This
+        // bounds the edge's in-memory registry; the active reaper (part 2, below) also prunes
+        // the on-disk ledger on a live edge. Reclaiming the public/ BYTES + retiring the
+        // authoritative admin ledger is SY.admin's job — its expiry sweep drives the same
+        // MSG_EDGE_UNPUBLISH_BLOB + MSG_BLOB_RELEASE path at TTL (run_publication_expiry_sweep).
+        if row.expires_at <= now {
+            tracing::info!(
+                publication_id = %row.publication_id,
+                key_sha256 = %row.key_sha256,
+                "sy-edge: dropping expired public artifact row at load"
+            );
+            continue;
+        }
+        registry.insert(row.key_sha256.clone(), row);
+    }
+    if invalid > 0 {
+        tracing::warn!(path = %path.display(), invalid, "sy-edge: dropped invalid public artifact rows at load");
+    }
+    if carried_keys > 0 {
+        let rewritten = persist_public_registry(path, &registry);
+        tracing::info!(
+            path = %path.display(),
+            converted = carried_keys,
+            rewritten = rewritten.is_ok(),
+            "sy-edge: the public registry held capability keys; it keeps only their SHA-256 now (A-82)"
+        );
+        if let Err(err) = rewritten {
+            tracing::error!(path = %path.display(), error = %err, "sy-edge could not rewrite the public registry without its keys; the next start converts it again");
+        }
+    }
+    registry
 }
 
+/// Drop the rows expired at `now` and write the table; how many went. Like a publication and an
+/// unpublication, it writes `publications.json` while it holds the table's write lock: one writer
+/// of the file at a time, and always the latest table.
+fn reap_public_registry(
+    registry: &RwLock<HashMap<String, PublicArtifactRow>>,
+    path: &std::path::Path,
+    now: u64,
+) -> usize {
+    let mut guard = registry.write().unwrap_or_else(PoisonError::into_inner);
+    let before = guard.len();
+    guard.retain(|_, row| row.expires_at > now);
+    let removed = before - guard.len();
+    if removed > 0 {
+        tracing::info!(removed, "sy-edge reaper: dropped expired public artifacts");
+        if let Err(err) = persist_public_registry(path, &guard) {
+            tracing::warn!(error = %err, "sy-edge reaper: persist pruned ledger failed");
+        }
+    }
+    removed
+}
+
+/// Every write of `publications.json` goes through here, under the public table's write lock (the
+/// conversion at load runs before the table is shared).
 fn persist_public_registry(
     path: &std::path::Path,
     registry: &HashMap<String, PublicArtifactRow>,
 ) -> Result<(), String> {
     let mut publications: Vec<_> = registry.values().cloned().collect();
-    publications.sort_by(|left, right| left.key.cmp(&right.key));
+    publications.sort_by(|left, right| left.key_sha256.cmp(&right.key_sha256));
     let data = serde_json::to_vec_pretty(&PublicArtifactsFile { publications })
         .map_err(|err| format!("serialize public registry: {err}"))?;
+    write_state_file(path, &data)
+}
+
+/// Write one of the edge's state files whole: a synced temporary file with mode 0640, then a
+/// rename, so a crash leaves the old file or the new one, never half of one.
+fn write_state_file(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     let temp = path.with_extension("json.tmp");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|err| format!("create public registry directory: {err}"))?;
+            .map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -1076,11 +1207,11 @@ fn persist_public_registry(
         .write(true)
         .mode(0o640)
         .open(&temp)
-        .map_err(|err| format!("open temporary public registry: {err}"))?;
-    file.write_all(&data)
+        .map_err(|err| format!("open {}: {err}", temp.display()))?;
+    file.write_all(data)
         .and_then(|_| file.sync_all())
-        .map_err(|err| format!("write temporary public registry: {err}"))?;
-    std::fs::rename(&temp, path).map_err(|err| format!("install public registry: {err}"))?;
+        .map_err(|err| format!("write {}: {err}", temp.display()))?;
+    std::fs::rename(&temp, path).map_err(|err| format!("install {}: {err}", path.display()))?;
     Ok(())
 }
 
@@ -1274,9 +1405,15 @@ struct EdgeSection {
     #[serde(default)]
     publications_path: Option<String>,
     #[serde(default)]
+    web_routes_path: Option<String>,
+    #[serde(default)]
     blob_public_root: Option<String>,
     #[serde(default)]
+    max_connections_per_ip: Option<usize>,
+    #[serde(default)]
     public_max_inflight: Option<usize>,
+    #[serde(default)]
+    public_max_inflight_per_ip: Option<usize>,
     #[serde(default)]
     public_ready_timeout_ms: Option<u64>,
     /// Public TLS cert chain (PEM) + private key (PEM) from DISK. When both are
@@ -1353,6 +1490,9 @@ impl Config {
         let publications_path = env("SY_EDGE_PUBLICATIONS")
             .or_else(|| edge.as_ref().and_then(|e| e.publications_path.clone()))
             .unwrap_or_else(|| "/var/lib/fluxbee/state/sy-edge/publications.json".to_string());
+        let web_routes_path = env("SY_EDGE_WEB_ROUTES")
+            .or_else(|| edge.as_ref().and_then(|e| e.web_routes_path.clone()))
+            .unwrap_or_else(|| "/var/lib/fluxbee/state/sy-edge/web_routes.json".to_string());
         let blob_public_root = env("SY_EDGE_BLOB_PUBLIC_ROOT")
             .or_else(|| edge.as_ref().and_then(|e| e.blob_public_root.clone()))
             .unwrap_or_else(|| "/var/lib/fluxbee/blob/public".to_string());
@@ -1389,12 +1529,22 @@ impl Config {
             http_listen,
             endpoints_path: Some(PathBuf::from(endpoints_path)),
             publications_path: PathBuf::from(publications_path),
+            web_routes_path: PathBuf::from(web_routes_path),
             blob_public_root: PathBuf::from(blob_public_root),
+            // 0 turns a per-address cap off, so it is taken as given.
+            max_connections_per_ip: env("SY_EDGE_MAX_CONNECTIONS_PER_IP")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.max_connections_per_ip))
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
             public_max_inflight: env("SY_EDGE_PUBLIC_MAX_INFLIGHT")
                 .and_then(|raw| raw.parse().ok())
                 .or_else(|| edge.as_ref().and_then(|e| e.public_max_inflight))
                 .filter(|&value| value > 0)
                 .unwrap_or(DEFAULT_PUBLIC_MAX_INFLIGHT),
+            public_max_inflight_per_ip: env("SY_EDGE_PUBLIC_MAX_INFLIGHT_PER_IP")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.public_max_inflight_per_ip))
+                .unwrap_or(DEFAULT_PUBLIC_MAX_INFLIGHT_PER_IP),
             public_ready_timeout_ms: env("SY_EDGE_PUBLIC_READY_TIMEOUT_MS")
                 .and_then(|raw| raw.parse().ok())
                 .or_else(|| edge.as_ref().and_then(|e| e.public_ready_timeout_ms))
@@ -1636,39 +1786,60 @@ struct FrontendState {
     /// lifetime; when none is free the door returns 503 instead of enqueuing unbounded.
     inflight: Arc<Semaphore>,
     public_inflight: Arc<Semaphore>,
+    /// A-86: the downloads each peer address holds, out of `public_inflight`.
+    public_peer_slots: Arc<PeerSlots>,
+    /// Downloads refused at a peer's cap, logged at most once per interval.
+    refused_downloads: std::sync::Mutex<RefusedConnections>,
+    /// The longest an `/e/` body may take to arrive whole (`INLINE_BODY_TIMEOUT`).
+    body_timeout: Duration,
 }
 
 async fn run_frontend(
     listen: String,
     state: Arc<FrontendState>,
     tls: Arc<EdgeTls>,
+    web_routes: Arc<WebRouteTable>,
+    max_connections_per_ip: usize,
 ) -> Result<(), SyEdgeError> {
-    let app = Router::new()
-        .route("/e/:ich", any(invoke_root))
-        .route("/e/:ich/*extra", any(invoke_extra))
-        .route("/public/:key", any(serve_public_artifact))
-        .route("/healthz", any(|| async { "ok" }))
-        .with_state(state);
+    let door = Door {
+        main: main_routes(state),
+        web: web_routes,
+        tls: Arc::clone(&tls),
+    };
     let listener = TcpListener::bind(&listen).await?;
     let addr = listener.local_addr()?;
     if tls.mode == TlsMode::Plaintext {
         tracing::info!(addr = %addr, "sy-edge public HTTP frontend ready (plaintext)");
-        axum::serve(listener, app).await?;
-        return Ok(());
+    } else {
+        tracing::info!(
+            addr = %addr,
+            mode = tls.mode.as_str(),
+            serving = tls.is_serving(),
+            "sy-edge public HTTPS frontend ready (TLS)"
+        );
     }
-    tracing::info!(
-        addr = %addr,
-        mode = tls.mode.as_str(),
-        serving = tls.is_serving(),
-        "sy-edge public HTTPS frontend ready (TLS)"
-    );
-    serve_tls_listener(
+    serve_door(
         listener,
-        app,
+        door,
         tls,
-        DoorLimits::new(MAX_TLS_CONNECTIONS, HTTP_HEADER_READ_TIMEOUT),
+        DoorLimits::new(
+            MAX_CONNECTIONS,
+            max_connections_per_ip,
+            HTTP_HEADER_READ_TIMEOUT,
+            DOOR_PACE,
+        ),
     )
     .await
+}
+
+/// The door's own routes, for the hosts that are the door's own (`host_route`).
+fn main_routes(state: Arc<FrontendState>) -> Router {
+    Router::new()
+        .route("/e/:ich", any(invoke_root))
+        .route("/e/:ich/*extra", any(invoke_extra))
+        .route("/public/:key", any(serve_public_artifact))
+        .route("/healthz", any(|| async { "ok" }))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,12 +1867,22 @@ const AWAITING_SCHEDULE: AwaitingSchedule = AwaitingSchedule {
     first: Duration::from_secs(30),
     max: Duration::from_secs(300),
 };
-/// The most connections the public TLS door holds at once, handshakes included; one more is
+/// The most connections the public door holds at once, TLS handshakes included; one more is
 /// closed at accept.
-const MAX_TLS_CONNECTIONS: usize = 4096;
-/// HTTP/1: a request head must arrive within this, and so must the first byte after the
-/// handshake. hyper applies it only with a timer (`serve_tls_connection`).
+const MAX_CONNECTIONS: usize = 4096;
+/// A request head must arrive within this, timed from the connection's start (after its TLS
+/// handshake) or from the previous answer: one byte, or an h2 preface, never holds a connection
+/// longer (A-87). hyper applies it only with a timer (`serve_http`).
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// A-86: how the door's connections must keep up while the edge waits on their peer (`Pace`):
+/// nothing moving for 30 s, or a pace under 1 KiB/s, ends the connection.
+const DOOR_PACE: PaceLimits = PaceLimits {
+    idle: Duration::from_secs(30),
+    min_rate: 1024,
+};
+/// An `/e/` body (64 KiB at most) must arrive whole within this. The pace alone would let a
+/// chunked body that stays just above it hold an `/e/` slot for minutes.
+const INLINE_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// After a failed accept (out of file descriptors, say) the loop waits this long, never spins.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Connections refused at the cap are logged at most once per interval, with their count.
@@ -2522,6 +2703,17 @@ fn log_tls_chain_diagnosis(source: &str, diagnosis: ChainDiagnosis) {
 /// wildcard (TLS-ALPN-01 cannot validate one, RFC 8737 §3) nor an IP literal.
 fn acme_challenge_name(raw: &str) -> Result<String, String> {
     let name = tls_material::normalize_name(raw);
+    if !is_dns_host_name(&name) {
+        return Err(format!(
+            "name must be a DNS host name (no wildcard, no IP literal), got '{raw}'"
+        ));
+    }
+    Ok(name)
+}
+
+/// A DNS host name as the edge takes one: lowercase labels of letters, digits and inner hyphens.
+/// Never a wildcard, an IP literal, a port or a trailing dot.
+fn is_dns_host_name(name: &str) -> bool {
     let valid_label = |label: &str| {
         !label.is_empty()
             && label.len() <= 63
@@ -2531,16 +2723,10 @@ fn acme_challenge_name(raw: &str) -> Result<String, String> {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     };
-    if name.is_empty()
-        || name.len() > 253
-        || name.parse::<std::net::IpAddr>().is_ok()
-        || !name.split('.').all(valid_label)
-    {
-        return Err(format!(
-            "name must be a DNS host name (no wildcard, no IP literal), got '{raw}'"
-        ));
-    }
-    Ok(name)
+    !name.is_empty()
+        && name.len() <= 253
+        && name.parse::<std::net::IpAddr>().is_err()
+        && name.split('.').all(valid_label)
 }
 
 /// The TLS-ALPN-01 digest: the SHA-256 of the key authorization, 64 hex characters. Checked here,
@@ -2615,23 +2801,109 @@ enum HelloRoute {
     Drop(&'static str),
 }
 
-/// The public TLS door's limits against slow or abundant clients.
+/// The public door's limits against slow or abundant clients.
 #[derive(Clone)]
 struct DoorLimits {
     /// One permit per connection, its handshake included.
     connections: Arc<Semaphore>,
     max_connections: usize,
-    /// The first request byte after the handshake, and every HTTP/1 request head, must arrive
-    /// within this.
+    /// The connections each peer address holds, taken at accept like the permit (A-86).
+    peer_connections: Arc<PeerSlots>,
+    /// Every HTTP/1 request head must arrive within this, the first one included (A-87).
     header_read_timeout: Duration,
+    /// What each connection must keep up while the edge waits on its peer (A-86).
+    pace: PaceLimits,
 }
 
 impl DoorLimits {
-    fn new(max_connections: usize, header_read_timeout: Duration) -> Self {
+    fn new(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        header_read_timeout: Duration,
+        pace: PaceLimits,
+    ) -> Self {
         Self {
             connections: Arc::new(Semaphore::new(max_connections)),
             max_connections,
+            peer_connections: PeerSlots::new(max_connections_per_ip),
             header_read_timeout,
+            pace,
+        }
+    }
+}
+
+/// How many connections, or downloads, one peer address may hold at once (A-86). An IPv6 peer
+/// counts by its /64, the block one subscriber gets; an IPv4-mapped address as its IPv4.
+struct PeerSlots {
+    /// 0: no cap.
+    max: usize,
+    held: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+}
+
+/// One slot of a `PeerSlots`, given back when dropped.
+struct PeerSlot {
+    slots: Arc<PeerSlots>,
+    /// `None` when there is no cap to count against.
+    key: Option<std::net::IpAddr>,
+}
+
+impl PeerSlots {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            held: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// A slot for `peer`, or `None` when it holds `max` already.
+    fn try_take(self: &Arc<Self>, peer: std::net::IpAddr) -> Option<PeerSlot> {
+        if self.max == 0 {
+            return Some(PeerSlot {
+                slots: Arc::clone(self),
+                key: None,
+            });
+        }
+        let key = match peer.to_canonical() {
+            std::net::IpAddr::V6(v6) => {
+                let [a, b, c, d, ..] = v6.segments();
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+            }
+            v4 => v4,
+        };
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = held.entry(key).or_insert(0);
+        if *count >= self.max {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot {
+            slots: Arc::clone(self),
+            key: Some(key),
+        })
+    }
+
+    #[cfg(test)]
+    fn held_by(&self, peer: std::net::IpAddr) -> usize {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get(&peer).copied().unwrap_or(0)
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
+        let mut held = self
+            .slots
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&key);
+            }
         }
     }
 }
@@ -2659,17 +2931,19 @@ impl RefusedConnections {
     }
 }
 
-/// The TLS accept loop: one task per connection, at most `limits.max_connections` at once. A
-/// connection over the cap is closed at once; a failed accept waits `ACCEPT_ERROR_BACKOFF`.
-async fn serve_tls_listener(
+/// The door's accept loop: one task per connection, at most `limits.max_connections` at once and
+/// at most `max_connections_per_ip` from one peer address, both counted before the handshake. A
+/// connection over either cap is closed at once; a failed accept waits `ACCEPT_ERROR_BACKOFF`.
+async fn serve_door(
     listener: TcpListener,
-    app: Router,
+    door: Door,
     tls: Arc<EdgeTls>,
     limits: DoorLimits,
 ) -> Result<(), SyEdgeError> {
     let mut refused = RefusedConnections::default();
+    let mut refused_peers = RefusedConnections::default();
     loop {
-        let (tcp, _peer) = match listener.accept().await {
+        let (tcp, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(error = %err, "sy-edge accept failed");
@@ -2677,10 +2951,25 @@ async fn serve_tls_listener(
                 continue;
             }
         };
+        let Some(peer_slot) = limits.peer_connections.try_take(peer.ip()) else {
+            drop(tcp);
+            if let Some(count) =
+                refused_peers.note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL)
+            {
+                tracing::warn!(
+                    peer = %peer.ip(),
+                    refused = count,
+                    max_connections_per_ip = limits.peer_connections.max,
+                    "sy-edge: a peer address at its connection cap; closing its new connections"
+                );
+            }
+            continue;
+        };
         let Ok(permit) = Arc::clone(&limits.connections).try_acquire_owned() else {
             drop(tcp);
             if let Some(count) = refused.note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL) {
                 tracing::warn!(
+                    peer = %peer.ip(),
                     refused = count,
                     max_connections = limits.max_connections,
                     "sy-edge: at its connection cap; closing new connections"
@@ -2688,61 +2977,52 @@ async fn serve_tls_listener(
             }
             continue;
         };
-        tokio::spawn(serve_tls_connection(
+        tokio::spawn(serve_door_connection(
             tcp,
-            app.clone(),
+            peer,
+            door.clone(),
             Arc::clone(&tls),
-            limits.header_read_timeout,
-            permit,
+            limits.clone(),
+            (permit, peer_slot),
         ));
     }
 }
 
-/// One connection, holding its permit to the end: the handshake (`accept_tls`), then hyper.
-/// hyper-util's HTTP/1-or-2 sniffing waits for bytes with no timeout of its own, so the first
-/// request byte must come within `header_read_timeout` here; after it, hyper's timer applies the
-/// same timeout to every HTTP/1 request head, an idle keep-alive connection included.
-async fn serve_tls_connection(
+/// One connection, holding its permit and its peer's slot to the end: the handshake
+/// (`accept_tls`) unless the door is plaintext, then HTTP (`serve_http`).
+async fn serve_door_connection(
     tcp: tokio::net::TcpStream,
-    app: Router,
+    peer: SocketAddr,
+    door: Door,
     tls: Arc<EdgeTls>,
-    header_read_timeout: Duration,
-    _permit: OwnedSemaphorePermit,
+    limits: DoorLimits,
+    _held: (OwnedSemaphorePermit, PeerSlot),
 ) {
-    let Some(tls_stream) = accept_tls(tcp, &tls).await else {
+    track_delivery(&tcp);
+    if tls.mode == TlsMode::Plaintext {
+        serve_http(tcp, peer, door, &limits).await;
         return;
-    };
-    // The bytes read here stay buffered for hyper; writes pass straight through.
-    let mut stream = tokio::io::BufReader::new(tls_stream);
-    match tokio::time::timeout(
-        header_read_timeout,
-        tokio::io::AsyncBufReadExt::fill_buf(&mut stream),
-    )
-    .await
-    {
-        Ok(Ok(first)) if !first.is_empty() => {}
-        Ok(Ok(_)) => return,
-        Ok(Err(err)) => {
-            tracing::debug!(error = %err, "sy-edge tls connection error");
-            return;
-        }
-        Err(_) => {
-            tracing::debug!("sy-edge closed a connection that sent nothing after its handshake");
-            return;
-        }
     }
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let service = hyper_util::service::TowerToHyperService::new(app);
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(header_read_timeout);
-    if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
-        tracing::debug!(error = %err, "sy-edge tls connection error");
+    if let Some(stream) = accept_tls(tcp, &tls).await {
+        serve_http(stream, peer, door, &limits).await;
     }
 }
+
+/// A-86: an accepted socket reports itself writable only once less than 16 KiB of what was written
+/// is still unsent (`TCP_NOTSENT_LOWAT`), so the write side of `Pace` follows what reaches the
+/// peer. Otherwise Linux wakes a writer only when its send queue drains to two thirds of a buffer
+/// that grows with the congestion window, and one wait on a slow mobile link could outlast the
+/// pace's whole credit. The ingress runs Linux; elsewhere nothing changes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn track_delivery(tcp: &tokio::net::TcpStream) {
+    const NOTSENT_LOWAT: u32 = 16 * 1024;
+    if let Err(err) = socket2::SockRef::from(tcp).set_tcp_notsent_lowat(NOTSENT_LOWAT) {
+        tracing::debug!(error = %err, "sy-edge could not set TCP_NOTSENT_LOWAT");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn track_delivery(_tcp: &tokio::net::TcpStream) {}
 
 /// Read the ClientHello, choose a configuration and finish the handshake, all under ONE timeout.
 /// `Some` only for the main path: a challenge is answered and closed here, and a dropped hello
@@ -2867,27 +3147,34 @@ async fn run_awaiting_rereads(tls: Arc<EdgeTls>, schedule: AwaitingSchedule) {
     }
 }
 
-/// The three TLS commands (§4), from `SY.admin@motherbee` only. They arrive on their own channel
-/// (`RPC_CH_TLS`) and each runs in its own task over the shared state, so they never wait behind
-/// `EDGE_PUBLISH_BLOB` (up to 60 s) or a secret resolution in the sequential system loop.
+/// The door's commands, from `SY.admin@motherbee` only: the three TLS ones (§4) and
+/// `EDGE_WEB_ROUTES`. They arrive on their own channel (`RPC_CH_TLS`) and each runs in its own
+/// task over the shared state, so they never wait behind `EDGE_PUBLISH_BLOB` (up to 60 s) or a
+/// secret resolution in the sequential system loop.
 async fn run_tls_commands(
     mut commands: RpcCommandReceiver,
     sender: NodeSender,
     tls: Option<Arc<EdgeTls>>,
+    web: Arc<WebRouteTable>,
     ttl: u8,
 ) {
     while let Some(msg) = commands.recv().await {
         let sender = sender.clone();
         let tls = tls.clone();
+        let web = Arc::clone(&web);
         tokio::spawn(async move {
-            if let Some((response, payload)) = tls_command_reply(tls.as_deref(), &msg).await {
+            if let Some((response, payload)) = tls_command_reply(tls.as_deref(), &web, &msg).await {
                 send_edge_reply(&sender, &msg, response, payload, ttl).await;
             }
         });
     }
 }
 
-async fn tls_command_reply(tls: Option<&EdgeTls>, msg: &Message) -> Option<(&'static str, Value)> {
+async fn tls_command_reply(
+    tls: Option<&EdgeTls>,
+    web: &WebRouteTable,
+    msg: &Message,
+) -> Option<(&'static str, Value)> {
     match msg.meta.msg.as_deref() {
         Some(MSG_EDGE_TLS_STATUS) => {
             Some((MSG_EDGE_TLS_STATUS_RESPONSE, tls_status_answer(tls, msg)))
@@ -2899,6 +3186,10 @@ async fn tls_command_reply(tls: Option<&EdgeTls>, msg: &Message) -> Option<(&'st
         Some(MSG_EDGE_ACME_CHALLENGE) => Some((
             MSG_EDGE_ACME_CHALLENGE_RESPONSE,
             acme_challenge_answer(tls, msg),
+        )),
+        Some(MSG_EDGE_WEB_ROUTES) => Some((
+            MSG_EDGE_WEB_ROUTES_RESPONSE,
+            web_routes_answer(tls, web, msg),
         )),
         other => {
             tracing::warn!(msg = ?other, "sy-edge: unexpected message on the TLS command channel");
@@ -3192,6 +3483,757 @@ async fn resolve_secrets(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Web hosts (docs/io-web-v2.md §11.1): the hosts the door serves only through io.web, never
+// through its own routes. SY.admin pushes the full set (`EDGE_WEB_ROUTES`) every minute; the edge
+// keeps it on disk, so a restart serves it at once.
+// ---------------------------------------------------------------------------
+
+/// The only upstream a web host may name: io.web on the motherbee (io-web-v2 §3). The edge takes
+/// no other, so a route can never point the door at a host or a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum WebUpstream {
+    #[serde(rename = "io.web")]
+    IoWeb,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebRoute {
+    host: String,
+    upstream: WebUpstream,
+}
+
+/// The full set of web hosts: the `EDGE_WEB_ROUTES` payload, the set its answer names, and the
+/// file the edge keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebRoutes {
+    routes: Vec<WebRoute>,
+}
+
+impl WebRoutes {
+    fn hosts(&self) -> Vec<&str> {
+        self.routes
+            .iter()
+            .map(|route| route.host.as_str())
+            .collect()
+    }
+}
+
+/// What one `EDGE_WEB_ROUTES` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebRoutesApplied {
+    /// The set differs from the one served before.
+    changed: bool,
+    /// The file holds the set. When a write fails, the set is served anyway and the next push
+    /// writes it again.
+    persisted: bool,
+}
+
+/// The web hosts the door serves: read by every request, replaced whole by `EDGE_WEB_ROUTES`,
+/// kept at `web_routes_path`.
+struct WebRouteTable {
+    path: PathBuf,
+    routes: RwLock<WebRoutes>,
+    /// What the file holds; `None` when unknown (unreadable, invalid, or a write that failed), so
+    /// the next push writes it. Held for a whole replace: one at a time.
+    on_disk: std::sync::Mutex<Option<WebRoutes>>,
+}
+
+impl WebRouteTable {
+    /// The set the file holds. No file is no web host. An unreadable or corrupt file is an ERROR
+    /// and starts empty, until SY.admin pushes the set again, within a minute; meanwhile a web
+    /// host is an unknown host to the door (`host_route`), which answers it 404. The main name is
+    /// checked once a certificate is served (`forget_main_name`).
+    fn load(path: PathBuf) -> Self {
+        let read = match std::fs::read(&path) {
+            Ok(raw) => serde_json::from_slice::<WebRoutes>(&raw)
+                .map_err(|err| err.to_string())
+                .and_then(|routes| validate_web_routes(routes, &[])),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(WebRoutes::default()),
+            Err(err) => Err(err.to_string()),
+        };
+        let (routes, on_disk) = match read {
+            Ok(routes) => (routes.clone(), Some(routes)),
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %err,
+                    "sy-edge: the web routes file is CORRUPT or unreadable; serving no web host until SY.admin pushes the set again (within a minute)"
+                );
+                (WebRoutes::default(), None)
+            }
+        };
+        if !routes.routes.is_empty() {
+            tracing::info!(path = %path.display(), hosts = ?routes.hosts(), "sy-edge web hosts loaded");
+        }
+        Self {
+            path,
+            routes: RwLock::new(routes),
+            on_disk: std::sync::Mutex::new(on_disk),
+        }
+    }
+
+    fn snapshot(&self) -> WebRoutes {
+        self.routes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The file was read before any certificate was served: with one served, drop a web host
+    /// that is the edge's main name (`validate_web_routes` refuses it in a push). The file is
+    /// written again at the next push.
+    fn forget_main_name(&self, certified: &[String]) {
+        let Some(main) = main_certified_name(certified) else {
+            return;
+        };
+        let mut on_disk = self.on_disk.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut live = self.routes.write().unwrap_or_else(PoisonError::into_inner);
+        if live.routes.iter().any(|route| route.host == main) {
+            live.routes.retain(|route| route.host != main);
+            *on_disk = None;
+            tracing::error!(
+                path = %self.path.display(),
+                main = %main,
+                "sy-edge: the web routes file names the edge's main name; that route is dropped, the door's own routes stay on it"
+            );
+        }
+    }
+
+    /// Whether `host`, in `canonical_host` form, is a web host.
+    fn serves(&self, host: &str) -> bool {
+        self.routes
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .routes
+            .iter()
+            .any(|route| route.host == host)
+    }
+
+    /// Serve `routes` (already validated) from now on, and write them unless the file holds them.
+    fn replace(&self, routes: WebRoutes) -> WebRoutesApplied {
+        let mut on_disk = self.on_disk.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = {
+            let mut live = self.routes.write().unwrap_or_else(PoisonError::into_inner);
+            let changed = *live != routes;
+            *live = routes.clone();
+            changed
+        };
+        if on_disk.as_ref() == Some(&routes) {
+            return WebRoutesApplied {
+                changed,
+                persisted: true,
+            };
+        }
+        let written = serde_json::to_vec_pretty(&routes)
+            .map_err(|err| format!("serialize web routes: {err}"))
+            .and_then(|data| write_state_file(&self.path, &data));
+        match written {
+            Ok(()) => {
+                *on_disk = Some(routes);
+                WebRoutesApplied {
+                    changed,
+                    persisted: true,
+                }
+            }
+            Err(err) => {
+                tracing::error!(path = %self.path.display(), error = %err, "sy-edge could not keep the web hosts on disk; serving them anyway, the next push writes them again");
+                *on_disk = None;
+                WebRoutesApplied {
+                    changed,
+                    persisted: false,
+                }
+            }
+        }
+    }
+}
+
+/// A requested set of web hosts in canonical form (sorted, each host in `canonical_host` form),
+/// or why it is refused: a host that is not a DNS name (a port other than 443, a wildcard, an IP
+/// literal), one named twice, or the edge's main name. The upstream is io.web, the only one
+/// `WebUpstream` admits.
+///
+/// `certified`: the DNS names of the certificate the door serves (none while it serves none),
+/// from which `main_certified_name` tells the main name when it can. A web host there would leave
+/// `/e/` and `/public/` without it.
+fn validate_web_routes(requested: WebRoutes, certified: &[String]) -> Result<WebRoutes, String> {
+    let mut routes: Vec<WebRoute> = Vec::with_capacity(requested.routes.len());
+    for route in requested.routes {
+        let host = canonical_host(&route.host)
+            .ok()
+            .filter(|host| host.port.is_none() && is_dns_host_name(&host.name))
+            .map(|host| host.name)
+            .ok_or_else(|| {
+                format!(
+                    "web host must be a DNS name (no port but 443, no wildcard, no IP literal), got '{}'",
+                    route.host
+                )
+            })?;
+        if routes.iter().any(|known| known.host == host) {
+            return Err(format!("web host '{host}' is declared twice"));
+        }
+        routes.push(WebRoute {
+            host,
+            upstream: route.upstream,
+        });
+    }
+    routes.sort_by(|left, right| left.host.cmp(&right.host));
+    if let Some(main) = main_certified_name(certified) {
+        if routes.iter().any(|route| route.host == main) {
+            return Err(format!(
+                "web host '{main}' is the edge's main name; its own routes (/e/, /public/) live there"
+            ));
+        }
+    }
+    Ok(WebRoutes { routes })
+}
+
+/// The edge's main name, when its certificate tells it: its only DNS name, or the one every other
+/// name lies under (SY.admin derives each web host from it: `archi.` + the main host). `None`
+/// when no certificate is served (awaiting, plaintext) or the names are unrelated.
+fn main_certified_name(names: &[String]) -> Option<&str> {
+    names
+        .iter()
+        .find(|candidate| {
+            !candidate.starts_with("*.")
+                && names.iter().all(|name| {
+                    name == *candidate
+                        || name
+                            .strip_suffix(candidate.as_str())
+                            .is_some_and(|label| label.ends_with('.'))
+                })
+        })
+        .map(String::as_str)
+}
+
+/// `EDGE_WEB_ROUTES`: replace the web hosts with the full set it carries. The answer names the set
+/// served from now on, `changed` and `persisted`.
+fn web_routes_answer(tls: Option<&EdgeTls>, web: &WebRouteTable, msg: &Message) -> Value {
+    let outcome: Result<WebRoutes, String> = (|| {
+        let tls = tls_command_edge(tls, msg, MSG_EDGE_WEB_ROUTES)?;
+        let requested: WebRoutes = serde_json::from_value(msg.payload.clone())
+            .map_err(|err| format!("invalid EDGE_WEB_ROUTES payload: {err}"))?;
+        let certified = tls
+            .served()
+            .map(|served| served.leaf.names.clone())
+            .unwrap_or_default();
+        validate_web_routes(requested, &certified)
+    })();
+    match outcome {
+        Ok(routes) => {
+            let applied = web.replace(routes.clone());
+            if applied.changed {
+                tracing::info!(hosts = ?routes.hosts(), persisted = applied.persisted, trace_id = %msg.routing.trace_id, "sy-edge web hosts replaced (EDGE_WEB_ROUTES)");
+            }
+            json!({
+                "status": "ok",
+                "routes": routes.routes,
+                "changed": applied.changed,
+                "persisted": applied.persisted,
+            })
+        }
+        Err(err) => tls_command_error(MSG_EDGE_WEB_ROUTES, msg, err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP on the door (docs/io-web-v2.md §11.1): hyper's HTTP/1 server, whose head timer starts
+// before the first byte (A-87); a stream that keeps a minimum pace (A-86); the peer's address for
+// the handlers; and every request dispatched by its host before any path route.
+// ---------------------------------------------------------------------------
+
+/// One connection's HTTP: HTTP/1 only, with no protocol sniffing, no HTTP/2 and no upgrade. Its
+/// head timer starts before the first byte, so a client that sends one byte, or an h2 preface,
+/// is closed at `header_read_timeout` at the latest (A-87); the same timer closes an idle
+/// keep-alive connection. The stream is paced (`PacedStream`, A-86).
+async fn serve_http<IO>(io: IO, peer: SocketAddr, door: Door, limits: &DoorLimits)
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let demand = BodyDemand::default();
+    let stream = PacedStream::new(io, limits.pace, demand.clone());
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let req = req.map(|body| Body::new(DemandBody::new(body, demand.clone())));
+        door.clone().handle(req, peer)
+    });
+    let mut http = hyper::server::conn::http1::Builder::new();
+    // 64 KiB of read and write buffer per connection (hyper's default is about 400 KiB): a head
+    // over it is refused, and a peer that stops reading holds that much at most.
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .max_buf_size(64 * 1024);
+    if let Err(err) = http
+        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+        .await
+    {
+        tracing::debug!(peer = %peer, error = %err, "sy-edge connection error");
+    }
+}
+
+/// What the door serves: its own routes (`/e/`, `/public/`, `/healthz`), and the web hosts.
+#[derive(Clone)]
+struct Door {
+    main: Router,
+    web: Arc<WebRouteTable>,
+    /// The certificate served tells the door its main name (`host_route`).
+    tls: Arc<EdgeTls>,
+}
+
+impl Door {
+    /// One request, by its host before any path (io-web-v2 §11.1, host-posture §4.4): only the
+    /// door's own hosts reach its routes (`host_route`); a web host answers 404 for every path in
+    /// 0.1.84 (the proxy to io.web comes in 0.1.85), and so does any other host. Every answer
+    /// carries the security headers (`with_security_headers`). The handlers find the peer's
+    /// address in `ConnectInfo<SocketAddr>`.
+    async fn handle(self, mut req: Request, peer: SocketAddr) -> Result<Response, Infallible> {
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let route = match request_host(req.uri(), req.headers()) {
+            Ok(host) => {
+                let served = self.tls.served();
+                let certified = served.as_ref().map(|served| served.leaf.names.as_slice());
+                host_route(host.as_ref(), &self.web, certified)
+            }
+            Err(reason) => {
+                tracing::debug!(peer = %peer, reason, "sy-edge refused a request for its host");
+                return Ok(http_error(
+                    StatusCode::BAD_REQUEST,
+                    "BAD_HOST",
+                    "invalid host",
+                ));
+            }
+        };
+        let response = match route {
+            HostRoute::Door => {
+                hyper::service::Service::call(
+                    &hyper_util::service::TowerToHyperService::new(self.main),
+                    req,
+                )
+                .await?
+            }
+            HostRoute::Web | HostRoute::Unknown => {
+                http_error(StatusCode::NOT_FOUND, "NOT_FOUND", "not found")
+            }
+        };
+        Ok(with_security_headers(response))
+    }
+}
+
+/// Where one request goes, by its host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostRoute {
+    /// The door's own routes.
+    Door,
+    /// A web host: 404 in 0.1.84, io.web's proxy in 0.1.85.
+    Web,
+    /// A host the edge does not serve: 404 (host-posture §4.4).
+    Unknown,
+}
+
+/// The door's own routes answer requests with no host, for an IP literal, and for the edge's main
+/// name on any port, which is never a web host. A web host, on any port, is one. With a
+/// certificate served, any other host is unknown; with none (plaintext, awaiting) the edge cannot
+/// tell its main name, and every other host keeps the door's routes. `certified`: the DNS names of
+/// the certificate served. When they do not tell a main name (`main_certified_name`), each of them
+/// that is not a web host is the door's.
+fn host_route(
+    host: Option<&RequestHost>,
+    web: &WebRouteTable,
+    certified: Option<&[String]>,
+) -> HostRoute {
+    let Some(host) = host else {
+        return HostRoute::Door;
+    };
+    if host.is_ip_literal() {
+        return HostRoute::Door;
+    }
+    let main = certified.and_then(main_certified_name);
+    if main == Some(host.name.as_str()) {
+        return HostRoute::Door;
+    }
+    if web.serves(&host.name) {
+        return HostRoute::Web;
+    }
+    match certified {
+        None => HostRoute::Door,
+        Some(_) if main.is_some() => HostRoute::Unknown,
+        Some(names) if names.contains(&host.name) => HostRoute::Door,
+        Some(_) => HostRoute::Unknown,
+    }
+}
+
+/// Add each of `SECURITY_HEADERS` that a response lacks, so a handler's own header stays. A
+/// published artifact keeps the content policy it chose (`OwnContentPolicy`).
+fn with_security_headers(mut response: Response) -> Response {
+    let own_policy = response.extensions().get::<OwnContentPolicy>().is_some();
+    let headers = response.headers_mut();
+    for (name, value) in SECURITY_HEADERS {
+        if own_policy && name == header::CONTENT_SECURITY_POLICY.as_str() {
+            continue;
+        }
+        headers
+            .entry(header::HeaderName::from_static(name))
+            .or_insert_with(|| HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// A request's host in the door's form (`canonical_host`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestHost {
+    /// Lowercase, one trailing dot dropped; an IPv6 literal keeps its brackets.
+    name: String,
+    /// `None` for 443 or no port.
+    port: Option<u16>,
+}
+
+impl RequestHost {
+    fn is_ip_literal(&self) -> bool {
+        self.name
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+    }
+}
+
+/// The host one request is for: the authority of an absolute-form target when there is one,
+/// otherwise its Host header, both in `canonical_host` form. `Ok(None)`: no host at all (an
+/// HTTP/1.0 request, or an empty Host). `Err`: two Host headers, a Host the target's authority
+/// contradicts, or one that does not parse; the door answers 400.
+fn request_host(uri: &Uri, headers: &HeaderMap) -> Result<Option<RequestHost>, &'static str> {
+    let mut values = headers.get_all(header::HOST).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err("two Host headers");
+    }
+    let from_header = match value {
+        None => None,
+        Some(value) => {
+            let text = value
+                .to_str()
+                .map_err(|_| "a Host that is not text")?
+                .trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(canonical_host(text)?)
+            }
+        }
+    };
+    let Some(authority) = uri.authority() else {
+        return Ok(from_header);
+    };
+    let target = canonical_host(authority.as_str())?;
+    if from_header.as_ref().is_some_and(|host| *host != target) {
+        return Err("a Host that contradicts the request target");
+    }
+    Ok(Some(target))
+}
+
+/// One authority in the door's form: the name lowercase with one trailing dot dropped, and the
+/// port unless it is 443 (or empty, RFC 3986 §6.2.3).
+fn canonical_host(raw: &str) -> Result<RequestHost, &'static str> {
+    let authority: axum::http::uri::Authority =
+        raw.parse().map_err(|_| "a host that does not parse")?;
+    let text = authority.as_str();
+    if text.contains('@') {
+        return Err("a host with user information");
+    }
+    let name = authority.host().to_ascii_lowercase();
+    let name = name.strip_suffix('.').unwrap_or(&name).to_string();
+    if name.is_empty() {
+        return Err("an empty host");
+    }
+    let port = match text[authority.host().len()..].strip_prefix(':') {
+        None | Some("") => None,
+        Some(port) => match port.parse::<u16>() {
+            Ok(443) => None,
+            Ok(port) => Some(port),
+            Err(_) => return Err("a port that is not a number"),
+        },
+    };
+    Ok(RequestHost { name, port })
+}
+
+/// A-86: how slowly a connection's peer may move bytes while the edge waits on it.
+#[derive(Debug, Clone, Copy)]
+struct PaceLimits {
+    /// The longest the edge waits on a peer that moves nothing. Also the most credit a peer can
+    /// hold: bytes moved early never buy a longer stall later.
+    idle: Duration,
+    /// Bytes per second: each `min_rate` bytes moved buy one second of waiting.
+    min_rate: u64,
+}
+
+/// One direction of a connection under `PaceLimits`. Its credit drains while the edge waits on
+/// the peer and refills by one second per `min_rate` bytes moved, up to `idle`: a peer that stops
+/// is cut after `idle`, and one that keeps moving bytes slower than `min_rate` a little later.
+/// Time the edge spends on its own work (a handler, an upstream) drains nothing.
+struct Pace {
+    limits: PaceLimits,
+    credit: Duration,
+    /// When the current wait began, or when it was last drained; `None` while not waiting.
+    waiting_since: Option<Instant>,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Pace {
+    fn new(limits: PaceLimits) -> Self {
+        Self {
+            limits,
+            credit: limits.idle,
+            waiting_since: None,
+            timer: None,
+        }
+    }
+
+    /// The edge waits on the peer at `now`: the credit left (none: cut the connection).
+    fn wait(&mut self, now: Instant) -> Duration {
+        if let Some(since) = self.waiting_since.replace(now) {
+            self.credit = self
+                .credit
+                .saturating_sub(now.saturating_duration_since(since));
+        }
+        self.credit
+    }
+
+    /// The wait ended at `now`, with `bytes` moved (none for an end of file, a finished flush,
+    /// or a wait the edge gave up because it is its own turn).
+    fn moved(&mut self, bytes: usize, now: Instant) {
+        if let Some(since) = self.waiting_since.take() {
+            self.credit = self
+                .credit
+                .saturating_sub(now.saturating_duration_since(since));
+        }
+        let earned = Duration::from_nanos(
+            (bytes as u64).saturating_mul(1_000_000_000) / self.limits.min_rate.max(1),
+        );
+        self.credit = self.credit.saturating_add(earned).min(self.limits.idle);
+    }
+
+    /// The edge waits on the peer: `Ready` with the error that ends the connection once the
+    /// credit is spent, otherwise `Pending` with a timer armed for the moment it would be.
+    fn poll_spent(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Error> {
+        loop {
+            let now = Instant::now();
+            let left = self.wait(now);
+            if left.is_zero() {
+                return Poll::Ready(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the peer kept the connection below the door's minimum pace",
+                ));
+            }
+            let deadline = now + left;
+            let timer = self
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+            timer.as_mut().reset(deadline);
+            if std::future::Future::poll(timer.as_mut(), cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+/// Whether a handler waits for request body bytes on this connection: set by its `DemandBody`,
+/// read by its `PacedStream`. hyper reads the first body bytes before the handler runs, so a read
+/// may go pending while nobody waits yet; it leaves its waker here, and the moment a handler starts
+/// waiting the stream is polled again and paced. A body that never starts is cut like a slow one.
+#[derive(Clone, Default)]
+struct BodyDemand(Arc<BodyDemandState>);
+
+#[derive(Default)]
+struct BodyDemandState {
+    wanted: std::sync::atomic::AtomicBool,
+    reader: futures::task::AtomicWaker,
+}
+
+impl BodyDemand {
+    fn set(&self, wanted: bool) {
+        self.0
+            .wanted
+            .store(wanted, std::sync::atomic::Ordering::SeqCst);
+        if wanted {
+            self.0.reader.wake();
+        }
+    }
+
+    fn wanted(&self) -> bool {
+        self.0.wanted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The stream's read went pending: wake it when a handler starts waiting for the body.
+    fn park_reader(&self, waker: &std::task::Waker) {
+        self.0.reader.register(waker);
+    }
+}
+
+/// A-86: every door connection's stream. A write, flush or shutdown that waits on the peer drains
+/// the write `Pace`; a read drains the read `Pace` only while a handler waits for body bytes
+/// (`BodyDemand`). hyper also reads to notice an end of file while the edge works on a request,
+/// and that wait is the edge's, never the peer's. A peer below the pace gets an error, which ends
+/// the connection, its handler and the permits they hold: a download slot, an `/e/` slot.
+struct PacedStream<IO> {
+    inner: IO,
+    read: Pace,
+    write: Pace,
+    demand: BodyDemand,
+}
+
+impl<IO> PacedStream<IO> {
+    fn new(inner: IO, limits: PaceLimits, demand: BodyDemand) -> Self {
+        Self {
+            inner,
+            read: Pace::new(limits),
+            write: Pace::new(limits),
+            demand,
+        }
+    }
+
+    /// The outcome of a write, a flush or a shutdown: progress refills the write credit, a wait
+    /// drains it.
+    fn paced_write<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        polled: Poll<std::io::Result<T>>,
+        bytes: impl Fn(&T) -> usize,
+    ) -> Poll<std::io::Result<T>> {
+        match polled {
+            Poll::Ready(Ok(value)) => {
+                self.write.moved(bytes(&value), Instant::now());
+                Poll::Ready(Ok(value))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => self.write.poll_spent(cx).map(Err),
+        }
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for PacedStream<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                this.read.moved(buf.filled().len() - before, Instant::now());
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                // Parked before the check, so a handler that starts waiting right after it still
+                // wakes this read.
+                this.demand.park_reader(cx.waker());
+                if this.demand.wanted() {
+                    this.read.poll_spent(cx).map(Err)
+                } else {
+                    this.read.moved(0, Instant::now());
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for PacedStream<IO> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.paced_write(cx, polled, |written| *written)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.paced_write(cx, polled, |written| *written)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_flush(cx);
+        this.paced_write(cx, polled, |_| 0)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.paced_write(cx, polled, |_| 0)
+    }
+}
+
+/// A request body that tells its connection's `PacedStream` when its handler waits for bytes.
+struct DemandBody<B> {
+    inner: B,
+    demand: BodyDemand,
+    /// This body set the demand, and clears it when it goes.
+    wanting: bool,
+}
+
+impl<B> DemandBody<B> {
+    fn new(inner: B, demand: BodyDemand) -> Self {
+        Self {
+            inner,
+            demand,
+            wanting: false,
+        }
+    }
+}
+
+impl<B> HttpBody for DemandBody<B>
+where
+    B: HttpBody + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        let wanting = polled.is_pending();
+        if wanting != this.wanting {
+            this.wanting = wanting;
+            this.demand.set(wanting);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for DemandBody<B> {
+    fn drop(&mut self) {
+        if self.wanting {
+            self.demand.set(false);
+        }
+    }
+}
+
 async fn invoke_root(
     State(state): State<Arc<FrontendState>>,
     AxumPath(ich): AxumPath<String>,
@@ -3214,20 +4256,23 @@ async fn serve_public_artifact(
     req: Request,
 ) -> Response {
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
-        return Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(header::ALLOW, "GET, HEAD")
-            .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return built(
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(header::ALLOW, "GET, HEAD")
+                .body(Body::empty()),
+        );
     }
     if !is_lower_hex_64(&key) {
         return public_not_found();
     }
+    // The table holds the SHA-256 of each key, never the key (A-82).
+    let key_sha256 = sha256_hex(&key);
     let row = match state
         .public_registry
         .read()
         .ok()
-        .and_then(|guard| guard.get(&key).cloned())
+        .and_then(|guard| guard.get(&key_sha256).cloned())
     {
         Some(row) => row,
         None => return public_not_found(),
@@ -3242,15 +4287,43 @@ async fn serve_public_artifact(
 
     let etag = format!("\"{}\"", row.sha256);
     if request_etag_matches(req.headers(), &etag) {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, etag)
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return artifact_response(built(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, etag)
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::empty()),
+        ));
     }
+    // A-86: one address holds at most `public_max_inflight_per_ip` of the download slots.
+    let peer_slot = match request_peer_ip(&req) {
+        Some(ip) => match state.public_peer_slots.try_take(ip) {
+            Some(slot) => Some(slot),
+            None => {
+                let refused = state
+                    .refused_downloads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL);
+                if let Some(count) = refused {
+                    tracing::warn!(
+                        peer = %ip,
+                        refused = count,
+                        max_per_ip = state.public_peer_slots.max,
+                        "sy-edge: a peer address at its download cap; refusing its new downloads"
+                    );
+                }
+                return http_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "PUBLIC_PEER_BUSY",
+                    "too many downloads from this address",
+                );
+            }
+        },
+        None => None,
+    };
     let permit = match Arc::clone(&state.public_inflight).try_acquire_owned() {
-        Ok(permit) => permit,
+        Ok(permit) => (permit, peer_slot),
         Err(_) => {
             return http_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -3285,12 +4358,13 @@ async fn serve_public_artifact(
     ) {
         Ok(range) => range,
         Err(()) => {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header(header::CONTENT_RANGE, format!("bytes */{}", row.size))
-                .header(header::ACCEPT_RANGES, "bytes")
-                .body(Body::empty())
-                .unwrap_or_else(|_| Response::new(Body::empty()));
+            return built(
+                Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", row.size))
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .body(Body::empty()),
+            );
         }
     };
     let content_length = if row.size == 0 { 0 } else { end - start + 1 };
@@ -3332,9 +4406,7 @@ async fn serve_public_artifact(
     }
     if req.method() == Method::HEAD || content_length == 0 {
         drop(permit);
-        return builder
-            .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()));
+        return artifact_response(built(builder.body(Body::empty())));
     }
 
     let mut file = tokio::fs::File::from_std(file);
@@ -3342,9 +4414,11 @@ async fn serve_public_artifact(
         tracing::warn!(publication_id = %row.publication_id, error = %err, "public artifact seek failed");
         return public_not_found();
     }
+    // The download slot and the peer's slot go with the last byte, or with the connection.
+    type DownloadSlots = (OwnedSemaphorePermit, Option<PeerSlot>);
     let stream = futures::stream::try_unfold(
         (file, permit, content_length),
-        |(mut file, permit, remaining): (tokio::fs::File, OwnedSemaphorePermit, u64)| async move {
+        |(mut file, permit, remaining): (tokio::fs::File, DownloadSlots, u64)| async move {
             if remaining == 0 {
                 return Ok(None);
             }
@@ -3363,9 +4437,32 @@ async fn serve_public_artifact(
             )))
         },
     );
-    builder
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+    artifact_response(built(builder.body(Body::from_stream(stream))))
+}
+
+/// Marks a response whose content policy the artifact decides (`content_policy`): the door adds
+/// none of its own (`with_security_headers`). A sandboxed page carries its own CSP; a PDF or an
+/// image keeps none, since a `default-src 'none'` can stop a browser's viewer, and artifacts may be
+/// framed.
+#[derive(Debug, Clone, Copy)]
+struct OwnContentPolicy;
+
+fn artifact_response(mut response: Response) -> Response {
+    response.extensions_mut().insert(OwnContentPolicy);
+    response
+}
+
+/// A response the edge built itself. One it could not build (an invalid header value, say) is a
+/// 500 with the security headers, never an empty 200 (A-83).
+fn built(response: Result<Response, axum::http::Error>) -> Response {
+    response.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "sy-edge could not build a response; answering 500");
+        http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "internal error",
+        )
+    })
 }
 
 fn public_not_found() -> Response {
@@ -3467,6 +4564,7 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+    let peer = request_peer(&req);
 
     // 1. Registry lookup — the ICH (URL) is the first capability gate. Clone the
     //    row out of the lock so nothing is held across the inward await.
@@ -3550,15 +4648,29 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         }
     }
 
-    // 4. Body — inline only, capped; the envelope check below is the hard gate.
-    let body = match to_bytes(req.into_body(), HTTP_ENVELOPE_INLINE_LIMIT_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    // 4. Body — inline only, capped; the envelope check below is the hard gate. A body that
+    //    comes slower than the door's pace ends with the connection (A-86, `PacedStream`), and
+    //    one that is not whole within `body_timeout` ends here.
+    let read = tokio::time::timeout(
+        state.body_timeout,
+        to_bytes(req.into_body(), HTTP_ENVELOPE_INLINE_LIMIT_BYTES),
+    );
+    let body = match read.await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) if !timed_out(&err) => {
             return http_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "BODY_TOO_LARGE",
                 "request body exceeds the inline limit",
             )
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::debug!(ich = %ich, peer = %peer, "sy-edge: an /e/ request body came too slowly");
+            return http_error(
+                StatusCode::REQUEST_TIMEOUT,
+                "BODY_TIMEOUT",
+                "request body too slow",
+            );
         }
     };
     let (body_inline, body_encoding) = if body.is_empty() {
@@ -3670,10 +4782,12 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         payload,
     };
     if let Err(err) = ensure_http_envelope_within_limit(&message) {
+        // A-88: the sizes stay in the edge's log.
+        tracing::debug!(ich = %ich, peer = %peer, error = %err, "sy-edge: an /e/ request does not fit the mesh envelope");
         return http_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "REQ_TOO_LARGE",
-            &err.to_string(),
+            "request too large",
         );
     }
 
@@ -3714,9 +4828,43 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         Err(err) => {
             let status = StatusCode::from_u16(rpc_error_to_http_status(&err))
                 .unwrap_or(StatusCode::BAD_GATEWAY);
-            http_error(status, rpc_error_code(&err), &err.to_string())
+            let code = rpc_error_code(&err);
+            // A-88: the trace, the target and the message family stay in the edge's log; the
+            // internet gets the fixed answer of the code.
+            tracing::warn!(ich = %ich, peer = %peer, code, error = %err, "sy-edge: an /e/ request got no answer from its channel");
+            http_error(status, code, rpc_error_message(&err))
         }
     }
+}
+
+/// The client's address, as the door's accept loop saw it (`Door::handle`), for the logs.
+fn request_peer(req: &Request) -> String {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| peer.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// The client's IP address, for the caps per address.
+fn request_peer_ip(req: &Request) -> Option<std::net::IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| peer.ip())
+}
+
+/// Whether an I/O timeout is behind `err`: the door's pace cut the stream (`PacedStream`).
+fn timed_out(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(err);
+    while let Some(err) = cause {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        cause = err.source();
+    }
+    false
 }
 
 /// Await the handler's reply correlated purely by `trace_id`. The reply family is
@@ -3754,6 +4902,17 @@ fn rpc_error_code(err: &RpcError) -> &'static str {
         RpcError::Node(_) => "ROUTER_ERROR",
         RpcError::InvalidResponse(_) => "INVALID_HANDLER_RESPONSE",
         _ => "HANDLER_ERROR",
+    }
+}
+
+/// The fixed message of each `rpc_error_code` (A-88): what failed, never the trace, the target or
+/// the message family that `RpcError`'s text carries.
+fn rpc_error_message(err: &RpcError) -> &'static str {
+    match err {
+        RpcError::Timeout { .. } => "the channel did not answer in time",
+        RpcError::Unreachable { .. } | RpcError::TtlExceeded { .. } => "the channel is unreachable",
+        RpcError::Disconnected | RpcError::Node(_) => "the channel is unavailable",
+        _ => "the channel failed to answer",
     }
 }
 
@@ -3932,14 +5091,37 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn http_error(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = json!({ "ok": false, "error_code": code, "message": message }).to_string();
+/// The headers on every answer the edge writes itself: its errors, a web host's 404 and the 500
+/// of a response it could not build (A-83). Nothing is cached, sniffed, framed, indexed or
+/// referred.
+const SECURITY_HEADERS: [(&str, &str); 5] = [
+    ("cache-control", "no-store"),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    ("x-robots-tag", "noindex, nofollow, noarchive"),
     (
+        "content-security-policy",
+        "default-src 'none'; frame-ancestors 'none'",
+    ),
+];
+
+/// One of the edge's own error answers. Its message is fixed text, never an error's detail, which
+/// goes to the edge's log only (A-88).
+fn http_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    let body = json!({ "ok": false, "error_code": code, "message": message }).to_string();
+    let mut response = (
         status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
-        .into_response()
+        .into_response();
+    for (name, value) in SECURITY_HEADERS {
+        response.headers_mut().insert(
+            header::HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
 }
 
 #[cfg(test)]
@@ -4630,10 +5812,15 @@ mod tests {
         assert_eq!(normalize_extra_path("/already"), "/already");
     }
 
+    /// The capability key of `sample_public_row`.
+    fn sample_key() -> String {
+        "ab".repeat(32)
+    }
+
     fn sample_public_row(data: &[u8]) -> PublicArtifactRow {
         let sha256 = format!("{:x}", Sha256::digest(data));
         PublicArtifactRow {
-            key: "ab".repeat(32),
+            key_sha256: sha256_hex(&sample_key()),
             publication_id: format!("pub:{}", Uuid::new_v4()),
             public_name: sha256.clone(),
             sha256,
@@ -4658,10 +5845,10 @@ mod tests {
         verify_public_artifact_file(&public_root, &row).unwrap();
 
         let mut registry = HashMap::new();
-        registry.insert(row.key.clone(), row.clone());
+        registry.insert(row.key_sha256.clone(), row.clone());
         persist_public_registry(&registry_path, &registry).unwrap();
         assert_eq!(
-            load_public_registry(&registry_path).get(&row.key),
+            load_public_registry(&registry_path).get(&row.key_sha256),
             Some(&row)
         );
 
@@ -4877,10 +6064,19 @@ mod tests {
     }
 
     async fn answer(tls: Option<&EdgeTls>, msg: &str, payload: Value) -> Value {
-        tls_command_reply(tls, &admin_command(msg, payload))
+        tls_command_reply(tls, &scratch_web_routes(), &admin_command(msg, payload))
             .await
             .expect("a TLS command")
             .1
+    }
+
+    /// A web route table on a file of its own that does not exist yet.
+    fn scratch_web_routes() -> WebRouteTable {
+        WebRouteTable::load(
+            std::env::temp_dir()
+                .join(format!("sy-edge-web-{}", Uuid::new_v4()))
+                .join("web_routes.json"),
+        )
     }
 
     /// The `acmeIdentifier` extension of a DER certificate: (critical, raw value).
@@ -5017,8 +6213,12 @@ mod tests {
     async fn loopback_door(tls: &Arc<EdgeTls>, limits: DoorLimits) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let app = Router::new().route("/healthz", any(|| async { "ok" }));
-        tokio::spawn(serve_tls_listener(listener, app, Arc::clone(tls), limits));
+        let door = Door {
+            main: Router::new().route("/healthz", any(|| async { "ok" })),
+            web: Arc::new(scratch_web_routes()),
+            tls: Arc::clone(tls),
+        };
+        tokio::spawn(serve_door(listener, door, Arc::clone(tls), limits));
         addr
     }
 
@@ -5370,7 +6570,7 @@ mod tests {
         tls.reload("boot").await.expect("a vault edge");
         let addr = loopback_door(
             &tls,
-            DoorLimits::new(MAX_TLS_CONNECTIONS, HTTP_HEADER_READ_TIMEOUT),
+            DoorLimits::new(MAX_CONNECTIONS, 0, HTTP_HEADER_READ_TIMEOUT, DOOR_PACE),
         )
         .await;
 
@@ -5819,6 +7019,7 @@ mod tests {
             ] {
                 let (_, reply) = tls_command_reply(
                     Some(&tls),
+                    &scratch_web_routes(),
                     &edge_command(origin, command, challenge.clone()),
                 )
                 .await
@@ -5861,6 +7062,7 @@ mod tests {
             commands,
             dispatcher.sender_snapshot(),
             Some(tls),
+            Arc::new(scratch_web_routes()),
             16,
         ));
 
@@ -5882,7 +7084,27 @@ mod tests {
         assert_eq!(reply.payload["status"], "ok");
         assert_eq!(reply.payload["state"], "serving");
 
-        // The blob command still waits for the loop, and no TLS command went its way.
+        // SY.admin's push of the web hosts takes the same channel.
+        let routes = admin_command(
+            MSG_EDGE_WEB_ROUTES,
+            json!({"routes": [{"host": "archi.edge.example.com", "upstream": "io.web"}]}),
+        );
+        router
+            .inject(routes.clone())
+            .await
+            .expect("web routes command");
+        let reply = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("EDGE_WEB_ROUTES answered while the loop is busy");
+        assert_eq!(
+            reply.meta.msg.as_deref(),
+            Some(MSG_EDGE_WEB_ROUTES_RESPONSE)
+        );
+        assert_eq!(reply.routing.trace_id, routes.routing.trace_id);
+        assert_eq!(reply.payload["status"], "ok", "{}", reply.payload);
+
+        // The blob command still waits for the loop, and no door command went its way.
         assert_eq!(
             system.try_recv().and_then(|msg| msg.meta.msg),
             Some(MSG_EDGE_PUBLISH_BLOB.to_string())
@@ -6131,7 +7353,11 @@ mod tests {
     #[tokio::test]
     async fn the_door_closes_connections_over_its_cap() {
         let tls = serving_edge(self_signed(&[EDGE])).await;
-        let addr = loopback_door(&tls, DoorLimits::new(1, HTTP_HEADER_READ_TIMEOUT)).await;
+        let addr = loopback_door(
+            &tls,
+            DoorLimits::new(1, 0, HTTP_HEADER_READ_TIMEOUT, DOOR_PACE),
+        )
+        .await;
         let mut first = connect_tls(addr).await;
         assert_eq!(get_healthz(&mut first).await, "ok");
         assert!(
@@ -6154,18 +7380,68 @@ mod tests {
     async fn a_connection_that_sends_nothing_is_closed_at_the_header_timeout() {
         let header_timeout = Duration::from_millis(300);
         let tls = serving_edge(self_signed(&[EDGE])).await;
-        let addr = loopback_door(&tls, DoorLimits::new(16, header_timeout)).await;
+        let addr = loopback_door(&tls, DoorLimits::new(16, 0, header_timeout, DOOR_PACE)).await;
 
-        // The handshake completes, then nothing: hyper-util's protocol sniffing has no timeout.
+        // The handshake completes, then nothing: hyper's head timer is already running.
         let mut silent = connect_tls(addr).await;
         let closed = closed_within(&mut silent, Duration::from_secs(5)).await;
         assert!(closed >= header_timeout.mul_f32(0.9), "{closed:?}");
 
-        // One request, then an idle keep-alive connection: hyper's timer closes it.
+        // One request, then an idle keep-alive connection: the same timer closes it.
         let mut idle = connect_tls(addr).await;
         assert_eq!(get_healthz(&mut idle).await, "ok");
         let closed = closed_within(&mut idle, Duration::from_secs(5)).await;
         assert!(closed >= header_timeout.mul_f32(0.9), "{closed:?}");
+    }
+
+    /// A-87: the head timer starts before the first byte, so a few bytes of a head never hold a
+    /// connection past it (hyper-util's protocol sniffing had no timeout after the first byte).
+    #[tokio::test]
+    async fn one_byte_is_closed_at_the_header_timeout() {
+        let header_timeout = Duration::from_millis(300);
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let addr = loopback_door(&tls, DoorLimits::new(16, 0, header_timeout, DOOR_PACE)).await;
+        for start in [&b"G"[..], b"PRI"] {
+            let mut stream = connect_tls(addr).await;
+            tokio::io::AsyncWriteExt::write_all(&mut stream, start)
+                .await
+                .expect("the first bytes");
+            let closed = closed_within(&mut stream, Duration::from_secs(5)).await;
+            let start = String::from_utf8_lossy(start);
+            assert!(closed >= header_timeout.mul_f32(0.9), "{start}: {closed:?}");
+            assert!(closed < header_timeout.mul_f32(3.0), "{start}: {closed:?}");
+        }
+    }
+
+    /// A-87: no HTTP/2, not even by prior knowledge. hyper's HTTP/1 parser refuses the preface at
+    /// once; the head timer would close it anyway.
+    #[tokio::test]
+    async fn an_h2_preface_is_never_served_and_closed_by_the_header_timeout() {
+        let header_timeout = Duration::from_millis(300);
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let addr = loopback_door(&tls, DoorLimits::new(16, 0, header_timeout, DOOR_PACE)).await;
+        let mut stream = connect_tls(addr).await;
+        // The client preface and an empty SETTINGS frame, as an h2 client opens.
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &preface)
+            .await
+            .expect("the preface");
+        let started = Instant::now();
+        let mut answered = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await {
+                Err(_) => panic!("the edge kept an h2 preface open"),
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(read)) => answered.extend_from_slice(&chunk[..read]),
+            }
+        }
+        assert!(started.elapsed() < header_timeout.mul_f32(3.0));
+        assert!(
+            answered.is_empty() || answered.starts_with(b"HTTP/1.1 "),
+            "no h2 frame comes back: {answered:?}"
+        );
     }
 
     #[test]
@@ -6189,7 +7465,1558 @@ mod tests {
             Some(10),
             "then once per interval, with the count since"
         );
-        assert_eq!(MAX_TLS_CONNECTIONS, 4096);
+        assert_eq!(MAX_CONNECTIONS, 4096);
         assert_eq!(ACCEPT_ERROR_BACKOFF, Duration::from_millis(100));
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP on the door (docs/io-web-v2.md §11.1)
+    // -----------------------------------------------------------------------
+
+    const PEER: &str = "203.0.113.7:50123";
+    const WEB_HOST: &str = "archi.edge.example.com";
+
+    /// Short limits, so the pace tests take a fraction of a second.
+    fn quick_limits(idle: Duration) -> DoorLimits {
+        DoorLimits::new(
+            16,
+            0,
+            Duration::from_secs(5),
+            PaceLimits {
+                idle,
+                min_rate: 1024,
+            },
+        )
+    }
+
+    /// One connection to `door` over an in-process pipe that holds `buffer` bytes each way; the
+    /// server's task ends with the connection.
+    fn pipe_to(
+        door: Door,
+        limits: DoorLimits,
+        buffer: usize,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        pipe_from(PEER, door, limits, buffer)
+    }
+
+    /// `pipe_to`, as if the connection came from `peer`.
+    fn pipe_from(
+        peer: &str,
+        door: Door,
+        limits: DoorLimits,
+        buffer: usize,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (client, server) = tokio::io::duplex(buffer);
+        let peer: SocketAddr = peer.parse().expect("peer");
+        let task = tokio::spawn(async move { serve_http(server, peer, door, &limits).await });
+        (client, task)
+    }
+
+    /// One whole answer, read to the end of the connection (the requests ask `connection: close`).
+    struct Answer {
+        status: u16,
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl Answer {
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().skip(1).find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+        }
+
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).expect("a JSON body")
+        }
+    }
+
+    async fn read_answer(stream: &mut tokio::io::DuplexStream) -> Answer {
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .expect("a status");
+        Answer {
+            status,
+            head,
+            body: raw[split + 4..].to_vec(),
+        }
+    }
+
+    async fn exchange(door: &Door, request: &str) -> Answer {
+        let (mut client, _server) = pipe_to(
+            door.clone(),
+            quick_limits(Duration::from_secs(5)),
+            64 * 1024,
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut client, request.as_bytes())
+            .await
+            .expect("request");
+        read_answer(&mut client).await
+    }
+
+    fn assert_security_headers(answer: &Answer) {
+        for (name, value) in SECURITY_HEADERS {
+            assert_eq!(answer.header(name).as_deref(), Some(value), "{name}");
+        }
+    }
+
+    /// A door whose own routes say which one answered, and who asked.
+    fn labelled_door(web: WebRouteTable, tls: Arc<EdgeTls>) -> Door {
+        Door {
+            main:
+                Router::new()
+                    .route("/healthz", any(|| async { "ok" }))
+                    .route("/e/*rest", any(|| async { "e" }))
+                    .route("/public/:key", any(|| async { "public" }))
+                    .route(
+                        "/peer",
+                        any(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move {
+                            peer.to_string()
+                        }),
+                    ),
+            web: Arc::new(web),
+            tls,
+        }
+    }
+
+    fn web_routes_with(hosts: &[&str]) -> WebRouteTable {
+        let table = scratch_web_routes();
+        let routes = WebRoutes {
+            routes: hosts
+                .iter()
+                .map(|host| WebRoute {
+                    host: host.to_string(),
+                    upstream: WebUpstream::IoWeb,
+                })
+                .collect(),
+        };
+        table.replace(validate_web_routes(routes, &[]).expect("valid routes"));
+        table
+    }
+
+    #[test]
+    fn a_request_has_one_canonical_host() {
+        let host = |target: &str, hosts: &[&str]| {
+            let uri: Uri = target.parse().expect("target");
+            let mut headers = HeaderMap::new();
+            for value in hosts {
+                headers.append(header::HOST, HeaderValue::from_str(value).expect("value"));
+            }
+            request_host(&uri, &headers)
+        };
+        let at = |name: &str, port: Option<u16>| {
+            Ok(Some(RequestHost {
+                name: name.to_string(),
+                port,
+            }))
+        };
+        let some = |name: &str| at(name, None);
+        // Case, one trailing dot and the port 443 go; the host stays.
+        assert_eq!(host("/", &["ARCHI.Edge.Example.COM"]), some(WEB_HOST));
+        assert_eq!(host("/", &["archi.edge.example.com."]), some(WEB_HOST));
+        assert_eq!(host("/", &["archi.edge.example.com:443"]), some(WEB_HOST));
+        assert_eq!(host("/", &["archi.edge.example.com.:443"]), some(WEB_HOST));
+        assert_eq!(host("/", &["archi.edge.example.com:"]), some(WEB_HOST));
+        // Only one dot goes; another port is kept.
+        assert_eq!(
+            host("/", &["archi.edge.example.com.."]),
+            some("archi.edge.example.com.")
+        );
+        assert_eq!(
+            host("/", &["archi.edge.example.com:8443"]),
+            at(WEB_HOST, Some(8443))
+        );
+        assert_eq!(host("/", &["[2001:db8::1]:443"]), some("[2001:db8::1]"));
+        // No host at all.
+        assert_eq!(host("/", &[]), Ok(None));
+        assert_eq!(host("/", &[""]), Ok(None));
+        // Refused: two Hosts, a bad port, user information.
+        assert!(host("/", &[WEB_HOST, "edge.example.com"]).is_err());
+        assert!(host("/", &[WEB_HOST, WEB_HOST]).is_err());
+        assert!(host("/", &["archi.edge.example.com:https"]).is_err());
+        assert!(host("/", &["archi.edge.example.com:65536"]).is_err());
+        assert!(host("/", &["user@archi.edge.example.com"]).is_err());
+        // The absolute form wins, and a Host must agree with it.
+        let absolute = "https://Archi.Edge.Example.com:443/healthz";
+        assert_eq!(host(absolute, &[]), some(WEB_HOST));
+        assert_eq!(host(absolute, &["archi.edge.example.com."]), some(WEB_HOST));
+        assert!(host(absolute, &["edge.example.com"]).is_err());
+        assert!(host(absolute, &["archi.edge.example.com:8443"]).is_err());
+        assert_eq!(
+            host("http://archi.edge.example.com:80/", &[]),
+            at(WEB_HOST, Some(80))
+        );
+    }
+
+    /// io-web-v2 §11.1 and host-posture §4.4: only the door's own hosts reach its routes.
+    #[tokio::test]
+    async fn only_the_door_s_own_hosts_reach_its_routes() {
+        // The combined certificate of 0.1.84: the main name and the web host.
+        let tls = serving_edge(self_signed(&[EDGE, WEB_HOST])).await;
+        let door = labelled_door(web_routes_with(&[WEB_HOST]), Arc::clone(&tls));
+        let request = |target: &str, host: &str| {
+            format!("GET {target} HTTP/1.1\r\n{host}connection: close\r\n\r\n")
+        };
+        // The main name on any port, an IP literal, and no host at all keep the door's routes.
+        for (target, host) in [
+            ("/healthz", "host: edge.example.com\r\n"),
+            ("/healthz", "host: EDGE.example.com.:443\r\n"),
+            ("/healthz", "host: edge.example.com:8443\r\n"),
+            ("/healthz", "host: 198.51.100.4\r\n"),
+            ("/healthz", "host: [2001:db8::1]:8443\r\n"),
+            ("https://edge.example.com/healthz", ""),
+        ] {
+            let answer = exchange(&door, &request(target, host)).await;
+            assert_eq!(
+                (answer.status, answer.body.as_slice()),
+                (200, &b"ok"[..]),
+                "{target} {host}"
+            );
+        }
+        let no_host = exchange(&door, "GET /healthz HTTP/1.0\r\n\r\n").await;
+        assert_eq!(no_host.body, b"ok");
+        // The handlers see the peer.
+        let peer = exchange(&door, &request("/peer", "host: edge.example.com\r\n")).await;
+        assert_eq!(peer.body, PEER.as_bytes());
+
+        // A web host, on any port and in any spelling, and any other host: a 404 with the
+        // security headers on every path.
+        let public = format!("/public/{}", "ab".repeat(32));
+        for (target, host) in [
+            ("/healthz", "host: archi.edge.example.com\r\n"),
+            ("/", "host: ARCHI.edge.example.com\r\n"),
+            ("/e/ich:1", "host: archi.edge.example.com.\r\n"),
+            (public.as_str(), "host: archi.edge.example.com:443\r\n"),
+            ("/healthz", "host: archi.edge.example.com:8443\r\n"),
+            ("/healthz", "host: archi.edge.example.com..\r\n"),
+            ("https://archi.edge.example.com/healthz", ""),
+            (
+                "https://archi.edge.example.com/e/ich:1",
+                "host: archi.edge.example.com\r\n",
+            ),
+            ("/healthz", "host: other.example.org\r\n"),
+            ("/e/ich:1", "host: tools.edge.example.com\r\n"),
+            ("/healthz", "host: edge.example.com..\r\n"),
+        ] {
+            let answer = exchange(&door, &request(target, host)).await;
+            assert_eq!(answer.status, 404, "{target} {host}");
+            assert_eq!(answer.json()["error_code"], "NOT_FOUND");
+            assert_security_headers(&answer);
+        }
+
+        // No certificate served (plaintext): the edge cannot tell its main name, and any other
+        // host keeps the door's routes; a web host still never reaches them.
+        let plaintext = labelled_door(web_routes_with(&[WEB_HOST]), Arc::new(EdgeTls::plaintext()));
+        let other = exchange(
+            &plaintext,
+            &request("/healthz", "host: other.example.org\r\n"),
+        )
+        .await;
+        assert_eq!(other.body, b"ok");
+        let web = exchange(
+            &plaintext,
+            &request("/healthz", "host: archi.edge.example.com:8443\r\n"),
+        )
+        .await;
+        assert_eq!(web.status, 404);
+
+        // Two Hosts, or a Host the target contradicts: 400.
+        for (target, host) in [
+            (
+                "/healthz",
+                "host: edge.example.com\r\nhost: archi.edge.example.com\r\n",
+            ),
+            (
+                "https://archi.edge.example.com/healthz",
+                "host: edge.example.com\r\n",
+            ),
+            ("/healthz", "host: archi.edge.example.com:x\r\n"),
+        ] {
+            let bad = exchange(&door, &request(target, host)).await;
+            assert_eq!(bad.status, 400, "{target} {host}");
+            assert_eq!(bad.json()["error_code"], "BAD_HOST");
+            assert_security_headers(&bad);
+        }
+    }
+
+    async fn push_web_routes(
+        tls: Option<&EdgeTls>,
+        table: &WebRouteTable,
+        payload: Value,
+    ) -> Value {
+        let (response, reply) =
+            tls_command_reply(tls, table, &admin_command(MSG_EDGE_WEB_ROUTES, payload))
+                .await
+                .expect("a door command");
+        assert_eq!(response, MSG_EDGE_WEB_ROUTES_RESPONSE);
+        reply
+    }
+
+    fn routes_payload(routes: &[(&str, &str)]) -> Value {
+        json!({
+            "routes": routes
+                .iter()
+                .map(|(host, upstream)| json!({"host": host, "upstream": upstream}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[tokio::test]
+    async fn web_routes_replace_the_whole_set_and_survive_a_restart() {
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let path = std::env::temp_dir()
+            .join(format!("sy-edge-web-{}", Uuid::new_v4()))
+            .join("web_routes.json");
+        let table = WebRouteTable::load(path.clone());
+
+        let applied = push_web_routes(
+            Some(&tls),
+            &table,
+            routes_payload(&[("Archi.Edge.Example.com.", "io.web")]),
+        )
+        .await;
+        assert_eq!(applied["status"], "ok");
+        assert_eq!(
+            applied["routes"],
+            json!([{"host": WEB_HOST, "upstream": "io.web"}])
+        );
+        assert_eq!(
+            (&applied["changed"], &applied["persisted"]),
+            (&json!(true), &json!(true))
+        );
+        assert!(table.serves(WEB_HOST));
+        let again =
+            push_web_routes(Some(&tls), &table, routes_payload(&[(WEB_HOST, "io.web")])).await;
+        assert_eq!(
+            again["changed"], false,
+            "SY.admin's minute push of the same set"
+        );
+
+        // A restart serves the set at once.
+        assert!(WebRouteTable::load(path.clone()).serves(WEB_HOST));
+
+        // The set is replaced whole.
+        let tools = "tools.edge.example.com";
+        let replaced =
+            push_web_routes(Some(&tls), &table, routes_payload(&[(tools, "io.web")])).await;
+        assert_eq!(replaced["changed"], true);
+        assert!(table.serves(tools) && !table.serves(WEB_HOST));
+
+        // Refused, and nothing changes: another upstream, a host that is not a DNS name, a host
+        // twice, an unknown field, the certificate's only name, another origin, no door.
+        for payload in [
+            routes_payload(&[(WEB_HOST, "io.api")]),
+            routes_payload(&[(WEB_HOST, "127.0.0.1:3000")]),
+            json!({"routes": [{"host": WEB_HOST}]}),
+            routes_payload(&[("archi.edge.example.com:8443", "io.web")]),
+            routes_payload(&[("*.edge.example.com", "io.web")]),
+            routes_payload(&[("10.0.0.7", "io.web")]),
+            routes_payload(&[(WEB_HOST, "io.web"), ("ARCHI.edge.example.com", "io.web")]),
+            json!({"routes": [{"host": WEB_HOST, "upstream": "io.web", "port": 3000}]}),
+            json!({}),
+            routes_payload(&[("Edge.Example.com", "io.web")]),
+            routes_payload(&[(EDGE, "io.web"), (WEB_HOST, "io.web")]),
+        ] {
+            let reply = push_web_routes(Some(&tls), &table, payload.clone()).await;
+            assert_eq!(reply["status"], "error", "{payload}");
+            assert!(table.serves(tools) && !table.serves(WEB_HOST), "{payload}");
+        }
+        let from_cloud = tls_command_reply(
+            Some(&tls),
+            &table,
+            &edge_command(
+                Some("IO.cloud@motherbee"),
+                MSG_EDGE_WEB_ROUTES,
+                routes_payload(&[]),
+            ),
+        )
+        .await
+        .expect("a door command")
+        .1;
+        assert_eq!(from_cloud["status"], "error");
+        assert_eq!(
+            push_web_routes(None, &table, routes_payload(&[])).await["status"],
+            "error"
+        );
+        assert!(table.serves(tools));
+
+        // With no certificate served the edge cannot tell its main name.
+        let awaiting = vault_edge(&FakeSource::new(vec![refused(TlsVerdict::NotFound)]));
+        awaiting.reload("boot").await.expect("a vault edge");
+        let unknown = scratch_web_routes();
+        assert_eq!(
+            push_web_routes(
+                Some(&awaiting),
+                &unknown,
+                routes_payload(&[(EDGE, "io.web")])
+            )
+            .await["status"],
+            "ok"
+        );
+
+        // The empty set: no web host, on disk too.
+        let cleared = push_web_routes(Some(&tls), &table, routes_payload(&[])).await;
+        assert_eq!(cleared["routes"], json!([]));
+        assert!(!table.serves(tools));
+        assert_eq!(
+            WebRouteTable::load(path.clone()).snapshot(),
+            WebRoutes::default()
+        );
+
+        // A file that does not parse starts with no web host, and the next push rewrites it.
+        std::fs::write(&path, b"{not json").expect("corrupt");
+        let restarted = WebRouteTable::load(path.clone());
+        assert_eq!(restarted.snapshot(), WebRoutes::default());
+        let rewritten = push_web_routes(Some(&tls), &restarted, routes_payload(&[])).await;
+        assert_eq!(
+            (&rewritten["changed"], &rewritten["persisted"]),
+            (&json!(false), &json!(true))
+        );
+        assert_eq!(
+            serde_json::from_slice::<WebRoutes>(&std::fs::read(&path).expect("file")).ok(),
+            Some(WebRoutes::default())
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[test]
+    fn the_edge_tells_its_main_name_from_its_certificate() {
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(main_certified_name(&names(&[EDGE])), Some(EDGE));
+        assert_eq!(main_certified_name(&names(&[WEB_HOST, EDGE])), Some(EDGE));
+        assert_eq!(
+            main_certified_name(&names(&["*.edge.example.com", EDGE])),
+            Some(EDGE)
+        );
+        // Unrelated names, a name that only ends like another, a lone wildcard: it cannot tell.
+        assert_eq!(
+            main_certified_name(&names(&[EDGE, "other.example.org"])),
+            None
+        );
+        assert_eq!(
+            main_certified_name(&names(&[EDGE, "badedge.example.com"])),
+            None
+        );
+        assert_eq!(main_certified_name(&names(&["*.edge.example.com"])), None);
+        assert_eq!(main_certified_name(&[]), None);
+
+        // The combined certificate of 0.1.84 (the main host and archi): the main name is still
+        // refused as a web host, in any spelling.
+        let set = |hosts: &[&str]| WebRoutes {
+            routes: hosts
+                .iter()
+                .map(|host| WebRoute {
+                    host: host.to_string(),
+                    upstream: WebUpstream::IoWeb,
+                })
+                .collect(),
+        };
+        let combined = names(&[EDGE, WEB_HOST]);
+        assert!(validate_web_routes(set(&[WEB_HOST]), &combined).is_ok());
+        assert!(validate_web_routes(set(&[EDGE]), &combined).is_err());
+        assert!(validate_web_routes(set(&["Edge.Example.com.:443"]), &combined).is_err());
+        assert!(validate_web_routes(set(&[EDGE]), &names(&[EDGE, "other.example.org"])).is_ok());
+    }
+
+    /// The pace's arithmetic, on explicit instants.
+    #[test]
+    fn the_pace_drains_while_the_edge_waits_and_refills_with_bytes() {
+        let limits = PaceLimits {
+            idle: Duration::from_secs(10),
+            min_rate: 100,
+        };
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut pace = Pace::new(limits);
+        assert_eq!(pace.wait(at(0)), Duration::from_secs(10));
+        assert_eq!(pace.wait(at(4)), Duration::from_secs(6));
+        // The wait ends with 100 bytes: one more second drained, one second earned.
+        pace.moved(100, at(5));
+        assert_eq!(pace.credit, Duration::from_secs(6));
+        // Time the edge does not wait on the peer drains nothing.
+        assert_eq!(pace.wait(at(60)), Duration::from_secs(6));
+        // Bytes refill up to `idle`, never beyond.
+        pace.moved(1_000_000, at(60));
+        assert_eq!(pace.credit, Duration::from_secs(10));
+        // A peer that moves 10 bytes a second (a tenth of the pace) loses 0.9 s a second. Each
+        // second the edge waits, then checks the credit as the byte comes (its timer would fire
+        // first when the credit runs out).
+        let mut second = 100;
+        loop {
+            pace.wait(at(second));
+            if pace.wait(at(second + 1)).is_zero() {
+                break;
+            }
+            pace.moved(10, at(second + 1));
+            second += 1;
+        }
+        assert_eq!(
+            second, 110,
+            "cut in its eleventh second: 10 s of credit, 0.9 s lost a second"
+        );
+        // One that moves 100 bytes a second never loses any.
+        let mut steady = Pace::new(limits);
+        for second in 0..100 {
+            steady.wait(at(second));
+            steady.moved(100, at(second + 1));
+        }
+        assert_eq!(steady.credit, Duration::from_secs(10));
+    }
+
+    /// A test state for the door's real routes, with one slot for `/e/` and one for `/public`.
+    fn door_state(
+        dispatcher: &Arc<RouterDispatcher>,
+        public_root: PathBuf,
+        timeout: Duration,
+    ) -> Arc<FrontendState> {
+        door_state_with(dispatcher, public_root, timeout, 1, 0, INLINE_BODY_TIMEOUT)
+    }
+
+    /// `door_state` with `downloads` download slots, `per_ip` of them for one address, and
+    /// `body_timeout` for an `/e/` body.
+    fn door_state_with(
+        dispatcher: &Arc<RouterDispatcher>,
+        public_root: PathBuf,
+        timeout: Duration,
+        downloads: usize,
+        per_ip: usize,
+        body_timeout: Duration,
+    ) -> Arc<FrontendState> {
+        Arc::new(FrontendState {
+            dispatcher: Arc::clone(dispatcher),
+            sender: dispatcher.sender_snapshot(),
+            registry: Arc::new(RwLock::new(HashMap::new())),
+            public_registry: Arc::new(RwLock::new(HashMap::new())),
+            blob_public_root: public_root,
+            self_ilk: "ilk:00000000-0000-0000-0000-000000000000".to_string(),
+            ttl: 16,
+            timeout,
+            inflight: Arc::new(Semaphore::new(1)),
+            public_inflight: Arc::new(Semaphore::new(downloads)),
+            public_peer_slots: PeerSlots::new(per_ip),
+            refused_downloads: std::sync::Mutex::new(RefusedConnections::default()),
+            body_timeout,
+        })
+    }
+
+    /// Open the public channel `ich` to `IO.test@motherbee`.
+    fn open_test_channel(state: &FrontendState, ich: &str) {
+        let (ich, entry) = row_to_entry(
+            serde_json::from_value(json!({
+                "ich": ich,
+                "owner_l2_name": "IO.test@motherbee",
+                "inbound_family": "user",
+                "auth_mode": "public",
+            }))
+            .expect("row"),
+        );
+        state.registry.write().expect("registry").insert(ich, entry);
+    }
+
+    /// The door's real routes, served in plaintext: every host but a web host reaches them.
+    fn real_door(state: &Arc<FrontendState>) -> Door {
+        Door {
+            main: main_routes(Arc::clone(state)),
+            web: Arc::new(scratch_web_routes()),
+            tls: Arc::new(EdgeTls::plaintext()),
+        }
+    }
+
+    /// `bytes` published as a download under `sample_key`, in a fresh public root.
+    fn published_download(bytes: &[u8]) -> (PathBuf, PublicArtifactRow) {
+        let root = std::env::temp_dir().join(format!("sy-edge-public-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("public root");
+        let row = PublicArtifactRow {
+            content_type: "application/octet-stream".to_string(),
+            presentation: "attachment".to_string(),
+            content_policy: "download-v1".to_string(),
+            ..sample_public_row(bytes)
+        };
+        std::fs::write(root.join(&row.public_name), bytes).expect("artifact");
+        (root, row)
+    }
+
+    async fn ended_within(server: tokio::task::JoinHandle<()>, limit: Duration) -> Duration {
+        let started = Instant::now();
+        tokio::time::timeout(limit, server)
+            .await
+            .expect("the connection ended in time")
+            .expect("server task");
+        started.elapsed()
+    }
+
+    /// A-86: a reader that stops reading a download loses it, and its download slot, after the
+    /// pace's idle; a reader that keeps up gets every byte.
+    #[tokio::test]
+    async fn a_stalled_reader_loses_its_download_slot() {
+        let (dispatcher, _router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let data: Vec<u8> = (0..1_048_576_u32).map(|i| (i % 251) as u8).collect();
+        let (root, row) = published_download(&data);
+        let state = door_state(&dispatcher, root.clone(), Duration::from_secs(5));
+        state
+            .public_registry
+            .write()
+            .expect("public registry")
+            .insert(row.key_sha256.clone(), row);
+        let request = format!(
+            "GET /public/{} HTTP/1.1\r\nhost: edge.example.com\r\nconnection: close\r\n\r\n",
+            sample_key()
+        );
+        let idle = Duration::from_millis(300);
+
+        let (mut stalled, server) = pipe_to(real_door(&state), quick_limits(idle), 8 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut stalled, request.as_bytes())
+            .await
+            .expect("request");
+        // It never reads.
+        let ended = ended_within(server, Duration::from_secs(5)).await;
+        assert!(ended >= idle.mul_f32(0.9), "{ended:?}");
+        assert_eq!(
+            state.public_inflight.available_permits(),
+            1,
+            "the slot is back"
+        );
+
+        let (mut reader, _server) = pipe_to(real_door(&state), quick_limits(idle), 8 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut reader, request.as_bytes())
+            .await
+            .expect("request");
+        let download = read_answer(&mut reader).await;
+        assert_eq!(download.status, 200);
+        assert!(download.body == data, "every byte, in order");
+        drop(stalled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A-86: a body that trickles in slower than the pace ends with its connection, and its
+    /// `/e/` slot comes back; nothing reaches the mesh.
+    #[tokio::test]
+    async fn a_slow_body_writer_is_cut_and_its_slot_released() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let state = door_state(&dispatcher, std::env::temp_dir(), Duration::from_secs(5));
+        open_test_channel(&state, "ich:slow");
+        let idle = Duration::from_millis(300);
+        let (client, server) = pipe_to(real_door(&state), quick_limits(idle), 64 * 1024);
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        tokio::io::AsyncWriteExt::write_all(
+            &mut write_half,
+            b"POST /e/ich:slow HTTP/1.1\r\nhost: edge.example.com\r\ncontent-type: text/plain\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789",
+        )
+        .await
+        .expect("head");
+        // Then one byte every 100 ms: 10 bytes a second against a pace of 1024.
+        let trickle = tokio::spawn(async move {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if tokio::io::AsyncWriteExt::write_all(&mut write_half, b"x")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), read_half.read_to_end(&mut raw))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 408 "), "{text}");
+        assert!(text.contains("\"error_code\":\"BODY_TIMEOUT\""), "{text}");
+        ended_within(server, Duration::from_secs(5)).await;
+        assert_eq!(
+            state.inflight.available_permits(),
+            1,
+            "the /e/ slot is back"
+        );
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing was forwarded"
+        );
+        trickle.abort();
+    }
+
+    /// A-86: the edge's own wait (here its channel's handler, slower than the pace's idle) is
+    /// never charged to the peer.
+    #[tokio::test]
+    async fn the_edge_s_own_wait_is_never_charged_to_the_peer() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let state = door_state(&dispatcher, std::env::temp_dir(), Duration::from_secs(5));
+        open_test_channel(&state, "ich:t");
+        let idle = Duration::from_millis(200);
+        let (mut client, _server) = pipe_to(real_door(&state), quick_limits(idle), 64 * 1024);
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"POST /e/ich:t HTTP/1.1\r\nhost: edge.example.com\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"q\":\"hey\"}",
+        )
+        .await
+        .expect("request");
+        let forwarded = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the request reaches the mesh");
+        assert_eq!(forwarded.payload, json!({"q": "hey"}));
+        tokio::time::sleep(idle * 3).await;
+        router
+            .inject(Message {
+                routing: Routing {
+                    src: "io-test-uuid".to_string(),
+                    src_l2_name: Some("IO.test@motherbee".to_string()),
+                    dst: Destination::Unicast(forwarded.routing.src.clone()),
+                    ttl: 16,
+                    trace_id: forwarded.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: "user".to_string(),
+                    ..Meta::default()
+                },
+                payload: json!({"answer": 42}),
+            })
+            .await
+            .expect("reply");
+        let answer = read_answer(&mut client).await;
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.json(), json!({"answer": 42}));
+    }
+
+    /// A-88: an `/e/` error answers the fixed body of its code; the trace, the target and the
+    /// message family stay in the edge's log.
+    #[tokio::test]
+    async fn an_e_error_answers_a_fixed_body() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let state = door_state(
+            &dispatcher,
+            std::env::temp_dir(),
+            Duration::from_millis(200),
+        );
+        open_test_channel(&state, "ich:t");
+        let door = real_door(&state);
+        let timed_out = tokio::spawn({
+            let door = door.clone();
+            async move {
+                exchange(
+                    &door,
+                    "POST /e/ich:t HTTP/1.1\r\nhost: edge.example.com\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+            }
+        });
+        let forwarded = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the request reaches the mesh");
+        let answer = timed_out.await.expect("exchange");
+        assert_eq!(answer.status, 504);
+        assert_eq!(
+            answer.json(),
+            json!({"ok": false, "error_code": "HANDLER_TIMEOUT", "message": "the channel did not answer in time"})
+        );
+        let body = String::from_utf8_lossy(&answer.body).to_string();
+        assert!(!body.contains(&forwarded.routing.trace_id), "{body}");
+        assert!(!body.contains("IO.test"), "{body}");
+        assert_security_headers(&answer);
+
+        // A body that fits the inline limit but not the mesh envelope once escaped.
+        let quotes = "\"".repeat(40_000);
+        let too_large = exchange(
+            &door,
+            &format!(
+                "POST /e/ich:t HTTP/1.1\r\nhost: edge.example.com\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{quotes}",
+                quotes.len()
+            ),
+        )
+        .await;
+        assert_eq!(too_large.status, 413);
+        assert_eq!(
+            too_large.json(),
+            json!({"ok": false, "error_code": "REQ_TOO_LARGE", "message": "request too large"})
+        );
+
+        // Every relay error has a fixed message that names nothing internal.
+        let timeout = RpcError::Timeout {
+            trace_id: "trace-7".to_string(),
+            target: "IO.test@motherbee".to_string(),
+            request_msg: "user".to_string(),
+            response_msg: "*".to_string(),
+            timeout_ms: 200,
+        };
+        for err in [timeout, RpcError::Disconnected] {
+            let message = rpc_error_message(&err);
+            assert!(!message.contains("trace-7") && !message.contains("IO.test"));
+        }
+    }
+
+    /// A-83: a response the edge cannot build is a 500 with the security headers, never an empty
+    /// 200.
+    #[tokio::test]
+    async fn an_unbuildable_response_is_a_500_with_the_security_headers() {
+        let response = built(
+            Response::builder()
+                .header("x-broken", "one\ntwo")
+                .body(Body::empty()),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for (name, value) in SECURITY_HEADERS {
+            assert_eq!(
+                response.headers().get(name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name}"
+            );
+        }
+        let body = to_bytes(response.into_body(), 1024).await.expect("body");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).expect("json")["error_code"],
+            "INTERNAL_ERROR"
+        );
+    }
+
+    /// A-82: a `publications.json` written before 0.1.84 holds the keys themselves. The load keys
+    /// the table by their SHA-256, rewrites the file without them, and the next load converts
+    /// nothing.
+    #[test]
+    fn publications_json_is_converted_once_to_key_hashes() {
+        let root = std::env::temp_dir().join(format!("sy-edge-a82-{}", Uuid::new_v4()));
+        let path = root.join("publications.json");
+        std::fs::create_dir_all(&root).expect("root");
+        let live_key = "c1".repeat(32);
+        let expired_key = "e0".repeat(32);
+        let row = sample_public_row(b"<!doctype html>a82");
+        let stored = |key: &str, expires_at: u64| {
+            let mut value = serde_json::to_value(&row).expect("row");
+            let fields = value.as_object_mut().expect("object");
+            fields.remove("key_sha256");
+            fields.insert("key".to_string(), json!(key));
+            fields.insert(
+                "publication_id".to_string(),
+                json!(format!("pub:{}", Uuid::new_v4())),
+            );
+            fields.insert("expires_at".to_string(), json!(expires_at));
+            value
+        };
+        let old = json!({"publications": [stored(&live_key, u64::MAX), stored(&expired_key, 1)]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&old).expect("json")).expect("old file");
+
+        let loaded = load_public_registry(&path);
+        assert_eq!(loaded.len(), 1);
+        let live = loaded
+            .get(&sha256_hex(&live_key))
+            .expect("keyed by the hash");
+        assert_eq!(live.key_sha256, sha256_hex(&live_key));
+        let on_disk = std::fs::read_to_string(&path).expect("rewritten");
+        assert!(
+            !on_disk.contains(&live_key) && !on_disk.contains(&expired_key),
+            "{on_disk}"
+        );
+        assert!(!on_disk.contains("\"key\""), "{on_disk}");
+        assert!(on_disk.contains(&sha256_hex(&live_key)));
+
+        assert_eq!(
+            load_public_registry(&path),
+            loaded,
+            "the second load converts nothing"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("file"), on_disk);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A-82: `EDGE_PUBLISH_BLOB` still carries the key; the edge keeps its hash, serves the key,
+    /// and the hash it keeps is no capability.
+    #[tokio::test]
+    async fn a_public_artifact_is_kept_and_served_by_the_hash_of_its_key() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let data = b"<!doctype html><p>a82</p>".to_vec();
+        let (root, sample) = published_download(&data);
+        let registry_path = root.join("state/publications.json");
+        let state = door_state(&dispatcher, root.clone(), Duration::from_secs(5));
+        let key = "d7".repeat(32);
+        let mut payload = serde_json::to_value(&sample).expect("row");
+        let fields = payload.as_object_mut().expect("object");
+        fields.remove("key_sha256");
+        fields.insert("key".to_string(), json!(key));
+        apply_publish_blob(
+            &dispatcher.sender_snapshot(),
+            &state.public_registry,
+            &registry_path,
+            &root,
+            &admin_command(MSG_EDGE_PUBLISH_BLOB, payload),
+            16,
+            Duration::from_secs(2),
+        )
+        .await;
+        let reply = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.payload["status"], "ok", "{}", reply.payload);
+        assert_eq!(reply.payload["url"], format!("/public/{key}"));
+        assert!(state
+            .public_registry
+            .read()
+            .expect("registry")
+            .contains_key(&sha256_hex(&key)));
+        let on_disk = std::fs::read_to_string(&registry_path).expect("publications.json");
+        assert!(!on_disk.contains(&key) && on_disk.contains(&sha256_hex(&key)));
+
+        let door = real_door(&state);
+        let get = |key: String| {
+            format!(
+                "GET /public/{key} HTTP/1.1\r\nhost: edge.example.com\r\nconnection: close\r\n\r\n"
+            )
+        };
+        let served = exchange(&door, &get(key.clone())).await;
+        assert_eq!((served.status, served.body.clone()), (200, data));
+        assert_eq!(exchange(&door, &get(sha256_hex(&key))).await.status, 404);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // The 0.1.84 review's fixes (E1-E7)
+    // -----------------------------------------------------------------------
+
+    /// Read one answer from the read half of a split pipe, to its end.
+    async fn read_split_answer(
+        stream: &mut tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    ) -> String {
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut raw))
+            .await
+            .expect("an answer in time")
+            .expect("read");
+        String::from_utf8_lossy(&raw).to_string()
+    }
+
+    /// E1: hyper reads a body's first bytes before the handler waits for them. A head whose body
+    /// never comes is still paced: the connection ends, and its `/e/` slot comes back.
+    #[tokio::test]
+    async fn a_body_that_never_starts_is_cut_and_its_slot_released() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let state = door_state(&dispatcher, std::env::temp_dir(), Duration::from_secs(5));
+        open_test_channel(&state, "ich:silent");
+        let idle = Duration::from_millis(300);
+        for head in [
+            "POST /e/ich:silent HTTP/1.1\r\nhost: edge.example.com\r\ncontent-length: 10\r\n\r\n",
+            "POST /e/ich:silent HTTP/1.1\r\nhost: edge.example.com\r\ntransfer-encoding: chunked\r\n\r\n",
+        ] {
+            let (client, server) = pipe_to(real_door(&state), quick_limits(idle), 64 * 1024);
+            let (mut read_half, mut write_half) = tokio::io::split(client);
+            tokio::io::AsyncWriteExt::write_all(&mut write_half, head.as_bytes())
+                .await
+                .expect("head");
+            let started = Instant::now();
+            let answer = read_split_answer(&mut read_half).await;
+            assert!(started.elapsed() < idle * 5, "{:?}", started.elapsed());
+            assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+            assert!(answer.contains("\"error_code\":\"BODY_TIMEOUT\""), "{answer}");
+            ended_within(server, Duration::from_secs(5)).await;
+            assert_eq!(state.inflight.available_permits(), 1, "the /e/ slot is back");
+            drop(write_half);
+        }
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(50))
+                .await
+                .is_none(),
+            "nothing was forwarded"
+        );
+    }
+
+    /// E1: a chunked body that keeps the pace but never ends is cut at `body_timeout`, so it
+    /// cannot hold an `/e/` slot for minutes.
+    #[tokio::test]
+    async fn a_body_must_be_whole_within_its_deadline() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let body_timeout = Duration::from_millis(600);
+        let state = door_state_with(
+            &dispatcher,
+            std::env::temp_dir(),
+            Duration::from_secs(5),
+            1,
+            0,
+            body_timeout,
+        );
+        open_test_channel(&state, "ich:chunked");
+        // A pace the trickle keeps: 200 bytes every 50 ms is 4 KB/s.
+        let (client, server) = pipe_to(
+            real_door(&state),
+            quick_limits(Duration::from_secs(5)),
+            64 * 1024,
+        );
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        tokio::io::AsyncWriteExt::write_all(
+            &mut write_half,
+            b"POST /e/ich:chunked HTTP/1.1\r\nhost: edge.example.com\r\ntransfer-encoding: chunked\r\n\r\n",
+        )
+        .await
+        .expect("head");
+        let started = Instant::now();
+        let trickle = tokio::spawn(async move {
+            let chunk = format!("c8\r\n{}\r\n", "x".repeat(200));
+            for _ in 0..200 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if tokio::io::AsyncWriteExt::write_all(&mut write_half, chunk.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let answer = read_split_answer(&mut read_half).await;
+        let elapsed = started.elapsed();
+        assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
+        assert!(elapsed >= body_timeout.mul_f32(0.9), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        ended_within(server, Duration::from_secs(5)).await;
+        assert_eq!(
+            state.inflight.available_permits(),
+            1,
+            "the /e/ slot is back"
+        );
+        assert!(router
+            .next_outgoing_within(Duration::from_millis(50))
+            .await
+            .is_none());
+        trickle.abort();
+    }
+
+    #[test]
+    fn peer_slots_count_an_address_its_ipv6_64_and_give_slots_back() {
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
+        let slots = PeerSlots::new(2);
+        let first = slots.try_take(ip("198.51.100.4")).expect("first");
+        let _second = slots
+            .try_take(ip("::ffff:198.51.100.4"))
+            .expect("the same IPv4");
+        assert!(slots.try_take(ip("198.51.100.4")).is_none(), "at the cap");
+        assert!(
+            slots.try_take(ip("198.51.100.5")).is_some(),
+            "another address"
+        );
+        drop(first);
+        assert_eq!(slots.held_by(ip("198.51.100.4")), 1);
+        assert!(
+            slots.try_take(ip("198.51.100.4")).is_some(),
+            "the slot came back"
+        );
+
+        // One IPv6 subscriber holds a /64: its addresses count together.
+        let _a = slots.try_take(ip("2001:db8:1:2::1")).expect("a");
+        let _b = slots.try_take(ip("2001:db8:1:2:ffff::9")).expect("b");
+        assert!(slots.try_take(ip("2001:db8:1:2::77")).is_none());
+        assert!(
+            slots.try_take(ip("2001:db8:1:3::1")).is_some(),
+            "another /64"
+        );
+        assert_eq!(slots.held_by(ip("2001:db8:1:2::")), 2);
+
+        // 0: no cap, and nothing counted.
+        let open = PeerSlots::new(0);
+        let held: Vec<_> = (0..1000)
+            .map(|_| open.try_take(ip("198.51.100.4")).expect("no cap"))
+            .collect();
+        assert_eq!(held.len(), 1000);
+        assert_eq!(open.held_by(ip("198.51.100.4")), 0);
+    }
+
+    /// E2: one address holds at most its share of the door's connections, counted at accept,
+    /// before the handshake.
+    #[tokio::test]
+    async fn one_address_holds_at_most_its_share_of_the_connections() {
+        let tls = serving_edge(self_signed(&[EDGE])).await;
+        let limits = DoorLimits::new(16, 2, HTTP_HEADER_READ_TIMEOUT, DOOR_PACE);
+        let per_ip = Arc::clone(&limits.peer_connections);
+        let addr = loopback_door(&tls, limits).await;
+        let mut first = connect_tls(addr).await;
+        let mut second = connect_tls(addr).await;
+        assert_eq!(get_healthz(&mut first).await, "ok");
+        assert_eq!(get_healthz(&mut second).await, "ok");
+        assert!(
+            try_connect_tls(addr).await.is_err(),
+            "a third connection from the same address is closed before its handshake"
+        );
+        assert_eq!(per_ip.held_by("127.0.0.1".parse().expect("ip")), 2);
+        drop(first);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut third) = try_connect_tls(addr).await {
+                assert_eq!(get_healthz(&mut third).await, "ok");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the slot came back");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(get_healthz(&mut second).await, "ok");
+    }
+
+    /// E2: one address holds at most `public_max_inflight_per_ip` downloads; another still gets
+    /// a slot.
+    #[tokio::test]
+    async fn one_address_holds_at_most_its_share_of_the_downloads() {
+        let (dispatcher, _router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let data: Vec<u8> = (0..1_048_576_u32).map(|i| (i % 251) as u8).collect();
+        let (root, row) = published_download(&data);
+        let state = door_state_with(
+            &dispatcher,
+            root.clone(),
+            Duration::from_secs(5),
+            4,
+            1,
+            INLINE_BODY_TIMEOUT,
+        );
+        state
+            .public_registry
+            .write()
+            .expect("public registry")
+            .insert(row.key_sha256.clone(), row);
+        let request = format!(
+            "GET /public/{} HTTP/1.1\r\nhost: edge.example.com\r\nconnection: close\r\n\r\n",
+            sample_key()
+        );
+        let limits = quick_limits(Duration::from_secs(5));
+
+        // A download that does not read holds the address's only slot.
+        let (mut holding, server) = pipe_to(real_door(&state), limits.clone(), 8 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut holding, request.as_bytes())
+            .await
+            .expect("request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state
+            .public_peer_slots
+            .held_by(PEER.parse::<SocketAddr>().expect("peer").ip())
+            == 0
+        {
+            assert!(Instant::now() < deadline, "the first download started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let refused = exchange(&real_door(&state), &request).await;
+        assert_eq!(refused.status, 429);
+        assert_eq!(refused.json()["error_code"], "PUBLIC_PEER_BUSY");
+        assert_security_headers(&refused);
+
+        let (mut other, _other_server) =
+            pipe_from("198.51.100.9:40000", real_door(&state), limits, 64 * 1024);
+        tokio::io::AsyncWriteExt::write_all(&mut other, request.as_bytes())
+            .await
+            .expect("request");
+        let served = read_answer(&mut other).await;
+        assert_eq!(served.status, 200, "another address still downloads");
+        assert!(served.body == data);
+
+        drop(holding);
+        ended_within(server, Duration::from_secs(5)).await;
+        assert_eq!(
+            state
+                .public_peer_slots
+                .held_by(PEER.parse::<SocketAddr>().expect("peer").ip()),
+            0
+        );
+        assert_eq!(state.public_inflight.available_permits(), 4);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// E3, over a real TCP pair (and the door's accept loop): a reader that stops reading loses
+    /// its download, and its slot, after the pace's idle.
+    #[tokio::test]
+    async fn a_stalled_reader_over_tcp_loses_its_download() {
+        let (dispatcher, _router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        // More than the kernel's buffers hold on either side (Linux and macOS grow a send buffer
+        // to 4 MiB at most; a receive buffer grows only as its reader reads).
+        let data: Vec<u8> = (0..8 * 1_048_576_u32).map(|i| (i % 251) as u8).collect();
+        let (root, row) = published_download(&data);
+        let state = door_state(&dispatcher, root.clone(), Duration::from_secs(5));
+        state
+            .public_registry
+            .write()
+            .expect("public registry")
+            .insert(row.key_sha256.clone(), row);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let idle = Duration::from_millis(500);
+        tokio::spawn(serve_door(
+            listener,
+            real_door(&state),
+            Arc::new(EdgeTls::plaintext()),
+            quick_limits(idle),
+        ));
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stalled,
+            format!(
+                "GET /public/{} HTTP/1.1\r\nhost: edge.example.com\r\n\r\n",
+                sample_key()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("request");
+        // It never reads: the slot comes back once the pace runs out.
+        let started = Instant::now();
+        while state.public_inflight.available_permits() == 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the download started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while state.public_inflight.available_permits() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the stalled download kept its slot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            started.elapsed() >= idle.mul_f32(0.9),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(stalled);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// E3: the door's sockets report themselves writable by what was delivered.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn accepted_sockets_track_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (accepted, _) = listener.accept().await.expect("accept");
+        track_delivery(&accepted);
+        assert_eq!(
+            socket2::SockRef::from(&accepted)
+                .tcp_notsent_lowat()
+                .expect("TCP_NOTSENT_LOWAT"),
+            16 * 1024
+        );
+    }
+
+    /// E4: a web route file read before the certificate cannot take the main name: the route is
+    /// dropped once a certificate is served, and the main name keeps the door's routes anyway.
+    #[test]
+    fn a_web_route_file_never_takes_the_main_name() {
+        let path = std::env::temp_dir()
+            .join(format!("sy-edge-web-{}", Uuid::new_v4()))
+            .join("web_routes.json");
+        let both = json!({"routes": [
+            {"host": EDGE, "upstream": "io.web"},
+            {"host": WEB_HOST, "upstream": "io.web"},
+        ]});
+        std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+        std::fs::write(&path, serde_json::to_vec(&both).expect("json")).expect("file");
+        let table = WebRouteTable::load(path.clone());
+        assert!(
+            table.serves(EDGE),
+            "nothing tells the main name before a certificate"
+        );
+        let certified = [EDGE.to_string(), WEB_HOST.to_string()];
+        let main = RequestHost {
+            name: EDGE.to_string(),
+            port: None,
+        };
+        assert_eq!(
+            host_route(Some(&main), &table, Some(certified.as_slice())),
+            HostRoute::Door,
+            "the main name is never a web host"
+        );
+
+        table.forget_main_name(&certified);
+        assert!(!table.serves(EDGE) && table.serves(WEB_HOST));
+        // The next push writes the file again, even with the same set.
+        let applied = table.replace(
+            validate_web_routes(
+                serde_json::from_value(
+                    json!({"routes": [{"host": WEB_HOST, "upstream": "io.web"}]}),
+                )
+                .expect("routes"),
+                &certified,
+            )
+            .expect("valid"),
+        );
+        assert_eq!(
+            applied,
+            WebRoutesApplied {
+                changed: false,
+                persisted: true
+            }
+        );
+        assert!(!WebRouteTable::load(path.clone()).serves(EDGE));
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// E5: hyper's buffer is 64 KiB: a head over it is refused.
+    #[tokio::test]
+    async fn a_head_over_64_kib_is_refused() {
+        let door = labelled_door(scratch_web_routes(), Arc::new(EdgeTls::plaintext()));
+        let (client, server) = pipe_to(door, quick_limits(Duration::from_secs(5)), 16 * 1024);
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        let writer = tokio::spawn(async move {
+            let head = format!(
+                "GET /healthz HTTP/1.1\r\nhost: edge.example.com\r\nx-padding: {}\r\n\r\n",
+                "p".repeat(70 * 1024)
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut write_half, head.as_bytes()).await;
+        });
+        let answer = read_split_answer(&mut read_half).await;
+        assert!(answer.starts_with("HTTP/1.1 431 "), "{answer}");
+        ended_within(server, Duration::from_secs(5)).await;
+        writer.abort();
+    }
+
+    /// E6: the reaper writes the table it holds the lock of.
+    #[test]
+    fn the_reaper_drops_expired_rows_and_writes_the_table() {
+        let root = std::env::temp_dir().join(format!("sy-edge-reaper-{}", Uuid::new_v4()));
+        let path = root.join("publications.json");
+        let live = sample_public_row(b"live");
+        let expired = PublicArtifactRow {
+            key_sha256: sha256_hex(&"e1".repeat(32)),
+            publication_id: format!("pub:{}", Uuid::new_v4()),
+            expires_at: 1_000,
+            ..sample_public_row(b"expired")
+        };
+        let registry = RwLock::new(HashMap::from([
+            (live.key_sha256.clone(), live.clone()),
+            (expired.key_sha256.clone(), expired),
+        ]));
+        assert_eq!(reap_public_registry(&registry, &path, 2_000), 1);
+        assert_eq!(
+            load_public_registry(&path),
+            HashMap::from([(live.key_sha256.clone(), live)])
+        );
+        let written = std::fs::read(&path).expect("file");
+        assert_eq!(reap_public_registry(&registry, &path, 2_000), 0);
+        assert_eq!(
+            std::fs::read(&path).expect("file"),
+            written,
+            "nothing to write"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// E7: every answer of the door carries the security headers; a published artifact keeps the
+    /// content policy it chose.
+    #[tokio::test]
+    async fn every_answer_of_the_door_carries_the_security_headers() {
+        let (dispatcher, mut router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.edge@ingress1",
+            build_sy_edge_rpc_profile().expect("profile"),
+        );
+        let page = b"<!doctype html><p>e7</p>".to_vec();
+        let root = std::env::temp_dir().join(format!("sy-edge-e7-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("root");
+        let html = sample_public_row(&page);
+        std::fs::write(root.join(&html.public_name), &page).expect("page");
+        let download_key = "dd".repeat(32);
+        let download = PublicArtifactRow {
+            key_sha256: sha256_hex(&download_key),
+            publication_id: format!("pub:{}", Uuid::new_v4()),
+            content_type: "application/octet-stream".to_string(),
+            presentation: "attachment".to_string(),
+            content_policy: "download-v1".to_string(),
+            ..sample_public_row(&page)
+        };
+        let state = door_state_with(
+            &dispatcher,
+            root.clone(),
+            Duration::from_secs(5),
+            4,
+            0,
+            INLINE_BODY_TIMEOUT,
+        );
+        {
+            let mut public = state.public_registry.write().expect("public registry");
+            public.insert(html.key_sha256.clone(), html.clone());
+            public.insert(download.key_sha256.clone(), download);
+        }
+        open_test_channel(&state, "ich:t");
+        let (ich, mut fanout) = row_to_entry(
+            serde_json::from_value(json!({
+                "ich": "ich:fan",
+                "owner_l2_name": "",
+                "inbound_family": "user",
+                "auth_mode": "public",
+                "fanout_family": "IO.wapp.*@motherbee",
+            }))
+            .expect("row"),
+        );
+        fanout.verify_token = Some("tok".to_string());
+        state
+            .registry
+            .write()
+            .expect("registry")
+            .insert(ich, fanout);
+        let door = real_door(&state);
+        let get = |target: &str, extra: &str| {
+            format!("GET {target} HTTP/1.1\r\nhost: edge.example.com\r\n{extra}connection: close\r\n\r\n")
+        };
+        let csp = |answer: &Answer| answer.header("content-security-policy");
+        let door_csp = Some(SECURITY_HEADERS[4].1.to_string());
+
+        // The door's own answers: every header.
+        let page_key = sample_key();
+        let mut answers = vec![
+            ("/healthz", 200, exchange(&door, &get("/healthz", "")).await),
+            ("unknown path", 404, exchange(&door, &get("/nope", "")).await),
+            ("bad path", 400, exchange(&door, &get("/public/%FF", "")).await),
+            (
+                "unknown channel",
+                404,
+                exchange(&door, &get("/e/ich:none", "")).await,
+            ),
+            (
+                "fanout challenge",
+                200,
+                exchange(
+                    &door,
+                    &get(
+                        "/e/ich:fan?hub.mode=subscribe&hub.verify_token=tok&hub.challenge=7",
+                        "",
+                    ),
+                )
+                .await,
+            ),
+            (
+                "POST /public",
+                405,
+                exchange(
+                    &door,
+                    &format!(
+                        "POST /public/{page_key} HTTP/1.1\r\nhost: edge.example.com\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ),
+                )
+                .await,
+            ),
+            (
+                "bad range",
+                416,
+                exchange(&door, &get(&format!("/public/{page_key}"), "range: bytes=999999-\r\n"))
+                    .await,
+            ),
+            (
+                "unknown artifact",
+                404,
+                exchange(&door, &get(&format!("/public/{}", "0".repeat(64)), "")).await,
+            ),
+        ];
+        let relayed = tokio::spawn({
+            let door = door.clone();
+            async move {
+                exchange(
+                    &door,
+                    "POST /e/ich:t HTTP/1.1\r\nhost: edge.example.com\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+            }
+        });
+        let forwarded = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the request reaches the mesh");
+        router
+            .inject(Message {
+                routing: Routing {
+                    src: "io-test-uuid".to_string(),
+                    src_l2_name: Some("IO.test@motherbee".to_string()),
+                    dst: Destination::Unicast(forwarded.routing.src.clone()),
+                    ttl: 16,
+                    trace_id: forwarded.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: "user".to_string(),
+                    ..Meta::default()
+                },
+                payload: json!({"ok": true}),
+            })
+            .await
+            .expect("reply");
+        answers.push(("relayed answer", 200, relayed.await.expect("exchange")));
+        for (case, status, answer) in &answers {
+            assert_eq!(answer.status, *status, "{case}");
+            assert_security_headers(answer);
+        }
+        assert_eq!(answers[4].2.body, b"7", "the challenge is still echoed");
+
+        // A published artifact: the same headers, and the content policy it chose.
+        let served_page = exchange(&door, &get(&format!("/public/{page_key}"), "")).await;
+        assert_eq!(served_page.status, 200);
+        assert!(csp(&served_page).is_some_and(|policy| policy.starts_with("sandbox allow-scripts")));
+        let served_download = exchange(&door, &get(&format!("/public/{download_key}"), "")).await;
+        assert_eq!(served_download.status, 200);
+        assert_eq!(
+            csp(&served_download),
+            None,
+            "a download keeps no policy of the door's"
+        );
+        let not_modified = exchange(
+            &door,
+            &get(
+                &format!("/public/{page_key}"),
+                &format!("if-none-match: \"{}\"\r\n", html.sha256),
+            ),
+        )
+        .await;
+        assert_eq!(not_modified.status, 304);
+        assert_eq!(csp(&not_modified), None);
+        for answer in [&served_page, &served_download, &not_modified] {
+            for (name, value) in SECURITY_HEADERS.iter().take(4) {
+                assert_eq!(answer.header(name).as_deref(), Some(*value), "{name}");
+            }
+        }
+        assert_ne!(csp(&served_page), door_csp);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

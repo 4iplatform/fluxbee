@@ -51,13 +51,15 @@ executor schema and an example; `GET /admin/actions/{action}` returns one
 7. Builds the executor's AI runtime (`build_admin_executor_ai_runtime`, see
    [The executor](#the-executor)). No key in the vault: the executor stays unavailable. An invalid
    `ai` section in hive.yaml: `main` returns the error and the process exits.
-8. Reads the `acme:` section and the certified name (`AcmeConfig::from_hive`). A section that
-   cannot work turns ACME off with a reason, in the log and in `GET /acme/status`; it never stops
-   the start.
+8. Reads the `web:` section (`WebConfig::from_hive`) and logs the web hosts it declares, then the
+   `acme:` section and the certified names (`AcmeConfig::from_hive`): the main name, then those
+   hosts. A section that cannot work declares nothing (`web:`) or turns ACME off (`acme:`) with a
+   reason, in the log (and in `GET /acme/status`); neither stops the start.
 9. Starts the HTTP server, the `NODE_STATUS_GET` loop, the `ADMIN_COMMAND` loop, the system loop
    (`CONFIG_GET`, `CONFIG_SET`, `VAULT_SECRET_CHANGED`), the publication expiry sweep (every
-   600 s, `run_publication_expiry_sweep`) and the ACME check (2 min after the start, then about
-   every 6 h, `AcmeService::run`; see [The ACME client](#the-acme-client)).
+   600 s, `run_publication_expiry_sweep`), the ACME check (2 min after the start, then about
+   every 6 h, `AcmeService::run`; see [The ACME client](#the-acme-client)) and the web routes push
+   (at once, then every 60 s, `WebRoutes::run`; see [The web hosts](#the-web-hosts)).
 
 ## HTTP API
 
@@ -237,7 +239,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `get_llm_usage`, `GET /config/storage/metrics` | `SY.storage@motherbee` | `USAGE_QUERY`, `STORAGE_METRICS_GET` |
 | `node_control_config_get/set` | the node | `CONFIG_GET`, `CONFIG_SET` |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
-| `publish_artifact`, `unpublish_artifact` | `IO.blob@motherbee`, then the public edge | `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` and back |
+| `publish_artifact`, `unpublish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT` (publish only), `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` and back |
 | `acme_status`, `acme_renew`, `acme_test`, `acme_reload` | answered by SY.admin's ACME client, which asks the public edge, SY.vault, the CA and SY.orchestrator | `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `VAULT_*`, `record_drift_alert` ([The ACME client](#the-acme-client)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
 
@@ -366,6 +368,18 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/public/<key>` (`handle_publish_artifact`). The edge is `admin.public_edge_node`, or the one
   connected ingress hive (`resolve_public_edge_node`). Expiry: default 1 day, 60 s to 30 days
   (`PUBLICATION_*_SECS`). The sweep retires expired ones every 600 s.
+- **A producer on a worker** (FINDINGS A-81) promotes its blob there, and Syncthing brings it to
+  the motherbee about 10 s later. Before the publication lock, unless the blob is in the
+  motherbee's `active/` already, SY.admin asks the producer's hive to scan its blob folder
+  (`SYSTEM_SYNC_HINT` to its `SY.orchestrator`, `fluxbee-blob`, `wait_for_idle: false`, 10 s at
+  most, in a task of its own) while it looks for the blob every half second for up to 30 s
+  (`await_producer_blob`). A producer on the motherbee gets the looks only. Either way the curate
+  answers for the blob. Any curate error, a lost answer included, releases what `IO.blob` may
+  have curated (`curate_publication_blob`).
+- **One budget of 110 s** covers a whole `publish_artifact`, under the 120 s ai.generic waits for
+  its answer: the wait for the blob, the publication lock, the curate (30 s at most) and the
+  edge's publish (75 s at most) each get what is left. A step with nothing left answers
+  `TIMEOUT`; at the edge's step, after releasing what was curated.
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048
@@ -394,11 +408,16 @@ acme:
   profile: "classic"                    # optional: the CA's default when absent
   contact: "mailto:ops@example.com"     # optional
   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # optional, only for a private CA
+web:
+  archi: true                           # optional: archi.<the main name> joins the certificate
 ```
 
-- The certified name is the host of `admin.public_base_url` (`SY_ADMIN_PUBLIC_BASE_URL` wins),
-  lowercase, with no trailing dot. It is read at boot: a new name takes effect when SY.admin
-  restarts, and replacing the certificate for it is an explicit `POST /acme/renew`.
+- The main certified name is the host of `admin.public_base_url` (`SY_ADMIN_PUBLIC_BASE_URL`
+  wins), lowercase, with no trailing dot. The web hosts `web:` declares follow it
+  ([The web hosts](#the-web-hosts)); one certificate carries every name. They are read at boot: a
+  new name takes effect when SY.admin restarts, and certifying it is an explicit
+  `POST /acme/renew` (after `POST /acme/test`). Until then the served certificate only raises
+  `name_not_covered`. A name taken out goes at the next renewal.
 - **Without `acme:`** nothing is ordered; the expiry checks and their alerts still run.
 - **A section that cannot work turns ACME off** (`config.state: off` and `config.reason` in
   `GET /acme/status`, an ERROR line in the log): `terms_agreed` not `true`; `public_base_url`
@@ -443,18 +462,26 @@ share one in-flight slot; a busy one answers `409 ACME_BUSY` with what is runnin
    (a metadata-only write, such as `vault_assign`, moves `updated_at` without changing the
    certificate) and compared again (`writable`); a difference that stays, or an edge that now
    serves another leaf, stops the run before any CA call.
-2. **Order** for the name, with the profile. `replaces` names the served leaf (its ARI identifier)
-   only when `acme.json` records it as issued by this account of this directory; an error that
-   points to it is retried once without it. The order URL is recorded at once, and after a restart
-   the order is resumed (`Account::order`), not placed again; one past finalize is replaced, since
-   its key died with the run. An abandoned authorization is deactivated.
-3. **Challenge.** `EDGE_ACME_CHALLENGE` arms the TLS-ALPN-01 digest for 600 s, the challenge is
-   marked ready and the order polled for up to 5 min; an invalid one reports the authorization's
-   error. The challenge is cleared afterwards, whatever happened.
-4. **Finalize** with a fresh P-256 key and a CSR (empty subject, SAN = the name; rcgen 0.13).
+2. **Order**: one order with every name as an identifier, the main one first, with the profile.
+   `replaces` names the served leaf (its ARI identifier) only when `acme.json` records it as issued
+   by this account of this directory; an error that points to it is retried once without it. The
+   order URL is recorded at once with its names, and after a restart the order is resumed
+   (`Account::order`), not placed again, when it carries the same names; one past finalize is
+   replaced, since its key died with the run. An abandoned order's authorizations whose challenge
+   was never marked ready are deactivated (`deactivate_unready`); one the CA validated, or still
+   validates, stays.
+3. **Challenge**, for each authorization (one per name): `EDGE_ACME_CHALLENGE` arms each pending
+   one's TLS-ALPN-01 digest for 600 s (the edge keeps one challenge per name), each is marked
+   ready, and the order is polled for up to 5 min. An order that does not end ready, or a partial
+   mark, is left to settle (`settle`): a CA can mark the order invalid as soon as one name fails,
+   while it still validates another, so the authorizations are read again every second, for up to
+   a minute, until none is still being validated. Only then are the failed names named, with
+   their errors, and every armed challenge cleared, whatever happened.
+4. **Finalize** with a fresh P-256 key and a CSR (empty subject, SAN = every name, the main one
+   first; rcgen 0.13).
 5. **Check before storing** (`check_material`): the edge's own verdict
-   (`json_router::tls_material::inspect`), the name, a chain of at least 2 that verifies to the
-   platform roots (`rustls-native-certs`; `ca-certificates`) or `acme.trust_anchor` for the name,
+   (`json_router::tls_material::inspect`), every name, a chain of at least 2 that verifies to the
+   platform roots (`rustls-native-certs`; `ca-certificates`) or `acme.trust_anchor` for each name,
    and more than 2 days left.
 6. **Store**: `VAULT_PUT` of `{cert, key}` under the edge's secret with explicit metadata
    (`resource_type: tls`, owner the edge, root tenant), right after checking again that the
@@ -476,6 +503,19 @@ share one in-flight slot; a busy one answers `409 ACME_BUSY` with what is runnin
 The private key exists in SY.admin's memory and in the vault only: it is never logged and never
 written to disk.
 
+**The main name is never held hostage** by an added one (`Run::main_alone_after`). An order that
+fails only on added names, the main name's authorization validated, is abandoned and followed at
+once by an order for the main name alone, when the run may fall back (a check's order, or
+`POST /acme/renew` when the edge serves no leaf for the main name or the served one is past its
+renewal point, `main_needs_certificate`; never a test order) and the edge loses nothing it serves
+or cannot wait (`main_alone_loses_nothing`: no served leaf covers the main name, the served leaf
+already lacks every name dropped, or it is in the last sixth of its lifetime). The attempt is then
+`installed` with a detail that says why, and `name_not_covered` stays open for the missing name.
+Otherwise the attempt fails and the backoff retries every name: a passing failure never replaces a
+certificate for every name. A renewal 48 h past its point (the `renewal_overdue` mark), after an
+order that failed only on added names (`AttemptRecord::failed_names`), orders the main name alone.
+The next renewal tries every name again.
+
 **The check** (`AcmeService::check_once`) runs 2 min after the start, then every 6 h plus up to
 30 min. It reads `EDGE_TLS_STATUS` and decides (`decide`):
 
@@ -485,9 +525,9 @@ written to disk.
 | answers `status: error` (no public listener, another origin) | a configuration error, in `edge.config_error`: no order, the regular schedule, no alert | the same |
 | `awaiting`, `not_found` | order now | `edge_without_certificate` |
 | `awaiting`, another reason | `EDGE_TLS_RELOAD`, then the alert; no order | `edge_without_certificate` |
-| serves a leaf this account issued | renew at a random point of the CA's ARI window (asked again after its Retry-After), else at two thirds of the lifetime | expiry checks only |
+| serves a leaf this account issued for the main name | renew at a random point of the CA's ARI window (asked again after its Retry-After), else at two thirds of the lifetime, with every name (a leaf that misses an added name too: `name_not_covered` meanwhile); 48 h past that point, after an order that failed only on added names, the main name alone | expiry checks only |
 | `acme.json` holds a newer certificate than the served one | `EDGE_TLS_RELOAD`, never a new order | |
-| serves a hand-seeded leaf, or one for another name | alerts only; `POST /acme/renew` replaces it | expiry checks only |
+| serves a hand-seeded leaf, or one for another main name | alerts only; `POST /acme/renew` replaces it | expiry checks only |
 | `disk` or `plaintext` mode | left alone | expiry checks only |
 
 - **Backoff**: a failed order waits 1 h, 2 h, 4 h and so on, up to 24 h; a `rateLimited` answer
@@ -509,7 +549,7 @@ that hive, kind and state is the same) counts as delivered.
 | `renewal_failed` | warning | the last attempt failed |
 | `renewal_overdue` | warning | 48 h past the renewal point, and the edge still serves that leaf |
 | `expiring` | critical | less than a sixth of the served leaf's lifetime is left |
-| `name_not_covered` | warning | the served leaf does not cover the name |
+| `name_not_covered` | warning | the served leaf does not cover one of the names (the detail lists the missing ones) |
 | `foreign_certificate` | warning | a hand-seeded leaf passed its renewal point (two thirds) |
 | `install_refused` | critical | the edge refused a certificate SY.admin issued |
 | `edge_without_certificate` | critical | the edge is `awaiting` |
@@ -522,13 +562,39 @@ others need it on.
 
 | Action | Route | Answer |
 | --- | --- | --- |
-| `acme_status` | `GET /acme/status` | the configuration (and why it is off), the terms URL, the directories read, the accounts, the edge (`live`: a fresh `EDGE_TLS_STATUS`; `last_seen`: what the last check judged by), the run in flight, the order recorded, a certificate waiting to be served, the hold and the pending rollback, the last check, attempt and test, the backoff, the next check, the renewal plan, the last 20 issued certificates and the open conditions. Times are RFC 3339. |
+| `acme_status` | `GET /acme/status` | the configuration (and why it is off; `config.name` is the main name, `config.names` every name), the terms URL, the directories read, the accounts, the edge (`live`: a fresh `EDGE_TLS_STATUS`; `last_seen`: what the last check judged by; `names_covered` and `names_missing`: the names its leaf covers), the run in flight, the order recorded, a certificate waiting to be served, the hold and the pending rollback, the last check, attempt and test, the backoff, the next check, the renewal plan, the last 20 issued certificates (each with its `names`) and the open conditions. Times are RFC 3339. |
 | `acme_renew` | `POST /acme/renew` | `202 accepted`; needs confirmation. Forced: no backoff and no cap, never past the CA's rate limit. Lifts an `install_refused` hold. Refused with `409`: `ACME_OFF`, `EDGE_NOT_CONFIGURED`, `ACME_BUSY`, `ACME_RATE_LIMITED`, `CERTIFICATE_NOT_SERVED` (reload first), `ROLLBACK_PENDING` |
 | `acme_test` | `POST /acme/test` | `202 accepted`; needs confirmation. Steps 1–5 against `staging_directory_url` with its own account and no `replaces`; nothing is stored or installed, and the staging root is reported untrusted (`last_test`). `409 ACME_TEST_SAME_DIRECTORY` when staging equals production |
 | `acme_reload` | `POST /acme/reload` | `EDGE_TLS_RELOAD`, after a manual change or a vault rollback: `200` with what the edge serves, `422 EDGE_REFUSED` (the edge kept its certificate, `refused.reason` and `refused.detail`), `503 EDGE_VAULT_UNAVAILABLE` (a `transient` refusal), `504 EDGE_NO_ANSWER`, `502 EDGE_ERROR` |
 
 None takes a parameter: a body with a field answers `400 INVALID_REQUEST`. The three POSTs are
 in the audit log. SY.architect's read tool translates `GET /acme/status`.
+
+## The web hosts
+
+The motherbee's `web:` section declares the hosts the public edge serves only through io.web,
+never through `/e/` or `/public/` ([docs/io-web-v2.md](../io-web-v2.md) §11.1). Source:
+`WebConfig` and `WebRoutes` in `src/bin/sy_admin.rs`.
+
+- **The declaration** (`WebConfig::from_hive`): each key is a host label, declared with `true`;
+  `archi` is the only one. The host is the label before the main certified name (`archi: true`
+  declares `archi.<host of admin.public_base_url>`), so the domain never comes from code. A bare
+  `web:`, `{}` or `archi: false` declares nothing. An unknown key, a value that is not a boolean, or
+  a `public_base_url` with no certifiable host declares nothing, with an ERROR line. It is read at
+  boot, which logs the declared hosts. The ACME client certifies them after the main name
+  ([The ACME client](#the-acme-client)).
+- **The push** (`WebRoutes::run`): at the start and every 60 s, SY.admin's own loop (the ACME check
+  runs every 6 h) sends `EDGE_WEB_ROUTES {routes: [{host, upstream: "io.web"}]}` to the public edge
+  as the ACME client resolves it (`admin.public_edge_node`, else the one connected ingress), with
+  a 20 s timeout. The edge takes it on its TLS command channel. Each push carries the full set: an
+  empty one without `web:`, so a host taken out leaves the edge at the first push after the
+  restart.
+- **The answer** is kept in memory: the edge, `acknowledged`, `refused`, `no_answer` or `no_edge`
+  with its detail, since when, and when the edge last acknowledged the set. Only a change of edge
+  or of answer is logged, the detail included (a timeout reads `no answer in 20s`, so repeated
+  ones are no change): INFO when acknowledged, and for no edge while no host is declared; WARN
+  otherwise, with the last acknowledgement. An edge older than 0.1.84 does not take the command,
+  which reads as no answer.
 
 ## Config
 
@@ -540,6 +606,7 @@ in the audit log. SY.architect's read tool translates `GET /acme/status`.
 | `admin.listen` | HTTP address (env `JSR_ADMIN_LISTEN` wins) |
 | `admin.public_edge_node`, `admin.public_base_url` | public artifacts and the ACME client; the host of `public_base_url` is the certified name (env `SY_ADMIN_PUBLIC_EDGE_NODE`, `SY_ADMIN_PUBLIC_BASE_URL` win) |
 | `acme` | the ACME client ([The ACME client](#the-acme-client)) |
+| `web` | the web hosts, pushed to the public edge and certified after the main name ([The web hosts](#the-web-hosts)) |
 | `ai` | executor provider and model |
 | `blob.path` | blob root, default `/var/lib/fluxbee/blob` |
 | `storage.path` | root of the `/modules` store, default `/var/lib/fluxbee` |
@@ -582,6 +649,8 @@ the same entries (`caller_hive_role`).
 - **ACME**: a section that cannot work turns ACME off; a CA, edge, vault or orchestrator that
   fails only fails the order or the alert, which the backoff and the next check retry. Nothing
   in the ACME client stops SY.admin.
+- **Web routes**: a `web:` section that cannot work declares nothing; an edge that refuses the
+  routes or does not answer is logged when that starts, and the full set goes again every minute.
 
 ## Health
 
@@ -702,7 +771,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `timer_format` | `POST /hives/{hive}/timer/format` | Format a UTC instant through SY.timer for a hive. |
 | `acme_status` | `GET /acme/status` | Read the ACME client of the public edge's certificate: its configuration (and why it is off), the terms URL, the accounts, the edge's live status, the order in flight, the last attempt and test, the next check and renewal point, the last issued certificates and the open certificate conditions. |
 | `acme_renew` | `POST /acme/renew` | Order the public edge's certificate now (forced: no backoff, no cap). |
-| `acme_test` | `POST /acme/test` | Run a test order against the staging directory with the real name: issued and checked, never stored or installed. |
+| `acme_test` | `POST /acme/test` | Run a test order against the staging directory with the real names: issued and checked, never stored or installed. |
 | `acme_reload` | `POST /acme/reload` | Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback. |
 
 ### HTTP routes outside the catalog

@@ -92,16 +92,9 @@ const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
 /// `trace_id` and still gets a row of its own. Each row keeps the whole message, its thread and its
 /// trace, and the time the router copied it (`ts`); `stored_at` is when SY.storage wrote it, the
 /// order a live reader follows, since a stream's batch can arrive late.
-///
-/// `ctx` and `seq` are no longer written. They stay one release, nullable, so a rollback to 0.1.82
-/// still starts (it creates its `(ctx, seq)` index at start); the next release drops both and that
-/// index. A 0.1.82 table loses their `NOT NULL` once: the `DO` block reads the catalog first, so
-/// later starts take no lock on `turns`.
 const TURNS_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS turns (
     dedupe_key  TEXT NOT NULL,
-    ctx         TEXT,
-    seq         BIGINT,
     ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
     stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     from_ilk    TEXT NOT NULL,
@@ -114,18 +107,27 @@ CREATE TABLE IF NOT EXISTS turns (
     trace_id    TEXT,
     message     JSONB NOT NULL
 );
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'turns'
-                  AND column_name IN ('ctx', 'seq') AND is_nullable = 'NO') THEN
-        ALTER TABLE turns ALTER COLUMN ctx DROP NOT NULL, ALTER COLUMN seq DROP NOT NULL;
-    END IF;
-END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);
 CREATE INDEX IF NOT EXISTS idx_turns_stored_at ON turns (stored_at, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns (thread_id);
+"#;
+
+/// `turns.ctx` and `seq`, the message log's key until 0.1.74, are written by nothing since 0.1.83,
+/// which kept them, nullable, so that a rollback to 0.1.82 still started: its start creates the
+/// index `idx_turns_ctx_seq` on them. A table that still has them loses both, and that index, once
+/// (`drop_turns_ctx_seq`). The catalog is read first, so a start with nothing to drop skips the
+/// drop and its `ACCESS EXCLUSIVE` lock on `turns`.
+const TURNS_CTX_SEQ_COLUMNS_SQL: &str = r#"
+SELECT column_name::text FROM information_schema.columns
+WHERE table_schema = current_schema() AND table_name = 'turns' AND column_name IN ('ctx', 'seq')
+ORDER BY 1
+"#;
+/// One batch, so one transaction: the index and both columns go together. `DROP COLUMN` changes
+/// only the catalog, without rewriting the table, so it is quick once it holds its lock.
+const TURNS_CTX_SEQ_DROP_SQL: &str = r#"
+DROP INDEX IF EXISTS idx_turns_ctx_seq;
+ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq;
 "#;
 
 /// Every record lands in the inbox first, keyed by `dedupe_key` (`message_dedupe_key`), so a
@@ -388,18 +390,29 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage (ts);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_stored ON llm_usage (stored_at, record_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_tenant_stored ON llm_usage (tenant_id, stored_at, record_id);
 "#;
+
+/// A step of `ensure_schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaStep {
+    /// Statements run as one batch.
+    Sql(&'static str),
+    /// `turns.ctx` and `seq` dropped, only while the catalog shows them (`drop_turns_ctx_seq`).
+    DropTurnsCtxSeq,
+}
+
 /// What `ensure_schema` runs at start, in order. Each schema statement waits at most 5 s for its
 /// lock: a DDL queued behind a long transaction would hold every later reader and writer of its
 /// table behind it, so it fails instead, and SY.storage exits and retries
 /// (`exit_without_database`). The reset leaves the shared connection's later statements waiting as
 /// long as they need.
-const SCHEMA_STEPS: [&str; 6] = [
-    "SET lock_timeout = '5s'",
-    TURNS_SCHEMA_SQL,
-    INBOX_SCHEMA_SQL,
-    COGNITION_SCHEMA_SQL,
-    USAGE_SCHEMA_SQL,
-    "RESET lock_timeout",
+const SCHEMA_STEPS: [SchemaStep; 7] = [
+    SchemaStep::Sql("SET lock_timeout = '5s'"),
+    SchemaStep::Sql(TURNS_SCHEMA_SQL),
+    SchemaStep::DropTurnsCtxSeq,
+    SchemaStep::Sql(INBOX_SCHEMA_SQL),
+    SchemaStep::Sql(COGNITION_SCHEMA_SQL),
+    SchemaStep::Sql(USAGE_SCHEMA_SQL),
+    SchemaStep::Sql("RESET lock_timeout"),
 ];
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;
@@ -794,8 +807,33 @@ impl Storage {
 
     async fn ensure_schema(&self) -> Result<(), StorageError> {
         for step in SCHEMA_STEPS {
-            self.client.batch_execute(step).await?;
+            match step {
+                SchemaStep::Sql(sql) => self.client.batch_execute(sql).await?,
+                SchemaStep::DropTurnsCtxSeq => self.drop_turns_ctx_seq().await?,
+            }
         }
+        Ok(())
+    }
+
+    /// Drops `turns.ctx` and `seq` and their index (`TURNS_CTX_SEQ_DROP_SQL`), only while the
+    /// catalog still shows one of the columns, and says so in one line. A later start finds
+    /// nothing and does nothing.
+    async fn drop_turns_ctx_seq(&self) -> Result<(), StorageError> {
+        let columns: Vec<String> = self
+            .client
+            .query(TURNS_CTX_SEQ_COLUMNS_SQL, &[])
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        self.client.batch_execute(TURNS_CTX_SEQ_DROP_SQL).await?;
+        tracing::info!(
+            columns = %columns.join(", "),
+            "dropped the turns columns nothing writes since 0.1.83, and any index on them"
+        );
         Ok(())
     }
 
@@ -3875,10 +3913,30 @@ mod tests {
             .unwrap();
         let turns = &TURNS_SCHEMA_SQL[start..];
         let turns = &turns[..turns.find(");").unwrap()];
+        let columns: Vec<&str> = turns
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                "dedupe_key",
+                "ts",
+                "stored_at",
+                "from_ilk",
+                "to_ilk",
+                "ich",
+                "msg_type",
+                "content",
+                "tags",
+                "thread_id",
+                "trace_id",
+                "message"
+            ]
+        );
         for column in [
             "dedupe_key  TEXT NOT NULL,",
-            "ctx         TEXT,",
-            "seq         BIGINT,",
             "stored_at   TIMESTAMPTZ NOT NULL DEFAULT now(),",
             "thread_id   TEXT,",
             "trace_id    TEXT,",
@@ -3896,38 +3954,54 @@ mod tests {
         ] {
             assert!(TURNS_SCHEMA_SQL.contains(index), "{index}");
         }
-        // ctx and seq, no longer written, lose a 0.1.82 table's NOT NULL once: the ALTER runs only
-        // while the catalog still says NOT NULL, so a later start takes no lock on `turns`. Their
-        // index is no longer created.
-        let guard = &TURNS_SCHEMA_SQL[TURNS_SCHEMA_SQL.find("DO $$").unwrap()..];
-        let guard = &guard[..guard.find("END $$;").unwrap()];
-        assert!(guard.contains("table_schema = current_schema() AND table_name = 'turns'"));
-        assert!(guard.contains("column_name IN ('ctx', 'seq') AND is_nullable = 'NO'"));
-        assert!(guard.contains(
-            "ALTER TABLE turns ALTER COLUMN ctx DROP NOT NULL, ALTER COLUMN seq DROP NOT NULL;"
-        ));
-        assert_eq!(
-            TURNS_SCHEMA_SQL.matches("ALTER TABLE").count(),
-            1,
-            "the ALTER runs only inside the guard"
-        );
-        assert!(!TURNS_SCHEMA_SQL.contains("idx_turns_ctx_seq"));
+        // ctx, seq and their index are neither created nor changed here: 0.1.83's DROP NOT NULL is
+        // gone, and `drop_turns_ctx_seq` drops what an old table still has.
+        for gone in ["ctx", "seq", "ALTER TABLE", "DO $$"] {
+            assert!(!TURNS_SCHEMA_SQL.contains(gone), "{gone}");
+        }
         assert!(INBOX_SCHEMA_SQL.contains("source_ts    TIMESTAMPTZ,"));
+    }
+
+    #[test]
+    fn the_old_key_columns_are_dropped_once() {
+        // The catalog is read first: the drop runs only while `turns` still shows `ctx` or `seq`,
+        // so a start with nothing to drop takes no lock on `turns` for it.
+        for guard in [
+            "FROM information_schema.columns",
+            "table_schema = current_schema() AND table_name = 'turns'",
+            "column_name IN ('ctx', 'seq')",
+        ] {
+            assert!(TURNS_CTX_SEQ_COLUMNS_SQL.contains(guard), "{guard}");
+        }
+        // The index and both columns, in one batch, so one transaction; nothing else.
+        let statements: Vec<&str> = TURNS_CTX_SEQ_DROP_SQL
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect();
+        assert_eq!(
+            statements,
+            [
+                "DROP INDEX IF EXISTS idx_turns_ctx_seq",
+                "ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq"
+            ]
+        );
     }
 
     #[test]
     fn every_schema_statement_runs_under_the_lock_timeout() {
         let (first, rest) = SCHEMA_STEPS.split_first().unwrap();
         let (last, ddl) = rest.split_last().unwrap();
-        assert_eq!(*first, "SET lock_timeout = '5s'");
-        assert_eq!(*last, "RESET lock_timeout");
+        assert_eq!(*first, SchemaStep::Sql("SET lock_timeout = '5s'"));
+        assert_eq!(*last, SchemaStep::Sql("RESET lock_timeout"));
         assert_eq!(
             ddl,
             [
-                TURNS_SCHEMA_SQL,
-                INBOX_SCHEMA_SQL,
-                COGNITION_SCHEMA_SQL,
-                USAGE_SCHEMA_SQL
+                SchemaStep::Sql(TURNS_SCHEMA_SQL),
+                SchemaStep::DropTurnsCtxSeq,
+                SchemaStep::Sql(INBOX_SCHEMA_SQL),
+                SchemaStep::Sql(COGNITION_SCHEMA_SQL),
+                SchemaStep::Sql(USAGE_SCHEMA_SQL),
             ]
         );
     }

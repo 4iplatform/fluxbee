@@ -1,8 +1,10 @@
 //! SY.admin's ACME client: the public edge's certificate, issued and renewed by an ACME CA with
 //! TLS-ALPN-01 on the :443 the edge already opens (docs/acme-edge-certificates-v1.md §3, §6, §7).
 //!
-//! - [`AcmeConfig`]: the motherbee's `acme:` section and the certified name (§3). A section that
-//!   cannot work turns ACME off with a reason; nothing here stops SY.admin from starting.
+//! - [`AcmeConfig`]: the motherbee's `acme:` section and the certified names (§3): the main one,
+//!   the host of `admin.public_base_url`, then the web hosts `web:` declares
+//!   (docs/io-web-v2.md §11.1). A section that cannot work turns ACME off with a reason; nothing
+//!   here stops SY.admin from starting.
 //! - [`AcmeCa`]: the CA, behind a small trait so the flow runs against a fake in the tests.
 //!   [`InstantAcmeCa`] is the real one (instant-acme 0.8.5, plus a plain GET of the directory).
 //! - [`AcmeMesh`]: the calls to the edge, SY.vault and SY.orchestrator. [`RouterMesh`] is the real
@@ -92,6 +94,10 @@ pub(crate) struct Timings {
     pub(crate) ca_call: Duration,
     /// The order polling, before finalize and after it.
     pub(crate) order_poll: Duration,
+    /// After an order that did not end ready, how often its authorizations are asked again, and
+    /// for how long at most, until no challenge is still being validated.
+    pub(crate) settle_every: Duration,
+    pub(crate) settle_limit: Duration,
     /// One EDGE_TLS_STATUS or EDGE_ACME_CHALLENGE.
     pub(crate) edge_call: Duration,
     /// One EDGE_TLS_RELOAD.
@@ -114,6 +120,8 @@ impl Default for Timings {
             edge_retry: Duration::from_secs(600),
             ca_call: Duration::from_secs(30),
             order_poll: Duration::from_secs(300),
+            settle_every: Duration::from_secs(1),
+            settle_limit: Duration::from_secs(60),
             edge_call: Duration::from_secs(20),
             reload: Duration::from_secs(75),
             mesh_call: Duration::from_secs(15),
@@ -131,8 +139,9 @@ impl Default for Timings {
 /// A working `acme:` section.
 #[derive(Clone)]
 pub(crate) struct AcmeSettings {
-    /// The host of `admin.public_base_url`, lowercase, without a trailing dot.
-    pub(crate) name: String,
+    /// The names the certificate carries, lowercase, without a trailing dot: the main one first
+    /// (the host of `admin.public_base_url`), then the web hosts `web:` declares.
+    pub(crate) names: Vec<String>,
     pub(crate) directory_url: String,
     pub(crate) staging_directory_url: String,
     pub(crate) profile: Option<String>,
@@ -142,45 +151,63 @@ pub(crate) struct AcmeSettings {
     pub(crate) trust_anchor_roots: Vec<CertificateDer<'static>>,
 }
 
+impl AcmeSettings {
+    /// The host of `admin.public_base_url`: every certificate carries it.
+    pub(crate) fn main_name(&self) -> &str {
+        self.names.first().map_or("", String::as_str)
+    }
+}
+
 /// The `acme:` section as SY.admin read it at boot.
 #[derive(Clone)]
 pub(crate) enum AcmeConfig {
     /// No `acme:` section: nothing is ordered; the expiry checks and their alerts still run.
     Absent {
-        name: Option<String>,
+        names: Vec<String>,
     },
     /// A section that cannot work: nothing is ordered, and the reason is in the log and the status.
     Off {
         reason: String,
-        name: Option<String>,
+        names: Vec<String>,
     },
     On(AcmeSettings),
 }
 
 impl AcmeConfig {
     /// Read the `acme:` section (`None` when the hive.yaml has none) against the effective
-    /// `admin.public_base_url`. Never fails: a section that cannot work is [`AcmeConfig::Off`].
+    /// `admin.public_base_url`, with the web hosts `web:` declares as the names after the main
+    /// one. Never fails: a section that cannot work is [`AcmeConfig::Off`].
     pub(crate) fn from_hive(
         section: Option<&serde_yaml::Value>,
         public_base_url: Option<&str>,
+        web_hosts: &[String],
     ) -> Self {
-        let name = certified_name(public_base_url);
-        let Some(section) = section else {
-            return AcmeConfig::Absent { name: name.ok() };
+        let main = certified_name(public_base_url);
+        let names: Vec<String> = match &main {
+            Ok(main) => std::iter::once(main.clone())
+                .chain(web_hosts.iter().cloned())
+                .collect(),
+            Err(_) => Vec::new(),
         };
-        match parse_section(section, &name) {
+        let Some(section) = section else {
+            return AcmeConfig::Absent { names };
+        };
+        match parse_section(section, &main, &names) {
             Ok(settings) => AcmeConfig::On(settings),
-            Err(reason) => AcmeConfig::Off {
-                reason,
-                name: name.ok(),
-            },
+            Err(reason) => AcmeConfig::Off { reason, names },
         }
     }
 
+    /// The main name, the host of `admin.public_base_url`.
     pub(crate) fn name(&self) -> Option<&str> {
+        self.names().first().map(String::as_str)
+    }
+
+    /// Every certified name, the main one first (none when `admin.public_base_url` is unusable).
+    pub(crate) fn names(&self) -> &[String] {
         match self {
-            AcmeConfig::Absent { name } | AcmeConfig::Off { name, .. } => name.as_deref(),
-            AcmeConfig::On(settings) => Some(settings.name.as_str()),
+            AcmeConfig::Absent { names } | AcmeConfig::Off { names, .. } => names,
+            AcmeConfig::On(settings) => &settings.names,
         }
     }
 
@@ -201,7 +228,7 @@ impl AcmeConfig {
             AcmeConfig::Off { reason, .. } => format!("ACME is off: {reason}"),
             AcmeConfig::On(settings) => format!(
                 "ACME is on for {} (directory {}, profile {})",
-                settings.name,
+                settings.names.join(", "),
                 settings.directory_url,
                 settings.profile.as_deref().unwrap_or("the CA's default")
             ),
@@ -209,9 +236,9 @@ impl AcmeConfig {
     }
 }
 
-/// The certified name: the host of `admin.public_base_url`, lowercase, with no trailing dot (§3).
-/// The URL must be https on port 443, and its host a DNS name with a dot: not an IP literal and
-/// not a wildcard.
+/// The main certified name: the host of `admin.public_base_url`, lowercase, with no trailing dot
+/// (§3). The URL must be https on port 443, and its host a DNS name with a dot: not an IP literal
+/// and not a wildcard.
 pub(crate) fn certified_name(public_base_url: Option<&str>) -> Result<String, String> {
     let url = public_base_url
         .map(str::trim)
@@ -255,7 +282,7 @@ pub(crate) fn certified_name(public_base_url: Option<&str>) -> Result<String, St
     }
     if host.contains('*') {
         return Err(format!(
-            "admin.public_base_url '{url}' has a wildcard host: ACME certifies one name"
+            "admin.public_base_url '{url}' has a wildcard host: ACME certifies exact names only"
         ));
     }
     if host.parse::<std::net::IpAddr>().is_ok() {
@@ -287,7 +314,8 @@ pub(crate) fn certified_name(public_base_url: Option<&str>) -> Result<String, St
 
 fn parse_section(
     section: &serde_yaml::Value,
-    name: &Result<String, String>,
+    main: &Result<String, String>,
+    names: &[String],
 ) -> Result<AcmeSettings, String> {
     let map = match section {
         serde_yaml::Value::Mapping(map) => map.clone(),
@@ -319,7 +347,7 @@ fn parse_section(
             Some(_) => Err(format!("acme.{key} is not a string")),
         }
     };
-    let name = name.clone()?;
+    main.clone()?;
     let directory_url =
         text("directory_url")?.unwrap_or_else(|| LETS_ENCRYPT_DIRECTORY.to_string());
     let staging_directory_url = text("staging_directory_url")?
@@ -351,7 +379,7 @@ fn parse_section(
         None => Vec::new(),
     };
     Ok(AcmeSettings {
-        name,
+        names: names.to_vec(),
         directory_url,
         staging_directory_url,
         profile,
@@ -755,12 +783,31 @@ pub(crate) struct AccountRecord {
     pub(crate) recorded_at: i64,
 }
 
+/// The names of an order or a certificate, the main one first. The files 0.1.82 and 0.1.83 wrote
+/// hold one `name`, read as a one-name list.
+fn one_or_more_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Names {
+        One(String),
+        More(Vec<String>),
+    }
+    Ok(match Names::deserialize(deserializer)? {
+        Names::One(name) => vec![name],
+        Names::More(names) => names,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OrderRecord {
     pub(crate) directory_url: String,
     pub(crate) account_url: String,
     pub(crate) order_url: String,
-    pub(crate) name: String,
+    #[serde(alias = "name", deserialize_with = "one_or_more_names")]
+    pub(crate) names: Vec<String>,
     pub(crate) profile: Option<String>,
     pub(crate) replaces: bool,
     pub(crate) kind: RunKind,
@@ -810,12 +857,26 @@ pub(crate) struct AttemptRecord {
     pub(crate) fingerprint: Option<String>,
     /// A test order's: whether its chain verified to a trusted root.
     pub(crate) trusted: Option<bool>,
+    /// A failed order's: the names whose authorization the CA did not validate (none when the
+    /// failure named no authorization).
+    #[serde(default)]
+    pub(crate) failed_names: Vec<String>,
 }
 
 impl AttemptRecord {
     fn failed(&self) -> bool {
         matches!(self.result.as_str(), "failed" | "refused")
     }
+
+    /// A failure that named only names after `main`: the CA validated the main name.
+    fn failed_only_on_added_names(&self, main: &str) -> bool {
+        self.failed() && only_added_names(&self.failed_names, main)
+    }
+}
+
+/// Whether `failed` names some names, none of them `main`.
+fn only_added_names(failed: &[String], main: &str) -> bool {
+    !failed.is_empty() && failed.iter().all(|name| name != main)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -834,7 +895,9 @@ pub(crate) struct IssuedRecord {
     pub(crate) authority_key_id: Option<String>,
     pub(crate) not_before: i64,
     pub(crate) not_after: i64,
-    pub(crate) name: String,
+    /// The names it was ordered for, the main one first.
+    #[serde(alias = "name", deserialize_with = "one_or_more_names")]
+    pub(crate) names: Vec<String>,
     pub(crate) profile: Option<String>,
     pub(crate) directory_url: String,
     pub(crate) account_url: String,
@@ -1094,17 +1157,27 @@ pub(crate) enum OrderStatus {
     Invalid,
 }
 
-/// The order's authorization for the name.
+/// One of the order's authorizations: one per name.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Authz {
+    /// The identifier, as the CA names it.
+    pub(crate) name: String,
+    pub(crate) state: AuthzState,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AuthzState {
-    /// Waiting for the TLS-ALPN-01 challenge: the name and the key authorization's SHA-256, hex.
-    Pending {
-        name: String,
-        digest: String,
-    },
-    /// Already valid (an authorization of the last 30 days).
+    /// Not validated yet: the key authorization's SHA-256, hex, and whether the CA is validating
+    /// its TLS-ALPN-01 challenge (marked ready, `processing`) or still waits for it (`pending`).
+    Pending { digest: String, processing: bool },
+    /// Valid: validated by this order, or an authorization the CA still holds for the account.
     Valid,
-    Other(String),
+    /// `invalid`, `deactivated`, `expired` or `revoked`, with the error the CA gave the
+    /// challenge.
+    Other {
+        status: String,
+        error: Option<String>,
+    },
 }
 
 #[async_trait]
@@ -1131,9 +1204,10 @@ pub(crate) trait AcmeCa: Send + Sync {
 pub(crate) trait CaAccount: Send + Sync {
     fn url(&self) -> String;
     fn profiles(&self) -> Vec<String>;
+    /// One order for every name: one identifier each.
     async fn new_order(
         &self,
-        name: &str,
+        names: &[String],
         profile: Option<&str>,
         replaces: Option<&CertRef>,
     ) -> Result<Box<dyn CaOrder>, CaError>;
@@ -1144,12 +1218,14 @@ pub(crate) trait CaAccount: Send + Sync {
 pub(crate) trait CaOrder: Send {
     fn url(&self) -> String;
     fn status(&mut self) -> OrderStatus;
-    async fn authorization(&mut self) -> Result<AuthzState, CaError>;
-    async fn set_challenge_ready(&mut self) -> Result<(), CaError>;
+    /// The order's authorizations; `refresh` asks the CA for each one again.
+    async fn authorizations(&mut self, refresh: bool) -> Result<Vec<Authz>, CaError>;
+    /// Mark the TLS-ALPN-01 challenge of the name's pending authorization ready.
+    async fn set_challenge_ready(&mut self, name: &str) -> Result<(), CaError>;
     async fn poll_ready(&mut self, limit: Duration) -> Result<OrderStatus, CaError>;
-    /// The error the CA gave the challenge, after a refresh of the authorization.
-    async fn challenge_error(&mut self) -> Option<String>;
-    async fn deactivate_pending(&mut self) -> Result<(), CaError>;
+    /// Deactivate the pending authorizations whose challenge was never marked ready, as the CA
+    /// reports them now. One the CA is validating, or validated, stays for the next order.
+    async fn deactivate_unready(&mut self) -> Result<(), CaError>;
     async fn finalize(&mut self, csr_der: &[u8]) -> Result<(), CaError>;
     /// Wait for the certificate and return the chain, PEM.
     async fn certificate(&mut self, limit: Duration) -> Result<String, CaError>;
@@ -1240,12 +1316,15 @@ pub(crate) enum Decision {
     Order {
         replaces: Option<CertRef>,
         reason: String,
+        /// For the main name alone: its renewal is overdue (docs/io-web-v2.md §11.1).
+        main_only: bool,
     },
     /// An order is due but held until then (`None`: until the operator acts).
     Held { until: Option<i64>, reason: String },
     /// Nothing is due before `renew_at`.
     Idle { renew_at: i64, reason: String },
-    /// A hand-seeded leaf or one for another name: alerts only; `POST /acme/renew` replaces it.
+    /// A hand-seeded leaf or one for another main name: alerts only; `POST /acme/renew` replaces
+    /// it.
     AlertOnly(String),
 }
 
@@ -1345,7 +1424,9 @@ pub(crate) fn rate_limited_until(detail: &str, now: i64) -> i64 {
 }
 
 /// The decision table of §7 for an edge that answered, with `acme:` configured. `renew_at` is the
-/// served leaf's renewal point when this account issued it (ARI or two thirds).
+/// served leaf's renewal point when this account issued it (ARI or two thirds). A leaf is judged
+/// by the main name: one this account issued that misses an added name is renewed at its point,
+/// with every name, and `name_not_covered` alerts meanwhile (docs/io-web-v2.md §11.1).
 pub(crate) fn decide(
     view: &EdgeView,
     settings: &AcmeSettings,
@@ -1381,6 +1462,7 @@ pub(crate) fn decide(
                 state,
                 settings,
                 None,
+                false,
                 "the edge has no certificate: there is nothing to replace".to_string(),
                 now,
             );
@@ -1398,22 +1480,33 @@ pub(crate) fn decide(
     let Some(leaf) = &view.leaf else {
         return Decision::LeaveAlone("the edge serves without reporting its leaf".to_string());
     };
-    let covered = tls_material::name_covered(&leaf.names, &settings.name);
+    let main = settings.main_name();
+    let covers_main = tls_material::name_covered(&leaf.names, main);
     let ours = issued_by_account(state, &settings.directory_url, &leaf.fingerprint);
     match ours {
-        Some(record) if covered => {
+        Some(record) if covers_main => {
             let renew_at = renew_at.unwrap_or_else(|| leaf.two_thirds());
             if now >= renew_at {
-                gate(
-                    state,
-                    settings,
-                    record.cert_ref(),
+                // 48 h past its point (`renewal_overdue`), after an order that failed only on
+                // added names, the main name is ordered alone: they never hold it hostage.
+                let overdue = settings.names.len() > 1
+                    && now >= renew_at + RENEWAL_OVERDUE_AFTER_SECS
+                    && state
+                        .last_attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.failed_only_on_added_names(main));
+                let reason = if overdue {
+                    format!(
+                        "the leaf this account issued is due since {}, 48 h past, and the last order failed only on added names: {main} is ordered alone",
+                        iso(renew_at)
+                    )
+                } else {
                     format!(
                         "the leaf this account issued is due since {}",
                         iso(renew_at)
-                    ),
-                    now,
-                )
+                    )
+                };
+                gate(state, settings, record.cert_ref(), overdue, reason, now)
             } else {
                 Decision::Idle {
                     renew_at,
@@ -1421,9 +1514,8 @@ pub(crate) fn decide(
                 }
             }
         }
-        _ if !covered => Decision::AlertOnly(format!(
-            "the served leaf does not cover {}; POST /acme/renew certifies it",
-            settings.name
+        _ if !covers_main => Decision::AlertOnly(format!(
+            "the served leaf does not cover {main}; POST /acme/renew certifies it"
         )),
         _ => Decision::AlertOnly(
             "the served leaf was seeded by hand; POST /acme/renew replaces it".to_string(),
@@ -1431,11 +1523,48 @@ pub(crate) fn decide(
     }
 }
 
+/// Whether the main name needs a certificate now: the edge serves no leaf that covers it, or the
+/// leaf it serves is past its renewal point. Only then may a `POST /acme/renew` that fails on an
+/// added name go on with the main name alone, so a retried one never spends issuances on a name
+/// the edge already serves (docs/io-web-v2.md §11.1).
+fn main_needs_certificate(
+    view: &EdgeView,
+    settings: &AcmeSettings,
+    state: &AcmeState,
+    now: i64,
+) -> bool {
+    match view.leaf.as_ref().filter(|_| view.serving()) {
+        None => true,
+        Some(leaf) => {
+            !tls_material::name_covered(&leaf.names, settings.main_name())
+                || now >= renewal_point(state, leaf)
+        }
+    }
+}
+
+/// Whether an order for the main name alone, `names[0]`, loses nothing the edge serves, or cannot
+/// wait: no served leaf covers the main name, the served leaf already lacks every name the order
+/// would drop, or it is in the last sixth of its lifetime (`expiring`). Otherwise the backoff
+/// retries every name, and a certificate for every name is never replaced by one for the main
+/// name alone after a passing failure of another (docs/io-web-v2.md §11.1).
+fn main_alone_loses_nothing(view: &EdgeView, names: &[String], now: i64) -> bool {
+    let Some((main, dropped)) = names.split_first() else {
+        return false;
+    };
+    let Some(leaf) = view.leaf.as_ref().filter(|_| view.serving()) else {
+        return true;
+    };
+    let covered = |name: &String| tls_material::name_covered(&leaf.names, name);
+    let expiring = leaf.lifetime() > 0 && leaf.not_after - now < leaf.lifetime() / 6;
+    !covered(main) || !dropped.iter().any(covered) || expiring
+}
+
 /// Hold a due order for the operator, a rate limit, the backoff or the cap.
 fn gate(
     state: &AcmeState,
     settings: &AcmeSettings,
     replaces: Option<CertRef>,
+    main_only: bool,
     reason: String,
     now: i64,
 ) -> Decision {
@@ -1471,7 +1600,11 @@ fn gate(
             reason: "one issuance per third of the lifetime (the cap)".to_string(),
         };
     }
-    Decision::Order { replaces, reason }
+    Decision::Order {
+        replaces,
+        reason,
+        main_only,
+    }
 }
 
 /// A condition open now.
@@ -1530,20 +1663,26 @@ pub(crate) fn evaluate_conditions(
                 );
             }
             if let Some(settings) = settings.filter(|_| view.is_vault() && view.serving()) {
-                let covered = tls_material::name_covered(&leaf.names, &settings.name);
-                if !covered {
+                let missing: Vec<&str> = settings
+                    .names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| !tls_material::name_covered(&leaf.names, name))
+                    .collect();
+                if !missing.is_empty() {
                     put(
                         "name_not_covered",
                         Severity::Warning,
                         format!(
                             "the certificate {edge} serves does not cover {} (it names {})",
-                            settings.name,
+                            missing.join(", "),
                             leaf.names.join(", ")
                         ),
                     );
                 }
+                let covers_main = tls_material::name_covered(&leaf.names, settings.main_name());
                 match issued_by_account(state, &settings.directory_url, &leaf.fingerprint) {
-                    Some(_) if covered => {
+                    Some(_) if covers_main => {
                         let point = renewal_point(state, leaf);
                         if now >= point + RENEWAL_OVERDUE_AFTER_SECS {
                             put(
@@ -1708,23 +1847,25 @@ impl std::fmt::Debug for SecretPem {
     }
 }
 
-/// A fresh P-256 key and a CSR with an empty subject and the name as its only SAN (§6 step 4).
-fn new_key_and_csr(name: &str) -> Result<(Vec<u8>, SecretPem), String> {
+/// A fresh P-256 key and a CSR with an empty subject and the names as its SANs, the main one
+/// first (§6 step 4).
+fn new_key_and_csr(names: &[String]) -> Result<(Vec<u8>, SecretPem), String> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|err| format!("generate the certificate key: {err}"))?;
-    let mut params = rcgen::CertificateParams::new(vec![name.to_string()])
-        .map_err(|err| format!("the CSR for {name}: {err}"))?;
+    let for_names = || format!("the CSR for {}", names.join(", "));
+    let mut params = rcgen::CertificateParams::new(names.to_vec())
+        .map_err(|err| format!("{}: {err}", for_names()))?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let csr = params
         .serialize_request(&key)
-        .map_err(|err| format!("the CSR for {name}: {err}"))?;
+        .map_err(|err| format!("{}: {err}", for_names()))?;
     Ok((csr.der().to_vec(), SecretPem(key.serialize_pem())))
 }
 
-/// Whether `chain` verifies to one of `roots` for `name` at `now` (§6 step 5).
+/// Whether `chain` verifies to one of `roots` for every one of `names` at `now` (§6 step 5).
 fn verify_chain(
     chain: &[CertificateDer<'static>],
-    name: &str,
+    names: &[String],
     now: i64,
     roots: Vec<CertificateDer<'static>>,
 ) -> Result<(), String> {
@@ -1739,20 +1880,18 @@ fn verify_chain(
         rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
             .build()
             .map_err(|err| err.to_string())?;
-    let server_name = ServerName::try_from(name.to_string()).map_err(|err| err.to_string())?;
     let (leaf, intermediates) = chain
         .split_first()
         .ok_or_else(|| "the chain is empty".to_string())?;
-    verifier
-        .verify_server_cert(
-            leaf,
-            intermediates,
-            &server_name,
-            &[],
-            UnixTime::since_unix_epoch(Duration::from_secs(now.max(0) as u64)),
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    let at = UnixTime::since_unix_epoch(Duration::from_secs(now.max(0) as u64));
+    for name in names {
+        let server_name =
+            ServerName::try_from(name.clone()).map_err(|err| format!("{name}: {err}"))?;
+        verifier
+            .verify_server_cert(leaf, intermediates, &server_name, &[], at)
+            .map_err(|err| format!("{name}: {err}"))?;
+    }
+    Ok(())
 }
 
 /// The platform roots (`ca-certificates` on the motherbee).
@@ -1835,6 +1974,8 @@ struct Failure {
     stage: &'static str,
     detail: String,
     rate_limited: bool,
+    /// The names whose authorization the CA did not validate, when the order failed at the poll.
+    failed_names: Vec<String>,
 }
 
 impl Failure {
@@ -1843,6 +1984,7 @@ impl Failure {
             stage,
             detail: detail.into(),
             rate_limited: false,
+            failed_names: Vec::new(),
         }
     }
 
@@ -1851,6 +1993,7 @@ impl Failure {
             stage,
             rate_limited: matches!(err, CaError::RateLimited(_)),
             detail: err.to_string(),
+            failed_names: Vec::new(),
         }
     }
 
@@ -1864,9 +2007,10 @@ impl Failure {
 /// How an order run ended.
 #[derive(Debug)]
 enum FlowEnd {
-    /// The edge serves the new certificate.
+    /// The edge serves the new certificate; `note` says why it carries the main name alone.
     Installed {
         fingerprint: String,
+        note: Option<String>,
     },
     /// Stored; the edge did not confirm it: the next check reloads it, never orders.
     NotServed {
@@ -1887,14 +2031,106 @@ enum FlowEnd {
     Failed(Failure),
 }
 
+impl FlowEnd {
+    /// The end of a run whose names were narrowed to the main one, with the reason in its
+    /// record.
+    fn noted(self, note: &str) -> Self {
+        let with_note = |detail: String| format!("{note}; {detail}");
+        match self {
+            FlowEnd::Installed { fingerprint, .. } => FlowEnd::Installed {
+                fingerprint,
+                note: Some(note.to_string()),
+            },
+            FlowEnd::NotServed {
+                fingerprint,
+                detail,
+            } => FlowEnd::NotServed {
+                fingerprint,
+                detail: with_note(detail),
+            },
+            FlowEnd::Refused {
+                fingerprint,
+                detail,
+            } => FlowEnd::Refused {
+                fingerprint,
+                detail: with_note(detail),
+            },
+            FlowEnd::Failed(mut failure) => {
+                failure.detail = with_note(failure.detail);
+                FlowEnd::Failed(failure)
+            }
+            tested @ FlowEnd::Tested { .. } => tested,
+        }
+    }
+}
+
 /// One order run's inputs.
+#[derive(Clone)]
 struct Run {
     kind: RunKind,
     settings: AcmeSettings,
+    /// The names the order carries, the main one first: every configured name, or the main one
+    /// alone (docs/io-web-v2.md §11.1).
+    names: Vec<String>,
     directory_url: String,
     edge_node: String,
     view: EdgeView,
     replaces: Option<CertRef>,
+    /// Whether an order that fails only on an added name may go on with the main name alone: a
+    /// check's order, or a renewal the main name needs; never a test order. What the edge serves
+    /// decides it too (`main_alone_loses_nothing`).
+    fallback: bool,
+    /// Why the names were narrowed to the main one, for the attempt's record.
+    note: Option<String>,
+}
+
+impl Run {
+    /// A run for every configured name.
+    fn every_name(
+        kind: RunKind,
+        settings: AcmeSettings,
+        directory_url: String,
+        edge_node: String,
+        view: EdgeView,
+        replaces: Option<CertRef>,
+    ) -> Self {
+        Self {
+            kind,
+            names: settings.names.clone(),
+            settings,
+            directory_url,
+            edge_node,
+            view,
+            replaces,
+            fallback: false,
+            note: None,
+        }
+    }
+
+    /// The order for the main name alone that follows this one, failed only on added names: the
+    /// CA validated the main name and refused another, the run may fall back, and what the edge
+    /// serves loses nothing by it, or cannot wait.
+    fn main_alone_after(&self, failure: &Failure, now: i64) -> Option<Run> {
+        let main = self.settings.main_name();
+        if !self.fallback
+            || self.names.len() < 2
+            || !only_added_names(&failure.failed_names, main)
+            || !main_alone_loses_nothing(&self.view, &self.names, now)
+        {
+            return None;
+        }
+        Some(Run {
+            names: vec![main.to_string()],
+            fallback: false,
+            note: Some(format!(
+                "the order for {} failed on {} ({}): {main} was ordered alone",
+                self.names.join(", "),
+                failure.failed_names.join(", "),
+                failure.detail
+            )),
+            ..self.clone()
+        })
+    }
 }
 
 /// A rollback SY.vault answered it cannot do: the secret has no previous version (the refused
@@ -2330,15 +2566,29 @@ impl AcmeService {
                     retry
                 }
             }
-            Decision::Order { replaces, .. } => {
-                let run = Run {
-                    kind: RunKind::Check,
-                    settings: settings.clone(),
-                    directory_url: settings.directory_url.clone(),
-                    edge_node: edge_node.to_string(),
+            Decision::Order {
+                replaces,
+                main_only,
+                ..
+            } => {
+                let mut run = Run::every_name(
+                    RunKind::Check,
+                    settings.clone(),
+                    settings.directory_url.clone(),
+                    edge_node.to_string(),
                     view,
                     replaces,
-                };
+                );
+                // A check orders only when the main name needs the certificate; what the edge
+                // serves decides whether a failed added name lets it go alone.
+                run.fallback = true;
+                if main_only {
+                    let main = settings.main_name().to_string();
+                    run.note = Some(format!(
+                        "the renewal is 48 h overdue and the last order failed only on added names: {main} was ordered alone"
+                    ));
+                    run.names = vec![main];
+                }
                 let started_at = now;
                 let end = self.order_flow(&run).await;
                 let pending = matches!(end, FlowEnd::NotServed { .. });
@@ -2721,7 +2971,49 @@ impl AcmeService {
                 return FlowEnd::Failed(Failure::new("order", reason));
             }
         }
-        let mut order = match self.place_order(account.as_ref(), run).await {
+        let end = self
+            .issue(account.as_ref(), run, &vault_key, served.as_ref())
+            .await;
+        let FlowEnd::Failed(failure) = &end else {
+            return end;
+        };
+        // The main name is never held hostage by an added one (docs/io-web-v2.md §11.1).
+        let Some(alone) = run.main_alone_after(failure, self.now()) else {
+            return end;
+        };
+        tracing::warn!(
+            names = %run.names.join(", "),
+            failed = %failure.failed_names.join(", "),
+            detail = %failure.detail,
+            "the order failed only on added names: the main name is ordered alone"
+        );
+        self.issue(account.as_ref(), &alone, &vault_key, served.as_ref())
+            .await
+    }
+
+    /// Steps 2–8 for the run's names, with the reason they were narrowed in the record.
+    async fn issue(
+        &self,
+        account: &dyn CaAccount,
+        run: &Run,
+        vault_key: &str,
+        served: Option<&WriteIdentity>,
+    ) -> FlowEnd {
+        let end = self.issue_steps(account, run, vault_key, served).await;
+        match &run.note {
+            Some(note) => end.noted(note),
+            None => end,
+        }
+    }
+
+    async fn issue_steps(
+        &self,
+        account: &dyn CaAccount,
+        run: &Run,
+        vault_key: &str,
+        served: Option<&WriteIdentity>,
+    ) -> FlowEnd {
+        let mut order = match self.place_order(account, run).await {
             Ok(order) => order,
             Err(failure) => return FlowEnd::Failed(failure),
         };
@@ -2730,7 +3022,7 @@ impl AcmeService {
             return FlowEnd::Failed(failure);
         }
         self.stage("finalize");
-        let finalized = self.finalize(&mut order, &run.settings.name).await;
+        let finalized = self.finalize(&mut order, &run.names).await;
         self.forget_order(run.kind);
         let (chain_pem, key_pem) = match finalized {
             Ok(material) => material,
@@ -2774,10 +3066,10 @@ impl AcmeService {
         self.stage("store");
         let written = match self
             .store(
-                &vault_key,
+                vault_key,
                 &run.edge_node,
                 run.view.fingerprint(),
-                served.as_ref(),
+                served,
                 &chain_pem,
                 &key_pem,
             )
@@ -2797,7 +3089,7 @@ impl AcmeService {
             state.pending_install = Some(PendingInstall {
                 fingerprint: fingerprint.clone(),
                 serial: serial.clone(),
-                vault_key: vault_key.clone(),
+                vault_key: vault_key.to_string(),
                 edge_node: run.edge_node.clone(),
                 written: written.clone(),
                 stored_at: now,
@@ -2807,10 +3099,13 @@ impl AcmeService {
         match self.reload_for(&run.edge_node, &fingerprint).await {
             Reloaded::Served => {
                 self.mark_installed(&fingerprint);
-                FlowEnd::Installed { fingerprint }
+                FlowEnd::Installed {
+                    fingerprint,
+                    note: None,
+                }
             }
             Reloaded::Refused(detail) => {
-                self.refused(&vault_key, written.as_ref(), &fingerprint, &serial, &detail)
+                self.refused(vault_key, written.as_ref(), &fingerprint, &serial, &detail)
                     .await;
                 FlowEnd::Refused {
                     fingerprint,
@@ -3040,8 +3335,9 @@ impl AcmeService {
         }
     }
 
-    /// Step 2: resume the recorded order, else place one (with `replaces`, retried once without
-    /// it when the CA refuses it) and record its URL at once.
+    /// Step 2: resume the recorded order for the same names, else place one for the run's names
+    /// (with `replaces`, retried once without it when the CA refuses it) and record its URL at
+    /// once.
     async fn place_order(
         &self,
         account: &dyn CaAccount,
@@ -3049,13 +3345,13 @@ impl AcmeService {
     ) -> Result<Box<dyn CaOrder>, Failure> {
         self.stage("order");
         let now = self.now();
-        let name = &run.settings.name;
+        let names = &run.names;
         let account_url = account.url();
         if run.kind != RunKind::Test {
             if let Some(recorded) = self.read(|state| state.order.clone()) {
                 if recorded.directory_url == run.directory_url
                     && recorded.account_url == account_url
-                    && recorded.name == *name
+                    && recorded.names == *names
                 {
                     match self.ca(account.resume_order(&recorded.order_url)).await {
                         Ok(mut order) => match order.status() {
@@ -3082,13 +3378,13 @@ impl AcmeService {
         let profile = run.settings.profile.as_deref();
         let mut replaced = run.replaces.is_some();
         let placed = match self
-            .ca(account.new_order(name, profile, run.replaces.as_ref()))
+            .ca(account.new_order(names, profile, run.replaces.as_ref()))
             .await
         {
             Err(CaError::Replaces(detail)) if replaced => {
                 tracing::warn!(detail = %detail, "the CA refused replaces: the order is placed once more without it");
                 replaced = false;
-                self.ca(account.new_order(name, profile, None)).await
+                self.ca(account.new_order(names, profile, None)).await
             }
             other => other,
         };
@@ -3098,7 +3394,7 @@ impl AcmeService {
                 directory_url: run.directory_url.clone(),
                 account_url,
                 order_url: order.url(),
-                name: name.clone(),
+                names: names.clone(),
                 profile: run.settings.profile.clone(),
                 replaces: replaced,
                 kind: run.kind,
@@ -3109,7 +3405,10 @@ impl AcmeService {
         Ok(order)
     }
 
-    /// Step 3: arm the edge, mark the challenge ready, poll; always clear the challenge.
+    /// Step 3, for every authorization: each pending one armed on the edge (it keeps one
+    /// challenge per name) and marked ready, then the order polled. Every armed challenge is
+    /// cleared afterwards, whatever happened, but only once the CA has finished the validations
+    /// it started (`settle`): a challenge cleared under a validation fails it.
     async fn validate(&self, order: &mut Box<dyn CaOrder>, run: &Run) -> Result<(), Failure> {
         self.stage("challenge");
         match order.status() {
@@ -3122,62 +3421,111 @@ impl AcmeService {
                 ))
             }
         }
-        let authorization = self
-            .ca(order.authorization())
+        let authorizations = self
+            .ca(order.authorizations(false))
             .await
             .map_err(|err| Failure::ca("challenge", err))?;
-        let (authz_name, digest) = match authorization {
-            AuthzState::Pending { name, digest } => (name, digest),
-            AuthzState::Valid => return self.poll(order).await,
-            AuthzState::Other(status) => {
+        let mut pending = Vec::new();
+        for authz in authorizations {
+            let name = tls_material::normalize_name(&authz.name);
+            if !run.names.contains(&name) {
                 return Err(Failure::new(
                     "challenge",
-                    format!("the authorization for {} is {status}", run.settings.name),
-                ))
+                    format!(
+                        "the CA authorizes {}, not {}",
+                        authz.name,
+                        run.names.join(", ")
+                    ),
+                ));
             }
-        };
-        if tls_material::normalize_name(&authz_name) != run.settings.name {
-            return Err(Failure::new(
-                "challenge",
-                format!("the CA authorizes {authz_name}, not {}", run.settings.name),
-            ));
+            match authz.state {
+                AuthzState::Valid => {}
+                AuthzState::Pending { digest, processing } => {
+                    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(Failure::new(
+                            "challenge",
+                            format!("the challenge digest for {name} is not 32 bytes of hex"),
+                        ));
+                    }
+                    pending.push((name, digest, processing));
+                }
+                AuthzState::Other { status, .. } => {
+                    return Err(Failure::new(
+                        "challenge",
+                        format!("the authorization for {name} is {status}"),
+                    ))
+                }
+            }
         }
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Failure::new(
-                "challenge",
-                "the challenge digest is not 32 bytes of hex",
-            ));
+        let mut armed = Vec::new();
+        let mut outcome = Ok(());
+        for (name, digest, _) in &pending {
+            match self.arm_challenge(&run.edge_node, name, digest).await {
+                Ok(()) => armed.push((name, digest)),
+                Err(detail) => {
+                    outcome = Err(Failure::new(
+                        "challenge",
+                        format!(
+                            "{} did not arm the challenge for {name}: {detail}",
+                            run.edge_node
+                        ),
+                    ));
+                    break;
+                }
+            }
         }
-        let arm = json!({
-            "name": run.settings.name,
-            "digest": digest,
-            "ttl_secs": CHALLENGE_TTL_SECS,
-        });
-        let armed = self
-            .deps
-            .mesh
-            .edge_challenge(&run.edge_node, arm, self.deps.timings.edge_call)
-            .await;
-        let armed = match armed {
-            Ok(answer) if answer_ok(&answer) && answer["armed"].as_bool() == Some(true) => Ok(()),
-            Ok(answer) => Err(answer_detail(&answer)),
-            Err(err) => Err(err.to_string()),
-        };
-        let outcome = match armed {
-            Err(detail) => Err(Failure::new(
-                "challenge",
-                format!("{} did not arm the challenge: {detail}", run.edge_node),
-            )),
-            Ok(()) => match self.ca(order.set_challenge_ready()).await {
-                Err(err) => Err(Failure::ca("challenge", err)),
-                Ok(()) => self.poll(order).await,
-            },
-        };
-        self.clear_challenge(&run.edge_node, &run.settings.name, &digest)
-            .await;
+        // A challenge the CA validates already (an order resumed after a restart) is not
+        // marked again.
+        let mut readied = false;
+        if outcome.is_ok() {
+            for (name, _, processing) in &pending {
+                if *processing {
+                    readied = true;
+                    continue;
+                }
+                match self.ca(order.set_challenge_ready(name)).await {
+                    Ok(()) => readied = true,
+                    Err(err) => {
+                        outcome = Err(Failure::ca("challenge", err));
+                        break;
+                    }
+                }
+            }
+        }
+        if outcome.is_ok() {
+            outcome = self.poll(order).await;
+        } else if readied {
+            // Some were marked before one failed: the CA validates those, and the edge answers
+            // until it is done.
+            self.settle(order).await;
+        }
+        for (name, digest) in armed {
+            self.clear_challenge(&run.edge_node, name, digest).await;
+        }
         outcome
     }
 
+    async fn arm_challenge(&self, edge_node: &str, name: &str, digest: &str) -> Result<(), String> {
+        let arm = json!({
+            "name": name,
+            "digest": digest,
+            "ttl_secs": CHALLENGE_TTL_SECS,
+        });
+        match self
+            .deps
+            .mesh
+            .edge_challenge(edge_node, arm, self.deps.timings.edge_call)
+            .await
+        {
+            Ok(answer) if answer_ok(&answer) && answer["armed"].as_bool() == Some(true) => Ok(()),
+            Ok(answer) => Err(answer_detail(&answer)),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// Poll the order. One that does not end ready is left to settle (`settle`); then the
+    /// failure names the names whose authorization the CA did not validate, with the error it gave
+    /// each one.
     async fn poll(&self, order: &mut Box<dyn CaOrder>) -> Result<(), Failure> {
         let limit = self.deps.timings.order_poll;
         let polled =
@@ -3185,30 +3533,76 @@ impl AcmeService {
         let problem = match polled {
             Ok(Ok(OrderStatus::Ready)) => return Ok(()),
             Ok(Ok(OrderStatus::Invalid)) => "the order is invalid".to_string(),
-            Ok(Ok(status)) => {
-                return Err(Failure::new(
-                    "challenge",
-                    format!("the order is {status:?} after polling"),
-                ))
-            }
+            Ok(Ok(status)) => format!("the order is {status:?} after polling"),
             Ok(Err(CaError::Problem(detail))) => detail,
-            Ok(Err(err)) => return Err(Failure::ca("challenge", err)),
-            Err(_) => {
-                return Err(Failure::new(
-                    "challenge",
-                    format!("the order was not ready in {}s", limit.as_secs()),
-                ))
+            Ok(Err(err @ CaError::Timeout(_))) => err.to_string(),
+            Ok(Err(err)) => {
+                // No answer, or a rate limit: what the CA validates still settles first.
+                self.settle(order).await;
+                return Err(Failure::ca("challenge", err));
             }
+            Err(_) => format!("the order was not ready in {}s", limit.as_secs()),
         };
-        let detail =
-            match tokio::time::timeout(self.deps.timings.ca_call, order.challenge_error()).await {
-                Ok(Some(error)) => error,
-                _ => problem,
+        let authorizations = self.settle(order).await;
+        let mut failed_names = Vec::new();
+        let mut errors = Vec::new();
+        for authz in authorizations {
+            let error = match authz.state {
+                AuthzState::Valid => continue,
+                AuthzState::Pending {
+                    processing: true, ..
+                } => "still being validated".to_string(),
+                AuthzState::Pending { .. } => "still pending".to_string(),
+                AuthzState::Other { status, error } => error.unwrap_or(status),
             };
-        Err(Failure::new(
-            "challenge",
-            format!("the CA did not validate the challenge: {detail}"),
-        ))
+            errors.push(format!("{}: {error}", authz.name));
+            failed_names.push(tls_material::normalize_name(&authz.name));
+        }
+        let detail = if errors.is_empty() {
+            format!("the CA did not validate the challenge: {problem}")
+        } else {
+            format!(
+                "the CA did not validate the challenge ({problem}): {}",
+                errors.join("; ")
+            )
+        };
+        let mut failure = Failure::new("challenge", detail);
+        failure.failed_names = failed_names;
+        Err(failure)
+    }
+
+    /// The order's authorizations once the CA has finished the validations it started, asked
+    /// again every second for up to a minute. A CA can mark an order invalid as soon as one name
+    /// fails, while it still validates another (the failure is quick at its first check, the
+    /// other name waits on its remote perspectives): that one is judged only once it settles, and
+    /// its challenge stays armed until then. Empty when the CA never gave them.
+    async fn settle(&self, order: &mut Box<dyn CaOrder>) -> Vec<Authz> {
+        let timings = &self.deps.timings;
+        let deadline = tokio::time::Instant::now() + timings.settle_limit;
+        let mut last = Vec::new();
+        loop {
+            let read = match tokio::time::timeout(timings.ca_call, order.authorizations(true)).await
+            {
+                Ok(Ok(authorizations)) => {
+                    last = authorizations;
+                    true
+                }
+                _ => false,
+            };
+            let validating = last.iter().any(|authz| {
+                matches!(
+                    authz.state,
+                    AuthzState::Pending {
+                        processing: true,
+                        ..
+                    }
+                )
+            });
+            if (read && !validating) || tokio::time::Instant::now() >= deadline {
+                return last;
+            }
+            tokio::time::sleep(timings.settle_every).await;
+        }
     }
 
     async fn clear_challenge(&self, edge_node: &str, name: &str, digest: &str) {
@@ -3229,10 +3623,12 @@ impl AcmeService {
         }
     }
 
-    /// An abandoned order: its pending authorizations are deactivated and its record dropped.
+    /// An abandoned order: the authorizations whose challenge was never marked ready are
+    /// deactivated, and its record dropped. One the CA validated, or still validates, stays: the
+    /// main name's, validated, serves the order for it alone that may follow.
     async fn abandon(&self, order: &mut Box<dyn CaOrder>, kind: RunKind) {
-        if let Err(err) = self.ca(order.deactivate_pending()).await {
-            tracing::warn!(error = %err, "the abandoned authorization could not be deactivated");
+        if let Err(err) = self.ca(order.deactivate_unready()).await {
+            tracing::warn!(error = %err, "the abandoned authorizations could not be deactivated");
         }
         self.forget_order(kind);
     }
@@ -3243,14 +3639,14 @@ impl AcmeService {
         }
     }
 
-    /// Step 4: a fresh key and CSR, finalize, the chain.
+    /// Step 4: a fresh key and a CSR for the names, finalize, the chain.
     async fn finalize(
         &self,
         order: &mut Box<dyn CaOrder>,
-        name: &str,
+        names: &[String],
     ) -> Result<(String, SecretPem), Failure> {
         let (csr, key) =
-            new_key_and_csr(name).map_err(|detail| Failure::new("finalize", detail))?;
+            new_key_and_csr(names).map_err(|detail| Failure::new("finalize", detail))?;
         self.ca(order.finalize(&csr))
             .await
             .map_err(|err| Failure::ca("finalize", err))?;
@@ -3274,8 +3670,8 @@ impl AcmeService {
         Ok((chain, key))
     }
 
-    /// Step 5: the shared verdict, the name, a chain with an intermediate that verifies to a
-    /// trusted root (a test order expects it not to), and more than 2 days left.
+    /// Step 5: the shared verdict, every name, a chain with an intermediate that verifies to a
+    /// trusted root for each name (a test order expects it not to), and more than 2 days left.
     fn check_material(
         &self,
         chain_pem: &str,
@@ -3283,13 +3679,19 @@ impl AcmeService {
         run: &Run,
         now: i64,
     ) -> Result<MaterialReport, String> {
-        let name = &run.settings.name;
         let checked = tls_material::inspect(chain_pem.as_bytes(), key_pem.expose().as_bytes(), now)
             .map_err(|err| format!("the certificate fails the edge's verdict: {err}"))?;
-        if !tls_material::name_covered(&checked.leaf.names, name) {
+        let missing: Vec<&str> = run
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !tls_material::name_covered(&checked.leaf.names, name))
+            .collect();
+        if !missing.is_empty() {
             return Err(format!(
-                "the leaf names {} and does not cover {name}",
-                checked.leaf.names.join(", ")
+                "the leaf names {} and does not cover {}",
+                checked.leaf.names.join(", "),
+                missing.join(", ")
             ));
         }
         if checked.chain.len() < 2 {
@@ -3300,11 +3702,12 @@ impl AcmeService {
         } else {
             Ok(run.settings.trust_anchor_roots.clone())
         };
-        let trust = roots.and_then(|roots| verify_chain(&checked.chain, name, now, roots));
+        let trust = roots.and_then(|roots| verify_chain(&checked.chain, &run.names, now, roots));
         if run.kind != RunKind::Test {
             if let Err(err) = &trust {
                 return Err(format!(
-                    "the chain does not verify to a trusted root for {name}: {err}"
+                    "the chain does not verify to a trusted root for {}: {err}",
+                    run.names.join(", ")
                 ));
             }
         }
@@ -3441,8 +3844,8 @@ impl AcmeService {
     fn finish(&self, run: &Run, started_at: i64, end: FlowEnd) {
         let now = self.now();
         let (result, stage, detail, fingerprint, trusted, failure) = match end {
-            FlowEnd::Installed { fingerprint } => {
-                ("installed", None, None, Some(fingerprint), None, None)
+            FlowEnd::Installed { fingerprint, note } => {
+                ("installed", None, note, Some(fingerprint), None, None)
             }
             FlowEnd::NotServed {
                 fingerprint,
@@ -3497,6 +3900,10 @@ impl AcmeService {
             detail,
             fingerprint,
             trusted,
+            failed_names: failure
+                .as_ref()
+                .map(|failure| failure.failed_names.clone())
+                .unwrap_or_default(),
         };
         tracing::info!(
             kind = run.kind.as_str(),
@@ -3682,7 +4089,7 @@ impl AcmeService {
         });
         Ok(json!({
             "kind": "renew",
-            "name": self.config.name(),
+            "names": self.config.names(),
             "started_at": iso(now),
             "progress": "GET /acme/status",
         }))
@@ -3695,14 +4102,14 @@ impl AcmeService {
         let view = match self.look(&edge_node).await {
             Ok(view) => view,
             Err(detail) => {
-                let run = Run {
-                    kind: RunKind::Renew,
+                let run = Run::every_name(
+                    RunKind::Renew,
                     settings,
                     directory_url,
                     edge_node,
-                    view: EdgeView::default(),
-                    replaces: None,
-                };
+                    EdgeView::default(),
+                    None,
+                );
                 self.finish(
                     &run,
                     started_at,
@@ -3716,20 +4123,26 @@ impl AcmeService {
             }
         };
         self.settle_pending(&view).await;
-        let replaces = self.read(|state| {
-            view.leaf.as_ref().and_then(|leaf| {
+        let now = self.now();
+        let (replaces, fallback) = self.read(|state| {
+            let replaces = view.leaf.as_ref().and_then(|leaf| {
                 issued_by_account(state, &directory_url, &leaf.fingerprint)
                     .and_then(IssuedRecord::cert_ref)
-            })
+            });
+            (
+                replaces,
+                main_needs_certificate(&view, &settings, state, now),
+            )
         });
-        let run = Run {
-            kind: RunKind::Renew,
+        let mut run = Run::every_name(
+            RunKind::Renew,
             settings,
             directory_url,
             edge_node,
             view,
             replaces,
-        };
+        );
+        run.fallback = fallback;
         let end = self.order_flow(&run).await;
         self.finish(&run, started_at, end);
         self.evaluate_and_alert().await;
@@ -3759,7 +4172,7 @@ impl AcmeService {
         });
         Ok(json!({
             "kind": "test",
-            "name": self.config.name(),
+            "names": self.config.names(),
             "directory_url": self.config_staging_url(),
             "started_at": iso(now),
             "progress": "GET /acme/status",
@@ -3778,14 +4191,16 @@ impl AcmeService {
         self.note_edge(&edge_node);
         let directory_url = settings.staging_directory_url.clone();
         let view = self.look(&edge_node).await;
-        let run = Run {
-            kind: RunKind::Test,
+        // A test order carries every name and never narrows them: it answers whether the CA
+        // validates each one.
+        let run = Run::every_name(
+            RunKind::Test,
             settings,
             directory_url,
             edge_node,
-            view: view.clone().unwrap_or_default(),
-            replaces: None,
-        };
+            view.clone().unwrap_or_default(),
+            None,
+        );
         let end = match view {
             Ok(_) => self.order_flow(&run).await,
             Err(detail) => FlowEnd::Failed(Failure::new(
@@ -3905,6 +4320,7 @@ impl AcmeService {
             "state": config_state,
             "reason": reason,
             "name": self.config.name(),
+            "names": self.config.names(),
         });
         if let AcmeConfig::On(settings) = &self.config {
             config["directory_url"] = json!(settings.directory_url);
@@ -3957,10 +4373,14 @@ impl AcmeService {
             .last_status
             .as_ref()
             .and_then(|view| view.leaf.as_ref());
-        let name_covered = match (served, self.config.name()) {
-            (Some(leaf), Some(name)) => Some(tls_material::name_covered(&leaf.names, name)),
-            _ => None,
-        };
+        let names = self.config.names();
+        let names_missing: Option<Vec<&String>> =
+            served.filter(|_| !names.is_empty()).map(|leaf| {
+                names
+                    .iter()
+                    .filter(|name| !tls_material::name_covered(&leaf.names, name))
+                    .collect()
+            });
         let issued_by_this_account = match (served, &self.config) {
             (Some(leaf), AcmeConfig::On(settings)) => Some(
                 issued_by_account(&state, &settings.directory_url, &leaf.fingerprint).is_some(),
@@ -4008,7 +4428,8 @@ impl AcmeService {
                 "unreachable_since_at": state.edge.unreachable_since_at,
                 "last_error": state.edge.last_error,
                 "config_error": state.edge.config_error,
-                "name_covered": name_covered,
+                "names_covered": names_missing.as_ref().map(Vec::is_empty),
+                "names_missing": names_missing.unwrap_or_default(),
                 "issued_by_this_account": issued_by_this_account,
             },
             "in_flight": in_flight,
@@ -4048,7 +4469,7 @@ fn issued_record(chain_pem: &str, run: &Run, account_url: &str, now: i64) -> Opt
         authority_key_id: leaf.authority_key_id.as_deref().map(hex::encode),
         not_before: leaf.not_before,
         not_after: leaf.not_after,
-        name: run.settings.name.clone(),
+        names: run.names.clone(),
         profile: run.settings.profile.clone(),
         directory_url: run.directory_url.clone(),
         account_url: account_url.to_string(),
@@ -4362,11 +4783,14 @@ impl CaAccount for InstantAcmeAccount {
 
     async fn new_order(
         &self,
-        name: &str,
+        names: &[String],
         profile: Option<&str>,
         replaces: Option<&CertRef>,
     ) -> Result<Box<dyn CaOrder>, CaError> {
-        let identifiers = [instant_acme::Identifier::Dns(name.to_string())];
+        let identifiers: Vec<instant_acme::Identifier> = names
+            .iter()
+            .map(|name| instant_acme::Identifier::Dns(name.clone()))
+            .collect();
         let mut request = instant_acme::NewOrder::new(&identifiers);
         if let Some(profile) = profile {
             request = request.profile(profile);
@@ -4423,52 +4847,67 @@ impl CaOrder for InstantAcmeOrder {
         order_status(self.order.state().status)
     }
 
-    async fn authorization(&mut self) -> Result<AuthzState, CaError> {
+    async fn authorizations(&mut self, refresh: bool) -> Result<Vec<Authz>, CaError> {
+        let mut found = Vec::new();
         let mut authorizations = self.order.authorizations();
-        let mut valid = false;
         while let Some(next) = authorizations.next().await {
             let mut authz = next.map_err(classify)?;
-            match authz.status {
-                instant_acme::AuthorizationStatus::Valid => valid = true,
+            if refresh {
+                authz.refresh().await.map_err(classify)?;
+            }
+            let name = authz.identifier().to_string();
+            let state = match authz.status {
+                instant_acme::AuthorizationStatus::Valid => AuthzState::Valid,
                 instant_acme::AuthorizationStatus::Pending => {
-                    let name = authz.identifier().to_string();
                     let challenge = authz
                         .challenge(instant_acme::ChallengeType::TlsAlpn01)
                         .ok_or_else(|| {
-                            CaError::Problem("the CA offers no tls-alpn-01 challenge".to_string())
+                            CaError::Problem(format!(
+                                "the CA offers no tls-alpn-01 challenge for {name}"
+                            ))
                         })?;
-                    let digest = hex::encode(challenge.key_authorization().digest());
-                    return Ok(AuthzState::Pending { name, digest });
+                    AuthzState::Pending {
+                        digest: hex::encode(challenge.key_authorization().digest()),
+                        processing: challenge.status == instant_acme::ChallengeStatus::Processing,
+                    }
                 }
-                other => return Ok(AuthzState::Other(format!("{other:?}").to_lowercase())),
-            }
+                other => AuthzState::Other {
+                    status: format!("{other:?}").to_lowercase(),
+                    error: authz
+                        .challenges
+                        .iter()
+                        .find_map(|challenge| challenge.error.as_ref().map(ToString::to_string)),
+                },
+            };
+            found.push(Authz { name, state });
         }
-        if valid {
-            Ok(AuthzState::Valid)
-        } else {
-            Err(CaError::Problem(
+        if found.is_empty() {
+            return Err(CaError::Problem(
                 "the order has no authorization".to_string(),
-            ))
+            ));
         }
+        Ok(found)
     }
 
-    async fn set_challenge_ready(&mut self) -> Result<(), CaError> {
+    async fn set_challenge_ready(&mut self, name: &str) -> Result<(), CaError> {
         let mut authorizations = self.order.authorizations();
         while let Some(next) = authorizations.next().await {
             let mut authz = next.map_err(classify)?;
-            if authz.status != instant_acme::AuthorizationStatus::Pending {
+            if authz.status != instant_acme::AuthorizationStatus::Pending
+                || tls_material::normalize_name(&authz.identifier().to_string()) != name
+            {
                 continue;
             }
             let mut challenge = authz
                 .challenge(instant_acme::ChallengeType::TlsAlpn01)
                 .ok_or_else(|| {
-                    CaError::Problem("the CA offers no tls-alpn-01 challenge".to_string())
+                    CaError::Problem(format!("the CA offers no tls-alpn-01 challenge for {name}"))
                 })?;
             return challenge.set_ready().await.map_err(classify);
         }
-        Err(CaError::Problem(
-            "the order has no pending authorization".to_string(),
-        ))
+        Err(CaError::Problem(format!(
+            "the order has no pending authorization for {name}"
+        )))
     }
 
     async fn poll_ready(&mut self, limit: Duration) -> Result<OrderStatus, CaError> {
@@ -4479,29 +4918,18 @@ impl CaOrder for InstantAcmeOrder {
             .map_err(classify)
     }
 
-    async fn challenge_error(&mut self) -> Option<String> {
-        let mut authorizations = self.order.authorizations();
-        while let Some(next) = authorizations.next().await {
-            let Ok(mut authz) = next else {
-                continue;
-            };
-            if authz.refresh().await.is_err() {
-                continue;
-            }
-            for challenge in &authz.challenges {
-                if let Some(error) = &challenge.error {
-                    return Some(error.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    async fn deactivate_pending(&mut self) -> Result<(), CaError> {
+    async fn deactivate_unready(&mut self) -> Result<(), CaError> {
         let mut authorizations = self.order.authorizations();
         while let Some(next) = authorizations.next().await {
             let mut authz = next.map_err(classify)?;
-            if authz.status == instant_acme::AuthorizationStatus::Pending {
+            // Asked again: a challenge marked ready leaves `pending` at the CA.
+            authz.refresh().await.map_err(classify)?;
+            let unready = authz.status == instant_acme::AuthorizationStatus::Pending
+                && authz
+                    .challenges
+                    .iter()
+                    .all(|challenge| challenge.status == instant_acme::ChallengeStatus::Pending);
+            if unready {
                 authz.deactivate().await.map_err(classify)?;
             }
         }

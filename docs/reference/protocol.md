@@ -482,7 +482,7 @@ them (`prepare_local_delivery`): the list is `PROTECTED_SYSTEM_ACTIONS`
 
 | Verbs | Allowed senders | Rule |
 | --- | --- | --- |
-| `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` | (1) |
+| `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `EDGE_WEB_ROUTES` | `SY.admin@motherbee` | (1) |
 | `CONFIG_GET`, `CONFIG_SET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` | `SY.admin@motherbee` | (2) |
 | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK` | `SY.orchestrator@motherbee`; `SY.admin@<the same hive>` | (3), (4) |
 | `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`, to another hive only; `SY.admin@<the same hive>`, never on the motherbee | (3), (4) |

@@ -69,6 +69,8 @@ rustls-pemfile = "2"
 x509-parser = "0.18"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "client-legacy", "http1", "http2"] }
+# SY.edge's TCP_NOTSENT_LOWAT on its accepted sockets (A-86); the version tokio already locks.
+socket2 = { version = "0.6", features = ["all"] }
 # SY.admin's ACME client for the public edge's certificate (docs/acme-edge-certificates-v1.md §6).
 # Pinned exactly; `ring` keeps aws-lc-rs out, and the CA's TLS is verified against the system
 # store (the .deb depends on ca-certificates).

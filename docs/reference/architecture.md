@@ -525,7 +525,7 @@ The rules of `fluxbee/system/allow`:
 
 | Rule | Sender | May send |
 | --- | --- | --- |
-| 1 | `SY.admin@motherbee` | edge commands: `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE` |
+| 1 | `SY.admin@motherbee` | edge commands: `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `EDGE_WEB_ROUTES` |
 | 2 | `SY.admin@motherbee` | to any hive: `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` |
 | 3 | `SY.orchestrator@motherbee`; for the reads also `SY.orchestrator@<same hive>` | the node lifecycle and inspection actions it forwards, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `SYSTEM_CORE_ROLLBACK`, and to another hive `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` |
 | 4 | `SY.admin@<same hive>` | every other protected action; `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` never on the motherbee |

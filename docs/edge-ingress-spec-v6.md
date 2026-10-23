@@ -209,6 +209,13 @@ payload             = body passthrough (JSON / utf8 / base64)
 (`send_with_matcher` + `RouteMatch::Any` + anti-shadowing guard for `UNREACHABLE`/`TTL`; return-leg
 `UNREACHABLE` surfaced as a fast 502, not a blocked `HANDLER_TIMEOUT` — M4).
 
+**Since 0.1.84** ([io.web v2](io-web-v2.md) §11.1; [SY.edge](nodes/sy-edge.md)): the edge picks
+each request's host before its path. Only the main name its certificate tells, an IP literal, or
+no host reach `/e/`; a web host that SY.admin declared (`EDGE_WEB_ROUTES`), and any other host,
+get 404. An `/e/` error answers a fixed body per code; the error's detail (trace, target, family)
+stays in the edge's log (A-88). A request body slower than the door's pace, or not whole in 30 s,
+ends its connection (A-86).
+
 ---
 
 ## 8. The entry token — in vault, fetched by the edge (secret_ref)

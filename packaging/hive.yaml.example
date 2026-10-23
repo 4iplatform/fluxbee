@@ -50,6 +50,18 @@ admin:
 #   contact: "mailto:ops@example.com"   # optional
 #   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # only for a private CA
 
+# The web hosts: names the public edge serves only through io.web, never /e/ or /public/
+# (docs/io-web-v2.md §11). Each is a label before the host of public_base_url: `archi: true`
+# declares archi.<that host>, Archi's own host. It needs one key set; a bare `web:` declares
+# nothing. SY.admin reads it at boot and pushes the routes to public_edge_node every minute.
+# Make the host's DNS record by hand, pointing at the ingress like the main name. With `acme:`,
+# the certificate carries the host too, after explicit steps: restart SY.admin,
+# POST /acme/test, then POST /acme/renew. Until then name_not_covered alerts. Removing the host
+# takes its route off the edge after the restart, and its name off the certificate at the next
+# renewal.
+# web:
+#   archi: true
+
 # Archi's HTTP UI/API. Loopback only: it has no authentication (FINDINGS A-46). Use it on the
 # motherbee itself, or from another machine through an SSH tunnel:
 #   ssh -L 3000:127.0.0.1:3000 <user>@<motherbee>

@@ -3,7 +3,9 @@
 **Status:** implemented in 0.1.82 (`d2980cf`) and validated on 8.x on 2026-10-21: PROD's edge serves
 a Let's Encrypt certificate (lab/DEPLOYMENTS.md, 0.1.82). Design of 2026-10-21, revised after one
 review round (protocol and security, fit with the code, operations). **Decisions:** the operator's O6 (2026-10-13), D1–D5 and the naming rules
-(2026-10-20). **Findings:** FINDINGS A-78 (new), PENDING-BUGS PB-1.
+(2026-10-20). **Findings:** FINDINGS A-78 (new), PENDING-BUGS PB-1. **0.1.84:** one certificate
+for several names, the main one and the web hosts `web:` declares ([io-web-v2](io-web-v2.md)
+§11.1); §3, §6, §7 and §9 say what changed.
 
 Each installation's public edge serves its own certificate from an ACME certificate authority, issued
 and renewed with no human step, validated with TLS-ALPN-01 on the :443 the edge already opens. The
@@ -11,8 +13,9 @@ CA is Let's Encrypt unless configured otherwise. Nothing in the code names a dom
 the names and the CA come from `hive.yaml`, so the open-source package works under any domain.
 
 Out of scope for v1:
-- `archi.<id>`: since 2026-10-23 the edge terminates it and proxies to io.web
-  ([io-web-v2](io-web-v2.md)), so this client issues that name too; `cloud.<id>` is not planned.
+- `cloud.<id>`: not planned. `archi.<id>` is a web host since 0.1.84: the edge terminates it and
+  proxies it to io.web ([io-web-v2](io-web-v2.md)), and this client certifies it with the main
+  name (§3).
 - More than one edge per installation (O7).
 - DNS automation and wildcard certificates.
 - External Account Binding, for CAs that need it.
@@ -29,7 +32,7 @@ Out of scope for v1:
 | D3 | Renew in the window the CA suggests (ARI, RFC 9773), else at two thirds of the lifetime. Alerts are relative to the lifetime; O6's fixed 21-day alert goes. |
 | D4 | The CA's default profile unless configured. At Let's Encrypt that is `classic`: 90 days today, 64 from 2027-02-10, 45 from 2028-02-16. Every rule here works with 45-day certificates. |
 | D5 | First an order against Let's Encrypt staging with the real PROD name, never installed; then production. |
-| Names | The certified name is the host of `admin.public_base_url`, so the URLs the system hands out and the certificate cannot disagree. |
+| Names | The certified name is the host of `admin.public_base_url`, so the URLs the system hands out and the certificate cannot disagree. Since 0.1.84 it is the main name of one certificate that also carries the web hosts `web:` declares (§3). |
 | Egress | The internet probe takes its target from `hive.yaml` (`egress.reachability_url`). There is no default. |
 | Examples | Shipped examples use neutral names (`edge_tls`, `example.com`). |
 
@@ -122,10 +125,20 @@ acme:
   profile: "classic"                    # optional: the CA's default when absent
   contact: "mailto:ops@example.com"     # optional (Let's Encrypt no longer emails)
   trust_anchor: "/etc/fluxbee/acme-ca.pem"   # optional, only for a private CA
+web:
+  archi: true                           # optional (0.1.84): archi.<the main name> joins the certificate
 ```
 
 - **Without `acme:`** nothing is ordered. The edge serves a certificate seeded by hand, as today, and
   the expiry checks and alerts of §7 still run.
+- **The names (0.1.84).** The main name comes first; then each web host of `web:`
+  ([io-web-v2](io-web-v2.md) §11.1), a label before the main name (`archi: true` declares
+  `archi.<main name>`). `web:` needs one key set: a bare `web:` declares nothing, and a section that
+  cannot work declares nothing and says why in the boot log. One certificate carries every name.
+- **Adding a name is explicit,** as a new main name is: the served certificate only raises
+  `name_not_covered` for it, and the cap holds automatic orders. The operator adds `web:`, restarts
+  SY.admin, runs `POST /acme/test` (the staging order validates every name), then `POST /acme/renew`
+  (forced, past the cap). Removing a name takes effect at the next renewal.
 - **A section that cannot work turns ACME off.** SY.admin keeps running, and `/acme/status` and the
   log say why. That happens when:
   - `terms_agreed` is not `true`;
@@ -143,8 +156,8 @@ acme:
 |---|---|---|---|
 | The certificate and its private key | SY.vault, under the ingress' `edge.tls_vault_key` (PROD `edge_tls_fluxbee_ai`, new installs `edge_tls`) | `SY.edge@<ingress>` | `{cert, key}` PEM, `resource_type: tls`, root tenant. One previous version for rollback. Only the edge reads it. |
 | The ACME account | SY.vault, `acme_account:<16 hex of SHA-256(directory_url)>` | `SY.admin@motherbee` | The library's credentials JSON; the URL in the metadata description. Cloud and the admin API cannot write it. |
-| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, profile), the last edge status seen, the conditions. No key. |
-| The name | `admin.public_base_url` (motherbee) | | |
+| Order state | `state_dir/sy-admin/acme.json` on the motherbee | | The account URL per directory, the order in flight, the last attempt, the last 20 issued certificates (serial, dates, names, profile), the last edge status seen, the conditions. No key. An order and a certificate record their `names`; the single `name` of a file 0.1.82 or 0.1.83 wrote reads as a one-name list. |
+| The names | `admin.public_base_url` and `web:` (motherbee) | | |
 | The edge's secret name | `edge.tls_vault_key` (ingress) | | SY.admin asks the edge for it, and accepts only names that start with `edge_tls`. |
 
 ---
@@ -260,22 +273,32 @@ single in-flight slot. A busy slot answers 409.
    - When the secret exists, its metadata must say `resource_type: tls`, root tenant, owner = this
      edge. That keeps a compromised edge from steering SY.admin's write onto another secret.
    - Confirm the vault answers before any CA call.
-2. **Order.** `newOrder` for the name, with the profile.
+2. **Order.** One `newOrder` with every name as an identifier, the main one first, with the profile.
    - `replaces` is the served leaf's ARI identifier, and only when `acme.json` records that serial as
      issued to this account by this directory.
    - If an error points to `replaces`, the order is retried once without it.
-   - The order URL is recorded at once. After a restart the order is resumed (`Account::order`), not
-     placed again.
-   - An abandoned authorization is deactivated.
-3. **Challenge.** `EDGE_ACME_CHALLENGE` arms the TLS-ALPN-01 digest for 600 s. Then the challenge is
+   - The order URL is recorded at once, with its names. After a restart the order is resumed
+     (`Account::order`), not placed again, when it carries the same names.
+   - An abandoned order's authorizations whose challenge was never marked ready are deactivated.
+     One the CA validated, or still validates, stays: a validated main name serves the order for
+     it alone that may follow.
+3. **Challenge,** for each authorization (one per name). `EDGE_ACME_CHALLENGE` arms each pending
+   one's TLS-ALPN-01 digest for 600 s; the edge keeps one challenge per name. Then each challenge is
    marked ready and the order polled for up to 5 min.
-   - An `invalid` result fetches the authorization's error.
-   - The challenge is cleared afterwards, whatever happened.
-4. **Finalize.** A new P-256 key and a CSR (empty subject, SAN = the name); finalize; fetch the chain.
+   - **An order that does not end ready is left to settle.** A CA can mark the order invalid as
+     soon as one name fails at its first check, while it still validates another from its remote
+     perspectives. The authorizations are read again every second, for up to a minute, until none
+     is still being validated. Only then are the failed names named, each with its error, and the
+     challenges cleared: a challenge cleared under a validation fails it.
+   - A partial mark (one challenge marked, the next refused) settles the same way.
+   - Every armed challenge is cleared afterwards, whatever happened.
+4. **Finalize.** A new P-256 key and a CSR (empty subject, SAN = every name, the main one first);
+   finalize; fetch the chain.
 5. **Check before storing:**
    - the shared verdict (§4);
-   - the leaf covers the name;
-   - the chain verifies to a trusted root for that name: the platform roots, or `acme.trust_anchor`;
+   - the leaf covers every name;
+   - the chain verifies to a trusted root for each name: the platform roots, or
+     `acme.trust_anchor`;
    - `not_after` is more than 2 days away.
 
    A staging or test-CA certificate fails here, so it is never installed by mistake.
@@ -293,6 +316,26 @@ single in-flight slot. A busy slot answers 409.
 
 The private key exists in SY.admin's memory and in the vault only. It is never logged and never
 written to disk.
+
+**The main name is never held hostage (0.1.84).** An added name can fail where the main one does
+not: its DNS record is missing, or points elsewhere.
+- **An order that fails only on added names,** with the main name's authorization validated, is
+  abandoned, and an order for the main name alone follows at once, when both hold:
+  - the run may fall back: a check's order, or a `POST /acme/renew` the main name needs (the edge
+    serves no leaf for it, or the served one is past its renewal point). A test order never
+    narrows its names: it answers whether the CA validates each one;
+  - the edge loses nothing it serves, or cannot wait: no served leaf covers the main name, the
+    served leaf already lacks every name the order would drop, or it is in the last sixth of its
+    lifetime (`expiring`).
+
+  The attempt is then `installed`, its detail says why, and `name_not_covered` stays open for the
+  missing name. Otherwise the attempt fails and the backoff retries every name, so a passing
+  failure never replaces a certificate for every name with one for the main name alone, and a
+  retried renewal never spends issuances on a name already served.
+- **A renewal 48 h past its point** (the `renewal_overdue` mark), after an order that failed only
+  on added names, orders the main name alone. A failure that named no authorization (the order
+  refused) keeps every name.
+- The next renewal tries every name again.
 
 **The test order (D5).** `POST /acme/test` takes no URL.
 - It runs steps 1–5 against `staging_directory_url`, with that directory's account and without
@@ -318,10 +361,12 @@ order. It reads `EDGE_TLS_STATUS`:
 | serves a leaf this account issued; ARI answers | renew at a random point of the suggested window (RFC 9773), honouring Retry-After | n/a |
 | serves a leaf this account issued; no ARI answer | renew at two thirds of its lifetime | n/a |
 | `acme.json` holds a newer certificate than the served one | `EDGE_TLS_RELOAD`, never a new order | n/a |
-| serves a leaf seeded by hand, or for another name | alert only (`foreign_certificate` at its renewal point, `name_not_covered`); `POST /acme/renew` replaces it | expiry checks only |
+| serves a leaf seeded by hand, or for another main name | alert only (`foreign_certificate` at its renewal point, `name_not_covered`); `POST /acme/renew` replaces it | expiry checks only |
+| serves a leaf this account issued for the main name that misses an added name (0.1.84) | `name_not_covered`; renewed at its point, with every name; `POST /acme/renew` certifies the name now | n/a |
 
 - **Name coverage:** a wildcard SAN covers one leftmost label. PROD's `*.fluxbee.ai` covers
-  `hive-k3m9x7q2.fluxbee.ai`.
+  `hive-k3m9x7q2.fluxbee.ai`, not `archi.hive-k3m9x7q2.fluxbee.ai`. A leaf is judged by the main
+  name; each other name only raises `name_not_covered`.
 - **Failures back off** 1 h, 2 h, 4 h and so on, up to 24 h. The failure count and the next attempt
   are kept in `acme.json`.
   - That stays under Let's Encrypt's limit of 5 failed validations per account and name per hour.
@@ -333,8 +378,8 @@ order. It reads `EDGE_TLS_STATUS`:
 
 | Action | Effect |
 |---|---|
-| `GET /acme/status` | the configuration and why it is off, if it is; the terms URL; the accounts; the edge's live status; the order in flight and its progress; the last attempt; the next check and the ARI window; the last issued certificates; the conditions open now |
-| `POST /acme/renew` | an order now: replaces a hand-seeded or foreign certificate, certifies a new name. Needs confirmation; answers 202. |
+| `GET /acme/status` | the configuration and why it is off, if it is (`config.names`: every name, the main one first); the terms URL; the accounts; the edge's live status, and which names the served leaf misses (`edge.names_missing`); the order in flight and its progress; the last attempt; the next check and the ARI window; the last issued certificates; the conditions open now |
+| `POST /acme/renew` | an order now: replaces a hand-seeded or foreign certificate, certifies a new name (a new main name, or a web host). Needs confirmation; answers 202. |
 | `POST /acme/test` | the staging order of §6. Needs confirmation; answers 202. |
 | `POST /acme/reload` | `EDGE_TLS_RELOAD`, after a manual change or a vault rollback |
 
@@ -347,7 +392,7 @@ does not write every 6 h.
 | `renewal_failed` | warning | the last attempt failed |
 | `renewal_overdue` | warning | 48 h past the renewal point, and the edge still serves the old leaf |
 | `expiring` | critical | less than a sixth of the leaf's lifetime is left |
-| `name_not_covered` | warning | the served leaf does not cover the name |
+| `name_not_covered` | warning | the served leaf does not cover one of the names (the detail lists the missing ones) |
 | `foreign_certificate` | warning | a hand-seeded leaf has passed its renewal point while `acme:` is set |
 | `install_refused` | critical | the edge refused a certificate SY.admin issued |
 | `edge_without_certificate` | critical | the edge is `awaiting` |
@@ -416,6 +461,23 @@ below needs the operator's approval and goes in the ledger.
 `issue "letsencrypt.org; validationmethods=tls-alpn-01; accounturi=<the account URL>"` (RFC 8657),
 plus `sectigo.com` only to reissue the wildcard.
 
+**0.1.84: Archi's name** ([io-web-v2](io-web-v2.md) §11.1). `archi.hive-k3m9x7q2.fluxbee.ai` is a
+CNAME of the main name (made by hand, 2026-10-23). The upgrade itself changes nothing: `acme.json`
+keeps parsing, and without `web:` the names are the one main name. Then, each step approved:
+
+1. Add `web: {archi: true}` to the motherbee's `hive.yaml`.
+2. Restart SY.admin when it is idle. The boot log names the declared host; the next check raises
+   `name_not_covered` for it and orders nothing (the served leaf is not due, and the cap holds).
+3. `POST /acme/test`: the staging order carries both names, and `last_test` must be `tested`.
+4. `POST /acme/renew`, confirmed (forced, past the cap).
+   - `/acme/status`: `config.names` lists both, `edge.names_missing` is empty, and the condition
+     closes.
+   - From outside, the served certificate names both hosts.
+
+**Rollback:** 0.1.83 cannot read the `names` lists 0.1.84 writes. It sets `acme.json` aside and
+starts empty, so it judges the served leaf hand-seeded (alerts only, `foreign_certificate` at its
+renewal point) until a `POST /acme/renew`.
+
 ---
 
 ## 10. Tests
@@ -442,5 +504,11 @@ plus `sectigo.com` only to reissue the wildcard.
     single-flight 409;
   - the decision table of §7, the backoff, the cap, the condition transitions;
   - the config checks, the `edge_tls` and metadata checks, the account URL check, the reserved
-    prefix.
+    prefix;
+  - several names (0.1.84): one order and one CSR for all, each authorization armed and cleared,
+    a main name judged only once its validation settles, a partial mark that deactivates only
+    the unmarked authorization, the main name ordered alone after a failure on an added one (each
+    condition of the served leaf) or 48 h past its point after such a failure (and not for a
+    renewal that does not need it, nor a test order), adding and removing a name, and an
+    `acme.json` in the shape 0.1.83 wrote.
 - **Live gate (8.x):** §9.

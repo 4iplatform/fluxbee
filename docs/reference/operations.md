@@ -417,10 +417,10 @@ a domain or a CA.
 5. **Restart SY.admin** when it is idle (`sudo systemctl restart sy-admin`): a restart cuts
    executor plans and relayed Cloud commands in flight.
 6. **Read `GET /acme/status`.** `config.state` must be `on`; when it is `off`, `config.reason`
-   says why (the same line is in `journalctl -u sy-admin`). `terms_url` is the terms you agreed
-   to, and `edge.live` is what the edge serves.
+   says why (the same line is in `journalctl -u sy-admin`). `config.names` are the certified
+   names, `terms_url` is the terms you agreed to, and `edge.live` is what the edge serves.
 7. **Optionally, `POST /acme/test`** (it creates the staging account and arms the edge, so confirm
-   it first): a staging order with the real name, issued and checked but never installed. Its
+   it first): a staging order with the real names, issued and checked but never installed. Its
    result is `last_test` in the status; a staging root is reported as untrusted, as expected.
 8. The first check runs 2 min after SY.admin starts. An edge with no certificate gets one ordered
    then; `last_attempt` and `issued` in the status show the result, and `renewal.renew_at` when
@@ -434,11 +434,38 @@ orders now: the new certificate goes into the edge's secret, the hand-seeded one
 vault as the previous version, and the edge reloads. From then on the check renews it by itself.
 The same call certifies a new name after `public_base_url` changed and SY.admin restarted.
 
+**Add a web host to the certificate** (Archi's, [io-web-v2](../io-web-v2.md) §11.1). One
+certificate carries the main name and every host `web:` declares, each a label before the main
+name:
+
+1. **DNS.** A record for `archi.<main name>` pointing at the ingress, like the main name's (a CNAME
+   of it works), made by hand.
+2. **The motherbee's hive.yaml:** `web: {archi: true}`. A bare `web:` declares nothing.
+3. **Restart SY.admin** when it is idle. Its log names the declared host, and the edge gets the
+   host's route within a minute. The served certificate does not cover the host yet: the check
+   raises `name_not_covered` (warning) and orders nothing, since the leaf is not due and the cap
+   holds automatic orders.
+4. **`POST /acme/test`**, confirmed: the staging order carries every name, and `last_test` says
+   which one the CA did not validate, if any.
+5. **`POST /acme/renew`**, confirmed (forced, past the cap). Then `config.names` lists every name,
+   `edge.names_missing` is empty, and `name_not_covered` closes.
+
+When the CA validates the main name but not the added one, an order goes on with the main name
+alone only when the edge would lose nothing it serves, or cannot wait: no certificate for the
+main name, one that already lacks the added name, or one in the last sixth of its lifetime;
+`last_attempt.detail` says why. Otherwise the attempt fails (`last_attempt.failed_names` names
+the host) and the backoff retries every name, so a certificate for both names is kept; 48 h past
+its renewal point, after such a failure, the main name is renewed alone. A `POST /acme/renew`
+while the main name is served and not due just fails: fix the host's DNS and renew again.
+Removing `web:` (and restarting) takes the host's route off the edge within a minute and its name
+off the certificate at the next renewal.
+
 **Roll back.** `POST /hives/motherbee/vault/secrets/<the edge's secret>/rollback` puts the previous
 version back, then `POST /acme/reload` makes the edge serve it. The check then sees a hand-seeded
 leaf and leaves it. Roll the vault back before downgrading to a version that cannot renew. The
 vault keeps one previous version, so after two renewals the hand-seeded certificate is no longer
-there: keep its files.
+there: keep its files. A downgrade below 0.1.84 cannot read the `acme.json` 0.1.84 writes: it sets
+the file aside and judges the served leaf hand-seeded until a `POST /acme/renew`.
 
 **When the edge refuses a certificate SY.admin issued**, SY.admin rolls the secret back at once,
 raises `install_refused` (critical) and orders nothing until you act: find the cause in

@@ -219,8 +219,10 @@ def certificate_health():
     conditions = body.get("conditions") or []
     critical = [c.get("kind") for c in conditions if c.get("severity") == "critical"]
     config = body.get("config") or {}
-    print("%-10s acme=%s name=%s conditions=%s%s" % (
-        "edge-cert", config.get("state"), config.get("name"),
+    # `names` since 0.1.84; an SY.admin before it (or rolled back) lists its one `name`.
+    names = config.get("names") or [n for n in [config.get("name")] if n]
+    print("%-10s acme=%s names=%s conditions=%s%s" % (
+        "edge-cert", config.get("state"), ",".join(names) or "none",
         ",".join(c.get("kind", "?") for c in conditions) or "none",
         " CRITICAL" if critical else ""))
     return not critical

@@ -12,6 +12,8 @@ use rcgen::{
 };
 
 const NAME: &str = "hive-1.example.com";
+/// The web host `web: {archi: true}` adds (docs/io-web-v2.md §11.1).
+const ARCHI: &str = "archi.hive-1.example.com";
 const EDGE: &str = "SY.edge@ingress1";
 const EDGE_KEY: &str = "edge_tls";
 const DIRECTORY: &str = "https://ca.example.test/directory";
@@ -129,14 +131,16 @@ fn first_pem(chain_pem: &str) -> String {
 
 #[derive(Default, Debug)]
 pub(super) struct CaLog {
-    /// (name, profile, replaces sent)
-    new_orders: Vec<(String, Option<String>, bool)>,
+    /// (names, profile, replaces sent)
+    new_orders: Vec<(Vec<String>, Option<String>, bool)>,
     resumed: Vec<String>,
     accounts_created: Vec<String>,
     directories: usize,
     ari_calls: usize,
-    set_ready: usize,
-    deactivated: usize,
+    /// The names whose challenge was marked ready, in order.
+    set_ready: Vec<String>,
+    /// The names whose authorization was deactivated, in order.
+    deactivated: Vec<String>,
     finalized: usize,
 }
 
@@ -144,10 +148,24 @@ pub(super) struct CaScript {
     directory: DirectoryInfo,
     ari: Result<AriAnswer, CaError>,
     new_order_errors: VecDeque<CaError>,
-    authz: AuthzState,
+    /// The order's own verdict when it carries no name of `refused`; an error leaves every
+    /// challenge marked ready under validation.
     poll: Result<OrderStatus, CaError>,
+    /// The error every authorization reports after an invalid order.
     challenge_error: Option<String>,
+    /// Names whose challenge the CA refuses, with its error: their authorization goes invalid,
+    /// the order with it at once, and the other names validate.
+    refused: BTreeMap<String, String>,
+    /// Names whose validation is still running through this many reads of the order's
+    /// authorizations asked again, the order's verdict notwithstanding.
+    slow: BTreeMap<String, usize>,
+    /// Names whose challenge cannot be marked ready, with the CA's error.
+    set_ready_errors: BTreeMap<String, String>,
+    /// Names whose authorization the CA already holds as valid.
+    valid: Vec<String>,
     resume_status: OrderStatus,
+    /// The names of every order placed, by URL (a resumed order unknown here carries NAME).
+    orders: HashMap<String, Vec<String>>,
     lifetime: i64,
     /// Run once when the CA hands out a certificate: something that happens during an order.
     on_certificate: Option<Box<dyn FnOnce() + Send>>,
@@ -164,18 +182,24 @@ impl Default for CaScript {
             },
             ari: Err(CaError::Problem("no ARI in this test".to_string())),
             new_order_errors: VecDeque::new(),
-            authz: AuthzState::Pending {
-                name: NAME.to_string(),
-                digest: "ab".repeat(32),
-            },
             poll: Ok(OrderStatus::Ready),
             challenge_error: None,
+            refused: BTreeMap::new(),
+            slow: BTreeMap::new(),
+            set_ready_errors: BTreeMap::new(),
+            valid: Vec::new(),
             resume_status: OrderStatus::Pending,
+            orders: HashMap::new(),
             lifetime: 90 * DAY,
             on_certificate: None,
             log: CaLog::default(),
         }
     }
+}
+
+/// The key authorization digest the fake CA gives a name: 32 bytes, distinct per name.
+fn digest_for(name: &str) -> String {
+    hex::encode(Sha256::digest(name.as_bytes()))
 }
 
 struct FakeCa {
@@ -252,13 +276,13 @@ impl CaAccount for FakeAccount {
 
     async fn new_order(
         &self,
-        name: &str,
+        names: &[String],
         profile: Option<&str>,
         replaces: Option<&CertRef>,
     ) -> Result<Box<dyn CaOrder>, CaError> {
         let mut script = lock(&self.script);
         script.log.new_orders.push((
-            name.to_string(),
+            names.to_vec(),
             profile.map(str::to_string),
             replaces.is_some(),
         ));
@@ -266,24 +290,35 @@ impl CaAccount for FakeAccount {
             return Err(err);
         }
         let n = script.log.new_orders.len();
-        Ok(self.order(format!("{}/order/{n}", self.url), OrderStatus::Pending))
+        let url = format!("{}/order/{n}", self.url);
+        script.orders.insert(url.clone(), names.to_vec());
+        Ok(self.order(url, names.to_vec(), OrderStatus::Pending))
     }
 
     async fn resume_order(&self, url: &str) -> Result<Box<dyn CaOrder>, CaError> {
-        let status = {
+        let (names, status) = {
             let mut script = lock(&self.script);
             script.log.resumed.push(url.to_string());
-            script.resume_status
+            let names = script
+                .orders
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| vec![NAME.to_string()]);
+            (names, script.resume_status)
         };
-        Ok(self.order(url.to_string(), status))
+        Ok(self.order(url.to_string(), names, status))
     }
 }
 
 impl FakeAccount {
-    fn order(&self, url: String, status: OrderStatus) -> Box<dyn CaOrder> {
+    fn order(&self, url: String, names: Vec<String>, status: OrderStatus) -> Box<dyn CaOrder> {
         Box::new(FakeOrder {
             url,
+            names,
             status,
+            readied: Vec::new(),
+            reads: 0,
+            polled: None,
             csr: None,
             script: Arc::clone(&self.script),
             pki: Arc::clone(&self.pki),
@@ -294,11 +329,59 @@ impl FakeAccount {
 
 struct FakeOrder {
     url: String,
+    names: Vec<String>,
     status: OrderStatus,
+    /// The names whose challenge was marked ready: the CA validates them.
+    readied: Vec<String>,
+    /// The reads of the authorizations asked again from the CA (`refresh`).
+    reads: usize,
+    /// What the last poll answered.
+    polled: Option<Result<OrderStatus, CaError>>,
     csr: Option<Vec<u8>>,
     script: Arc<Mutex<CaScript>>,
     pki: Arc<TestPki>,
     clock: Arc<AtomicI64>,
+}
+
+impl FakeOrder {
+    /// One authorization as the CA holds it now.
+    fn authz_state(&self, script: &CaScript, name: &str) -> AuthzState {
+        let digest = digest_for(name);
+        if script.valid.iter().any(|valid| valid == name) {
+            return AuthzState::Valid;
+        }
+        if !self.readied.iter().any(|readied| readied == name) {
+            return AuthzState::Pending {
+                digest,
+                processing: false,
+            };
+        }
+        let validating = AuthzState::Pending {
+            digest,
+            processing: true,
+        };
+        if self.reads <= script.slow.get(name).copied().unwrap_or(0) {
+            return validating;
+        }
+        if let Some(error) = script.refused.get(name) {
+            return AuthzState::Other {
+                status: "invalid".to_string(),
+                error: Some(error.clone()),
+            };
+        }
+        let refused_here = self
+            .names
+            .iter()
+            .any(|name| script.refused.contains_key(name));
+        match &self.polled {
+            Some(Ok(OrderStatus::Invalid)) if !refused_here => AuthzState::Other {
+                status: "invalid".to_string(),
+                error: script.challenge_error.clone(),
+            },
+            Some(Err(_)) => validating,
+            _ => AuthzState::Valid,
+        }
+    }
 }
 
 #[async_trait]
@@ -311,29 +394,68 @@ impl CaOrder for FakeOrder {
         self.status
     }
 
-    async fn authorization(&mut self) -> Result<AuthzState, CaError> {
-        Ok(lock(&self.script).authz.clone())
+    async fn authorizations(&mut self, refresh: bool) -> Result<Vec<Authz>, CaError> {
+        if refresh {
+            self.reads += 1;
+        }
+        let script = lock(&self.script);
+        Ok(self
+            .names
+            .iter()
+            .map(|name| Authz {
+                name: name.clone(),
+                state: self.authz_state(&script, name),
+            })
+            .collect())
     }
 
-    async fn set_challenge_ready(&mut self) -> Result<(), CaError> {
-        lock(&self.script).log.set_ready += 1;
+    async fn set_challenge_ready(&mut self, name: &str) -> Result<(), CaError> {
+        let mut script = lock(&self.script);
+        if let Some(error) = script.set_ready_errors.get(name) {
+            return Err(CaError::Problem(error.clone()));
+        }
+        script.log.set_ready.push(name.to_string());
+        self.readied.push(name.to_string());
         Ok(())
     }
 
     async fn poll_ready(&mut self, _limit: Duration) -> Result<OrderStatus, CaError> {
-        let polled = lock(&self.script).poll.clone();
+        let polled = {
+            let script = lock(&self.script);
+            if self
+                .names
+                .iter()
+                .any(|name| script.refused.contains_key(name))
+            {
+                Ok(OrderStatus::Invalid)
+            } else {
+                script.poll.clone()
+            }
+        };
         if let Ok(status) = &polled {
             self.status = *status;
         }
+        self.polled = Some(polled.clone());
         polled
     }
 
-    async fn challenge_error(&mut self) -> Option<String> {
-        lock(&self.script).challenge_error.clone()
-    }
-
-    async fn deactivate_pending(&mut self) -> Result<(), CaError> {
-        lock(&self.script).log.deactivated += 1;
+    async fn deactivate_unready(&mut self) -> Result<(), CaError> {
+        let mut script = lock(&self.script);
+        let unready: Vec<String> = self
+            .names
+            .iter()
+            .filter(|name| {
+                matches!(
+                    self.authz_state(&script, name),
+                    AuthzState::Pending {
+                        processing: false,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect();
+        script.log.deactivated.extend(unready);
         Ok(())
     }
 
@@ -756,13 +878,21 @@ fn temp_dir(label: &str) -> PathBuf {
 
 fn settings() -> AcmeSettings {
     AcmeSettings {
-        name: NAME.to_string(),
+        names: vec![NAME.to_string()],
         directory_url: DIRECTORY.to_string(),
         staging_directory_url: STAGING.to_string(),
         profile: None,
         contact: Some("mailto:ops@example.com".to_string()),
         trust_anchor: None,
         trust_anchor_roots: Vec::new(),
+    }
+}
+
+/// The settings with `web: {archi: true}`: the main name, then Archi's host.
+fn settings_with_archi() -> AcmeSettings {
+    AcmeSettings {
+        names: vec![NAME.to_string(), ARCHI.to_string()],
+        ..settings()
     }
 }
 
@@ -774,6 +904,8 @@ fn test_timings() -> Timings {
         edge_retry: Duration::from_secs(600),
         ca_call: Duration::from_secs(5),
         order_poll: Duration::from_secs(5),
+        settle_every: Duration::from_millis(2),
+        settle_limit: Duration::from_millis(100),
         edge_call: Duration::from_secs(5),
         reload: Duration::from_secs(5),
         mesh_call: Duration::from_secs(5),
@@ -816,9 +948,13 @@ impl Harness {
         Self::new(AcmeConfig::On(settings()))
     }
 
+    fn with_archi() -> Self {
+        Self::new(AcmeConfig::On(settings_with_archi()))
+    }
+
     fn absent() -> Self {
         Self::new(AcmeConfig::Absent {
-            name: Some(NAME.to_string()),
+            names: vec![NAME.to_string()],
         })
     }
 
@@ -923,7 +1059,7 @@ pub(crate) fn inert_service(state_dir: &Path) -> Arc<AcmeService> {
     let clock = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
     let now = Arc::clone(&clock);
     AcmeService::new(
-        AcmeConfig::Absent { name: None },
+        AcmeConfig::Absent { names: Vec::new() },
         AcmeDeps {
             ca: Arc::new(FakeCa {
                 script: Arc::new(Mutex::new(CaScript::default())),
@@ -1033,10 +1169,9 @@ async fn a_challenge_the_ca_refuses_fails_backs_off_and_alerts_once() {
     assert_eq!(state.backoff.next_attempt_at, Some(now + HOUR));
     assert!(state.order.is_none(), "an abandoned order is forgotten");
     assert!(!h.mesh().vault.contains_key(EDGE_KEY), "nothing stored");
-    assert_eq!(
-        h.ca().log.deactivated,
-        1,
-        "its authorization is deactivated"
+    assert!(
+        h.ca().log.deactivated.is_empty(),
+        "an authorization the CA judged is not deactivated"
     );
     assert_eq!(h.mesh().clears.len(), 1, "the challenge is cleared");
     let mut alerts = h.alerts();
@@ -1094,7 +1229,10 @@ async fn a_poll_that_never_ends_abandons_the_order() {
         state.last_attempt.unwrap().stage.as_deref(),
         Some("challenge")
     );
-    assert_eq!(h.ca().log.deactivated, 1);
+    assert!(
+        h.ca().log.deactivated.is_empty(),
+        "a challenge the CA still validates is left to it"
+    );
     assert_eq!(h.mesh().clears.len(), 1);
     assert!(state.order.is_none());
 }
@@ -1355,7 +1493,7 @@ fn seed_account_and_order(h: &Harness, order_url: &str) {
             directory_url: DIRECTORY.to_string(),
             account_url: account_url_for(DIRECTORY),
             order_url: order_url.to_string(),
-            name: NAME.to_string(),
+            names: vec![NAME.to_string()],
             profile: None,
             replaces: false,
             kind: RunKind::Check,
@@ -1466,6 +1604,786 @@ async fn one_order_at_a_time_a_busy_slot_answers_409() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Several names: the main one and the web hosts (docs/io-web-v2.md §11.1)
+// ---------------------------------------------------------------------------------------------
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| name.to_string()).collect()
+}
+
+/// The names of the leaf the edge serves now.
+fn served_names(h: &Harness) -> Vec<String> {
+    leaf_of(h.mesh().served.as_deref().expect("a served leaf")).names
+}
+
+#[tokio::test]
+async fn one_order_carries_every_name_and_arms_and_clears_each_authorization() {
+    let h = Harness::with_archi();
+    h.service.check_once().await;
+
+    assert_eq!(h.ca().log.new_orders[0].0, names(&[NAME, ARCHI]));
+    assert_eq!(h.ca().log.set_ready, names(&[NAME, ARCHI]));
+    {
+        let mesh = h.mesh();
+        let armed: Vec<(Value, Value)> = mesh
+            .arms
+            .iter()
+            .map(|arm| (arm["name"].clone(), arm["digest"].clone()))
+            .collect();
+        assert_eq!(
+            armed,
+            vec![
+                (json!(NAME), json!(digest_for(NAME))),
+                (json!(ARCHI), json!(digest_for(ARCHI))),
+            ]
+        );
+        let cleared: Vec<(Value, Value)> = mesh
+            .clears
+            .iter()
+            .map(|clear| (clear["name"].clone(), clear["digest"].clone()))
+            .collect();
+        assert_eq!(
+            cleared, armed,
+            "every armed challenge is cleared by its digest"
+        );
+    }
+    // The CSR carried both names, the main one first.
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    let state = h.state();
+    assert_eq!(state.last_attempt.unwrap().result, "installed");
+    assert_eq!(state.issued[0].names, names(&[NAME, ARCHI]));
+    assert!(h.open_conditions().is_empty(), "{:?}", h.open_conditions());
+    let status = h.service.status().await;
+    assert_eq!(status["config"]["name"], NAME);
+    assert_eq!(status["config"]["names"], json!([NAME, ARCHI]));
+    assert_eq!(status["edge"]["names_covered"], true);
+    assert_eq!(status["edge"]["names_missing"], json!([]));
+}
+
+#[tokio::test]
+async fn an_authorization_the_ca_still_holds_is_not_armed() {
+    let h = Harness::with_archi();
+    h.ca().valid.push(NAME.to_string());
+    h.service.check_once().await;
+    let armed: Vec<Value> = h
+        .mesh()
+        .arms
+        .iter()
+        .map(|arm| arm["name"].clone())
+        .collect();
+    assert_eq!(armed, vec![json!(ARCHI)]);
+    assert_eq!(h.ca().log.set_ready, names(&[ARCHI]));
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+}
+
+#[tokio::test]
+async fn an_order_that_fails_only_on_an_added_name_orders_the_main_name_alone() {
+    let h = Harness::with_archi();
+    h.ca().refused.insert(
+        ARCHI.to_string(),
+        "DNS problem: NXDOMAIN looking up A for archi.hive-1.example.com".to_string(),
+    );
+    h.service.check_once().await;
+
+    assert_eq!(
+        h.ca()
+            .log
+            .new_orders
+            .iter()
+            .map(|order| order.0.clone())
+            .collect::<Vec<_>>(),
+        vec![names(&[NAME, ARCHI]), names(&[NAME])]
+    );
+    assert!(
+        h.ca().log.deactivated.is_empty(),
+        "the main name's validated authorization stays for the order for it alone"
+    );
+    assert_eq!(h.mesh().arms.len(), 3);
+    assert_eq!(h.mesh().clears.len(), 3);
+    assert_eq!(served_names(&h), names(&[NAME]));
+    let state = h.state();
+    let attempt = state.last_attempt.clone().unwrap();
+    assert_eq!(attempt.result, "installed");
+    let detail = attempt.detail.unwrap();
+    assert!(
+        detail.contains(ARCHI) && detail.contains("NXDOMAIN") && detail.contains("alone"),
+        "{detail}"
+    );
+    assert_eq!(state.issued.last().unwrap().names, names(&[NAME]));
+    assert_eq!(state.backoff, Backoff::default());
+    // name_not_covered stays open for the missing name; the run itself did not fail.
+    assert_eq!(h.open_conditions(), vec!["name_not_covered"]);
+    assert!(state.conditions["name_not_covered"].detail.contains(ARCHI));
+    let status = h.service.status().await;
+    assert_eq!(status["edge"]["names_covered"], false);
+    assert_eq!(status["edge"]["names_missing"], json!([ARCHI]));
+}
+
+#[tokio::test]
+async fn an_order_that_fails_on_the_main_name_orders_nothing_else() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(NAME.to_string(), "Connection refused".to_string());
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    let state = h.state();
+    let attempt = state.last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert_eq!(attempt.stage.as_deref(), Some("challenge"));
+    assert!(attempt.detail.unwrap().contains(NAME));
+    assert_eq!(state.backoff.failures, 1);
+    assert!(!h.mesh().vault.contains_key(EDGE_KEY));
+}
+
+/// The CA turns the order invalid as soon as Archi's name fails, while it still validates the main
+/// name: the main name is judged once it settles, its challenge answered until then.
+#[tokio::test]
+async fn the_main_name_is_judged_once_its_validation_settles() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "CAA record forbids issuance".to_string());
+    h.ca().slow.insert(NAME.to_string(), 3);
+    h.service.check_once().await;
+    assert_eq!(
+        h.ca()
+            .log
+            .new_orders
+            .iter()
+            .map(|order| order.0.clone())
+            .collect::<Vec<_>>(),
+        vec![names(&[NAME, ARCHI]), names(&[NAME])],
+        "the main name, validated after all, is ordered alone"
+    );
+    assert!(h.ca().log.deactivated.is_empty());
+    assert_eq!(h.state().last_attempt.unwrap().result, "installed");
+    assert_eq!(served_names(&h), names(&[NAME]));
+}
+
+/// A validation that does not settle within the limit counts as failed: no fallback.
+#[tokio::test]
+async fn a_main_name_still_validating_at_the_limit_is_not_left_alone() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    h.ca().slow.insert(NAME.to_string(), usize::MAX);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert_eq!(attempt.failed_names, names(&[NAME, ARCHI]));
+    assert!(h.ca().log.deactivated.is_empty(), "left to the CA");
+}
+
+/// One challenge could not be marked ready: the one that was is validated before the edge stops
+/// answering, and only the other is deactivated.
+#[tokio::test]
+async fn a_partial_ready_deactivates_only_what_was_never_marked() {
+    let h = Harness::with_archi();
+    h.ca().set_ready_errors.insert(
+        ARCHI.to_string(),
+        "urn:ietf:params:acme:error:malformed".to_string(),
+    );
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.set_ready, names(&[NAME]));
+    assert_eq!(h.ca().log.deactivated, names(&[ARCHI]));
+    assert_eq!(h.mesh().clears.len(), 2, "both challenges are cleared");
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert_eq!(attempt.stage.as_deref(), Some("challenge"));
+    assert!(attempt.detail.unwrap().contains("malformed"));
+}
+
+/// A passing failure of Archi's name never replaces a certificate for every name: the backoff
+/// retries both.
+#[tokio::test]
+async fn a_failure_on_an_added_name_keeps_a_certificate_for_every_name() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    let not_before = h.state().issued[0].not_before;
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "Timeout during connect".to_string());
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(
+        h.ca().log.new_orders.len(),
+        2,
+        "no order for the main name alone"
+    );
+    let state = h.state();
+    assert_eq!(state.last_attempt.unwrap().result, "failed");
+    assert_eq!(state.backoff.failures, 1);
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    // Archi's name answers again: past the backoff, both are renewed.
+    h.ca().refused.clear();
+    h.advance(HOUR + 1);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders[2].0, names(&[NAME, ARCHI]));
+    assert_eq!(h.state().last_attempt.unwrap().result, "installed");
+}
+
+/// A leaf for the main name alone loses nothing by another: at its point it is renewed for the
+/// main name alone while Archi's name still fails.
+#[tokio::test]
+async fn a_leaf_already_without_the_added_name_renews_for_the_main_name_alone() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    h.service.check_once().await;
+    assert_eq!(served_names(&h), names(&[NAME]));
+    let not_before = h.state().issued.last().unwrap().not_before;
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    let orders: Vec<Vec<String>> = h
+        .ca()
+        .log
+        .new_orders
+        .iter()
+        .map(|order| order.0.clone())
+        .collect();
+    assert_eq!(
+        orders[2..],
+        [names(&[NAME, ARCHI]), names(&[NAME])],
+        "every name first, then the main name alone"
+    );
+    assert_eq!(h.state().last_attempt.unwrap().result, "installed");
+}
+
+/// A certificate for every name in the last sixth of its lifetime cannot wait for the added name.
+#[tokio::test]
+async fn an_expiring_leaf_falls_back_to_the_main_name_alone() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    let not_before = h.state().issued[0].not_before;
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    // Day 76 of 90: less than a sixth (15 days) is left.
+    h.clock.store(not_before + 76 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders[2].0, names(&[NAME]));
+    assert_eq!(h.state().last_attempt.unwrap().result, "installed");
+    assert_eq!(served_names(&h), names(&[NAME]));
+}
+
+#[test]
+fn the_main_name_goes_alone_only_when_nothing_served_is_lost_or_time_is_short() {
+    let pki = TestPki::new("Alone");
+    let now = chrono::Utc::now().timestamp();
+    let both = names(&[NAME, ARCHI]);
+    let serving = |names: &[&str], not_before: i64, not_after: i64| {
+        let (chain, _) = pki.seeded(names, not_before, not_after);
+        view_serving(&leaf_of(&chain))
+    };
+    // No leaf, or none for the main name.
+    assert!(main_alone_loses_nothing(
+        &view_awaiting("not_found"),
+        &both,
+        now
+    ));
+    assert!(main_alone_loses_nothing(
+        &serving(&["other.example.org"], now - DAY, now + 80 * DAY),
+        &both,
+        now
+    ));
+    // A leaf that already lacks Archi's name.
+    assert!(main_alone_loses_nothing(
+        &serving(&[NAME], now - DAY, now + 80 * DAY),
+        &both,
+        now
+    ));
+    // A leaf for both names: kept, unless in its last sixth.
+    assert!(!main_alone_loses_nothing(
+        &serving(&[NAME, ARCHI], now - 60 * DAY, now + 30 * DAY),
+        &both,
+        now
+    ));
+    assert!(main_alone_loses_nothing(
+        &serving(&[NAME, ARCHI], now - 80 * DAY, now + 10 * DAY),
+        &both,
+        now
+    ));
+}
+
+#[tokio::test]
+async fn a_forced_renewal_does_not_fall_back_while_the_main_name_is_served_and_not_due() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "Timeout during connect".to_string());
+    h.service.check_once().await;
+    assert_eq!(served_names(&h), names(&[NAME]));
+    // The operator retries while Archi's name still fails: no issuance for the main name alone.
+    h.advance(HOUR);
+    h.service.begin_renew().expect("renew");
+    h.settle().await;
+    assert_eq!(
+        h.ca().log.new_orders.len(),
+        3,
+        "one combined order, nothing after it"
+    );
+    assert_eq!(
+        h.ca().log.new_orders[2].0,
+        names(&[NAME, ARCHI]),
+        "the renewal tries every name"
+    );
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert!(attempt.detail.unwrap().contains(ARCHI));
+    assert_eq!(served_names(&h), names(&[NAME]));
+    // Once Archi's name validates, the same call certifies both.
+    h.ca().refused.clear();
+    h.service.begin_renew().expect("renew");
+    h.settle().await;
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    h.service.check_once().await;
+    assert!(h.open_conditions().is_empty(), "{:?}", h.open_conditions());
+}
+
+#[tokio::test]
+async fn a_test_order_carries_every_name_and_never_falls_back() {
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    h.service.begin_test().expect("test");
+    h.settle().await;
+    let test = h.state().last_test.unwrap();
+    assert_eq!(test.result, "failed");
+    assert!(test.detail.unwrap().contains(ARCHI));
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    assert_eq!(h.ca().log.new_orders[0].0, names(&[NAME, ARCHI]));
+}
+
+#[tokio::test]
+async fn adding_a_name_alerts_and_the_explicit_renewal_certifies_it() {
+    let mut h = Harness::on();
+    h.install_first().await;
+    // web: {archi: true}, and SY.admin restarted.
+    h.config = AcmeConfig::On(settings_with_archi());
+    h.restart();
+    h.advance(DAY);
+    h.service.check_once().await;
+    assert_eq!(
+        h.ca().log.new_orders.len(),
+        1,
+        "a missing name is alerted only"
+    );
+    assert!(h.state().last_check.unwrap().decision.starts_with("idle"));
+    assert_eq!(h.open_conditions(), vec!["name_not_covered"]);
+    // POST /acme/renew, forced past the cap.
+    h.service.begin_renew().expect("renew");
+    h.settle().await;
+    assert_eq!(h.ca().log.new_orders[1].0, names(&[NAME, ARCHI]));
+    assert!(
+        h.ca().log.new_orders[1].2,
+        "it replaces the leaf this account issued"
+    );
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    h.service.check_once().await;
+    assert!(h.open_conditions().is_empty(), "{:?}", h.open_conditions());
+    assert!(h
+        .alerts()
+        .contains(&("name_not_covered".to_string(), "closed".to_string())));
+}
+
+#[tokio::test]
+async fn removing_a_name_takes_effect_at_the_next_renewal() {
+    let mut h = Harness::with_archi();
+    h.install_first().await;
+    h.config = AcmeConfig::On(settings());
+    h.restart();
+    h.advance(DAY);
+    h.service.check_once().await;
+    assert!(
+        h.open_conditions().is_empty(),
+        "the served leaf covers the one name"
+    );
+    assert_eq!(h.ca().log.new_orders.len(), 1);
+    // At the renewal point, the order names the main name only.
+    let not_before = h.state().issued[0].not_before;
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders[1].0, names(&[NAME]));
+    assert_eq!(served_names(&h), names(&[NAME]));
+}
+
+#[tokio::test]
+async fn a_renewal_48_hours_overdue_after_a_failure_on_added_names_orders_the_main_name_alone() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    let not_before = h.state().issued[0].not_before;
+    // Two thirds of 90 days is day 60. Archi's name fails there: the backoff retries both.
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert_eq!(attempt.failed_names, names(&[ARCHI]));
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+    // 49 h past the point, after that failure, the main name goes alone.
+    h.clock
+        .store(not_before + 60 * DAY + 49 * HOUR, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders[2].0, names(&[NAME]));
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "installed");
+    assert!(attempt.detail.unwrap().contains("overdue"));
+    assert_eq!(served_names(&h), names(&[NAME]));
+    assert_eq!(h.open_conditions(), vec!["name_not_covered"]);
+}
+
+#[tokio::test]
+async fn a_renewal_overdue_after_a_failure_that_named_no_added_name_keeps_every_name() {
+    let h = Harness::with_archi();
+    h.install_first().await;
+    let not_before = h.state().issued[0].not_before;
+    // The order itself is refused at the renewal point: no authorization is named.
+    h.ca().new_order_errors.push_back(CaError::Problem(
+        "the CA is down for maintenance".to_string(),
+    ));
+    h.clock.store(not_before + 60 * DAY, Ordering::SeqCst);
+    h.service.check_once().await;
+    let attempt = h.state().last_attempt.unwrap();
+    assert_eq!(attempt.result, "failed");
+    assert!(attempt.failed_names.is_empty());
+    h.clock
+        .store(not_before + 60 * DAY + 49 * HOUR, Ordering::SeqCst);
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.new_orders[2].0, names(&[NAME, ARCHI]));
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+}
+
+#[test]
+fn the_decision_table_judges_a_leaf_by_the_main_name() {
+    let pki = TestPki::new("Names");
+    let now = chrono::Utc::now().timestamp();
+    let both = settings_with_archi();
+    let (chain, _) = pki.seeded(&[NAME], now - 10 * DAY, now + 80 * DAY);
+    let leaf = leaf_of(&chain);
+    let ours = issued_state(&leaf, now - 40 * DAY);
+    // A leaf this account issued for the main name only: renewed at its point, with every name.
+    assert!(matches!(
+        decide(&view_serving(&leaf), &both, &ours, Some(now + DAY), now),
+        Decision::Idle { .. }
+    ));
+    assert!(matches!(
+        decide(&view_serving(&leaf), &both, &ours, Some(now - 1), now),
+        Decision::Order {
+            main_only: false,
+            ..
+        }
+    ));
+    // 48 h past the point the main name goes alone, only after an order that failed on added
+    // names alone; with one name there is nothing to narrow.
+    let failed_on = |failed: &[&str]| {
+        let mut state = ours.clone();
+        state.last_attempt = Some(AttemptRecord {
+            kind: RunKind::Check,
+            directory_url: DIRECTORY.to_string(),
+            started_at: now - HOUR,
+            finished_at: now - HOUR,
+            result: "failed".to_string(),
+            stage: Some("challenge".to_string()),
+            detail: Some("the CA did not validate the challenge".to_string()),
+            fingerprint: None,
+            trusted: None,
+            failed_names: names(failed),
+        });
+        state
+    };
+    let overdue = |settings: &AcmeSettings, state: &AcmeState| match decide(
+        &view_serving(&leaf),
+        settings,
+        state,
+        Some(now - 48 * HOUR),
+        now,
+    ) {
+        Decision::Order { main_only, .. } => main_only,
+        other => panic!("{other:?}"),
+    };
+    assert!(overdue(&both, &failed_on(&[ARCHI])));
+    assert!(!overdue(&both, &ours), "no failure");
+    assert!(!overdue(&both, &failed_on(&[NAME, ARCHI])));
+    assert!(
+        !overdue(&both, &failed_on(&[])),
+        "a failure that named no name"
+    );
+    assert!(!overdue(&settings(), &failed_on(&[ARCHI])));
+    // A hand-seeded leaf for the main name stays alerted only.
+    assert!(matches!(
+        decide(&view_serving(&leaf), &both, &AcmeState::default(), None, now),
+        Decision::AlertOnly(reason) if reason.contains("seeded by hand")
+    ));
+    // name_not_covered names only the missing name.
+    let mut state = ours;
+    state.edge.last_status = Some(view_serving(&leaf));
+    let open = evaluate_conditions(Some(&both), &state, now);
+    assert_eq!(open.keys().collect::<Vec<_>>(), vec!["name_not_covered"]);
+    assert!(open["name_not_covered"].detail.contains(ARCHI));
+    assert!(!open["name_not_covered"]
+        .detail
+        .contains(&format!("cover {NAME}")));
+}
+
+#[test]
+fn the_material_check_and_the_chain_check_run_per_name() {
+    let pki = TestPki::new("Per name");
+    let now = chrono::Utc::now().timestamp();
+    let (chain, key) = pki.seeded(&[NAME], now - DAY, now + 80 * DAY);
+    let (parsed, _) = tls_material::parse_chain(chain.as_bytes()).expect("chain");
+    let roots = || vec![pki.root_der.clone()];
+    assert!(verify_chain(&parsed, &names(&[NAME]), now, roots()).is_ok());
+    let err = verify_chain(&parsed, &names(&[NAME, ARCHI]), now, roots()).unwrap_err();
+    assert!(err.starts_with(ARCHI), "{err}");
+
+    let mut h = Harness::with_archi();
+    h.platform = Arc::new(pki);
+    h.restart();
+    let run = Run::every_name(
+        RunKind::Check,
+        settings_with_archi(),
+        DIRECTORY.to_string(),
+        EDGE.to_string(),
+        EdgeView::default(),
+        None,
+    );
+    let err = h
+        .service
+        .check_material(&chain, &SecretPem(key.clone()), &run, now)
+        .err()
+        .expect("a leaf that misses a name");
+    assert!(err.contains(&format!("does not cover {ARCHI}")), "{err}");
+    let alone = Run {
+        names: names(&[NAME]),
+        ..run
+    };
+    assert!(h
+        .service
+        .check_material(&chain, &SecretPem(key), &alone, now)
+        .is_ok());
+}
+
+#[test]
+fn the_names_come_from_the_public_base_url_and_web() {
+    let url = Some("https://hive-1.example.com");
+    let archi = [ARCHI.to_string()];
+    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url, &archi) {
+        AcmeConfig::On(settings) => {
+            assert_eq!(settings.names, names(&[NAME, ARCHI]));
+            assert_eq!(settings.main_name(), NAME);
+        }
+        _ => panic!("expected on"),
+    }
+    let absent = AcmeConfig::from_hive(None, url, &archi);
+    assert_eq!(absent.names(), names(&[NAME, ARCHI]).as_slice());
+    assert_eq!(absent.name(), Some(NAME));
+    let off = AcmeConfig::from_hive(Some(&yaml("terms_agreed: false")), url, &archi);
+    assert_eq!(off.names(), names(&[NAME, ARCHI]).as_slice());
+    // Without a usable public_base_url there is no name at all.
+    let none = AcmeConfig::from_hive(None, Some("http://hive-1.example.com"), &archi);
+    assert!(none.names().is_empty() && none.name().is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// acme.json as 0.1.82 and 0.1.83 wrote it: one `name` per order and certificate
+// ---------------------------------------------------------------------------------------------
+
+/// A copy of the shape 0.1.83 writes, every field present: the order in flight and the issued
+/// certificate carry one `name`.
+fn acme_json_0_1_83(order_url: &str) -> String {
+    let account = account_url_for(DIRECTORY);
+    let staging_account = account_url_for(STAGING);
+    let fingerprint = "5d".repeat(32);
+    format!(
+        r#"{{
+  "schema_version": 1,
+  "accounts": {{
+    "{DIRECTORY}": {{
+      "account_url": "{account}",
+      "vault_key": "{account_key}",
+      "recorded_at": 1761000000
+    }},
+    "{STAGING}": {{
+      "account_url": "{staging_account}",
+      "vault_key": "{staging_key}",
+      "recorded_at": 1760990000
+    }}
+  }},
+  "order": {{
+    "directory_url": "{DIRECTORY}",
+    "account_url": "{account}",
+    "order_url": "{order_url}",
+    "name": "{NAME}",
+    "profile": null,
+    "replaces": false,
+    "kind": "check",
+    "started_at": 1761001000
+  }},
+  "pending_install": null,
+  "install_refused": null,
+  "rollback_pending": null,
+  "last_attempt": {{
+    "kind": "renew",
+    "directory_url": "{DIRECTORY}",
+    "started_at": 1761000500,
+    "finished_at": 1761000560,
+    "result": "installed",
+    "stage": null,
+    "detail": null,
+    "fingerprint": "{fingerprint}",
+    "trusted": null
+  }},
+  "last_test": {{
+    "kind": "test",
+    "directory_url": "{STAGING}",
+    "started_at": 1760990000,
+    "finished_at": 1760990050,
+    "result": "tested",
+    "stage": null,
+    "detail": "issued and checked; the root is not trusted, as expected of a staging CA",
+    "fingerprint": "{fingerprint}",
+    "trusted": false
+  }},
+  "last_check": {{
+    "at": 1761001000,
+    "decision": "idle until 2026-12-20T18:00:00Z: the leaf this account issued is not due"
+  }},
+  "issued": [
+    {{
+      "serial": "05a1b2",
+      "fingerprint": "{fingerprint}",
+      "authority_key_id": "142eb317b75856cbae500940e61faf9d8b14c2c6",
+      "not_before": 1761000000,
+      "not_after": 1768776000,
+      "name": "{NAME}",
+      "profile": "classic",
+      "directory_url": "{DIRECTORY}",
+      "account_url": "{account}",
+      "issued_at": 1761000540,
+      "stored": true,
+      "installed": true,
+      "installed_at": 1761000560
+    }}
+  ],
+  "backoff": {{
+    "failures": 0,
+    "next_attempt_at": null,
+    "rate_limited_until": null
+  }},
+  "renewal": {{
+    "fingerprint": "{fingerprint}",
+    "source": "ari",
+    "renew_at": 1766000000,
+    "window_start_at": 1765900000,
+    "window_end_at": 1766100000,
+    "explanation_url": null,
+    "next_ari_fetch_at": 1761022600
+  }},
+  "edge": {{
+    "node": "{EDGE}",
+    "not_configured": null,
+    "last_status": {{
+      "mode": "vault",
+      "tls_vault_key": "{EDGE_KEY}",
+      "state": "serving",
+      "reason": null,
+      "detail": null,
+      "leaf": {{
+        "fingerprint": "{fingerprint}",
+        "not_before": 1761000000,
+        "not_after": 1768776000,
+        "names": ["{NAME}"],
+        "issuer": "C=US, O=Let's Encrypt, CN=R13",
+        "chain_len": 2
+      }},
+      "loaded_at": 1761000560,
+      "changed": null,
+      "refused": null,
+      "vault_version": 3,
+      "vault_updated_at": "2026-10-21T18:02:40.123456Z"
+    }},
+    "last_answer_at": 1761001000,
+    "unreachable_since_at": null,
+    "last_error": null,
+    "config_error": null
+  }},
+  "conditions": {{}},
+  "unsent_closures": [],
+  "next_check_at": 1761022600
+}}"#,
+        account_key = account_vault_key(DIRECTORY),
+        staging_key = account_vault_key(STAGING),
+    )
+}
+
+/// A harness whose acme.json is the one 0.1.83 wrote, its account in the vault: a restart onto
+/// the new code.
+fn upgraded_from_0_1_83(config: AcmeConfig, order_url: &str) -> Harness {
+    let mut h = Harness::new(config);
+    h.mesh().put(
+        &account_vault_key(DIRECTORY),
+        json!({ "id": account_url_for(DIRECTORY) }),
+        json!({}),
+    );
+    fs::create_dir_all(h.state_path().parent().unwrap()).unwrap();
+    fs::write(h.state_path(), acme_json_0_1_83(order_url)).unwrap();
+    h.restart();
+    h
+}
+
+#[tokio::test]
+async fn an_acme_json_of_0_1_83_keeps_parsing_with_one_name_per_record() {
+    let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
+    let h = upgraded_from_0_1_83(AcmeConfig::On(settings()), &order_url);
+    assert!(
+        h.service.state_warning.is_none(),
+        "{:?}",
+        h.service.state_warning
+    );
+    let state = h.state();
+    assert_eq!(state.order.as_ref().unwrap().names, names(&[NAME]));
+    assert_eq!(state.issued[0].names, names(&[NAME]));
+    assert_eq!(state.renewal.as_ref().unwrap().source, "ari");
+    assert_eq!(state.accounts.len(), 2);
+    // The file was read in place, never set aside.
+    let siblings: Vec<String> = fs::read_dir(h.state_path().parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(siblings, vec!["acme.json".to_string()]);
+    // The order it records is the one name's: resumed, not placed again.
+    h.service.check_once().await;
+    assert_eq!(h.ca().log.resumed, vec![order_url]);
+    assert!(h.ca().log.new_orders.is_empty());
+    assert_eq!(h.state().last_attempt.unwrap().result, "installed");
+    // Written back with the names list.
+    let written: Value =
+        serde_json::from_str(&fs::read_to_string(h.state_path()).unwrap()).unwrap();
+    for record in written["issued"].as_array().unwrap() {
+        assert_eq!(record["names"], json!([NAME]));
+        assert!(record.get("name").is_none(), "{record}");
+    }
+}
+
+#[tokio::test]
+async fn a_recorded_one_name_order_is_not_resumed_for_two_names() {
+    let order_url = format!("{}/order/7", account_url_for(DIRECTORY));
+    let h = upgraded_from_0_1_83(AcmeConfig::On(settings_with_archi()), &order_url);
+    assert!(h.service.state_warning.is_none());
+    h.service.check_once().await;
+    assert!(h.ca().log.resumed.is_empty());
+    assert_eq!(h.ca().log.new_orders[0].0, names(&[NAME, ARCHI]));
+    assert_eq!(served_names(&h), names(&[NAME, ARCHI]));
+}
+
+// ---------------------------------------------------------------------------------------------
 // The decision table (§7)
 // ---------------------------------------------------------------------------------------------
 
@@ -1518,7 +2436,7 @@ fn issued_state(leaf: &LeafInfo, issued_at: i64) -> AcmeState {
         authority_key_id: leaf.authority_key_id.as_deref().map(hex::encode),
         not_before: leaf.not_before,
         not_after: leaf.not_after,
-        name: NAME.to_string(),
+        names: vec![NAME.to_string()],
         profile: None,
         directory_url: DIRECTORY.to_string(),
         account_url: account_url_for(DIRECTORY),
@@ -1558,7 +2476,8 @@ fn the_decision_table_rows() {
         decide(&view_awaiting("not_found"), &settings, &empty, None, now),
         Decision::Order {
             replaces: None,
-            reason: "the edge has no certificate: there is nothing to replace".to_string()
+            reason: "the edge has no certificate: there is nothing to replace".to_string(),
+            main_only: false,
         }
     );
     // awaiting, any other verdict: reload, never order.
@@ -1644,7 +2563,7 @@ fn the_decision_table_rows() {
     ));
     // A leaf this account issued for another name is not renewed automatically either.
     let mut renamed = settings.clone();
-    renamed.name = "hive-2.example.com".to_string();
+    renamed.names = vec!["hive-2.example.com".to_string()];
     assert!(matches!(
         decide(&view_serving(&leaf), &renamed, &ours, Some(now - 1), now),
         Decision::AlertOnly(_)
@@ -2016,7 +2935,7 @@ fn every_condition_kind_is_one_the_orchestrator_takes() {
     let (chain, _) = pki.seeded(&["other.example.org"], now - 80 * DAY, now + 10 * DAY);
     let leaf = leaf_of(&chain);
     let mut state = issued_state(&leaf, now - 80 * DAY);
-    state.issued[0].name = "other.example.org".to_string();
+    state.issued[0].names = vec!["other.example.org".to_string()];
     state.edge.node = Some(EDGE.to_string());
     state.edge.last_status = Some(view_awaiting("forbidden"));
     state.edge.unreachable_since_at = Some(now - 2 * HOUR);
@@ -2030,6 +2949,7 @@ fn every_condition_kind_is_one_the_orchestrator_takes() {
         detail: Some("invalid".to_string()),
         fingerprint: None,
         trusted: None,
+        failed_names: Vec::new(),
     });
     state.install_refused = Some(InstallRefused {
         fingerprint: "aa".repeat(32),
@@ -2306,12 +3226,12 @@ fn the_name_is_the_lowercase_host_of_the_public_base_url() {
 fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
     let url = Some("https://hive-1.example.com");
     assert!(matches!(
-        AcmeConfig::from_hive(None, url),
-        AcmeConfig::Absent { name: Some(ref name) } if name == NAME
+        AcmeConfig::from_hive(None, url, &[]),
+        AcmeConfig::Absent { ref names } if names == &[NAME.to_string()]
     ));
-    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url) {
+    match AcmeConfig::from_hive(Some(&yaml("terms_agreed: true")), url, &[]) {
         AcmeConfig::On(settings) => {
-            assert_eq!(settings.name, NAME);
+            assert_eq!(settings.names, vec![NAME.to_string()]);
             assert_eq!(settings.directory_url, LETS_ENCRYPT_DIRECTORY);
             assert_eq!(
                 settings.staging_directory_url,
@@ -2326,6 +3246,7 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
             "terms_agreed: true\ndirectory_url: https://acme.example.net/dir\nstaging_directory_url: https://acme-staging.example.net/dir\nprofile: classic\ncontact: mailto:ops@example.com",
         )),
         url,
+        &[],
     ) {
         AcmeConfig::On(settings) => {
             assert_eq!(settings.directory_url, "https://acme.example.net/dir");
@@ -2353,7 +3274,7 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
         ),
         ("[1, 2]", "not a mapping"),
     ] {
-        let reason = off_reason(&AcmeConfig::from_hive(Some(&yaml(section)), url));
+        let reason = off_reason(&AcmeConfig::from_hive(Some(&yaml(section)), url, &[]));
         assert!(reason.contains(why), "{section}: {reason}");
     }
     for (base, why) in [
@@ -2366,6 +3287,7 @@ fn the_acme_section_is_on_off_or_absent_and_never_fails_the_boot() {
         let reason = off_reason(&AcmeConfig::from_hive(
             Some(&yaml("terms_agreed: true")),
             base,
+            &[],
         ));
         assert!(reason.contains(why), "{base:?}: {reason}");
     }
@@ -2381,7 +3303,7 @@ fn a_trust_anchor_is_read_at_boot() {
         "terms_agreed: true\ntrust_anchor: {}",
         path.display()
     ));
-    match AcmeConfig::from_hive(Some(&section), Some("https://hive-1.example.com")) {
+    match AcmeConfig::from_hive(Some(&section), Some("https://hive-1.example.com"), &[]) {
         AcmeConfig::On(settings) => assert_eq!(settings.trust_anchor_roots.len(), 1),
         _ => panic!("expected on"),
     }
@@ -2393,7 +3315,8 @@ fn a_trust_anchor_is_read_at_boot() {
     ));
     assert!(off_reason(&AcmeConfig::from_hive(
         Some(&section),
-        Some("https://hive-1.example.com")
+        Some("https://hive-1.example.com"),
+        &[]
     ))
     .contains("holds no certificate"));
 }
@@ -2463,7 +3386,9 @@ async fn the_status_shows_the_configuration_the_edge_the_certificates_and_the_co
     );
     assert_eq!(status["edge"]["node"], EDGE);
     assert_eq!(status["edge"]["live"]["state"], "serving");
-    assert_eq!(status["edge"]["name_covered"], true);
+    assert_eq!(status["edge"]["names_covered"], true);
+    assert_eq!(status["edge"]["names_missing"], json!([]));
+    assert_eq!(status["config"]["names"], json!([NAME]));
     assert_eq!(status["edge"]["issued_by_this_account"], true);
     assert_eq!(status["last_attempt"]["result"], "installed");
     assert!(status["in_flight"].is_null());
