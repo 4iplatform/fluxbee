@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ live | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
+| **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ live | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
+| **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ replaced by 0.1.84 | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
 | **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ replaced by 0.1.83 | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
 | **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ replaced by 0.1.82 | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
 | **0.1.80** | 2026-10-17 | `58db83a` | motherbee + spokes (core) | ✅ replaced by 0.1.81 | snap `pre-batch-0-1-80` (all 4 VMs) · `apt install fluxbee=0.1.79` + core-update of the spokes |
@@ -92,6 +93,118 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.84 — The door ready for a second host: one certificate for two names, the edge serves by host, the door's own fixes, a worker's agent can publish (io-web-v2 §11.1; A-87, A-86, A-88, A-83, A-82, A-81)
+
+- **Date:** 2026-10-23 (ART) · **Previous version:** 0.1.83 · **Commit:** `5be9e7b`.
+- **Scope:**
+  - motherbee and the three spokes (core update);
+  - the motherbee's `hive.yaml` (`web: {archi: true}`);
+  - the edge's certificate (two names).
+- **Design:** [io-web-v2](../docs/io-web-v2.md) §11.1. One review for fit and one for security split
+  stage 1 in two: this release (the door) and 0.1.85 (the proxy and io.web).
+- **What changed:**
+  - **SY.admin:**
+    - `web: {archi: true}` declares the Archi host: `archi.` + the host of
+      `admin.public_base_url`, logged at boot;
+    - the ACME client takes a list of names:
+      - one order carries them all, and each authorization is armed, settled and cleared;
+      - coverage and chain checks run per name;
+      - 0.1.83's `acme.json` reads as a one-name list;
+      - the main name is ordered alone only when that loses nothing, or once the renewal is 48 h
+        overdue;
+    - `EDGE_WEB_ROUTES` goes to the edge every 60 s on its `tls` channel. It is admitted only from
+      `SY.admin@motherbee`: router lists, `PROTECTED_SYSTEM_ACTIONS` (31), the policy, both wasm
+      files;
+    - **A-81:** `publish_artifact`:
+      - asks the producer's hive to scan its blob folder;
+      - waits up to 30 s, outside the publication lock, for the file in the motherbee's `active/`;
+      - runs under a 110 s budget;
+      - releases what was curated on any curate error.
+  - **SY.edge:**
+    - **Routing by host:** one canonical host per request.
+      - A declared web host gets 404 on every path; so does an unknown host.
+      - The door's routes answer only the main name, an IP literal or no Host.
+      - Two Hosts get 400.
+      - The web routes are kept in `web_routes.json`, so a restart serves them at once.
+    - **A-87:** hyper's HTTP/1 builder, with a header-read timeout that starts before the first
+      byte. No protocol sniffing, no HTTP/2.
+    - **A-86:**
+      - every connection's stream is paced: 30 s of idle credit, then 1 KiB/s, with reads
+        charged only while a body is read;
+      - a 30 s body deadline;
+      - `TCP_NOTSENT_LOWAT` 16 KiB;
+      - per-IP caps: `edge.max_connections_per_ip` (256) and `edge.public_max_inflight_per_ip`
+        (8); 0 turns either off;
+      - the header buffer is capped at 64 KiB (431 beyond).
+    - **A-88:** one fixed error body per code; the detail goes only to the log.
+    - **A-83:** a response that cannot be built is a 500. Every response gets the security headers.
+    - **A-82:** only `SHA-256(key)` is stored or logged. `publications.json` is converted once at
+      start, and the conversion is reported.
+  - **SY.storage:** `turns.ctx`/`seq` and their index are dropped (step 2 of 2), behind a schema
+    check, and the step is logged.
+  - **lab/ops.py:** the edge-cert line lists the certificate's names.
+- **Deploy:**
+  - build of `5be9e7b` in 37 min; deploy in 266 s;
+  - snapshots `pre-door-0-1-84` on the 4 VMs (`pre-batch-0-1-81` was deleted);
+  - 0.1.84 on all 4 (core manifest `2e04bae5f1eeb8d4`); health clean;
+  - SY.admin's first web-route push found the edge restarting (`NODE_NOT_FOUND`). The next, 60 s
+    later, was ACKed.
+- **The transition** (approved by the operator; the four steps of io-web-v2 §11.1):
+  1. `web:` with `archi: true` added to the motherbee's `hive.yaml` (the copy before:
+     `/root/hive.yaml.bak-pre-0184-web`);
+  2. SY.admin restarted, logged the Archi host and asked ACME for both names;
+  3. `POST /acme/test`: both names issued and checked against Let's Encrypt staging;
+  4. `POST /acme/renew`: the new certificate was installed at 23:19 UTC: Let's Encrypt YE2, both
+     names, valid until 2027-01-21.
+- **Gate:**
+  - **The certificate:**
+    - from outside, both names verify against one certificate;
+    - `/acme/status` and `ops health` list both names, with no condition.
+  - **Hosts, from outside:**
+    - the main name: `/healthz` 200 with `nosniff`; `/e/<unknown>` 404 with a fixed body;
+    - the Archi host answers 404 on `/healthz`, `/e/` and `/public/`, including:
+      - `:443`, uppercase with a trailing dot, and `:8443`;
+      - SNI for the main name with Host for the Archi host;
+    - an unknown host: 404; the IP literal: 200; two Hosts: 400;
+    - after an edge restart, the route came back from disk (`web_hosts=1`), and the Archi host
+      still answered 404.
+  - **Connections:** a connection with one byte was closed after 30.2 s; an h2 preface, in 0.3 s.
+  - **Cloud through the door:** a relay (`list_tenants`) works.
+  - **A-81, with a mesh client instead of the model:**
+    - why no model: a tenant's agents read only their own tenant's AI key, and the test tenant had
+      none;
+    - setup: a test agent's identity on worker1 (`AI.gate0184@worker1`), its node stopped and its
+      ILK kept;
+    - the page was written into worker1's `active/`, and `publish_artifact` was sent 1 s later;
+    - result: `ok` after 12.8 s and 13.3 s (two runs), with no warning in SY.admin's log;
+    - from outside, the link served the page with the sandbox CSP, `nosniff` and `no-store`;
+    - after the unpublish, it answered 404.
+  - **A-82:** the edge logs `key_sha256`; no raw key is left in its state directory.
+  - **Storage:** the columns and their index are gone; SY.storage logged the step.
+  - **Health:** `failed=0` and `denials=0` on all 4 from the deploy through the gate.
+  - **Covered by tests only:**
+    - the per-IP caps, the pacing and the body deadline;
+    - a 500 with the security headers (A-83) and an `/e/` reply failure (A-88);
+    - the fallback to the main name alone.
+- **Cleanup:**
+  - the gate tenants, nodes and ILKs (purged by the teardown);
+  - the publications (unpublished);
+  - the gate blobs, gone from every hive within 90 s.
+- **Upgrading another hive:**
+  - the release needs nothing by hand;
+  - a motherbee that wants the Archi host:
+    1. needs `acme:` on, and DNS for `archi.<id>` must resolve first (HTTP-01 for that name);
+    2. then runs the four steps above.
+- **Rollback:**
+  - snapshot `pre-door-0-1-84`;
+  - or `apt install fluxbee=0.1.83` plus the core update of the spokes:
+    - 0.1.83 neither writes nor needs the dropped columns, and it ignores `web:`;
+    - 0.1.83's SY.admin cannot read the new `acme.json`. It sets the file aside and treats the
+      served certificate as hand-seeded until a `/acme/renew`;
+    - the edge's `publications.json` was converted to key hashes, which 0.1.83 cannot use. PROD
+      had no live publication;
+  - back to 0.1.82, also `ALTER TABLE turns ADD COLUMN ctx TEXT, ADD COLUMN seq BIGINT;`.
 
 ## 0.1.83 — Control-path hardening: the admin answers mesh callers by an allowlist, orchestrator actions get a direction, the router binds WAN senders, SSH on the DMZ hosts, only a vouched email identifies a person (A-62, A-20, A-22, A-42, A-46 stage 4, A-55, A-79)
 

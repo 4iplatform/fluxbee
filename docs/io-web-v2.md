@@ -1,8 +1,12 @@
 # io.web v2: the edge as reverse proxy, Archi through Cloud, artifacts
 
-**Status:** direction agreed with the operator on 2026-10-22 and 2026-10-23. Nothing implemented.
-The next step is to design the pieces from the outside in (§9) and review them with the operator
-before any code.
+**Status:**
+
+- The direction was agreed with the operator on 2026-10-22 and 2026-10-23.
+- Stage 1 is designed and reviewed (§11):
+  - release 0.1.84, the door ready for a second host, is validated on 8.x (2026-10-23; ledger
+    0.1.84);
+  - next is release 0.1.85, the proxy and io.web (§11.2).
 
 **What this document is.** The single place that records where this track stands, so the next
 iteration starts from here and not from the conversation. It supersedes:
@@ -300,6 +304,9 @@ PROD's `/e/` down.
 (71.182.182.80). The domain has no CAA record.
 
 ### 11.1 Release 0.1.84: the door ready for a second host
+
+**Validated on 8.x (2026-10-23).** A-81 ran without the model, through a mesh client carrying
+a test agent's identity. See the ledger's 0.1.84 entry.
 
 1. **The declaration.** The motherbee's `hive.yaml` gets `web: {archi: true}`.
    - It needs at least one key: a bare `web:` reads as absent.

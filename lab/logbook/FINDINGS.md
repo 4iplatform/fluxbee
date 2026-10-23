@@ -1078,15 +1078,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-88 🔴 OPEN (found 2026-10-23) — An `/e/` error hands internal detail to the internet
+### A-88 ✅ RESOLVED (0.1.84; covered by tests, the fixed bodies seen on 8.x) — An `/e/` error hands internal detail to the internet
 
+- **Fixed (0.1.84, `5be9e7b`):** one fixed body per error code; the detail goes only to the edge's
+  log. Seen on 8.x: an unknown `/e/` endpoint answers `NOT_FOUND` "no such endpoint". A failed
+  reply is covered by tests.
 - **What happens:** when the handler's reply fails, `/e/` answers with `err.to_string()`
   (src/bin/sy_edge.rs ~3717), which can carry a timeout's `trace_id` and the request's message
   family.
 - **Fix (io-web-v2 §11.1):** a fixed error body per code, the detail only in the edge's log.
 
-### A-87 🔴 OPEN (found 2026-10-23) — One byte holds an edge connection forever
+### A-87 ✅ VALIDATED ON 8.x (0.1.84, 2026-10-23) — One byte holds an edge connection forever
 
+- **Fixed (0.1.84, `5be9e7b`):** hyper's HTTP/1 builder with a header-read timeout that starts
+  before the first byte; no protocol sniffing, no HTTP/2. Validated from outside: a connection
+  that sent one byte was closed after 30.2 s, and an h2 preface in 0.3 s.
 - **What happens:** the edge serves every connection with hyper-util's `auto::Builder` and
   `serve_connection_with_upgrades` (src/bin/sy_edge.rs ~2734-2744), which sniffs for the HTTP/2
   preface. The sniff has no timeout after the first byte (hyper-util ignores `http1_only()`
@@ -1097,8 +1103,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the first byte; no protocol sniffing and no HTTP/2 (reachable today only by prior knowledge);
   tests for one byte and for an h2 preface.
 
-### A-86 🔴 OPEN (found 2026-10-22) — Stalled readers can block the edge's downloads
+### A-86 ✅ RESOLVED (0.1.84; covered by tests, the idle cut seen on 8.x) — Stalled readers can block the edge's downloads
 
+- **Fixed (0.1.84, `5be9e7b`):**
+  - every connection's stream is paced (30 s of idle credit, then 1 KiB/s), with a 30 s body
+    deadline and `TCP_NOTSENT_LOWAT` 16 KiB;
+  - per-IP caps: 256 connections (`edge.max_connections_per_ip`) and 8 downloads
+    (`edge.public_max_inflight_per_ip`);
+  - downloads keep their own 128 slots, apart from `/e/`'s.
+- **Validated:** the idle cut on 8.x (the A-87 test); the caps and the pacing by tests only.
 - **What happens:** `/public` streams with no write timeout, so 128 readers that stop reading hold
   every download slot (`PUBLIC_BUSY` for everyone), and every route shares one 4,096-connection cap.
 - **Fix:** a minimum rate, an idle deadline, a per-IP cap, and download slots kept apart from
@@ -1120,22 +1133,36 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** `O_NOFOLLOW` at each step, regular files only, a path under a root-only directory, and
   an extraction with caps that sets its own modes.
 
-### A-83 🔴 OPEN (found 2026-10-22) — The edge answers an empty 200 when it cannot build a response
+### A-83 ✅ RESOLVED (0.1.84; covered by tests) — The edge answers an empty 200 when it cannot build a response
 
+- **Fixed (0.1.84, `5be9e7b`):** a response that cannot be built is a 500, and a layer puts the
+  security headers on every response. 8.x never had to build one.
 - **What happens:** three places in src/bin/sy_edge.rs fall back to
   `Response::new(Body::empty())` when a response cannot be built (for example an invalid header
   value): a 200 with no body and no security headers.
 - **Fix:** answer 500 with the security headers.
 
-### A-82 🔴 OPEN (found 2026-10-22) — The edge logs capability keys
+### A-82 ✅ VALIDATED ON 8.x (0.1.84, 2026-10-23) — The edge logs capability keys
 
+- **Fixed (0.1.84, `5be9e7b`):** the edge stores and logs only `SHA-256(key)`; its
+  `publications.json` is converted once, and the conversion is reported. Validated: a publication
+  made in the gate was logged with `key_sha256`, its link was served, and no raw key was left in
+  the edge's state directory.
 - **What happens:** src/bin/sy_edge.rs logs `key = %row.key` when it publishes a public artifact
   and when it drops an expired one; those records leave the DMZ through the router stream, and the
   keys sit in plaintext on the edge's disk.
 - **Fix:** the edge stores and logs only `SHA-256(key)`.
 
-### A-81 🔴 OPEN (found 2026-10-22) — An agent on a worker cannot publish a page
+### A-81 ✅ VALIDATED ON 8.x (0.1.84, 2026-10-23) — An agent on a worker cannot publish a page
 
+- **Fixed (0.1.84, `5be9e7b`):** as below, with a 110 s budget for the whole call.
+- **Validated (the agent's path without the model):**
+  - a mesh client carried a test agent's identity on worker1;
+  - it wrote a page into worker1's `active/` and sent `publish_artifact` 1 s later;
+  - the answer was `ok` after 12.8 s and 13.3 s (two runs);
+  - the edge served the page from outside, and answered 404 after the unpublish.
+  - The model's own tool call was not run: the test tenant had no AI key, and a tenant's agents
+    read only their own.
 - **What happens:** ai.generic's `publish_html_page` promotes the blob on its worker and calls
   `publish_artifact` at once; IO.blob opens the motherbee's `active/` with no wait, before
   Syncthing has brought the file (~10 s), and answers `BLOB_NOT_FOUND`, which the model receives
