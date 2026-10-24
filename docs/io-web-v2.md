@@ -397,6 +397,7 @@ a test agent's identity. See the ledger's 0.1.84 entry.
 ### 11.2 Release 0.1.85: the proxy and io.web
 
 **Validated on 8.x (2026-10-24).** The review added two rules this section did not have:
+
 - a role-gated mesh server keeps no TLS sessions, so a resumed session never skips the registry;
 - core IO runtimes run only in the root tenant and under their canonical names.
 
