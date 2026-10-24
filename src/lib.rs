@@ -1,6 +1,5 @@
 pub mod config;
 pub mod mesh_hmac;
-pub mod mesh_tls;
 mod opa;
 pub mod paths;
 pub mod router;

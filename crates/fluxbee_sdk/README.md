@@ -334,6 +334,7 @@ router. The router keeps a short, best-effort log and delivers it in batches to 
 | Timer | `fluxbee_sdk::TimerClient` | SY.timer: `TimerClient::new_with_dispatcher(dispatcher, TimerClientConfig::default())`; see `examples/timer_client.rs` |
 | Logging | `fluxbee_sdk::logging::fmt()` | the `tracing` subscriber every binary uses: colour only on a terminal |
 | Prelude | `fluxbee_sdk::prelude::*` | common symbols. `RouteMatch`, `RouteTarget` and `RpcCommandReceiver` come from the crate root |
+| Mesh (feature `mesh-tls`) | `fluxbee_sdk::mesh` | the mesh TLS material (`MeshCa`, `MeshTlsMaterial`: the WAN's configs, the client that verifies io.web by name, the server that admits only some roles) and the motherbee's hive registry (`HiveRegistry`: `lists`, the strict `role`, `entries`, `until_not`); `IO_WEB_PORT`, `IO_WEB_SERVER_NAME`. Only a node that speaks mesh TLS enables it |
 
 IO nodes provision the ILK of whoever writes to them (`ILK_PROVISION` to SY.identity) through
 `nodes/io/common` (`provision_ilk_in_scope`); the SDK holds only the message names and types. The IO

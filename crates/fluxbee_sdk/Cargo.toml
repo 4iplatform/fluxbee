@@ -6,6 +6,12 @@ edition = "2021"
 [lints]
 workspace = true
 
+[features]
+# `fluxbee_sdk::mesh`: the mesh's own TLS (its CA, each hive's leaf, the WAN's and io.web's configs)
+# and the motherbee's hive registry. Only a node that speaks mesh TLS enables it; no other node
+# builds rustls or rcgen through the SDK.
+mesh-tls = ["dep:rustls", "dep:rcgen", "dep:rustls-pemfile", "dep:x509-parser"]
+
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -20,3 +26,13 @@ mime_guess = "2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 memmap2 = "0.9"
 nix = { version = "0.28", features = ["fs", "mman"] }
+# `mesh-tls` only. The versions and features the root workspace declares, so it builds one of each;
+# `ring` keeps aws-lc-rs out.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+x509-parser = { version = "0.18", optional = true }
+
+[dev-dependencies]
+# The `mesh` tests run real handshakes.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

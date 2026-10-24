@@ -26,6 +26,7 @@ use fluxbee_sdk::blob::{
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
 use fluxbee_sdk::identity::IdentityError;
+use fluxbee_sdk::mesh::{LeafBundle, MeshCa, HIVE_REGISTRY_DIR, MESH_TLS_DIR};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::AdminCommandRequest;
@@ -54,8 +55,6 @@ use json_router::{
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
-const MESH_TLS_BASE_DIR: &str = "/var/lib/fluxbee/tls";
-const MESH_CA_DIR: &str = "/var/lib/fluxbee/tls/ca";
 use json_router::router::system_policy::PRIMARY_HIVE_ID;
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
@@ -1187,13 +1186,12 @@ fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), Orchestrato
 
 /// Motherbee: ensure the dedicated mesh CA exists (load from disk, or generate +
 /// persist). The CA key is the root of WAN mTLS trust (kept 0600 under
-/// MESH_CA_DIR); it is NOT derived from the SSH key (isolation).
-fn ensure_mesh_ca() -> Result<json_router::mesh_tls::MeshCa, OrchestratorError> {
-    use json_router::mesh_tls::MeshCa;
+/// `<MESH_TLS_DIR>/ca`); it is NOT derived from the SSH key (isolation).
+fn ensure_mesh_ca() -> Result<MeshCa, OrchestratorError> {
     use std::os::unix::fs::OpenOptionsExt;
-    let dir = Path::new(MESH_CA_DIR);
-    fs::create_dir_all(dir)?;
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let dir = Path::new(MESH_TLS_DIR).join("ca");
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let ca_crt = dir.join("ca.crt");
     let ca_key = dir.join("ca.key");
     let load = || {
@@ -1237,16 +1235,13 @@ fn ensure_mesh_ca() -> Result<json_router::mesh_tls::MeshCa, OrchestratorError> 
 }
 
 /// Write a hive's TLS material (ca.crt + leaf cert/key) into the LOCAL
-/// `/var/lib/fluxbee/tls/<hive_id>/` — used for motherbee's own material so its
+/// `<MESH_TLS_DIR>/<hive_id>/` — used for motherbee's own material so its
 /// router can present a cert.
-fn write_local_hive_tls(
-    ca: &json_router::mesh_tls::MeshCa,
-    hive_id: &str,
-) -> Result<(), OrchestratorError> {
+fn write_local_hive_tls(ca: &MeshCa, hive_id: &str) -> Result<(), OrchestratorError> {
     let leaf = ca
         .issue_leaf(hive_id)
         .map_err(|e| format!("issue leaf: {e}"))?;
-    let dir = Path::new(MESH_TLS_BASE_DIR).join(hive_id);
+    let dir = Path::new(MESH_TLS_DIR).join(hive_id);
     fs::create_dir_all(&dir)?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     fs::write(dir.join("ca.crt"), ca.ca_cert_pem())?;
@@ -1323,7 +1318,7 @@ fn ensure_motherbee_ssh_key() {
 /// A spoke's mesh TLS material: the CA certificate and the spoke's leaf.
 struct HiveTlsMaterial {
     ca_cert_pem: String,
-    leaf: json_router::mesh_tls::LeafBundle,
+    leaf: LeafBundle,
 }
 
 /// add_hive: issue the leaf for `hive_id`. Every flow calls it before the join's first SSH
@@ -1350,7 +1345,7 @@ fn issue_hive_tls(hive_id: &str) -> Result<HiveTlsMaterial, serde_json::Value> {
     })
 }
 
-/// add_hive: push the mesh TLS material to the remote node's `/var/lib/fluxbee/tls/<hive_id>/`
+/// add_hive: push the mesh TLS material to the remote node's `<MESH_TLS_DIR>/<hive_id>/`
 /// over the join's SSH channel. Fatal: every spoke template requires mTLS, so a spoke without its
 /// leaf never reaches the mesh. A push lost to an SSH blip is retryable, so the key stays and the
 /// retry is key-first.
@@ -1379,7 +1374,7 @@ fn push_hive_tls_inner(
     hive_id: &str,
     tls: &HiveTlsMaterial,
 ) -> Result<(), OrchestratorError> {
-    let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
+    let dir = format!("{MESH_TLS_DIR}/{hive_id}");
     // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
     // which leaves the new file at the umask default (often world-readable) until
     // the chmod below. An owner-only directory blocks traversal in that window, so
@@ -27271,7 +27266,7 @@ fn parse_bool_str(raw: &str) -> Option<bool> {
 }
 
 fn hives_root() -> PathBuf {
-    json_router::paths::storage_root_dir().join("hives")
+    PathBuf::from(HIVE_REGISTRY_DIR)
 }
 
 fn run_cmd(mut cmd: Command, label: &str) -> Result<(), OrchestratorError> {

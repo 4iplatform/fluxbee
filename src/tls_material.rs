@@ -219,7 +219,7 @@ pub fn inspect(
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|err| MaterialError::BadKey(err.to_string()))?
         .ok_or(MaterialError::NoKey)?;
-    // rustls 0.23 needs a process crypto provider (mirrors src/mesh_tls.rs). Idempotent.
+    // rustls 0.23 needs a process crypto provider (mirrors fluxbee_sdk::mesh). Idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = rustls::crypto::ring::default_provider();
     let signing_key = provider

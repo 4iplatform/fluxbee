@@ -56,7 +56,7 @@ pub struct RouterConfig {
     /// WAN mTLS peer-auth mode: "disabled" | "permissive" | "required".
     pub wan_mtls_mode: String,
     /// Directory holding this hive's mesh TLS material (ca.crt, cert.crt,
-    /// cert.key) — `/var/lib/fluxbee/tls/<hive_id>`.
+    /// cert.key) — `<MESH_TLS_DIR>/<hive_id>`, `/var/lib/fluxbee/tls/<hive_id>`.
     pub tls_dir: PathBuf,
     pub hive_role: String,
     pub blob_enabled: bool,
@@ -252,7 +252,7 @@ impl RouterConfig {
             (uuid, shm_name)
         };
         let node_socket_path = node_socket_dir.join(format!("{}.sock", router_uuid.simple()));
-        let tls_dir = PathBuf::from("/var/lib/fluxbee/tls").join(&hive_id);
+        let tls_dir = PathBuf::from(fluxbee_sdk::mesh::MESH_TLS_DIR).join(&hive_id);
         Ok(Self {
             router_name,
             router_l2_name,

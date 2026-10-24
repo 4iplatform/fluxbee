@@ -40,7 +40,8 @@ nix = { version = "0.28", features = ["fs", "mman"] }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-fluxbee-sdk = { path = "crates/fluxbee_sdk" }
+# `mesh-tls`: the mesh TLS material and the hive registry (fluxbee_sdk::mesh).
+fluxbee-sdk = { path = "crates/fluxbee_sdk", features = ["mesh-tls"] }
 fluxbee-ai-sdk = { path = "crates/fluxbee_ai_sdk" }
 wasmtime = "19.0.0"
 regex = "1.10"
@@ -59,8 +60,9 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 aes-gcm = "0.10"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
-# WAN mTLS peer-auth (mesh CA + per-hive leaf certs). `ring` provider to keep
-# build deps light (no aws-lc-rs/cmake). See docs/history/onworking-coa/wan-mtls-peer-auth.md.
+# TLS for the router's WAN (its mesh material comes from fluxbee_sdk::mesh, which declares the
+# same versions and features) and the edge's public door. `ring` provider to keep build deps light
+# (no aws-lc-rs/cmake). See docs/history/onworking-coa/wan-mtls-peer-auth.md.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # The rcgen and x509-parser that instant-acme brings, so the workspace builds one of each.

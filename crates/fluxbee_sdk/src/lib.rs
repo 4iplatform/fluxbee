@@ -5,6 +5,8 @@ pub mod identity;
 pub mod logging;
 pub mod managed_control_plane;
 pub mod managed_node;
+#[cfg(feature = "mesh-tls")]
+pub mod mesh;
 pub mod node_client;
 pub mod node_config;
 pub mod node_secret;

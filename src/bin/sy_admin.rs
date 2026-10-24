@@ -32,6 +32,7 @@ use fluxbee_ai_sdk::{
     UsageWork,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
+use fluxbee_sdk::mesh::{is_valid_hive_id, HiveRegistry, HiveRole};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
     VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
@@ -658,8 +659,8 @@ async fn main() -> Result<(), AdminError> {
     }
     let acme_edge: acme::EdgeResolver = {
         let configured = public_edge_node.clone();
-        let hives_root = hives_registry_root_for(&state_dir);
-        Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &hives_root))
+        let registry = hive_registry_for(&state_dir);
+        Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &registry))
     };
     let web_routes = Arc::new(WebRoutes::new(web.hosts, Arc::clone(&acme_edge)));
     let acme_ca = Arc::new(acme::InstantAcmeCa::new(
@@ -707,7 +708,7 @@ async fn main() -> Result<(), AdminError> {
         acme: acme_service,
         connected_nodes: Arc::new(connected_nodes_from_shm),
     };
-    log_registry_caller_roles(&http_ctx.hive_id, &hives_registry_root(&http_ctx));
+    log_registry_caller_roles(&http_ctx.hive_id, &hive_registry(&http_ctx));
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
     let sweep_ctx = http_ctx.clone();
@@ -4533,65 +4534,50 @@ enum CallerHive {
     Egress,
 }
 
+impl From<HiveRole> for CallerHive {
+    fn from(role: HiveRole) -> Self {
+        match role {
+            HiveRole::Worker => CallerHive::Worker,
+            HiveRole::Ingress => CallerHive::Ingress,
+            HiveRole::Egress => CallerHive::Egress,
+        }
+    }
+}
+
 /// The role of `hive`, a mesh caller's hive. This admin's own hive is the motherbee; any other is
 /// what the hive registry records (`<hive>/info.yaml`, written by the orchestrator: the registry
-/// of A-48), once its join is done (`status: connected` and no join phase but `done`). Fails
-/// closed: no entry, no role, an entry for another hive, a join in flight or a removed hive is
-/// `None`, which the A-62 table admits to nothing.
-fn caller_hive_role(admin_hive: &str, registry_root: &Path, hive: &str) -> Option<CallerHive> {
+/// of A-48) in its strict reading (`HiveRegistry::role`): once its join is done (`status:
+/// connected` and no join phase but `done`). Fails closed: no entry, no role, an entry for
+/// another hive, a join in flight or a removed hive is `None`, which the A-62 table admits to
+/// nothing.
+fn caller_hive_role(admin_hive: &str, registry: &HiveRegistry, hive: &str) -> Option<CallerHive> {
     if hive == admin_hive {
         return Some(CallerHive::Motherbee);
     }
-    if !plain_hive_id(hive) {
-        return None;
-    }
-    let raw = fs::read_to_string(registry_root.join(hive).join("info.yaml")).ok()?;
-    let info = serde_yaml::from_str::<serde_json::Value>(&raw).ok()?;
-    let field = |key: &str| {
-        info.get(key)
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-    };
-    let join_done = info
-        .get("join")
-        .and_then(|join| join.get("phase"))
-        .is_none_or(|phase| phase.as_str() == Some("done"));
-    if field("hive_id") != Some(hive) || field("status") != Some("connected") || !join_done {
-        return None;
-    }
-    match field("role")?.to_ascii_lowercase().as_str() {
-        "worker" => Some(CallerHive::Worker),
-        "ingress" => Some(CallerHive::Ingress),
-        "egress" => Some(CallerHive::Egress),
-        _ => None,
-    }
+    registry.role(hive).map(CallerHive::from)
 }
 
 /// Each entry of the hive registry with the role the A-62 table gives its nodes
 /// (`caller_hive_role`), in name order.
 fn registry_caller_roles(
     admin_hive: &str,
-    registry_root: &Path,
+    registry: &HiveRegistry,
 ) -> Vec<(String, Option<CallerHive>)> {
-    let mut roles: Vec<(String, Option<CallerHive>)> = fs::read_dir(registry_root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .map(|hive| {
-            let role = caller_hive_role(admin_hive, registry_root, &hive);
-            (hive, role)
+    registry
+        .entries()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            let role = caller_hive_role(admin_hive, registry, entry.name());
+            (entry.name().to_string(), role)
         })
-        .collect();
-    roles.sort_by(|a, b| a.0.cmp(&b.0));
-    roles
+        .collect()
 }
 
 /// At start, the role each registered hive's nodes have over the mesh, so that a hive the table
 /// refuses for a reason of the registry (no role, a join not done) shows at once.
-fn log_registry_caller_roles(admin_hive: &str, registry_root: &Path) {
-    for (hive, role) in registry_caller_roles(admin_hive, registry_root) {
+fn log_registry_caller_roles(admin_hive: &str, registry: &HiveRegistry) {
+    for (hive, role) in registry_caller_roles(admin_hive, registry) {
         match role {
             Some(role) => {
                 tracing::info!(hive = %hive, role = ?role, "mesh caller role from the hive registry")
@@ -4602,16 +4588,6 @@ fn log_registry_caller_roles(admin_hive: &str, registry_root: &Path) {
             ),
         }
     }
-}
-
-/// A hive id as a join accepts one (1 to 64 of `[A-Za-z0-9_-]`): a directory of the registry,
-/// never a path.
-fn plain_hive_id(hive: &str) -> bool {
-    !hive.is_empty()
-        && hive.len() <= 64
-        && hive
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// `name` (the part of a node name before `@`) is a node of `family` (`AI`, `IO`, `WF`).
@@ -5103,7 +5079,7 @@ fn admit_mesh_caller(
         .rsplit_once('@')
         .map(|(_, hive)| hive)
         .unwrap_or_default();
-    let role = caller_hive_role(&ctx.hive_id, &hives_registry_root(ctx), hive);
+    let role = caller_hive_role(&ctx.hive_id, &hive_registry(ctx), hive);
     match authorize_mesh_caller(caller, role, action, target, params, &ctx.hive_id)
         .map_err(MeshRefusal::Unauthorized)?
     {
@@ -5502,44 +5478,38 @@ fn resolve_artifact_publisher(
     Ok((option.tenant_id, caller.to_string()))
 }
 
-/// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator.
-fn hives_registry_root(ctx: &AdminContext) -> PathBuf {
-    hives_registry_root_for(&ctx.state_dir)
+/// The hives this motherbee joined: one `<hive>/info.yaml` each, written by the orchestrator, in
+/// `hives/` beside the state directory (`HIVE_REGISTRY_DIR` on a motherbee).
+fn hive_registry(ctx: &AdminContext) -> HiveRegistry {
+    hive_registry_for(&ctx.state_dir)
 }
 
-fn hives_registry_root_for(state_dir: &Path) -> PathBuf {
-    state_dir.parent().unwrap_or(state_dir).join("hives")
+fn hive_registry_for(state_dir: &Path) -> HiveRegistry {
+    HiveRegistry::new(state_dir.parent().unwrap_or(state_dir).join("hives"))
 }
 
 /// Every hive a global write must reach: the motherbee plus each joined hive the registry calls
 /// `connected`, reachable right now or not. The LSA only says who is reachable now; a hive cut off
 /// keeps enforcing its last policy, so it has to show up as pending, not drop out of the report.
 fn opa_rollout_hives(ctx: &AdminContext) -> Vec<String> {
-    connected_hives_with(&ctx.hive_id, &hives_registry_root(ctx))
+    connected_hives_with(&ctx.hive_id, &hive_registry(ctx))
 }
 
-fn connected_hives_with(self_hive: &str, registry_root: &Path) -> Vec<String> {
+/// `self_hive` and every hive whose registry entry says `status: connected`, by the `hive_id` it
+/// records, whatever its join says.
+fn connected_hives_with(self_hive: &str, registry: &HiveRegistry) -> Vec<String> {
     let mut hives = vec![self_hive.to_string()];
-    if let Ok(entries) = fs::read_dir(registry_root) {
-        for entry in entries.flatten() {
-            let Ok(raw) = fs::read_to_string(entry.path().join("info.yaml")) else {
-                continue;
-            };
-            let Ok(info) = serde_yaml::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
-            if info.get("status").and_then(|value| value.as_str()) != Some("connected") {
-                continue;
-            }
-            if let Some(hive) = info
-                .get("hive_id")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|hive| !hive.is_empty())
-            {
-                if !hives.iter().any(|known| known == hive) {
-                    hives.push(hive.to_string());
-                }
+    for entry in registry.entries().unwrap_or_default() {
+        if entry.field("status") != Some("connected") {
+            continue;
+        }
+        if let Some(hive) = entry
+            .field("hive_id")
+            .map(str::trim)
+            .filter(|hive| !hive.is_empty())
+        {
+            if !hives.iter().any(|known| known == hive) {
+                hives.push(hive.to_string());
             }
         }
     }
@@ -5548,42 +5518,29 @@ fn connected_hives_with(self_hive: &str, registry_root: &Path) -> Vec<String> {
 }
 
 fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
-    resolve_public_edge_node_from(ctx.public_edge_node.as_deref(), &hives_registry_root(ctx))
+    resolve_public_edge_node_from(ctx.public_edge_node.as_deref(), &hive_registry(ctx))
 }
 
 /// `admin.public_edge_node`, else the one connected ingress in the hives registry.
 fn resolve_public_edge_node_from(
     configured: Option<&str>,
-    hives_root: &Path,
+    registry: &HiveRegistry,
 ) -> Result<String, String> {
     if let Some(edge) = configured {
         return validate_public_edge_node(edge).map(str::to_string);
     }
     let mut candidates = Vec::new();
-    let entries = fs::read_dir(hives_root).map_err(|err| {
+    let entries = registry.entries().map_err(|err| {
         format!(
             "cannot inspect ingress inventory '{}': {err}",
-            hives_root.display()
+            registry.root().display()
         )
     })?;
-    for entry in entries.flatten() {
-        let info_path = entry.path().join("info.yaml");
-        let Ok(raw) = fs::read_to_string(&info_path) else {
-            continue;
-        };
-        let Ok(info) = serde_yaml::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        if info.get("role").and_then(|value| value.as_str()) != Some("ingress")
-            || info.get("status").and_then(|value| value.as_str()) != Some("connected")
-        {
+    for entry in entries {
+        if entry.field("role") != Some("ingress") || entry.field("status") != Some("connected") {
             continue;
         }
-        let hive_id = info
-            .get("hive_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .trim();
+        let hive_id = entry.field("hive_id").unwrap_or_default().trim();
         if !hive_id.is_empty() {
             candidates.push(format!("SY.edge@{hive_id}"));
         }
@@ -16250,7 +16207,7 @@ impl TeardownNodeRequest {
                     && role
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-                    && plain_hive_id(hive)
+                    && is_valid_hive_id(hive)
             })
             .ok_or_else(|| format!("node_name must be <role>@<hive>, not '{node_name}'"))?;
         if role.starts_with("SY.") || role.starts_with("RT.") {
@@ -18721,7 +18678,8 @@ mod tests {
         fs::write(root.join(dir).join("info.yaml"), info).unwrap();
     }
 
-    /// A caller's hive role comes from the hive registry, and fails closed.
+    /// A caller's hive role: the motherbee for this admin's own hive, else the registry's strict
+    /// reading (`HiveRegistry::role`, whose cases the SDK tests), which fails closed.
     #[test]
     fn a_callers_hive_role_comes_from_the_registry() {
         let root = test_temp_dir("mesh-caller-hive");
@@ -18737,61 +18695,23 @@ mod tests {
             ),
             (
                 "egress1",
-                format!("hive_id: egress1\nstatus: connected\nrole: EGRESS\n{done}"),
-            ),
-            (
-                "old1",
-                "hive_id: old1\nstatus: connected\nrole: worker\n".to_string(),
+                format!("hive_id: egress1\nstatus: connected\nrole: egress\n{done}"),
             ),
             (
                 "joining1",
                 "hive_id: joining1\nstatus: joining\nrole: worker\njoin:\n  phase: accepted\n"
                     .to_string(),
             ),
-            (
-                "failed1",
-                "hive_id: failed1\nstatus: failed\nrole: worker\n".to_string(),
-            ),
-            (
-                "tail1",
-                "hive_id: tail1\nstatus: connected\nrole: ingress\njoin:\n  phase: harden_ssh\n"
-                    .to_string(),
-            ),
-            (
-                "norole1",
-                format!("hive_id: norole1\nstatus: connected\n{done}"),
-            ),
-            (
-                "mother1",
-                format!("hive_id: mother1\nstatus: connected\nrole: motherbee\n{done}"),
-            ),
-            (
-                "other1",
-                format!("hive_id: worker9\nstatus: connected\nrole: worker\n{done}"),
-            ),
-            ("garbled1", ": not yaml : [".to_string()),
         ] {
             write_registry_entry(&root, dir, &info);
         }
-        let role = |hive: &str| caller_hive_role(PRIMARY_HIVE_ID, &root, hive);
+        let registry = HiveRegistry::new(&root);
+        let role = |hive: &str| caller_hive_role(PRIMARY_HIVE_ID, &registry, hive);
         assert_eq!(role(PRIMARY_HIVE_ID), Some(CallerHive::Motherbee));
         assert_eq!(role("worker1"), Some(CallerHive::Worker));
-        assert_eq!(role("old1"), Some(CallerHive::Worker));
         assert_eq!(role("ingress1"), Some(CallerHive::Ingress));
         assert_eq!(role("egress1"), Some(CallerHive::Egress));
-        for hive in [
-            "joining1",
-            "failed1",
-            "tail1",
-            "norole1",
-            "mother1",
-            "other1",
-            "garbled1",
-            "gone1",
-            "../worker1",
-            "",
-            "worker1/..",
-        ] {
+        for hive in ["joining1", "gone1", "../worker1", ""] {
             assert_eq!(role(hive), None, "{hive}");
         }
     }
@@ -21163,7 +21083,7 @@ mod tests {
             fs::write(root.join(dir).join("info.yaml"), info).unwrap();
         }
         assert_eq!(
-            connected_hives_with("motherbee", &root),
+            connected_hives_with("motherbee", &HiveRegistry::new(&root)),
             vec![
                 "egress1".to_string(),
                 "motherbee".to_string(),
@@ -21178,7 +21098,7 @@ mod tests {
     #[tokio::test]
     async fn the_policy_hives_are_the_registry_hives() {
         let (ctx, _harness) = opa_test_admin("opa-policy-hives");
-        let registry = hives_registry_root(&ctx);
+        let registry = hive_registry(&ctx);
         for (dir, info) in [
             (
                 "worker1",
@@ -21189,8 +21109,7 @@ mod tests {
                 "hive_id: half\nrole: worker\nstatus: provisioning\n",
             ),
         ] {
-            fs::create_dir_all(registry.join(dir)).unwrap();
-            fs::write(registry.join(dir).join("info.yaml"), info).unwrap();
+            write_registry_entry(registry.root(), dir, info);
         }
         let expected = vec!["motherbee".to_string(), "worker1".to_string()];
         assert_eq!(opa_rollout_hives(&ctx), expected);
@@ -21207,7 +21126,7 @@ mod tests {
             json!(["motherbee", "worker1"])
         );
         assert_eq!(body["pending_hives_policy"], json!(["worker1"]));
-        let _ = fs::remove_dir_all(registry.parent().unwrap());
+        let _ = fs::remove_dir_all(registry.root().parent().unwrap());
     }
 
     /// One global policy, eventual convergence: the motherbee applied it, a hive still syncing is
@@ -23668,10 +23587,10 @@ mod tests {
     /// (an ingress), both joined.
     fn mesh_test_admin(prefix: &str) -> (AdminContext, fluxbee_sdk::RouterDispatcherTestHarness) {
         let (ctx, harness) = opa_test_admin(prefix);
-        let registry = hives_registry_root(&ctx);
+        let registry = hive_registry(&ctx);
         for (hive, role) in [("worker1", "worker"), ("ingress1", "ingress")] {
             write_registry_entry(
-                &registry,
+                registry.root(),
                 hive,
                 &format!(
                     "hive_id: {hive}\nstatus: connected\nrole: {role}\njoin:\n  phase: done\n"
@@ -24317,14 +24236,17 @@ mod tests {
         }
         fs::write(root.join("stray-file"), "not a hive").unwrap();
         assert_eq!(
-            registry_caller_roles(PRIMARY_HIVE_ID, &root),
+            registry_caller_roles(PRIMARY_HIVE_ID, &HiveRegistry::new(&root)),
             vec![
                 ("ingress1".to_string(), Some(CallerHive::Ingress)),
                 ("joining1".to_string(), None),
                 ("worker1".to_string(), Some(CallerHive::Worker)),
             ]
         );
-        assert!(registry_caller_roles(PRIMARY_HIVE_ID, &root.join("absent")).is_empty());
+        assert!(
+            registry_caller_roles(PRIMARY_HIVE_ID, &HiveRegistry::new(root.join("absent")))
+                .is_empty()
+        );
     }
 
     /// A step that fails makes the teardown TEARDOWN_INCOMPLETE with the same report; a secret not

@@ -1,9 +1,13 @@
-//! Mesh mTLS for the router WAN (peer authentication across the insecure WAN
-//! boundary). A motherbee-rooted **dedicated CA** issues per-hive leaf certs
-//! (CN + SAN = hive_id); the WAN handshake is mutual TLS verifying the peer cert
-//! is CA-signed, and the application binds the TLS identity (cert hive_id) to the
-//! hive_id claimed in the WAN HELLO. The CA key is NOT derived from the SSH key
-//! (isolation). See `docs/history/onworking-coa/wan-mtls-peer-auth.md`.
+//! Mesh mTLS: peer authentication between hives across the insecure WAN boundary. A
+//! motherbee-rooted **dedicated CA** issues per-hive leaf certs (CN + SAN = hive_id). Two uses:
+//! - **the router's WAN:** mutual TLS verifying the peer cert is CA-signed, and the application
+//!   binds the TLS identity (cert hive_id) to the hive_id claimed in the WAN HELLO
+//!   (`server_config`, `client_config`);
+//! - **io.web:** the edge verifies io.web's cert by name (`client_config_by_name`), and io.web
+//!   admits only a hive the registry gives an admitted role (`server_config_for_roles`).
+//!
+//! The CA key is NOT derived from the SSH key (isolation). See
+//! `docs/history/onworking-coa/wan-mtls-peer-auth.md`.
 
 use std::io::BufReader;
 use std::sync::Arc;
@@ -13,7 +17,14 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+use super::registry::{HiveRegistry, HiveRole};
+
+/// Where each hive keeps its material, `<dir>/<hive_id>/{ca.crt,cert.crt,cert.key}`, as add_hive
+/// distributes it (`MeshTlsMaterial::load_from_dir`). On the motherbee, `ca/` holds the CA.
+pub const MESH_TLS_DIR: &str = "/var/lib/fluxbee/tls";
 
 const CA_COMMON_NAME: &str = "fluxbee-mesh-ca";
 
@@ -137,7 +148,7 @@ impl MeshCa {
 
 /// A hive's loaded TLS material: its own leaf (to present) + the mesh CA roots
 /// (to verify peers). Built from PEM on disk; produces rustls server/client
-/// configs for the WAN transport.
+/// configs for the WAN transport and for io.web.
 pub struct MeshTlsMaterial {
     leaf_chain: Vec<CertificateDer<'static>>,
     leaf_key: PrivateKeyDer<'static>,
@@ -146,7 +157,7 @@ pub struct MeshTlsMaterial {
 
 impl MeshTlsMaterial {
     /// Load a hive's TLS material from a directory holding `ca.crt`, `cert.crt`,
-    /// and `cert.key` (what `add_hive` distributes to `/var/lib/fluxbee/tls/<hive>`).
+    /// and `cert.key` (what `add_hive` distributes to `<MESH_TLS_DIR>/<hive>`).
     pub fn load_from_dir(dir: &std::path::Path) -> Result<Self, MeshTlsError> {
         let ca = std::fs::read_to_string(dir.join("ca.crt"))?;
         let cert = std::fs::read_to_string(dir.join("cert.crt"))?;
@@ -185,6 +196,30 @@ impl MeshTlsMaterial {
         Ok(Arc::new(cfg))
     }
 
+    /// Server config for a mesh service only some hives may call (io.web admits the ingress):
+    /// present our leaf, and REQUIRE a client cert that chains to the mesh CA and whose hive
+    /// (`peer_hive_from_cert`) `registry` gives one of `roles`, read at each handshake with the
+    /// strict reading (`HiveRegistry::role`). Any other client fails inside the handshake, so the
+    /// service never sees its connection.
+    pub fn server_config_for_roles(
+        &self,
+        registry: HiveRegistry,
+        roles: &[HiveRole],
+    ) -> Result<Arc<ServerConfig>, MeshTlsError> {
+        let ca = rustls::server::WebPkiClientVerifier::builder(self.ca_roots.clone())
+            .build()
+            .map_err(|e| MeshTlsError::Verifier(e.to_string()))?;
+        let verifier = Arc::new(RoleClientVerifier {
+            ca,
+            registry,
+            roles: roles.to_vec(),
+        });
+        let cfg = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
+        Ok(Arc::new(cfg))
+    }
+
     /// Client config: present our leaf, verify the server cert chains to the
     /// mesh CA — but DO NOT check the server name (the WAN client doesn't know
     /// the uplink's hive_id ahead of the handshake). Identity is bound at the
@@ -199,6 +234,18 @@ impl MeshTlsMaterial {
         let cfg = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
+        Ok(Arc::new(cfg))
+    }
+
+    /// Client config for a mesh service at a known hive (the edge dialling io.web): present our
+    /// leaf, and verify the server cert with rustls' WebPki verifier over the mesh CA, its name
+    /// included. The caller connects with the server's hive id as the `ServerName`
+    /// (`IO_WEB_SERVER_NAME` for io.web), which a mesh leaf carries as its SAN; any other hive's
+    /// leaf fails the handshake.
+    pub fn client_config_by_name(&self) -> Result<Arc<ClientConfig>, MeshTlsError> {
+        let cfg = ClientConfig::builder()
+            .with_root_certificates(self.ca_roots.clone())
             .with_client_auth_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
         Ok(Arc::new(cfg))
     }
@@ -259,6 +306,70 @@ impl rustls::client::danger::ServerCertVerifier for CaOnlyServerVerifier {
     }
 }
 
+/// Server-side verifier of `server_config_for_roles`: the mesh CA's webpki client verifier
+/// first, then the client's hive must hold one of `roles` in the registry, read now. Its refusal
+/// is `ApplicationVerificationFailure`, which rustls sends as the fatal alert `access_denied`: in
+/// TLS a valid certificate that access control turned away.
+#[derive(Debug)]
+struct RoleClientVerifier {
+    ca: Arc<dyn ClientCertVerifier>,
+    registry: HiveRegistry,
+    roles: Vec<HiveRole>,
+}
+
+impl ClientCertVerifier for RoleClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.ca.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self.ca.verify_client_cert(end_entity, intermediates, now)?;
+        let hive = peer_hive_from_cert(end_entity);
+        let role = hive.as_deref().and_then(|hive| self.registry.role(hive));
+        if role.is_some_and(|role| self.roles.contains(&role)) {
+            return Ok(verified);
+        }
+        // The caller sees only rustls' error, so the hive and what the registry says are logged
+        // here.
+        tracing::warn!(
+            hive = hive.as_deref().unwrap_or_default(),
+            role = ?role,
+            admitted = ?self.roles,
+            "mesh client refused in the handshake: the hive registry gives its hive no admitted role"
+        );
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.ca.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.ca.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.ca.supported_verify_schemes()
+    }
+}
+
 /// Extract the hive_id from a peer's leaf cert: prefer the SAN DNS name, fall
 /// back to the CN. Used (server side) to verify the cryptographically
 /// authenticated identity matches the hive_id claimed in the WAN HELLO, so a
@@ -296,52 +407,84 @@ fn key_from_pem(pem: &str) -> Result<PrivateKeyDer<'static>, MeshTlsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::{test_registry, IO_WEB_SERVER_NAME};
+    use rustls::{AlertDescription, CertificateError};
 
     /// A mesh CA and a worker1 leaf made by the 0.1.82 code (rcgen 0.13), as a motherbee and a
     /// spoke hold them before their update.
-    const FIXTURE_CA_CRT: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/ca.crt");
-    const FIXTURE_CA_KEY: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/ca.key");
-    const FIXTURE_WORKER1_CRT: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/worker1.crt");
-    const FIXTURE_WORKER1_KEY: &str = include_str!("../tests/fixtures/mesh-ca-0.1.82/worker1.key");
+    const FIXTURE_CA_CRT: &str = include_str!("../../tests/fixtures/mesh-ca-0.1.82/ca.crt");
+    const FIXTURE_CA_KEY: &str = include_str!("../../tests/fixtures/mesh-ca-0.1.82/ca.key");
+    const FIXTURE_WORKER1_CRT: &str =
+        include_str!("../../tests/fixtures/mesh-ca-0.1.82/worker1.crt");
+    const FIXTURE_WORKER1_KEY: &str =
+        include_str!("../../tests/fixtures/mesh-ca-0.1.82/worker1.key");
 
-    /// One mutual-TLS handshake over the WAN configs, then a byte each way: (the hive the server
-    /// saw, the hive the client saw).
+    /// `hive`'s material: a leaf `ca` issues, with `ca`'s certificate as the roots.
+    fn material(ca: &MeshCa, hive: &str) -> MeshTlsMaterial {
+        let leaf = ca.issue_leaf(hive).unwrap();
+        MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap()
+    }
+
+    /// The rustls error a TLS stream's I/O error carries.
+    fn rustls_error(err: &std::io::Error) -> Option<&rustls::Error> {
+        err.get_ref()?.downcast_ref::<rustls::Error>()
+    }
+
+    /// The hive of the first certificate a peer presented.
+    fn peer_hive(certs: Option<&[CertificateDer<'_>]>) -> std::io::Result<String> {
+        certs
+            .and_then(|certs| certs.first())
+            .and_then(peer_hive_from_cert)
+            .ok_or_else(|| std::io::Error::other("the peer presented no hive"))
+    }
+
+    /// One handshake over `server` and `client`, the client naming the server `name`, then a byte
+    /// from the server: the hive each side saw in the other's certificate, or the error it ended
+    /// with. A refusal inside the handshake fails the server's accept, and the client's handshake
+    /// or its read of that byte.
+    async fn handshake(
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+        name: &'static str,
+    ) -> (std::io::Result<String>, std::io::Result<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut tls = TlsAcceptor::from(server).accept(server_io).await?;
+            let hive = peer_hive(tls.get_ref().1.peer_certificates())?;
+            tls.write_all(b"y").await?;
+            tls.flush().await?;
+            Ok::<_, std::io::Error>(hive)
+        });
+        let client = tokio::spawn(async move {
+            let name = rustls::pki_types::ServerName::try_from(name).unwrap();
+            let mut tls = TlsConnector::from(client).connect(name, client_io).await?;
+            let hive = peer_hive(tls.get_ref().1.peer_certificates())?;
+            let mut buf = [0u8; 1];
+            tls.read_exact(&mut buf).await?;
+            Ok::<_, std::io::Error>(hive)
+        });
+        (server.await.unwrap(), client.await.unwrap())
+    }
+
+    /// One mutual-TLS handshake over the WAN configs, then a byte: (the hive the server saw, the
+    /// hive the client saw).
     async fn mtls_round_trip(
         server: &MeshTlsMaterial,
         client: &MeshTlsMaterial,
     ) -> (String, String) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio_rustls::{TlsAcceptor, TlsConnector};
-        let acceptor = TlsAcceptor::from(server.server_config().unwrap());
-        let connector = TlsConnector::from(client.client_config().unwrap());
-        let (client_io, server_io) = tokio::io::duplex(8192);
-
-        let server = tokio::spawn(async move {
-            let mut tls = acceptor.accept(server_io).await.expect("server handshake");
-            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
-            let hive = peer_hive_from_cert(&certs[0]).unwrap();
-            // Post-handshake ping/pong over the encrypted channel keeps both
-            // streams alive through the full handshake and proves data flows.
-            let mut buf = [0u8; 1];
-            tls.read_exact(&mut buf).await.unwrap();
-            tls.write_all(b"y").await.unwrap();
-            hive
-        });
-        let client = tokio::spawn(async move {
-            // CA-only verifier ignores the server name; any valid DNS name works.
-            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
-            let mut tls = connector
-                .connect(name, client_io)
-                .await
-                .expect("client handshake");
-            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
-            let hive = peer_hive_from_cert(&certs[0]).unwrap();
-            tls.write_all(b"x").await.unwrap();
-            let mut buf = [0u8; 1];
-            tls.read_exact(&mut buf).await.unwrap();
-            hive
-        });
-        (server.await.unwrap(), client.await.unwrap())
+        // CA-only verifier ignores the server name; any valid DNS name works.
+        let (server_saw, client_saw) = handshake(
+            server.server_config().unwrap(),
+            client.client_config().unwrap(),
+            "mesh",
+        )
+        .await;
+        (
+            server_saw.expect("server handshake"),
+            client_saw.expect("client handshake"),
+        )
     }
 
     /// The update's gate: the updated motherbee reloads the CA the 0.1.82 code made and issues its
@@ -458,13 +601,8 @@ mod tests {
     async fn mtls_handshake_round_trips_and_exposes_peer_identity() {
         install_crypto_provider();
         let ca = MeshCa::generate().unwrap();
-        let mb = ca.issue_leaf("motherbee").unwrap();
-        let w1 = ca.issue_leaf("worker1").unwrap();
-        let server_mat =
-            MeshTlsMaterial::from_pem(&mb.cert_pem, &mb.key_pem, ca.ca_cert_pem()).unwrap();
-        let client_mat =
-            MeshTlsMaterial::from_pem(&w1.cert_pem, &w1.key_pem, ca.ca_cert_pem()).unwrap();
-        let (server_saw, client_saw) = mtls_round_trip(&server_mat, &client_mat).await;
+        let (server_saw, client_saw) =
+            mtls_round_trip(&material(&ca, "motherbee"), &material(&ca, "worker1")).await;
 
         // mutual auth succeeded; each side sees the OTHER's hive identity.
         assert_eq!(server_saw, "worker1", "server sees the client hive");
@@ -473,7 +611,6 @@ mod tests {
 
     #[tokio::test]
     async fn mtls_handshake_rejects_cert_from_a_foreign_ca() {
-        use tokio_rustls::{TlsAcceptor, TlsConnector};
         install_crypto_provider();
         let mesh_ca = MeshCa::generate().unwrap();
         let attacker_ca = MeshCa::generate().unwrap(); // different CA
@@ -485,20 +622,17 @@ mod tests {
         let client_mat =
             MeshTlsMaterial::from_pem(&forged.cert_pem, &forged.key_pem, mesh_ca.ca_cert_pem())
                 .unwrap();
-        let acceptor = TlsAcceptor::from(server_mat.server_config().unwrap());
-        let connector = TlsConnector::from(client_mat.client_config().unwrap());
-        let (client_io, server_io) = tokio::io::duplex(8192);
-        let server = tokio::spawn(async move { acceptor.accept(server_io).await.is_ok() });
-        let client = tokio::spawn(async move {
-            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
-            connector.connect(name, client_io).await.is_ok()
-        });
+        let (server_saw, _) = handshake(
+            server_mat.server_config().unwrap(),
+            client_mat.client_config().unwrap(),
+            "mesh",
+        )
+        .await;
         // The server must reject the attacker's foreign-CA client cert.
         assert!(
-            !server.await.unwrap(),
+            server_saw.is_err(),
             "foreign-CA client cert must be rejected"
         );
-        let _ = client.await;
     }
 
     #[test]
@@ -510,5 +644,133 @@ mod tests {
         assert_eq!(peer_hive_from_cert(&a[0]).as_deref(), Some("motherbee"));
         assert_eq!(peer_hive_from_cert(&b[0]).as_deref(), Some("worker7"));
         assert_ne!(a[0], b[0]);
+    }
+
+    /// The edge dials io.web by name: the motherbee's leaf passes under `motherbee`, and another
+    /// hive's leaf from the same CA fails the client's handshake on the name.
+    #[tokio::test]
+    async fn the_named_client_accepts_only_the_hive_it_names() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().unwrap();
+        let client = material(&ca, "ingress1").client_config_by_name().unwrap();
+
+        let motherbee = material(&ca, "motherbee").server_config().unwrap();
+        let (server_saw, client_saw) =
+            handshake(motherbee, Arc::clone(&client), IO_WEB_SERVER_NAME).await;
+        assert_eq!(
+            server_saw.expect("the server admits the client"),
+            "ingress1"
+        );
+        assert_eq!(client_saw.expect("the name matches"), "motherbee");
+
+        let worker1 = material(&ca, "worker1").server_config().unwrap();
+        let (_, client_saw) = handshake(worker1, client, IO_WEB_SERVER_NAME).await;
+        let err = client_saw.expect_err("worker1's leaf does not carry the name motherbee");
+        assert!(
+            matches!(
+                rustls_error(&err),
+                Some(rustls::Error::InvalidCertificate(
+                    CertificateError::NotValidForName
+                        | CertificateError::NotValidForNameContext { .. }
+                ))
+            ),
+            "{err}"
+        );
+    }
+
+    /// io.web admits a connected ingress, by the registry read at each handshake. A worker, a hive
+    /// not connected, a join not done and a hive the registry does not hold fail the server's
+    /// handshake on the registry (`access_denied`), and a certificate from another CA on its chain.
+    #[tokio::test]
+    async fn the_role_verifier_admits_only_a_hive_with_an_admitted_role() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().unwrap();
+        let registry = test_registry(&[
+            (
+                "ingress1",
+                "hive_id: ingress1\nstatus: connected\nrole: ingress\njoin:\n  phase: done\n",
+            ),
+            (
+                "worker1",
+                "hive_id: worker1\nstatus: connected\nrole: worker\njoin:\n  phase: done\n",
+            ),
+            (
+                "ingress2",
+                "hive_id: ingress2\nstatus: failed\nrole: ingress\n",
+            ),
+            (
+                "ingress3",
+                "hive_id: ingress3\nstatus: connected\nrole: ingress\njoin:\n  phase: harden_ssh\n",
+            ),
+        ]);
+        let server = material(&ca, "motherbee")
+            .server_config_for_roles(registry.clone(), &[HiveRole::Ingress])
+            .unwrap();
+        let dial = |hive: &str| material(&ca, hive).client_config_by_name().unwrap();
+
+        let (server_saw, client_saw) =
+            handshake(Arc::clone(&server), dial("ingress1"), IO_WEB_SERVER_NAME).await;
+        assert_eq!(server_saw.expect("a connected ingress"), "ingress1");
+        assert_eq!(client_saw.expect("served"), "motherbee");
+
+        for hive in ["worker1", "ingress2", "ingress3", "ingress9"] {
+            let (server_saw, client_saw) =
+                handshake(Arc::clone(&server), dial(hive), IO_WEB_SERVER_NAME).await;
+            let err = server_saw.expect_err(hive);
+            assert_eq!(
+                rustls_error(&err),
+                Some(&rustls::Error::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure
+                )),
+                "{hive}: {err}"
+            );
+            let err = client_saw.expect_err(hive);
+            assert_eq!(
+                rustls_error(&err),
+                Some(&rustls::Error::AlertReceived(
+                    AlertDescription::AccessDenied
+                )),
+                "{hive}: {err}"
+            );
+        }
+
+        // A leaf for ingress1 from another CA fails on its chain and never reaches the registry.
+        // Which chain error depends on the other CA's subject: this one, made by the same code,
+        // names our CA's subject, so the signature fails (BadSignature, not UnknownIssuer).
+        let forged = MeshCa::generate().unwrap().issue_leaf("ingress1").unwrap();
+        let forged =
+            MeshTlsMaterial::from_pem(&forged.cert_pem, &forged.key_pem, ca.ca_cert_pem()).unwrap();
+        let (server_saw, _) = handshake(
+            Arc::clone(&server),
+            forged.client_config_by_name().unwrap(),
+            IO_WEB_SERVER_NAME,
+        )
+        .await;
+        let err = server_saw.expect_err("another CA");
+        assert!(
+            matches!(
+                rustls_error(&err),
+                Some(rustls::Error::InvalidCertificate(reason))
+                    if *reason != CertificateError::ApplicationVerificationFailure
+            ),
+            "{err}"
+        );
+
+        // Read live: once the registry stops calling ingress1 an ingress, its next handshake fails.
+        std::fs::write(
+            registry.root().join("ingress1").join("info.yaml"),
+            "hive_id: ingress1\nstatus: connected\nrole: worker\njoin:\n  phase: done\n",
+        )
+        .unwrap();
+        let (server_saw, _) = handshake(server, dial("ingress1"), IO_WEB_SERVER_NAME).await;
+        let err = server_saw.expect_err("ingress1 is no longer an ingress");
+        assert_eq!(
+            rustls_error(&err),
+            Some(&rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure
+            )),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(registry.root());
     }
 }

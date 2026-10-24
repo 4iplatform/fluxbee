@@ -1,6 +1,6 @@
 //! Per-hive HMAC peer-auth for the SY.identity sync channel (TCP :9100). Unlike
 //! the router WAN (which crosses the insecure boundary and uses mTLS, see
-//! `mesh_tls`), identity sync is an internal channel, so it gets a lighter
+//! `fluxbee_sdk::mesh`), identity sync is an internal channel, so it gets a lighter
 //! symmetric mechanism: a per-hive shared key `K_hive` (the motherbee holds one
 //! per replica; each replica holds its own), dedicated (not derived from the
 //! mesh CA / SSH key) and distributed at `add_hive` over the authenticated SSH

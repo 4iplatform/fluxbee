@@ -10,6 +10,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
+use fluxbee_sdk::mesh::{is_valid_hive_id, HiveRegistry};
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
     MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND, VAULT_BOOTSTRAP_ACTION,
@@ -525,7 +526,7 @@ async fn handle_vault_message(
     // in vault and requires an authorized vault_get), and the same notice to the edge that owns
     // the secret, if one does (A-78).
     if let Some(payload) = outcome.broadcast {
-        let edges = edge_nodes(hive_id, &hive_registry_root());
+        let edges = edge_nodes(hive_id, &HiveRegistry::motherbee());
         match secret_changed_notices(
             sender.uuid(),
             msg.meta.dst_ilk.as_deref(),
@@ -574,27 +575,16 @@ struct EdgeNode {
     ilk: String,
 }
 
-/// SY.orchestrator's registry of the hives the motherbee joined, one directory per hive id
-/// (`hives_root` in src/bin/sy_orchestrator.rs). The router admits a WAN peer only while its hive
-/// is listed there (A-48).
-fn hive_registry_root() -> PathBuf {
-    json_router::paths::storage_root_dir().join("hives")
-}
-
-/// The edges a secret may belong to: `SY.edge@<hive>` on this hive and on every hive in the
-/// registry. The vault keeps a secret's owner as an ILK, and a system node's ILK is derived from
-/// its name (`deterministic_system_ilk_id`), so an owner is an edge when it is one of these ILKs.
-/// Read for each change, so a hive joined after the vault started counts.
-fn edge_nodes(own_hive: &str, registry_root: &Path) -> Vec<EdgeNode> {
+/// The edges a secret may belong to: `SY.edge@<hive>` on this hive and on every hive the hive
+/// registry lists (A-48, the loose reading: a directory with a valid hive id). The vault keeps a
+/// secret's owner as an ILK, and a system node's ILK is derived from its name
+/// (`deterministic_system_ilk_id`), so an owner is an edge when it is one of these ILKs. Read for
+/// each change, so a hive joined after the vault started counts.
+fn edge_nodes(own_hive: &str, registry: &HiveRegistry) -> Vec<EdgeNode> {
     let mut hives = vec![own_hive.to_string()];
-    if let Ok(entries) = fs::read_dir(registry_root) {
-        for entry in entries.flatten() {
-            let Ok(hive) = entry.file_name().into_string() else {
-                continue;
-            };
-            if json_router::mesh_hmac::is_valid_hive_id(&hive) && entry.path().is_dir() {
-                hives.push(hive);
-            }
+    for entry in registry.entries().unwrap_or_default() {
+        if is_valid_hive_id(entry.name()) {
+            hives.push(entry.name().to_string());
         }
     }
     hives.sort();
@@ -726,7 +716,7 @@ async fn emit_bootstrap_secret_broadcasts(
         tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
         return Ok(());
     }
-    let edges = edge_nodes(hive_id, &hive_registry_root());
+    let edges = edge_nodes(hive_id, &HiveRegistry::motherbee());
     let src_uuid = sender.uuid().to_string();
     let mut emitted = 0usize;
     let mut skipped = 0usize;
@@ -2799,20 +2789,20 @@ mod tests {
         }
     }
 
-    fn temp_hive_registry(hives: &[&str]) -> PathBuf {
+    fn temp_hive_registry(hives: &[&str]) -> HiveRegistry {
         let root =
             std::env::temp_dir().join(format!("fluxbee-vault-hives-{}", Uuid::new_v4().simple()));
         for hive in hives {
             fs::create_dir_all(root.join(hive)).expect("create hive dir");
         }
-        root
+        HiveRegistry::new(root)
     }
 
     #[test]
     fn the_edges_are_this_hives_and_the_joined_hives() {
         // A file and a name that is not a hive id are not hives; this hive counts once.
         let registry = temp_hive_registry(&["ingress1", "worker-2", "motherbee", "bad.name"]);
-        fs::write(registry.join("notes.txt"), "not a hive").expect("write file");
+        fs::write(registry.root().join("notes.txt"), "not a hive").expect("write file");
         let edges = edge_nodes("motherbee", &registry);
         let names: Vec<&str> = edges.iter().map(|edge| edge.name.as_str()).collect();
         assert_eq!(
@@ -2826,7 +2816,10 @@ mod tests {
             );
         }
         // No registry (a fresh motherbee): this hive's edge only.
-        let only_this_hive = edge_nodes("motherbee", &registry.join("missing"));
+        let only_this_hive = edge_nodes(
+            "motherbee",
+            &HiveRegistry::new(registry.root().join("missing")),
+        );
         assert_eq!(
             only_this_hive,
             vec![EdgeNode {
@@ -2834,7 +2827,7 @@ mod tests {
                 ilk: fluxbee_sdk::deterministic_system_ilk_id("SY.edge@motherbee"),
             }]
         );
-        cleanup(registry);
+        cleanup(registry.root().to_path_buf());
     }
 
     /// A-78: the notice about a secret an edge owns also goes to that edge, addressed to it, with
@@ -2951,7 +2944,7 @@ mod tests {
             assert_eq!(notices.len(), 1, "{:?} {:?}", other.ilk, other.owner_ilk);
             assert!(matches!(notices[0].routing.dst, Destination::Broadcast));
         }
-        cleanup(registry);
+        cleanup(registry.root().to_path_buf());
     }
 
     /// The handlers name the owner of every change as the read rules see it, so a put, rotate,
@@ -3048,7 +3041,7 @@ mod tests {
             .expect("delete");
             assert!(to_the_edge(out), "{field}: delete");
         }
-        cleanup(registry);
+        cleanup(registry.root().to_path_buf());
         cleanup(dir);
     }
 

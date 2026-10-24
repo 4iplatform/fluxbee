@@ -5313,7 +5313,7 @@ mod tests {
     /// erroring instead, this fails and the marker gate can be reconsidered.
     #[test]
     fn rustls_silently_drops_the_intermediate_of_a_glued_chain() {
-        let ca = json_router::mesh_tls::MeshCa::generate().expect("ca");
+        let ca = fluxbee_sdk::mesh::MeshCa::generate().expect("ca");
         let leaf = ca.issue_leaf("edge-test").expect("leaf");
 
         let clean = format!("{}{}", leaf.cert_pem, ca.ca_cert_pem());

@@ -9,8 +9,9 @@ what passes through it (the log plane) for SY.storage and SY.cognition.
 
 Source: `src/main.rs`, `src/router/mod.rs` (routing, WAN, IRP), `src/router/stream.rs` (the
 stream), `src/router/system_policy.rs` and `policy/system.rego` (system authority),
-`src/opa.rs` (policy evaluation), `src/config/mod.rs` (settings), `src/mesh_tls.rs` (WAN mTLS),
-`src/shm/mod.rs` (shared memory).
+`src/opa.rs` (policy evaluation), `src/config/mod.rs` (settings), `src/shm/mod.rs` (shared
+memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive registry, feature
+`mesh-tls`).
 
 | | |
 | --- | --- |
@@ -69,9 +70,9 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
 - `wan.mtls`: `disabled` (also when missing or unknown), `permissive` or `required`. With
   `required` the server demands a client certificate signed by the mesh CA, the peer's hive is
   taken from its certificate, and a `HELLO` that claims another hive is dropped
-  (`src/mesh_tls.rs`). With `required` and no TLS material on disk the router logs
-  `WAN FAIL-CLOSED` and rejects every peer; `permissive` falls back to plaintext with a warning.
-  TLS files are `/var/lib/fluxbee/tls/<hive_id>/` (`tls_dir`).
+  (`crates/fluxbee_sdk/src/mesh/tls.rs`). With `required` and no TLS material on disk the router
+  logs `WAN FAIL-CLOSED` and rejects every peer; `permissive` falls back to plaintext with a
+  warning. TLS files are `/var/lib/fluxbee/tls/<hive_id>/` (`tls_dir`).
 - The WAN `HELLO` carries the protocol version `fluxbee/1.16` (`MESH_PROTOCOL_VERSION`); a
   mismatch is only logged, never rejected (comment on the constant in
   `crates/fluxbee_sdk/src/protocol.rs`).
@@ -82,7 +83,8 @@ stream), `src/router/system_policy.rs` and `policy/system.rego` (system authorit
   `HIVE_NOT_REGISTERED` and the log line `wan peer rejected: hive not registered`. An admitted
   session looks again every 10 s and closes when the directory is gone
   (`wan peer session closed: hive no longer registered`), so the link of a removed hive ends by
-  itself (`wan_peer_admission`, `hive_unregistered`). Both lines carry
+  itself (`wan_peer_admission`, `hive_unregistered`; the registry's loose reading,
+  `HiveRegistry::lists` in `crates/fluxbee_sdk/src/mesh/registry.rs`). Both lines carry
   `reason=HIVE_NOT_REGISTERED`. The registry is the only list. Spokes keep none and listen on no
   WAN port; a spoke that is rejected logs the reason (`wan uplink error`) and backs off like any
   failed attempt.

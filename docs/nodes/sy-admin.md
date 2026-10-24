@@ -144,7 +144,8 @@ caller and the action; a command with no stamped caller is refused too.
   list is closed to the whole mesh, Archi included, and the unit test
   `every_action_has_a_mesh_decision` fails until it is listed.
 - **A hive's role comes from the hive registry**, `/var/lib/fluxbee/hives/<hive>/info.yaml`
-  (`caller_hive_role`): `status: connected`, its join done, and `role` worker, ingress or egress.
+  (`caller_hive_role`, over the SDK's strict reading `HiveRegistry::role`): `status: connected`,
+  its join done, and `role` worker, ingress or egress.
   It fails closed: no entry, no role, a hive still joining or a removed one gets nothing. The
   local hive is the motherbee. At start SY.admin logs the role of each registered hive, and a
   warning for each one that gets none (`log_registry_caller_roles`).

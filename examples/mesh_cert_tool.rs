@@ -1,4 +1,4 @@
-//! Mesh TLS cert tool (dev/ops + lab validation). Uses the real `mesh_tls` code.
+//! Mesh TLS cert tool (dev/ops + lab validation). Uses the real `fluxbee_sdk::mesh` code.
 //!
 //!   mesh_cert_tool gen-ca <ca_dir>
 //!       Generate a dedicated mesh CA into <ca_dir>/{ca.crt,ca.key}.
@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use json_router::mesh_tls::MeshCa;
+use fluxbee_sdk::mesh::MeshCa;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

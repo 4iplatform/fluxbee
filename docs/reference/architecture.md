@@ -360,9 +360,10 @@ is retried after 5 s doubling up to 60 s (`wan_connect_loop`, `UplinkRetry`). Th
 
 The motherbee's orchestrator keeps a dedicated mesh CA in `/var/lib/fluxbee/tls/ca/`
 (`ensure_mesh_ca`) and signs one leaf per hive, with CN and SAN set to the `hive_id`
-(`MeshCa::issue_leaf` in `src/mesh_tls.rs`). Each hive reads `ca.crt`, `cert.crt` and `cert.key` from
-`/var/lib/fluxbee/tls/<hive_id>/` (`MeshTlsMaterial::load_from_dir`). `add_hive` puts them there
-(`push_hive_tls_inner`); a hive that loses its leaf is joined again.
+(`MeshCa::issue_leaf` in `crates/fluxbee_sdk/src/mesh/tls.rs`). Each hive reads `ca.crt`,
+`cert.crt` and `cert.key` from `/var/lib/fluxbee/tls/<hive_id>/`
+(`MeshTlsMaterial::load_from_dir`). `add_hive` puts them there (`push_hive_tls_inner`); a hive that
+loses its leaf is joined again.
 
 The handshake (`handle_wan_connection`): under TLS, each side first checks that the other's
 certificate chains to the mesh CA. Both sides send `HELLO` (`protocol`, `router_id`, `router_name`,

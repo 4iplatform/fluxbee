@@ -27,6 +27,9 @@ use crate::shm::{
     HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
     OPA_STATUS_LOADING, OPA_STATUS_OK,
 };
+use fluxbee_sdk::mesh::{
+    install_crypto_provider, peer_hive_from_cert, HiveRegistry, MeshTlsMaterial,
+};
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reachability, build_wan_reject, Destination,
@@ -416,13 +419,13 @@ impl Router {
             //   only bites on a genuine misconfig/attack.)
             // - permissive -> degrade to plaintext (the lenient rollout mode).
             let (wan_tls, effective_mtls_mode) = if self.cfg.wan_mtls_mode != "disabled" {
-                crate::mesh_tls::install_crypto_provider();
+                install_crypto_provider();
                 let degraded = if self.cfg.wan_mtls_mode == "required" {
                     "required".to_string() // fail-closed: no plaintext fallback
                 } else {
                     "disabled".to_string()
                 };
-                match crate::mesh_tls::MeshTlsMaterial::load_from_dir(&self.cfg.tls_dir) {
+                match MeshTlsMaterial::load_from_dir(&self.cfg.tls_dir) {
                     Ok(mat) => match (mat.server_config(), mat.client_config()) {
                         (Ok(sc), Ok(cc)) => (
                             Some(WanTls {
@@ -469,6 +472,7 @@ impl Router {
                 hello_interval_ms: self.cfg.hello_interval_ms,
                 dead_interval_ms: self.cfg.dead_interval_ms,
                 hive_registry: (self.cfg.hive_role == "motherbee").then(HiveRegistry::motherbee),
+                hive_registry_recheck: HIVE_REGISTRY_RECHECK,
                 nodes: Arc::clone(&self.nodes),
                 peer_nodes: Arc::clone(&self.peer_nodes),
                 peer_routers: Arc::clone(&self.peer_routers),
@@ -2830,7 +2834,7 @@ async fn tls_accept(
         .1
         .peer_certificates()
         .and_then(|c| c.first())
-        .and_then(crate::mesh_tls::peer_hive_from_cert);
+        .and_then(peer_hive_from_cert);
     // A CA-signed cert with no extractable hive_id can't be bound to the HELLO,
     // so it is not trustable as a peer identity — reject (defense-in-depth; mesh
     // leaves always carry CN+SAN, so this never fires for a legit peer).
@@ -2870,7 +2874,7 @@ async fn connect_wan_connection(
         .1
         .peer_certificates()
         .and_then(|c| c.first())
-        .and_then(crate::mesh_tls::peer_hive_from_cert);
+        .and_then(peer_hive_from_cert);
     if hive.is_none() {
         return Err(RouterError::Startup(
             "wan server certificate has no extractable hive_id".to_string(),
@@ -2965,32 +2969,9 @@ const HIVE_REGISTRY_RECHECK: Duration = Duration::from_secs(10);
 /// How long a rejected peer's link stays open for the reject to be written.
 const WAN_REJECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The hives the motherbee joined (A-48): SY.orchestrator creates `<root>/<hive_id>/` when it
-/// accepts a join and remove_hive deletes it after the hive's REMOVE_HIVE_CLEANUP. The motherbee
-/// admits a WAN peer only while its hive is listed here; no other hive keeps a registry.
-struct HiveRegistry {
-    root: PathBuf,
-    recheck_every: Duration,
-}
-
-impl HiveRegistry {
-    /// `/var/lib/fluxbee/hives`, SY.orchestrator's `hives_root`.
-    fn motherbee() -> Self {
-        Self {
-            root: crate::paths::storage_root_dir().join("hives"),
-            recheck_every: HIVE_REGISTRY_RECHECK,
-        }
-    }
-
-    fn lists(&self, hive_id: &str) -> bool {
-        // The hive id comes from the peer: one that is not a plain name (`..`, `/etc`) would look
-        // outside the registry.
-        crate::mesh_hmac::is_valid_hive_id(hive_id) && self.root.join(hive_id).is_dir()
-    }
-}
-
-/// Whether a peer hive may hold a WAN session here: with a registry, only a listed one; the
-/// `WAN_REJECT` reason otherwise.
+/// Whether a peer hive may hold a WAN session here: with a registry (the motherbee's, A-48), only a
+/// hive it lists, a join in flight included, since the join needs the link; the `WAN_REJECT`
+/// reason otherwise. No other hive keeps a registry.
 fn wan_peer_admission(registry: Option<&HiveRegistry>, hive_id: &str) -> Result<(), &'static str> {
     match registry {
         Some(registry) if !registry.lists(hive_id) => Err(WAN_REJECT_HIVE_NOT_REGISTERED),
@@ -2998,19 +2979,16 @@ fn wan_peer_admission(registry: Option<&HiveRegistry>, hive_id: &str) -> Result<
     }
 }
 
-/// Completes once the registry stops listing `hive_id`, checked every `recheck_every`. Without a
-/// registry it never completes.
-async fn hive_unregistered(registry: Option<&HiveRegistry>, hive_id: &str) {
-    let Some(registry) = registry else {
-        return std::future::pending().await;
-    };
-    let period = registry.recheck_every;
-    let mut ticker = time::interval_at(time::Instant::now() + period, period);
-    loop {
-        ticker.tick().await;
-        if !registry.lists(hive_id) {
-            return;
+/// Completes once the registry stops listing `hive_id`, checked every `period`. Without a registry
+/// it never completes.
+async fn hive_unregistered(registry: Option<&HiveRegistry>, hive_id: &str, period: Duration) {
+    match registry {
+        Some(registry) => {
+            registry
+                .until_not(hive_id, period, HiveRegistry::lists)
+                .await
         }
+        None => std::future::pending().await,
     }
 }
 
@@ -3200,7 +3178,7 @@ where
     let _ = broadcast_lsa(&ctx, Some(&peer_hello.hive_id)).await;
 
     // A hive removed while its link is up is cut off within one registry recheck.
-    let unregistered = hive_unregistered(registry, &peer_hello.hive_id);
+    let unregistered = hive_unregistered(registry, &peer_hello.hive_id, ctx.hive_registry_recheck);
     tokio::pin!(unregistered);
     loop {
         let frame = tokio::select! {
@@ -4941,8 +4919,11 @@ struct WanContext {
     identity_frontdesk_node_name: String,
     hello_interval_ms: u64,
     dead_interval_ms: u64,
-    /// The hive registry the motherbee admits WAN peers against; `None` on every other hive.
+    /// The hive registry the motherbee admits WAN peers against (A-48, its loose reading:
+    /// `HiveRegistry::lists`); `None` on every other hive.
     hive_registry: Option<HiveRegistry>,
+    /// How often an admitted peer's session checks that its hive is still listed.
+    hive_registry_recheck: Duration,
     nodes: Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     peer_routers: Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
@@ -10886,17 +10867,17 @@ mod tests {
         cleanup(&shm_name);
     }
 
-    /// A hive registry in a temporary directory, listing `hives`, rechecked every 20 ms.
+    /// How often a test's WAN session rechecks the registry.
+    const TEST_REGISTRY_RECHECK: Duration = Duration::from_millis(20);
+
+    /// A hive registry in a temporary directory, listing `hives`.
     fn test_hive_registry(hives: &[&str]) -> HiveRegistry {
         let root = std::env::temp_dir().join(format!("fluxbee-hives-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create registry");
         for hive in hives {
             fs::create_dir(root.join(hive)).expect("create registry entry");
         }
-        HiveRegistry {
-            root,
-            recheck_every: Duration::from_millis(20),
-        }
+        HiveRegistry::new(root)
     }
 
     /// The motherbee gateway's WAN context, with no nodes, peers or TLS.
@@ -10914,6 +10895,7 @@ mod tests {
             hello_interval_ms: 10_000,
             dead_interval_ms: 40_000,
             hive_registry,
+            hive_registry_recheck: TEST_REGISTRY_RECHECK,
             nodes: Arc::new(Mutex::new(HashMap::new())),
             peer_nodes: Arc::new(Mutex::new(HashMap::new())),
             peer_routers: Arc::new(Mutex::new(HashMap::new())),
@@ -11036,13 +11018,13 @@ mod tests {
         }
         // Another hive keeps no registry and checks nothing.
         assert_eq!(wan_peer_admission(None, "worker2"), Ok(()));
-        let _ = fs::remove_dir_all(&registry.root);
+        let _ = fs::remove_dir_all(registry.root());
     }
 
     #[tokio::test]
     async fn the_registry_recheck_completes_once_the_hive_is_removed() {
         let registry = test_hive_registry(&["worker1"]);
-        let unregistered = hive_unregistered(Some(&registry), "worker1");
+        let unregistered = hive_unregistered(Some(&registry), "worker1", TEST_REGISTRY_RECHECK);
         tokio::pin!(unregistered);
         assert!(
             time::timeout(Duration::from_millis(100), &mut unregistered)
@@ -11050,17 +11032,17 @@ mod tests {
                 .is_err(),
             "the hive is still registered"
         );
-        fs::remove_dir_all(registry.root.join("worker1")).expect("remove registry entry");
+        fs::remove_dir_all(registry.root().join("worker1")).expect("remove registry entry");
         time::timeout(Duration::from_secs(2), &mut unregistered)
             .await
             .expect("the recheck notices the removal");
         // Without a registry there is nothing to recheck.
         let never = time::timeout(
             Duration::from_millis(100),
-            hive_unregistered(None, "worker1"),
+            hive_unregistered(None, "worker1", TEST_REGISTRY_RECHECK),
         );
         assert!(never.await.is_err());
-        let _ = fs::remove_dir_all(&registry.root);
+        let _ = fs::remove_dir_all(registry.root());
     }
 
     #[tokio::test]
@@ -11088,7 +11070,7 @@ mod tests {
             .expect("session result");
         assert!(ctx.wan_peers.lock().await.is_empty());
         if let Some(registry) = ctx.hive_registry.as_ref() {
-            let _ = fs::remove_dir_all(&registry.root);
+            let _ = fs::remove_dir_all(registry.root());
         }
     }
 
@@ -11110,7 +11092,12 @@ mod tests {
         );
         assert!(ctx.wan_peers.lock().await.contains_key("worker1"));
 
-        let registry_root = ctx.hive_registry.as_ref().expect("registry").root.clone();
+        let registry_root = ctx
+            .hive_registry
+            .as_ref()
+            .expect("registry")
+            .root()
+            .to_path_buf();
         fs::remove_dir_all(registry_root.join("worker1")).expect("remove registry entry");
         time::timeout(Duration::from_secs(2), session)
             .await
