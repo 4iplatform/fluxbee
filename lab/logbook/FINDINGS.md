@@ -1078,6 +1078,75 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-92 ✅ VALIDATED ON 8.x (0.1.85, 2026-10-24) — What the 0.1.85 review found and the release fixed
+
+Found by the code review round of [io-web-v2](../../docs/io-web-v2.md) §11.2 (security,
+operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were seen on 8.x.
+
+- **TLS resumption skipped io.web's role check:**
+  - **The problem:** on a resumed TLS 1.3 session, rustls restores the client chain without
+    calling the verifier. A hive removed from the registry, or demoted, stayed admitted through
+    the edge's tickets.
+  - **Fixed:** the SDK's role-gated server config keeps no sessions and issues no tickets; the
+    named client config never resumes; io.web checks the role again right after the handshake.
+  - **Tested:** the test failed on the old code. *Live:* every probe got a full handshake, and
+    worker1 and egress1 were refused.
+- **A tenant's io.web could take the web door:**
+  - **The problem:** the orchestrator admitted a core IO runtime in any tenant and under any
+    `IO.*` name, so a tenant (through Cloud's `provision_node`) could bind 9200 first.
+  - **Fixed:** core IO runtimes run only in the root tenant (`TENANT_ROOT_REQUIRED`) and only as
+    `IO.<x>@motherbee` (`CORE_IO_NAME_MISMATCH`); io.web refuses to run under any other name or
+    tenant.
+  - *Live:* three attempts got `CORE_IO_NAME_MISMATCH`.
+- **`web_status` could not see the edge's upstream:** a missing upstream only reached the edge's
+  log. The `EDGE_WEB_ROUTES` answer now carries it, shown as `routes.upstream` and as `upstream=`
+  in the ops line (*live*: `upstream=ready`).
+- **Port 9200 and the edge's direct path to the motherbee were undocumented:** added to the port
+  tables, the exposure section and the firewall alert.
+- **One WARN line per failed proxied request:** now aggregated per interval. *Live:* one line,
+  `failed=1`, with the request id of the 502 before io.web started.
+
+### A-91 🔵 TO EVALUATE (found 2026-10-24) — io.blob and io.cloud boot UNCONFIGURED while they work; io.web boots CONFIGURED
+
+- **What happens:**
+  - The SDK's boilerplate rule reads a seed-only `config.json` as UNCONFIGURED. So io.blob and
+    io.cloud answer CONFIG_GET with `node_not_configured`, while they curate and relay with their
+    defaults, and their status reads HEALTHY.
+  - io.web (0.1.85) applies its contract to `{}` at boot and runs CONFIGURED.
+- **To decide** with the IO family's review: whether the siblings should materialize their
+  defaults the same way, so that a node's state says whether it works.
+
+### A-90 🔴 OPEN (found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
+
+- **What happens:** the proxy opens a TCP and TLS connection to io.web for each request and closes
+  it first. Each one leaves a TIME_WAIT on the ingress.
+  - One internet client pipelining GETs to the web host faster than about 470 per second runs out
+    of the ingress's ephemeral ports toward the motherbee. Every web-host request then gets a 502
+    until about 60 s after the flood ends.
+  - The proxy's 128 slots are global, so one client can also hold them all.
+  - `/e/` and `/public/` are not affected.
+- **Impact today:** none that matters; the web host serves a placeholder page. It matters once
+  Archi is behind the proxy (stage 2).
+- **Fix, before stage 2:**
+  - a per-client share of the proxy's slots (`PeerSlots`, as `/public/`);
+  - a small keep-alive pool to io.web, so connections and their handshakes are not per request,
+    or at least io.web closing first (`Connection: close` upstream);
+  - a deadline for a stalled io.web body (docs/nodes/sy-edge.md, "Not there yet").
+
+### A-89 🔴 OPEN (found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
+
+- **What happens:** io.web takes one of its 256 slots at accept, before the TLS handshake, which
+  may take 10 s.
+  - Any host that reaches the motherbee's 9200 can keep the slots full with idle connections,
+    about 26 new ones per second. That means any spoke on the internal network, or the
+    motherbee's LAN address.
+  - The edge's connections are then closed at accept, and the web host answers 502.
+  - No certificate is needed. It is not reachable from the internet.
+- **Fix, before stage 2:**
+  - count against the 256 only connections past their handshake;
+  - give connections still in their handshake a small budget per source address and a shorter
+    timeout (2–3 s on the internal network).
+
 ### A-88 ✅ RESOLVED (0.1.84; covered by tests, the fixed bodies seen on 8.x) — An `/e/` error hands internal detail to the internet
 
 - **Fixed (0.1.84, `5be9e7b`):** one fixed body per error code; the detail goes only to the edge's

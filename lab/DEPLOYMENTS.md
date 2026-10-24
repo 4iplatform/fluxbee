@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ live | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
+| **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ live | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
+| **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ replaced by 0.1.85 | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
 | **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ replaced by 0.1.84 | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
 | **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ replaced by 0.1.83 | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
 | **0.1.81** | 2026-10-20 | `99b0d2a` | motherbee + spokes (core) + egress1 `hive.yaml` + DB | ✅ replaced by 0.1.82 | snap `pre-batch-0-1-81` (all 4 VMs) · `apt install fluxbee=0.1.80` + core-update of the spokes |
@@ -93,6 +94,130 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.85 — The edge proxies the web host to io.web, a new managed node on the motherbee behind mesh mTLS; web_status; core IO runtimes pinned (io-web-v2 §11.2; A-89, A-90, A-91, A-92)
+
+- **Date:** 2026-10-24 (ART) · **Previous version:** 0.1.84 · **Commits:**
+  - `5f796be`: the SDK's mesh module, the refactor of step 1;
+  - `95bacd3`: the release.
+- **Scope:** the motherbee and the three spokes (core update), and one new node started by the
+  operator: `IO.web@motherbee` in the root tenant.
+- **Design:** [io-web-v2](../docs/io-web-v2.md) §11.2. Built by agents in two steps:
+  - step 1, the SDK's mesh module;
+  - step 2, in parallel: the proxy, io.web, and `web_status`.
+
+  One code review round (security, operations); its fixes are FINDINGS A-92. The deferred ones are
+  A-89 and A-90.
+- **What changed:**
+  - **The SDK (`fluxbee_sdk::mesh`, feature `mesh-tls`):**
+    - the mesh's TLS material and the hive registry readers, one copy for the router, SY.admin,
+      SY.orchestrator, SY.edge, SY.vault and io.web, each keeping its own reading;
+    - a client config that verifies the server by name;
+    - a server config that admits only some registry roles. It keeps no sessions, so a resumed
+      session never skips the check (A-92).
+  - **SY.edge:** a declared web host is proxied to io.web.
+    - **The upstream:** the host the ingress's router dials, on port 9200, over mesh mTLS, with the
+      server verified as `motherbee`.
+    - **Requests:** GET and HEAD only, with no body (405, 400). The framing is rebuilt and
+      hop-by-hop headers are stripped both ways. The edge sets its own forwarding headers and
+      request id.
+    - **Errors and limits:**
+      - a fixed 502 with the request id;
+      - a 503 cap (`edge.web_max_inflight`, 128);
+      - 5 s connect and 30 s head timeouts.
+    - **Logs:** one line per request, with the path and never the query. Failures are logged
+      aggregated.
+    - A web host on another port gets 404.
+    - The `EDGE_WEB_ROUTES` answer carries the upstream's state.
+  - **io.web (`nodes/io/io-web`):** a managed IO runtime.
+    - It runs only as `IO.web@motherbee` in the root tenant, with a fail-closed self-check.
+    - `base-nodes.json` lists it with `boot: false`.
+    - It serves HTTPS on `0.0.0.0:9200` with the motherbee's mesh leaf.
+    - It admits only a client whose hive the registry lists as a connected ingress, checked in the
+      handshake and again after it. It cuts the connection when that changes.
+    - It serves a minimal page under a strict CSP and `/healthz`; everything else is 404.
+  - **SY.orchestrator:** a core IO runtime runs only in the root tenant (`TENANT_ROOT_REQUIRED`)
+    and only as `IO.<x>@motherbee` (`CORE_IO_NAME_MISMATCH`).
+  - **SY.admin:** `GET /web/status` (`web_status`) shows:
+    - the host;
+    - the certificate's names;
+    - the route the edge acknowledged, and its upstream;
+    - io.web's state.
+
+    Archi reads it, and `ops.py health` prints a `web` line.
+- **Deploy:**
+  - build of `95bacd3` in 26 min, publish in 12 s, deploy in 223 s;
+  - snapshots `pre-web-0-1-85` on the 4 VMs (`pre-acme-0-1-82` was deleted);
+  - 0.1.85 on all 4 (core manifest `626fb3e7971bfe3e`), with health clean.
+  - `web_status` right after: the route acknowledged, the upstream `ready`, io.web `absent`. The
+    Archi host answered the fixed 502 `UPSTREAM_UNAVAILABLE` with its request id.
+- **The one step by hand** (approved by the operator): `run_node IO.web@motherbee` in the root
+  tenant. The node came up RUNNING, HEALTHY and CONFIGURED, serving on `0.0.0.0:9200` and
+  admitting `ingress`.
+- **Gate:**
+  - **From outside, strict TLS:**
+    - `https://archi.<id>/` serves io.web's page with:
+      - `default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`;
+      - `nosniff`, `no-referrer` and `no-store`;
+      - no version.
+    - HEAD 200 with no body. `/healthz` 200. An unknown path and `/e/` on the Archi host: io.web's
+      404.
+    - At the edge: POST, OPTIONS and TRACE got 405 with `Allow: GET, HEAD`; a GET with a body and
+      an Upgrade got 400.
+    - Spoofed forwarding headers never reached io.web.
+  - **From inside the mesh,** dialling `10.10.10.10:9200` with each hive's leaf:
+
+    | Hive | Result |
+    |---|---|
+    | ingress1 | admitted, 200 |
+    | ingress1 with no certificate | refused (`certificate_required`) |
+    | worker1 | refused in the handshake (`access_denied`) |
+    | worker1 with no certificate | refused |
+    | egress1 | refused (`access_denied`) |
+
+    io.web logged each refusal with the hive and its role.
+  - **Logs:** a query (`?code=…`) appeared in neither the edge's log nor io.web's. One request id
+    is on both sides. The edge logs the client's real address. The proxy took 7–12 ms.
+  - **The door (0.1.84's checks):**
+    - the Archi host, with `:443` or uppercase and a trailing dot, is proxied; with `:8443`, 404;
+    - SNI for the main name with Host for Archi goes to Archi, because routing is per request;
+    - the main name, the IP literal, an unknown host and two Hosts answer as in 0.1.84;
+    - the certificate keeps its two names.
+  - **Restarts:**
+    - after an edge restart, the route came back from disk, and the Archi host answered 200 at
+      once;
+    - after `restart_node IO.web`, there was no gap seen from outside.
+  - **Refusals:** each of these got `CORE_IO_NAME_MISMATCH`, and IO.blob and IO.cloud were
+    untouched:
+    - io.web as `IO.webx` in the root tenant;
+    - io.web as `IO.webt` in a test tenant;
+    - io.web under the name `IO.blob@motherbee`.
+  - **Regressions:**
+    - Cloud's relay through `/e/` works;
+    - a page published from worker1 (A-81's test) was `ok` after 12.8 s, served from outside, 404
+      after the unpublish, and nothing was left on any hive.
+  - **Health:** `failed=0`, `denials=0` on all 4. The ops line reads
+    `web host=archi.… route=acknowledged upstream=ready io.web=running`.
+  - **Covered by tests only:**
+    - `TENANT_ROOT_REQUIRED`: a non-canonical name is refused first;
+    - the connection cut on a registry change;
+    - the 503 cap;
+    - the TLS resumption fix.
+- **Cleanup:**
+  - the gate tenants and nodes (deleted and purged);
+  - the publication (unpublished);
+  - the probe scripts on the hives.
+- **Upgrading another hive:**
+  - the release needs nothing by hand;
+  - where the web door is wanted (after 0.1.84's `web:` and two-name certificate), the operator
+    starts `IO.web@motherbee` in the root tenant once;
+  - the ingress must reach the motherbee's 9200/tcp. No host rule is written today.
+  - A factory reset removes io.web, which is `boot: false`.
+- **Rollback:**
+  - snapshot `pre-web-0-1-85`;
+  - or kill and purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` plus the core update
+    of the spokes. Nothing on disk changes format: the SDK refactor keeps every path. 0.1.84's
+    edge answers 404 for the web host.
 
 ## 0.1.84 — The door ready for a second host: one certificate for two names, the edge serves by host, the door's own fixes, a worker's agent can publish (io-web-v2 §11.1; A-87, A-86, A-88, A-83, A-82, A-81)
 

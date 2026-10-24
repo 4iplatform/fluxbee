@@ -6,7 +6,10 @@
 - Stage 1 is designed and reviewed (§11):
   - release 0.1.84, the door ready for a second host, is validated on 8.x (2026-10-23; ledger
     0.1.84);
-  - next is release 0.1.85, the proxy and io.web (§11.2).
+  - release 0.1.85, the proxy and io.web, is validated on 8.x (2026-10-24; ledger 0.1.85):
+    `https://archi.<id>/` serves io.web's page through the edge.
+- Next is stage 2 (§11.3: sessions, Cloud's one-time code, Archi behind io.web). FINDINGS A-89
+  and A-90, the proxy's and io.web's limits under load, come first.
 
 **What this document is.** The single place that records where this track stands, so the next
 iteration starts from here and not from the conversation. It supersedes:
@@ -392,6 +395,12 @@ a test agent's identity. See the ledger's 0.1.84 entry.
   - an agent on worker1 publishes a page.
 
 ### 11.2 Release 0.1.85: the proxy and io.web
+
+**Validated on 8.x (2026-10-24).** The review added two rules this section did not have:
+- a role-gated mesh server keeps no TLS sessions, so a resumed session never skips the registry;
+- core IO runtimes run only in the root tenant and under their canonical names.
+
+See the ledger's 0.1.85 entry and FINDINGS A-89..A-92.
 
 1. **One shared module in the SDK** (behind a feature): the mesh TLS material and one reader of
    the hive registry. The router, SY.admin, the edge and io.web use it; today it is spread between
