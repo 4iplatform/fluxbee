@@ -84,7 +84,7 @@ Examples: `SY.identity@motherbee`, `AI.billing@motherbee`, `IO.slack.support@mot
   a company: Fluxbee Cloud maps its companies to tenants. Changing an ILK's tenant grants or
   revokes nothing. A tenant that is not active gets no secrets and no new nodes.
 - **Root tenant** (`tnt:00000000-0000-0000-0000-000000000001`): the installation's own. Only the
-  core runs there (`SY.*`, the router, `IO.cloud`, `IO.blob`). Every other node runs in a tenant
+  core runs there (`SY.*`, the router, `IO.cloud`, `IO.blob`, `IO.web`). Every other node runs in a tenant
   you create.
 
 A new person arrives in two steps: an IO node provisions a `temporary` ILK for a sender it does
@@ -532,6 +532,7 @@ calls use `/hives/motherbee/...`.
 |---|---|---|
 | 9000/tcp | motherbee | WAN links between routers. The shipped `hive.yaml` requires mutual TLS (`wan.mtls: required`). |
 | 9100/tcp | motherbee | Identity sync to the worker replicas, with a per-hive HMAC (`identity.sync.auth: required`). |
+| 9200/tcp | motherbee | IO.web, once the operator starts it: only the ingress' `SY.edge` dials it, over the mesh's mutual TLS, to proxy the web hosts (`archi.<id>`). |
 | 22000/tcp | motherbee | Syncthing, for software and blobs. Once a hive switches to the owned options (host posture stage 3), spokes only dial out, and discovery, relays and UDP are off. |
 | 443/tcp | ingress | `SY.edge`, the public HTTPS door. |
 | 8080/tcp | motherbee, 127.0.0.1 | SY.admin. |

@@ -2175,13 +2175,14 @@ async fn reconcile_persisted_custom_nodes(
         // Checked before anything is stopped: a node that still runs is left running, not killed.
         if let Some(refusal) =
             genesis_refusal(&node.node_name, &runtime_key, node_tenant.as_deref())
+                .or_else(|| core_io_refusal(&node.node_name, &runtime_key, node_tenant.as_deref()))
         {
             failed = failed.saturating_add(1);
             tracing::warn!(
                 node_name = node.node_name,
                 runtime = runtime_key,
                 payload = %refusal,
-                "persisted custom node not relaunched: only the core is born in the genesis tenant"
+                "persisted custom node not relaunched: only the core is born in the genesis tenant, and a core IO runtime only there, as its own node"
             );
             continue;
         }
@@ -6910,9 +6911,9 @@ fn report_ingress_ssh_problem(
     );
 }
 
-/// ufw or firewalld, when active: either may close 9000, 9100, 22000 or 443 without anyone seeing
-/// it. ufw's own unit reads active even when ufw is off, so it is asked (`ufw status`); firewalld
-/// is a daemon, active when it runs.
+/// ufw or firewalld, when active: either may close 9000, 9100, 9200, 22000 or 443 without anyone
+/// seeing it. ufw's own unit reads active even when ufw is off, so it is asked (`ufw status`);
+/// firewalld is a daemon, active when it runs.
 fn active_host_firewalls() -> Vec<&'static str> {
     let mut active = Vec::new();
     if command_exists("ufw") {
@@ -6943,7 +6944,7 @@ fn report_active_host_firewalls(hive_id: &str) {
     let firewalls = active.join(" and ");
     tracing::warn!(
         firewalls = %firewalls,
-        "a host firewall is active: it may close 9000, 9100, 22000 or 443"
+        "a host firewall is active: it may close 9000, 9100, 9200, 22000 or 443"
     );
     append_drift_alert(
         "posture",
@@ -6952,8 +6953,9 @@ fn report_active_host_firewalls(hive_id: &str) {
         hive_id,
         format!(
             "{firewalls} is active on this host. It may close 9000 (WAN), 9100 (identity sync), \
-             22000 (Syncthing) or 443 (the edge) without anyone seeing it: Fluxbee writes no rule \
-             to it, and runs only on hosts created for it (D25). Turn it off."
+             9200 (io.web, for the edge), 22000 (Syncthing) or 443 (the edge) without anyone \
+             seeing it: Fluxbee writes no rule to it, and runs only on hosts created for it (D25). \
+             Turn it off."
         ),
         None,
         None,
@@ -14476,14 +14478,16 @@ fn node_kind_from_name(name: &str) -> String {
 }
 
 /// The IO runtimes the core itself runs: shared platform resources, not something a solution asks
-/// for (operator decisions 2026-10-02/03, FINDINGS A-43). io.web is designed but not built yet.
+/// for (operator decisions 2026-10-02/03, FINDINGS A-43). io.cloud and io.blob boot with the
+/// install; io.web runs where the operator starts it (packaging/base-nodes.json).
 const CORE_IO_RUNTIMES: &[&str] = &["io.cloud", "io.blob", "io.web"];
 
 /// Whether a node is part of the core, the only thing born in the genesis (root) tenant. The
 /// orchestrator defines it, being who gives out the genesis tenant (operator, 2026-10-14;
 /// docs/ilk-tenant-model-v1.md D10): the SY.* nodes and the RT.* names, which belong to the router
 /// (neither is ever spawned by run_node), and the core IO runtimes. Everything else (AI, WF, any
-/// other IO node, or a core IO name on another runtime) is launched by a tenant.
+/// other IO node) is launched by a tenant; a core IO runtime under another name, or a core IO
+/// node's name on another runtime, runs nowhere (`core_io_refusal`).
 fn is_core_node(node_name: &str, runtime: &str) -> bool {
     let local = node_name
         .split_once('@')
@@ -14518,6 +14522,65 @@ fn genesis_refusal(
         "message": format!(
             "'{node_name}' (runtime '{runtime}') cannot run in the genesis (root) tenant: only the core is born there (SY.*, RT.* and the core IO runtimes {}); launch it from a tenant",
             CORE_IO_RUNTIMES.join(", ")
+        ),
+        "node_name": node_name,
+        "runtime": runtime,
+        "tenant_id": tenant_id,
+    }))
+}
+
+/// The one node the core IO runtime `core` (one of `CORE_IO_RUNTIMES`) runs as, a singleton on
+/// the motherbee: `IO.web@motherbee` for io.web, as packaging/base-nodes.json names io.blob's and
+/// io.cloud's instance.
+fn core_io_node_name(core: &str) -> String {
+    format!("IO.{}@{PRIMARY_HIVE_ID}", core.trim_start_matches("io."))
+}
+
+/// Some(error reply) when a core IO runtime would run anywhere but its one place, the mirror of
+/// `genesis_refusal`:
+/// - it runs only as its own node, and that name runs no other runtime (`core_io_node_name`,
+///   `CORE_IO_NAME_MISMATCH`);
+/// - it runs only in the genesis (root) tenant (`TENANT_ROOT_REQUIRED`).
+///
+/// Otherwise a tenant (Cloud's `provision_node` launches any `IO.*` name on any runtime) or a
+/// mistyped name could start a second io.web on its port, or take a core node's name before the
+/// operator. With no tenant known the tenant is not checked, as in `genesis_refusal`: a run_node
+/// without one registers no identity, so it starts nothing. Checked wherever a node is launched,
+/// right after `genesis_refusal`.
+fn core_io_refusal(
+    node_name: &str,
+    runtime: &str,
+    tenant_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let runtime_key = runtime.trim().to_ascii_lowercase();
+    // The core runtime the request names, by its runtime or by its node's name.
+    let core = CORE_IO_RUNTIMES
+        .iter()
+        .copied()
+        .find(|core| *core == runtime_key || core_io_node_name(core) == node_name)?;
+    let core_node = core_io_node_name(core);
+    if node_name != core_node || runtime_key != core {
+        return Some(serde_json::json!({
+            "status": "error",
+            "error_code": "CORE_IO_NAME_MISMATCH",
+            "message": format!(
+                "'{node_name}' (runtime '{runtime}') cannot run: the core IO runtime {core} runs only as {core_node}, and that name runs only {core}"
+            ),
+            "node_name": node_name,
+            "runtime": runtime,
+            "core_node": core_node,
+        }));
+    }
+    let tenant_id = tenant_id?;
+    if fluxbee_sdk::is_root_tenant(tenant_id) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "status": "error",
+        "error_code": "TENANT_ROOT_REQUIRED",
+        "message": format!(
+            "'{node_name}' (runtime '{runtime}') is a core IO node: it runs only in the genesis (root) tenant {}, not in '{tenant_id}'",
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID
         ),
         "node_name": node_name,
         "runtime": runtime,
@@ -20007,7 +20070,9 @@ async fn run_node_flow(
 
     // The tenant this spawn would register and inject: the one both rules are about.
     let spawn_tenant = resolve_tenant_id_for_node(payload);
-    if let Some(refusal) = genesis_refusal(&node_name, &runtime, spawn_tenant.as_deref()) {
+    if let Some(refusal) = genesis_refusal(&node_name, &runtime, spawn_tenant.as_deref())
+        .or_else(|| core_io_refusal(&node_name, &runtime, spawn_tenant.as_deref()))
+    {
         return refusal;
     }
     if let Some(refusal) = tenant_gate_refusal(
@@ -20508,7 +20573,9 @@ fn managed_node_launch_plan(
         };
     let (_, persisted_tenant) = load_persisted_node_identity(state, node_name);
     let tenant = persisted_tenant.or_else(|| config_tenant_id(&config));
-    if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref()) {
+    if let Some(refusal) = genesis_refusal(node_name, &runtime_key, tenant.as_deref())
+        .or_else(|| core_io_refusal(node_name, &runtime_key, tenant.as_deref()))
+    {
         return Err(refusal);
     }
     validate_wf_runtime_spawn_contract(
@@ -35161,6 +35228,75 @@ blob:
         }
     }
 
+    /// The mirror of the genesis rule: a core IO runtime runs only as its own node,
+    /// `IO.<name>@motherbee`, whose name runs no other runtime (CORE_IO_NAME_MISMATCH), and only in
+    /// the root tenant (TENANT_ROOT_REQUIRED), so neither a tenant nor a mistyped name starts a
+    /// second io.web. Anything else is none of its business.
+    #[test]
+    fn a_core_io_runtime_runs_only_as_its_own_node_in_the_genesis_tenant() {
+        let root = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let root_without_hyphens = "tnt:00000000000000000000000000000001";
+        let tenant = "tnt:8a0c3f8e-2f1b-4d3a-9c55-0f6e2b7d9a11";
+        // The core IO nodes, as PROD runs IO.cloud and IO.blob and the operator starts IO.web:
+        // in the root tenant, in any spelling of it, or with no tenant known.
+        for (name, runtime) in [
+            ("IO.cloud@motherbee", "io.cloud"),
+            ("IO.blob@motherbee", "io.blob"),
+            ("IO.web@motherbee", "io.web"),
+            ("IO.web@motherbee", "IO.Web"),
+        ] {
+            for known in [Some(root), Some(root_without_hyphens), None] {
+                assert!(
+                    core_io_refusal(name, runtime, known).is_none(),
+                    "{name} {runtime} {known:?}"
+                );
+                assert!(genesis_refusal(name, runtime, known).is_none(), "{name}");
+            }
+            let refusal = core_io_refusal(name, runtime, Some(tenant)).expect(name);
+            assert_eq!(refusal["error_code"], "TENANT_ROOT_REQUIRED", "{name}");
+            assert_eq!(refusal["tenant_id"], tenant);
+            assert!(
+                refusal["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(root)),
+                "{refusal}"
+            );
+        }
+        // A core IO runtime under another name, or a core IO node's name on another runtime: in
+        // any tenant, the root one included, or none.
+        for (name, runtime, core_node) in [
+            ("IO.web2@motherbee", "io.web", "IO.web@motherbee"),
+            ("IO.web.second@motherbee", "io.web", "IO.web@motherbee"),
+            ("IO.web@worker1", "io.web", "IO.web@motherbee"),
+            ("io.web@motherbee", "io.web", "IO.web@motherbee"),
+            ("IO.blob@motherbee", "io.web", "IO.blob@motherbee"),
+            ("IO.cloud.acme@motherbee", "io.cloud", "IO.cloud@motherbee"),
+            ("WF.oddly.named@motherbee", "io.cloud", "IO.cloud@motherbee"),
+            ("IO.blob@worker1", "io.blob", "IO.blob@motherbee"),
+            ("IO.web@motherbee", "io.api", "IO.web@motherbee"),
+            ("IO.cloud@motherbee", "io.slack", "IO.cloud@motherbee"),
+        ] {
+            for known in [Some(root), Some(tenant), None] {
+                let refusal = core_io_refusal(name, runtime, known)
+                    .unwrap_or_else(|| panic!("{name} {runtime} {known:?}"));
+                assert_eq!(refusal["error_code"], "CORE_IO_NAME_MISMATCH", "{name}");
+                assert_eq!(refusal["core_node"], core_node, "{name} {runtime}");
+            }
+        }
+        // Any other node: the genesis rule's business, not this one's.
+        for (name, runtime) in [
+            ("IO.api.support@motherbee", "io.api"),
+            ("IO.slack.acme@motherbee", "io.slack"),
+            ("IO.webhooks@motherbee", "io.api"),
+            ("AI.sales@motherbee", "ai.generic"),
+            ("WF.flow@motherbee", "wf.engine"),
+        ] {
+            for known in [Some(root), Some(tenant), None] {
+                assert!(core_io_refusal(name, runtime, known).is_none(), "{name}");
+            }
+        }
+    }
+
     /// Stage 3 (docs/ilk-tenant-model-v1.md §2.3): a node of a tenant known not to be active is not
     /// started; when the hive cannot tell, the launch goes on as before.
     #[test]
@@ -35222,6 +35358,7 @@ blob:
             "async fn run_node_flow(",
             &[
                 "genesis_refusal(",
+                "core_io_refusal(",
                 "tenant_gate_refusal(",
                 "forward_system_action_to_hive(",
                 "ensure_node_identity_registered(",
@@ -35287,6 +35424,7 @@ blob:
             "async fn reconcile_persisted_custom_nodes(",
             &[
                 "genesis_refusal(",
+                "core_io_refusal(",
                 "match tenant_gate(",
                 "persist_node_runtime_version(",
                 "clear_stale_transient_unit(",

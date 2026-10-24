@@ -201,8 +201,8 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
   node verifies the HMAC with its own `app_secret` (the edge does NOT verify signatures).
 - **D3**: `boot=true` degraded (io.slack scheme). **Changed by the operator on 2026-10-02 (A-43):**
   `boot=false`, no base instance. Each number's `IO.wapp.<label>` node is launched by its tenant with
-  `run_node`, never in the root tenant (only io.cloud and io.blob run there; the orchestrator refuses
-  any other IO node with `TENANT_ROOT_NOT_ALLOWED`).
+  `run_node`, never in the root tenant (only the core IO nodes io.cloud, io.blob and io.web run
+  there; the orchestrator refuses any other IO node with `TENANT_ROOT_NOT_ALLOWED`).
 - **D4**: Vault secret `resource_type` = `"whatsapp"` (new canonical) vs reuse `"bearer_token"`
   (io-cloud test uses `wapp_token`/`bearer_token`). Recommend a dedicated `"whatsapp"` type.
 - **D5**: Default inbound target `io.dst_node` = `AI.generic@motherbee` (matches the io.slack decision).

@@ -183,7 +183,7 @@ All other SSH is dropped. This works the same with one NIC or several.
 nothing today, and turning ufw on would lock SSH and :443 out (D25).
 
 **New:** an active ufw or firewalld raises a posture alert (`host_firewall_active`), since it may close
-9000, 9100, 22000 or 443 without anyone seeing it.
+9000, 9100, 9200, 22000 or 443 without anyone seeing it.
 
 **Cleanup:** remove_hive and the factory reset drop the new table and its unit.
 

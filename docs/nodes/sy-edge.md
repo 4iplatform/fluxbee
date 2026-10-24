@@ -8,8 +8,9 @@ gave it, and it takes commands only from `SY.admin@motherbee`. Its certificate c
 it swaps a new one in place and answers the ACME TLS-ALPN-01 challenge SY.admin arms when it
 orders one ([ACME design](../acme-edge-certificates-v1.md) §4). It chooses each request's host
 before any path: only its main name, an IP literal or no host reach `/e/` and `/public/`; the web
-hosts SY.admin declares (`archi.<id>`) answer 404 until the proxy to io.web exists
-([io.web v2](../io-web-v2.md) §11), and so does any other host.
+hosts SY.admin declares (`archi.<id>`) go to io.web on the motherbee, through a reverse proxy over
+the mesh's mutual TLS, its third surface ([io.web v2](../io-web-v2.md) §11.2); any other host
+answers 404.
 
 Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are in
 `src/tls_material.rs`. The URL commands it receives are sent by `SY.admin`
@@ -23,6 +24,7 @@ Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are
 | Role | ingress (`system_nodes.ingress` in `packaging/hive.yaml.example`) |
 | systemd unit | `sy-edge.service`: `After=network.target rt-gateway.service`, `Wants=rt-gateway.service`, `Restart=always`, `RestartSec=5`, `TimeoutStopSec=15` |
 | Listens on | `edge.listen` from hive.yaml, ingress role only (`resolve_http_listen`); `add_hive` asks for it, e.g. `0.0.0.0:443` |
+| Dials | io.web, for the web hosts only: the host of `wan.uplinks[0].address` on port 9200 (`IO_WEB_PORT`), over the mesh's mutual TLS (see The proxy to io.web) |
 | State | `/etc/fluxbee/edge.endpoints.json`, `/var/lib/fluxbee/state/sy-edge/publications.json`, `/var/lib/fluxbee/state/sy-edge/web_routes.json`, reads `/var/lib/fluxbee/blob/public` |
 
 ## Where it runs
@@ -53,9 +55,11 @@ the secret cannot be read it starts AWAITING and re-reads on its own (see TLS be
 
 `main` in `src/bin/sy_edge.rs`, in order:
 
-1. `Config::load` reads `/etc/fluxbee/hive.yaml` (`role` and the `edge:` section) and the
-   environment. A missing or unparsable hive.yaml gives no `edge:` section, so no public listener
-   (`load_hive_edge`).
+1. `Config::load` reads `/etc/fluxbee/hive.yaml` (`role`, the `edge:` section, and for the proxy
+   `hive_id` and `wan.uplinks[0].address`) and the environment. A missing or unparsable hive.yaml
+   gives no `edge:` section, so no public listener (`load_hive_edge`). `wan:` is the router's
+   section and is read leniently (`first_uplink_address`): a shape the edge does not expect leaves
+   the proxy without an upstream, never the door without its listener.
 2. Logging from `RUST_LOG` (default `info,sy_edge=debug,fluxbee_sdk=info`), reloadable at run
    time (see Config).
 3. Connects to the router (`RouterDispatcher::connect_with_retry`, retry every 1 s). The door's
@@ -75,6 +79,10 @@ the secret cannot be read it starts AWAITING and re-reads on its own (see TLS be
      process exits.
    - An invalid TLS configuration (an empty `tls_vault_key`, only one of `tls_cert`/`tls_key`)
      also exits. The public port is never bound in plaintext unless the mode is `plaintext`.
+   - The proxy's upstream is built once (`IoWebClient::for_hive`): the line
+     `sy-edge web proxy ready: web hosts go to io.web` names it, or an ERROR says what is missing
+     (the mesh TLS material, `hive_id`, `wan.uplinks`) and every web host answers 502 until it is
+     fixed and the edge restarts.
 7. Starts the door's command task (`run_tls_commands`), beside the system loop.
 8. Starts a reaper that every 600 s drops expired public rows and, if it dropped any, rewrites
    the publications file.
@@ -92,13 +100,14 @@ Every request is dispatched by its host first, before any path (`Door::handle`):
    at all (HTTP/1.0, an empty `Host`), an IP literal, and the edge's main name on any port. The
    main name comes from the certificate served (`main_certified_name`, see Web hosts) and is never
    a web host.
-3. **A web host** on any port (Web hosts below) answers `404 NOT_FOUND` for every path and method,
-   `/healthz` included: it never reaches `/e/` or `/public/` (io-web-v2 D13). The proxy to io.web
-   comes in 0.1.85.
-4. **Any other host** answers the same 404 while a certificate is served. With none (plaintext,
-   or a vault edge still awaiting) the edge cannot tell its main name, and every host but a web
-   host keeps the door's routes. When the certificate's names tell no main name (unrelated
-   names), each of them that is not a web host is the door's.
+3. **A web host** (Web hosts below) goes to io.web for every path, `/healthz` included (The proxy
+   to io.web below): it never reaches `/e/` or `/public/` (io-web-v2 D13). Only on its own port:
+   the same host with any port but 443 is an unknown host (io-web-v2 §11.1, "other ports never
+   match a route"), and gets the 404 below, never the door's routes either.
+4. **Any other host** answers `404 NOT_FOUND` while a certificate is served. With none
+   (plaintext, or a vault edge still awaiting) the edge cannot tell its main name, and every host
+   but a web host keeps the door's routes. When the certificate's names tell no main name
+   (unrelated names), each of them that is not a web host is the door's.
 5. **The door's own routes** (`main_routes`):
 
 | Route | Methods | What it does |
@@ -133,8 +142,8 @@ Limits on the door (`serve_door`, `serve_http`, `DoorLimits`):
   bytes), the connection spends a credit of 30 s that every 1024 bytes moved refill by one second,
   never above 30 s (`DOOR_PACE`, `Pace`). A peer that moves nothing for 30 s, or keeps moving less
   than 1 KiB/s, gets an I/O error that ends the connection, its handler and the permits they hold
-  (a download slot, an `/e/` slot). The time the edge spends on its own work (a channel's
-  handler, later an upstream) is never charged: hyper keeps reading to notice an end of file
+  (a download slot, an `/e/` slot, a proxied request's slot). The time the edge spends on its own
+  work (a channel's handler, io.web) is never charged: hyper keeps reading to notice an end of file
   while a request is served, and only the request body sets the demand (`BodyDemand`,
   `DemandBody`). hyper reads a body's first bytes before the handler runs, so the read leaves its
   waker on the demand, and the handler's first wait wakes it: a body that never starts is cut too.
@@ -143,25 +152,27 @@ Limits on the door (`serve_door`, `serve_http`, `DoorLimits`):
   unsent. Otherwise Linux wakes a writer when its send queue drains to two thirds of a buffer that
   grows with the congestion window, and one wait on a slow mobile link could outlast the credit.
 - **The peer's address** from the accept loop reaches every handler as
-  `ConnectInfo<SocketAddr>` (`Door::handle`), for the logs (`request_peer`) and later for
-  `X-Forwarded-For`.
+  `ConnectInfo<SocketAddr>` (`Door::handle`), for the logs (`request_peer`), and the proxy, for
+  `X-Forwarded-For` and `Forwarded`.
 - **A failed accept** (out of file descriptors, say) waits 100 ms before the next one, instead of
   spinning.
 
-Error bodies are JSON: `{"ok": false, "error_code": ..., "message": ...}` (`http_error`). The
-message is fixed text per code, never an error's detail, which goes to the edge's log only (A-88).
+Error bodies are JSON: `{"ok": false, "error_code": ..., "message": ...}` (`http_error`; the
+proxy's 502 adds `request_id`). The message is fixed text per code, never an error's detail,
+which goes to the edge's log only (A-88).
 
 Every answer of the door carries the security headers (`SECURITY_HEADERS`, added by
 `with_security_headers` in `Door::handle` where a response lacks them, so a handler's own header
 stays): `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
 `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex, nofollow, noarchive` and
 `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. That covers the `/e/`
-relay, the fanout `hub.challenge` echo, axum's own 404 and 400, `/healthz` and every `/public`
-answer. A published artifact's `200`, `206` and `304` keep the content policy the artifact chose
-(`OwnContentPolicy`): the sandboxed page its own CSP, a download or a static file none, since a
-`default-src 'none'` can stop a browser's PDF viewer and artifacts may be framed. A response the
-edge cannot build (an invalid header value, say) is a `500 INTERNAL_ERROR` with them, never an
-empty 200 (`built`, A-83).
+relay, the fanout `hub.challenge` echo, axum's own 404 and 400, `/healthz`, every `/public`
+answer and every answer through the proxy, io.web's own included: there a header io.web set (its
+content policy, say) wins. A published artifact's `200`, `206` and `304` keep the content policy
+the artifact chose (`OwnContentPolicy`): the sandboxed page its own CSP, a download or a static
+file none, since a `default-src 'none'` can stop a browser's PDF viewer and artifacts may be
+framed. A response the edge cannot build (an invalid header value, say) is a
+`500 INTERNAL_ERROR` with them, never an empty 200 (`built`, A-83).
 
 ### `/e/<ich>`: forwarding into the mesh
 
@@ -248,6 +259,90 @@ edge acks only after the file shows up under the public root with the right size
 (`wait_for_public_artifact_ready`, polling every 250 ms up to `public_ready_timeout_ms`, default
 60 000).
 
+### The proxy to io.web
+
+The door's third surface ([io.web v2](../io-web-v2.md) §11.2): every request for a web host, on
+any path, goes to io.web on the motherbee (`WebProxy::forward`). Nothing else is reached through
+it, never a host or a port that a request or a route names.
+
+**The upstream** (`IoWebClient`, built once at boot by `IoWebClient::for_hive`):
+
+- **Where:** the host this hive's router dials, the host of `wan.uplinks[0].address` in hive.yaml
+  (on PROD `10.10.10.10`), on `IO_WEB_PORT` (9200, `fluxbee_sdk::mesh`).
+- **TLS, mutual, over the mesh:** the edge presents its hive's leaf from
+  `/var/lib/fluxbee/tls/<hive_id>/` (`MESH_TLS_DIR`), and verifies io.web's certificate inside the
+  handshake with rustls' WebPki verifier over the mesh CA, under the name `motherbee`
+  (`IO_WEB_SERVER_NAME`, `MeshTlsMaterial::client_config_by_name`), never the address it dials. A
+  leaf of another hive from the same CA fails the handshake. It never resumes a TLS session: io.web
+  checks the registry only on a full handshake.
+- **One connection per proxied request:** TCP, TLS, then hyper's HTTP/1 client, closed when the
+  response ends. Nothing is pooled: on the LAN a handshake costs milliseconds, and no request can
+  desync another on its way to io.web.
+- **Without the material, a valid `hive_id` or an uplink,** the edge logs why at boot (ERROR) and
+  every web host answers the 502 below. It never falls back to plaintext, or to the router's
+  CA-only verifier. Its answer to `EDGE_WEB_ROUTES` says so (`upstream`, see Web hosts), so
+  SY.admin's `GET /web/status` shows it.
+
+**The route's policy** (`web_policy_refusal`), applied before anything reaches io.web. In this
+stage every web route takes GET and HEAD with no body:
+
+| Request | Answer |
+| --- | --- |
+| any method but GET and HEAD, CONNECT and TRACE included | `405 METHOD_NOT_ALLOWED`, `Allow: GET, HEAD` |
+| an `Upgrade` header | `400 UPGRADE_NOT_ALLOWED` |
+| a body: a `Content-Length` other than 0, or any `Transfer-Encoding` | `400 BODY_NOT_ALLOWED` |
+
+**What io.web gets** (`io_web_request`, `io_web_request_headers`):
+
+- the method, and the target in origin form (`/path?query`) whatever form the client sent;
+- the client's headers, first without the hop-by-hop ones (`Connection`, `Keep-Alive`,
+  `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authorization`,
+  `Proxy-Authenticate`) and every header a `Connection` header names (`strip_hop_by_hop`), then
+  without `Content-Length`, `Expect`, `Host`, `Forwarded`, `X-Request-Id`, every
+  `X-Forwarded-*`, `X-Real-IP`, `True-Client-IP`, `X-Original-URL`, `X-Rewrite-URL` and the
+  method overrides `X-HTTP-Method-Override`, `X-HTTP-Method` and `X-Method-Override`
+  (`DROPPED_REQUEST_HEADERS`);
+- then the edge's own, in place of any the client sent: `Host` (the web host, in canonical form),
+  `X-Forwarded-For` (the peer address the accept loop saw; an IPv4-mapped one as its IPv4),
+  `X-Forwarded-Proto` (`https`, or `http` on a plaintext door), `X-Forwarded-Host` (the web
+  host), `Forwarded` (RFC 7239, `for=<peer>;proto=<proto>;host=<host>`, an IPv6 peer as
+  `"[<address>]"`) and a fresh `X-Request-Id` (a UUID);
+- no body: the framing is the edge's own. Cookies and `Authorization` pass as the client sent
+  them; the session rules come with stage 2 (io-web-v2 §11.3).
+
+**What the client gets** (`from_io_web`): io.web's status and headers, without the hop-by-hop ones
+and those io.web's `Connection` names, and without a `Content-Length` that a `Transfer-Encoding`
+overrode (`strip_io_web_response_headers`). The body streams as io.web sends it, through the
+door's paced stream, and hyper frames it again. The security headers io.web did not set are
+added (see above).
+
+**Errors and limits:**
+
+- **Any failure to get io.web's response head** answers `502 UPSTREAM_UNAVAILABLE`, with a fixed
+  message and the request id, in the body (`request_id`) and in `X-Request-Id`
+  (`io_web_unavailable`). That is: no upstream, a refused connection, a TLS handshake the edge
+  refuses (io.web's certificate does not verify), io.web refusing the edge's certificate, a reset
+  or a close before the head, a `101`, and either timeout. In TLS 1.3 io.web's refusal
+  (`access_denied`) is the first thing the edge reads after it sends the request: the edge's
+  connect succeeds first. The detail (`IoWebFailure`) goes to the edge's log only.
+- **`IO_WEB_CONNECT_TIMEOUT`, 5 s:** the TCP connection and the TLS handshake, together.
+- **`IO_WEB_HEAD_TIMEOUT`, 30 s:** io.web's response head, once the request is sent. The body
+  has no deadline of its own, and the client keeps the door's pace.
+- **`web_max_inflight`, 128 by default (0 turns it off):** the proxied requests in flight at
+  once, each with its own connection to io.web, each held from the request to the response's last
+  byte, or to the end of the client's connection. One more gets a quick `503 WEB_BUSY` and never
+  reaches io.web; the refusals are logged at most once per 10 s, with their count.
+- **hyper's buffer** on a connection to io.web is 64 KiB (`IO_WEB_MAX_BUF`), as on the door's
+  own connections.
+
+**Logs:** one INFO line per request io.web answers, `sy-edge proxied a request to io.web`. A
+request io.web does not answer is counted, and the failures are logged at most once per 10 s, as
+the refusals at the cap are: the WARN `sy-edge: io.web did not answer proxied requests (502): ...`
+carries `failed` (how many since the last line) and the last one's `error`. Each line carries
+`request_id`, `method`, `host`, `path` without its query (stage 2's exchange code rides the query,
+§11.3), `status`, `duration_ms` (to the response head) and `peer`, the WARN those of the last
+failure. A request the route's policy refuses is a DEBUG line.
+
 ## Mesh messages
 
 Handled one at a time in the loop at the end of `main`, except the door's four commands (the
@@ -266,7 +361,7 @@ resolution.
 | `EDGE_TLS_STATUS` | `SY.admin@motherbee` | What the listener serves: mode, state, the leaf (`tls_status_answer`; shape in the TLS section) |
 | `EDGE_TLS_RELOAD` | `SY.admin@motherbee` | Re-read the certificate once and swap it in place if it passes (`tls_reload_answer`; vault edge only) |
 | `EDGE_ACME_CHALLENGE` | `SY.admin@motherbee` | Arm or clear a TLS-ALPN-01 challenge (`acme_challenge_answer`; vault edge only) |
-| `EDGE_WEB_ROUTES` | `SY.admin@motherbee` | Replace the web hosts with the full set, keep it on disk, answer the set applied (`web_routes_answer`; see Web hosts) |
+| `EDGE_WEB_ROUTES` | `SY.admin@motherbee` | Replace the web hosts with the full set, keep it on disk, answer the set applied and the proxy's upstream (`web_routes_answer`; see Web hosts) |
 | `VAULT_SECRET_CHANGED` | `SY.vault@<vault_hive>` | Re-fetch channel secrets; reload the certificate when the notice is about its key (below) |
 | `CONFIG_GET` / `CONFIG_SET` | `SY.admin@motherbee` | The edge's own config (`apply_node_config`) |
 | `NODE_STATUS_GET` | an orchestrator, or SY.admin / SY.vault of the same hive | Default status reply (`try_handle_default_node_status`) |
@@ -312,14 +407,23 @@ stays, when:
   `archi.<id>` lies under `<id>`). With unrelated names, or no certificate served (awaiting,
   plaintext), it cannot tell, and the check is skipped.
 
-The answer is `{status: "ok", routes, changed, persisted}`: the set served from now on, in
-canonical form and sorted, whether it differs from the one before, and whether the file holds it.
+The answer is `{status: "ok", routes, changed, persisted, upstream}`: the set served from now on,
+in canonical form and sorted, whether it differs from the one before, whether the file holds it,
+and the proxy's way to io.web (`WebProxy::upstream_status`), which SY.admin shows as
+`routes.upstream` in `GET /web/status`:
+
+- `state`: `ready`, or `unavailable` when the edge found no upstream at its boot; then `reason`
+  says what is missing (the mesh TLS material, `hive_id`, `wan.uplinks`), and every web host
+  answers 502 until it is fixed and the edge restarts;
+- `last_failure`: the last proxied request io.web did not answer, `{at, kind}` (Unix seconds, and
+  `no_upstream`, `connect`, `handshake`, `connect_timeout`, `http_handshake`, `head_timeout`,
+  `head` or `switched_protocols`, `IoWebFailure::kind`), or null; never anything of the request.
 The set is written to `web_routes_path` through a synced temporary file and a rename, only when
 the file does not already hold it; a failed write is logged at ERROR, the set is served anyway, and
 the next push writes it again.
 
-At boot the file is read before the door opens, so a restarted edge answers 404 for a web host at
-once; no file is no web host. It is read before any certificate: once the boot read of the
+At boot the file is read before the door opens, so a restarted edge proxies a web host at once; no
+file is no web host. It is read before any certificate: once the boot read of the
 certificate serves one, a route that names the main name is dropped, logged at ERROR, and written
 over at the next push (`WebRouteTable::forget_main_name`); a request for the main name gets the
 door's routes in any case (`host_route`). A corrupt or unreadable file is an ERROR and starts with
@@ -484,6 +588,7 @@ cannot run: another origin, an edge with no public listener, or a RELOAD or CHAL
 | `public_max_inflight` | `SY_EDGE_PUBLIC_MAX_INFLIGHT` | 128 |
 | `public_max_inflight_per_ip` | `SY_EDGE_PUBLIC_MAX_INFLIGHT_PER_IP` | 8 (0: no cap) |
 | `public_ready_timeout_ms` | `SY_EDGE_PUBLIC_READY_TIMEOUT_MS` | 60 000 |
+| `web_max_inflight` | `SY_EDGE_WEB_MAX_INFLIGHT` | 128 (0: no cap) |
 | `tls_vault_key` | `SY_EDGE_TLS_VAULT_KEY` | none |
 | `vault_hive` | `SY_EDGE_VAULT_HIVE` | `motherbee` |
 | `tls_cert`, `tls_key` | `SY_EDGE_TLS_CERT`, `SY_EDGE_TLS_KEY` | none |
@@ -492,6 +597,11 @@ Environment only: `CONFIG_DIR` (default `/etc/fluxbee`), `NODE_NAME`, `NODE_VERS
 `ROUTER_SOCKET` (default `/var/run/fluxbee/routers`), `UUID_PERSISTENCE_DIR` (default
 `/var/lib/fluxbee/state/nodes`), `TTL` (16), `HANDLER_TIMEOUT_MS` (30 000), `MAX_INFLIGHT`
 (1024), `RUST_LOG`.
+
+hive.yaml only, outside `edge:`, for the proxy: `hive_id` (its mesh TLS material,
+`/var/lib/fluxbee/tls/<hive_id>/`) and `wan.uplinks[0].address` (io.web's host), the ones
+add_hive writes for the ingress. Neither has an environment override: the upstream is never
+anything but the motherbee the router dials.
 
 `add_hive` writes the ingress hive.yaml `edge:` block (`resolve_add_hive_ingress_section` and the
 template in `src/bin/sy_orchestrator.rs`): `ingress.listen` is required; `ingress.tls_vault_key`
@@ -535,8 +645,13 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - **The certificate deleted from the vault.** The edge keeps serving what it loaded.
 - **Bad files.** An unreadable or invalid endpoints file starts an empty table (every `/e/` gets
   404). An invalid publications file starts an empty public table. An unreadable or invalid web
-  routes file starts with no web host, so a web host gets the door's own routes until SY.admin's
+  routes file starts with no web host, so a web host is an unknown host (404) until SY.admin's
   next push, within a minute.
+- **io.web down, slow or refusing.** Each proxied request answers the fixed 502 with its request
+  id, and the edge logs why, at most once per 10 s with the count; nothing restarts. No mesh TLS
+  material, `hive_id` or uplink at boot: every web host answers 502 until it is fixed and the edge
+  restarts (the boot ERROR says which, and so does `upstream` in the answer to `EDGE_WEB_ROUTES`).
+  More than `web_max_inflight` requests at once: a quick 503.
 - **Slow, stalled or greedy clients.** A client below the door's pace loses its connection, and
   the download or `/e/` slot it held; a head that does not arrive in 30 s, or an `/e/` body not
   whole in 30 s, ends it too. One address past its share of connections or downloads is refused
@@ -554,8 +669,12 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - One certificate for every name: the edge chooses no certificate by SNI. SY.admin's ACME client
   orders one that names the main host and every web host, and the edge terminates TLS for all of
   them (io-web-v2 §5, O6; §11.1).
-- The proxy to io.web (io-web-v2 §11.2, 0.1.85): until then a web host answers 404 for every
-  path.
+- The proxy's stage 2 (io-web-v2 §11.3): the edge passes cookies and `Authorization` to io.web as
+  the client sent them; filtering cookies to `__Host-` ones, and bodies on upload paths, come
+  with sessions. Today every web route is GET and HEAD with no body.
+- The proxy keeps no connection to io.web between requests, and io.web's response body has no
+  deadline of its own: an io.web that stalls mid-body holds that request's slot until the client
+  leaves.
 - The `shared-secret` mode is one static bearer per channel. There is no other auth mode.
 - The owner node's reply is always sent as `200 application/json`.
 
@@ -567,6 +686,10 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
   `sy-edge public HTTPS frontend ready (TLS)` means the port is bound; `serving=false` on it means
   the edge is AWAITING a certificate.
 - `EDGE_TLS_STATUS` (sent by SY.admin) says what the door serves, or why it awaits.
+- The proxy: `sy-edge web proxy ready: web hosts go to io.web` at boot names the upstream, and
+  each proxied request leaves its line (see The proxy to io.web). On the motherbee,
+  `GET /web/status` shows its upstream and last failure (`routes.upstream`). Through the edge,
+  `curl -s https://archi.<id>/healthz` asks io.web's own `/healthz`.
 - The open channels: `GET /channels/externalized?edge_node=SY.edge@<ingress>` on SY.admin
   (`list_externalized` → `EDGE_LIST_URLS`).
 
@@ -580,5 +703,6 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
   checks and the three TLS commands.
 - [The router](rt-gateway.md): the system policy that admits the `EDGE_*` commands.
 - [Edge ingress spec v6](../edge-ingress-spec-v6.md): the design (ICH model, invariants).
+- [io.web v2](../io-web-v2.md): the web hosts and the proxy to io.web (§11).
 - [IO.blob spec](../io-blob-spec-v1.md): curation and the public folder.
 - [Host posture spec](../host-posture-and-exposure-spec-v1.md): what is exposed on each role.

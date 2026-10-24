@@ -1719,6 +1719,52 @@ async fn an_order_that_fails_only_on_an_added_name_orders_the_main_name_alone() 
     assert_eq!(status["edge"]["names_missing"], json!([ARCHI]));
 }
 
+/// What `GET /web/status` shows of the certificate (docs/io-web-v2.md §11.2), with no call to the
+/// edge: the names the client certifies, the leaf the edge served at the last look, and the web
+/// hosts that leaf misses.
+#[tokio::test]
+async fn the_web_status_shows_the_certified_names_and_the_leaf_last_seen() {
+    let web_hosts = names(&[ARCHI]);
+    let h = Harness::with_archi();
+    let before = h.service.web_certificate(&web_hosts);
+    assert_eq!(before["acme"], "on");
+    assert_eq!(before["names"], json!([NAME, ARCHI]));
+    assert_eq!(before["served"], Value::Null, "no look yet");
+    assert_eq!(before["last_answer_at"], Value::Null);
+    assert_eq!(before["hosts_missing"], Value::Null);
+
+    h.service.check_once().await;
+    let looks = h.mesh().statuses;
+    let after = h.service.web_certificate(&web_hosts);
+    assert_eq!(h.mesh().statuses, looks, "the edge is not asked");
+    assert_eq!(after["served"]["names"], json!(served_names(&h)));
+    assert!(
+        after["served"]["not_after"].is_string(),
+        "RFC 3339: {after}"
+    );
+    assert!(after["last_answer_at"].is_string(), "{after}");
+    assert_eq!(after["hosts_missing"], json!([]));
+
+    // A leaf for the main name alone misses Archi's host.
+    let h = Harness::with_archi();
+    h.ca()
+        .refused
+        .insert(ARCHI.to_string(), "NXDOMAIN".to_string());
+    h.service.check_once().await;
+    assert_eq!(served_names(&h), names(&[NAME]));
+    let missing = h.service.web_certificate(&web_hosts);
+    assert_eq!(missing["names"], json!([NAME, ARCHI]));
+    assert_eq!(missing["hosts_missing"], json!([ARCHI]));
+
+    // Without an acme section the names are still the ones a renewal would certify.
+    let absent = Harness::new(AcmeConfig::Absent {
+        names: names(&[NAME, ARCHI]),
+    });
+    let certificate = absent.service.web_certificate(&web_hosts);
+    assert_eq!(certificate["acme"], "absent");
+    assert_eq!(certificate["names"], json!([NAME, ARCHI]));
+}
+
 #[tokio::test]
 async fn an_order_that_fails_on_the_main_name_orders_nothing_else() {
     let h = Harness::with_archi();

@@ -345,6 +345,10 @@ get secrets and start (§3.4). LLM usage is recorded per tenant (`llm_usage`, `d
   The core is:
   - `SY.*` and `RT.*` names;
   - `IO.*` nodes on the runtimes `io.cloud`, `io.blob` and `io.web` (`CORE_IO_RUNTIMES`).
+- **The core IO runtimes run only there, each as its own node** (`core_io_refusal`):
+  `IO.cloud@motherbee`, `IO.blob@motherbee`, `IO.web@motherbee`. One outside the root tenant is
+  `TENANT_ROOT_REQUIRED`; one under another name, or one of those names on another runtime, is
+  `CORE_IO_NAME_MISMATCH`.
 - SY.vault treats it as always active (`ensure_tenant_active`).
 
 ### 3.4 What a tenant that is not active cannot do

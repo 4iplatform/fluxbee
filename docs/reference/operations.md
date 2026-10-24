@@ -85,14 +85,15 @@ it builds the package with `packaging/build-deb.sh` and installs it with
 | 3000/tcp | SY.architect UI/API | `127.0.0.1` (`architect.listen`) | `packaging/hive.yaml.example` |
 | 9000/tcp | WAN between hives (gateway router) | `wan.listen`; set on the motherbee only | [rt-gateway](../nodes/rt-gateway.md) |
 | 9100/tcp | identity sync | `0.0.0.0`, motherbee only | [SY.identity](../nodes/sy-identity.md) |
+| 9200/tcp | IO.web, for the ingress' edge only (mutual TLS, a connected ingress) | `0.0.0.0`, motherbee only, once the operator starts it | [IO.web](../io/io-web.md) |
 | 22000/tcp | Syncthing | the motherbee; spokes dial it and listen on `127.0.0.1` | `SYNCTHING_SYNC_PORT_TCP` in `src/bin/sy_orchestrator.rs` |
 | 8384/tcp | Syncthing REST | `127.0.0.1` | Syncthing unit written by the orchestrator |
 | 5432/tcp | PostgreSQL | the distribution's default; `fluxbee-firstboot` uses `127.0.0.1` | `packaging/fluxbee-firstboot` |
 | `edge.listen` (e.g. 443) | SY.edge, the public door | ingress hives only | `packaging/hive.yaml.example` |
 
 The orchestrator writes no rule to `ufw` or `firewalld`. An active one is a `posture` drift alert,
-`host_firewall_active` (at boot and about every minute), since it may close 9000, 9100, 22000 or
-443 without anyone seeing it. SSH on the DMZ hosts is the product's own
+`host_firewall_active` (at boot and about every minute), since it may close 9000, 9100, 9200, 22000
+or 443 without anyone seeing it. SSH on the DMZ hosts is the product's own
 ([control-path-hardening-v1.md](../control-path-hardening-v1.md) §6):
 
 - **The ingress** accepts SSH (the ports `sshd -T` reports, IPv4 and IPv6) only from loopback, the
@@ -318,8 +319,12 @@ orchestrator). SY nodes and the router are not managed this way and cannot be la
 | config, state, status | `GET`/`PUT /hives/{hive}/nodes/{name}/config`, `GET .../state`, `GET .../status` | for an SY node or the router, `status` reads its packaged unit (`sy-<name>`, `rt-gateway`) and the router's LSA, with `config` and `state` not managed and no `status_version` (the read writes nothing); a core node this hive's role does not run answers `NODE_NOT_FOUND` |
 
 `run_node` refuses: `SY.*`/`RT.*` names; any node in the root tenant except the core IO runtimes
-`io.cloud`, `io.blob`, `io.web` (`TENANT_ROOT_NOT_ALLOWED`, `genesis_refusal`); a tenant that is
-not active; a `WF.*` node whose runtime is not a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`).
+`io.cloud`, `io.blob`, `io.web` (`TENANT_ROOT_NOT_ALLOWED`, `genesis_refusal`); a core IO runtime
+under any name but its own, `IO.cloud@motherbee`, `IO.blob@motherbee`, `IO.web@motherbee`, or one of
+those names on another runtime (`CORE_IO_NAME_MISMATCH`), and a core IO node outside the root
+tenant (`TENANT_ROOT_REQUIRED`; both `core_io_refusal`); a tenant that is not active; a `WF.*` node
+whose runtime is not a workflow package (`WF_RUNTIME_PACKAGE_REQUIRED`). Start, restart and the
+boot relaunch refuse the same root-tenant cases.
 
 **Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first):
 
@@ -495,6 +500,25 @@ expiry conditions run without `acme:` too.
 **When the motherbee is down,** nothing renews and nothing alerts. An external monitor of the
 public name's certificate expiry, run from outside the installation, covers that.
 
+## The web door
+
+The public edge serves each host `web:` declares only through io.web
+([io-web-v2](../io-web-v2.md) §11): the edge on the ingress takes the request and proxies it to
+`IO.web@motherbee`. `GET /web/status` on the motherbee shows the four pieces of the door, each a
+state, never an error ([SY.admin](../nodes/sy-admin.md#the-web-doors-status)):
+
+| Piece | Ready | Otherwise |
+| --- | --- | --- |
+| `web`: the host | `state: declared`, the host in `hosts` | `absent`: add `web: {archi: true}` to the motherbee's hive.yaml and restart SY.admin; `invalid`: `reason` says why |
+| `certificate` | `hosts_missing: []` | `POST /acme/test`, then `POST /acme/renew` ("Add a web host to the certificate" in [Certificates](#certificates-acme)). `served` is the leaf at the ACME client's last look; `GET /acme/status` asks the edge afresh |
+| `routes`: the edge's answer to the last push | `state: acknowledged`, `acknowledged_at` within the last minutes (SY.admin pushes every 60 s), and `upstream.state: ready`, the edge's way to io.web | `no_edge`: no `admin.public_edge_node` and not exactly one connected ingress (`detail` says which); `no_answer`: the edge is down or older than 0.1.84; `refused`: the edge's journal says why; `upstream.state: unavailable`: the edge has no way to io.web and answers every web host 502, `upstream.reason` says what is missing on the ingress (its mesh TLS material, `hive_id`, `wan.uplinks`), then restart `sy-edge` there. `upstream.last_failure` is the last request io.web did not answer (`at`, `kind`); the edge's journal says why (`io.web did not answer proxied requests`) |
+| `io_web` | `state: running`, `answer.health_state: HEALTHY` | `absent`: io.web starts only by an explicit launch, once ([Node lifecycle](#node-lifecycle)): `POST /hives/motherbee/nodes` with `node_name: IO.web@motherbee`, `runtime: io.web` and the root tenant as `tenant_id`; `stopped`: `start_node`; `failed` or `silent`: `journalctl -u fluxbee-node-IO.web-motherbee`, then `restart_node`; `unknown`: the orchestrator did not answer (`view_error`), retry |
+
+With all four ready, the edge's upstream included, `https://archi.<main name>/` answers io.web's
+page from outside, with a valid certificate. A recent `routes.upstream.last_failure` with
+everything else ready means io.web refused the edge or did not answer it: the edge's journal on the
+ingress and io.web's on the motherbee say why.
+
 ## Health checks
 
 | Check | What it tells |
@@ -508,12 +532,30 @@ public name's certificate expiry, run from outside the installation, covers that
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the orchestrators record (`category` `core`, `egress`, `posture`, `syncthing`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes |
+| `GET /acme/status` | the edge's certificate: ACME's configuration, the names, the open conditions ([Certificates](#certificates-acme)) |
+| `GET /web/status` | the web door: the declared host, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
 | `GET /config/storage/metrics` | SY.storage's inbox |
 | `systemctl --failed`, `journalctl -u <unit>` | per host |
 
 `lab/ops.py health [--since HH:MM]` runs on every host and passes only when all of `failed`,
 `denials`, `srcdrops`, `streamlost`, `usagelost` and `usagerej` are 0 (what each counts:
-[rt-gateway](../nodes/rt-gateway.md#what-it-logs-that-labopspy-health-counts)).
+[rt-gateway](../nodes/rt-gateway.md#what-it-logs-that-labopspy-health-counts)). Two lines from
+SY.admin follow:
+
+```text
+edge-cert  acme=on names=hive-k3m9x7q2.fluxbee.ai,archi.hive-k3m9x7q2.fluxbee.ai conditions=none
+web        host=archi.hive-k3m9x7q2.fluxbee.ai route=acknowledged upstream=ready io.web=running
+```
+
+- `edge-cert` (`GET /acme/status`): a `critical` condition fails the check.
+- `web` (`GET /web/status`): the declared host (`none` without `web:`, `invalid` for a section
+  that cannot work), the edge's answer to the routes (`routes.state`), the edge's way to io.web
+  (`routes.upstream.state`: `ready`, `unavailable`, or `unknown` when the last push was not
+  acknowledged), with the kind and time of its last failure when there is one
+  (`upstream=ready(head@2026-10-23T14:02:11Z)`), and io.web's state, with its health when it
+  reports one other than `HEALTHY` (`io.web=running(DEGRADED)`). It never fails the check: io.web
+  runs only once the operator starts it, and the edge answers again within a minute of a restart.
+
 `lab/ops.py versions` and `lab/ops.py opa-status` print the version and policy view per hive.
 
 ## Links

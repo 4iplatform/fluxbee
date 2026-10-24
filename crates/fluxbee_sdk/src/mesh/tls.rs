@@ -4,7 +4,8 @@
 //!   binds the TLS identity (cert hive_id) to the hive_id claimed in the WAN HELLO
 //!   (`server_config`, `client_config`);
 //! - **io.web:** the edge verifies io.web's cert by name (`client_config_by_name`), and io.web
-//!   admits only a hive the registry gives an admitted role (`server_config_for_roles`).
+//!   admits only a hive the registry gives an admitted role (`server_config_for_roles`), at every
+//!   handshake: neither side resumes a session.
 //!
 //! The CA key is NOT derived from the SSH key (isolation). See
 //! `docs/history/onworking-coa/wan-mtls-peer-auth.md`.
@@ -201,6 +202,12 @@ impl MeshTlsMaterial {
     /// (`peer_hive_from_cert`) `registry` gives one of `roles`, read at each handshake with the
     /// strict reading (`HiveRegistry::role`). Any other client fails inside the handshake, so the
     /// service never sees its connection.
+    ///
+    /// The role check must run on every handshake, and rustls calls the client verifier only on a
+    /// full one: a resumed session restores the client's certificate without it, so a hive the
+    /// registry removed or demoted would stay admitted until a restart. The server therefore keeps
+    /// no session and sends no TLS 1.3 ticket (nor a TLS 1.2 one, rustls' default), and every
+    /// handshake is a full one, whatever the client offers.
     pub fn server_config_for_roles(
         &self,
         registry: HiveRegistry,
@@ -214,9 +221,11 @@ impl MeshTlsMaterial {
             registry,
             roles: roles.to_vec(),
         });
-        let cfg = ServerConfig::builder()
+        let mut cfg = ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
+        cfg.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        cfg.send_tls13_tickets = 0;
         Ok(Arc::new(cfg))
     }
 
@@ -242,11 +251,13 @@ impl MeshTlsMaterial {
     /// leaf, and verify the server cert with rustls' WebPki verifier over the mesh CA, its name
     /// included. The caller connects with the server's hive id as the `ServerName`
     /// (`IO_WEB_SERVER_NAME` for io.web), which a mesh leaf carries as its SAN; any other hive's
-    /// leaf fails the handshake.
+    /// leaf fails the handshake. It never resumes a session: the service checks its client's role
+    /// only on a full handshake (`server_config_for_roles`).
     pub fn client_config_by_name(&self) -> Result<Arc<ClientConfig>, MeshTlsError> {
-        let cfg = ClientConfig::builder()
+        let mut cfg = ClientConfig::builder()
             .with_root_certificates(self.ca_roots.clone())
             .with_client_auth_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
+        cfg.resumption = rustls::client::Resumption::disabled();
         Ok(Arc::new(cfg))
     }
 }
@@ -770,6 +781,117 @@ mod tests {
                 CertificateError::ApplicationVerificationFailure
             )),
             "{err}"
+        );
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// One handshake of `client` with `server` under io.web's name, then a byte from the server,
+    /// which brings the client any ticket the server sent: how the client's handshake went.
+    async fn client_handshake_kind(
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+    ) -> rustls::HandshakeKind {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut tls = TlsAcceptor::from(server).accept(server_io).await?;
+            tls.write_all(b"y").await?;
+            tls.flush().await?;
+            Ok::<_, std::io::Error>(tls)
+        });
+        let name = rustls::pki_types::ServerName::try_from(IO_WEB_SERVER_NAME).unwrap();
+        let mut tls = TlsConnector::from(client)
+            .connect(name, client_io)
+            .await
+            .expect("handshake");
+        let mut buf = [0u8; 1];
+        tls.read_exact(&mut buf).await.expect("a byte");
+        let _server = server.await.unwrap().expect("accept");
+        tls.get_ref().1.handshake_kind().expect("a handshake")
+    }
+
+    /// A demotion holds at the hive's very next handshake, on a client configuration kept from the
+    /// first one, as the edge keeps its connector. A resumed session would restore the client's
+    /// certificate without the role check, so io.web's server keeps no session and sends no
+    /// ticket, even to a client that offers to resume, and the edge's client never offers.
+    #[tokio::test]
+    async fn a_demoted_hive_is_refused_at_its_next_handshake_on_the_same_client_config() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().unwrap();
+        let ingress = "hive_id: ingress1\nstatus: connected\nrole: ingress\njoin:\n  phase: done\n";
+        let demoted = "hive_id: ingress1\nstatus: connected\nrole: worker\njoin:\n  phase: done\n";
+        let registry = test_registry(&[("ingress1", ingress)]);
+        let info = registry.root().join("ingress1").join("info.yaml");
+        let server = material(&ca, "motherbee")
+            .server_config_for_roles(registry.clone(), &[HiveRole::Ingress])
+            .unwrap();
+        let ingress1 = material(&ca, "ingress1");
+        // A client that offers to resume, as rustls' default does.
+        let resuming = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(ingress1.ca_roots.clone())
+                .with_client_auth_cert(ingress1.leaf_chain.clone(), ingress1.leaf_key.clone_key())
+                .unwrap(),
+        );
+        for (client, label) in [
+            (
+                ingress1.client_config_by_name().unwrap(),
+                "the edge's client",
+            ),
+            (resuming, "a client that offers to resume"),
+        ] {
+            std::fs::write(&info, ingress).unwrap();
+            let (server_saw, client_saw) =
+                handshake(Arc::clone(&server), Arc::clone(&client), IO_WEB_SERVER_NAME).await;
+            assert_eq!(server_saw.expect(label), "ingress1", "{label}");
+            assert_eq!(client_saw.expect(label), "motherbee", "{label}");
+
+            std::fs::write(&info, demoted).unwrap();
+            let (server_saw, client_saw) =
+                handshake(Arc::clone(&server), client, IO_WEB_SERVER_NAME).await;
+            let err = server_saw.expect_err(label);
+            assert_eq!(
+                rustls_error(&err),
+                Some(&rustls::Error::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure
+                )),
+                "{label}: {err}"
+            );
+            let err = client_saw.expect_err(label);
+            assert_eq!(
+                rustls_error(&err),
+                Some(&rustls::Error::AlertReceived(
+                    AlertDescription::AccessDenied
+                )),
+                "{label}: {err}"
+            );
+        }
+
+        // The edge's client never offers to resume, even to a server that sends tickets (the
+        // WAN's); a client that does resumes there.
+        let wan = material(&ca, "motherbee").server_config().unwrap();
+        let named = ingress1.client_config_by_name().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client_handshake_kind(Arc::clone(&wan), Arc::clone(&named)).await,
+                rustls::HandshakeKind::Full
+            );
+        }
+        let resuming = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(ingress1.ca_roots.clone())
+                .with_client_auth_cert(ingress1.leaf_chain.clone(), ingress1.leaf_key.clone_key())
+                .unwrap(),
+        );
+        assert_eq!(
+            client_handshake_kind(Arc::clone(&wan), Arc::clone(&resuming)).await,
+            rustls::HandshakeKind::Full
+        );
+        assert_eq!(
+            client_handshake_kind(wan, resuming).await,
+            rustls::HandshakeKind::Resumed,
+            "the WAN's server resumes, so the check above is not vacuous"
         );
         let _ = std::fs::remove_dir_all(registry.root());
     }

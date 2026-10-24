@@ -123,7 +123,12 @@ same way, with `managed: false`.
    (`managed_spawn_disallowed_reason`).
 2. A node may not run in the root tenant unless it is core: `SY.*`, `RT.*`, or an `IO.*` node on
    `io.cloud`, `io.blob` or `io.web` (`is_core_node`, `genesis_refusal`:
-   `TENANT_ROOT_NOT_ALLOWED`). A tenant that is not active is refused (`TENANT_NOT_ACTIVE`).
+   `TENANT_ROOT_NOT_ALLOWED`). The mirror (`core_io_refusal`): a core IO runtime runs only as its
+   own node, `IO.cloud@motherbee`, `IO.blob@motherbee` or `IO.web@motherbee`, and none of those
+   names runs another runtime (`CORE_IO_NAME_MISMATCH`); and only in the root tenant
+   (`TENANT_ROOT_REQUIRED`). A tenant that is not active is refused (`TENANT_NOT_ACTIVE`). Start,
+   restart and the boot relaunch check the same rules (a refused node that still runs is left
+   running).
 3. A node for another hive is forwarded to that hive's orchestrator as `SPAWN_NODE`.
 4. The runtime comes from `/var/lib/fluxbee/dist/runtimes/manifest.json`; the entry point is
    `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/bin/start.sh` (`runtime_start_script`).
@@ -364,7 +369,7 @@ What the code does today:
 - **Host firewalls** (`report_active_host_firewalls`): the orchestrator writes no rule to ufw or
   firewalld. At boot and about once a minute it records a `posture` alert `host_firewall_active`
   when `ufw status` says `Status: active` or the `firewalld` unit runs, since either may close
-  9000, 9100, 22000 or 443 without anyone seeing it.
+  9000, 9100, 9200, 22000 or 443 without anyone seeing it.
 - **Loopback check** (`watchdog_listener_check`): about once a minute it runs `ss -H -tlnp` and,
   if `sy-admin` or `sy-architect` listens off loopback, logs a warning and records a `posture`
   drift alert. It changes nothing.

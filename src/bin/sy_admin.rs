@@ -40,8 +40,9 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
     MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
     MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
-    MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_EDGE_WEB_ROUTES, MSG_EDGE_WEB_ROUTES_RESPONSE, MSG_NODE_STATUS_GET,
+    MSG_NODE_STATUS_GET_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED,
+    SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -340,6 +341,8 @@ struct AdminContext {
     command_log_lock: Arc<std::sync::Mutex<()>>,
     /// The public edge's certificate (docs/acme-edge-certificates-v1.md §6, §7).
     acme: Arc<acme::AcmeService>,
+    /// The web hosts and the edge's last answer to their routes (docs/io-web-v2.md §11).
+    web: Arc<WebRoutes>,
     /// The nodes connected now, given this hive (`connected_nodes_from_shm`).
     connected_nodes: ConnectedNodes,
 }
@@ -662,7 +665,7 @@ async fn main() -> Result<(), AdminError> {
         let registry = hive_registry_for(&state_dir);
         Arc::new(move || resolve_public_edge_node_from(configured.as_deref(), &registry))
     };
-    let web_routes = Arc::new(WebRoutes::new(web.hosts, Arc::clone(&acme_edge)));
+    let web_routes = Arc::new(WebRoutes::new(web, Arc::clone(&acme_edge)));
     let acme_ca = Arc::new(acme::InstantAcmeCa::new(
         &acme_config.trust_anchor_roots(),
         acme::platform_roots,
@@ -687,7 +690,7 @@ async fn main() -> Result<(), AdminError> {
         hive_id.clone(),
     );
     tokio::spawn(Arc::clone(&acme_service).run());
-    tokio::spawn(web_routes.run(Arc::clone(&router_client)));
+    tokio::spawn(Arc::clone(&web_routes).run(Arc::clone(&router_client)));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -706,6 +709,7 @@ async fn main() -> Result<(), AdminError> {
         runtime_manifest_lock: Arc::new(Mutex::new(())),
         command_log_lock: Arc::new(std::sync::Mutex::new(())),
         acme: acme_service,
+        web: web_routes,
         connected_nodes: Arc::new(connected_nodes_from_shm),
     };
     log_registry_caller_roles(&http_ctx.hive_id, &hive_registry(&http_ctx));
@@ -859,6 +863,16 @@ impl WebConfig {
         Self { hosts, error: None }
     }
 
+    /// `declared` (with hosts), `absent` (no section, or no key set) or `invalid` (a section that
+    /// cannot work, with its error), for `GET /web/status`.
+    fn state(&self) -> &'static str {
+        match (&self.error, self.hosts.is_empty()) {
+            (Some(_), _) => "invalid",
+            (None, true) => "absent",
+            (None, false) => "declared",
+        }
+    }
+
     /// The boot log line: the declared hosts, or why a section declares nothing.
     fn log(&self) {
         match (&self.error, self.hosts.as_slice()) {
@@ -881,7 +895,8 @@ impl WebConfig {
 /// of `web:` leaves the edge at the first push after the restart. It goes to the edge ACME
 /// addresses, and the edge takes it on its TLS command channel, beside its system loop.
 struct WebRoutes {
-    hosts: Vec<String>,
+    /// `web:` as read at boot: the hosts pushed, or why none is.
+    config: WebConfig,
     edge: acme::EdgeResolver,
     timeout: Duration,
     last: std::sync::Mutex<Option<WebRoutesPush>>,
@@ -899,6 +914,18 @@ enum WebRoutesOutcome {
     NoEdge(String),
 }
 
+impl WebRoutesOutcome {
+    /// The answer's name in `GET /web/status`, and what came with it.
+    fn state(&self) -> (&'static str, Option<&str>) {
+        match self {
+            WebRoutesOutcome::Acknowledged => ("acknowledged", None),
+            WebRoutesOutcome::Refused(detail) => ("refused", Some(detail)),
+            WebRoutesOutcome::NoAnswer(detail) => ("no_answer", Some(detail)),
+            WebRoutesOutcome::NoEdge(reason) => ("no_edge", Some(reason)),
+        }
+    }
+}
+
 /// The last push, kept in memory.
 #[derive(Debug, Clone, PartialEq)]
 struct WebRoutesPush {
@@ -908,12 +935,53 @@ struct WebRoutesPush {
     since: i64,
     /// When the edge last acknowledged the set.
     acknowledged_at: Option<i64>,
+    /// The edge's proxy to io.web, as its acknowledgement of this push reports it; `None` for any
+    /// other answer.
+    upstream: Option<EdgeWebUpstream>,
+}
+
+/// The edge's proxy to io.web, from its answer to `EDGE_WEB_ROUTES`: whether it has a way to
+/// io.web, and the last request io.web did not answer. With routes acknowledged and no upstream,
+/// every web host answers 502.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct EdgeWebUpstream {
+    /// `ready`, or `unavailable` with `reason`, as the edge found it at its boot.
+    state: String,
+    reason: Option<String>,
+    last_failure: Option<EdgeWebFailure>,
+}
+
+/// The last proxied request io.web did not answer: its time and kind, nothing of the request.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct EdgeWebFailure {
+    /// Unix seconds.
+    at: i64,
+    kind: String,
+}
+
+impl EdgeWebUpstream {
+    /// The `upstream` of an acknowledgement; `None` when it has none that parses.
+    fn from_answer(payload: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(payload.get("upstream")?.clone()).ok()
+    }
+
+    /// As `GET /web/status` shows it, with RFC 3339 times.
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "reason": self.reason,
+            "last_failure": self.last_failure.as_ref().map(|failure| serde_json::json!({
+                "at": unix_rfc3339(failure.at),
+                "kind": failure.kind,
+            })),
+        })
+    }
 }
 
 impl WebRoutes {
-    fn new(hosts: Vec<String>, edge: acme::EdgeResolver) -> Self {
+    fn new(config: WebConfig, edge: acme::EdgeResolver) -> Self {
         Self {
-            hosts,
+            config,
             edge,
             timeout: WEB_ROUTES_CALL_TIMEOUT,
             last: std::sync::Mutex::new(None),
@@ -933,6 +1001,7 @@ impl WebRoutes {
     /// `EDGE_WEB_ROUTES {routes: [{host, upstream}]}`.
     fn payload(&self) -> serde_json::Value {
         let routes: Vec<serde_json::Value> = self
+            .config
             .hosts
             .iter()
             .map(|host| serde_json::json!({ "host": host, "upstream": WEB_ROUTES_UPSTREAM }))
@@ -944,8 +1013,8 @@ impl WebRoutes {
     /// whether it changed.
     async fn push_once(&self, client: &RouterDispatcher) -> (WebRoutesPush, bool) {
         let now = Utc::now().timestamp();
-        let (edge, outcome) = match (self.edge)() {
-            Err(reason) => (None, WebRoutesOutcome::NoEdge(reason)),
+        let (edge, outcome, upstream) = match (self.edge)() {
+            Err(reason) => (None, WebRoutesOutcome::NoEdge(reason), None),
             Ok(edge) => {
                 let answer = send_system_request_with_meta(
                     client,
@@ -962,23 +1031,23 @@ impl WebRoutes {
                     self.timeout,
                 )
                 .await;
-                let outcome = match answer {
-                    Ok(payload) if payload_is_ok(&payload) => WebRoutesOutcome::Acknowledged,
-                    Ok(payload) => WebRoutesOutcome::Refused(
-                        payload_error_detail(&payload).unwrap_or_else(|| payload.to_string()),
+                let (outcome, upstream) = match answer {
+                    Ok(payload) if payload_is_ok(&payload) => (
+                        WebRoutesOutcome::Acknowledged,
+                        EdgeWebUpstream::from_answer(&payload),
                     ),
-                    // A timeout's text names its own trace: stated without it, a repeated one
-                    // is the same answer.
-                    Err(err) => WebRoutesOutcome::NoAnswer(
-                        match err.downcast_ref::<fluxbee_sdk::RpcError>() {
-                            Some(rpc) if rpc.is_timeout() => {
-                                format!("no answer in {:?}", self.timeout)
-                            }
-                            _ => err.to_string(),
-                        },
+                    Ok(payload) => (
+                        WebRoutesOutcome::Refused(
+                            payload_error_detail(&payload).unwrap_or_else(|| payload.to_string()),
+                        ),
+                        None,
+                    ),
+                    Err(err) => (
+                        WebRoutesOutcome::NoAnswer(no_answer_detail(&err, self.timeout)),
+                        None,
                     ),
                 };
-                (Some(edge), outcome)
+                (Some(edge), outcome, upstream)
             }
         };
         let mut last = self
@@ -1003,6 +1072,7 @@ impl WebRoutes {
             },
             edge,
             outcome,
+            upstream,
         };
         if !same {
             self.log_change(&push, previous.as_ref());
@@ -1011,25 +1081,55 @@ impl WebRoutes {
         (push, !same)
     }
 
+    /// The routes in `GET /web/status`: the full set every push carries, the edge's answer to the
+    /// last one (`not_pushed` before the first), and the proxy's `upstream` that answer reported
+    /// (null unless it acknowledged the set).
+    fn status(&self) -> serde_json::Value {
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (state, detail) = last
+            .as_ref()
+            .map_or(("not_pushed", None), |push| push.outcome.state());
+        serde_json::json!({
+            "state": state,
+            "edge": last.as_ref().and_then(|push| push.edge.as_deref()),
+            "set": self.payload()["routes"],
+            "detail": detail,
+            "since_at": last.as_ref().map(|push| unix_rfc3339(push.since)),
+            "acknowledged_at": last
+                .as_ref()
+                .and_then(|push| push.acknowledged_at)
+                .map(unix_rfc3339),
+            "upstream": last
+                .as_ref()
+                .and_then(|push| push.upstream.as_ref())
+                .map(EdgeWebUpstream::status),
+        })
+    }
+
     fn log_change(&self, push: &WebRoutesPush, previous: Option<&WebRoutesPush>) {
         let edge = push.edge.as_deref().unwrap_or("none");
-        let hosts = if self.hosts.is_empty() {
+        let hosts = if self.config.hosts.is_empty() {
             "none".to_string()
         } else {
-            self.hosts.join(", ")
-        };
-        let rfc3339 = |at: i64| {
-            chrono::DateTime::from_timestamp(at, 0)
-                .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
-                .unwrap_or_else(|| at.to_string())
+            self.config.hosts.join(", ")
         };
         let before = previous.map_or_else(
             || "the first push".to_string(),
-            |previous| format!("{:?} since {}", previous.outcome, rfc3339(previous.since)),
+            |previous| {
+                format!(
+                    "{:?} since {}",
+                    previous.outcome,
+                    unix_rfc3339(previous.since)
+                )
+            },
         );
         let acknowledged = push
             .acknowledged_at
-            .map_or_else(|| "never".to_string(), rfc3339);
+            .map_or_else(|| "never".to_string(), unix_rfc3339);
         match &push.outcome {
             WebRoutesOutcome::Acknowledged => tracing::info!(
                 edge = %edge,
@@ -1054,7 +1154,7 @@ impl WebRoutes {
                 "the edge did not answer its web routes; pushed again every minute"
             ),
             // With no host declared there is nothing the edge misses.
-            WebRoutesOutcome::NoEdge(reason) if self.hosts.is_empty() => tracing::info!(
+            WebRoutesOutcome::NoEdge(reason) if self.config.hosts.is_empty() => tracing::info!(
                 reason = %reason,
                 before = %before,
                 "no public edge to push the (empty) web routes to"
@@ -1067,6 +1167,202 @@ impl WebRoutes {
             ),
         }
     }
+}
+
+/// Unix seconds in RFC 3339, as the status pages show times.
+fn unix_rfc3339(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| at.to_string())
+}
+
+/// Why a call got no answer. A timeout's text names its own trace: stated without it, a repeated
+/// timeout reads the same.
+fn no_answer_detail(err: &AdminError, limit: Duration) -> String {
+    match err.downcast_ref::<fluxbee_sdk::RpcError>() {
+        Some(rpc) if rpc.is_timeout() => format!("no answer in {limit:?}"),
+        _ => err.to_string(),
+    }
+}
+
+// --- The operator's view of the web door (docs/io-web-v2.md §11.2) ---------------------------
+
+/// The node io.web runs as: `IO.web@<the motherbee>`, in the root tenant. It starts only by an
+/// explicit `run_node` (`boot: false` in base-nodes.json).
+const IO_WEB_NODE: &str = "IO.web";
+/// How long `GET /web/status` waits for io.web's own NODE_STATUS_GET answer. Its other read, the
+/// orchestrator's view of the node, gets the action's timeout (`admin_action_timeout`).
+const WEB_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// What the orchestrator says of io.web (`get_node_status`).
+#[derive(Debug)]
+enum IoWebView {
+    /// It has no such node: never launched, or purged.
+    NotFound,
+    /// Its `node_status`.
+    Found(serde_json::Value),
+    /// No view: no answer in time, or an error.
+    Unavailable(String),
+}
+
+impl IoWebView {
+    /// The orchestrator's answer to `get_node_status`, asked within `limit`.
+    fn from_answer(answer: Result<serde_json::Value, AdminError>, limit: Duration) -> Self {
+        match answer {
+            Ok(payload) if payload_is_ok(&payload) => match payload.get("node_status") {
+                Some(status) if status.is_object() => IoWebView::Found(status.clone()),
+                _ => IoWebView::Unavailable(format!("an answer without node_status: {payload}")),
+            },
+            Ok(payload) if payload_error_code(&payload).as_deref() == Some("NODE_NOT_FOUND") => {
+                IoWebView::NotFound
+            }
+            Ok(payload) => IoWebView::Unavailable(
+                payload_error_detail(&payload).unwrap_or_else(|| payload.to_string()),
+            ),
+            Err(err) => IoWebView::Unavailable(no_answer_detail(&err, limit)),
+        }
+    }
+
+    fn lifecycle_state(&self) -> Option<&str> {
+        match self {
+            IoWebView::Found(status) => status
+                .get("lifecycle_state")
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        }
+    }
+}
+
+/// io.web's state in one word: `running` when it answered its NODE_STATUS_GET; otherwise the
+/// orchestrator's view, `absent` (no such node), `silent` (running, but no answer), `starting`,
+/// `stopped` or `failed`; `unknown` when the orchestrator says nothing either.
+fn io_web_state(view: &IoWebView, answered: bool) -> &'static str {
+    if answered {
+        return "running";
+    }
+    match view {
+        IoWebView::NotFound => "absent",
+        IoWebView::Unavailable(_) => "unknown",
+        IoWebView::Found(_) => match view.lifecycle_state() {
+            Some("RUNNING") => "silent",
+            Some("STARTING") => "starting",
+            Some("STOPPED") => "stopped",
+            Some("FAILED") => "failed",
+            _ => "unknown",
+        },
+    }
+}
+
+/// io.web in `GET /web/status`. Two reads, asked together, each within its limit: the
+/// orchestrator's view of `IO.web@<hive>` (whether it exists and runs, as
+/// `GET /hives/<hive>/nodes/<node>/status` reads it) and the node's own NODE_STATUS_GET answer.
+async fn io_web_status(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    view_limit: Duration,
+    probe_limit: Duration,
+) -> serde_json::Value {
+    let node = format!("{IO_WEB_NODE}@{}", ctx.hive_id);
+    let action = "get_node_status";
+    let payload = normalize_admin_payload(
+        action,
+        serde_json::json!({ "node_name": node }),
+        Some(&ctx.hive_id),
+    );
+    let request = build_admin_request(ctx, action, payload, Some(ctx.hive_id.clone()));
+    let relay = admin_node_name(&ctx.hive_id);
+    let (view, answer) = tokio::join!(
+        send_admin_request(client, request, view_limit, &relay),
+        send_system_request(
+            client,
+            &node,
+            MSG_NODE_STATUS_GET,
+            MSG_NODE_STATUS_GET_RESPONSE,
+            serde_json::json!({ "node_name": node }),
+            probe_limit,
+        ),
+    );
+    let view = IoWebView::from_answer(view, view_limit);
+    let answer = answer.map_err(|err| no_answer_detail(&err, probe_limit));
+    let found = match &view {
+        IoWebView::Found(status) => Some(status),
+        _ => None,
+    };
+    serde_json::json!({
+        "node": node,
+        "state": io_web_state(&view, answer.is_ok()),
+        "lifecycle_state": view.lifecycle_state(),
+        "runtime_version": found.and_then(|status| status.pointer("/runtime/resolved_version")),
+        "view_error": match &view {
+            IoWebView::Unavailable(detail) => Some(detail),
+            _ => None,
+        },
+        "answer": answer.as_ref().ok(),
+        "answer_error": answer.as_ref().err(),
+    })
+}
+
+/// The answer of `GET /web/status`: the hosts `web:` declares, the certificate's names as the
+/// ACME client holds them, the routes and the edge's last answer to them, and io.web.
+async fn web_status_payload(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    view_limit: Duration,
+    probe_limit: Duration,
+) -> serde_json::Value {
+    let web = &ctx.web.config;
+    serde_json::json!({
+        "now_at": unix_rfc3339(Utc::now().timestamp()),
+        "web": {
+            "state": web.state(),
+            "hosts": web.hosts,
+            "reason": web.error,
+        },
+        "certificate": ctx.acme.web_certificate(&web.hosts),
+        "routes": ctx.web.status(),
+        "io_web": io_web_status(ctx, client, view_limit, probe_limit).await,
+    })
+}
+
+/// `web_status` (docs/io-web-v2.md §11.2). It takes no parameter, and it always answers 200: no
+/// `web:`, no edge, and a missing or silent io.web are states, named in the answer.
+async fn handle_web_status(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    params: &serde_json::Value,
+) -> (u16, String) {
+    let action = "web_status";
+    if let Some(field) = unexpected_parameter(params) {
+        return (
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": format!("{action} takes no parameters (got {field})"),
+            })
+            .to_string(),
+        );
+    }
+    let payload = web_status_payload(
+        ctx,
+        client,
+        admin_action_timeout(action),
+        WEB_STATUS_PROBE_TIMEOUT,
+    )
+    .await;
+    (
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": payload,
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    )
 }
 
 fn default_admin_executor_schema_version() -> u32 {
@@ -3738,6 +4034,9 @@ enum InternalActionRoute {
     /// SY.admin's own ACME client for the public edge's certificate
     /// (docs/acme-edge-certificates-v1.md §7).
     Acme,
+    /// SY.admin's own view of the web door: the web hosts, the certificate's names, the routes
+    /// the edge acknowledged and io.web (docs/io-web-v2.md §11.2).
+    WebStatus,
 }
 
 #[derive(Clone, Copy)]
@@ -3748,7 +4047,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "15";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "16";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4384,6 +4683,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         requires_target: false,
         allow_legacy_hive_id: false,
     },
+    InternalActionSpec {
+        action: "web_status",
+        route: InternalActionRoute::WebStatus,
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
 ];
 
 /// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
@@ -4519,7 +4824,8 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "acme_status"
         | "acme_renew"
         | "acme_test"
-        | "acme_reload" => MeshAccess::Archi,
+        | "acme_reload"
+        | "web_status" => MeshAccess::Archi,
         _ => return None,
     };
     Some(access)
@@ -7063,12 +7369,23 @@ async fn dispatch_internal_admin_command(
             }
             (status, body)
         }
+        // A read, so not in the audit log.
+        InternalActionRoute::WebStatus => handle_web_status(ctx, client, &params).await,
     };
 
     Ok(InternalAdminDispatchResult {
         http_status: status,
         envelope: parse_internal_response_envelope(action, status, &body),
     })
+}
+
+/// The first field of a body sent to an action that takes none (`None` for no body or `{}`).
+fn unexpected_parameter(params: &serde_json::Value) -> Option<String> {
+    match params {
+        serde_json::Value::Null => None,
+        serde_json::Value::Object(fields) => fields.keys().next().cloned(),
+        _ => Some("a body that is not an object".to_string()),
+    }
 }
 
 /// The four actions of SY.admin's ACME client (docs/acme-edge-certificates-v1.md §7). None takes
@@ -7078,12 +7395,7 @@ async fn handle_acme_action(
     action: &str,
     params: &serde_json::Value,
 ) -> (u16, String) {
-    let unexpected = match params {
-        serde_json::Value::Null => None,
-        serde_json::Value::Object(fields) => fields.keys().next().cloned(),
-        _ => Some("a body that is not an object".to_string()),
-    };
-    let result = if let Some(field) = unexpected {
+    let result = if let Some(field) = unexpected_parameter(params) {
         Err(acme::ActionRefusal {
             http_status: 400,
             error_code: "INVALID_REQUEST",
@@ -8487,6 +8799,19 @@ async fn handle_http(
                 "acme_reload",
                 None,
                 payload,
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        // The operator's view of the web door (docs/io-web-v2.md §11.2).
+        ("GET", "/web/status") => {
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "web_status",
+                None,
+                serde_json::json!({}),
                 AdminOrigin::Http,
             )
             .await?;
@@ -11370,6 +11695,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::StreamStatus => ("stream_status", None),
         InternalActionRoute::LlmUsage => ("llm_usage", None),
         InternalActionRoute::Acme => ("acme", None),
+        InternalActionRoute::WebStatus => ("web_status", None),
     };
     serde_json::json!({
         "name": spec.action,
@@ -11706,6 +12032,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "acme_renew" => "Order the public edge's certificate now (forced: no backoff, no cap). Replaces a hand-seeded or foreign certificate, certifies a new name, and lifts an install_refused hold. Answers 202; progress in GET /acme/status.",
         "acme_test" => "Run a test order against the staging directory with the real names: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
         "acme_reload" => "Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback.",
+        "web_status" => "Read the web door: the hosts the web section declares, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state. The names come from the ACME client (the ones it certifies, and the leaf the edge served at its last look); io.web's state from the orchestrator's view of IO.web@motherbee and the node's own NODE_STATUS_GET answer.",
         _ => "Admin action.",
     }
 }
@@ -11936,6 +12263,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "acme_renew" => vec!["POST /acme/renew"],
         "acme_test" => vec!["POST /acme/test"],
         "acme_reload" => vec!["POST /acme/reload"],
+        "web_status" => vec!["GET /web/status"],
         _ => Vec::new(),
     }
 }
@@ -13444,6 +13772,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "acme_renew" => "curl -X POST /acme/renew",
         "acme_test" => "curl -X POST /acme/test",
         "acme_reload" => "curl -X POST /acme/reload",
+        "web_status" => "curl -X GET /web/status",
         _ => return None,
     };
     Some(text.to_string())
@@ -13504,7 +13833,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
             "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
-            "Only IO.cloud and IO.blob (runtimes io.cloud, io.blob) run in the root tenant. Launch any other IO.* node with the tenant it serves; in the root tenant it is refused with TENANT_ROOT_NOT_ALLOWED.",
+            "Only the core IO nodes run in the root tenant: IO.cloud, IO.blob and IO.web (runtimes io.cloud, io.blob, io.web; the orchestrator's CORE_IO_RUNTIMES). Launch any other IO.* node with the tenant it serves; in the root tenant it is refused with TENANT_ROOT_NOT_ALLOWED.",
             "A tenant that is not active (pending or suspended) starts no node: TENANT_NOT_ACTIVE.",
             "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
@@ -13819,6 +14148,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "503 EDGE_VAULT_UNAVAILABLE when the edge got no verdict from SY.vault (reason transient): nothing changed, retry later.",
             "Use it after a manual vault change or a vault rollback (POST /hives/motherbee/vault/secrets/<key>/rollback).",
             "504 EDGE_NO_ANSWER when the edge does not answer in 75 s; 502 EDGE_ERROR when it cannot run the command (not a vault edge); 409 ACME_BUSY while an ACME run is in flight.",
+        ],
+        "web_status" => vec![
+            "Motherbee-only: SY.admin answers it (docs/io-web-v2.md §11.2). Takes no body. Always 200: no web section, no edge, and a missing or silent io.web are states, named in the answer.",
+            "web.state is declared (web.hosts), absent (no web section, or no key set) or invalid (web.reason says why). hive.yaml is read at boot.",
+            "certificate.names are the names the ACME client certifies (config.names of GET /acme/status); certificate.served is the leaf the edge served at the ACME client's last look (edge.last_seen there), last_answer_at the edge's last answer, and hosts_missing the web hosts that leaf does not cover (null without a leaf). GET /acme/status asks the edge afresh.",
+            "routes.state is the edge's answer to the last push of the full set (routes.set, pushed at the start and every 60 s): acknowledged, refused, no_answer, no_edge (no admin.public_edge_node and not exactly one connected ingress; routes.detail says which) or not_pushed before the first push. acknowledged_at is the edge's last acknowledgement.",
+            "io_web.state: running (it answered NODE_STATUS_GET in 3 s: io_web.answer); otherwise the orchestrator's view (lifecycle_state, as GET /hives/motherbee/nodes/IO.web@motherbee/status reads it): silent (it runs but did not answer), starting, stopped, failed, absent (no IO.web@motherbee: it starts only with run_node, in the root tenant); unknown when neither says (view_error, answer_error).",
         ],
         _ => vec![],
     }
@@ -17458,6 +17794,8 @@ fn admin_action_timeout(action: &str) -> Duration {
         "get_llm_usage" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_USAGE_TIMEOUT_SECS").unwrap_or(20))
         }
+        // web_status: its read of the orchestrator's view of io.web (the node's own answer waits
+        // WEB_STATUS_PROBE_TIMEOUT, at the same time).
         "list_admin_actions"
         | "get_admin_action_help"
         | "hive_status"
@@ -17467,7 +17805,8 @@ fn admin_action_timeout(action: &str) -> Duration {
         | "timer_convert"
         | "timer_parse"
         | "timer_format"
-        | "list_streams" => {
+        | "list_streams"
+        | "web_status" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_TIMEOUT_SECS").unwrap_or(5))
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
@@ -20510,6 +20849,10 @@ mod tests {
             runtime_manifest_lock: Arc::new(Mutex::new(())),
             command_log_lock: Arc::new(std::sync::Mutex::new(())),
             acme: acme::tests::inert_service(&state_dir),
+            web: Arc::new(WebRoutes::new(
+                WebConfig::default(),
+                Arc::new(|| Err("no edge in the tests".to_string())),
+            )),
             connected_nodes: Arc::new(|_| Err("no shared memory in the tests".to_string())),
         };
         (ctx, harness)
@@ -23556,7 +23899,6 @@ mod tests {
             assert_eq!(admin_methods_allowed_for_path(path), vec![method]);
         }
         assert_eq!(admin_action_timeout("acme_reload"), Duration::from_secs(90));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "15");
     }
 
     #[tokio::test]
@@ -24651,7 +24993,10 @@ mod tests {
     fn web_routes(hosts: &[&str], edge: Result<&str, &str>) -> WebRoutes {
         let edge = edge.map(str::to_string).map_err(str::to_string);
         WebRoutes {
-            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            config: WebConfig {
+                hosts: hosts.iter().map(|host| host.to_string()).collect(),
+                error: None,
+            },
             edge: Arc::new(move || edge.clone()),
             timeout: Duration::from_secs(5),
             last: std::sync::Mutex::new(None),
@@ -24677,7 +25022,14 @@ mod tests {
             let ok = reply_to(
                 &sent,
                 MSG_EDGE_WEB_ROUTES_RESPONSE,
-                json!({ "status": "ok" }),
+                json!({
+                    "status": "ok",
+                    "upstream": {
+                        "state": "ready",
+                        "reason": null,
+                        "last_failure": { "at": WEB_SINCE, "kind": "connect" },
+                    },
+                }),
             );
             harness.inject(ok).await.unwrap();
         };
@@ -24686,6 +25038,18 @@ mod tests {
         assert_eq!(first.outcome, WebRoutesOutcome::Acknowledged);
         assert_eq!(first.edge.as_deref(), Some("SY.edge@ingress1"));
         assert_eq!(first.acknowledged_at, Some(first.since));
+        assert_eq!(
+            first.upstream,
+            Some(EdgeWebUpstream {
+                state: "ready".to_string(),
+                reason: None,
+                last_failure: Some(EdgeWebFailure {
+                    at: WEB_SINCE,
+                    kind: "connect".to_string(),
+                }),
+            }),
+            "the edge's proxy, kept with the push"
+        );
 
         let drive = async {
             let sent = harness.next_outgoing_within(wait).await.expect("the push");
@@ -24702,6 +25066,7 @@ mod tests {
             WebRoutesOutcome::Refused("unknown upstream".to_string())
         );
         assert_eq!(second.acknowledged_at, first.acknowledged_at);
+        assert_eq!(second.upstream, None, "only an acknowledgement reports it");
     }
 
     /// The whole answer is compared: the same refusal again is no news, another one is; a
@@ -24786,6 +25151,379 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    // --- GET /web/status (docs/io-web-v2.md §11.2) -----------------------------------------
+
+    const WEB_IO_NODE: &str = "IO.web@motherbee";
+    /// When the edge started to answer the way the last push records (Unix seconds).
+    const WEB_SINCE: i64 = 1_792_700_000;
+
+    /// How the test answers io.web's two reads: the orchestrator's view of the node and the
+    /// node's own NODE_STATUS_GET.
+    #[derive(Clone, Copy, Debug)]
+    enum IoWebScript {
+        /// The orchestrator has no IO.web@motherbee, and the router reaches no such node.
+        Absent,
+        /// The orchestrator sees it running, and it answers.
+        Running,
+        /// The orchestrator sees it running, and it does not answer.
+        Silent,
+        /// The orchestrator is still booting, and the node does not answer.
+        Unknown,
+    }
+
+    /// Answer the two reads of one `GET /web/status` as `script` says.
+    async fn answer_io_web_reads(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        script: IoWebScript,
+    ) {
+        for _ in 0..2 {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("a read of io.web");
+            if sent.meta.msg_type == "admin" {
+                assert_eq!(sent.meta.action.as_deref(), Some("get_node_status"));
+                assert_eq!(
+                    dst_of(&sent),
+                    json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+                );
+                assert_eq!(sent.payload["node_name"], WEB_IO_NODE);
+                assert_eq!(sent.payload["target"], PRIMARY_HIVE_ID);
+                let view = match script {
+                    IoWebScript::Absent => json!({
+                        "status": "error",
+                        "error_code": "NODE_NOT_FOUND",
+                        "message": "node 'IO.web@motherbee' not found",
+                    }),
+                    IoWebScript::Running | IoWebScript::Silent => json!({
+                        "status": "ok",
+                        "node_name": WEB_IO_NODE,
+                        "node_status": {
+                            "node_name": WEB_IO_NODE,
+                            "lifecycle_state": "RUNNING",
+                            "health_state": "HEALTHY",
+                            "runtime": { "name": "io.web", "resolved_version": "0.1.85" },
+                        },
+                    }),
+                    IoWebScript::Unknown => json!({
+                        "status": "error",
+                        "error_code": "ORCHESTRATOR_BOOTING",
+                        "message": "the orchestrator is still booting; retry shortly",
+                    }),
+                };
+                let mut answer = reply_to(&sent, "", view);
+                answer.meta.msg_type = "admin".to_string();
+                answer.meta.msg = None;
+                harness.inject(answer).await.unwrap();
+            } else {
+                assert_eq!(sent.meta.msg.as_deref(), Some(MSG_NODE_STATUS_GET));
+                assert_eq!(dst_of(&sent), json!(WEB_IO_NODE));
+                let answer = match script {
+                    IoWebScript::Absent => Some(reply_to(
+                        &sent,
+                        MSG_UNREACHABLE,
+                        json!({ "reason": "NODE_NOT_FOUND", "original_dst": WEB_IO_NODE }),
+                    )),
+                    IoWebScript::Running => Some(reply_to(
+                        &sent,
+                        MSG_NODE_STATUS_GET_RESPONSE,
+                        json!({
+                            "status": "ok",
+                            "health_state": "HEALTHY",
+                            "lifecycle_state": "CONFIGURED",
+                        }),
+                    )),
+                    IoWebScript::Silent | IoWebScript::Unknown => None,
+                };
+                if let Some(answer) = answer {
+                    harness.inject(answer).await.unwrap();
+                }
+            }
+        }
+    }
+
+    /// One `GET /web/status` payload, with io.web's reads answered as `script` says; the node's
+    /// own answer is waited for 100 ms.
+    async fn web_status_with(
+        ctx: &AdminContext,
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        script: IoWebScript,
+    ) -> Value {
+        let status = web_status_payload(
+            ctx,
+            &ctx.rpc,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        let (payload, ()) = tokio::join!(status, answer_io_web_reads(harness, script));
+        payload
+    }
+
+    fn with_last_push(routes: WebRoutes, push: Option<WebRoutesPush>) -> Arc<WebRoutes> {
+        *routes.last.lock().unwrap() = push;
+        Arc::new(routes)
+    }
+
+    /// The routes as the edge last answered them: acknowledged (with the edge's proxy, ready or
+    /// not), refused, not pushed yet, and no edge to push them to. Each with the full set the
+    /// pushes carry.
+    #[tokio::test]
+    async fn the_web_status_names_the_edges_last_answer_to_the_routes() {
+        let (mut ctx, mut harness) = opa_test_admin("web-status-routes");
+        let set = json!([{ "host": WEB_ARCHI, "upstream": "io.web" }]);
+        let edge = "SY.edge@ingress1";
+        let acknowledged_at = WEB_SINCE + 600;
+        let failed_at = WEB_SINCE + 300;
+        let acknowledged = |upstream: EdgeWebUpstream| WebRoutesPush {
+            edge: Some(edge.to_string()),
+            outcome: WebRoutesOutcome::Acknowledged,
+            since: WEB_SINCE,
+            acknowledged_at: Some(acknowledged_at),
+            upstream: Some(upstream),
+        };
+        let no_material = "mesh TLS material in /var/lib/fluxbee/tls/ingress1: io: not found";
+        for (push, state, detail, last_acknowledged, upstream) in [
+            (
+                Some(acknowledged(EdgeWebUpstream {
+                    state: "ready".to_string(),
+                    reason: None,
+                    last_failure: Some(EdgeWebFailure {
+                        at: failed_at,
+                        kind: "handshake".to_string(),
+                    }),
+                })),
+                "acknowledged",
+                None,
+                Some(acknowledged_at),
+                json!({
+                    "state": "ready",
+                    "reason": null,
+                    "last_failure": { "at": unix_rfc3339(failed_at), "kind": "handshake" },
+                }),
+            ),
+            // The routes acknowledged, and no way to io.web: every web host answers 502.
+            (
+                Some(acknowledged(EdgeWebUpstream {
+                    state: "unavailable".to_string(),
+                    reason: Some(no_material.to_string()),
+                    last_failure: None,
+                })),
+                "acknowledged",
+                None,
+                Some(acknowledged_at),
+                json!({ "state": "unavailable", "reason": no_material, "last_failure": null }),
+            ),
+            (
+                Some(WebRoutesPush {
+                    edge: Some(edge.to_string()),
+                    outcome: WebRoutesOutcome::Refused("unknown upstream".to_string()),
+                    since: WEB_SINCE,
+                    acknowledged_at: Some(acknowledged_at),
+                    upstream: None,
+                }),
+                "refused",
+                Some("unknown upstream"),
+                Some(acknowledged_at),
+                Value::Null,
+            ),
+            (None, "not_pushed", None, None, Value::Null),
+            (
+                Some(WebRoutesPush {
+                    edge: None,
+                    outcome: WebRoutesOutcome::NoEdge("no connected ingress hive".to_string()),
+                    since: WEB_SINCE,
+                    acknowledged_at: None,
+                    upstream: None,
+                }),
+                "no_edge",
+                Some("no connected ingress hive"),
+                None,
+                Value::Null,
+            ),
+        ] {
+            let pushed = push.is_some();
+            let edge_of_push = push.as_ref().and_then(|push| push.edge.clone());
+            ctx.web = with_last_push(web_routes(&[WEB_ARCHI], Ok(edge)), push);
+            let payload = web_status_with(&ctx, &mut harness, IoWebScript::Absent).await;
+            let routes = &payload["routes"];
+            assert_eq!(routes["state"], state, "{payload}");
+            assert_eq!(routes["set"], set, "{state}");
+            assert_eq!(routes["edge"], json!(edge_of_push), "{state}");
+            assert_eq!(routes["detail"], json!(detail), "{state}");
+            assert_eq!(
+                routes["since_at"],
+                json!(pushed.then(|| unix_rfc3339(WEB_SINCE))),
+                "{state}"
+            );
+            assert_eq!(
+                routes["acknowledged_at"],
+                json!(last_acknowledged.map(unix_rfc3339)),
+                "{state}"
+            );
+            assert_eq!(routes["upstream"], upstream, "{state}");
+            assert_eq!(payload["web"]["state"], "declared");
+            assert_eq!(payload["web"]["hosts"], json!([WEB_ARCHI]));
+        }
+    }
+
+    /// io.web absent, running and silent, and unknown when neither read says: each a state, never
+    /// an error.
+    #[tokio::test]
+    async fn the_web_status_names_io_webs_state() {
+        let (ctx, mut harness) = opa_test_admin("web-status-io-web");
+        let absent = web_status_with(&ctx, &mut harness, IoWebScript::Absent).await;
+        let io_web = &absent["io_web"];
+        assert_eq!(io_web["node"], WEB_IO_NODE);
+        assert_eq!(io_web["state"], "absent", "{absent}");
+        assert_eq!(io_web["lifecycle_state"], Value::Null);
+        assert_eq!(io_web["view_error"], Value::Null, "no node is no error");
+        assert_eq!(io_web["answer"], Value::Null);
+        assert!(
+            io_web["answer_error"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("NODE_NOT_FOUND")),
+            "{io_web}"
+        );
+
+        let running = web_status_with(&ctx, &mut harness, IoWebScript::Running).await;
+        let io_web = &running["io_web"];
+        assert_eq!(io_web["state"], "running", "{running}");
+        assert_eq!(io_web["lifecycle_state"], "RUNNING");
+        assert_eq!(io_web["runtime_version"], "0.1.85");
+        assert_eq!(io_web["answer"]["health_state"], "HEALTHY");
+        assert_eq!(io_web["answer_error"], Value::Null);
+
+        let silent = web_status_with(&ctx, &mut harness, IoWebScript::Silent).await;
+        let io_web = &silent["io_web"];
+        assert_eq!(io_web["state"], "silent", "{silent}");
+        assert_eq!(io_web["lifecycle_state"], "RUNNING");
+        assert_eq!(io_web["answer"], Value::Null);
+        assert_eq!(io_web["answer_error"], "no answer in 100ms");
+
+        let unknown = web_status_with(&ctx, &mut harness, IoWebScript::Unknown).await;
+        let io_web = &unknown["io_web"];
+        assert_eq!(io_web["state"], "unknown", "{unknown}");
+        assert!(
+            io_web["view_error"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("booting")),
+            "{io_web}"
+        );
+    }
+
+    /// The node's own answer says it runs, whatever the orchestrator; without it, the
+    /// orchestrator's lifecycle names the state.
+    #[test]
+    fn io_webs_state_comes_from_its_answer_then_from_the_orchestrator() {
+        let found = |lifecycle: &str| IoWebView::Found(json!({ "lifecycle_state": lifecycle }));
+        for (view, answered, state) in [
+            (found("STOPPED"), true, "running"),
+            (
+                IoWebView::Unavailable("no answer".to_string()),
+                true,
+                "running",
+            ),
+            (found("RUNNING"), false, "silent"),
+            (found("STARTING"), false, "starting"),
+            (found("STOPPED"), false, "stopped"),
+            (found("FAILED"), false, "failed"),
+            (found("UNKNOWN"), false, "unknown"),
+            (IoWebView::NotFound, false, "absent"),
+            (
+                IoWebView::Unavailable("no answer".to_string()),
+                false,
+                "unknown",
+            ),
+        ] {
+            assert_eq!(io_web_state(&view, answered), state, "{view:?} {answered}");
+        }
+    }
+
+    /// Through the dispatcher, as the HTTP route reaches it: 200 with every part, without `web:`
+    /// and with no edge; a parameter is refused.
+    #[tokio::test]
+    async fn web_status_answers_200_without_web_and_without_an_edge() {
+        let (ctx, mut harness) = opa_test_admin("web-status-dispatch");
+        let status = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "web_status",
+            None,
+            json!({}),
+            AdminOrigin::Http,
+        );
+        let (result, ()) = tokio::join!(
+            status,
+            answer_io_web_reads(&mut harness, IoWebScript::Running)
+        );
+        let result = result.expect("answered");
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        let payload = &result.envelope["payload"];
+        assert_eq!(result.envelope["status"], "ok");
+        assert_eq!(
+            payload["web"],
+            json!({ "state": "absent", "hosts": [], "reason": null })
+        );
+        assert_eq!(payload["certificate"]["acme"], "absent");
+        assert_eq!(payload["routes"]["state"], "not_pushed");
+        assert_eq!(payload["routes"]["set"], json!([]));
+        assert_eq!(payload["io_web"]["state"], "running");
+        assert!(payload["now_at"].is_string());
+
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "web_status",
+            None,
+            json!({ "host": WEB_ARCHI }),
+            AdminOrigin::Http,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 400);
+        assert_eq!(refused.envelope["error_code"], "INVALID_REQUEST");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The web section's state: declared, absent, or invalid (with its reason) when it cannot
+    /// work.
+    #[test]
+    fn the_web_sections_state_is_declared_absent_or_invalid() {
+        assert_eq!(WebConfig::default().state(), "absent");
+        let declared = WebConfig::from_hive(Some(&web_section("archi: true")), Some(WEB_BASE_URL));
+        assert_eq!(declared.state(), "declared");
+        let invalid = WebConfig::from_hive(Some(&web_section("archie: true")), Some(WEB_BASE_URL));
+        assert_eq!(invalid.state(), "invalid");
+        assert!(invalid.error.is_some());
+    }
+
+    /// `web_status` is in the catalog like `acme_status`: a read, with its route, help and
+    /// example, and over the mesh for Archi alone.
+    #[test]
+    fn the_web_status_action_is_registered_with_its_contract() {
+        let spec = resolve_internal_action_spec("web_status").expect("web_status");
+        assert!(matches!(spec.route, InternalActionRoute::WebStatus));
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], true);
+        assert_eq!(doc["confirmation_required"], false);
+        assert_eq!(doc["path_patterns"], json!(["GET /web/status"]));
+        assert_ne!(doc["summary"], "Admin action.");
+        assert!(!admin_action_request_notes("web_status").is_empty());
+        assert_eq!(
+            admin_action_example_scmd("web_status").as_deref(),
+            Some("curl -X GET /web/status")
+        );
+        assert_eq!(admin_methods_allowed_for_path("/web/status"), vec!["GET"]);
+        assert_eq!(mesh_access("web_status"), Some(MeshAccess::Archi));
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"web_status"));
+        // The orchestrator's view, which itself waits up to 2 s for the node's answer.
+        assert_eq!(admin_action_timeout("web_status"), Duration::from_secs(5));
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "16");
     }
 
     // --- A-81: a producer's blob reaches the motherbee before its curate -------------------

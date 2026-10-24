@@ -26,7 +26,7 @@ registers them in SY.identity (`ILK_REGISTER`).
 - **Root tenant:** nobody registers there. If the case belongs to the root tenant, it answers
   `TENANT_NOT_REGISTRABLE` (`error_code` `TENANT_ROOT_NOT_REGISTRABLE`) without calling SY.identity
   or the LLM, and the person stays temporary. SY.identity rejects the same for any caller.
-  Only io.cloud and io.blob run in the root tenant, and neither of them provisions people there (operator
+  Only io.cloud, io.blob and io.web run in the root tenant, and none of them provisions people there (operator
   decision 2026-10-02): this answer stays as defense in depth.
 - **Vouched and claimed emails** (`docs/control-path-hardening-v1.md` §7): only a handoff's own
   `subject.email` is vouched, and it goes in `identification.email`; the case keeps it, out of the LLM's reach,

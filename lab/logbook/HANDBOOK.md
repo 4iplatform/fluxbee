@@ -992,7 +992,7 @@ DELETE /hives/{h}/nodes/{n}@{h}   -d '{"purge_instance":true}'
 POST   /hives/{h}/nodes                 # run_node — tenant_id is MANDATORY: the one the node had
   {"node_name":"IO.api.acme","runtime":"io.api","runtime_version":"current",
    "tenant_id":"tnt:<the node's tenant>"}
-# The root tenant (tnt:00000000-0000-0000-0000-000000000001) is only valid for IO.cloud and IO.blob:
+# The root tenant (tnt:00000000-0000-0000-0000-000000000001) is only valid for IO.cloud, IO.blob and IO.web:
 # any other IO node there gets TENANT_ROOT_NOT_ALLOWED (A-43).
 ```
 

@@ -82,8 +82,8 @@ nodes already registered; no other role may run it. Only `SY.*` names are accept
 (`HIVE_YAML_NON_SY_LIFECYCLE_NODES` in `crates/fluxbee_sdk/src/managed_node.rs` is empty).
 
 Some binaries also check the role themselves. SY.admin and SY.storage exit unless the role is
-`motherbee`. SY.identity refuses any role but `motherbee` and `worker`. IO.cloud and IO.blob refuse
-to run off the motherbee. SY.edge opens its public port only when the role is `ingress`
+`motherbee`. SY.identity refuses any role but `motherbee` and `worker`. IO.cloud, IO.blob and IO.web
+refuse to run off the motherbee. SY.edge opens its public port only when the role is `ingress`
 (`resolve_http_listen` in `src/bin/sy_edge.rs`).
 
 ### 2.3 How a hive is created
@@ -237,7 +237,9 @@ AI, IO and WF nodes are managed: the orchestrator launches them from runtimes.
 - **Instances.** `run_node` (`POST /hives/{hive}/nodes`, `run_node_flow`) creates one. For another
   hive, the motherbee's orchestrator forwards the request. On the target hive it:
   1. refuses a node that is not core in the root tenant (`genesis_refusal`,
-     `TENANT_ROOT_NOT_ALLOWED`) and a node whose tenant is not active (`tenant_gate_refusal`);
+     `TENANT_ROOT_NOT_ALLOWED`), a core IO runtime anywhere but as its own node in the root tenant
+     (`core_io_refusal`: `CORE_IO_NAME_MISMATCH`, `TENANT_ROOT_REQUIRED`) and a node whose tenant
+     is not active (`tenant_gate_refusal`);
   2. resolves the runtime version (`current` by default) and its `bin/start.sh`
      (`resolve_runtime_spawn_entrypoint`);
   3. registers the node's ILK with SY.identity on the motherbee (`ILK_REGISTER`,
@@ -267,14 +269,15 @@ the `boot: true` ones. Its `singletons` list is empty: IO.blob and IO.cloud are 
 | `io.cloud` | `io-cloud` | yes, as `IO.cloud@motherbee` |
 | `io.slack` | `io-slack` | no |
 | `io.wapp` | `io-wapp` | no |
+| `io.web` | `io-web` | no: the operator starts `IO.web@motherbee` ([io-web.md](../io/io-web.md)) |
 | `ai.generic` | `ai_node_runner` | no |
 | `wf.engine` | `wf-generic` (Go) | no |
 | `io.linkedhelper` | `io-linkedhelper` | no |
 
 Only the core runs in the root tenant (`tnt:00000000-0000-0000-0000-000000000001`,
 `DEFAULT_ROOT_TENANT_ID` in `crates/fluxbee_sdk/src/identity.rs`): `SY.*`, `RT.*` and the IO
-runtimes `io.cloud`, `io.blob` and `io.web` (`is_core_node`, `CORE_IO_RUNTIMES`; `io.web` is not
-built yet). Every other node is launched for a tenant.
+runtimes `io.cloud`, `io.blob` and `io.web` (`is_core_node`, `CORE_IO_RUNTIMES`). Every other node
+is launched for a tenant.
 
 ## 4. Routers
 
@@ -458,11 +461,14 @@ otherwise the edge fetches its TLS certificate and key from SY.vault (`edge.tls_
 | `/e/<ich>`, `/e/<ich>/...` | An externalized channel. The edge starts with no rows; SY.admin opens each one with `EDGE_OPEN_URL` (admin action `externalize`, `handle_externalize` in `src/bin/sy_admin.rs`). A row maps the channel's ICH to its owner node, the message family, the allowed methods and the auth mode (public or shared secret). The edge forwards the request by name to the owner, an `IO.*` node, and waits for its reply (`HANDLER_TIMEOUT_MS`, default 30 s). Rows persist in `/etc/fluxbee/edge.endpoints.json`. |
 | `/public/<key>` | A public artifact, `GET` or `HEAD`, where `<key>` is 64 lowercase hex characters (`serve_public_artifact`). On the motherbee, SY.admin has IO.blob copy the bytes into `blob/public/` (`BLOB_CURATE`), Syncthing carries that folder to the ingress, and SY.admin registers the key on the edge (`EDGE_PUBLISH_BLOB`). An expired key answers 404. |
 | `/healthz` | Liveness. |
+| any path on a web host | A host SY.admin declares (`archi.<id>`, `EDGE_WEB_ROUTES`) goes to io.web, never to the routes above (`WebProxy::forward`, [io-web-v2](../io-web-v2.md) §11). The edge dials `IO.web@motherbee` itself: TCP to the host of its first `wan.uplinks` on port 9200 (`IO_WEB_PORT`), mutual TLS over the mesh CA with io.web's name verified, one connection per request. io.web admits only a hive the registry lists as a connected ingress ([io.web](../io/io-web.md)). |
 
-The router fences the edge: only `SY.admin@motherbee` may command it, and its data path runs only to
-and from `IO.*` nodes and never carries system messages (`vpn_allows_between`,
-`edge_service_control_allowed`, `edge_data_path_allowed`, `edge_vault_read_allowed`). Design and
-history: [edge-ingress-spec-v6.md](../edge-ingress-spec-v6.md).
+The router fences the edge: only `SY.admin@motherbee` may command it, and its data path over the
+router runs only to and from `IO.*` nodes and never carries system messages (`vpn_allows_between`,
+`edge_service_control_allowed`, `edge_data_path_allowed`, `edge_vault_read_allowed`). The proxy to
+io.web is the one path that does not cross the router: a direct mTLS TCP connection from the
+ingress to the motherbee's port 9200. Design and history:
+[edge-ingress-spec-v6.md](../edge-ingress-spec-v6.md).
 
 ### 6.2 IO.cloud, the relay for Fluxbee Cloud
 
@@ -579,6 +585,7 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
 | --- | --- | --- | --- |
 | 9000/tcp | motherbee | `rt-gateway`, `wan.listen` | WAN; spokes dial it; transport per `wan.mtls` (§5.1) |
 | 9100/tcp | motherbee | SY.identity, `0.0.0.0:<identity.sync.port>` | identity replicas; per-hive HMAC (§5.3) |
+| 9200/tcp | motherbee | IO.web, `0.0.0.0:9200` (`IO_WEB_PORT`) | the edge's proxy, from the ingress only: mutual TLS, a client the registry lists as a connected ingress (§6.1) |
 | 22000/tcp | motherbee; spokes on 127.0.0.1 after the stage-3 switch | Syncthing | software and blobs (§5.4) |
 | 443/tcp | ingress | SY.edge, `edge.listen` | the public HTTPS door (§6.1) |
 | 8080/tcp | motherbee, 127.0.0.1 | SY.admin | no authentication |
@@ -589,8 +596,8 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
 
 Nodes and routers inside a hive talk over Unix sockets and shared memory, never TCP. Every
 Syncthing link is TCP and a spoke only dials. The orchestrator writes no rule to ufw or firewalld;
-an active one is a `host_firewall_active` posture alert, since it may close 9000, 9100, 22000 or
-443. The DMZ hosts filter SSH with tables of their own ([control-path hardening
+an active one is a `host_firewall_active` posture alert, since it may close 9000, 9100, 9200, 22000
+or 443. The DMZ hosts filter SSH with tables of their own ([control-path hardening
 §6](../control-path-hardening-v1.md)): the ingress accepts it only from loopback, the motherbee's
 address in its `wan.uplinks` and `ingress.ssh_allow_from` (`inet fluxbee_ingress`,
 `reconcile_ingress_ssh`; an input that fails keeps the rules in force), and the egress drops it on

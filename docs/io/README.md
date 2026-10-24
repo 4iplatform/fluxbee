@@ -7,6 +7,7 @@ This folder contains the active IO contracts used by this repository.
 - [io-nodes-spec.md](io-nodes-spec.md): the IO node model
 - [io-common.md](io-common.md): what every IO node shares
 - [io-api-node-spec.md](io-api-node-spec.md): IO.api, the HTTP channel for API partners
+- [io-web.md](io-web.md): IO.web, the motherbee's web node behind the edge
 - [io-slack.md](io-slack.md), [io-slack-deploy-runbook.md](io-slack-deploy-runbook.md),
   [io-slack-tasks.md](io-slack-tasks.md): IO.slack
 - [io-linked-helper-adapter-specs.md](io-linked-helper-adapter-specs.md),
@@ -20,6 +21,7 @@ This folder contains the active IO contracts used by this repository.
 
 - `IO.slack`
 - `IO.api`
+- `IO.web`
 - shared `io-common`
 
 ## Canonical rules
@@ -42,6 +44,9 @@ When an imported/historical note conflicts with these specs, the current runtime
 - Production node-to-router integration in this repo uses `fluxbee_sdk` + Unix sockets.
 - `IO.api` never binds a TCP listener. Public HTTP terminates at `SY.edge` and reaches the instance
   as an authenticated Edge message over the router socket.
+- `IO.web` is the one IO node with a TCP listener: `SY.edge` proxies its web hosts to it over the
+  mesh's mutual TLS, on the motherbee's internal leg ([io-web.md](io-web.md)). Public HTTP still
+  terminates at `SY.edge`.
 - Provider-specific outbound transports remain adapter-owned only when their active spec says so.
 
 ## Known Issue / Troubleshooting

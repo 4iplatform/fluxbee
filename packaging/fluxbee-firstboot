@@ -116,9 +116,10 @@ fi
 
 echo "== [6/6] spawn base node instances (running, degraded until configured) =="
 # Auto-spawn one default instance of each boot=true runtime at the root tenant: the system IO
-# nodes (IO.cloud, IO.blob), the only IO nodes that run there (FINDINGS A-43). They come up
-# RUNNING but degraded/unconfigured until the operator configures them. Every other runtime
-# (io.api, io.wapp, io.slack, ai.generic, ...) is baked but not started: a tenant launches it.
+# nodes (IO.cloud, IO.blob). The only other IO node that runs there is IO.web, which the
+# operator starts (boot=false; FINDINGS A-43). They come up RUNNING but degraded/unconfigured
+# until the operator configures them. Every other runtime (io.api, io.wapp, io.slack,
+# ai.generic, ...) is baked but not started: a tenant launches it.
 while IFS=$'\t' read -r rt inst; do
   [ -n "$rt" ] && [ -n "$inst" ] || continue
   body="{\"node_name\":\"$inst\",\"runtime\":\"$rt\",\"runtime_version\":\"current\",\"tenant_id\":\"$ROOT_TENANT\"}"
@@ -151,6 +152,11 @@ cat <<EOF
     WhatsApp: resource_type "whatsapp", {access_token, app_secret, verify_token}, plus ONE
     edge endpoint for the Meta app with the family glob "IO.wapp.*@$HIVE_ID" and each node's
     io.phone_number_id set via CONFIG_SET (one IO.wapp.<label> node per number).
+
+  - IO.web, the web node behind the edge (docs/io/io-web.md), is not started here either. Once
+    hive.yaml declares a web host (web:), start it once, in the root tenant:
+      curl -sS -X POST $ADMIN/hives/$HIVE_ID/nodes -H 'content-type: application/json' \\
+        -d '{"node_name":"IO.web@$HIVE_ID","runtime":"io.web","runtime_version":"current","tenant_id":"$ROOT_TENANT"}'
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 

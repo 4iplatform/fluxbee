@@ -184,11 +184,17 @@ system_nodes:
 # owner_node MUST be the edge's fully-qualified name so the dedicated-owner read
 # authorizes (the edge has no identity SHM; authz is by its deterministic ilk). The
 # name must start with "edge_tls".
+# The web hosts (`web:` on the motherbee) go through the edge to io.web on the motherbee: the
+# host of this hive's wan.uplinks[0], port 9200, over the mesh's mutual TLS with the material in
+# /var/lib/fluxbee/tls/<hive_id> (docs/nodes/sy-edge.md, "The proxy to io.web").
+# web_max_inflight caps the requests in flight to io.web, each with its own connection to the
+# motherbee until its response ends; one more gets a quick 503 (default 128; 0 turns it off).
 # edge:
 #   listen: "0.0.0.0:443"
 #   tls_vault_key: "edge_tls"
 #   vault_hive: "motherbee"
 #   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
+#   web_max_inflight: 128
 
 # --- ingress (root-level section; only used when role: ingress) -----------------------
 # The ingress takes SSH only from loopback, the motherbee (its address in wan.uplinks) and the

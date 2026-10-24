@@ -492,7 +492,7 @@ Defaults shown are sized for a moderate deployment. Document scaling guidance in
 
 On a `role: egress` host, **nftables is the single firewall backend for both inbound and egress**. The orchestrator does not use `ufw` on egress hosts: the inbound port rules (WAN/identity) that other roles opened via `ufw` before 0.1.83 are instead expressed in the same Fluxbee-owned nftables ruleset on the egress host. This avoids two backends managing forwarding/inbound policy on the same host, and the contradiction of disabling `ufw` while still depending on it for inbound ports.
 
-`nft` must be present on an egress host; if absent, provisioning fails loud (no silent fallback to ufw/iptables). Since 0.1.83 no role writes ufw or firewalld rules; when either is active, the orchestrator raises the posture alert `host_firewall_active`, since it may close 9000, 9100, 22000 or 443 ([control-path hardening](control-path-hardening-v1.md) §6).
+`nft` must be present on an egress host; if absent, provisioning fails loud (no silent fallback to ufw/iptables). Since 0.1.83 no role writes ufw or firewalld rules; when either is active, the orchestrator raises the posture alert `host_firewall_active`, since it may close 9000, 9100, 9200, 22000 or 443 ([control-path hardening](control-path-hardening-v1.md) §6).
 
 ---
 

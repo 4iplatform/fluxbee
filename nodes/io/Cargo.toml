@@ -9,6 +9,7 @@ members = [
   "io-sim",
   "io-slack",
   "io-wapp",
+  "io-web",
 ]
 
 [workspace.package]
@@ -27,9 +28,14 @@ result_large_err = "allow"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["multipart"] }
+bytes = "1"
 fluxbee-sdk = { path = "../../crates/fluxbee_sdk" }
 futures-util = "0.3"
 hmac = "0.12"
+http-body-util = "0.1"
+# io.web's HTTP/1 server, as the edge serves its door: hyper's builder with its head-read timer.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 nix = { version = "0.28", features = ["fs"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
@@ -38,6 +44,9 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "io-util", "sync"] }
+# io.web's mesh mutual TLS: the version and features the root workspace and fluxbee_sdk::mesh
+# declare, so `ring` stays the only provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "url"] }

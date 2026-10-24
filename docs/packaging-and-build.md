@@ -54,13 +54,16 @@ Defined in `packaging/base-nodes.json`:
 | io.api | runtime | baked in, NOT at boot: each API (`IO.api.<label>`) is launched by the tenant that needs it, with its tenant |
 | io.slack | runtime | baked in, NOT at boot: each Slack binding is launched by the tenant that needs it, with its tenant |
 | io.wapp | runtime | baked in, NOT at boot: each WhatsApp number (`IO.wapp.<label>`) is launched by its tenant |
+| io.web | runtime (core IO) | baked in, NOT at boot: the operator starts `IO.web@motherbee` once, in the root tenant ([io-web.md](io/io-web.md)) |
 | ai.generic | runtime | baked in, NOT at boot: the `AI.*` instances are created with `run_node` when they are needed |
 | wf.engine | runtime | baked in, NOT at boot — the WF.* nodes are spawned from a **workflow package** that runs on this runtime, not by `run_node` on the bare runtime (that gives `WF_RUNTIME_PACKAGE_REQUIRED`) |
 | io.linkedhelper | runtime | baked in, NOT at boot (a tenant launches it on demand) |
 
-Only IO.cloud and IO.blob start with the install, and they are the only IO nodes that run in the
-root tenant `tnt:00000000-0000-0000-0000-000000000001` (operator decision 2026-10-02, A-43).
-They start **running but degraded** until the operator configures them. The other IO runtimes
+Only IO.cloud and IO.blob start with the install, in the root tenant
+`tnt:00000000-0000-0000-0000-000000000001` (operator decision 2026-10-02, A-43).
+They start **running but degraded** until the operator configures them. IO.web, the third IO node
+of the root tenant, starts only when the operator launches it there with `run_node`
+([io-web-v2](io-web-v2.md) §11.2). The other IO runtimes
 stay baked in and spawnable: a tenant launches them (or an operator, for that tenant) with `run_node`.
 In the root tenant (the genesis one) only the core is born: the SY.\*, the RT.\* and the core IO nodes (io.cloud,
 io.blob, io.web). The orchestrator defines this and rejects any other node there (IO, AI or WF) with
@@ -210,9 +213,10 @@ vault**), reconnects the consumers and auto-spawns in the root tenant the boot m
 (IO.blob/IO.cloud). When it finishes it prints the **next steps**.
 
 After the firstboot these are left **running**: the `SY.*` core + IO.blob + IO.cloud, **degraded**
-until they are configured. (io.api, io.wapp, io.slack, io.linkedhelper, `ai.generic` and `wf.engine` stay
-**baked in but NOT at boot** — `boot:false` in `base-nodes.json`; their instances are created on
-demand, and the IO ones from their tenant.)
+until they are configured. (io.api, io.wapp, io.slack, io.linkedhelper, io.web, `ai.generic` and
+`wf.engine` stay **baked in but NOT at boot** — `boot:false` in `base-nodes.json`; their instances
+are created on demand: the IO channel ones from their tenant, IO.web by the operator in the root
+tenant.)
 
 A hive installed before 0.1.56 may have `IO.api@motherbee` and `IO.wapp.default@motherbee` in
 the root tenant. The orchestrator no longer starts, restarts or relaunches them at boot

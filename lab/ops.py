@@ -14,7 +14,8 @@ Commands
   versions                         core version and manifest hash per hive
   opa-status [HIVE...]             user OPA policy per hive: version, in_sync, published, router
   health [--since HH:MM]           per VM: failed units, gate denials, routing.src drops, records
-                                   the router stream lost, usage records lost or rejected (UTC)
+                                   the router stream lost, usage records lost or rejected (UTC);
+                                   then the edge certificate (edge-cert) and the web door (web)
   build VERSION [--wait]           pull and build the .deb on the build VM (log /root/build-V.log)
   publish VERSION                  publish the built .deb to the apt repo on the build VM
   deploy VERSION --snapshot NAME [--drop OLD]
@@ -206,7 +207,9 @@ def health(since):
         print("%-10s %s" % (hive, rows.get(hive, "no answer")))
         ok = ok and rows.get(hive, "") == (
             "failed=0 denials=0 srcdrops=0 streamlost=0 usagelost=0 usagerej=0")
-    return certificate_health() and ok
+    certificate_ok = certificate_health()
+    web_health()
+    return certificate_ok and ok
 
 
 def certificate_health():
@@ -226,6 +229,29 @@ def certificate_health():
         ",".join(c.get("kind", "?") for c in conditions) or "none",
         " CRITICAL" if critical else ""))
     return not critical
+
+
+def web_health():
+    """The web door (GET /web/status, docs/io-web-v2.md §11.2): the declared host, the edge's
+    answer to the web routes, the edge's way to io.web (`unknown` unless the last push was
+    acknowledged) with the kind and time of its last failure, and io.web's state with its health
+    when it is not HEALTHY. It never fails the health check: io.web runs only once the operator
+    starts it, and the edge answers again within a minute of a restart."""
+    reply = admin("GET", "/web/status", timeout=15)
+    body = reply.get("payload")
+    if not isinstance(body, dict) or "io_web" not in body:
+        print("%-10s %s" % ("web", reply.get("error_code") or reply.get("raw", "")[:60] or "no answer"))
+        return
+    web, io_web = body.get("web") or {}, body.get("io_web") or {}
+    routes = body.get("routes") or {}
+    host = ",".join(web.get("hosts") or []) or ("none" if web.get("state") == "absent" else web.get("state"))
+    upstream = routes.get("upstream") or {}
+    failure = upstream.get("last_failure") or {}
+    health = (io_web.get("answer") or {}).get("health_state")
+    print("%-10s host=%s route=%s upstream=%s%s io.web=%s%s" % (
+        "web", host, routes.get("state"), upstream.get("state") or "unknown",
+        "(%s@%s)" % (failure.get("kind"), failure.get("at")) if failure else "",
+        io_web.get("state"), "(%s)" % health if health and health != "HEALTHY" else ""))
 
 
 def utc_stamp(epoch):

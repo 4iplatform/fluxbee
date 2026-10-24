@@ -4306,16 +4306,57 @@ impl AcmeService {
         }
     }
 
-    /// `GET /acme/status`.
-    pub(crate) async fn status(&self) -> Value {
-        let now = self.now();
-        let state = self.read(Clone::clone);
-        let (config_state, reason) = match (&self.config, lock(&self.off_reason).clone()) {
+    /// `config.state` of the status, `absent`, `off` or `on`, and why it is off.
+    fn config_state(&self) -> (&'static str, Option<String>) {
+        match (&self.config, lock(&self.off_reason).clone()) {
             (AcmeConfig::Absent { .. }, _) => ("absent", None),
             (AcmeConfig::Off { reason, .. }, _) => ("off", Some(reason.clone())),
             (AcmeConfig::On(_), Some(reason)) => ("off", Some(reason)),
             (AcmeConfig::On(_), None) => ("on", None),
-        };
+        }
+    }
+
+    /// The certificate as `GET /web/status` shows it (docs/io-web-v2.md §11.2), from what this
+    /// client holds, with no call to the edge: the names it certifies (`config.names` of the
+    /// status), the leaf the edge served at its last look (`edge.last_seen`) with the time of the
+    /// edge's last answer, and the web hosts that leaf does not cover (`None` without a leaf).
+    pub(crate) fn web_certificate(&self, web_hosts: &[String]) -> Value {
+        let (config_state, _) = self.config_state();
+        let (leaf, last_answer_at) = self.read(|state| {
+            (
+                state
+                    .edge
+                    .last_status
+                    .as_ref()
+                    .and_then(|view| view.leaf.clone()),
+                state.edge.last_answer_at,
+            )
+        });
+        let hosts_missing: Option<Vec<&String>> = leaf.as_ref().map(|leaf| {
+            web_hosts
+                .iter()
+                .filter(|host| !tls_material::name_covered(&leaf.names, host))
+                .collect()
+        });
+        let mut certificate = json!({
+            "acme": config_state,
+            "names": self.config.names(),
+            "served": leaf.as_ref().map(|leaf| json!({
+                "names": leaf.names,
+                "not_after": leaf.not_after,
+            })),
+            "last_answer_at": last_answer_at,
+            "hosts_missing": hosts_missing,
+        });
+        humanize_times(&mut certificate);
+        certificate
+    }
+
+    /// `GET /acme/status`.
+    pub(crate) async fn status(&self) -> Value {
+        let now = self.now();
+        let state = self.read(Clone::clone);
+        let (config_state, reason) = self.config_state();
         let mut config = json!({
             "state": config_state,
             "reason": reason,

@@ -18,6 +18,10 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
+use fluxbee_sdk::mesh::{
+    install_crypto_provider, is_valid_hive_id, MeshTlsMaterial, IO_WEB_PORT, IO_WEB_SERVER_NAME,
+    MESH_TLS_DIR,
+};
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
     MSG_EDGE_ACME_CHALLENGE, MSG_EDGE_ACME_CHALLENGE_RESPONSE, MSG_EDGE_CLOSE_URL,
@@ -35,7 +39,7 @@ use fluxbee_sdk::{
     RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver, RpcError, RpcRequestLabels,
 };
 use json_router::tls_material::{self, ChainDiagnosis, MaterialError};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -134,6 +138,9 @@ const DEFAULT_PUBLIC_READY_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
 /// A-86: the downloads one peer address may hold at once, of `public_max_inflight` (0: no cap).
 const DEFAULT_PUBLIC_MAX_INFLIGHT_PER_IP: usize = 8;
+/// io-web-v2 §11.2: the requests the proxy holds at once to io.web, each with its own connection
+/// to the motherbee until its response ends (0: no cap). io.web serves a few operators.
+const DEFAULT_WEB_MAX_INFLIGHT: usize = 128;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -163,6 +170,13 @@ struct Config {
     /// Downloads one peer address may hold at once (0: no cap).
     public_max_inflight_per_ip: usize,
     public_ready_timeout_ms: u64,
+    /// Proxied requests in flight to io.web at once (0: no cap).
+    web_max_inflight: usize,
+    /// This hive's id, which names its mesh TLS material (`MESH_TLS_DIR/<hive_id>/`).
+    hive_id: Option<String>,
+    /// The motherbee's address as this hive's router dials it (`wan.uplinks[0].address`): its host
+    /// is where io.web listens.
+    motherbee_uplink: Option<String>,
     /// Public TLS material from disk. When both are `Some` the frontend serves HTTPS.
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -253,7 +267,7 @@ async fn main() -> Result<(), SyEdgeError> {
     ));
     let public_registry: Arc<RwLock<HashMap<String, PublicArtifactRow>>> =
         Arc::new(RwLock::new(load_public_registry(&config.publications_path)));
-    // The web hosts (io-web-v2 §11.1): from disk, so a restart answers them at once, before
+    // The web hosts (io-web-v2 §11.1): from disk, so a restart proxies them at once, before
     // SY.admin's next push.
     let web_routes = Arc::new(WebRouteTable::load(config.web_routes_path.clone()));
 
@@ -274,6 +288,9 @@ async fn main() -> Result<(), SyEdgeError> {
     // on a role with no public door: such an edge still receives vault notices and must NOT react
     // to them, and it answers the TLS commands with an error.
     let mut edge_tls: Option<Arc<EdgeTls>> = None;
+    // The door's proxy to io.web, whose upstream the answer to EDGE_WEB_ROUTES reports. `None`
+    // with no public door, like `edge_tls`.
+    let mut web_proxy: Option<Arc<WebProxy>> = None;
 
     // Ingress-hive role: run the public HTTPS door. Fail-closed — absent on any
     // other role (`resolve_http_listen`).
@@ -345,11 +362,40 @@ async fn main() -> Result<(), SyEdgeError> {
         if let Some(served) = tls.served() {
             web_routes.forget_main_name(&served.leaf.names);
         }
+        // The proxy to io.web (io-web-v2 §11.2), from this hive's mesh TLS material and the
+        // motherbee's address, read once. Without them every web host answers 502: never
+        // plaintext, never a verifier that skips io.web's name.
+        let upstream = IoWebClient::for_hive(
+            std::path::Path::new(MESH_TLS_DIR),
+            config.hive_id.as_deref(),
+            config.motherbee_uplink.as_deref(),
+        );
+        match &upstream {
+            Ok(client) => tracing::info!(
+                upstream = %client.authority,
+                server_name = IO_WEB_SERVER_NAME,
+                web_max_inflight = config.web_max_inflight,
+                "sy-edge web proxy ready: web hosts go to io.web"
+            ),
+            Err(reason) => tracing::error!(
+                reason = %reason,
+                "sy-edge: the proxy to io.web has no upstream; every web host answers 502 until this is fixed and the edge restarts"
+            ),
+        }
+        let proxy = Arc::new(WebProxy::new(upstream, config.web_max_inflight));
+        web_proxy = Some(Arc::clone(&proxy));
         let door_web_routes = Arc::clone(&web_routes);
         let max_connections_per_ip = config.max_connections_per_ip;
         tokio::spawn(async move {
-            if let Err(err) =
-                run_frontend(listen, state, tls, door_web_routes, max_connections_per_ip).await
+            if let Err(err) = run_frontend(
+                listen,
+                state,
+                tls,
+                door_web_routes,
+                proxy,
+                max_connections_per_ip,
+            )
+            .await
             {
                 tracing::error!(error = %err, "sy-edge public frontend exited");
             }
@@ -368,6 +414,7 @@ async fn main() -> Result<(), SyEdgeError> {
         sender.clone(),
         edge_tls.clone(),
         Arc::clone(&web_routes),
+        web_proxy,
         config.ttl,
     ));
 
@@ -1385,13 +1432,20 @@ async fn apply_node_config(
 // Config
 // ---------------------------------------------------------------------------
 
-/// The `role` + optional `edge:` section of `hive.yaml`, the ONLY fields sy_edge
-/// needs from it. Other sections (wan/blob/…) are ignored — NO
-/// `deny_unknown_fields`, or the whole file would fail to parse.
-#[derive(Debug, Clone, Deserialize)]
+/// The fields of `hive.yaml` sy_edge needs: `role` and the optional `edge:` section, and for the
+/// proxy to io.web the hive's id (its mesh TLS material) and `wan:` (the motherbee's address).
+/// Other sections (blob/…) are ignored — NO `deny_unknown_fields`, or the whole file would fail
+/// to parse.
+#[derive(Debug, Clone, Default, Deserialize)]
 struct HiveEdgeFile {
     #[serde(default)]
+    hive_id: Option<String>,
+    #[serde(default)]
     role: Option<String>,
+    /// The router's section, read as a plain value (`first_uplink_address`): a shape the edge does
+    /// not expect leaves the proxy without its upstream, never the door without its listener.
+    #[serde(default)]
+    wan: Option<serde_yaml::Value>,
     #[serde(default)]
     edge: Option<EdgeSection>,
 }
@@ -1416,6 +1470,8 @@ struct EdgeSection {
     public_max_inflight_per_ip: Option<usize>,
     #[serde(default)]
     public_ready_timeout_ms: Option<u64>,
+    #[serde(default)]
+    web_max_inflight: Option<usize>,
     /// Public TLS cert chain (PEM) + private key (PEM) from DISK. When both are
     /// set the frontend serves HTTPS. Alternatively `tls_vault_key` pulls the same
     /// material from SY.vault (preferred — no cert on the DMZ box's config).
@@ -1433,22 +1489,44 @@ struct EdgeSection {
     vault_hive: Option<String>,
 }
 
-/// Read `role` + `edge:` from `<config_dir>/hive.yaml`. Best-effort: a missing or
-/// unparsable file yields `(None, None)` so the node still boots but never binds a
-/// public listener (fail-closed).
-fn load_hive_edge(config_dir: &std::path::Path) -> (Option<String>, Option<EdgeSection>) {
+/// Read `<config_dir>/hive.yaml` (`HiveEdgeFile`). Best-effort: a missing or unparsable file
+/// yields no role and no `edge:` section, so the node still boots but never binds a public
+/// listener (fail-closed).
+fn load_hive_edge(config_dir: &std::path::Path) -> HiveEdgeFile {
     let path = config_dir.join("hive.yaml");
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(_) => return (None, None),
+        Err(_) => return HiveEdgeFile::default(),
     };
     match serde_yaml::from_str::<HiveEdgeFile>(&raw) {
-        Ok(parsed) => (parsed.role, parsed.edge),
+        Ok(parsed) => parsed,
         Err(err) => {
             tracing::warn!(path = %path.display(), error = %err, "sy-edge could not parse hive.yaml; no public listener");
-            (None, None)
+            HiveEdgeFile::default()
         }
     }
+}
+
+/// The address this hive's router dials, `wan.uplinks[0].address`: on an ingress, the motherbee's.
+fn first_uplink_address(wan: Option<&serde_yaml::Value>) -> Option<String> {
+    wan?.get("uplinks")?
+        .get(0)?
+        .get("address")?
+        .as_str()
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
+}
+
+/// The host of an uplink address (`10.10.10.10:9000`, `[fd00::10]:9000`, `motherbee.lan:9000`, or
+/// one with no port); an IPv6 literal keeps its brackets. `None` when it names no host.
+fn uplink_host(address: &str) -> Option<String> {
+    let authority: axum::http::uri::Authority = address.trim().parse().ok()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Fail-closed public-listener decision. An explicit env override wins (dev/test
@@ -1478,10 +1556,11 @@ impl Config {
     fn load() -> Self {
         let config_dir =
             PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string()));
-        let (role, edge) = load_hive_edge(&config_dir);
+        let hive = load_hive_edge(&config_dir);
+        let edge = hive.edge.clone();
         let http_listen = resolve_http_listen(
             env("SY_EDGE_HTTP_LISTEN"),
-            role.as_deref(),
+            hive.role.as_deref(),
             edge.as_ref().and_then(|e| e.listen.clone()),
         );
         let endpoints_path = env("SY_EDGE_ENDPOINTS")
@@ -1550,6 +1629,18 @@ impl Config {
                 .or_else(|| edge.as_ref().and_then(|e| e.public_ready_timeout_ms))
                 .filter(|&value| value > 0)
                 .unwrap_or(DEFAULT_PUBLIC_READY_TIMEOUT_MS),
+            // 0 turns the cap off, so it is taken as given.
+            web_max_inflight: env("SY_EDGE_WEB_MAX_INFLIGHT")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.web_max_inflight))
+                .unwrap_or(DEFAULT_WEB_MAX_INFLIGHT),
+            hive_id: hive
+                .hive_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|hive_id| !hive_id.is_empty())
+                .map(str::to_string),
+            motherbee_uplink: first_uplink_address(hive.wan.as_ref()),
             tls_cert,
             tls_key,
             tls_vault_key,
@@ -1799,11 +1890,13 @@ async fn run_frontend(
     state: Arc<FrontendState>,
     tls: Arc<EdgeTls>,
     web_routes: Arc<WebRouteTable>,
+    proxy: Arc<WebProxy>,
     max_connections_per_ip: usize,
 ) -> Result<(), SyEdgeError> {
     let door = Door {
         main: main_routes(state),
         web: web_routes,
+        proxy,
         tls: Arc::clone(&tls),
     };
     let listener = TcpListener::bind(&listen).await?;
@@ -3156,14 +3249,18 @@ async fn run_tls_commands(
     sender: NodeSender,
     tls: Option<Arc<EdgeTls>>,
     web: Arc<WebRouteTable>,
+    proxy: Option<Arc<WebProxy>>,
     ttl: u8,
 ) {
     while let Some(msg) = commands.recv().await {
         let sender = sender.clone();
         let tls = tls.clone();
         let web = Arc::clone(&web);
+        let proxy = proxy.clone();
         tokio::spawn(async move {
-            if let Some((response, payload)) = tls_command_reply(tls.as_deref(), &web, &msg).await {
+            if let Some((response, payload)) =
+                tls_command_reply(tls.as_deref(), &web, proxy.as_deref(), &msg).await
+            {
                 send_edge_reply(&sender, &msg, response, payload, ttl).await;
             }
         });
@@ -3173,6 +3270,7 @@ async fn run_tls_commands(
 async fn tls_command_reply(
     tls: Option<&EdgeTls>,
     web: &WebRouteTable,
+    proxy: Option<&WebProxy>,
     msg: &Message,
 ) -> Option<(&'static str, Value)> {
     match msg.meta.msg.as_deref() {
@@ -3189,7 +3287,7 @@ async fn tls_command_reply(
         )),
         Some(MSG_EDGE_WEB_ROUTES) => Some((
             MSG_EDGE_WEB_ROUTES_RESPONSE,
-            web_routes_answer(tls, web, msg),
+            web_routes_answer(tls, web, proxy, msg),
         )),
         other => {
             tracing::warn!(msg = ?other, "sy-edge: unexpected message on the TLS command channel");
@@ -3709,8 +3807,14 @@ fn main_certified_name(names: &[String]) -> Option<&str> {
 }
 
 /// `EDGE_WEB_ROUTES`: replace the web hosts with the full set it carries. The answer names the set
-/// served from now on, `changed` and `persisted`.
-fn web_routes_answer(tls: Option<&EdgeTls>, web: &WebRouteTable, msg: &Message) -> Value {
+/// served from now on, `changed` and `persisted`, and the proxy's `upstream`
+/// (`WebProxy::upstream_status`), so SY.admin sees a door that has its routes but no way to io.web.
+fn web_routes_answer(
+    tls: Option<&EdgeTls>,
+    web: &WebRouteTable,
+    proxy: Option<&WebProxy>,
+    msg: &Message,
+) -> Value {
     let outcome: Result<WebRoutes, String> = (|| {
         let tls = tls_command_edge(tls, msg, MSG_EDGE_WEB_ROUTES)?;
         let requested: WebRoutes = serde_json::from_value(msg.payload.clone())
@@ -3732,6 +3836,7 @@ fn web_routes_answer(tls: Option<&EdgeTls>, web: &WebRouteTable, msg: &Message) 
                 "routes": routes.routes,
                 "changed": applied.changed,
                 "persisted": applied.persisted,
+                "upstream": proxy.map(WebProxy::upstream_status),
             })
         }
         Err(err) => tls_command_error(MSG_EDGE_WEB_ROUTES, msg, err),
@@ -3741,7 +3846,7 @@ fn web_routes_answer(tls: Option<&EdgeTls>, web: &WebRouteTable, msg: &Message) 
 // ---------------------------------------------------------------------------
 // HTTP on the door (docs/io-web-v2.md §11.1): hyper's HTTP/1 server, whose head timer starts
 // before the first byte (A-87); a stream that keeps a minimum pace (A-86); the peer's address for
-// the handlers; and every request dispatched by its host before any path route.
+// the handlers and the proxy; and every request dispatched by its host before any path route.
 // ---------------------------------------------------------------------------
 
 /// One connection's HTTP: HTTP/1 only, with no protocol sniffing, no HTTP/2 and no upgrade. Its
@@ -3772,29 +3877,28 @@ where
     }
 }
 
-/// What the door serves: its own routes (`/e/`, `/public/`, `/healthz`), and the web hosts.
+/// What the door serves: its own routes (`/e/`, `/public/`, `/healthz`), and the web hosts through
+/// the proxy to io.web.
 #[derive(Clone)]
 struct Door {
     main: Router,
     web: Arc<WebRouteTable>,
-    /// The certificate served tells the door its main name (`host_route`).
+    proxy: Arc<WebProxy>,
+    /// The certificate served tells the door its main name (`host_route`), and its mode the
+    /// scheme the proxy reports to io.web.
     tls: Arc<EdgeTls>,
 }
 
 impl Door {
     /// One request, by its host before any path (io-web-v2 §11.1, host-posture §4.4): only the
-    /// door's own hosts reach its routes (`host_route`); a web host answers 404 for every path in
-    /// 0.1.84 (the proxy to io.web comes in 0.1.85), and so does any other host. Every answer
-    /// carries the security headers (`with_security_headers`). The handlers find the peer's
-    /// address in `ConnectInfo<SocketAddr>`.
+    /// door's own hosts reach its routes (`host_route`); a web host goes to io.web for every path
+    /// (`WebProxy::forward`, §11.2), and any other host answers 404. Every answer carries the
+    /// security headers (`with_security_headers`). The handlers find the peer's address in
+    /// `ConnectInfo<SocketAddr>`.
     async fn handle(self, mut req: Request, peer: SocketAddr) -> Result<Response, Infallible> {
         req.extensions_mut().insert(ConnectInfo(peer));
-        let route = match request_host(req.uri(), req.headers()) {
-            Ok(host) => {
-                let served = self.tls.served();
-                let certified = served.as_ref().map(|served| served.leaf.names.as_slice());
-                host_route(host.as_ref(), &self.web, certified)
-            }
+        let host = match request_host(req.uri(), req.headers()) {
+            Ok(host) => host,
             Err(reason) => {
                 tracing::debug!(peer = %peer, reason, "sy-edge refused a request for its host");
                 return Ok(http_error(
@@ -3804,15 +3908,29 @@ impl Door {
                 ));
             }
         };
-        let response = match route {
-            HostRoute::Door => {
+        let route = {
+            let served = self.tls.served();
+            let certified = served.as_ref().map(|served| served.leaf.names.as_slice());
+            host_route(host.as_ref(), &self.web, certified)
+        };
+        let response = match (route, host) {
+            (HostRoute::Door, _) => {
                 hyper::service::Service::call(
                     &hyper_util::service::TowerToHyperService::new(self.main),
                     req,
                 )
                 .await?
             }
-            HostRoute::Web | HostRoute::Unknown => {
+            // `host_route` names a web host only for a request with a host.
+            (HostRoute::Web, Some(host)) => {
+                let proto = if self.tls.mode == TlsMode::Plaintext {
+                    "http"
+                } else {
+                    "https"
+                };
+                self.proxy.forward(req, &host.name, peer, proto).await
+            }
+            (HostRoute::Web, None) | (HostRoute::Unknown, _) => {
                 http_error(StatusCode::NOT_FOUND, "NOT_FOUND", "not found")
             }
         };
@@ -3825,18 +3943,19 @@ impl Door {
 enum HostRoute {
     /// The door's own routes.
     Door,
-    /// A web host: 404 in 0.1.84, io.web's proxy in 0.1.85.
+    /// A web host: the proxy to io.web.
     Web,
     /// A host the edge does not serve: 404 (host-posture §4.4).
     Unknown,
 }
 
 /// The door's own routes answer requests with no host, for an IP literal, and for the edge's main
-/// name on any port, which is never a web host. A web host, on any port, is one. With a
-/// certificate served, any other host is unknown; with none (plaintext, awaiting) the edge cannot
-/// tell its main name, and every other host keeps the door's routes. `certified`: the DNS names of
-/// the certificate served. When they do not tell a main name (`main_certified_name`), each of them
-/// that is not a web host is the door's.
+/// name on any port, which is never a web host. A web host is one on its own port only (443, or
+/// none named): on another port it is unknown (io-web-v2 §11.1), and never reaches the door's
+/// routes either. With a certificate served, any other host is unknown; with none (plaintext,
+/// awaiting) the edge cannot tell its main name, and every other host keeps the door's routes.
+/// `certified`: the DNS names of the certificate served. When they do not tell a main name
+/// (`main_certified_name`), each of them that is not a web host is the door's.
 fn host_route(
     host: Option<&RequestHost>,
     web: &WebRouteTable,
@@ -3853,7 +3972,11 @@ fn host_route(
         return HostRoute::Door;
     }
     if web.serves(&host.name) {
-        return HostRoute::Web;
+        return if host.port.is_none() {
+            HostRoute::Web
+        } else {
+            HostRoute::Unknown
+        };
     }
     match certified {
         None => HostRoute::Door,
@@ -4232,6 +4355,605 @@ impl<B> Drop for DemandBody<B> {
             self.demand.set(false);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The proxy to io.web (docs/io-web-v2.md §11.2), the door's third surface: a web host's requests
+// go to io.web on the motherbee over the mesh's mutual TLS, and nowhere else (never a host or a
+// port a request or a route names). In this stage a web host takes GET and HEAD with no body. The
+// edge rebuilds the framing, strips the hop-by-hop headers both ways and sets the forwarding
+// headers itself; io.web's body streams back through the door's paced stream.
+// ---------------------------------------------------------------------------
+
+/// The TCP connection to io.web and the TLS handshake on it must finish within this, together.
+const IO_WEB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// io.web's response head must arrive within this once the request is sent. The body then has no
+/// deadline of its own: it streams as io.web sends it, and the door's pace bounds the client.
+const IO_WEB_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// hyper's buffer on a connection to io.web, as on the door's own connections.
+const IO_WEB_MAX_BUF: usize = 64 * 1024;
+
+/// The hop-by-hop headers (RFC 9110 §7.6.1, and the older `Keep-Alive` and `Proxy-Connection`).
+/// They describe one connection, so they never cross the proxy in either direction, and neither
+/// does any header a `Connection` header names (`strip_hop_by_hop`).
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+];
+
+/// Request headers that never reach io.web, besides the hop-by-hop ones and every
+/// `X-Forwarded-*`: the framing, `Expect` and `Host`, which the edge rebuilds; the forwarding
+/// headers it sets itself; the headers some servers take for the client's address or the URL; and
+/// the method overrides, which would turn a GET into another method past the route's policy.
+const DROPPED_REQUEST_HEADERS: [&str; 12] = [
+    "content-length",
+    "expect",
+    "host",
+    "forwarded",
+    "x-request-id",
+    "x-real-ip",
+    "true-client-ip",
+    "x-original-url",
+    "x-rewrite-url",
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+];
+
+/// The door's third surface: the web hosts' requests to io.web, under the route's policy
+/// (`web_policy_refusal`) and the proxy's cap.
+struct WebProxy {
+    /// io.web, or why the edge has no way to it; then every proxied request answers 502.
+    upstream: Result<IoWebClient, String>,
+    /// One permit per proxied request in flight, held to its response's last byte
+    /// (`IoWebBody`); `None` when `web_max_inflight` is 0.
+    inflight: Option<Arc<Semaphore>>,
+    max_inflight: usize,
+    /// Requests refused at the cap, logged at most once per interval.
+    refused: std::sync::Mutex<RefusedConnections>,
+    /// Requests io.web did not answer: the last one, for SY.admin (`upstream_status`), and the
+    /// ones not logged yet.
+    failures: std::sync::Mutex<ProxyFailures>,
+}
+
+/// The proxy's failures to get io.web's answer.
+#[derive(Debug, Default)]
+struct ProxyFailures {
+    /// The last one: when (Unix seconds) and its kind (`IoWebFailure::kind`), nothing of its
+    /// request.
+    last: Option<(i64, &'static str)>,
+    /// Logged at most once per interval, with their count and the last one's error, as the
+    /// refusals at the cap are.
+    unlogged: RefusedConnections,
+}
+
+impl WebProxy {
+    fn new(upstream: Result<IoWebClient, String>, max_inflight: usize) -> Self {
+        Self {
+            upstream,
+            inflight: (max_inflight > 0).then(|| Arc::new(Semaphore::new(max_inflight))),
+            max_inflight,
+            refused: std::sync::Mutex::new(RefusedConnections::default()),
+            failures: std::sync::Mutex::new(ProxyFailures::default()),
+        }
+    }
+
+    /// The upstream as the `EDGE_WEB_ROUTES` answer reports it: `state` `ready`, or `unavailable`
+    /// with the boot `reason` (every web host then answers 502 until the edge restarts); and
+    /// `last_failure`, the time (`at`, Unix seconds) and `kind` of the last request io.web did not
+    /// answer, never anything of the request.
+    fn upstream_status(&self) -> Value {
+        let last = self
+            .failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last;
+        json!({
+            "state": if self.upstream.is_ok() { "ready" } else { "unavailable" },
+            "reason": self.upstream.as_ref().err(),
+            "last_failure": last.map(|(at, kind)| json!({ "at": at, "kind": kind })),
+        })
+    }
+
+    /// One request for the web host `host` (`canonical_host` form), from `peer`, which reached the
+    /// door over `proto`. A request the route's policy refuses, or one over the cap, never reaches
+    /// io.web. Any failure to get io.web's answer is the fixed 502 (`io_web_unavailable`), and
+    /// its detail goes to the log only. One log line per request io.web answers, and the failures
+    /// at most once per interval, with their count and the last one: the method, the path without
+    /// its query (stage 2's exchange code rides the query, §11.3), the status, the time to the
+    /// response head and the request id io.web got.
+    async fn forward(
+        &self,
+        req: Request,
+        host: &str,
+        peer: SocketAddr,
+        proto: &'static str,
+    ) -> Response {
+        if let Some(refused) = web_policy_refusal(req.method(), req.headers()) {
+            tracing::debug!(
+                peer = %peer,
+                method = %req.method(),
+                host,
+                path = req.uri().path(),
+                status = refused.status().as_u16(),
+                "sy-edge refused a request for a web host"
+            );
+            return refused;
+        }
+        let slot = match &self.inflight {
+            None => None,
+            Some(inflight) => match Arc::clone(inflight).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let refused = self
+                        .refused
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL);
+                    if let Some(count) = refused {
+                        tracing::warn!(
+                            peer = %peer,
+                            refused = count,
+                            web_max_inflight = self.max_inflight,
+                            "sy-edge: the proxy to io.web is at its cap; refusing new requests"
+                        );
+                    }
+                    return http_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "WEB_BUSY",
+                        "too many requests in flight; retry shortly",
+                    );
+                }
+            },
+        };
+        let started = Instant::now();
+        let request_id = Uuid::new_v4().to_string();
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let outcome = match &self.upstream {
+            Ok(client) => {
+                let forwarding = Forwarding {
+                    host,
+                    client: peer.ip(),
+                    proto,
+                    request_id: &request_id,
+                };
+                client.send(io_web_request(&req, &forwarding)).await
+            }
+            Err(reason) => Err(IoWebFailure::NoUpstream(reason.clone())),
+        };
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match outcome {
+            Ok(response) => {
+                tracing::info!(
+                    request_id = %request_id,
+                    method = %method,
+                    host,
+                    path = %path,
+                    status = response.status().as_u16(),
+                    duration_ms,
+                    peer = %peer,
+                    "sy-edge proxied a request to io.web"
+                );
+                from_io_web(response, slot)
+            }
+            Err(failure) => {
+                let due = {
+                    let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+                    failures.last = Some((now_unix_secs(), failure.kind()));
+                    failures
+                        .unlogged
+                        .note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL)
+                };
+                if let Some(count) = due {
+                    tracing::warn!(
+                        failed = count,
+                        request_id = %request_id,
+                        method = %method,
+                        host,
+                        path = %path,
+                        status = StatusCode::BAD_GATEWAY.as_u16(),
+                        duration_ms,
+                        peer = %peer,
+                        error = %failure,
+                        "sy-edge: io.web did not answer proxied requests (502): how many since the last line, and the last one"
+                    );
+                }
+                io_web_unavailable(&request_id)
+            }
+        }
+    }
+}
+
+/// The edge's way to io.web: the host this hive's router dials (the motherbee), on `IO_WEB_PORT`,
+/// over the mesh's mutual TLS. The edge presents its hive's leaf, and verifies io.web's inside the
+/// handshake with rustls' WebPki verifier over the mesh CA, under the name `IO_WEB_SERVER_NAME`
+/// whatever address it dials (`MeshTlsMaterial::client_config_by_name`). One connection per
+/// proxied request, closed once its response ends: nothing is pooled.
+struct IoWebClient {
+    /// `<motherbee host>:IO_WEB_PORT`.
+    authority: String,
+    tls: tokio_rustls::TlsConnector,
+    /// `IO_WEB_SERVER_NAME`, never the address dialled, which the certificate does not name.
+    server_name: ServerName<'static>,
+    /// `IO_WEB_CONNECT_TIMEOUT`, `IO_WEB_HEAD_TIMEOUT`; shorter in the tests.
+    connect_timeout: Duration,
+    head_timeout: Duration,
+}
+
+impl IoWebClient {
+    /// A client of io.web at `authority`, over `tls`, a client configuration that verifies the
+    /// server by name (`client_config_by_name`); never the router's CA-only one.
+    fn new(authority: String, tls: Arc<rustls::ClientConfig>) -> Result<Self, String> {
+        let server_name = ServerName::try_from(IO_WEB_SERVER_NAME)
+            .map_err(|err| format!("io.web's server name '{IO_WEB_SERVER_NAME}': {err}"))?;
+        Ok(Self {
+            authority,
+            tls: tokio_rustls::TlsConnector::from(tls),
+            server_name,
+            connect_timeout: IO_WEB_CONNECT_TIMEOUT,
+            head_timeout: IO_WEB_HEAD_TIMEOUT,
+        })
+    }
+
+    /// This hive's client of io.web: its mesh TLS material, `<tls_root>/<hive_id>/` (`ca.crt`,
+    /// `cert.crt`, `cert.key`, as add_hive distributes them), and the host of its first WAN uplink.
+    /// The error says what is missing.
+    fn for_hive(
+        tls_root: &std::path::Path,
+        hive_id: Option<&str>,
+        uplink: Option<&str>,
+    ) -> Result<Self, String> {
+        let uplink =
+            uplink.ok_or("hive.yaml has no wan.uplinks, so the motherbee's address is unknown")?;
+        let host = uplink_host(uplink)
+            .ok_or_else(|| format!("wan.uplinks[0].address '{uplink}' names no host"))?;
+        let hive_id = hive_id
+            .filter(|hive_id| is_valid_hive_id(hive_id))
+            .ok_or("hive.yaml has no valid hive_id, so this hive's mesh TLS material is unknown")?;
+        let dir = tls_root.join(hive_id);
+        install_crypto_provider();
+        let material = MeshTlsMaterial::load_from_dir(&dir)
+            .map_err(|err| format!("mesh TLS material in {}: {err}", dir.display()))?;
+        let tls = material
+            .client_config_by_name()
+            .map_err(|err| format!("mesh TLS client configuration: {err}"))?;
+        Self::new(format!("{host}:{IO_WEB_PORT}"), tls)
+    }
+
+    /// Send `request` on a connection of its own, and wait for the response head. The connection
+    /// closes once the response body ends, or is dropped.
+    async fn send(
+        &self,
+        request: hyper::Request<Body>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, IoWebFailure> {
+        let mut sender = tokio::time::timeout(self.connect_timeout, self.dial())
+            .await
+            .map_err(|_| IoWebFailure::ConnectTimeout(self.connect_timeout))??;
+        let response = tokio::time::timeout(self.head_timeout, sender.send_request(request))
+            .await
+            .map_err(|_| IoWebFailure::HeadTimeout(self.head_timeout))?
+            .map_err(IoWebFailure::Head)?;
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return Err(IoWebFailure::Switched);
+        }
+        Ok(response)
+    }
+
+    /// TCP, then TLS, then hyper's HTTP/1 client on top; the connection runs in its own task.
+    async fn dial(&self) -> Result<hyper::client::conn::http1::SendRequest<Body>, IoWebFailure> {
+        let tcp = tokio::net::TcpStream::connect(&self.authority)
+            .await
+            .map_err(IoWebFailure::Connect)?;
+        let _ = tcp.set_nodelay(true);
+        let stream = self
+            .tls
+            .connect(self.server_name.clone(), tcp)
+            .await
+            .map_err(IoWebFailure::Handshake)?;
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .max_buf_size(IO_WEB_MAX_BUF)
+            .handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .map_err(IoWebFailure::Http)?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::debug!(error = %error_chain(&err), "sy-edge: a connection to io.web ended with an error");
+            }
+        });
+        Ok(sender)
+    }
+}
+
+/// Why one proxied request got no answer from io.web. The log reads it; the client gets the fixed
+/// 502 (`io_web_unavailable`).
+#[derive(Debug)]
+enum IoWebFailure {
+    /// The edge has no way to io.web (`WebProxy::upstream`).
+    NoUpstream(String),
+    Connect(std::io::Error),
+    /// The TLS handshake failed on the edge's side: io.web's certificate does not verify (another
+    /// CA, another name), or the connection dropped.
+    Handshake(std::io::Error),
+    /// The TCP connection and the TLS handshake took longer than `connect_timeout`.
+    ConnectTimeout(Duration),
+    Http(hyper::Error),
+    HeadTimeout(Duration),
+    /// The request went out and no whole head came back. io.web's refusal of the edge's
+    /// certificate lands here: in TLS 1.3 the client's handshake ends before the server checks
+    /// that certificate, so the refusal (`access_denied`) is the first thing read.
+    Head(hyper::Error),
+    /// io.web switched protocols, which the edge never asks for.
+    Switched,
+}
+
+impl IoWebFailure {
+    /// The failure's name in the `EDGE_WEB_ROUTES` answer (`WebProxy::upstream_status`), without
+    /// its detail.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::NoUpstream(_) => "no_upstream",
+            Self::Connect(_) => "connect",
+            Self::Handshake(_) => "handshake",
+            Self::ConnectTimeout(_) => "connect_timeout",
+            Self::Http(_) => "http_handshake",
+            Self::HeadTimeout(_) => "head_timeout",
+            Self::Head(_) => "head",
+            Self::Switched => "switched_protocols",
+        }
+    }
+}
+
+impl std::fmt::Display for IoWebFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoUpstream(reason) => write!(f, "no upstream: {reason}"),
+            Self::Connect(err) => write!(f, "connect: {}", error_chain(err)),
+            Self::Handshake(err) => write!(f, "TLS handshake: {}", error_chain(err)),
+            Self::ConnectTimeout(limit) => {
+                write!(f, "connect and TLS handshake took more than {limit:?}")
+            }
+            Self::Http(err) => write!(f, "HTTP/1 handshake: {}", error_chain(err)),
+            Self::HeadTimeout(limit) => write!(f, "no response head within {limit:?}"),
+            Self::Head(err) => write!(f, "response head: {}", error_chain(err)),
+            Self::Switched => write!(f, "io.web answered 101 Switching Protocols"),
+        }
+    }
+}
+
+/// An error and its sources, outermost first, for a log line.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut cause = err.source();
+    while let Some(err) = cause {
+        text.push_str(": ");
+        text.push_str(&err.to_string());
+        cause = err.source();
+    }
+    text
+}
+
+/// Why the route's policy refuses a request, answered before anything reaches io.web: in this
+/// stage a web host takes GET and HEAD only (CONNECT and TRACE among the rest: `405` with
+/// `Allow`), with no upgrade and no body (a `Content-Length` other than 0, or any
+/// `Transfer-Encoding`).
+fn web_policy_refusal(method: &Method, headers: &HeaderMap) -> Option<Response> {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        let mut refused = http_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "METHOD_NOT_ALLOWED",
+            "only GET and HEAD are served on this host",
+        );
+        refused
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+        return Some(refused);
+    }
+    if headers.contains_key(header::UPGRADE) {
+        return Some(http_error(
+            StatusCode::BAD_REQUEST,
+            "UPGRADE_NOT_ALLOWED",
+            "this host does not switch protocols",
+        ));
+    }
+    let has_body = headers.contains_key(header::TRANSFER_ENCODING)
+        || headers.get_all(header::CONTENT_LENGTH).iter().any(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|length| length.trim().parse::<u64>().ok())
+                != Some(0)
+        });
+    if has_body {
+        return Some(http_error(
+            StatusCode::BAD_REQUEST,
+            "BODY_NOT_ALLOWED",
+            "a request to this host carries no body",
+        ));
+    }
+    None
+}
+
+/// What the edge tells io.web about a request it forwards.
+struct Forwarding<'a> {
+    /// The web host, in `canonical_host` form.
+    host: &'a str,
+    /// The peer's address, as the door's accept loop saw it.
+    client: std::net::IpAddr,
+    /// `https`, or `http` on a plaintext door.
+    proto: &'static str,
+    /// Fresh for each request; the edge's log line names it too.
+    request_id: &'a str,
+}
+
+/// The request io.web gets: the method and the target in origin form, the client's headers as
+/// `io_web_request_headers` leaves them, and no body (`web_policy_refusal` let none through).
+fn io_web_request(req: &Request, forwarding: &Forwarding<'_>) -> hyper::Request<Body> {
+    let mut upstream = hyper::Request::new(Body::empty());
+    *upstream.method_mut() = req.method().clone();
+    *upstream.uri_mut() = req
+        .uri()
+        .path_and_query()
+        .cloned()
+        .map(Uri::from)
+        .unwrap_or_else(|| Uri::from_static("/"));
+    *upstream.headers_mut() = io_web_request_headers(req.headers(), forwarding);
+    upstream
+}
+
+/// The client's headers as io.web gets them: the hop-by-hop ones and those `Connection` names
+/// stripped first (`strip_hop_by_hop`), then `DROPPED_REQUEST_HEADERS` and every `X-Forwarded-*`;
+/// then the edge's own `Host` (the web host), `X-Forwarded-For`, `X-Forwarded-Proto`,
+/// `X-Forwarded-Host`, `Forwarded` (RFC 7239) and `X-Request-Id`, in place of any the client sent.
+fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> HeaderMap {
+    let mut headers = inbound.clone();
+    strip_hop_by_hop(&mut headers);
+    let dropped: Vec<header::HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            DROPPED_REQUEST_HEADERS.contains(&name.as_str())
+                || name.as_str().starts_with("x-forwarded-")
+        })
+        .cloned()
+        .collect();
+    for name in dropped {
+        headers.remove(name);
+    }
+    let client = forwarding.client.to_canonical();
+    // RFC 7239 §6: an IPv6 node is bracketed, and then quoted.
+    let node = match client {
+        std::net::IpAddr::V6(v6) => format!("\"[{v6}]\""),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+    };
+    let (host, proto) = (forwarding.host, forwarding.proto);
+    let set = [
+        (header::HOST, host.to_string()),
+        (
+            header::HeaderName::from_static("x-forwarded-for"),
+            client.to_string(),
+        ),
+        (
+            header::HeaderName::from_static("x-forwarded-proto"),
+            proto.to_string(),
+        ),
+        (
+            header::HeaderName::from_static("x-forwarded-host"),
+            host.to_string(),
+        ),
+        (
+            header::FORWARDED,
+            format!("for={node};proto={proto};host={host}"),
+        ),
+        (
+            header::HeaderName::from_static("x-request-id"),
+            forwarding.request_id.to_string(),
+        ),
+    ];
+    for (name, value) in set {
+        // Every value is a host the door validated, an address, a scheme or a UUID: all valid.
+        if let Ok(value) = HeaderValue::try_from(value) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+/// Remove the hop-by-hop headers (`HOP_BY_HOP_HEADERS`) and every header a `Connection` header
+/// names, from a request or a response.
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let named: Vec<header::HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+}
+
+/// io.web's headers as the door sends them: a `Content-Length` that a `Transfer-Encoding`
+/// overrides goes (RFC 9112 §6.3), then the hop-by-hop headers (`strip_hop_by_hop`). hyper
+/// frames the body again on the client's connection.
+fn strip_io_web_response_headers(headers: &mut HeaderMap) {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        headers.remove(header::CONTENT_LENGTH);
+    }
+    strip_hop_by_hop(headers);
+}
+
+/// io.web's response as the door sends it: its status, its headers (`strip_io_web_response_headers`)
+/// and its body as it comes (`IoWebBody`). `Door::handle` adds the security headers io.web did not
+/// set (`with_security_headers`).
+fn from_io_web(
+    response: hyper::Response<hyper::body::Incoming>,
+    slot: Option<OwnedSemaphorePermit>,
+) -> Response {
+    let (mut parts, body) = response.into_parts();
+    strip_io_web_response_headers(&mut parts.headers);
+    Response::from_parts(
+        parts,
+        Body::new(IoWebBody {
+            inner: body,
+            _slot: slot,
+        }),
+    )
+}
+
+/// io.web's response body on its way to the client, holding the request's in-flight slot: given
+/// back with the last byte, or with the connection.
+struct IoWebBody {
+    inner: hyper::body::Incoming,
+    _slot: Option<OwnedSemaphorePermit>,
+}
+
+impl HttpBody for IoWebBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The fixed answer when io.web did not answer. What failed is in the edge's log line, which the
+/// request id finds.
+fn io_web_unavailable(request_id: &str) -> Response {
+    let mut response = error_answer(
+        StatusCode::BAD_GATEWAY,
+        json!({
+            "ok": false,
+            "error_code": "UPSTREAM_UNAVAILABLE",
+            "message": "the service is unavailable; retry shortly",
+            "request_id": request_id,
+        }),
+    );
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 async fn invoke_root(
@@ -5091,9 +5813,9 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// The headers on every answer the edge writes itself: its errors, a web host's 404 and the 500
-/// of a response it could not build (A-83). Nothing is cached, sniffed, framed, indexed or
-/// referred.
+/// The headers on every answer the edge writes itself: its errors, an unknown host's 404 and the
+/// 500 of a response it could not build (A-83). Nothing is cached, sniffed, framed, indexed or
+/// referred. io.web's answers get the ones io.web did not set.
 const SECURITY_HEADERS: [(&str, &str); 5] = [
     ("cache-control", "no-store"),
     ("x-content-type-options", "nosniff"),
@@ -5108,11 +5830,18 @@ const SECURITY_HEADERS: [(&str, &str); 5] = [
 /// One of the edge's own error answers. Its message is fixed text, never an error's detail, which
 /// goes to the edge's log only (A-88).
 fn http_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
-    let body = json!({ "ok": false, "error_code": code, "message": message }).to_string();
+    error_answer(
+        status,
+        json!({ "ok": false, "error_code": code, "message": message }),
+    )
+}
+
+/// An error answer of the edge's: `body` as JSON, with the security headers.
+fn error_answer(status: StatusCode, body: Value) -> Response {
     let mut response = (
         status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body,
+        body.to_string(),
     )
         .into_response();
     for (name, value) in SECURITY_HEADERS {
@@ -5127,6 +5856,7 @@ fn http_error(status: StatusCode, code: &'static str, message: &'static str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxbee_sdk::mesh::{HiveRegistry, HiveRole, MeshCa};
     use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
     #[test]
@@ -6064,10 +6794,15 @@ mod tests {
     }
 
     async fn answer(tls: Option<&EdgeTls>, msg: &str, payload: Value) -> Value {
-        tls_command_reply(tls, &scratch_web_routes(), &admin_command(msg, payload))
-            .await
-            .expect("a TLS command")
-            .1
+        tls_command_reply(
+            tls,
+            &scratch_web_routes(),
+            None,
+            &admin_command(msg, payload),
+        )
+        .await
+        .expect("a TLS command")
+        .1
     }
 
     /// A web route table on a file of its own that does not exist yet.
@@ -6216,10 +6951,16 @@ mod tests {
         let door = Door {
             main: Router::new().route("/healthz", any(|| async { "ok" })),
             web: Arc::new(scratch_web_routes()),
+            proxy: no_proxy(),
             tls: Arc::clone(tls),
         };
         tokio::spawn(serve_door(listener, door, Arc::clone(tls), limits));
         addr
+    }
+
+    /// A proxy with no way to io.web: every request it sends answers 502.
+    fn no_proxy() -> Arc<WebProxy> {
+        Arc::new(WebProxy::new(Err("no io.web in this test".to_string()), 0))
     }
 
     /// How long until the server closes `stream`: a read that ends (EOF or error) within
@@ -7020,6 +7761,7 @@ mod tests {
                 let (_, reply) = tls_command_reply(
                     Some(&tls),
                     &scratch_web_routes(),
+                    None,
                     &edge_command(origin, command, challenge.clone()),
                 )
                 .await
@@ -7063,6 +7805,7 @@ mod tests {
             dispatcher.sender_snapshot(),
             Some(tls),
             Arc::new(scratch_web_routes()),
+            Some(no_proxy()),
             16,
         ));
 
@@ -7103,6 +7846,12 @@ mod tests {
         );
         assert_eq!(reply.routing.trace_id, routes.routing.trace_id);
         assert_eq!(reply.payload["status"], "ok", "{}", reply.payload);
+        // The task answers with the door's proxy, as `main` hands it over.
+        assert_eq!(
+            reply.payload["upstream"]["state"], "unavailable",
+            "{}",
+            reply.payload
+        );
 
         // The blob command still waits for the loop, and no door command went its way.
         assert_eq!(
@@ -7590,6 +8339,7 @@ mod tests {
                         }),
                     ),
             web: Arc::new(web),
+            proxy: no_proxy(),
             tls,
         }
     }
@@ -7694,21 +8444,31 @@ mod tests {
         let peer = exchange(&door, &request("/peer", "host: edge.example.com\r\n")).await;
         assert_eq!(peer.body, PEER.as_bytes());
 
-        // A web host, on any port and in any spelling, and any other host: a 404 with the
-        // security headers on every path.
+        // A web host, in any spelling, goes to the proxy on every path (here with no io.web: the
+        // proxy's 502), never to the door's routes.
         let public = format!("/public/{}", "ab".repeat(32));
         for (target, host) in [
             ("/healthz", "host: archi.edge.example.com\r\n"),
             ("/", "host: ARCHI.edge.example.com\r\n"),
             ("/e/ich:1", "host: archi.edge.example.com.\r\n"),
             (public.as_str(), "host: archi.edge.example.com:443\r\n"),
-            ("/healthz", "host: archi.edge.example.com:8443\r\n"),
-            ("/healthz", "host: archi.edge.example.com..\r\n"),
             ("https://archi.edge.example.com/healthz", ""),
             (
                 "https://archi.edge.example.com/e/ich:1",
                 "host: archi.edge.example.com\r\n",
             ),
+        ] {
+            let answer = exchange(&door, &request(target, host)).await;
+            assert_eq!(answer.status, 502, "{target} {host}");
+            assert_eq!(answer.json()["error_code"], "UPSTREAM_UNAVAILABLE");
+            assert_security_headers(&answer);
+        }
+
+        // A web host on another port, and any other host: a 404 with the security headers on
+        // every path.
+        for (target, host) in [
+            ("/healthz", "host: archi.edge.example.com:8443\r\n"),
+            ("/healthz", "host: archi.edge.example.com..\r\n"),
             ("/healthz", "host: other.example.org\r\n"),
             ("/e/ich:1", "host: tools.edge.example.com\r\n"),
             ("/healthz", "host: edge.example.com..\r\n"),
@@ -7730,10 +8490,16 @@ mod tests {
         assert_eq!(other.body, b"ok");
         let web = exchange(
             &plaintext,
+            &request("/healthz", "host: archi.edge.example.com\r\n"),
+        )
+        .await;
+        assert_eq!(web.status, 502);
+        let web_elsewhere = exchange(
+            &plaintext,
             &request("/healthz", "host: archi.edge.example.com:8443\r\n"),
         )
         .await;
-        assert_eq!(web.status, 404);
+        assert_eq!(web_elsewhere.status, 404);
 
         // Two Hosts, or a Host the target contradicts: 400.
         for (target, host) in [
@@ -7759,10 +8525,14 @@ mod tests {
         table: &WebRouteTable,
         payload: Value,
     ) -> Value {
-        let (response, reply) =
-            tls_command_reply(tls, table, &admin_command(MSG_EDGE_WEB_ROUTES, payload))
-                .await
-                .expect("a door command");
+        let (response, reply) = tls_command_reply(
+            tls,
+            table,
+            None,
+            &admin_command(MSG_EDGE_WEB_ROUTES, payload),
+        )
+        .await
+        .expect("a door command");
         assert_eq!(response, MSG_EDGE_WEB_ROUTES_RESPONSE);
         reply
     }
@@ -7839,6 +8609,7 @@ mod tests {
         let from_cloud = tls_command_reply(
             Some(&tls),
             &table,
+            None,
             &edge_command(
                 Some("IO.cloud@motherbee"),
                 MSG_EDGE_WEB_ROUTES,
@@ -8033,6 +8804,7 @@ mod tests {
         Door {
             main: main_routes(Arc::clone(state)),
             web: Arc::new(scratch_web_routes()),
+            proxy: no_proxy(),
             tls: Arc::new(EdgeTls::plaintext()),
         }
     }
@@ -9018,5 +9790,976 @@ mod tests {
         }
         assert_ne!(csp(&served_page), door_csp);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // The proxy to io.web (docs/io-web-v2.md §11.2)
+    // -----------------------------------------------------------------------
+
+    /// io.web's page in these tests, and the content policy it sets on it.
+    const IO_WEB_PAGE: &str = "<!doctype html><p>io.web</p>";
+    const IO_WEB_CSP: &str = "default-src 'self'; frame-ancestors 'none'";
+
+    /// `hive`'s mesh material: a leaf `ca` issues, with `ca`'s certificate as the roots.
+    fn mesh_material(ca: &MeshCa, hive: &str) -> MeshTlsMaterial {
+        let leaf = ca.issue_leaf(hive).expect("leaf");
+        MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem())
+            .expect("material")
+    }
+
+    /// A hive registry in a fresh directory, as SY.orchestrator writes it: `ingress1` a connected
+    /// ingress, `worker1` a connected worker.
+    fn mesh_registry() -> HiveRegistry {
+        let root = std::env::temp_dir().join(format!("sy-edge-hives-{}", Uuid::new_v4()));
+        for (hive, role) in [("ingress1", "ingress"), ("worker1", "worker")] {
+            std::fs::create_dir_all(root.join(hive)).expect("hive dir");
+            std::fs::write(
+                root.join(hive).join("info.yaml"),
+                format!("hive_id: {hive}\nstatus: connected\nrole: {role}\njoin:\n  phase: done\n"),
+            )
+            .expect("info.yaml");
+        }
+        HiveRegistry::new(root)
+    }
+
+    /// io.web's TLS in these tests, as io.web's own: `leaf`'s certificate, and a client admitted
+    /// only when the registry calls its hive a connected ingress.
+    fn io_web_tls(ca: &MeshCa, leaf: &str, registry: &HiveRegistry) -> Arc<rustls::ServerConfig> {
+        mesh_material(ca, leaf)
+            .server_config_for_roles(registry.clone(), &[HiveRole::Ingress])
+            .expect("server config")
+    }
+
+    /// The edge's client of io.web at `authority`, presenting `hive`'s leaf.
+    fn io_web_client(ca: &MeshCa, hive: &str, authority: &str) -> IoWebClient {
+        let tls = mesh_material(ca, hive)
+            .client_config_by_name()
+            .expect("client config");
+        IoWebClient::new(authority.to_string(), tls).expect("client")
+    }
+
+    /// What a test io.web saw of one request.
+    #[derive(Debug)]
+    struct SeenByIoWeb {
+        /// The hive of the client certificate the edge presented.
+        client_hive: Option<String>,
+        method: Method,
+        target: String,
+        headers: HeaderMap,
+    }
+
+    /// What a test io.web does with a request.
+    #[derive(Clone, Copy)]
+    enum IoWebBehavior {
+        /// Answers `IO_WEB_PAGE`, with hop-by-hop headers of its own and its own content policy.
+        Page,
+        /// Takes the request and never answers.
+        Silent,
+        /// Takes the request and closes the connection.
+        HangUp,
+    }
+
+    /// A test io.web on a loopback port, under `tls`: its address, and for each connection the
+    /// request it saw, or why its handshake failed.
+    async fn test_io_web(
+        tls: Arc<rustls::ServerConfig>,
+        behavior: IoWebBehavior,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Result<SeenByIoWeb, String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let authority = listener.local_addr().expect("addr").to_string();
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let tls = Arc::clone(&tls);
+                let seen = seen_tx.clone();
+                tokio::spawn(async move {
+                    let stream = match tokio_rustls::TlsAcceptor::from(tls).accept(tcp).await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            let _ = seen.send(Err(err.to_string()));
+                            return;
+                        }
+                    };
+                    let client_hive = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|chain| chain.first())
+                        .and_then(fluxbee_sdk::mesh::peer_hive_from_cert);
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let _ = seen.send(Ok(SeenByIoWeb {
+                                client_hive: client_hive.clone(),
+                                method: req.method().clone(),
+                                target: req.uri().to_string(),
+                                headers: req.headers().clone(),
+                            }));
+                            async move {
+                                match behavior {
+                                    IoWebBehavior::Page => Ok(hyper::Response::builder()
+                                        .header("content-type", "text/html; charset=utf-8")
+                                        .header("content-security-policy", IO_WEB_CSP)
+                                        .header("connection", "x-io-web-hop")
+                                        .header("x-io-web-hop", "1")
+                                        .header("keep-alive", "timeout=5")
+                                        .header("x-io-web", "page")
+                                        .body(Body::from(IO_WEB_PAGE))
+                                        .expect("page")),
+                                    IoWebBehavior::Silent => {
+                                        std::future::pending::<
+                                            Result<hyper::Response<Body>, std::io::Error>,
+                                        >()
+                                        .await
+                                    }
+                                    IoWebBehavior::HangUp => {
+                                        Err(std::io::Error::other("io.web hangs up"))
+                                    }
+                                }
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (authority, seen_rx)
+    }
+
+    /// A door that serves `WEB_HOST` through `proxy`, with the combined certificate of 0.1.84.
+    async fn proxied_door(proxy: WebProxy) -> Door {
+        Door {
+            main: Router::new().route("/healthz", any(|| async { "ok" })),
+            web: Arc::new(web_routes_with(&[WEB_HOST])),
+            proxy: Arc::new(proxy),
+            tls: serving_edge(self_signed(&[EDGE, WEB_HOST])).await,
+        }
+    }
+
+    /// A request for `WEB_HOST`, with `extra` header lines and `body`.
+    fn web_request(method: &str, target: &str, extra: &str, body: &str) -> String {
+        format!("{method} {target} HTTP/1.1\r\nhost: {WEB_HOST}\r\n{extra}connection: close\r\n\r\n{body}")
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                header::HeaderName::from_bytes(name.as_bytes()).expect("name"),
+                HeaderValue::from_str(value).expect("value"),
+            );
+        }
+        headers
+    }
+
+    fn sorted_names(headers: &HeaderMap) -> Vec<String> {
+        let mut names: Vec<String> = headers.keys().map(|name| name.to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// The rustls error behind `err`, through its sources and the I/O errors that carry one.
+    fn rustls_error_in(err: &(dyn std::error::Error + 'static)) -> Option<rustls::Error> {
+        let mut cause = Some(err);
+        while let Some(err) = cause {
+            if let Some(found) = err.downcast_ref::<rustls::Error>() {
+                return Some(found.clone());
+            }
+            if let Some(found) = err
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            {
+                return Some(found.clone());
+            }
+            cause = err.source();
+        }
+        None
+    }
+
+    /// io.web's refusal of the edge's certificate, as the edge reads it after its request: the
+    /// `access_denied` alert. io.web closes the connection after the alert, and the request the
+    /// edge wrote meanwhile turns that close into a reset; on a loaded machine the reset can reach
+    /// the edge's write before the alert reaches its read.
+    fn refused_by_io_web(err: &(dyn std::error::Error + 'static)) -> bool {
+        if let Some(found) = rustls_error_in(err) {
+            return found == rustls::Error::AlertReceived(rustls::AlertDescription::AccessDenied);
+        }
+        let mut cause = Some(err);
+        while let Some(err) = cause {
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                return matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                );
+            }
+            cause = err.source();
+        }
+        false
+    }
+
+    /// Wait until `proxy` holds no request in flight.
+    async fn all_slots_back(proxy: &WebProxy) {
+        let inflight = proxy.inflight.as_ref().expect("a cap");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while inflight.available_permits() < proxy.max_inflight {
+            assert!(Instant::now() < deadline, "a slot was never given back");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// io-web-v2 §11.2: the headers io.web gets. The hop-by-hop ones and those `Connection` names
+    /// go first, then the framing, `Expect`, `Host`, the trust and forwarding headers the client
+    /// sent and the method overrides; the edge's own take their place.
+    #[test]
+    fn the_edge_rebuilds_the_headers_io_web_gets() {
+        let inbound = header_map(&[
+            ("host", "ARCHI.edge.example.com:443"),
+            ("connection", "keep-alive, X-Custom-Hop"),
+            ("connection", "close"),
+            ("x-custom-hop", "1"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("te", "trailers"),
+            ("trailer", "x-checksum"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("proxy-authorization", "Basic Zm9vOmJhcg=="),
+            ("proxy-authenticate", "Basic"),
+            ("content-length", "0"),
+            ("expect", "100-continue"),
+            ("forwarded", "for=198.51.100.66;proto=http"),
+            ("x-forwarded-for", "198.51.100.66"),
+            ("x-forwarded-proto", "http"),
+            ("x-forwarded-host", "evil.example.org"),
+            ("x-forwarded-port", "80"),
+            ("x-forwarded-prefix", "/admin"),
+            ("x-request-id", "chosen-by-the-client"),
+            ("x-real-ip", "198.51.100.66"),
+            ("true-client-ip", "198.51.100.66"),
+            ("x-original-url", "/admin"),
+            ("x-rewrite-url", "/admin"),
+            ("x-http-method-override", "DELETE"),
+            ("x-http-method", "DELETE"),
+            ("x-method-override", "DELETE"),
+            ("cookie", "a=b"),
+            ("authorization", "Bearer t"),
+            ("accept", "text/html"),
+            ("user-agent", "edge-test"),
+            ("origin", "https://archi.edge.example.com"),
+        ]);
+        let request_id = Uuid::new_v4().to_string();
+        let forwarding = |client: &str| Forwarding {
+            host: WEB_HOST,
+            client: client.parse().expect("ip"),
+            proto: "https",
+            request_id: &request_id,
+        };
+        let headers = io_web_request_headers(&inbound, &forwarding("203.0.113.7"));
+        assert_eq!(
+            sorted_names(&headers),
+            [
+                "accept",
+                "authorization",
+                "cookie",
+                "forwarded",
+                "host",
+                "origin",
+                "user-agent",
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "x-request-id",
+            ]
+        );
+        let value = |headers: &HeaderMap, name: &str| {
+            let values: Vec<&str> = headers
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().expect("text"))
+                .collect();
+            assert_eq!(values.len(), 1, "{name}: {values:?}");
+            values[0].to_string()
+        };
+        assert_eq!(value(&headers, "host"), WEB_HOST);
+        assert_eq!(value(&headers, "x-forwarded-for"), "203.0.113.7");
+        assert_eq!(value(&headers, "x-forwarded-proto"), "https");
+        assert_eq!(value(&headers, "x-forwarded-host"), WEB_HOST);
+        assert_eq!(
+            value(&headers, "forwarded"),
+            format!("for=203.0.113.7;proto=https;host={WEB_HOST}")
+        );
+        assert_eq!(value(&headers, "x-request-id"), request_id);
+        assert_eq!(value(&headers, "cookie"), "a=b");
+
+        // An IPv6 peer: bare in X-Forwarded-For, bracketed and quoted in Forwarded; an
+        // IPv4-mapped one as its IPv4.
+        let v6 = io_web_request_headers(&inbound, &forwarding("2001:db8::7"));
+        assert_eq!(value(&v6, "x-forwarded-for"), "2001:db8::7");
+        assert_eq!(
+            value(&v6, "forwarded"),
+            format!("for=\"[2001:db8::7]\";proto=https;host={WEB_HOST}")
+        );
+        let mapped = io_web_request_headers(&inbound, &forwarding("::ffff:203.0.113.7"));
+        assert_eq!(value(&mapped, "x-forwarded-for"), "203.0.113.7");
+        assert!(value(&mapped, "forwarded").starts_with("for=203.0.113.7;"));
+    }
+
+    /// io-web-v2 §11.2: io.web's hop-by-hop headers, and those its `Connection` names, never reach
+    /// the client; a `Transfer-Encoding` takes the `Content-Length` it overrides with it.
+    #[test]
+    fn io_web_s_hop_by_hop_headers_never_reach_the_client() {
+        let mut headers = header_map(&[
+            ("content-type", "text/html; charset=utf-8"),
+            ("content-length", "27"),
+            ("content-security-policy", IO_WEB_CSP),
+            ("set-cookie", "__Host-s=1; Path=/; Secure; HttpOnly"),
+            ("connection", "keep-alive, X-IO-Web-Hop"),
+            ("x-io-web-hop", "1"),
+            ("keep-alive", "timeout=5"),
+            ("upgrade", "h2c"),
+            ("proxy-authenticate", "Basic"),
+            ("trailer", "x-checksum"),
+        ]);
+        strip_io_web_response_headers(&mut headers);
+        assert_eq!(
+            sorted_names(&headers),
+            [
+                "content-length",
+                "content-security-policy",
+                "content-type",
+                "set-cookie"
+            ]
+        );
+        let mut chunked = header_map(&[
+            ("transfer-encoding", "chunked"),
+            ("content-length", "27"),
+            ("content-type", "text/html"),
+        ]);
+        strip_io_web_response_headers(&mut chunked);
+        assert_eq!(sorted_names(&chunked), ["content-type"]);
+    }
+
+    /// io-web-v2 §11.2: a web host's request reaches io.web over the mesh's mutual TLS. io.web
+    /// sees the ingress's certificate, the target, the edge's own forwarding headers and none of
+    /// the client's hop-by-hop or trust headers; the client gets io.web's answer without io.web's
+    /// hop-by-hop headers, with io.web's content policy and the door's other security headers. A
+    /// leaf of another hive, from the same CA, never passes for io.web.
+    #[tokio::test]
+    async fn a_web_host_reaches_io_web_over_the_mesh_with_the_edge_s_forwarding_headers() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let (authority, mut seen) =
+            test_io_web(io_web_tls(&ca, "motherbee", &registry), IoWebBehavior::Page).await;
+        let door = proxied_door(WebProxy::new(
+            Ok(io_web_client(&ca, "ingress1", &authority)),
+            4,
+        ))
+        .await;
+
+        let client_headers = concat!(
+            "x-forwarded-for: 198.51.100.66\r\n",
+            "x-forwarded-host: evil.example.org\r\n",
+            "x-forwarded-proto: http\r\n",
+            "forwarded: for=198.51.100.66\r\n",
+            "x-real-ip: 198.51.100.66\r\n",
+            "true-client-ip: 198.51.100.66\r\n",
+            "x-original-url: /admin\r\n",
+            "x-rewrite-url: /admin\r\n",
+            "x-http-method-override: POST\r\n",
+            "x-request-id: chosen-by-the-client\r\n",
+            "connection: x-hop\r\n",
+            "x-hop: 1\r\n",
+            "keep-alive: timeout=600\r\n",
+            "te: trailers\r\n",
+            "proxy-authorization: Basic Zm9vOmJhcg==\r\n",
+            "expect: 100-continue\r\n",
+            "content-length: 0\r\n",
+            "cookie: a=b\r\n",
+            "user-agent: edge-test\r\n",
+        );
+        let answer = exchange(
+            &door,
+            &web_request("GET", "/page?code=secret", client_headers, ""),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(answer.body, IO_WEB_PAGE.as_bytes());
+
+        let request = seen
+            .recv()
+            .await
+            .expect("io.web saw the request")
+            .expect("io.web's handshake");
+        assert_eq!(
+            request.client_hive.as_deref(),
+            Some("ingress1"),
+            "the edge presented the ingress's leaf"
+        );
+        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.target, "/page?code=secret");
+        let values = |name: &str| -> Vec<String> {
+            request
+                .headers
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().expect("text").to_string())
+                .collect()
+        };
+        assert_eq!(values("host"), [WEB_HOST]);
+        assert_eq!(values("x-forwarded-for"), ["203.0.113.7"]);
+        assert_eq!(values("x-forwarded-proto"), ["https"]);
+        assert_eq!(values("x-forwarded-host"), [WEB_HOST]);
+        assert_eq!(
+            values("forwarded"),
+            [format!("for=203.0.113.7;proto=https;host={WEB_HOST}")]
+        );
+        let request_id = values("x-request-id");
+        assert!(
+            request_id.len() == 1 && Uuid::parse_str(&request_id[0]).is_ok(),
+            "a fresh request id: {request_id:?}"
+        );
+        assert_eq!(values("cookie"), ["a=b"]);
+        assert_eq!(values("user-agent"), ["edge-test"]);
+        for gone in [
+            "x-real-ip",
+            "true-client-ip",
+            "x-original-url",
+            "x-rewrite-url",
+            "x-http-method-override",
+            "connection",
+            "x-hop",
+            "keep-alive",
+            "te",
+            "proxy-authorization",
+            "expect",
+            "content-length",
+            "transfer-encoding",
+        ] {
+            assert!(values(gone).is_empty(), "{gone} reached io.web");
+        }
+
+        // io.web's answer: its own content policy wins; the door adds what io.web did not set;
+        // io.web's hop-by-hop headers, and the one its Connection names, stay behind.
+        assert_eq!(
+            answer.header("content-security-policy").as_deref(),
+            Some(IO_WEB_CSP)
+        );
+        assert_eq!(answer.header("cache-control").as_deref(), Some("no-store"));
+        assert_eq!(
+            answer.header("x-content-type-options").as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(answer.header("x-io-web").as_deref(), Some("page"));
+        assert_eq!(answer.header("x-io-web-hop"), None);
+        assert_eq!(answer.header("keep-alive"), None);
+        all_slots_back(&door.proxy).await;
+
+        // HEAD: io.web's length, no body. An absolute-form target goes in origin form.
+        let head = exchange(&door, &web_request("HEAD", "/page", "", "")).await;
+        assert_eq!(head.status, 200);
+        assert!(head.body.is_empty());
+        assert_eq!(
+            head.header("content-length"),
+            Some(IO_WEB_PAGE.len().to_string())
+        );
+        let absolute = exchange(
+            &door,
+            &web_request("GET", "https://archi.edge.example.com/abs?q=1", "", ""),
+        )
+        .await;
+        assert_eq!(absolute.status, 200);
+        let head_seen = seen.recv().await.expect("HEAD").expect("handshake");
+        assert_eq!(
+            (head_seen.method, head_seen.target.as_str()),
+            (Method::HEAD, "/page")
+        );
+        let absolute_seen = seen.recv().await.expect("GET").expect("handshake");
+        assert_eq!(absolute_seen.target, "/abs?q=1");
+
+        // A plaintext door tells io.web so.
+        let plaintext = Door {
+            tls: Arc::new(EdgeTls::plaintext()),
+            ..door.clone()
+        };
+        assert_eq!(
+            exchange(&plaintext, &web_request("GET", "/", "", ""))
+                .await
+                .status,
+            200
+        );
+        let plain_seen = seen.recv().await.expect("GET").expect("handshake");
+        assert_eq!(
+            plain_seen
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok()),
+            Some("http")
+        );
+        all_slots_back(&door.proxy).await;
+
+        // A server presenting worker1's leaf, from the same CA, is not io.web: the edge's
+        // handshake refuses its name, and the client gets the fixed 502.
+        let (impostor, mut impostor_seen) =
+            test_io_web(io_web_tls(&ca, "worker1", &registry), IoWebBehavior::Page).await;
+        let client = io_web_client(&ca, "ingress1", &impostor);
+        let refused = client
+            .send(io_web_request(
+                &Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+                &Forwarding {
+                    host: WEB_HOST,
+                    client: "203.0.113.7".parse().expect("ip"),
+                    proto: "https",
+                    request_id: "r",
+                },
+            ))
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(
+                &refused,
+                IoWebFailure::Handshake(err) if matches!(
+                    rustls_error_in(err),
+                    Some(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForName
+                            | rustls::CertificateError::NotValidForNameContext { .. }
+                    ))
+                )
+            ),
+            "{refused}"
+        );
+        let impostor_door = proxied_door(WebProxy::new(Ok(client), 4)).await;
+        let answer = exchange(&impostor_door, &web_request("GET", "/", "", "")).await;
+        assert_eq!(answer.status, 502);
+        assert_eq!(answer.json()["error_code"], "UPSTREAM_UNAVAILABLE");
+        while let Ok(seen) = impostor_seen.try_recv() {
+            assert!(seen.is_err(), "the impostor never got a request: {seen:?}");
+        }
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// io-web-v2 §11.2: a web host takes GET and HEAD only, with no body and no upgrade; the edge
+    /// refuses anything else, and io.web never sees it.
+    #[tokio::test]
+    async fn the_edge_refuses_other_methods_bodies_and_upgrades_before_io_web() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let (authority, mut seen) =
+            test_io_web(io_web_tls(&ca, "motherbee", &registry), IoWebBehavior::Page).await;
+        let door = proxied_door(WebProxy::new(
+            Ok(io_web_client(&ca, "ingress1", &authority)),
+            4,
+        ))
+        .await;
+
+        for request in [
+            web_request("POST", "/", "content-length: 3\r\n", "a=1"),
+            web_request("POST", "/", "content-length: 0\r\n", ""),
+            web_request("PUT", "/", "content-length: 0\r\n", ""),
+            web_request("DELETE", "/", "", ""),
+            web_request("PATCH", "/", "content-length: 0\r\n", ""),
+            web_request("OPTIONS", "/", "", ""),
+            web_request("TRACE", "/", "", ""),
+            format!("CONNECT {WEB_HOST}:443 HTTP/1.1\r\nhost: {WEB_HOST}:443\r\nconnection: close\r\n\r\n"),
+        ] {
+            let answer = exchange(&door, &request).await;
+            assert_eq!(answer.status, 405, "{request}");
+            assert_eq!(answer.header("allow").as_deref(), Some("GET, HEAD"));
+            assert_eq!(answer.json()["error_code"], "METHOD_NOT_ALLOWED");
+            assert_security_headers(&answer);
+        }
+        for (request, code) in [
+            (
+                web_request("GET", "/", "content-length: 3\r\n", "abc"),
+                "BODY_NOT_ALLOWED",
+            ),
+            (
+                web_request("GET", "/", "transfer-encoding: chunked\r\n", "0\r\n\r\n"),
+                "BODY_NOT_ALLOWED",
+            ),
+            (
+                web_request(
+                    "GET",
+                    "/socket",
+                    "connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+                    "",
+                ),
+                "UPGRADE_NOT_ALLOWED",
+            ),
+        ] {
+            let answer = exchange(&door, &request).await;
+            assert_eq!(answer.status, 400, "{request}");
+            assert_eq!(answer.json()["error_code"], code, "{request}");
+            assert_security_headers(&answer);
+        }
+        // A HEAD answer has no body to read the code from.
+        let head = exchange(
+            &door,
+            &web_request("HEAD", "/", "content-length: 1\r\n", "x"),
+        )
+        .await;
+        assert_eq!(head.status, 400);
+        assert_security_headers(&head);
+        assert!(seen.try_recv().is_err(), "nothing reached io.web");
+
+        // A GET with an empty body does.
+        let answer = exchange(&door, &web_request("GET", "/", "content-length: 0\r\n", "")).await;
+        assert_eq!(answer.status, 200);
+        assert!(seen.recv().await.expect("seen").is_ok());
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// io-web-v2 §11.2: whatever keeps io.web's answer from the edge, the client gets the same
+    /// fixed 502 with the request id, and the detail stays in the edge's log. io.web's refusal of
+    /// the edge's certificate arrives after the edge's connect: TLS 1.3 ends the client's handshake
+    /// before the server checks its certificate. The proxy's upstream, as the `EDGE_WEB_ROUTES`
+    /// answer reports it, keeps the last failure's time and kind, and the failures are logged at
+    /// most once per interval, with their count.
+    #[tokio::test]
+    async fn every_failure_to_reach_io_web_is_the_fixed_502() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let motherbee = || io_web_tls(&ca, "motherbee", &registry);
+        // Nothing listens on the port.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .to_string();
+        let (served, _) = test_io_web(motherbee(), IoWebBehavior::Page).await;
+        let (silent, _) = test_io_web(motherbee(), IoWebBehavior::Silent).await;
+        let (hangs_up, _) = test_io_web(motherbee(), IoWebBehavior::HangUp).await;
+        // A port whose connections the kernel takes and nothing ever reads: the TLS handshake
+        // never ends.
+        let mute = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let mute_addr = mute.local_addr().expect("addr").to_string();
+
+        type Expected = fn(&IoWebFailure) -> bool;
+        let cases: [(&str, &str, &str, Expected, &str); 5] = [
+            (
+                "connect refused",
+                &closed,
+                "ingress1",
+                |failure| matches!(failure, IoWebFailure::Connect(_)),
+                "connect",
+            ),
+            // The registry calls worker1 a worker: io.web refuses its certificate, once the edge's
+            // side of the handshake is over.
+            (
+                "refused after connect",
+                &served,
+                "worker1",
+                |failure| matches!(failure, IoWebFailure::Head(err) if refused_by_io_web(err)),
+                "head",
+            ),
+            (
+                "no head in time",
+                &silent,
+                "ingress1",
+                |failure| matches!(failure, IoWebFailure::HeadTimeout(_)),
+                "head_timeout",
+            ),
+            (
+                "closed before the head",
+                &hangs_up,
+                "ingress1",
+                |failure| matches!(failure, IoWebFailure::Head(_)),
+                "head",
+            ),
+            (
+                "no handshake in time",
+                &mute_addr,
+                "ingress1",
+                |failure| matches!(failure, IoWebFailure::ConnectTimeout(_)),
+                "connect_timeout",
+            ),
+        ];
+        let probe = || {
+            io_web_request(
+                &Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+                &Forwarding {
+                    host: WEB_HOST,
+                    client: "203.0.113.7".parse().expect("ip"),
+                    proto: "https",
+                    request_id: "probe",
+                },
+            )
+        };
+        for (case, authority, hive, expected, kind) in cases {
+            let mut client = io_web_client(&ca, hive, authority);
+            client.connect_timeout = Duration::from_millis(300);
+            client.head_timeout = Duration::from_millis(300);
+            let failure = client
+                .send(probe())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case}: io.web answered"));
+            assert!(expected(&failure), "{case}: {failure}");
+            assert_eq!(failure.kind(), kind, "{case}");
+
+            let door = proxied_door(WebProxy::new(Ok(client), 2)).await;
+            assert_eq!(
+                door.proxy.upstream_status(),
+                json!({"state": "ready", "reason": null, "last_failure": null}),
+                "{case}"
+            );
+            let before = now_unix_secs();
+            let answer = exchange(&door, &web_request("GET", "/page?code=x", "", "")).await;
+            assert_unavailable(case, &answer);
+            let upstream = door.proxy.upstream_status();
+            assert_eq!(upstream["state"], "ready", "{case}");
+            assert_eq!(upstream["last_failure"]["kind"], kind, "{case}: {upstream}");
+            let at = upstream["last_failure"]["at"].as_i64().expect("at");
+            assert!(
+                (before..=now_unix_secs()).contains(&at),
+                "{case}: {upstream}"
+            );
+            // Its time and kind only: nothing of the request (its path, its query, the peer).
+            let text = upstream.to_string();
+            for request in ["/page", "code=", "203.0.113.7", WEB_HOST] {
+                assert!(!text.contains(request), "{case}: {text}");
+            }
+            all_slots_back(&door.proxy).await;
+        }
+
+        // No upstream at all (no mesh material, no uplink): the same 502, never plaintext. The
+        // answer says why, and the failures of one burst are one line: the first at once, the
+        // others counted for the next.
+        let door = proxied_door(WebProxy::new(Err("no material".to_string()), 2)).await;
+        for _ in 0..3 {
+            let answer = exchange(&door, &web_request("GET", "/", "", "")).await;
+            assert_unavailable("no upstream", &answer);
+        }
+        let upstream = door.proxy.upstream_status();
+        assert_eq!(upstream["state"], "unavailable");
+        assert_eq!(upstream["reason"], "no material");
+        assert_eq!(upstream["last_failure"]["kind"], "no_upstream");
+        assert_eq!(
+            door.proxy
+                .failures
+                .lock()
+                .expect("failures")
+                .unlogged
+                .unlogged,
+            2,
+            "logged once, two counted for the next line"
+        );
+        // The answer to EDGE_WEB_ROUTES carries it.
+        let routes = scratch_web_routes();
+        let (_, reply) = tls_command_reply(
+            Some(&*door.tls),
+            &routes,
+            Some(&*door.proxy),
+            &admin_command(
+                MSG_EDGE_WEB_ROUTES,
+                json!({"routes": [{"host": WEB_HOST, "upstream": "io.web"}]}),
+            ),
+        )
+        .await
+        .expect("a door command");
+        assert_eq!(reply["status"], "ok", "{reply}");
+        assert_eq!(reply["upstream"], door.proxy.upstream_status());
+        drop(mute);
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// The fixed 502: a request id in the body and in `X-Request-Id`, and nothing internal.
+    fn assert_unavailable(case: &str, answer: &Answer) {
+        assert_eq!(answer.status, 502, "{case}");
+        let body = answer.json();
+        assert_eq!(body["error_code"], "UPSTREAM_UNAVAILABLE", "{case}");
+        assert_eq!(
+            body["message"], "the service is unavailable; retry shortly",
+            "{case}"
+        );
+        let request_id = body["request_id"].as_str().expect("a request id");
+        assert!(Uuid::parse_str(request_id).is_ok(), "{case}: {request_id}");
+        assert_eq!(
+            answer.header("x-request-id").as_deref(),
+            Some(request_id),
+            "{case}"
+        );
+        let text = String::from_utf8_lossy(&answer.body).to_ascii_lowercase();
+        for internal in [
+            "127.0.0.1",
+            "motherbee",
+            "worker1",
+            "access",
+            "tls",
+            "timed",
+            "code=",
+        ] {
+            assert!(!text.contains(internal), "{case}: {text}");
+        }
+        assert_security_headers(answer);
+    }
+
+    /// io-web-v2 §11.2: past `web_max_inflight` the proxy answers a quick 503 and io.web never
+    /// sees the request; a slot comes back when its request ends. 0 is no cap.
+    #[tokio::test]
+    async fn past_its_cap_the_proxy_answers_a_quick_503() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let (silent, mut seen) = test_io_web(
+            io_web_tls(&ca, "motherbee", &registry),
+            IoWebBehavior::Silent,
+        )
+        .await;
+        let mut client = io_web_client(&ca, "ingress1", &silent);
+        client.head_timeout = Duration::from_millis(800);
+        let door = proxied_door(WebProxy::new(Ok(client), 1)).await;
+
+        let held = tokio::spawn({
+            let door = door.clone();
+            async move { exchange(&door, &web_request("GET", "/slow", "", "")).await }
+        });
+        seen.recv()
+            .await
+            .expect("io.web holds the first request")
+            .expect("handshake");
+        let started = Instant::now();
+        let busy = exchange(&door, &web_request("GET", "/next", "", "")).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(busy.status, 503);
+        assert_eq!(busy.json()["error_code"], "WEB_BUSY");
+        assert_security_headers(&busy);
+        assert!(
+            seen.try_recv().is_err(),
+            "the refused request never reached io.web"
+        );
+
+        assert_eq!(held.await.expect("exchange").status, 502);
+        all_slots_back(&door.proxy).await;
+        assert!(WebProxy::new(Err("none".to_string()), 0).inflight.is_none());
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// io-web-v2 §11.2: the proxy's upstream comes from hive.yaml: this hive's mesh TLS material
+    /// under its id, and its first uplink's host on `IO_WEB_PORT`, verified as
+    /// `IO_WEB_SERVER_NAME`. A `wan:` of another shape leaves the proxy without an upstream, never
+    /// the door without its section; what is missing is named, and nothing falls back.
+    #[test]
+    fn the_proxy_s_upstream_comes_from_hive_yaml() {
+        let dir = std::env::temp_dir().join(format!("sy-edge-hive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("hive.yaml"),
+            concat!(
+                "hive_id: ingress1\n",
+                "role: ingress\n",
+                "wan:\n",
+                "  gateway_name: RT.gateway\n",
+                "  mtls: required\n",
+                "  uplinks:\n",
+                "    - address: \"10.10.10.10:9000\"\n",
+                "blob:\n",
+                "  enabled: false\n",
+                "edge:\n",
+                "  listen: \"0.0.0.0:443\"\n",
+                "  web_max_inflight: 32\n",
+            ),
+        )
+        .expect("hive.yaml");
+        let hive = load_hive_edge(&dir);
+        assert_eq!(hive.hive_id.as_deref(), Some("ingress1"));
+        assert_eq!(
+            first_uplink_address(hive.wan.as_ref()).as_deref(),
+            Some("10.10.10.10:9000")
+        );
+        assert_eq!(
+            hive.edge.as_ref().and_then(|edge| edge.web_max_inflight),
+            Some(32)
+        );
+        for wan in [
+            "wan: 7\n",
+            "wan:\n  uplinks: []\n",
+            "wan:\n  uplinks:\n    - port: 9000\n",
+            "",
+        ] {
+            std::fs::write(
+                dir.join("hive.yaml"),
+                format!(
+                    "hive_id: ingress1\nrole: ingress\n{wan}edge:\n  listen: \"0.0.0.0:443\"\n"
+                ),
+            )
+            .expect("hive.yaml");
+            let hive = load_hive_edge(&dir);
+            assert_eq!(first_uplink_address(hive.wan.as_ref()), None, "{wan}");
+            assert!(hive.edge.is_some(), "{wan}");
+        }
+
+        for (address, host) in [
+            ("10.10.10.10:9000", Some("10.10.10.10")),
+            (" 10.10.10.10:9000 ", Some("10.10.10.10")),
+            ("[fd00::10]:9000", Some("[fd00::10]")),
+            ("motherbee.lan:9000", Some("motherbee.lan")),
+            ("10.10.10.10", Some("10.10.10.10")),
+            ("", None),
+            (":9000", None),
+            ("user@10.10.10.10:9000", None),
+            ("not a host", None),
+        ] {
+            assert_eq!(uplink_host(address).as_deref(), host, "{address}");
+        }
+
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let leaf = ca.issue_leaf("ingress1").expect("leaf");
+        let root = dir.join("tls");
+        std::fs::create_dir_all(root.join("ingress1")).expect("tls dir");
+        std::fs::write(root.join("ingress1").join("ca.crt"), ca.ca_cert_pem()).expect("ca.crt");
+        std::fs::write(root.join("ingress1").join("cert.crt"), &leaf.cert_pem).expect("cert.crt");
+        std::fs::write(root.join("ingress1").join("cert.key"), &leaf.key_pem).expect("cert.key");
+        let client = IoWebClient::for_hive(&root, Some("ingress1"), Some("10.10.10.10:9000"))
+            .expect("a client");
+        assert_eq!(client.authority, format!("10.10.10.10:{IO_WEB_PORT}"));
+        assert_eq!(
+            client.server_name,
+            ServerName::try_from(IO_WEB_SERVER_NAME).expect("name")
+        );
+        let v6 = IoWebClient::for_hive(&root, Some("ingress1"), Some("[fd00::10]:9000"))
+            .expect("a client");
+        assert_eq!(v6.authority, format!("[fd00::10]:{IO_WEB_PORT}"));
+        for (hive_id, uplink, missing) in [
+            (Some("ingress1"), None, "wan.uplinks"),
+            (Some("ingress1"), Some(":9000"), "names no host"),
+            (None, Some("10.10.10.10:9000"), "hive_id"),
+            (Some("../ingress1"), Some("10.10.10.10:9000"), "hive_id"),
+            (
+                Some("ingress2"),
+                Some("10.10.10.10:9000"),
+                "mesh TLS material",
+            ),
+        ] {
+            let err = IoWebClient::for_hive(&root, hive_id, uplink)
+                .err()
+                .expect("refused");
+            assert!(err.contains(missing), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

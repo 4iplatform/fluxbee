@@ -170,8 +170,9 @@ of the system and its nodes; operator decision 2026-10-02). If the case's tenant
   the frontdesk translates it into the same result.
 
 The person stays `temporary`: `ILK_PROVISION` in the root tenant still works. In the root
-tenant only io.cloud and io.blob run, and neither provisions people there: the orchestrator rejects
-any other IO node with `TENANT_ROOT_NOT_ALLOWED` (operator decision 2026-10-02, A-43). That leaves
+tenant only the core IO nodes run (io.cloud, io.blob and io.web), and none provisions people there:
+the orchestrator rejects any other IO node with `TENANT_ROOT_NOT_ALLOWED` (operator decision
+2026-10-02, A-43). That leaves
 the case of an IO node that provisions without a tenant (section 4.3): if it routes through `Resolve`, every message
 from that person comes back to the frontdesk and gets the same answer. This frontdesk rule stays as
 defense in depth.

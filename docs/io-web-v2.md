@@ -199,7 +199,7 @@ A new node is not a special case. Every leg of Fluxbee has to know it:
 | --- | --- |
 | Packaging | the runtime in the `.deb` and `base-nodes.json`; core-update and rollback like any node |
 | Orchestrator | placement, spawn, the watchdog, reconcile, removal; inventory and versions |
-| Control plane | CONFIG_GET/SET through the managed control plane (`managed_control_plane.rs`), state UNCONFIGURED/CONFIGURED/FAILED_CONFIG, the config contract documented |
+| Control plane | CONFIG_GET/SET through the common IO control plane over the SDK's (`managed_control_plane.rs`); no field in stage 1, so it boots CONFIGURED on its defaults and is FAILED_CONFIG only for a config it refuses; the config contract documented ([io-web.md](io/io-web.md)) |
 | Identity | its ILK in the root tenant, like the other system IO nodes |
 | Vault | its secrets (for example the key that signs sessions) by `vault_ref` |
 | SY.admin | the actions and HTTP routes that declare proxy routes and mint codes; `mesh_access` rows; the action catalog |
@@ -207,8 +207,8 @@ A new node is not a special case. Every leg of Fluxbee has to know it:
 | The edge | the third surface: proxy routes pushed by SY.admin, rebuilt after a reimage, the certificates per host |
 | Cloud | the operation that asks for the code, relayed by io.cloud (the Cloud tables and catalog) |
 | Archi | its tools and handbook, and its write list if new actions mutate |
-| Observability | logs on the router stream, `NODE_STATUS_GET`, health in `ops.py health` |
-| Posture | the new motherbee port in the host rules; the ingress's outbound connection |
+| Observability | logs in its unit's journal (its mesh messages are all system ones, which the router stream does not copy); `NODE_STATUS_GET` with the port's state in `extensions.web`; health in `ops.py health` |
+| Posture | the new motherbee port, 9200; no role writes host rules today, and the parked host-posture stage 4 must admit tcp 9200 from the ingress; the ingress's outbound connection |
 | Docs and tests | node page, references, unit tests, CI, the gate on 8.x |
 
 The edge's new surface has the same list from the edge's side.
@@ -433,8 +433,8 @@ a test agent's identity. See the ledger's 0.1.84 entry.
        `frame-ancestors 'none'`, `nosniff` and a strict CSP;
      - `GET /healthz`;
      - everything else is 404.
-   - **Like any node:** NODE_STATUS_GET, logs on the router stream, inventory, upgrades with the
-     core.
+   - **Like any node:** NODE_STATUS_GET, logs in its unit's journal (as io.blob and io.cloud; the
+     router stream carries messages, not node logs), inventory, upgrades with the core.
 4. **The operator:**
    - `GET /web/status` (`web_status`) shows the host, the certificate's names, the route the edge
      acknowledged, and io.web's state;

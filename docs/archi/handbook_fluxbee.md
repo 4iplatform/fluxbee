@@ -524,7 +524,7 @@ Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
 - `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
-- an `IO.*` node other than `IO.cloud` / `IO.blob` never runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: `run_node` with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
+- an `IO.*` node other than `IO.cloud`, `IO.blob` and `IO.web` (the core IO nodes) never runs in the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: `run_node` with that tenant fails with `TENANT_ROOT_NOT_ALLOWED` (§8.2)
 - For `WF.*`, do not use `runtime: "wf.engine"` in `run_node`; first publish/apply the workflow through `wf_rules_compile_apply` and spawn the resulting concrete runtime (`wf.<workflow_name>`).
 
 ### 8.1.1 Tenant discovery before first spawn
@@ -558,7 +558,7 @@ Rules:
 - in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
 - run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node, which runs in the admin/company tenant
-- run an `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]`. Never pick the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001` for it, even when it is the only `is_root=true` tenant: only `IO.cloud` and `IO.blob` run there
+- run an `IO.*` node in the tenant the operator names, or in the one you read from an existing node (as above); if there is none, block with `missing_fields:["tenant_id"]`. Never pick the hive's root tenant `tnt:00000000-0000-0000-0000-000000000001` for it, even when it is the only `is_root=true` tenant: only the core IO nodes `IO.cloud`, `IO.blob` and `IO.web` run there
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
 ### 8.1.2 Agent cognitive definition
@@ -592,8 +592,9 @@ Rules:
 
 An IO channel node (`io.api`, `io.slack`, `io.wapp`, `io.linkedhelper`, ...) is launched by the
 tenant that needs it, or by an operator for that tenant, and runs with that tenant. None runs in the
-hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: only `IO.cloud` and `IO.blob` run
-there, and they are the only IO nodes the base install starts (operator decision 2026-10-02). The
+hive's root tenant `tnt:00000000-0000-0000-0000-000000000001`: only the core IO nodes run there,
+`IO.cloud`, `IO.blob` and `IO.web`. The base install starts `IO.cloud` and `IO.blob` (operator
+decision 2026-10-02); `IO.web@motherbee` starts only when the operator launches it. The
 orchestrator refuses any other IO node in the root tenant with `TENANT_ROOT_NOT_ALLOWED`. Every
 binding is its own instance of its runtime:
 

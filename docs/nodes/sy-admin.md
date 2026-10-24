@@ -242,6 +242,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
 | `publish_artifact`, `unpublish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT` (publish only), `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` and back |
 | `acme_status`, `acme_renew`, `acme_test`, `acme_reload` | answered by SY.admin's ACME client, which asks the public edge, SY.vault, the CA and SY.orchestrator | `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `VAULT_*`, `record_drift_alert` ([The ACME client](#the-acme-client)) |
+| `web_status` | answered by SY.admin from what it holds, plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
@@ -249,7 +250,8 @@ Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hiv
 `sync_hint` 45, `core_rollback` 300, `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
 `kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
 orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
-catalog/help/timer/`hive_status`/`list_streams` 5 (`JSR_ADMIN_TIMEOUT_SECS`), everything else 30
+catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEOUT_SECS`; for
+`web_status`, its read of the orchestrator's view of io.web), everything else 30
 (`JSR_ADMIN_ORCH_TIMEOUT_SECS`).
 
 ### ORCHESTRATOR_BOOTING
@@ -591,11 +593,41 @@ never through `/e/` or `/public/` ([docs/io-web-v2.md](../io-web-v2.md) §11.1).
   empty one without `web:`, so a host taken out leaves the edge at the first push after the
   restart.
 - **The answer** is kept in memory: the edge, `acknowledged`, `refused`, `no_answer` or `no_edge`
-  with its detail, since when, and when the edge last acknowledged the set. Only a change of edge
-  or of answer is logged, the detail included (a timeout reads `no answer in 20s`, so repeated
-  ones are no change): INFO when acknowledged, and for no edge while no host is declared; WARN
-  otherwise, with the last acknowledgement. An edge older than 0.1.84 does not take the command,
-  which reads as no answer.
+  with its detail, since when, and when the edge last acknowledged the set. An acknowledgement
+  also carries the edge's proxy to io.web (`upstream`: `ready` or `unavailable` with its reason,
+  and the last request io.web did not answer, its time and kind), kept with that push
+  (`EdgeWebUpstream`). Only a change of edge or of answer is logged, the detail included (a
+  timeout reads `no answer in 20s`, so repeated ones are no change), never a change of upstream:
+  INFO when acknowledged, and for no edge while no host is declared; WARN otherwise, with the last
+  acknowledgement. An edge older than 0.1.84 does not take the command, which reads as no answer.
+
+## The web door's status
+
+`GET /web/status` (`web_status`) is the operator's view of the web door
+([docs/io-web-v2.md](../io-web-v2.md) §11.2): what SY.admin holds, plus two reads of io.web. It
+takes no body and always answers 200: no `web:`, no edge, and a missing or silent io.web are
+states, named in the answer. Source: `handle_web_status` and `io_web_status` in
+`src/bin/sy_admin.rs`, `AcmeService::web_certificate` in `src/bin/sy_admin/acme.rs`.
+
+| Part | What it says | From |
+| --- | --- | --- |
+| `web` | `state`: `declared` (with `hosts`), `absent` (no section, or no key set) or `invalid` (`reason` says why) | `web:` as read at boot |
+| `certificate` | `acme` (the client's `config.state`); `names`, the names it certifies (the main one, then the web hosts); `served`, the `names` and `not_after` of the leaf the edge served at the client's last look; `last_answer_at`, the edge's last answer to the client; `hosts_missing`, the web hosts that leaf does not cover (null without a leaf) | the ACME client, with no call to the edge: `config.names` and `edge.last_seen` of `GET /acme/status`, which asks the edge afresh |
+| `routes` | `state`: `acknowledged`, `refused`, `no_answer`, `no_edge`, or `not_pushed` before the first push; `edge`, `set` (the full set every push carries), `detail`, `since_at` and `acknowledged_at`; `upstream`, the edge's way to io.web as its acknowledgement reported it (null for any other answer): `state` `ready` or `unavailable` (then every web host answers 502), `reason` (what the edge found missing at its boot), `last_failure` (`at`, `kind` of the last request io.web did not answer, or null) | the last push ([The web hosts](#the-web-hosts)) |
+| `io_web` | `node` (`IO.web@motherbee`), `state`; `lifecycle_state` and `runtime_version`, the orchestrator's view; `answer`, the node's own `NODE_STATUS_GET` answer; `view_error` and `answer_error` | `get_node_status` to `SY.orchestrator@motherbee` (5 s) and `NODE_STATUS_GET` to `IO.web@motherbee` (3 s), sent together |
+
+`io_web.state`:
+
+- `running`: it answered `NODE_STATUS_GET`, whatever the orchestrator says; `answer.health_state`
+  is the health it reports;
+- `silent`: the orchestrator sees it `RUNNING`, but it did not answer in 3 s;
+- `starting`, `stopped`, `failed`: the orchestrator's lifecycle;
+- `absent`: the orchestrator has no `IO.web@motherbee` (`NODE_NOT_FOUND`), never launched or
+  purged. io.web starts only with an explicit `run_node`, in the root tenant;
+- `unknown`: neither read says (`view_error`, `answer_error`).
+
+Times are RFC 3339. A read, so it is not in the audit log; over the mesh only Archi may ask for it
+(`mesh_access`).
 
 ## Config
 
@@ -663,7 +695,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 15, 105 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 16, 106 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -774,6 +806,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `acme_renew` | `POST /acme/renew` | Order the public edge's certificate now (forced: no backoff, no cap). |
 | `acme_test` | `POST /acme/test` | Run a test order against the staging directory with the real names: issued and checked, never stored or installed. |
 | `acme_reload` | `POST /acme/reload` | Make the public edge re-read its certificate from SY.vault (EDGE_TLS_RELOAD), after a manual change or a vault rollback. |
+| `web_status` | `GET /web/status` | Read the web door: the hosts the web section declares, the certificate's names, the routes pushed to the public edge with its last answer, and io.web's state. |
 
 ### HTTP routes outside the catalog
 
