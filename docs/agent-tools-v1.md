@@ -84,6 +84,18 @@ whether the model receives images. It is about the model, not a tool.
    - the package ships the JSON next to the runtime (`dist/runtimes/ai.generic/<version>/tools.json`),
      which is the copy Archi reads.
 3. **The HELP** is one generic verb, `NODE_HELP`, which any node with a self-description answers.
+   The contract (decided 2026-10-26):
+   - **One card:**
+     `{name, summary, when_to_use, limits: [..], present_when, input: <JSON schema>,
+     output: <JSON schema>, errors: [{code, meaning}]}`.
+   - **The catalog file:** `{runtime, runtime_version, tools: [card, ..]}`, every base tool.
+   - **`NODE_HELP_RESPONSE` from the node:** `{status: "ok", node_name, runtime,
+     runtime_version, tools: [card, ..]}`, the same cards as the catalog. `present_when` says
+     when each tool is there.
+   - **The route:** `NODE_HELP` travels as `NODE_STATUS_GET` does, SY.admin → the node's hive
+     orchestrator → the node.
+   - **A node that does not describe itself:** after a short timeout, `node_help` answers 200
+     with `help: null` and the reason.
    - `ai.generic` answers it with its catalog.
    - SY.timer keeps `TIMER_HELP`, and may answer `NODE_HELP` later.
    - SY.admin exposes it as `node_help`, for the operator and Archi, because SY.admin mediates.

@@ -534,6 +534,11 @@ pub const MSG_CONFIG_RESPONSE: &str = "CONFIG_RESPONSE";
 pub const MSG_OPA_RELOAD: &str = "OPA_RELOAD";
 pub const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 pub const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
+/// A node's self-description (docs/agent-tools-v1.md T3, docs/sy-timer.md §3): an AI node answers
+/// with its tool catalog. It travels as `NODE_STATUS_GET` does, SY.admin → the node's hive
+/// orchestrator → the node.
+pub const MSG_NODE_HELP: &str = "NODE_HELP";
+pub const MSG_NODE_HELP_RESPONSE: &str = "NODE_HELP_RESPONSE";
 
 // SY.edge URL-service command plane (SY.admin -> SY.edge). These are VERIFIED SERVICE
 // DIRECTIVES, not config: SY.admin opens/closes one public URL (an `ICH`) on the edge's

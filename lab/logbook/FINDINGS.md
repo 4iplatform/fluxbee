@@ -1078,6 +1078,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-96 🔵 TO EVALUATE (noted 2026-10-26) — How the SY nodes' tokens are measured per message
+
+- **What happens:** the SY nodes that call a model (cognition, Archi, the frontdesk) keep the
+  hive's single provider (agent-tools-v1 T8). How their tokens are measured per message is still
+  open.
+- **The operator (2026-10-26):** *"después vemos cómo se miden los tokens por mensaje"*.
+
 ### A-95 🔴 OPEN (found 2026-10-26) — ai.generic logs the full public link of a page it publishes
 
 - **What happens:** after `publish_html_page`, ai.generic writes an INFO line with the whole URL,
