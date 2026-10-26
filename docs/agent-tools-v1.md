@@ -48,6 +48,7 @@ place for the track; the next iteration starts here.
 **T8 in the code (checked 2026-10-26).** The SDK's clients take the provider on every call, both
 protocols exist, and the usage records keep the provider and the model of each call. Two nodes on
 the same code with different providers share nothing. What changes:
+
 - `behavior.provider` is accepted; without it, the node uses the hive's `ai.default_provider`;
 - the vault lookup follows the node's provider;
 - `behavior.base_url`, when set, must be that provider's host. Today either host passes with
@@ -58,6 +59,7 @@ The SY nodes (cognition, Archi, the frontdesk) keep the hive's provider.
 
 **T9 in the code:** the AI node's only "capabilities" is `behavior.capabilities.multimodal`,
 whether the model receives images. It is about the model, not a tool.
+
 - It becomes `behavior.multimodal`.
 - The old key is refused. PROD's AI configs are converted once, and the conversion is reported.
 - The default role's "Do not invent platform capabilities" becomes "Do not offer tools you do not
