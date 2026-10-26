@@ -84,7 +84,8 @@ Decisions as they were taken, with the operator's reasons. Dated; not rewritten 
 
 ## Future
 
-Designs not built yet: [solution-manifest-spec_1](solution-manifest-spec_1.md),
+Designs not built yet: [agent-tools-v1](agent-tools-v1.md) (what an AI agent can do, declared
+once), [solution-manifest-spec_1](solution-manifest-spec_1.md),
 [scope-binding-energy-spec](scope-binding-energy-spec.md),
 [future_implementations/](future_implementations/).
 

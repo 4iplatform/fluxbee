@@ -1078,6 +1078,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-95 🔴 OPEN (found 2026-10-26) — ai.generic logs the full public link of a page it publishes
+
+- **What happens:** after `publish_html_page`, ai.generic writes an INFO line with the whole URL,
+  capability key included (`published HTML page tool="publish_html_page" url=…/public/<key>`).
+  Anyone who reads the worker's journal can open the page until it expires.
+- **Fix:** log the publication id only, as the edge does since A-82.
+
+### A-94 🔴 OPEN (found 2026-10-26) — "capabilities" means six different things
+
+- **What happens:** the word names six unrelated things, none of them what an agent can do:
+  1. identity's `capabilities` arrays: retired and never implemented (identity addendum §2.4);
+     SY.identity rejects them;
+  2. `behavior.capabilities.multimodal`: whether an AI node's model takes images;
+  3. the "capability" URL and key of `/public/`: a link that is itself the permission;
+  4. the "capability query" of `list_cloud_actions`: what Cloud may ask SY.admin;
+  5. SY.timer's HELP catalog: its own capabilities;
+  6. the router's WAN HELLO, `capabilities: ["lsa", "forwarding"]`: protocol negotiation.
+- **Decided** (operator, 2026-10-26): what an agent can do is called **tools**
+  ([agent-tools-v1](../../docs/agent-tools-v1.md)). The six uses get one cleanup pass:
+  - rename each one to what it is;
+  - drop what is dead (1);
+  - keep "capability" only in its security sense (3).
+
+### A-93 🔵 TO EVALUATE (found 2026-10-26) — An AI node cannot choose its provider
+
+- **What happens:** a node chooses its model (`behavior.model`) and its endpoint (`behavior.base_url`,
+  `api.openai.com` or `api.anthropic.com` only). Its provider, and with it the API's format and the
+  vault key it looks for, is always the hive's: `hive.yaml ai.default_provider`, anthropic on 8.x.
+  `behavior.provider` is refused. So a tenant with only an OpenAI key cannot run an agent on 8.x.
+  This follows the operator decision of 2026-10-02 (`ai.generic` the only runtime, the key the
+  hive provider's).
+- **The operator (2026-10-26):** "no veo qué problema hay al instanciar el código usar un proveedor
+  u otro". The model client already speaks both protocols. A node would need to choose the provider
+  in `behavior`, and the vault lookup would follow that provider. Pending.
+
 ### A-92 ✅ VALIDATED ON 8.x (0.1.85, 2026-10-24) — What the 0.1.85 review found and the release fixed
 
 Found by the code review round of [io-web-v2](../../docs/io-web-v2.md) §11.2 (security,
