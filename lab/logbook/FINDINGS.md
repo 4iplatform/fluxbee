@@ -1096,12 +1096,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   5. SY.timer's HELP catalog: its own capabilities;
   6. the router's WAN HELLO, `capabilities: ["lsa", "forwarding"]`: protocol negotiation.
 - **Decided** (operator, 2026-10-26): what an agent can do is called **tools**
-  ([agent-tools-v1](../../docs/agent-tools-v1.md)). The six uses get one cleanup pass:
-  - rename each one to what it is;
-  - drop what is dead (1);
-  - keep "capability" only in its security sense (3).
+  ([agent-tools-v1](../../docs/agent-tools-v1.md) T7, T9).
+  - **The AI node gets one meaning:** `behavior.capabilities.multimodal` becomes
+    `behavior.multimodal`, and the default role stops saying "capabilities".
+  - **Infra nodes keep their own uses (2–6):** *"cada nodo puede tener las suyas"*.
+  - **Identity's dead arrays (1) stay refused.**
 
-### A-93 🔵 TO EVALUATE (found 2026-10-26) — An AI node cannot choose its provider
+### A-93 🔴 OPEN, decided (found 2026-10-26) — An AI node cannot choose its provider
 
 - **What happens:** a node chooses its model (`behavior.model`) and its endpoint (`behavior.base_url`,
   `api.openai.com` or `api.anthropic.com` only). Its provider, and with it the API's format and the
@@ -1111,7 +1112,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   hive provider's).
 - **The operator (2026-10-26):** "no veo qué problema hay al instanciar el código usar un proveedor
   u otro". The model client already speaks both protocols. A node would need to choose the provider
-  in `behavior`, and the vault lookup would follow that provider. Pending.
+  in `behavior`, and the vault lookup would follow that provider.
+- **Decided** (operator, 2026-10-26): *"el proveedor de AI queda restringido al tenant del nodo, pero
+  no al proveedor"*. The provider is per node, and the key comes from the node's tenant.
+- **Checked:** nothing in the code stops two nodes from running different providers. The change is
+  in agent-tools-v1 (T8), for the proposed 0.1.86.
 
 ### A-92 ✅ VALIDATED ON 8.x (0.1.85, 2026-10-24) — What the 0.1.85 review found and the release fixed
 

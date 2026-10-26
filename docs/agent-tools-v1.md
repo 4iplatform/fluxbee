@@ -37,20 +37,69 @@ place for the track; the next iteration starts here.
 | T6 | **Roles stay reusable and independent of channels and tools.** A "sales" role serves an agent on WhatsApp and one on email. Skills and handbooks may name base tools, since every agent has them. The definition model (role, skills, handbooks, personality) does not change. |
 | T7 | **The names:** what an agent can do is called **tools**, and the generated document is **the tool catalog**. The word "capabilities" is not used for this (A-94). |
 
-## 3. Open, for the next iteration
+**Also decided, the same day:**
 
-1. **The card's exact format.** Its fields, and how its JSON schemas become the model's tool
-   definition and the catalog.
-2. **Where the catalog lives and how Archi reads it.** For example, next to the runtime in
-   `dist/runtimes/ai.generic/<version>/`, or through the HELP.
-3. **The HELP message:** one generic verb for every node, or one per family, as `TIMER_HELP`.
-4. **New base tools, one at a time, each with its own rule.** The operator's examples:
+| ID | Decision |
+|---|---|
+| T8 | **The AI provider is per node (A-93).** The AI key stays restricted to the node's tenant, but not to the hive's provider. One agent may run on Claude and another on OpenAI. |
+| T9 | **In the AI node, "capabilities" goes; "tools" is its only word for what an agent can do (A-94).** Infra nodes keep their own uses (the router's WAN HELLO, SY.timer's HELP, the security sense of a capability link, Cloud's catalog). |
+| T10 | **The frontdesk (`SY.frontdesk.gov`) is a SY node with its own needs.** Its tools are its own, outside the base-tool catalog. |
+
+**T8 in the code (checked 2026-10-26).** The SDK's clients take the provider on every call, both
+protocols exist, and the usage records keep the provider and the model of each call. Two nodes on
+the same code with different providers share nothing. What changes:
+- `behavior.provider` is accepted; without it, the node uses the hive's `ai.default_provider`;
+- the vault lookup follows the node's provider;
+- `behavior.base_url`, when set, must be that provider's host. Today either host passes with
+  either provider, which is a latent mismatch;
+- the docs and Archi learn the field.
+
+The SY nodes (cognition, Archi, the frontdesk) keep the hive's provider.
+
+**T9 in the code:** the AI node's only "capabilities" is `behavior.capabilities.multimodal`,
+whether the model receives images. It is about the model, not a tool.
+- It becomes `behavior.multimodal`.
+- The old key is refused. PROD's AI configs are converted once, and the conversion is reported.
+- The default role's "Do not invent platform capabilities" becomes "Do not offer tools you do not
+  have".
+
+## 3. The details (technical, proposed by Claude 2026-10-26; the operator may veto)
+
+1. **The card.** `FunctionToolDefinition` grows into a card with these fields:
+   - `name`, `summary` (one line), `when_to_use`, `limits` (a list) and `present_when`, the
+     conditions. For example, the state tools need an interlocutor, and `publish_html_page` needs
+     an identity;
+   - `input` and `output` as JSON schemas;
+   - `errors`, as `{code, meaning}`.
+
+   The model's definition is rendered from it: the summary, when to use it, the limits, and one
+   line on what it returns, with the input schema. Model APIs take only a name, a description and
+   the input.
+2. **The catalog** is generated from the cards into the repo:
+   - `docs/reference/agent-tools.md`, plus its JSON;
+   - a CI check fails when the catalog and the code disagree, as the admin catalog's parity check
+     does;
+   - the package ships the JSON next to the runtime (`dist/runtimes/ai.generic/<version>/tools.json`),
+     which is the copy Archi reads.
+3. **The HELP** is one generic verb, `NODE_HELP`, which any node with a self-description answers.
+   - `ai.generic` answers it with its catalog.
+   - SY.timer keeps `TIMER_HELP`, and may answer `NODE_HELP` later.
+   - SY.admin exposes it as `node_help`, for the operator and Archi, because SY.admin mediates.
+4. **The first release (proposed 0.1.86):**
+   - the cards for the 14 tools that exist;
+   - the catalog and its CI check;
+   - `NODE_HELP` and `node_help`;
+   - Archi reading the catalog;
+   - T8, T9 and A-95.
+
+   No new tool is in it.
+5. **The new base tools come after, one per iteration, each with its own rule:**
    - the current time;
    - timers (SY.timer);
-   - a message to another node (with the rule that SY.admin mediates every action);
+   - a message to another node (SY.admin mediates every action);
    - reading from the blob.
-5. **The frontdesk runtime** (`ai-frontdesk-gov`) has its own tools. Does it get its own catalog?
-6. **Fluxbee tools** (T1), after the base ones.
+
+   Fluxbee tools (T1) come later.
 
 ## 4. Related
 
