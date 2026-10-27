@@ -164,7 +164,9 @@ After the boot it runs these jobs:
   Syncthing peers (about once a minute) and the egress, and reports SY.admin or Archi bound off
   loopback (`watchdog_listener_check`).
 - **Managed nodes**, every 60 s in their own task (`run_managed_runtime_reconcile_loop`). It
-  relaunches a dead AI, IO or WF node whose `_system.relaunch_on_boot` is true.
+  relaunches a dead AI, IO or WF node whose `_system.relaunch_on_boot` is true, and moves a running
+  one onto what its runtime names now, once that is on its hive: the version the pointer names, for
+  a node that follows `current`, and a package's base runtime's new `current`, pinned or not.
 - **Node lifecycle and joins**: `run_node`, start, restart, kill and remove (§3.4), `add_hive` and
   `remove_hive`. The motherbee's orchestrator takes them from SY.admin and forwards node actions for
   another hive to `SY.orchestrator@<hive>` (`forward_system_action_to_hive`).

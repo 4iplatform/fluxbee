@@ -63,8 +63,9 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    (`run_syncthing_options_switch_loop`).
 6. **`finish_bootstrap`**: on the motherbee, waits for `sy-storage` to be active (30 s) and for its
    database to answer `STORAGE_METRICS_GET` over the mesh (30 s, `wait_for_storage_db_ready`);
-   then, on every role, relaunches the persisted managed nodes
-   (`reconcile_persisted_custom_nodes`, mode `Rebind`) and hands the blob folders over.
+   then, on every role, runs the managed-node reconcile once (`reconcile_persisted_custom_nodes`,
+   the pass the 60 s loop repeats, [Managed nodes](#managed-nodes)) and hands the blob folders
+   over.
 7. Sets `booted`, logs `hive ready`, and starts the watchdog (every 5 s).
 
 ### ORCHESTRATOR_BOOTING
@@ -153,18 +154,36 @@ An ILK id is taken and stored in its canonical form, `ilk:<uuid>` lowercase and 
 one SY.identity answers, the identity map (an older map's other forms are read canonical), and
 `_system.ilk_id`.
 
-- **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false`; `start_node` and
-  `restart_node` set it `true` (`set_node_relaunch_on_boot`). A crash does not change it.
+- **`runtime_version`** is the version the node was last launched on. Every launch writes it
+  before it launches the node, under the node's lock: `run_node` in the config it creates; start,
+  restart and the reconcile with `persist_node_launch`, in one write with `relaunch_on_boot: true`
+  and, for a package on a base runtime that moves to another version, that version's
+  `package_path` (where the WF engine reads its definition). Nothing is written when the config
+  already says all of it. The node reads the version when it starts (`NODE_HELP`), and status
+  reports it (`runtime.resolved_version`; FINDINGS A-101). A launch whose version cannot be
+  written does not happen: start and restart answer `CONFIG_WRITE_FAILED`, and the reconcile logs
+  "could not record the runtime version in the node's config; not launching it".
+- **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false`. `start_node` and
+  `restart_node` set it `true` before they launch the node, in the same write as the version, so
+  it cannot race a conversion the node makes of its config at boot (FINDINGS A-102); a start of a
+  node that already runs sets it alone (`set_node_relaunch_on_boot`). A crash does not change it,
+  nor a launch that fails: after `START_FAILED` or `RESTART_FAILED` the reconcile tries the node
+  again every pass until `kill_node`, as the answer's `hint` says.
 - **`launched_by`** is the request's `launched_by` (up to 128 characters of `[A-Za-z0-9._-@]`),
   else `system` (`launched_by_from_payload`). SY.admin always stamps it: `cloud`, `archi`,
   `operator`, or the caller's name. For Cloud's node actions SY.admin also sends
   `require_tenant_id` / `require_launched_by`, and a node that does not match answers
   `NODE_NOT_FOUND`.
 - **Relaunch.** At boot and every 60 s (`run_managed_runtime_reconcile_loop`),
-  `reconcile_persisted_custom_nodes` relaunches each persisted node with a runtime and
-  `relaunch_on_boot: true` whose unit is not active and that the router does not see. At boot
-  (`Rebind`) a running node that follows `current` is also moved to the version the pointer now
-  names (FINDINGS A-39).
+  `reconcile_persisted_custom_nodes` takes each persisted node with a runtime and
+  `relaunch_on_boot: true`. It holds the node's lock (`try_lock_node`: a node an action holds waits
+  for the next pass), and reads under it the node's config again and the runtimes manifest: a pass
+  is long, and a copy of the manifest read at its start could move a node back to the version an
+  older manifest named. Two passes never run at once: the boot's takes `reconcile_pass`, waiting
+  for a loop pass that runs, and the loop skips its tick while the boot's holds it. A node whose
+  unit is not active and that the router does not see is launched once what its runtime names is
+  ready on this hive; until then it waits, logged once ("node is down, and what its runtime names
+  is not ready on this hive; it is launched once it is"). A running node may be moved, below.
 - **Stop and removal.** `kill_node` runs `systemctl stop` and `reset-failed` on the unit. With
   `purge_instance`, and in `remove_node_instance` (refused while the node runs), it also removes
   the instance directory and sends one `teardown_node {node_name, ilk_id}` to
@@ -184,6 +203,86 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   (`TEARDOWN_FORWARD_TIMEOUT_SECS`). The node's identity-map entry is already gone by then, so a
   retry of the purge does not find the ILK again: the answer's `ilk_delete.ilk_id` is what to clean
   up by hand.
+
+### A running node and a new runtime version
+
+A running node moves to what its runtime names now, on the reconcile's next pass
+(`reconcile_step`, `running_node_move`; FINDINGS A-39, A-109). What its runtime names
+(`launch_target`) is a version and the start script that version runs:
+
+- the version is the pointer's for a node that follows `current`
+  (`requested_runtime_version: current`), and its pin otherwise;
+- the start script is the version's own `bin/start.sh`, or, for a package on a base runtime
+  (`config_only`, `workflow`), its base's `current` one. A package's pin is its own version: its
+  base always follows `current`, and nothing pins it.
+
+What a unit runs is read from systemd, not from the config (`live_unit`): its ExecStart
+(`systemctl show -p ExecStart`), and the version its launch wrote in its environment,
+`FLUXBEE_NODE_RUNTIME_VERSION` (`build_managed_node_run_command`, since 0.1.88). A full runtime's
+ExecStart names its version, since the version is in the start script's path; a package's
+ExecStart is its base's start script, the same for every version of the package, so only that
+variable shows a package's version.
+
+The move:
+
+- **When:** at the orchestrator's boot and every 60 s, for a node whose unit is active:
+  - its ExecStart does not run the target's start script, compared as
+    `managed_node_restart_command` does. That is a package whose base's `current` moved, pinned
+    or not (every WF node on `wf.engine`, Archi's config-only AI packages on `ai.generic`), or a
+    full runtime on another version than its runtime names: a new `current` it follows, or a
+    `set_node_config` that rebinds a running full-runtime node, which this pass relaunches within
+    a minute without a restart;
+  - or its unit carries another version than the target: a package whose own version changed, a
+    `set_node_config` rebind of a package node included, for a unit launched since 0.1.88;
+  - or, when neither says what version it runs (a package unit launched before 0.1.88, or no
+    ExecStart), it follows `current` and the pointer names another version than its
+    `_system.runtime_version`. A package node launched before 0.1.88 and rebound with
+    `set_node_config` is not seen until its next launch.
+
+  A `.deb` upgrade, a core update (this hive's orchestrator restarts only when its own binary
+  changed), or a runtime published with `--set-current` reaches every running node within a
+  minute of the new version reaching its hive.
+- **A config that only lags is written, not relaunched:** a unit that runs the target while
+  `_system.runtime_version` names another version (a launch before 0.1.88 did not write it, FINDINGS
+  A-101) gets the version written under its lock, and keeps running: "running node runs the
+  version its runtime names, but its config named another; recorded it, the node keeps running".
+  Status reports the version at once; the node reads it for `NODE_HELP` at its next start.
+- **Only when that is ready on this hive** (`runtime_version_not_ready`), the readiness every
+  launch checks: run, start and restart refuse with `RUNTIME_NOT_PRESENT`, which SY.wf-rules
+  retries, before they stop or start anything (`runtime_readiness_refusal`). Ready is:
+  - what the runtime listing reports as the version's `readiness` (`runtime_present`,
+    `base_runtime_ready`, `start_sh_executable`);
+  - for a package on a base runtime, the files a start requires (`package.json`, and a workflow's
+    `flow/definition.json`);
+  - the binary the start script runs (`start_script_entry`). Every publish script
+    (`scripts/publish-runtime.sh` and the `publish-*-runtime.sh` built on it) writes the line
+    `exec "$SCRIPT_DIR/<binary>" "$@"`, and a start script in a version without a `package.json`
+    must have it: one that does not is not ready, and the reason says the binary is not known. A
+    package's own start script (its version has the `package.json` every package carries) is the
+    package's business.
+
+  A spoke gets the manifest and the files through Syncthing, in any order. Until then the node
+  stays as it is, and the orchestrator logs once per target "running node is not on what its
+  runtime names now, and that is not ready on this hive; it stays as it is until it is", with the
+  reason.
+- **How:** the checks of any launch come first (the root-tenant rules, the tenant gate, the entry
+  point and its preflight); a node they refuse keeps running. Then `persist_node_launch` writes
+  the version (with its `package_path`, for a package that moves to another version), and the unit
+  is stopped and created again at the new start script, carrying the new version. The journal
+  has:
+  - for a new version in the config, "running node follows 'current' and the pointer moved;
+    relaunching it on the new version" and "runtime 'current' pointer moved; rebinding node to the
+    new version";
+  - otherwise, "running node's unit runs another start script or version than its runtime names
+    now; relaunching it on what its runtime names";
+  - then "persisted custom node relaunched during reconcile".
+- **Once per move:** the next pass finds the unit running the target's start script and version,
+  and the config naming it, and leaves the node.
+- **Never:** a node that runs what its runtime names. A pinned node keeps its pin: the pointer does
+  not move it, but a new pin set with `set_node_config` does, as above.
+
+`restart_node` moves a node at once. It restarts the unit in place only when it runs the planned
+start script and carries the planned version; otherwise it creates the unit again.
 
 ## Hives: add_hive and remove_hive
 

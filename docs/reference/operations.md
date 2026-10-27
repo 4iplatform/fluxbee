@@ -263,6 +263,13 @@ sends `SYSTEM_UPDATE` to that hive's orchestrator: it answers `sync_pending` (HT
 copy of the manifest has that hash and the artifacts are present, then reloads the manifest and
 applies retention; it does not restart nodes. `run_node` reads the manifest from disk.
 
+A running node that follows `current` moves to a new `current` on its own: the orchestrator's
+reconcile relaunches it on that version within a minute of the version's files reaching its hive,
+with or without the update. A pinned node keeps its version; a package on a base runtime (a WF
+node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to its base's new
+`current`, pinned or not
+([SY.orchestrator](../nodes/sy-orchestrator.md#a-running-node-and-a-new-runtime-version)).
+
 ## Upgrade
 
 ### The motherbee
@@ -276,7 +283,8 @@ applies retention; it does not restart nodes. `run_node` reads the manifest from
 - its boot (`bootstrap_local`) restarts every core service whose running binary was replaced
   (`/proc/<pid>/exe` ends in ` (deleted)`), in start order, records it as the last core update
   (`via: package`), rebuilds the per-role core trees for the spokes, and moves managed nodes that
-  follow `current` onto the new version (`reconcile_persisted_custom_nodes` with `Rebind`).
+  follow `current` onto the new version (`reconcile_persisted_custom_nodes`, the pass its 60 s
+  loop repeats).
 
 ### The spokes (core update)
 
@@ -291,6 +299,10 @@ applies retention; it does not restart nodes. `run_node` reads the manifest from
   order, checking each; a failed check rolls the binaries back. A replaced `sy-orchestrator`
   restarts itself through a transient `systemd-run` timer. The outcome is in
   `core-update-last.json`; what is installed, in `core-installed.json`.
+- The spoke's managed nodes that follow `current`, and its package nodes whose base runtime
+  moved, move to the new runtime versions within a minute of those versions reaching it, through
+  the orchestrator's 60 s reconcile, whether or not the update restarted its orchestrator
+  (FINDINGS A-109).
 - `POST /hives/{hive}/core/rollback {"generation":"latest"}` (or `{"to_manifest_hash"}`, with
   `dry_run`) goes back to a backed-up generation.
 - `GET /hives/{hive}/versions` (and `GET /versions` for every connected hive) compares core,
@@ -312,7 +324,7 @@ orchestrator). SY nodes and the router are not managed this way and cannot be la
 | Action | Route | Notes |
 | --- | --- | --- |
 | launch | `POST /hives/{hive}/nodes {node_name, runtime, runtime_version, tenant_id, config}` | `runtime_version` defaults to `current`; registers the node's ILK (type `agent`) with SY.identity, writes `config.json`, starts the unit with `FLUXBEE_NODE_NAME`, `FLUXBEE_NODE_ILK_ID`, `FLUXBEE_NODE_TENANT_ID` |
-| start / restart | `POST /hives/{hive}/nodes/{name}/start`, `.../restart` | need an existing config (`NODE_CONFIG_NOT_FOUND`) |
+| start / restart | `POST /hives/{hive}/nodes/{name}/start`, `.../restart` | need an existing config (`NODE_CONFIG_NOT_FOUND`); refuse a version whose files, its binary included, are not on the hive yet (`RUNTIME_NOT_PRESENT`), with nothing stopped; a launch that fails (`START_FAILED`, `RESTART_FAILED`) is tried again by the reconcile every 60 s until the node is stopped |
 | stop | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": false}` | there is no separate stop action; the node is stopped and not relaunched at boot; its config, ILK, secrets and timers stay |
 | remove | `DELETE /hives/{hive}/nodes/{name}` with `{"purge_instance": true}` | full teardown, below |
 | remove a stopped instance | `DELETE /hives/{hive}/nodes/{name}/instance` | refused while running (`NODE_INSTANCE_RUNNING`) |
@@ -348,6 +360,18 @@ Keeping nodes alive: every 60 s the orchestrator relaunches a managed node that 
 (`MANAGED_RECONCILE_INTERVAL_SECS`); every 5 s its watchdog starts `rt-gateway` and any system
 service that is not active (`watchdog_tick`).
 
+Moving to a new runtime: the same 60 s pass relaunches a running node on what its runtime names
+now, once that is ready on its hive: the version the pointer names, for a node that follows
+`current`, and the start script that version runs, which for a package on a base runtime is its
+base's `current` one, pinned or not. What a unit runs is read from systemd (its ExecStart, and the
+version its launch wrote in its environment), so a node whose config only lagged gets its config
+written, without a restart. Until the target is ready the node stays as it is, logged once per
+target. A pinned node keeps its version until `set_node_config` rebinds it, which the pass then
+applies (a package node launched before 0.1.88 takes it at its next launch). Every launch writes
+the version into `_system.runtime_version` before it launches the node, so `status` and
+`NODE_HELP` report the version the node runs
+([SY.orchestrator](../nodes/sy-orchestrator.md#a-running-node-and-a-new-runtime-version)).
+
 ## Orchestrator boot
 
 `bootstrap_local` then `finish_bootstrap` in `src/bin/sy_orchestrator.rs`:
@@ -362,7 +386,8 @@ service that is not active (`watchdog_tick`).
    (`LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS`; a timeout only warns);
 5. on the motherbee, waits for `sy-storage` (30 s) and for its database to answer
    `STORAGE_METRICS_GET` (30 s); failing either ends the orchestrator, which systemd restarts;
-6. relaunches persisted nodes and hands over the blob folders.
+6. relaunches persisted nodes, moves the running ones that follow a moved `current`, and hands
+   over the blob folders.
 
 Until step 6 ends, admin actions get `ORCHESTRATOR_BOOTING` (HTTP 500 through
 `error_code_to_http_status`); retry. On SIGTERM the orchestrator exits without stopping the hive.

@@ -60,7 +60,8 @@ On an existing hive this is one explicit step, which the ledger records, as for 
 From then on it is a managed node like the others:
 
 - the orchestrator relaunches it at boot from its `config.json`;
-- a `.deb` upgrade moves it to the new version (`reconcile_persisted_custom_nodes` with `Rebind`);
+- a new `current` for io.web, from a `.deb` upgrade or a publish, moves it to that version within
+  a minute (`reconcile_persisted_custom_nodes`);
 - `DELETE /hives/motherbee/nodes/IO.web@motherbee` with `{"purge_instance": false}` stops it, and
   it stays stopped across boots; with `{"purge_instance": true}` it removes it.
 

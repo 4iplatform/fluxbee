@@ -716,6 +716,14 @@ struct OrchestratorState {
     // SAME node race and drift those stores. Per-node (not global) so different
     // nodes still operate concurrently. Same registry pattern as the hive lock.
     node_lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The version each running node waits for, by node name: one that follows `current` stays
+    /// on its version while the one the pointer names is not on this hive yet (FINDINGS A-109).
+    /// The reconcile logs a wait once per target version, not on every pass.
+    relaunch_waits: std::sync::Mutex<HashMap<String, String>>,
+    /// Held by a reconcile pass for its whole run (`reconcile_persisted_custom_nodes`): the boot's
+    /// pass waits for it, and the 60 s loop skips a tick while the boot's pass holds it, so two
+    /// passes never run at once.
+    reconcile_pass: Mutex<()>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -810,6 +818,25 @@ impl OrchestratorState {
                 .clone()
         };
         lock.try_lock_owned().ok()
+    }
+
+    /// Records that `node_name` waits for `version`; true only the first time it waits for that
+    /// version, so the wait is logged once.
+    fn note_relaunch_wait(&self, node_name: &str, version: &str) -> bool {
+        self.relaunch_waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(node_name.to_string(), version.to_string())
+            .as_deref()
+            != Some(version)
+    }
+
+    /// Forgets a node's wait: it moved, or it no longer has to.
+    fn clear_relaunch_wait(&self, node_name: &str) {
+        self.relaunch_waits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(node_name);
     }
 }
 
@@ -961,6 +988,8 @@ async fn main() -> Result<(), OrchestratorError> {
         blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
+        relaunch_waits: std::sync::Mutex::new(HashMap::new()),
+        reconcile_pass: Mutex::new(()),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -1784,13 +1813,17 @@ async fn finish_bootstrap(
         )
         .await?;
     }
-    // Boot runs after every package upgrade and core update: it also moves running nodes that
-    // follow `current` onto the version the pointer now names (FINDINGS A-39).
-    if let Err(err) = reconcile_persisted_custom_nodes(state, ReconcileRunning::Rebind).await {
-        tracing::warn!(
-            error = %err,
-            "persisted custom node reconcile failed during bootstrap"
-        );
+    // The pass the 60 s loop repeats: it launches the nodes that should run, and moves running
+    // nodes onto what their runtime names now (FINDINGS A-39, A-109). It waits for a loop pass
+    // that already runs, and the loop skips its ticks while this one holds the pass.
+    {
+        let _pass = state.reconcile_pass.lock().await;
+        if let Err(err) = reconcile_persisted_custom_nodes(state).await {
+            tracing::warn!(
+                error = %err,
+                "persisted custom node reconcile failed during bootstrap"
+            );
+        }
     }
     hand_over_blob_folder_entries(&state.hive_id, &state.blob, &state.dist);
     Ok(())
@@ -1984,6 +2017,10 @@ async fn wait_for_storage_db_ready(
 /// in production for exactly this reason. Runs in its OWN task — NOT the 5s watchdog critical
 /// path — so a slow systemctl on a wedged unit never stalls rt-gateway/SY.* self-heal; and
 /// reconcile uses try_lock per node so a held admin lock never blocks it.
+///
+/// The same pass moves a running node that follows `current` when the pointer moved: a core
+/// update restarts only the services whose binary changed, so this hive's orchestrator may not
+/// restart at all, and a runtime published without a `.deb` restarts nothing (FINDINGS A-109).
 const MANAGED_RECONCILE_INTERVAL_SECS: u64 = 60;
 
 async fn run_managed_runtime_reconcile_loop(state: Arc<OrchestratorState>) {
@@ -1994,51 +2031,387 @@ async fn run_managed_runtime_reconcile_loop(state: Arc<OrchestratorState>) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(err) = reconcile_persisted_custom_nodes(&state, ReconcileRunning::Leave).await {
+        // Two passes at once could each decide on its own copy of the manifest, and the older one
+        // move a node back: the boot's pass holds the pass, and this tick is skipped.
+        let Ok(_pass) = state.reconcile_pass.try_lock() else {
+            tracing::info!("boot reconcile still running; skipping this managed-runtime reconcile");
+            continue;
+        };
+        if let Err(err) = reconcile_persisted_custom_nodes(&state).await {
             tracing::warn!(error = %err, "managed-runtime liveness reconcile failed");
         }
     }
 }
 
-/// What the reconcile does with a node that is already running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReconcileRunning {
-    /// Liveness only (the periodic loop): a running node is left alone.
+/// What a reconcile pass does with one persisted node, read under its lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconcileStep {
+    /// Running on what its runtime names now, and its config says so; or seen by the router
+    /// without an active unit: left as it is.
     Leave,
-    /// Boot, i.e. after a package upgrade or a core update: a running node that follows
-    /// `current` and whose pointer moved is relaunched on the new version with one restart.
-    /// Left running, it would keep executing a runtime directory dpkg has already removed, and
-    /// any restart of its unit (needrestart, a crash) would fail with 203/EXEC (FINDINGS A-39).
-    Rebind,
+    /// Not running and not seen by the router, and what its runtime names is ready on this hive:
+    /// launched.
+    Launch,
+    /// Running what its runtime names now, while its config names another version (a launch
+    /// before 0.1.88 did not record it, FINDINGS A-101): the version is written, and the node is
+    /// left running.
+    Record(LaunchTarget),
+    /// Running, but not on what its runtime names now (`running_node_move`), which is ready on this
+    /// hive: relaunched on it with one restart. Left running, it would keep executing a runtime
+    /// directory dpkg may already have removed, and any restart of its unit (needrestart, a crash)
+    /// would fail with 203/EXEC (FINDINGS A-39, A-109).
+    Relaunch(LaunchTarget),
+    /// To be launched or relaunched on what its runtime names now, which is not ready on this hive
+    /// yet (`reason`): Syncthing can deliver the manifest before the files. Left as it is until it
+    /// is. `first` is true the first time it waits for that target, for one log line.
+    Wait {
+        target: LaunchTarget,
+        reason: String,
+        first: bool,
+    },
 }
 
-/// The version a node that follows `current` should move to, when the manifest pointer moved
-/// under it. `None` when it is pinned, up to date, or its runtime cannot be resolved: a running
-/// node is never torn down because the manifest does not name a version for it.
-fn moved_current_version(
+/// What a node's runtime names now (`launch_target`): the version its intent resolves to (the
+/// pointer's, for a node that follows `current`; its pin, else), the start script that version
+/// runs, its own or its base runtime's, and, for a package on a base runtime, the version's package
+/// directory. A package's pin is its own version: its base runtime always runs the base's `current`
+/// (`resolve_runtime_spawn_entrypoint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchTarget {
+    version: String,
+    script_path: String,
+    package_path: Option<String>,
+}
+
+/// What the reconcile does with a running node (`running_node_move`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunningNodeMove {
+    /// It runs the target already; only its config names another version.
+    Record(LaunchTarget),
+    /// It does not run the target.
+    Relaunch(LaunchTarget),
+}
+
+/// What systemd says an active unit runs: its ExecStart, and the runtime version its launch wrote
+/// in its environment (`NODE_RUNTIME_VERSION_ENV`; a unit launched before 0.1.88 has none). Each is
+/// `None` when systemd does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LiveUnit {
+    exec_start: Option<String>,
+    runtime_version: Option<String>,
+}
+
+/// The reconcile's decision for `node`, from what systemd and the router say of it (`live`, for an
+/// active unit). Only a node whose unit is active is moved; one the router sees without an active
+/// unit is left. Nothing is launched or relaunched on what is not ready on this hive.
+fn reconcile_step(
+    state: &OrchestratorState,
     manifest: &RuntimeManifest,
     node: &PersistedManagedNode,
-) -> Option<String> {
-    if !node.follows_current() {
-        return None;
+    unit_active: bool,
+    live: &LiveUnit,
+    visible_in_router: bool,
+    runtimes_root: &Path,
+) -> ReconcileStep {
+    let launch = if unit_active {
+        match running_node_move(manifest, node, live) {
+            None => None,
+            Some(RunningNodeMove::Record(target)) => {
+                state.clear_relaunch_wait(&node.node_name);
+                return ReconcileStep::Record(target);
+            }
+            Some(RunningNodeMove::Relaunch(target)) => Some(target),
+        }
+    } else if visible_in_router {
+        None
+    } else {
+        // A node that is down is launched on what its runtime names; one whose runtime the manifest
+        // cannot resolve goes on to the launch, which says so.
+        let Some(target) = launch_target(manifest, node) else {
+            state.clear_relaunch_wait(&node.node_name);
+            return ReconcileStep::Launch;
+        };
+        Some(target)
+    };
+    let Some(target) = launch else {
+        state.clear_relaunch_wait(&node.node_name);
+        return ReconcileStep::Leave;
+    };
+    if let Some(reason) =
+        runtime_version_not_ready(manifest, &node.runtime, &target.version, runtimes_root)
+    {
+        let waits_for = format!("{} {}", target.version, target.script_path);
+        let first = state.note_relaunch_wait(&node.node_name, &waits_for);
+        return ReconcileStep::Wait {
+            target,
+            reason,
+            first,
+        };
     }
-    let runtime_key = resolve_runtime_key(manifest, &node.runtime).ok()?;
-    let version = resolve_runtime_version(manifest, &runtime_key, "current").ok()?;
-    (version != node.runtime_version).then_some(version)
+    state.clear_relaunch_wait(&node.node_name);
+    if unit_active {
+        ReconcileStep::Relaunch(target)
+    } else {
+        ReconcileStep::Launch
+    }
 }
 
+/// What a node's runtime names now; `None` when the manifest cannot resolve its runtime, version
+/// or entry point.
+fn launch_target(manifest: &RuntimeManifest, node: &PersistedManagedNode) -> Option<LaunchTarget> {
+    let runtime_key = resolve_runtime_key(manifest, &node.runtime).ok()?;
+    let requested_version = if node.follows_current() {
+        "current"
+    } else {
+        node.runtime_version.as_str()
+    };
+    let version = resolve_runtime_version(manifest, &runtime_key, requested_version).ok()?;
+    let entrypoint = resolve_runtime_spawn_entrypoint(manifest, &runtime_key, &version).ok()?;
+    Some(LaunchTarget {
+        package_path: entrypoint.runtime_base.as_ref().map(|_| {
+            runtime_package_dir(&runtime_key, &version)
+                .display()
+                .to_string()
+        }),
+        script_path: entrypoint.script_path,
+        version,
+    })
+}
+
+/// Whether a running node runs what its runtime names now (`launch_target`), from what its unit
+/// runs, not from its config:
+/// - a unit whose ExecStart does not run the target's start script is relaunched, compared as
+///   `managed_node_restart_command` does: a package whose base's `current` moved, pinned or not,
+///   or a full runtime on another version;
+/// - else what version it runs is the one its launch wrote in the unit's environment, or, for a
+///   full runtime whose ExecStart runs the target's start script, the target's (the path names
+///   it). Another version is relaunched; the target's, with a config that names another, is only
+///   recorded (FINDINGS A-101: a restart before 0.1.88 did not write it);
+/// - with neither known (a package unit launched before 0.1.88, or no ExecStart), the config's
+///   version decides, as for a node that follows `current` when the pointer moved (A-109).
+///
+/// `None` when it runs the target and its config says so, or when the manifest cannot resolve what
+/// it should run: a running node is never torn down for that.
+fn running_node_move(
+    manifest: &RuntimeManifest,
+    node: &PersistedManagedNode,
+    live: &LiveUnit,
+) -> Option<RunningNodeMove> {
+    let target = launch_target(manifest, node)?;
+    let runs_script = live
+        .exec_start
+        .as_deref()
+        .map(|exec_start| exec_start.contains(&target.script_path));
+    if runs_script == Some(false) {
+        return Some(RunningNodeMove::Relaunch(target));
+    }
+    let runs_version = live.runtime_version.clone().or_else(|| {
+        (runs_script == Some(true) && target.package_path.is_none()).then(|| target.version.clone())
+    });
+    let recorded = node.runtime_version == target.version;
+    match runs_version {
+        Some(version) if version == target.version => {
+            (!recorded).then_some(RunningNodeMove::Record(target))
+        }
+        Some(_) => Some(RunningNodeMove::Relaunch(target)),
+        None => (!recorded).then_some(RunningNodeMove::Relaunch(target)),
+    }
+}
+
+/// What systemd says an active unit runs.
+fn live_unit(unit: &str) -> LiveUnit {
+    let mut properties = systemd_unit_show(unit, &["ExecStart", "Environment"]);
+    LiveUnit {
+        exec_start: properties
+            .remove("ExecStart")
+            .filter(|exec_start| !exec_start.is_empty()),
+        runtime_version: properties
+            .remove("Environment")
+            .and_then(|environment| stamped_runtime_version(&environment)),
+    }
+}
+
+/// The runtime version in a unit's `Environment`, as `systemctl show` prints it: assignments
+/// separated by spaces.
+fn stamped_runtime_version(environment: &str) -> Option<String> {
+    environment
+        .split_whitespace()
+        .find_map(|assignment| {
+            assignment
+                .strip_prefix(NODE_RUNTIME_VERSION_ENV)?
+                .strip_prefix('=')
+        })
+        .filter(|version| valid_token(version))
+        .map(str::to_string)
+}
+
+/// Why `version` of `runtime` cannot start on this hive yet; `None` when it can. Every launch checks
+/// it: run, start and restart (`RUNTIME_NOT_PRESENT`) and the reconcile (FINDINGS A-39). Ready is:
+/// - what the runtime listing reports as `readiness` (`runtime_readiness_for_entry_with_root`: the
+///   version's directory, and its start script or its base runtime's, executable);
+/// - the package files that a start requires (`node_package_files_preflight`);
+/// - the binary the start script runs (`start_script_entry`): Syncthing can deliver the script
+///   before the binary.
+fn runtime_version_not_ready(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    version: &str,
+    runtimes_root: &Path,
+) -> Option<String> {
+    let entries = match runtime_manifest_entry_map(manifest) {
+        Ok(entries) => entries,
+        Err(err) => return Some(err.to_string()),
+    };
+    let (runtime_key, entry) = match resolve_runtime_key_from_map(&entries, runtime) {
+        Ok(key) => match entries.get(&key) {
+            Some(entry) => (key, entry),
+            None => return Some(format!("runtime '{key}' not found in manifest")),
+        },
+        Err(err) => return Some(err.to_string()),
+    };
+    let readiness = runtime_readiness_for_entry_with_root(
+        &runtime_key,
+        entry,
+        manifest.runtimes.as_object(),
+        runtimes_root,
+    );
+    let ready = |field: &str| {
+        readiness
+            .get(version)
+            .and_then(|item| item.get(field))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    // The base runtime before the start script: a package that runs on one reports the base's
+    // start script in both fields.
+    let not_ready = [
+        (
+            "runtime_present",
+            "its directory or start script is not here",
+        ),
+        (
+            "base_runtime_ready",
+            "its base runtime's start script is not ready",
+        ),
+        ("start_sh_executable", "its start script is not executable"),
+    ]
+    .into_iter()
+    .find(|(field, _)| !ready(field));
+    if let Some((field, what)) = not_ready {
+        let package_dir = runtime_package_dir_with_root(runtimes_root, &runtime_key, version);
+        return Some(format!(
+            "{what} (readiness.{field} is false; {})",
+            package_dir.display()
+        ));
+    }
+    // Only the message is kept: the hive and the node name are for an operator's answer.
+    if let Err(payload) =
+        node_package_files_preflight(manifest, runtimes_root, &runtime_key, version, "", "")
+    {
+        return Some(
+            payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("its package files are not here")
+                .to_string(),
+        );
+    }
+    let entrypoint = match resolve_runtime_spawn_entrypoint(manifest, &runtime_key, version) {
+        Ok(entrypoint) => entrypoint,
+        Err(err) => return Some(err.message()),
+    };
+    let start_script = runtimes_root
+        .join(&entrypoint.script_runtime)
+        .join(&entrypoint.script_version)
+        .join("bin/start.sh");
+    match start_script_entry(&start_script) {
+        Ok(StartScriptEntry::PackageScript) => None,
+        Ok(StartScriptEntry::Binary(binary)) => {
+            (!(binary.is_file() && local_runtime_script_is_executable(&binary))).then(|| {
+                format!(
+                    "the binary its start script runs is not here or not executable ({})",
+                    binary.display()
+                )
+            })
+        }
+        Err(reason) => Some(reason),
+    }
+}
+
+/// The environment variable in which a managed node's unit carries the runtime version it was
+/// launched on (`build_managed_node_run_command`). The reconcile reads it to know what a unit runs,
+/// a package's version included, which its ExecStart (its base's start script) does not show.
+const NODE_RUNTIME_VERSION_ENV: &str = "FLUXBEE_NODE_RUNTIME_VERSION";
+
+/// The largest start script `start_script_entry` reads; the publish scripts write a few lines.
+const START_SCRIPT_MAX_BYTES: u64 = 64 * 1024;
+
+/// What a version's start script runs, as far as the orchestrator knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartScriptEntry {
+    /// The binary its line `exec "$SCRIPT_DIR/<binary>" "$@"` names, next to the script: the line
+    /// every publish script writes (`scripts/publish-runtime.sh` and the scripts built on it).
+    Binary(PathBuf),
+    /// A package's own start script (its version directory has the `package.json` every package
+    /// carries): what it runs is the package's.
+    PackageScript,
+}
+
+/// What `start_script` runs. A start script a publish script wrote (no `package.json` next to its
+/// `bin/`) must have the line those scripts write: one that does not is an error, so a version
+/// whose binary cannot be known is not ready, never ready without the check.
+fn start_script_entry(start_script: &Path) -> Result<StartScriptEntry, String> {
+    let version_dir = start_script
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "start script '{}' has no version directory",
+                start_script.display()
+            )
+        })?;
+    if version_dir.join("package.json").is_file() {
+        return Ok(StartScriptEntry::PackageScript);
+    }
+    let unknown = |why: String| {
+        format!(
+            "the binary its start script runs is not known: {why} ({})",
+            start_script.display()
+        )
+    };
+    let metadata =
+        fs::metadata(start_script).map_err(|err| unknown(format!("cannot read it: {err}")))?;
+    if metadata.len() > START_SCRIPT_MAX_BYTES {
+        return Err(unknown(format!(
+            "it is larger than {START_SCRIPT_MAX_BYTES} bytes, and a publish script writes a few lines"
+        )));
+    }
+    let script = fs::read_to_string(start_script)
+        .map_err(|err| unknown(format!("cannot read it: {err}")))?;
+    let binary = script
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("exec \"$SCRIPT_DIR/")?
+                .strip_suffix("\" \"$@\"")
+        })
+        .filter(|binary| !matches!(*binary, "" | "." | "..") && !binary.contains('/'))
+        .ok_or_else(|| {
+            unknown(
+                "it has no line `exec \"$SCRIPT_DIR/<binary>\" \"$@\"`, which every publish script \
+                 writes"
+                    .to_string(),
+            )
+        })?;
+    Ok(StartScriptEntry::Binary(
+        start_script.with_file_name(binary),
+    ))
+}
+
+/// One reconcile pass over the persisted nodes. Its callers hold `reconcile_pass` for it.
 async fn reconcile_persisted_custom_nodes(
     state: &OrchestratorState,
-    running: ReconcileRunning,
 ) -> Result<(), OrchestratorError> {
-    let manifest = match load_runtime_manifest_result()? {
-        Some(manifest) => manifest,
-        None => {
-            tracing::warn!("runtime manifest missing; skipping persisted custom node reconcile");
-            return Ok(());
-        }
-    };
-
     let nodes = persisted_custom_nodes(state)?;
     if nodes.is_empty() {
         tracing::info!("no persisted custom node instances found for reconcile");
@@ -2049,62 +2422,142 @@ async fn reconcile_persisted_custom_nodes(
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
-    for node in nodes {
-        let unit = unit_from_node_name(&node.node_name);
+    for listed in nodes {
+        let unit = unit_from_node_name(&listed.node_name);
         // SO-04: hold the per-node lifecycle lock across this node's liveness check AND its
         // respawn — exactly like run/kill/restart/remove/config_set — so a reconcile never races
         // a concurrent admin op on the same node (identity/config/systemd drift). try_lock, NOT
         // block: if an admin op holds this node's lock it is already managing it, so skip and
         // retry next cycle rather than stalling the reconcile of every OTHER node behind it.
-        let Some(_node_guard) = state.try_lock_node(&node.node_name) else {
+        let Some(_node_guard) = state.try_lock_node(&listed.node_name) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
-        // The list was read before this node's lock: a stop that finished in between cleared the
-        // flag, and the node stays stopped.
-        let still_relaunched =
-            load_node_effective_config(&node.config_path)
+        // The runtimes manifest is read under the node's lock, as the node is: a pass is long, and a
+        // start, a restart or a publish may move the pointer meanwhile. A copy read at the pass's
+        // start could move a node back to the version an older manifest named.
+        let manifest = match load_runtime_manifest_result()? {
+            Some(manifest) => manifest,
+            None => {
+                tracing::warn!(
+                    "runtime manifest missing; skipping persisted custom node reconcile"
+                );
+                return Ok(());
+            }
+        };
+        // The list was read before this node's lock, so the node is read again under it: a stop
+        // that finished in between cleared the flag, and the node stays stopped; a start or a
+        // restart may have moved it already.
+        let Some(node) = load_node_effective_config(&listed.config_path)
+            .ok()
+            .and_then(|config| {
+                persisted_managed_node_from_config_value(
+                    &listed.node_name,
+                    &listed.kind,
+                    listed.config_path.clone(),
+                    &config,
+                    true,
+                )
                 .ok()
-                .and_then(|config| {
-                    config
-                        .get("_system")
-                        .and_then(|system| system.get("relaunch_on_boot"))
-                        .and_then(|value| value.as_bool())
-                })
-                == Some(true);
-        if !still_relaunched {
+                .flatten()
+            })
+        else {
             skipped = skipped.saturating_add(1);
             continue;
-        }
-        let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
-        let visible_in_router = local_inventory_has_node(state, &node.node_name);
-        // Only a node whose unit we own is rebound; one visible without an active unit is left.
-        let rebind_to = match running {
-            ReconcileRunning::Rebind if unit_active => moved_current_version(&manifest, &node),
-            _ => None,
         };
-        if let Some(to) = rebind_to.as_deref() {
-            tracing::info!(
-                node_name = node.node_name,
-                runtime = node.runtime,
-                from = node.runtime_version,
-                to = to,
-                unit = unit,
-                "running node follows 'current' and the pointer moved; relaunching it on the new version"
-            );
-        } else if unit_active || visible_in_router {
-            skipped = skipped.saturating_add(1);
-            tracing::info!(
-                node_name = node.node_name,
-                runtime = node.runtime,
-                runtime_version = node.runtime_version,
-                unit = unit,
-                unit_active = unit_active,
-                visible_in_router = visible_in_router,
-                "skipping persisted custom node reconcile; instance already active/visible"
-            );
-            continue;
-        }
+        let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
+        let live = if unit_active {
+            live_unit(&unit)
+        } else {
+            LiveUnit::default()
+        };
+        let visible_in_router = local_inventory_has_node(state, &node.node_name);
+        let relaunch = match reconcile_step(
+            state,
+            &manifest,
+            &node,
+            unit_active,
+            &live,
+            visible_in_router,
+            Path::new(DIST_RUNTIME_ROOT_DIR),
+        ) {
+            ReconcileStep::Launch => None,
+            ReconcileStep::Relaunch(target) => Some(target),
+            ReconcileStep::Record(target) => {
+                // It runs that version already: a relaunch would only restart it.
+                match persist_node_launch(
+                    &node.config_path,
+                    &target.version,
+                    target.package_path.as_deref(),
+                ) {
+                    Ok(()) => {
+                        skipped = skipped.saturating_add(1);
+                        tracing::info!(
+                            node_name = node.node_name,
+                            runtime = node.runtime,
+                            from = node.runtime_version,
+                            to = target.version,
+                            unit = unit,
+                            "running node runs the version its runtime names, but its config named another; recorded it, the node keeps running"
+                        );
+                    }
+                    Err(err) => {
+                        failed = failed.saturating_add(1);
+                        tracing::warn!(
+                            node_name = node.node_name,
+                            runtime_version = target.version,
+                            error = %err,
+                            "could not record the version a running node runs in its config"
+                        );
+                    }
+                }
+                continue;
+            }
+            ReconcileStep::Leave => {
+                skipped = skipped.saturating_add(1);
+                tracing::info!(
+                    node_name = node.node_name,
+                    runtime = node.runtime,
+                    runtime_version = node.runtime_version,
+                    unit = unit,
+                    unit_active = unit_active,
+                    visible_in_router = visible_in_router,
+                    "skipping persisted custom node reconcile; instance already active/visible"
+                );
+                continue;
+            }
+            ReconcileStep::Wait {
+                target,
+                reason,
+                first,
+            } => {
+                skipped = skipped.saturating_add(1);
+                if first && unit_active {
+                    tracing::info!(
+                        node_name = node.node_name,
+                        runtime = node.runtime,
+                        from = node.runtime_version,
+                        to = target.version,
+                        entry = target.script_path,
+                        running = live.exec_start.as_deref().unwrap_or_default(),
+                        reason = reason,
+                        unit = unit,
+                        "running node is not on what its runtime names now, and that is not ready on this hive; it stays as it is until it is"
+                    );
+                } else if first {
+                    tracing::info!(
+                        node_name = node.node_name,
+                        runtime = node.runtime,
+                        runtime_version = target.version,
+                        entry = target.script_path,
+                        reason = reason,
+                        unit = unit,
+                        "node is down, and what its runtime names is not ready on this hive; it is launched once it is"
+                    );
+                }
+                continue;
+            }
+        };
 
         let runtime_key = match resolve_runtime_key(&manifest, &node.runtime) {
             Ok(value) => value,
@@ -2127,7 +2580,7 @@ async fn reconcile_persisted_custom_nodes(
         // directory and removes the old one, so re-resolving the stored answer ("0.1.1") fails
         // with `version not available` and the node is abandoned mid-crash-loop — observed in
         // production on the 0.1.1 → 0.1.2 upgrade, on all four runtime nodes at once (U-10).
-        // Re-resolving the INTENT lands on the new version and this boot pass repairs them.
+        // Re-resolving the INTENT lands on the new version and this pass repairs them.
         //
         // A node pinned to an explicit version still resolves to that version, and still fails
         // loudly if it is gone — which is the correct outcome for a deliberate pin.
@@ -2225,25 +2678,6 @@ async fn reconcile_persisted_custom_nodes(
                 );
             }
         }
-        if version != node.runtime_version {
-            // The pointer moved under a `current` node — say so plainly. This is the visible
-            // sign that an upgrade propagated, and it is the line an operator should find when
-            // they wonder why a node restarted.
-            tracing::info!(
-                node_name = node.node_name,
-                runtime = runtime_key,
-                from = node.runtime_version,
-                to = version,
-                "runtime 'current' pointer moved; rebinding node to the new version"
-            );
-            if let Err(err) = persist_node_runtime_version(&node.config_path, &version) {
-                tracing::warn!(
-                    node_name = node.node_name,
-                    error = %err,
-                    "failed to persist the rebound runtime version; the node still starts on the new one"
-                );
-            }
-        }
         let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
             Ok(value) => value,
             Err(err) => {
@@ -2293,6 +2727,65 @@ async fn reconcile_persisted_custom_nodes(
             continue;
         }
 
+        if let Some(target) = relaunch.as_ref() {
+            if target.version != node.runtime_version {
+                tracing::info!(
+                    node_name = node.node_name,
+                    runtime = node.runtime,
+                    from = node.runtime_version,
+                    to = target.version,
+                    unit = unit,
+                    "running node follows 'current' and the pointer moved; relaunching it on the new version"
+                );
+            } else {
+                tracing::info!(
+                    node_name = node.node_name,
+                    runtime = node.runtime,
+                    runtime_version = node.runtime_version,
+                    running = live.exec_start.as_deref().unwrap_or_default(),
+                    running_version = live.runtime_version.as_deref().unwrap_or_default(),
+                    entry = target.script_path,
+                    unit = unit,
+                    "running node's unit runs another start script or version than its runtime names now; relaunching it on what its runtime names"
+                );
+            }
+        }
+        if version != node.runtime_version {
+            // The pointer moved under a `current` node — say so plainly. This is the visible
+            // sign that an upgrade propagated, and it is the line an operator should find when
+            // they wonder why a node restarted.
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                from = node.runtime_version,
+                to = version,
+                "runtime 'current' pointer moved; rebinding node to the new version"
+            );
+        }
+        // What the node is launched on goes into its config first (FINDINGS A-101): the node reads
+        // `_system.runtime_version` when it starts (NODE_HELP), status reports it, and the next pass
+        // finds a relaunched node up to date, so a move relaunches it once (A-109). A package that
+        // moves to another version gets that version's `package_path`, where the WF engine reads
+        // its definition. A node launched on a version its config does not name would be relaunched
+        // on every pass, so one whose config cannot be written is not launched.
+        let package_path = entrypoint.runtime_base.as_ref().map(|_| {
+            runtime_package_dir(&runtime_key, &version)
+                .display()
+                .to_string()
+        });
+        if let Err(err) = persist_node_launch(&node.config_path, &version, package_path.as_deref())
+        {
+            failed = failed.saturating_add(1);
+            tracing::warn!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                runtime_version = version,
+                error = %err,
+                "could not record the runtime version in the node's config; not launching it"
+            );
+            continue;
+        }
+
         // Free the unit name before relaunching.
         //
         // Managed nodes run as TRANSIENT units (`systemd-run`), and systemd refuses to create a
@@ -2300,12 +2793,13 @@ async fn reconcile_persisted_custom_nodes(
         // fragment file". A node left crash-looping by an upgrade sits in `auto-restart`, which
         // is exactly that state: not active, but still loaded, holding its name hostage with the
         // OLD ExecStart path. Without this the rebind above resolves correctly and then the
-        // relaunch fails on every boot, which is what happened on the 0.1.2 → 0.1.3 upgrade.
+        // relaunch fails on every pass, which is what happened on the 0.1.2 → 0.1.3 upgrade.
         clear_stale_transient_unit(&unit);
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
             &entrypoint.script_path,
+            &version,
             persisted_ilk.as_deref(),
             persisted_tenant.as_deref(),
         );
@@ -16522,14 +17016,23 @@ fn config_version_from_value(value: &serde_json::Value) -> u64 {
 /// to. Persisting only the latter is what made a `.deb` upgrade orphan every node: the caller
 /// asked to follow `current`, the answer was frozen into the unit path, and when the upgrade
 /// replaced the runtime directory the path dangled (U-10).
-/// Rewrite `_system.runtime_version` in a node's persisted config, leaving everything else —
-/// including `requested_runtime_version`, the intent — untouched.
 ///
-/// Used when a `current`-following node is rebound after the manifest pointer moved, so the
-/// config on disk reflects what is actually running.
-fn persist_node_runtime_version(
+/// What every launch of an existing node (start, restart, the reconcile) records in its config,
+/// under the node's lock and before it launches it, in one write; the rest of the config,
+/// `requested_runtime_version` (the intent) included, is left as it is:
+/// - `runtime_version`, the version it launches: the node reads it when it starts (NODE_HELP), and
+///   status reports it (FINDINGS A-101);
+/// - with a new version, `package_path`, for a node on a base runtime: that version's package
+///   directory, where the WF engine reads its definition;
+/// - `relaunch_on_boot: true`: a launched node is one the relaunches bring back. Written before the
+///   launch, it cannot race a conversion the node makes of the same file at boot (FINDINGS A-102).
+///
+/// Nothing is written when the config already says all of it. `run_node` writes the same in the
+/// config it creates, also before launching.
+fn persist_node_launch(
     config_path: &Path,
     version: &str,
+    package_path: Option<&str>,
 ) -> Result<(), OrchestratorError> {
     let raw = fs::read_to_string(config_path)?;
     let mut config: serde_json::Value = serde_json::from_str(&raw)?;
@@ -16543,10 +17046,38 @@ fn persist_node_runtime_version(
         )
         .into());
     };
-    system.insert(
-        "runtime_version".to_string(),
-        serde_json::Value::String(version.to_string()),
-    );
+    let mut changed = false;
+    if system
+        .get("runtime_version")
+        .and_then(|value| value.as_str())
+        != Some(version)
+    {
+        system.insert(
+            "runtime_version".to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+        if let Some(package_path) = package_path {
+            system.insert(
+                "package_path".to_string(),
+                serde_json::Value::String(package_path.to_string()),
+            );
+        }
+        changed = true;
+    }
+    if system
+        .get("relaunch_on_boot")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        system.insert(
+            "relaunch_on_boot".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
     system.insert(
         "updated_at_ms".to_string(),
         serde_json::Value::from(now_epoch_ms()),
@@ -17490,6 +18021,34 @@ fn runtime_package_files_preflight(
         "target": target_hive,
         "node_name": node_name,
         "requested_runtime_materialization": materialization,
+    }))
+}
+
+/// A launch refused while what it would launch is not ready on this hive
+/// (`runtime_version_not_ready`, FINDINGS A-39): `RUNTIME_NOT_PRESENT`, which callers retry
+/// (SY.wf-rules waits for the sync). Run, start and restart check it before they stop or start
+/// anything, as the reconcile does before it launches.
+fn runtime_readiness_refusal(
+    manifest: &RuntimeManifest,
+    runtime_key: &str,
+    version: &str,
+    runtimes_root: &Path,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    let Some(reason) = runtime_version_not_ready(manifest, runtime_key, version, runtimes_root)
+    else {
+        return Ok(());
+    };
+    Err(serde_json::json!({
+        "status": "error",
+        "error_code": "RUNTIME_NOT_PRESENT",
+        "message": format!("runtime {runtime_key} {version} is not ready on this hive: {reason}"),
+        "runtime": runtime_key,
+        "version": version,
+        "hint": "The runtime syncs from the motherbee; retry once it has arrived",
+        "target": target_hive,
+        "node_name": node_name,
     }))
 }
 
@@ -20517,6 +21076,16 @@ async fn run_node_flow(
     ) {
         return payload;
     }
+    if let Err(payload) = runtime_readiness_refusal(
+        &manifest,
+        &runtime_key,
+        &version,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        &target_hive,
+        &node_name,
+    ) {
+        return payload;
+    }
 
     // SO-03: preflight the local node config BEFORE any SY.identity mutation, so a
     // re-run against an existing node returns NODE_ALREADY_EXISTS without having
@@ -20706,6 +21275,7 @@ async fn run_node_flow(
         &unit,
         &node_name,
         &entrypoint.script_path,
+        &version,
         identity_ilk_id.as_deref(),
         identity_tenant_id.as_deref(),
     );
@@ -20959,6 +21529,16 @@ fn managed_node_launch_plan(
         &state.hive_id,
         &node.node_name,
     )?;
+    // A restart right after a release must not stop a node that runs to launch one that cannot
+    // start yet (FINDINGS A-39).
+    runtime_readiness_refusal(
+        &manifest,
+        &runtime_key,
+        &resolved_version,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        &state.hive_id,
+        &node.node_name,
+    )?;
 
     Ok(ManagedNodeLaunchPlan {
         unit: unit_from_node_name(&node.node_name),
@@ -20980,6 +21560,7 @@ fn managed_node_start_command(state: &OrchestratorState, plan: &ManagedNodeLaunc
             &plan.unit,
             &plan.node.node_name,
             &plan.entrypoint.script_path,
+            &plan.resolved_version,
             ilk_id.as_deref(),
             tenant_id.as_deref(),
         ),
@@ -20996,6 +21577,7 @@ fn managed_node_restart_command(
         &plan.unit,
         &plan.node.node_name,
         &plan.entrypoint.script_path,
+        &plan.resolved_version,
         ilk_id.as_deref(),
         tenant_id.as_deref(),
     );
@@ -21009,9 +21591,13 @@ fn managed_node_restart_command(
         // enough if the unit still points at the old one.
         //
         // So: restart in place only when the live ExecStart already points at the planned
-        // entrypoint. Otherwise tear the unit down and re-create it at the new path.
+        // entrypoint, and the unit carries the planned version (`NODE_RUNTIME_VERSION_ENV`): a
+        // package on a base runtime keeps the base's start script across its own versions, and a
+        // restart in place would keep the old version in the unit. Otherwise tear the unit down
+        // and re-create it at the new path.
         format!(
-            "if systemctl show -p ExecStart --value {unit} 2>/dev/null | grep -qF {script}; then \
+            "if systemctl show -p ExecStart --value {unit} 2>/dev/null | grep -qF {script} \
+                && systemctl show -p Environment --value {unit} 2>/dev/null | tr ' ' '\\n' | grep -qxF '{stamp}'; then \
                 systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd}); \
              else \
                 systemctl stop {unit} >/dev/null 2>&1 || true; \
@@ -21020,11 +21606,48 @@ fn managed_node_restart_command(
              fi",
             unit = shell_single_quote(&plan.unit),
             script = shell_single_quote(&plan.entrypoint.script_path),
+            stamp = shell_single_quote(&format!(
+                "{NODE_RUNTIME_VERSION_ENV}={}",
+                plan.resolved_version
+            )),
             run_cmd = run_cmd,
         )
     } else {
         managed_node_start_command(state, plan)
     }
+}
+
+/// Start and restart record in the node's config what they launch, before launching it
+/// (`persist_node_launch`): the version, the package path of a package that moves to another
+/// version, and `relaunch_on_boot: true` (FINDINGS A-101, A-102). An error is the request's answer,
+/// with nothing stopped or started yet.
+fn record_planned_launch(
+    target_hive: &str,
+    plan: &ManagedNodeLaunchPlan,
+) -> Result<(), serde_json::Value> {
+    let package_path = plan.entrypoint.runtime_base.as_ref().map(|_| {
+        runtime_package_dir(&plan.runtime_key, &plan.resolved_version)
+            .display()
+            .to_string()
+    });
+    persist_node_launch(
+        &plan.node.config_path,
+        &plan.resolved_version,
+        package_path.as_deref(),
+    )
+    .map_err(|err| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_WRITE_FAILED",
+            "message": format!("could not record the launch in the node's config: {err}"),
+            "target": target_hive,
+            "node_name": plan.node.node_name,
+            "runtime": plan.runtime_key,
+            "version": plan.resolved_version,
+            "requested_version": plan.requested_version,
+            "unit": plan.unit,
+        })
+    })
 }
 
 async fn start_or_restart_node_flow(
@@ -21139,6 +21762,9 @@ async fn start_or_restart_node_flow(
     ) {
         return refusal;
     }
+    if let Err(answer) = record_planned_launch(&target_hive, &plan) {
+        return answer;
+    }
 
     let cmd = if restart {
         managed_node_restart_command(state, &plan, unit_active)
@@ -21153,7 +21779,7 @@ async fn start_or_restart_node_flow(
     match execute_on_hive(state, &target_hive, &cmd, label) {
         Ok(()) => serde_json::json!({
             "status": "ok",
-            "relaunch_on_boot": set_node_relaunch_on_boot(state, &plan.node.node_name, true),
+            "relaunch_on_boot": true,
             "state": if restart { "restarted" } else { "started" },
             "target": target_hive,
             "hive": target_hive,
@@ -21164,10 +21790,14 @@ async fn start_or_restart_node_flow(
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         }),
+        // The launch was recorded before it was tried (`record_planned_launch`), so the node is
+        // one the relaunches bring back: the reconcile tries it again on every pass.
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": if restart { "RESTART_FAILED" } else { "START_FAILED" },
             "message": err.to_string(),
+            "relaunch_on_boot": true,
+            "hint": "relaunch_on_boot is set: the orchestrator's reconcile tries to launch this node again every 60 s until kill_node stops it",
             "target": target_hive,
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
@@ -22348,6 +22978,7 @@ fn build_managed_node_run_command(
     unit: &str,
     node_name: &str,
     script_path: &str,
+    runtime_version: &str,
     ilk_id: Option<&str>,
     tenant_id: Option<&str>,
 ) -> String {
@@ -22356,8 +22987,12 @@ fn build_managed_node_run_command(
     // orchestrator after a successful `ILK_REGISTER` to SY.identity. SY system
     // nodes don't go through this path (they're started by static systemd
     // units and resolve their own deterministic ILK via SHM), so the extra
-    // env vars are only emitted when provided.
-    let mut extra_env = String::new();
+    // env vars are only emitted when provided. The unit also carries the runtime version it
+    // runs (`NODE_RUNTIME_VERSION_ENV`), which the reconcile reads back (`live_unit`).
+    let mut extra_env = format!(
+        " --setenv={NODE_RUNTIME_VERSION_ENV}='{}'",
+        shell_single_quote(runtime_version)
+    );
     if let Some(ilk) = ilk_id.map(str::trim).filter(|v| !v.is_empty()) {
         extra_env.push_str(&format!(
             " --setenv=FLUXBEE_NODE_ILK_ID='{}'",
@@ -35753,7 +36388,7 @@ blob:
                 "genesis_refusal(",
                 "core_io_refusal(",
                 "match tenant_gate(",
-                "persist_node_runtime_version(",
+                "if let Err(err) = persist_node_launch(",
                 "clear_stale_transient_unit(",
                 "execute_on_hive(",
             ],
@@ -35851,44 +36486,1118 @@ blob:
         assert_eq!(failed["restarted"], serde_json::json!(["rt-gateway"]));
     }
 
-    /// A-39: after an upgrade, a running node that follows `current` moves to the version the
-    /// pointer names; a pinned or up-to-date node stays, and so does one whose runtime the
-    /// manifest cannot resolve (a running node is never torn down for that).
-    #[test]
-    fn only_a_node_following_a_moved_current_is_rebound() {
-        let manifest = RuntimeManifest {
+    /// A manifest whose io.api pointer names `current`.
+    fn io_api_manifest(current: &str) -> RuntimeManifest {
+        RuntimeManifest {
             schema_version: 1,
             version: 1790000000000,
             updated_at: None,
             runtimes: serde_json::json!({
-                "io.api": {"available": ["0.1.52", "0.1.53"], "current": "0.1.53", "type": "full_runtime"}
+                "io.api": {
+                    "available": ["0.1.52", "0.1.53", "0.1.54"],
+                    "current": current,
+                    "type": "full_runtime"
+                }
             }),
             hash: None,
-        };
-        let node = |requested: &str, bound: &str, runtime: &str| PersistedManagedNode {
+        }
+    }
+
+    /// A persisted node that asked for `requested` and is bound to `bound`.
+    fn persisted_io_api_node(requested: &str, bound: &str, runtime: &str) -> PersistedManagedNode {
+        PersistedManagedNode {
             requested_runtime_version: requested.to_string(),
-            node_name: "IO.api@motherbee".to_string(),
+            node_name: "IO.api.acme@worker1".to_string(),
             kind: "IO".to_string(),
             runtime: runtime.to_string(),
             runtime_version: bound.to_string(),
             config_path: PathBuf::from("/tmp/config.json"),
             relaunch_on_boot: true,
+        }
+    }
+
+    /// The start script a publish script writes, running `binary` next to it.
+    fn published_start_script(binary: &str) -> String {
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\n\
+             SCRIPT_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
+             exec \"$SCRIPT_DIR/{binary}\" \"$@\"\n"
+        )
+    }
+
+    /// A version under `root` as a publish script lays it out: `bin/start.sh` and the binary it
+    /// runs, both with `mode`.
+    fn stage_runtime(root: &Path, runtime: &str, version: &str, mode: u32) {
+        let bin = root.join(runtime).join(version).join("bin");
+        fs::create_dir_all(&bin).expect("bin dir");
+        fs::write(bin.join("start.sh"), published_start_script("node-bin")).expect("start.sh");
+        fs::write(bin.join("node-bin"), "binary").expect("binary");
+        for file in ["start.sh", "node-bin"] {
+            fs::set_permissions(bin.join(file), fs::Permissions::from_mode(mode)).expect("chmod");
+        }
+    }
+
+    /// What systemd shows for an active unit that runs `script`, launched on `stamped` when given.
+    fn live_on(script: &str, stamped: Option<&str>) -> LiveUnit {
+        LiveUnit {
+            exec_start: Some(format!(
+                "{{ path={script} ; argv[]={script} ; ignore_errors=no ; start_time=[n/a] ; \
+                 stop_time=[n/a] ; pid=4242 ; code=(null) ; status=0/0 }}"
+            )),
+            runtime_version: stamped.map(str::to_string),
+        }
+    }
+
+    /// A full runtime's `version`, on its own start script.
+    fn target(runtime: &str, version: &str) -> LaunchTarget {
+        LaunchTarget {
+            version: version.to_string(),
+            script_path: runtime_start_script(runtime, version),
+            package_path: None,
+        }
+    }
+
+    /// A package's `version`, on its base's start script.
+    fn package_target(
+        runtime: &str,
+        version: &str,
+        base: &str,
+        base_version: &str,
+    ) -> LaunchTarget {
+        LaunchTarget {
+            version: version.to_string(),
+            script_path: runtime_start_script(base, base_version),
+            package_path: Some(runtime_package_dir(runtime, version).display().to_string()),
+        }
+    }
+
+    /// A-39, A-109, A-101: what a running node runs is read from its unit, not from its config.
+    /// - A node that follows `current` moves when the pointer moved; with no ExecStart to compare,
+    ///   its config decides.
+    /// - A unit on another start script moves.
+    /// - A unit that runs the target, with a config that names another version, only has its config
+    ///   written: a launch before 0.1.88 did not write it. That is AI.pruebas@worker1 on PROD,
+    ///   config 0.1.86 on ai.generic/0.1.87.
+    /// - A pinned or up-to-date node on its start script stays, and so does one whose runtime the
+    ///   manifest cannot resolve: a running node is never torn down for that.
+    #[test]
+    fn a_running_node_moves_when_its_unit_is_not_on_what_its_runtime_names() {
+        let manifest = io_api_manifest("0.1.53");
+        let node = persisted_io_api_node;
+        let on = |version: &str| live_on(&runtime_start_script("io.api", version), None);
+        let relaunch = Some(RunningNodeMove::Relaunch(target("io.api", "0.1.53")));
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.52", "io.api"),
+                &LiveUnit::default()
+            ),
+            relaunch
+        );
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.52", "io.api"),
+                &on("0.1.52")
+            ),
+            relaunch
+        );
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.53", "io.api"),
+                &on("0.1.52")
+            ),
+            relaunch
+        );
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.52", "io.api"),
+                &on("0.1.53")
+            ),
+            Some(RunningNodeMove::Record(target("io.api", "0.1.53")))
+        );
+        for (requested, bound, runtime, runs) in [
+            ("current", "0.1.53", "io.api", "0.1.53"),
+            ("0.1.52", "0.1.52", "io.api", "0.1.52"),
+            ("current", "0.1.52", "io.gone", "0.1.52"),
+        ] {
+            for live in [LiveUnit::default(), on(runs)] {
+                assert_eq!(
+                    running_node_move(&manifest, &node(requested, bound, runtime), &live),
+                    None,
+                    "{requested} {bound} {runtime} {live:?}"
+                );
+            }
+        }
+        // The version a unit was launched on, which it carries, says what it runs.
+        let stamped =
+            |version: &str| live_on(&runtime_start_script("io.api", "0.1.53"), Some(version));
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.52", "io.api"),
+                &stamped("0.1.53")
+            ),
+            Some(RunningNodeMove::Record(target("io.api", "0.1.53")))
+        );
+        assert_eq!(
+            running_node_move(
+                &manifest,
+                &node("current", "0.1.53", "io.api"),
+                &stamped("0.1.53")
+            ),
+            None
+        );
+    }
+
+    /// A package's version is the one its unit carries: its ExecStart is its base's start script,
+    /// the same for every version of the package.
+    #[test]
+    fn a_package_nodes_version_is_read_from_its_unit() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1790000000000,
+            updated_at: None,
+            runtimes: serde_json::json!({
+                "wf.invoice": {
+                    "available": ["7", "8"],
+                    "current": "8",
+                    "type": "workflow",
+                    "runtime_base": "wf.engine"
+                },
+                "wf.engine": {"available": ["0.1.88"], "current": "0.1.88", "type": "full_runtime"}
+            }),
+            hash: None,
+        };
+        let pinned = |bound: &str| PersistedManagedNode {
+            node_name: "WF.invoice@worker1".to_string(),
+            kind: "WF".to_string(),
+            ..persisted_io_api_node(bound, bound, "wf.invoice")
+        };
+        let engine = runtime_start_script("wf.engine", "0.1.88");
+        let target = |version: &str| package_target("wf.invoice", version, "wf.engine", "0.1.88");
+        // Rebound to 8 (SY.wf-rules' set_node_config), still running 7: relaunched on 8.
+        assert_eq!(
+            running_node_move(&manifest, &pinned("8"), &live_on(&engine, Some("7"))),
+            Some(RunningNodeMove::Relaunch(target("8")))
+        );
+        assert_eq!(
+            running_node_move(&manifest, &pinned("8"), &live_on(&engine, Some("8"))),
+            None
+        );
+        // A unit launched before 0.1.88 carries no version: the config decides.
+        assert_eq!(
+            running_node_move(&manifest, &pinned("8"), &live_on(&engine, None)),
+            None
+        );
+        let following = PersistedManagedNode {
+            requested_runtime_version: "current".to_string(),
+            ..pinned("7")
         };
         assert_eq!(
-            moved_current_version(&manifest, &node("current", "0.1.52", "io.api")).as_deref(),
-            Some("0.1.53")
+            running_node_move(&manifest, &following, &live_on(&engine, None)),
+            Some(RunningNodeMove::Relaunch(target("8")))
         );
         assert_eq!(
-            moved_current_version(&manifest, &node("current", "0.1.53", "io.api")),
-            None
+            running_node_move(&manifest, &following, &live_on(&engine, Some("8"))),
+            Some(RunningNodeMove::Record(target("8")))
         );
         assert_eq!(
-            moved_current_version(&manifest, &node("0.1.52", "0.1.52", "io.api")),
-            None
+            stamped_runtime_version(
+                "FLUXBEE_NODE_NAME=WF.invoice@worker1 FLUXBEE_NODE_RUNTIME_VERSION=8 \
+                 FLUXBEE_NODE_TENANT_ID=tnt:acme"
+            )
+            .as_deref(),
+            Some("8")
+        );
+        for environment in [
+            "FLUXBEE_NODE_NAME=WF.invoice@worker1",
+            "FLUXBEE_NODE_RUNTIME_VERSION_X=8",
+            "FLUXBEE_NODE_RUNTIME_VERSION=",
+            "",
+        ] {
+            assert_eq!(stamped_runtime_version(environment), None, "{environment}");
+        }
+    }
+
+    /// A-109: every pass of the reconcile, the 60 s loop's as much as the boot's, moves a running
+    /// node that follows `current` once the pointer moved and the new version is ready on its
+    /// hive. A core update that leaves the orchestrator running, or a runtime published without a
+    /// `.deb`, reaches it within a pass. A config that only lagged is written, not relaunched.
+    #[test]
+    fn the_reconcile_moves_a_running_node_that_follows_a_moved_current() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        stage_runtime(&root, "io.api", "0.1.53", 0o755);
+        let state = sample_orchestrator_state_for_tests();
+        let manifest = io_api_manifest("0.1.53");
+        let node = persisted_io_api_node("current", "0.1.52", "io.api");
+        let old = live_on(&runtime_start_script("io.api", "0.1.52"), None);
+
+        for (live, visible_in_router) in [
+            (LiveUnit::default(), true),
+            (LiveUnit::default(), false),
+            (old, true),
+        ] {
+            assert_eq!(
+                reconcile_step(
+                    &state,
+                    &manifest,
+                    &node,
+                    true,
+                    &live,
+                    visible_in_router,
+                    &root
+                ),
+                ReconcileStep::Relaunch(target("io.api", "0.1.53"))
+            );
+        }
+        // The runtime as the node's config names it: the manifest's key is found without case.
+        assert_eq!(
+            reconcile_step(
+                &state,
+                &manifest,
+                &persisted_io_api_node("current", "0.1.52", "IO.API"),
+                true,
+                &LiveUnit::default(),
+                true,
+                &root
+            ),
+            ReconcileStep::Relaunch(target("io.api", "0.1.53"))
+        );
+        // It runs 0.1.53 already: only its config is written.
+        assert_eq!(
+            reconcile_step(
+                &state,
+                &manifest,
+                &node,
+                true,
+                &live_on(&runtime_start_script("io.api", "0.1.53"), None),
+                true,
+                &root
+            ),
+            ReconcileStep::Record(target("io.api", "0.1.53"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A-109: Syncthing can bring the manifest before the files. Until the new version is ready on
+    /// this hive the node stays on its version, and the wait is logged once per target, not on
+    /// every pass.
+    #[test]
+    fn a_running_node_waits_for_its_new_version_and_the_wait_is_logged_once() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        let state = sample_orchestrator_state_for_tests();
+        let node = persisted_io_api_node("current", "0.1.52", "io.api");
+        let manifest = io_api_manifest("0.1.53");
+        let live = LiveUnit::default();
+
+        match reconcile_step(&state, &manifest, &node, true, &live, true, &root) {
+            ReconcileStep::Wait {
+                target: waits_for,
+                reason,
+                first,
+            } => {
+                assert_eq!(waits_for, target("io.api", "0.1.53"));
+                assert!(first, "the first wait for a target is logged");
+                assert!(
+                    reason.contains("readiness.runtime_present is false"),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The start script arrived, not executable yet: still waiting, and not logged again.
+        stage_runtime(&root, "io.api", "0.1.53", 0o644);
+        match reconcile_step(&state, &manifest, &node, true, &live, true, &root) {
+            ReconcileStep::Wait { reason, first, .. } => {
+                assert!(!first, "a wait is logged once per target");
+                assert!(
+                    reason.contains("readiness.start_sh_executable is false"),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The pointer moved again while it waited: the new target is logged once.
+        let manifest = io_api_manifest("0.1.54");
+        for first in [true, false] {
+            assert!(
+                matches!(
+                    reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+                    ReconcileStep::Wait { ref target, first: logged, .. }
+                        if target.version == "0.1.54" && logged == first
+                ),
+                "logged={first}"
+            );
+        }
+        // Ready: relaunched, and the wait is forgotten, so a later wait is logged again.
+        stage_runtime(&root, "io.api", "0.1.54", 0o755);
+        assert_eq!(
+            reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+            ReconcileStep::Relaunch(target("io.api", "0.1.54"))
+        );
+        assert!(state.relaunch_waits.lock().expect("waits").is_empty());
+        let _ = fs::remove_dir_all(root.join("io.api").join("0.1.54"));
+        assert!(matches!(
+            reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+            ReconcileStep::Wait { first: true, .. }
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A package that runs on a base runtime is ready with its own files too, which run, start and
+    /// restart require: a node does not move onto a package whose package.json has not arrived.
+    #[test]
+    fn a_package_node_waits_for_its_package_files() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        let state = sample_orchestrator_state_for_tests();
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1790000000000,
+            updated_at: None,
+            runtimes: serde_json::json!({
+                "ai.support": {
+                    "available": ["1.0.0", "1.1.0"],
+                    "current": "1.1.0",
+                    "type": "config_only",
+                    "runtime_base": "ai.generic"
+                },
+                "ai.generic": {"available": ["0.1.88"], "current": "0.1.88", "type": "full_runtime"}
+            }),
+            hash: None,
+        };
+        let node = PersistedManagedNode {
+            node_name: "AI.support@worker1".to_string(),
+            kind: "AI".to_string(),
+            ..persisted_io_api_node("current", "1.0.0", "ai.support")
+        };
+        stage_runtime(&root, "ai.generic", "0.1.88", 0o755);
+        let package_dir = root.join("ai.support").join("1.1.0");
+        fs::create_dir_all(&package_dir).expect("package dir");
+        let live = LiveUnit::default();
+
+        match reconcile_step(&state, &manifest, &node, true, &live, true, &root) {
+            ReconcileStep::Wait {
+                target: waits_for,
+                reason,
+                ..
+            } => {
+                assert_eq!(
+                    waits_for,
+                    package_target("ai.support", "1.1.0", "ai.generic", "0.1.88")
+                );
+                assert!(reason.contains("package.json"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        fs::write(package_dir.join("package.json"), "{}").expect("package.json");
+        assert_eq!(
+            reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+            ReconcileStep::Relaunch(package_target(
+                "ai.support",
+                "1.1.0",
+                "ai.generic",
+                "0.1.88"
+            ))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A package on a base runtime runs the base's `current` start script, whatever its own pin.
+    /// When the base's pointer moves and the new base is ready here, a running package node whose
+    /// unit still runs the old one is relaunched on it, pinned or not, once; until it is ready, it
+    /// waits, logged once. One whose ExecStart systemd does not show is left: nothing is guessed.
+    #[test]
+    fn a_package_node_moves_when_its_base_runtime_moves() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        let state = sample_orchestrator_state_for_tests();
+        let manifest = |base_current: &str| RuntimeManifest {
+            schema_version: 1,
+            version: 1790000000000,
+            updated_at: None,
+            runtimes: serde_json::json!({
+                "wf.invoice": {
+                    "available": ["7"],
+                    "current": "7",
+                    "type": "workflow",
+                    "runtime_base": "wf.engine"
+                },
+                "ai.support": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "config_only",
+                    "runtime_base": "ai.generic"
+                },
+                "wf.engine": {
+                    "available": ["0.1.87", "0.1.88"],
+                    "current": base_current,
+                    "type": "full_runtime"
+                },
+                "ai.generic": {
+                    "available": ["0.1.87", "0.1.88"],
+                    "current": base_current,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        for (runtime, version) in [("wf.invoice", "7"), ("ai.support", "1.0.0")] {
+            let dir = root.join(runtime).join(version);
+            fs::create_dir_all(dir.join("flow")).expect("package dir");
+            fs::write(dir.join("package.json"), "{}").expect("package.json");
+            fs::write(dir.join("flow/definition.json"), "{}").expect("definition.json");
+        }
+        stage_runtime(&root, "wf.engine", "0.1.87", 0o755);
+        stage_runtime(&root, "ai.generic", "0.1.87", 0o755);
+        // Pinned, as SY.wf-rules binds a WF node; and one that follows `current`.
+        let wf = PersistedManagedNode {
+            node_name: "WF.invoice@worker1".to_string(),
+            kind: "WF".to_string(),
+            ..persisted_io_api_node("7", "7", "wf.invoice")
+        };
+        let ai = PersistedManagedNode {
+            node_name: "AI.support@worker1".to_string(),
+            kind: "AI".to_string(),
+            ..persisted_io_api_node("current", "1.0.0", "ai.support")
+        };
+        let on = |base: &str, version: &str| live_on(&runtime_start_script(base, version), None);
+
+        let before = manifest("0.1.87");
+        for (node, live) in [
+            (&wf, on("wf.engine", "0.1.87")),
+            (&ai, on("ai.generic", "0.1.87")),
+        ] {
+            assert_eq!(
+                reconcile_step(&state, &before, node, true, &live, true, &root),
+                ReconcileStep::Leave
+            );
+        }
+
+        let after = manifest("0.1.88");
+        for first in [true, false] {
+            match reconcile_step(
+                &state,
+                &after,
+                &wf,
+                true,
+                &on("wf.engine", "0.1.87"),
+                true,
+                &root,
+            ) {
+                ReconcileStep::Wait {
+                    target: waits_for,
+                    reason,
+                    first: logged,
+                } => {
+                    assert_eq!(
+                        waits_for,
+                        package_target("wf.invoice", "7", "wf.engine", "0.1.88")
+                    );
+                    assert_eq!(logged, first);
+                    assert!(
+                        reason.contains("readiness.base_runtime_ready is false"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        stage_runtime(&root, "wf.engine", "0.1.88", 0o755);
+        stage_runtime(&root, "ai.generic", "0.1.88", 0o755);
+        assert_eq!(
+            reconcile_step(
+                &state,
+                &after,
+                &wf,
+                true,
+                &on("wf.engine", "0.1.87"),
+                true,
+                &root
+            ),
+            ReconcileStep::Relaunch(package_target("wf.invoice", "7", "wf.engine", "0.1.88"))
         );
         assert_eq!(
-            moved_current_version(&manifest, &node("current", "0.1.52", "io.gone")),
-            None
+            reconcile_step(
+                &state,
+                &after,
+                &ai,
+                true,
+                &on("ai.generic", "0.1.87"),
+                true,
+                &root
+            ),
+            ReconcileStep::Relaunch(package_target(
+                "ai.support",
+                "1.0.0",
+                "ai.generic",
+                "0.1.88"
+            ))
+        );
+        // Once: its unit now runs the new base.
+        assert_eq!(
+            reconcile_step(
+                &state,
+                &after,
+                &wf,
+                true,
+                &on("wf.engine", "0.1.88"),
+                true,
+                &root
+            ),
+            ReconcileStep::Leave
+        );
+        assert_eq!(
+            reconcile_step(&state, &after, &wf, true, &LiveUnit::default(), true, &root),
+            ReconcileStep::Leave
+        );
+        assert!(state.relaunch_waits.lock().expect("waits").is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Runs one of the repository's publish scripts with `args`.
+    fn run_publish_script(script: &str, args: &[&str]) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join(script);
+        let output = Command::new("bash")
+            .arg(&path)
+            .args(args)
+            .output()
+            .expect("bash runs");
+        assert!(
+            output.status.success(),
+            "{script}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Every publish script writes a start script whose binary `start_script_entry` reads: each one
+    /// is run here against a temporary dist root with a dummy binary, as an operator runs it.
+    #[test]
+    fn every_publish_script_writes_a_start_script_whose_binary_is_known() {
+        let root = std::env::temp_dir().join(format!("fluxbee-publish-{}", Uuid::new_v4()));
+        let binary = root.join("build").join("dummy-node");
+        fs::create_dir_all(binary.parent().expect("build dir")).expect("build dir");
+        fs::write(&binary, "binary").expect("dummy binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let dist = root.join("dist");
+        let (binary_arg, dist_arg) = (binary.display().to_string(), dist.display().to_string());
+        let common = [
+            "--version",
+            "1.0.0",
+            "--binary",
+            &binary_arg,
+            "--dist-root",
+            &dist_arg,
+        ];
+        for (script, runtime, extra) in [
+            ("publish-runtime.sh", "test.plain", &[][..]),
+            ("publish-ia-runtime.sh", "ai.test", &["--skip-build"][..]),
+            (
+                "publish-io-runtime.sh",
+                "io.test",
+                &["--kind", "slack", "--skip-build"][..],
+            ),
+            (
+                "publish-io-api-runtime.sh",
+                "io.apitest",
+                &["--skip-build"][..],
+            ),
+            (
+                "publish-io-linkedhelper-runtime.sh",
+                "io.lhtest",
+                &["--skip-build"][..],
+            ),
+        ] {
+            let mut args = vec!["--runtime", runtime];
+            args.extend_from_slice(&common);
+            args.extend_from_slice(extra);
+            run_publish_script(script, &args);
+            let bin = dist
+                .join("runtimes")
+                .join(runtime)
+                .join("1.0.0")
+                .join("bin");
+            assert_eq!(
+                start_script_entry(&bin.join("start.sh")),
+                Ok(StartScriptEntry::Binary(bin.join("dummy-node"))),
+                "{script}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A version is not ready until the binary its start script runs is here and executable:
+    /// Syncthing can deliver the script first. A start script a publish script wrote that does not
+    /// say which binary it runs fails closed: the version is not ready, and the reason says why. A
+    /// package's own start script (its version has a package.json) is the exception.
+    #[test]
+    fn the_binary_a_start_script_runs_is_part_of_readiness() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        let state = sample_orchestrator_state_for_tests();
+        let manifest = io_api_manifest("0.1.53");
+        let node = persisted_io_api_node("current", "0.1.52", "io.api");
+        let live = LiveUnit::default();
+        let version_dir = root.join("io.api").join("0.1.53");
+        let bin = version_dir.join("bin");
+        fs::create_dir_all(&bin).expect("bin dir");
+        let start = bin.join("start.sh");
+        fs::write(&start, published_start_script("io-api")).expect("start.sh");
+        fs::set_permissions(&start, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let binary = bin.join("io-api");
+        let waits = |state: &OrchestratorState| match reconcile_step(
+            state, &manifest, &node, true, &live, true, &root,
+        ) {
+            ReconcileStep::Wait { reason, .. } => reason,
+            other => panic!("{other:?}"),
+        };
+
+        assert!(waits(&state).contains("io-api"));
+        fs::write(&binary, "binary").expect("binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(waits(&state).contains("not executable"));
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(
+            reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+            ReconcileStep::Relaunch(target("io.api", "0.1.53"))
+        );
+
+        for unknown in [
+            "#!/usr/bin/env bash\nexec /opt/io-api/run \"$@\"\n",
+            "#!/usr/bin/env bash\nexec \"$SCRIPT_DIR/../io-api\" \"$@\"\n",
+            "#!/usr/bin/env bash\nexec \"$SCRIPT_DIR/..\" \"$@\"\n",
+        ] {
+            fs::write(&start, unknown).expect("start.sh");
+            assert!(start_script_entry(&start).is_err(), "{unknown}");
+            assert!(
+                waits(&state).contains("the binary its start script runs is not known"),
+                "{unknown}"
+            );
+        }
+        // A package's own start script: what it runs is the package's.
+        fs::write(version_dir.join("package.json"), "{}").expect("package.json");
+        assert_eq!(
+            start_script_entry(&start),
+            Ok(StartScriptEntry::PackageScript)
+        );
+        assert_eq!(
+            reconcile_step(&state, &manifest, &node, true, &live, true, &root),
+            ReconcileStep::Relaunch(target("io.api", "0.1.53"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A pinned node is never moved off its pin, nor an up-to-date one off its version, even with
+    /// another version ready; nor one whose runtime the manifest cannot resolve. One the router sees
+    /// without an active unit is left. A node that is down is launched once what its runtime names
+    /// is ready here, and waits until then, logged once (FINDINGS A-39).
+    #[test]
+    fn the_reconcile_leaves_a_pinned_or_up_to_date_node_and_launches_a_down_one_when_ready() {
+        let root = std::env::temp_dir().join(format!("fluxbee-reconcile-{}", Uuid::new_v4()));
+        stage_runtime(&root, "io.api", "0.1.52", 0o755);
+        let state = sample_orchestrator_state_for_tests();
+        let manifest = io_api_manifest("0.1.53");
+
+        for (node, runs) in [
+            (
+                persisted_io_api_node("0.1.52", "0.1.52", "io.api"),
+                "0.1.52",
+            ),
+            (
+                persisted_io_api_node("current", "0.1.53", "io.api"),
+                "0.1.53",
+            ),
+            (
+                persisted_io_api_node("current", "0.1.52", "io.gone"),
+                "0.1.52",
+            ),
+        ] {
+            for live in [
+                LiveUnit::default(),
+                live_on(&runtime_start_script("io.api", runs), None),
+            ] {
+                for visible_in_router in [true, false] {
+                    assert_eq!(
+                        reconcile_step(
+                            &state,
+                            &manifest,
+                            &node,
+                            true,
+                            &live,
+                            visible_in_router,
+                            &root
+                        ),
+                        ReconcileStep::Leave,
+                        "{node:?}"
+                    );
+                }
+            }
+        }
+        let following = persisted_io_api_node("current", "0.1.52", "io.api");
+        let down = LiveUnit::default();
+        assert_eq!(
+            reconcile_step(&state, &manifest, &following, false, &down, true, &root),
+            ReconcileStep::Leave
+        );
+        for first in [true, false] {
+            match reconcile_step(&state, &manifest, &following, false, &down, false, &root) {
+                ReconcileStep::Wait {
+                    target: waits_for,
+                    first: logged,
+                    ..
+                } => {
+                    assert_eq!(waits_for, target("io.api", "0.1.53"));
+                    assert_eq!(logged, first);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        stage_runtime(&root, "io.api", "0.1.53", 0o755);
+        assert_eq!(
+            reconcile_step(&state, &manifest, &following, false, &down, false, &root),
+            ReconcileStep::Launch
+        );
+        // One whose runtime the manifest cannot resolve goes on to the launch, which says so.
+        assert_eq!(
+            reconcile_step(
+                &state,
+                &manifest,
+                &persisted_io_api_node("current", "0.1.52", "io.gone"),
+                false,
+                &down,
+                false,
+                &root
+            ),
+            ReconcileStep::Launch
+        );
+        assert!(state.relaunch_waits.lock().expect("waits").is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// FINDINGS A-39: run, start and restart refuse a version that is not ready on this hive with
+    /// RUNTIME_NOT_PRESENT, which SY.wf-rules retries, before anything is stopped or started.
+    #[test]
+    fn a_launch_refuses_a_version_that_is_not_ready() {
+        let root = std::env::temp_dir().join(format!("fluxbee-readiness-{}", Uuid::new_v4()));
+        let manifest = io_api_manifest("0.1.53");
+        let refusal = runtime_readiness_refusal(
+            &manifest,
+            "io.api",
+            "0.1.53",
+            &root,
+            "worker1",
+            "IO.api.acme@worker1",
+        )
+        .expect_err("nothing is here");
+        assert_eq!(refusal["error_code"], "RUNTIME_NOT_PRESENT");
+        assert_eq!(refusal["version"], "0.1.53");
+        assert!(refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not ready on this hive")));
+        stage_runtime(&root, "io.api", "0.1.53", 0o755);
+        assert_eq!(
+            runtime_readiness_refusal(
+                &manifest,
+                "io.api",
+                "0.1.53",
+                &root,
+                "worker1",
+                "IO.api.acme@worker1"
+            ),
+            Ok(())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A start or restart plan for `AI.pruebas@worker1`, recorded in `config_path`.
+    fn ai_pruebas_plan(config_path: &Path) -> ManagedNodeLaunchPlan {
+        ManagedNodeLaunchPlan {
+            node: PersistedManagedNode {
+                node_name: "AI.pruebas@worker1".to_string(),
+                kind: "AI".to_string(),
+                runtime: "ai.generic".to_string(),
+                runtime_version: "0.1.86".to_string(),
+                requested_runtime_version: "current".to_string(),
+                config_path: config_path.to_path_buf(),
+                relaunch_on_boot: false,
+            },
+            unit: unit_from_node_name("AI.pruebas@worker1"),
+            runtime_key: "ai.generic".to_string(),
+            resolved_version: "0.1.87".to_string(),
+            requested_version: "current".to_string(),
+            entrypoint: RuntimeSpawnEntrypoint {
+                script_runtime: "ai.generic".to_string(),
+                script_version: "0.1.87".to_string(),
+                script_path: runtime_start_script("ai.generic", "0.1.87"),
+                runtime_base: None,
+            },
+            tenant: None,
+        }
+    }
+
+    /// A-101, A-102: a start or a restart writes, before it launches the node and in one write, the
+    /// version it launches and `relaunch_on_boot: true` (a stopped node's start sets it again), and
+    /// keeps the rest of the config, its mode included: the node reads the version when it starts
+    /// (NODE_HELP), status reports it, and a conversion the node makes at boot cannot race the
+    /// flag. Recording what the config already says writes nothing, and a config it cannot record
+    /// in is the request's answer. That this comes before the launch is
+    /// `every_launch_path_records_its_version_before_launching`.
+    #[test]
+    fn start_and_restart_record_the_launch_before_it() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-launch-record-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("node dir");
+        let config_path = dir.join("config.json");
+        write_json_atomic(
+            &config_path,
+            &serde_json::json!({
+                "behavior": {"system_prompt": "hi"},
+                "_system": {
+                    "runtime": "ai.generic",
+                    "runtime_version": "0.1.86",
+                    "requested_runtime_version": "current",
+                    "relaunch_on_boot": false,
+                    "config_version": 4,
+                    "updated_at_ms": 1
+                }
+            }),
+        )
+        .expect("config");
+
+        record_planned_launch("worker1", &ai_pruebas_plan(&config_path)).expect("recorded");
+        let config = load_node_effective_config(&config_path).expect("config");
+        assert_eq!(config["_system"]["runtime_version"], "0.1.87");
+        assert_eq!(config["_system"]["relaunch_on_boot"], true);
+        assert_eq!(config["_system"]["requested_runtime_version"], "current");
+        assert_eq!(config["_system"]["config_version"], 4);
+        assert_eq!(config["behavior"]["system_prompt"], "hi");
+        assert!(config["_system"].get("package_path").is_none());
+        let mode = fs::metadata(&config_path)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let written = fs::read(&config_path).expect("read");
+        record_planned_launch("worker1", &ai_pruebas_plan(&config_path)).expect("recorded");
+        assert_eq!(fs::read(&config_path).expect("read"), written);
+
+        let answer = record_planned_launch("worker1", &ai_pruebas_plan(&dir.join("absent.json")))
+            .expect_err("a config it cannot record the launch in");
+        assert_eq!(answer["error_code"], "CONFIG_WRITE_FAILED");
+        assert_eq!(answer["node_name"], "AI.pruebas@worker1");
+        assert_eq!(answer["version"], "0.1.87");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A package node that moves to another version of its package gets that version's
+    /// `package_path`, where the WF engine reads its definition; one that keeps its version keeps
+    /// the `package_path` its binder wrote.
+    #[test]
+    fn a_package_node_that_moves_gets_its_new_package_path() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-launch-record-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("node dir");
+        let config_path = dir.join("config.json");
+        let old_path = runtime_package_dir("wf.invoice", "7").display().to_string();
+        write_json_atomic(
+            &config_path,
+            &serde_json::json!({
+                "_system": {
+                    "runtime": "wf.invoice",
+                    "runtime_version": "7",
+                    "requested_runtime_version": "current",
+                    "runtime_base": "wf.engine",
+                    "package_path": old_path,
+                    "relaunch_on_boot": true
+                }
+            }),
+        )
+        .expect("config");
+        let plan = |resolved: &str| ManagedNodeLaunchPlan {
+            node: PersistedManagedNode {
+                node_name: "WF.invoice@worker1".to_string(),
+                kind: "WF".to_string(),
+                runtime: "wf.invoice".to_string(),
+                runtime_version: "7".to_string(),
+                requested_runtime_version: "current".to_string(),
+                config_path: config_path.clone(),
+                relaunch_on_boot: true,
+            },
+            unit: unit_from_node_name("WF.invoice@worker1"),
+            runtime_key: "wf.invoice".to_string(),
+            resolved_version: resolved.to_string(),
+            requested_version: "current".to_string(),
+            entrypoint: RuntimeSpawnEntrypoint {
+                script_runtime: "wf.engine".to_string(),
+                script_version: "0.1.88".to_string(),
+                script_path: runtime_start_script("wf.engine", "0.1.88"),
+                runtime_base: Some("wf.engine".to_string()),
+            },
+            tenant: None,
+        };
+
+        record_planned_launch("worker1", &plan("7")).expect("recorded");
+        let config = load_node_effective_config(&config_path).expect("config");
+        assert_eq!(config["_system"]["package_path"], old_path.as_str());
+
+        record_planned_launch("worker1", &plan("8")).expect("recorded");
+        let config = load_node_effective_config(&config_path).expect("config");
+        assert_eq!(config["_system"]["runtime_version"], "8");
+        assert_eq!(
+            config["_system"]["package_path"],
+            runtime_package_dir("wf.invoice", "8").display().to_string()
+        );
+        assert_eq!(config["_system"]["requested_runtime_version"], "current");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A-101, A-102: every path that launches a node records what it launches in the node's
+    /// config before launching it: run in the config it creates, start and restart, and the
+    /// reconcile after its preflight, so it never records a version it then cannot launch. Start
+    /// and restart write nothing after the launch. Pinned by reading the source, since the
+    /// property is one of order.
+    #[test]
+    fn every_launch_path_records_its_version_before_launching() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |name: &str| {
+            let start = src.find(name).expect(name);
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|o| start + o)
+                .expect("its end");
+            &src[start..end]
+        };
+        let in_order = |name: &str, marks: &[&str]| {
+            let body = body(name);
+            let at: Vec<usize> = marks
+                .iter()
+                .map(|mark| body.find(mark).unwrap_or_else(|| panic!("{name}: {mark}")))
+                .collect();
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{name}: {marks:?} at {at:?}"
+            );
+        };
+        in_order(
+            "async fn run_node_flow(",
+            &["ensure_node_effective_config_on_spawn(", "execute_on_hive("],
+        );
+        in_order(
+            "async fn start_or_restart_node_flow(",
+            &[
+                "managed_node_launch_plan(",
+                "tenant_gate_refusal(",
+                "record_planned_launch(",
+                "managed_node_restart_command(",
+                "execute_on_hive(",
+            ],
+        );
+        let flow = body("async fn start_or_restart_node_flow(");
+        let launch = flow.find("execute_on_hive(").expect("the launch");
+        assert!(
+            !flow[launch..].contains("set_node_relaunch_on_boot("),
+            "the relaunch flag is written before the launch (A-102)"
+        );
+        in_order(
+            "async fn reconcile_persisted_custom_nodes(",
+            &[
+                "try_lock_node(",
+                "persisted_managed_node_from_config_value(",
+                "reconcile_step(",
+                "if let Some(payload) = preflight_error",
+                "if let Err(err) = persist_node_launch(",
+                "clear_stale_transient_unit(",
+                "execute_on_hive(",
+            ],
+        );
+    }
+
+    /// A pass decides on the manifest as it is under each node's lock, and two passes never run at
+    /// once: the boot's waits for the pass, and the loop skips a tick while the boot's holds it. A
+    /// copy of the manifest read earlier could move a node back to the version an older one named.
+    /// Run, start and restart check the readiness the reconcile waits for (FINDINGS A-39). Pinned by
+    /// reading the source, since the properties are ones of order.
+    #[test]
+    fn a_pass_decides_on_the_manifest_under_the_nodes_lock_and_passes_never_overlap() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |name: &str| {
+            let start = src.find(name).expect(name);
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|o| start + o)
+                .expect("its end");
+            &src[start..end]
+        };
+        let in_order = |name: &str, marks: &[&str]| {
+            let body = body(name);
+            let at: Vec<usize> = marks
+                .iter()
+                .map(|mark| body.find(mark).unwrap_or_else(|| panic!("{name}: {mark}")))
+                .collect();
+            assert!(
+                at.windows(2).all(|w| w[0] < w[1]),
+                "{name}: {marks:?} at {at:?}"
+            );
+        };
+        in_order(
+            "async fn reconcile_persisted_custom_nodes(",
+            &[
+                "try_lock_node(",
+                "load_runtime_manifest_result(",
+                "reconcile_step(",
+            ],
+        );
+        let pass = body("async fn reconcile_persisted_custom_nodes(");
+        assert_eq!(
+            pass.matches("load_runtime_manifest_result(").count(),
+            1,
+            "one manifest, read under the node's lock"
+        );
+        in_order(
+            "async fn finish_bootstrap(",
+            &[
+                "reconcile_pass.lock().await",
+                "reconcile_persisted_custom_nodes(",
+            ],
+        );
+        in_order(
+            "async fn run_managed_runtime_reconcile_loop(",
+            &[
+                "reconcile_pass.try_lock()",
+                "reconcile_persisted_custom_nodes(",
+            ],
+        );
+        in_order(
+            "fn managed_node_launch_plan(",
+            &[
+                "node_package_files_preflight(",
+                "runtime_readiness_refusal(",
+            ],
+        );
+        in_order(
+            "async fn run_node_flow(",
+            &[
+                "runtime_spawn_preflight_with_manifest(",
+                "runtime_readiness_refusal(",
+                "ensure_node_identity_registered(",
+                "execute_on_hive(",
+            ],
+        );
+        in_order(
+            "async fn start_or_restart_node_flow(",
+            &["managed_node_launch_plan(", "execute_on_hive("],
         );
     }
 
@@ -35940,6 +37649,10 @@ blob:
         assert!(
             cmd.contains("systemctl restart"),
             "when they already match, restarting in place is enough: {cmd}"
+        );
+        assert!(
+            cmd.contains("grep -qxF 'FLUXBEE_NODE_RUNTIME_VERSION=0.1.14'"),
+            "in place only when the unit carries the planned version too: {cmd}"
         );
     }
 
@@ -36513,6 +38226,8 @@ blob:
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
             hive_topology_locks: StdMutex::new(HashMap::new()),
             node_lifecycle_locks: StdMutex::new(HashMap::new()),
+            relaunch_waits: StdMutex::new(HashMap::new()),
+            reconcile_pass: Mutex::new(()),
             rpc: OnceLock::new(),
         }
     }
@@ -38228,11 +39943,14 @@ blob:
             "fluxbee-node-AI.demo-motherbee",
             "AI.demo@motherbee",
             "/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh",
+            "1.0.0",
             None,
             None,
         );
 
         assert!(cmd.contains("--setenv=FLUXBEE_NODE_NAME='AI.demo@motherbee'"));
+        // The version it runs, which the reconcile reads back from the unit.
+        assert!(cmd.contains("--setenv=FLUXBEE_NODE_RUNTIME_VERSION='1.0.0'"));
         assert!(cmd.contains("systemd-run --unit fluxbee-node-AI.demo-motherbee"));
         assert!(cmd.contains("'/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh'"));
         // When ilk/tenant are None, the env vars are NOT emitted (SY managed
@@ -38247,6 +39965,7 @@ blob:
             "fluxbee-node-AI.demo-motherbee",
             "AI.demo@motherbee",
             "/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh",
+            "1.0.0",
             Some("ilk:11111111-2222-3333-4444-555555555555"),
             Some("tnt:00000000-0000-0000-0000-000000000001"),
         );

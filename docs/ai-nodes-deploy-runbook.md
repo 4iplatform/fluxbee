@@ -200,8 +200,8 @@ What the agent says:
 
 ## 6) Update `ai.generic` without a new `.deb` (development)
 
-The standard path: publish the runtime on the motherbee, update the node's hive, and restart the
-node through SY.admin.
+The standard path: publish the runtime on the motherbee and update the node's hive. A node that
+follows `current` then moves on its own; a restart through SY.admin moves it at once.
 
 1. **Build and publish**, on the motherbee, from the repo:
 
@@ -232,8 +232,14 @@ node through SY.admin.
        -d '{"channel":"dist","folder_id":"fluxbee-dist-runtimes"}'
      ```
 
-3. **Restart the node through SY.admin** (`POST /hives/{hive}/nodes/{node}/restart`). The update
-   restarts no node.
+3. **The node moves.** The update restarts no node, but the orchestrator of the node's hive
+   relaunches a node launched with `runtime_version: current` on the new version within a minute
+   of the version's files reaching that hive: its journal has "running node follows 'current' and
+   the pointer moved; relaunching it on the new version". A node pinned to a version of
+   `ai.generic` keeps it. A config-only AI package (the ones Archi builds on `ai.generic`) runs
+   `ai.generic`'s `current`, so it restarts onto every new `current` of `ai.generic`, pinned or
+   not. To move the node at once, restart it through SY.admin
+   (`POST /hives/{hive}/nodes/{node}/restart`):
 
    ```bash
    curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/restart"
@@ -241,7 +247,9 @@ node through SY.admin.
 
    - The restart recreates the node's unit at the version `current` now points at, for a node
      launched with `runtime_version: current`; a node pinned to a version keeps it. The answer's
-     `version` is the one it runs.
+     `version` is the one it runs, and `NODE_HELP` and the node's status report it too.
+   - Until the new version's files, its binary included, are on the node's hive, the restart
+     answers `RUNTIME_NOT_PRESENT` and leaves the node running: retry it.
    - It works on any hive: SY.admin sends it to the motherbee's orchestrator, which passes it to
      the node's hive.
    - Do not restart the unit with a local `systemctl`: that relaunches the binary the unit was
