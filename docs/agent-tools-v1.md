@@ -132,3 +132,47 @@ whether the model receives images. It is about the model, not a tool.
 - FINDINGS A-93: an AI node cannot choose its provider (pending).
 - FINDINGS A-94: the cleanup of "capabilities".
 - FINDINGS A-95: `ai.generic` logs the full link of a page it publishes.
+
+## 5. Every model tool in the code today (inventory, 2026-10-27)
+
+The starting point for consolidating them one by one (the operator, 2026-10-27).
+
+**A. The AI agents' base tools (`ai.generic`).** All of them have cards since 0.1.86.
+
+| Tool | What it does |
+|---|---|
+| `thread_state_get`, `thread_state_put`, `thread_state_delete` (AI SDK) | One saved record per person, across that person's conversations with the agent. |
+| `generate_{csv,text,json,markdown,html,pdf,xlsx,docx,png,jpeg}_artifact` | One file attached to the reply. |
+| `publish_html_page` | A page at a public link that expires in 24 h (SY.admin's `publish_artifact`). |
+
+**B. The frontdesk's own tools (`SY.frontdesk.gov`, T10):** `ilk_register`, plus
+`thread_state_get` and `thread_state_put`.
+
+**C. Archi's tools (`src/bin/sy_architect.rs`, 19, plain definitions, no cards):**
+
+| Where | Tools |
+|---|---|
+| The operator's chat | `fluxbee_system_get` (SY.admin's reads), `list_agent_assets`, `get_agent_asset`, `delete_agent_asset`, `create_agent_{role,skill,handbook,personality}_asset`, `fluxbee_start_pipeline`, `fluxbee_pipeline_action`, `fluxbee_plan_compiler` |
+| The designer | `assess_layer`, `get_manifest_current`, `query_hive`, `submit_solution_manifest` |
+| The design auditor | `submit_design_audit_verdict` |
+| The programmer | `submit_artifact_bundle` |
+| The plan compiler | `query_hive`, `get_admin_action_help`, `submit_executor_plan` |
+
+**D. SY.admin's executor (runs Archi's plans, `src/bin/sy_admin.rs`):**
+- one tool per plan step, named after its admin action and built from the action registry;
+- `get_admin_action_help` and `report_step_issue`.
+
+**E. Programmed elsewhere, with no agent tool yet** (the candidates of §3.5):
+
+| Candidate | What already exists |
+|---|---|
+| The current time | SY.timer: `TIMER_NOW`, `TIMER_NOW_IN`, `TIMER_CONVERT`, `TIMER_PARSE`, `TIMER_FORMAT`. Any node may call SY.timer directly. |
+| Timers | SY.timer: `TIMER_SCHEDULE`, `TIMER_SCHEDULE_RECURRING`, `TIMER_GET`, `TIMER_LIST`, `TIMER_CANCEL`, `TIMER_RESCHEDULE`, `TIMER_PURGE_OWNER`, `TIMER_HELP`. |
+| A message to another node | Every node sends messages through the SDK's node client; SY.admin's `send_node_message` is the operator's. |
+| Reading from the blob | The SDK's `BlobToolkit`. Agents write blobs (the generators) and receive attachments, but cannot read one on demand. |
+| Taking a page down | SY.admin's `unpublish_artifact` already admits an AI node on its own publications. |
+
+**Overlaps found:**
+- `get_admin_action_help` exists twice, in Archi's plan compiler and in SY.admin's executor.
+- `query_hive` serves both the designer and the plan compiler.
+- Archi's and the executor's tools have no cards: T2 covers the agents' tools only.
