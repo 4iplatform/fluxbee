@@ -1463,7 +1463,7 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
         request: FunctionModelTurnRequest,
     ) -> Result<FunctionModelTurnResponse> {
         let (system, messages) = build_anthropic_function_messages(&self.system, &request.items)?;
-        let tools = request
+        let mut tools = request
             .tools
             .into_iter()
             .map(|tool| {
@@ -1474,10 +1474,18 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
                 })
             })
             .collect::<Vec<_>>();
+        // A cache breakpoint on the last tool: the definitions are the same on every turn, in name
+        // order (`FunctionToolRegistry`), so Anthropic reads them from its prompt cache instead of
+        // billing them again. Without tools there is no breakpoint and no `tools`.
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = anthropic_cache_breakpoint();
+        }
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), Value::String(self.model.clone()));
         body.insert("messages".to_string(), Value::Array(messages));
-        body.insert("tools".to_string(), Value::Array(tools));
+        if !tools.is_empty() {
+            body.insert("tools".to_string(), Value::Array(tools));
+        }
         body.insert(
             "max_tokens".to_string(),
             Value::from(
@@ -1487,7 +1495,7 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
             ),
         );
         if !system.is_empty() {
-            body.insert("system".to_string(), Value::String(system));
+            body.insert("system".to_string(), Value::Array(system));
         }
         if let Some(temperature) = self.model_settings.temperature {
             body.insert("temperature".to_string(), Value::from(temperature));
@@ -1534,19 +1542,21 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
                 }
             }
         }
+        // The whole prompt and the answer, as OpenAI's `total_tokens` counts them: Anthropic's
+        // `input_tokens` is only the part after the last cache breakpoint, and Archi's token
+        // budget reads this sum.
         let tokens_used = value
             .get("usage")
             .map(|usage| {
-                usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .saturating_add(
-                        usage
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    )
+                [
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "output_tokens",
+                ]
+                .iter()
+                .map(|field| usage.get(field).and_then(Value::as_u64).unwrap_or(0))
+                .fold(0, u64::saturating_add)
             })
             .unwrap_or(0) as u32;
         Ok(FunctionModelTurnResponse {
@@ -1561,16 +1571,31 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
     }
 }
 
+/// Anthropic's prompt-cache breakpoint with its default 5-minute life: the prompt up to and
+/// including the block that carries it, in the order `tools`, `system`, `messages`, is cached and
+/// read back by the next request that starts with the same bytes. A prompt shorter than the
+/// model's minimum is sent uncached, without an error.
+fn anthropic_cache_breakpoint() -> Value {
+    json!({"type": "ephemeral"})
+}
+
+/// The `system` blocks and the `messages` of a tool turn.
+///
+/// The configured system prompt (an agent's definition, a SY node's own prompt) is the first block
+/// and a cache breakpoint: after the tools, it is what every turn of the node repeats. The run's
+/// own system text (its immediate memory: the summary, the active operations) changes from message
+/// to message, so it follows in a block of its own, after the breakpoint. A blank one is left out:
+/// Anthropic refuses an empty text block.
 fn build_anthropic_function_messages(
     configured_system: &Option<String>,
     items: &[FunctionLoopItem],
-) -> Result<(String, Vec<Value>)> {
-    let mut system_parts = configured_system.iter().cloned().collect::<Vec<_>>();
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut run_system = Vec::new();
     let mut messages = Vec::new();
     let mut index = 0usize;
     while index < items.len() {
         match &items[index] {
-            FunctionLoopItem::SystemText { content } => system_parts.push(content.clone()),
+            FunctionLoopItem::SystemText { content } => run_system.push(content.clone()),
             FunctionLoopItem::UserText { content } => messages.push(json!({
                 "role": "user",
                 "content": [{"type":"text", "text":content}],
@@ -1643,7 +1668,25 @@ fn build_anthropic_function_messages(
             break;
         }
     }
-    Ok((system_parts.join("\n\n"), messages))
+    let mut system = Vec::new();
+    if let Some(configured) = configured_system
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        system.push(json!({
+            "type": "text",
+            "text": configured,
+            "cache_control": anthropic_cache_breakpoint(),
+        }));
+    }
+    let run_system = run_system
+        .into_iter()
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !run_system.is_empty() {
+        system.push(json!({"type": "text", "text": run_system.join("\n\n")}));
+    }
+    Ok((system, messages))
 }
 
 /// The longest one model call may take: one `generate` or one tool turn, the provider's own retries
@@ -1848,7 +1891,7 @@ mod tests {
             "anthropic error status=400 type=invalid_request_error message=bad max_tokens".into()
         )));
     }
-    use crate::function_calling::FunctionToolResult;
+    use crate::function_calling::{FunctionToolDefinition, FunctionToolResult};
 
     #[test]
     fn ai_provider_wire_form_is_openai_and_matches_display() {
@@ -2577,5 +2620,119 @@ providers:
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         handle.join().expect("server thread");
+    }
+
+    /// The body of one Anthropic tool turn, as the API receives it, and the turn.
+    async fn anthropic_tool_turn(
+        system: Option<&str>,
+        items: Vec<FunctionLoopItem>,
+        tools: Vec<FunctionToolDefinition>,
+    ) -> (Value, FunctionModelTurnResponse) {
+        let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+            "content": [{"type": "text", "text": "listo"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 4000,
+                "output_tokens": 2
+            }
+        }));
+        let model = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model(
+                "claude-sonnet-5-5",
+                system.map(str::to_string),
+                ModelSettings::default(),
+            );
+        let turn = model
+            .run_turn(FunctionModelTurnRequest { items, tools })
+            .await
+            .expect("tool turn");
+        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        handle.join().expect("server thread");
+        (body_rx.recv().expect("captured body"), turn)
+    }
+
+    fn tool_definition(name: &str) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: name.to_string(),
+            description: format!("The {name} tool."),
+            parameters_json_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// Prompt caching (Anthropic's Messages API): a breakpoint on the last tool caches every tool
+    /// definition, and one on the configured system prompt caches the tools and that prompt. The
+    /// run's own system text, which changes per message, goes after both, unmarked. The turn's
+    /// tokens count the cached prompt too.
+    #[tokio::test]
+    async fn an_anthropic_tool_turn_marks_the_tools_and_the_system_prompt_for_the_cache() {
+        let summary = "Immediate conversation summary:\ngoal: a report";
+        let (body, turn) = anthropic_tool_turn(
+            Some("You are AI.sales."),
+            vec![
+                FunctionLoopItem::SystemText {
+                    content: summary.to_string(),
+                },
+                FunctionLoopItem::UserText {
+                    content: "the report, please".to_string(),
+                },
+            ],
+            vec![
+                tool_definition("generate_csv_artifact"),
+                tool_definition("thread_state_get"),
+            ],
+        )
+        .await;
+        let breakpoint = json!({"type": "ephemeral"});
+        assert_eq!(body["tools"][0].get("cache_control"), None);
+        assert_eq!(body["tools"][1]["name"], "thread_state_get");
+        assert_eq!(body["tools"][1]["cache_control"], breakpoint);
+        assert_eq!(
+            body["system"],
+            json!([
+                {"type": "text", "text": "You are AI.sales.", "cache_control": breakpoint},
+                {"type": "text", "text": summary}
+            ])
+        );
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            2,
+            "of the 4 breakpoints a request may have"
+        );
+        assert_eq!(turn.tokens_used, 3 + 50 + 4000 + 2);
+    }
+
+    /// A turn without tools sends no `tools` and marks nothing there; without a configured prompt,
+    /// the run's own system text goes alone and unmarked, and with neither there is no `system`.
+    #[tokio::test]
+    async fn an_anthropic_tool_turn_without_tools_or_prompt_stays_a_plain_request() {
+        let ask = || FunctionLoopItem::UserText {
+            content: "hola".to_string(),
+        };
+        let (body, _) = anthropic_tool_turn(
+            None,
+            vec![
+                FunctionLoopItem::SystemText {
+                    content: "Active operations:\n- op-1".to_string(),
+                },
+                ask(),
+            ],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(body.get("tools"), None);
+        assert_eq!(
+            body["system"],
+            json!([{"type": "text", "text": "Active operations:\n- op-1"}])
+        );
+        assert!(!body.to_string().contains("cache_control"));
+
+        let (body, _) = anthropic_tool_turn(Some("  "), vec![ask()], Vec::new()).await;
+        assert_eq!(body.get("system"), None);
+        assert_eq!(body.get("tools"), None);
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hola");
     }
 }

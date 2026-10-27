@@ -8208,6 +8208,50 @@ mod tests {
         }
     }
 
+    /// NODE_HELP (docs/agent-tools-v1.md §3.3) reaches a node only from an orchestrator, as the
+    /// node reads do: its own hive's, or the motherbee's. Another node, the admin of another hive,
+    /// a sender known only through the hub and a tap copy are dropped at delivery.
+    #[test]
+    fn node_help_reaches_a_node_only_from_the_orchestrators() {
+        let delivery = |sender: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(sender.to_string()),
+                dst: Destination::Unicast("AI.sales@worker1".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: system_meta(fluxbee_sdk::protocol::MSG_NODE_HELP),
+            payload: serde_json::json!({ "node_name": "AI.sales@worker1" }),
+        };
+        for sender in ["SY.orchestrator@worker1", "SY.orchestrator@motherbee"] {
+            assert!(
+                prepare_local_delivery("worker1", &delivery(sender), false).is_some(),
+                "{sender} must reach the node"
+            );
+        }
+        for rogue in [
+            "AI.support@worker1",
+            "SY.architect@motherbee",
+            "SY.admin@motherbee",
+            "SY.vault@worker1",
+            "SY.orchestrator@ingress1",
+            "IO.cloud@motherbee",
+        ] {
+            assert!(
+                prepare_local_delivery("worker1", &delivery(rogue), false).is_none(),
+                "{rogue} must not reach the node"
+            );
+        }
+        assert!(
+            prepare_local_delivery("worker1", &delivery("SY.orchestrator@motherbee"), true)
+                .is_none()
+        );
+        let mut tapped = delivery("SY.orchestrator@worker1");
+        tapped.meta.via_tap = true;
+        assert!(prepare_local_delivery("worker1", &tapped, false).is_none());
+    }
+
     /// The edge gate and the system policy list the same edge commands. A command missing from the
     /// gate is answered VPN_BLOCKED before the policy is asked; one missing from the protected
     /// actions reaches the edge without the policy. Every command has its answer in the gate.

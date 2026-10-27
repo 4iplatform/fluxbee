@@ -8,20 +8,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
-    create_function_calling_model, create_llm_client, extract_response_envelope, extract_text,
-    resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
-    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateStore,
-    ThreadStateToolsProvider, ToolRunWatch, UsageRecorder,
+    control_request, create_function_calling_model, create_llm_client, extract_response_envelope,
+    extract_text, resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider,
+    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
+    LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
+    ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool, ThreadStatePutTool,
+    ThreadStateStore, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::managed_control_plane::{
     build_node_status_response_payload, ControlPlaneErrorInfo, ManagedNodeLifecycleState,
 };
 use fluxbee_sdk::protocol::{
-    Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_CONFIG_GET,
+    MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     managed_node_name, IdentityError, NodeConfig, NodeUuidMode, OperationalRouteProfile,
@@ -184,12 +185,6 @@ struct ImmediateMemorySection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct BehaviorCapabilities {
-    #[serde(default)]
-    multimodal: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RunnerModelSettings {
     #[serde(default)]
     temperature: Option<f32>,
@@ -238,8 +233,10 @@ struct EffectiveBehaviorSection {
     model_settings: Option<RunnerModelSettings>,
     #[serde(default)]
     base_url: Option<String>,
+    /// Whether the model receives images and documents: false for the frontdesk. The same key as
+    /// ai.generic's (agent-tools-v1 T9).
     #[serde(default)]
-    capabilities: Option<BehaviorCapabilities>,
+    multimodal: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1357,16 +1354,21 @@ impl GenericAiNode {
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
-        // Thread state tools remain the source for node-level "hard state".
-        // In scoped AI runtimes the canonical key is src_ilk; thread_id is
-        // conversational metadata only.
-        // Immediate memory is managed separately by the runner as short-horizon context.
+        // The case's state, bound to the sender's src_ilk (thread_id is conversational metadata
+        // only); immediate memory is the runner's short-horizon context. The frontdesk's tools are
+        // its own (agent-tools-v1 T10): read and save, never delete. A registered case ends saved
+        // as status=completed, and the turn's result is read back from it
+        // (`build_frontdesk_result_for_conversation`): a deleted one would read as a conversation
+        // that registered nobody. Only the deterministic handoff deletes a case, in code.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
-            let provider = ThreadStateToolsProvider::with_get_put_delete_scoped(
+            registry.register(Arc::new(ThreadStateGetTool::new(
                 store.clone(),
                 src_ilk.clone(),
-            );
-            provider.register_tools(registry)?;
+            )))?;
+            registry.register(Arc::new(ThreadStatePutTool::new(
+                store.clone(),
+                src_ilk.clone(),
+            )))?;
         }
         Ok(())
     }
@@ -2017,42 +2019,86 @@ impl GenericAiNode {
         }
     }
 
+    /// A control verb runs only as the router's authority gate delivers it, from the node that
+    /// sends it (`control_request`): SY.admin@motherbee for the config, this hive's orchestrator for
+    /// the status. Anything else that names a verb is refused with `unauthorized`.
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
-        let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET)
-        {
-            (
-                MSG_NODE_STATUS_GET_RESPONSE,
-                self.build_node_status_get_response().await,
-            )
-        } else if command.eq_ignore_ascii_case("CONFIG_SET") {
-            ("CONFIG_RESPONSE", self.apply_config_set(&msg).await)
-        } else if command.eq_ignore_ascii_case("CONFIG_GET") {
-            ("CONFIG_RESPONSE", self.build_config_get_response().await)
-        } else if command.eq_ignore_ascii_case("PING") {
-            ("PONG", self.build_ping_response().await)
-        } else if command.eq_ignore_ascii_case("STATUS") {
-            ("STATUS_RESPONSE", self.build_status_response().await)
-        } else {
-            let state = self.control_plane.read().await.current_state;
-            (
-                "CONFIG_RESPONSE",
-                self.error_response(
-                    "unknown_system_msg",
-                    format!("Unsupported control-plane command: {command}"),
-                    1,
-                    0,
-                    state.as_str(),
+        let (response_msg, response_payload) =
+            match control_request(&msg, &self.node_name, &CONTROL_VERBS) {
+                ControlRequest::Run(MSG_NODE_STATUS_GET) => (
+                    MSG_NODE_STATUS_GET_RESPONSE,
+                    self.build_node_status_get_response().await,
                 ),
-            )
-        };
+                ControlRequest::Run(MSG_CONFIG_SET) => {
+                    (MSG_CONFIG_RESPONSE, self.apply_config_set(&msg).await)
+                }
+                ControlRequest::Run(MSG_CONFIG_GET) => {
+                    (MSG_CONFIG_RESPONSE, self.build_config_get_response().await)
+                }
+                ControlRequest::Run(MSG_PING) => ("PONG", self.build_ping_response().await),
+                ControlRequest::Run(MSG_STATUS) => {
+                    ("STATUS_RESPONSE", self.build_status_response().await)
+                }
+                ControlRequest::Refuse { verb, reason } => {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        trace_id = %msg.routing.trace_id,
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        msg_type = %msg.meta.msg_type,
+                        msg = %command,
+                        reason = %reason,
+                        "control request refused (unauthorized)"
+                    );
+                    self.refused_control_response(verb, reason).await
+                }
+                ControlRequest::Run(_) | ControlRequest::Other => {
+                    let state = self.control_plane.read().await.current_state;
+                    (
+                        MSG_CONFIG_RESPONSE,
+                        self.error_response(
+                            "unknown_system_msg",
+                            format!("Unsupported control-plane command: {command}"),
+                            1,
+                            0,
+                            state.as_str(),
+                        ),
+                    )
+                }
+            };
         Ok(Some(build_control_plane_response(
             &msg,
             response_msg,
             response_payload,
         )))
+    }
+
+    /// The answer to a control request the node refuses: the response its verb names, so the
+    /// sender does not wait out its timeout, with the error code `unauthorized` in that response's
+    /// own shape.
+    async fn refused_control_response(&self, verb: &str, reason: String) -> (&'static str, Value) {
+        let response_msg = match verb {
+            MSG_NODE_STATUS_GET => MSG_NODE_STATUS_GET_RESPONSE,
+            MSG_PING => "PONG",
+            MSG_STATUS => "STATUS_RESPONSE",
+            _ => MSG_CONFIG_RESPONSE,
+        };
+        if response_msg != MSG_CONFIG_RESPONSE {
+            let refusal =
+                json!({"status": "error", "error_code": "unauthorized", "message": reason});
+            return (response_msg, refusal);
+        }
+        let state = self.control_plane.read().await;
+        let refusal = self.error_response(
+            "unauthorized",
+            reason,
+            state.schema_version,
+            state.config_version,
+            state.current_state.as_str(),
+        );
+        (response_msg, refusal)
     }
 
     async fn apply_config_set(&self, msg: &Message) -> Value {
@@ -2935,9 +2981,7 @@ fn build_behavior_from_effective_config(
                 .and_then(|runtime| runtime.immediate_memory.clone())
                 .unwrap_or_default();
             let multimodal = behavior
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.multimodal)
+                .multimodal
                 .unwrap_or_else(default_multimodal_for_runtime);
 
             Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
@@ -3030,14 +3074,8 @@ fn materialize_effective_defaults(
         if config.behavior.instructions.is_none() {
             config.behavior.instructions = Some(frontdesk_default_instructions_snapshot());
         }
-        if config.behavior.capabilities.is_none() {
-            config.behavior.capabilities = Some(BehaviorCapabilities {
-                multimodal: Some(default_multimodal_for_runtime()),
-            });
-        } else if let Some(caps) = config.behavior.capabilities.as_mut() {
-            if caps.multimodal.is_none() {
-                caps.multimodal = Some(default_multimodal_for_runtime());
-            }
+        if config.behavior.multimodal.is_none() {
+            config.behavior.multimodal = Some(default_multimodal_for_runtime());
         }
     }
     config
@@ -3049,6 +3087,18 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
     }
 }
 
+/// The control verbs the frontdesk answers. Each one runs only from the node that sends it
+/// (`control_request`).
+const CONTROL_VERBS: [&str; 5] = [
+    MSG_NODE_STATUS_GET,
+    MSG_CONFIG_SET,
+    MSG_CONFIG_GET,
+    MSG_PING,
+    MSG_STATUS,
+];
+
+/// A message for the control plane, never for the model: a `system` or an `admin` one. Which of
+/// them run is `handle_control_plane`'s to say.
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
         || msg.meta.msg_type.eq_ignore_ascii_case("admin")
@@ -3797,11 +3847,12 @@ mod tests {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// A NODE_STATUS_GET from the orchestrator of the frontdesk's hive, the one that sends it.
     fn sample_request() -> Message {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                src_l2_name: None,
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
@@ -3851,7 +3902,7 @@ mod tests {
     fn test_node() -> GenericAiNode {
         let gov_identity = GovIdentityConfig::default();
         GenericAiNode {
-            node_name: "SY.frontdesk.gov".to_string(),
+            node_name: "SY.frontdesk.gov@motherbee".to_string(),
             self_ilk_id: None,
             behavior: Arc::new(RwLock::new(None)),
             thread_state_store: None,
@@ -3911,6 +3962,98 @@ mod tests {
         assert_eq!(configured["health_state"], json!("HEALTHY"));
         assert_eq!(configured["lifecycle_state"], json!("CONFIGURED"));
         assert!(configured.get("last_error").is_none());
+    }
+
+    async fn control_answer(node: &GenericAiNode, msg: Message) -> Message {
+        node.handle_control_plane(msg)
+            .await
+            .expect("control plane")
+            .expect("an answer")
+    }
+
+    /// CONFIG_GET and CONFIG_SET come from SY.admin@motherbee, NODE_STATUS_GET from the
+    /// orchestrator of the frontdesk's hive. A node, an `admin` message, a verb in another case
+    /// and the orchestrator of another hive are refused with `unauthorized`.
+    #[tokio::test]
+    async fn the_control_plane_runs_a_verb_only_from_the_node_that_sends_it() {
+        let node = test_node();
+        let config_get = {
+            let mut msg = sample_request();
+            msg.routing.src_l2_name = Some("SY.admin@motherbee".to_string());
+            msg.meta.msg = Some(MSG_CONFIG_GET.to_string());
+            msg
+        };
+        let answer = control_answer(&node, config_get.clone()).await;
+        assert_eq!(answer.meta.msg.as_deref(), Some(MSG_CONFIG_RESPONSE));
+        assert_eq!(
+            answer.payload["contract"]["node_kind"],
+            json!("SY.frontdesk.gov")
+        );
+        let status = control_answer(&node, sample_request()).await;
+        assert_eq!(status.payload["status"], json!("ok"));
+
+        let from_a_node = {
+            let mut msg = config_get.clone();
+            msg.routing.src_l2_name = Some("IO.slack.main@motherbee".to_string());
+            msg
+        };
+        let as_admin = {
+            let mut msg = config_get.clone();
+            msg.meta.msg_type = "admin".to_string();
+            msg
+        };
+        let lowercase = {
+            let mut msg = config_get;
+            msg.meta.msg = Some("config_get".to_string());
+            msg
+        };
+        for msg in [from_a_node, as_admin, lowercase] {
+            let answer = control_answer(&node, msg).await;
+            assert_eq!(answer.meta.msg.as_deref(), Some(MSG_CONFIG_RESPONSE));
+            assert_eq!(answer.payload["ok"], json!(false));
+            assert_eq!(answer.payload["error"]["code"], json!("unauthorized"));
+        }
+        let mut other_hive = sample_request();
+        other_hive.routing.src_l2_name = Some("SY.orchestrator@worker1".to_string());
+        let answer = control_answer(&node, other_hive).await;
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        assert_eq!(answer.payload["status"], json!("error"));
+        assert_eq!(answer.payload["error_code"], json!("unauthorized"));
+    }
+
+    /// The frontdesk's tools are its own (agent-tools-v1 T10): it reads and saves its case and
+    /// registers it, and never deletes it. A registered case ends saved as `completed`, which the
+    /// turn's result is read from.
+    #[tokio::test]
+    async fn the_frontdesk_reads_and_saves_its_case_but_never_deletes_it() {
+        let (node, _state) = test_node_with_state();
+        let ctx = BehaviorContext {
+            src_ilk: Some(TEST_ILK.to_string()),
+            ..BehaviorContext::default()
+        };
+        let definitions = node
+            .build_tool_registry(&ctx)
+            .expect("registry")
+            .definitions();
+        let names = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["ilk_register", "thread_state_get", "thread_state_put"]
+        );
+        for definition in &definitions {
+            assert!(
+                !definition.description.contains("thread_state_delete"),
+                "{}",
+                definition.name
+            );
+        }
+        assert!(!FRONTDESK_DEFAULT_SYSTEM_PROMPT.contains("delete"));
     }
 
     #[tokio::test]
@@ -4410,11 +4553,14 @@ mod tests {
                 ..EffectiveConfigDocument::default()
             },
         );
-        let runtime = serde_json::to_value(&config).expect("serialize")["runtime"].clone();
+        let baked = serde_json::to_value(&config).expect("serialize");
         assert_eq!(
-            runtime,
+            baked["runtime"],
             json!({"immediate_memory": {"enabled": false, "recent_interactions_max": 10, "summary_max_chars": 1600}})
         );
+        // agent-tools-v1 T9: the model's images are `behavior.multimodal`, off for the frontdesk.
+        assert_eq!(baked["behavior"]["multimodal"], json!(false));
+        assert!(baked["behavior"].get("capabilities").is_none());
     }
 
     /// As in ai.generic: a model call that times out is retryable only while no tool has run

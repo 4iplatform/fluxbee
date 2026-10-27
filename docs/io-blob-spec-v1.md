@@ -120,7 +120,9 @@ hook — not every generated HTML ends up published. `ai.generic` exposes the to
 `publish_html_page {filename, content}` (registered only when the node has a resolved identity):
 it validates the HTML with the same gate as `generate_html_artifact`, writes the blob (`put_bytes` +
 `promote`) and runs `publish_artifact` against `SY.admin` over the mesh socket, returning the capability
-URL to the model so that it delivers it in its answer. An IO/WF producer would do the analogous thing with its
+URL to the model so that it delivers it in its answer. The node's journal names the publication's id,
+never the URL (FINDINGS A-95). What the model is told about the tool is its card, in
+[reference/agent-tools.md](reference/agent-tools.md). An IO/WF producer would do the analogous thing with its
 own trigger; the admin contract is identical.
 
 ### 4.2 Admin -> IO.blob worker RPC

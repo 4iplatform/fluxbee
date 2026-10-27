@@ -312,7 +312,7 @@ wasm and baked into the router binary with `include_bytes!` (`src/router/system_
 ### 6.2 Protected actions and who may send them
 
 The gate covers system messages (`meta.type` compared without case, `is_system_kind`) whose
-`meta.msg` is one of the 31 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
+`meta.msg` is one of the 32 `PROTECTED_SYSTEM_ACTIONS`. The input is that verb, the router-stamped
 `src_l2_name` (§2) and the hive of the router doing the delivery.
 
 | Rule in `system.rego` | Actions | Allowed origin |
@@ -320,7 +320,7 @@ The gate covers system messages (`meta.type` compared without case, `is_system_k
 | (1) | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`, `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `EDGE_WEB_ROUTES` | `SY.admin@motherbee` |
 | (2) | `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `CONFIG_CHANGED` | `SY.admin@motherbee` |
 | (3) mutations | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`; `ADD_HIVE_FINALIZE` and `REMOVE_HIVE_CLEANUP` never on the motherbee itself |
-| (3) reads | `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`, `SY.orchestrator@<this hive>` |
+| (3) reads | `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `NODE_HELP` (a node's self-description, [agent-tools-v1](../agent-tools-v1.md) §3.3), `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`, `SY.orchestrator@<this hive>` |
 | (4) | every protected action outside (1) and (2): the (3) lists and `INVENTORY_REQUEST`; never `ADD_HIVE_FINALIZE` or `REMOVE_HIVE_CLEANUP` on the motherbee | `SY.admin@<this hive>` |
 | (5) | `NODE_STATUS_GET` | `SY.vault@<this hive>` |
 | (6) | `WAN_REACHABILITY_VOUCH`: not a message, the router asks it before it accepts a hub's reachability advertisement | `RT.gateway@motherbee` |

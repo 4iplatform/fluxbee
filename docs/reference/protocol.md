@@ -327,7 +327,7 @@ drops answer nothing, and a request then times out: a foreign `src` (§2.3), a p
 an unauthorized sender (§7), a broadcast with a non-UUID `trace_id`, a drop route, a frame the
 router enlarged past the limit (§1.3).
 
-### 6.2 NODE_STATUS_GET
+### 6.2 NODE_STATUS_GET and NODE_HELP
 
 When SY.orchestrator reports the status of a RUNNING node (`get_node_status_flow`,
 `src/bin/sy_orchestrator.rs`), it asks the node with `NODE_STATUS_GET` and waits 2 s
@@ -343,6 +343,18 @@ the payload of the answer. It is a protected verb (§7).
 - Go: `BuildDefaultNodeStatusResponse`, and `BuildManagedNodeStatusResponse`, which takes the
   health from the config state (`CONFIGURED` is `HEALTHY`, anything else `DEGRADED`) and adds
   `last_error` (`go/fluxbee-go-sdk/status.go`).
+
+`NODE_HELP` (`MSG_NODE_HELP`, `crates/fluxbee_sdk/src/protocol.rs`) asks a node to describe itself
+([agent-tools-v1](../agent-tools-v1.md) §3.3). It travels as `NODE_STATUS_GET` does: SY.admin's
+`node_help` reaches the orchestrator of the node's hive (`node_help_flow`), which sends it to the
+node and waits 3 s (`NODE_HELP_PROBE_TIMEOUT_SECS`). It is a protected verb (§7).
+
+- A node with a self-description answers `NODE_HELP_RESPONSE` to `routing.src` with the same
+  `trace_id` and payload `{status: "ok", node_name, runtime, runtime_version, tools: [card, ...]}`;
+  a card is `{name, summary, when_to_use, limits, present_when, input, output, errors}`. ai.generic
+  answers with its tool catalog.
+- A node without one need not answer: its silence reads as `help: null` in `node_help`, not as an
+  error.
 
 ### 6.3 CONFIG_GET, CONFIG_SET, CONFIG_RESPONSE
 
@@ -486,7 +498,7 @@ them (`prepare_local_delivery`): the list is `PROTECTED_SYSTEM_ACTIONS`
 | `CONFIG_GET`, `CONFIG_SET`, `CONFIG_CHANGED`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` | `SY.admin@motherbee` | (2) |
 | `SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `SYSTEM_CORE_ROLLBACK` | `SY.orchestrator@motherbee`; `SY.admin@<the same hive>` | (3), (4) |
 | `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP` | `SY.orchestrator@motherbee`, to another hive only; `SY.admin@<the same hive>`, never on the motherbee | (3), (4) |
-| `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`; `SY.orchestrator@<the same hive>`; `SY.admin@<the same hive>` | (3), (4) |
+| `NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `NODE_HELP`, `LIST_NODES`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME` | `SY.orchestrator@motherbee`; `SY.orchestrator@<the same hive>`; `SY.admin@<the same hive>` | (3), (4) |
 | `INVENTORY_REQUEST` | `SY.admin@<the same hive>` | (4) |
 | `NODE_STATUS_GET` (in addition) | `SY.vault@<the same hive>` | (5) |
 
@@ -497,7 +509,8 @@ them (`prepare_local_delivery`): the list is `PROTECTED_SYSTEM_ACTIONS`
 - Any other system verb passes this gate. A node that must restrict one checks `src_l2_name`
   itself, as SY.identity and SY.admin do.
 
-For a node author: a CONFIG_SET or a NODE_STATUS_GET that reaches your node has passed this check.
+For a node author: a CONFIG_SET, a NODE_STATUS_GET or a NODE_HELP that reaches your node has passed
+this check.
 
 ---
 

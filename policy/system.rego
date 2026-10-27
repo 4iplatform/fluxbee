@@ -78,8 +78,11 @@ spoke_only_action_on_motherbee if {
 }
 
 # The reads: from the motherbee's orchestrator, or from the orchestrator of the hive that answers.
+# NODE_HELP, a node's self-description (docs/agent-tools-v1.md §3.3), travels as NODE_STATUS_GET
+# does: the motherbee's orchestrator forwards it to the node's hive, whose orchestrator asks the
+# node. Rule (4) also admits it from the same hive's admin; rule (5) does not.
 orchestrator_reads := {
-	"NODE_CONFIG_GET", "NODE_STATE_GET", "NODE_STATUS_GET", "LIST_NODES",
+	"NODE_CONFIG_GET", "NODE_STATE_GET", "NODE_STATUS_GET", "NODE_HELP", "LIST_NODES",
 	"GET_VERSIONS", "GET_RUNTIMES", "GET_RUNTIME",
 }
 

@@ -151,3 +151,21 @@ fi
 rm -f "$tmp_start"
 
 echo "Configured AI start.sh runtime profile: $RUNTIME"
+
+# ai.generic's tool catalog goes next to the runtime, as the .deb ships it (packaging/build-deb.sh):
+# the repository's docs/reference/agent-tools.json with this version.
+if [[ "$RUNTIME" == "ai.generic" ]]; then
+  tmp_tools="$(mktemp)"
+  python3 -c 'import json, sys
+catalog = json.load(open(sys.argv[1], encoding="utf-8"))
+catalog["runtime_version"] = sys.argv[2]
+open(sys.argv[3], "w", encoding="utf-8").write(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n")' \
+    "$ROOT_DIR/docs/reference/agent-tools.json" "$VERSION" "$tmp_tools"
+  if [[ "$USE_SUDO" == "1" ]]; then
+    sudo install -m 0644 "$tmp_tools" "$RUNTIME_DIR/tools.json"
+  else
+    install -m 0644 "$tmp_tools" "$RUNTIME_DIR/tools.json"
+  fi
+  rm -f "$tmp_tools"
+  echo "Published the tool catalog: $RUNTIME_DIR/tools.json"
+fi

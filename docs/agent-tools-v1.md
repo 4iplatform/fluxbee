@@ -82,7 +82,8 @@ whether the model receives images. It is about the model, not a tool.
    - a CI check fails when the catalog and the code disagree, as the admin catalog's parity check
      does;
    - the package ships the JSON next to the runtime (`dist/runtimes/ai.generic/<version>/tools.json`),
-     which is the copy Archi reads.
+     which is the copy Archi reads. `get_runtime` answers it as `tool_catalog`, so Archi can
+     design agents before any of them runs.
 3. **The HELP** is one generic verb, `NODE_HELP`, which any node with a self-description answers.
    The contract (decided 2026-10-26):
    - **One card:**
@@ -92,10 +93,15 @@ whether the model receives images. It is about the model, not a tool.
    - **`NODE_HELP_RESPONSE` from the node:** `{status: "ok", node_name, runtime,
      runtime_version, tools: [card, ..]}`, the same cards as the catalog. `present_when` says
      when each tool is there.
-   - **The route:** `NODE_HELP` travels as `NODE_STATUS_GET` does, SY.admin → the node's hive
-     orchestrator → the node.
-   - **A node that does not describe itself:** after a short timeout, `node_help` answers 200
-     with `help: null` and the reason.
+   - **The route:** `NODE_HELP` travels as `NODE_STATUS_GET` does: SY.admin → the motherbee's
+     orchestrator → the node's hive orchestrator → the node. SY.admin addresses only its own
+     hive's orchestrator.
+   - **A node that does not describe itself:** `node_help` answers 200 with `help: null` and the
+     reason.
+     - The orchestrator answers at once, without asking, for a node whose runtime (or runtime
+       base) is not `ai.generic`.
+     - An AI node that does not answer within 3 s gets a neutral reason.
+     - The wait runs in its own task, so it never holds the orchestrator.
    - `ai.generic` answers it with its catalog.
    - SY.timer keeps `TIMER_HELP`, and may answer `NODE_HELP` later.
    - SY.admin exposes it as `node_help`, for the operator and Archi, because SY.admin mediates.

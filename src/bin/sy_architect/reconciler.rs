@@ -111,7 +111,7 @@ pub fn node_exists(item: &serde_json::Value) -> bool {
 /// Whether a node's stored config holds what the manifest declares for it: every declared key, at
 /// every level, with the declared value. `stored` is `get_node_config`'s answer (`{status, target,
 /// hive, node_name, path, config_version, config}`), the config.json the node runs, which the node
-/// fills in (ai.generic saves `behavior` with `model_settings`, `base_url` and `capabilities` the
+/// fills in (ai.generic saves `behavior` with `model_settings`, `base_url` and `multimodal` the
 /// manifest may not declare) beside the runtime's defaults, `tenant_id` and the orchestrator's
 /// `_system`: a key only the stored config has is not compared. A config declares nothing when it
 /// is not a non-empty object.
@@ -1194,7 +1194,7 @@ mod tests {
                 "model": "claude-sonnet-5-5",
                 "model_settings": null,
                 "base_url": null,
-                "capabilities": { "multimodal": true }
+                "multimodal": true
             } })),
         );
         let ops = reconcile_nodes(&desired, &snapshot);
@@ -1205,7 +1205,7 @@ mod tests {
             "node_name": "AI.coa@motherbee",
             "hive": "motherbee",
             "runtime": "ai.generic",
-            "config": { "behavior": { "kind": "ai_chat", "capabilities": { "multimodal": false } } }
+            "config": { "behavior": { "kind": "ai_chat", "multimodal": false } }
         })];
         let ops = reconcile_nodes(&desired, &snapshot);
         assert_eq!(ops.len(), 1);

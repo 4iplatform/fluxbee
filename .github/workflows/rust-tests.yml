@@ -2,9 +2,10 @@ name: rust-tests
 
 # cargo fmt --check, cargo clippy (warnings denied) and cargo test for both Rust workspaces (the
 # root one and nodes/io) on each push or pull request that touches Rust code, the baked system
-# policy, or the contract fixtures shared with the Go tests. The structural lints clippy leaves
-# alone are allowed once per workspace, in its Cargo.toml's [workspace.lints.clippy].
-# Toolchain pinned to the one fb-build builds the .deb with.
+# policy, the contract fixtures shared with the Go tests, or ai.generic's tool catalog (its test
+# `the_tool_catalog_matches_the_cards` is the catalog's parity check with the tools' cards). The
+# structural lints clippy leaves alone are allowed once per workspace, in its Cargo.toml's
+# [workspace.lints.clippy]. Toolchain pinned to the one fb-build builds the .deb with.
 
 on:
   pull_request:
@@ -17,6 +18,7 @@ on:
       - "Cargo.lock"
       - "go/fluxbee-go-sdk/testdata/**"
       - "go/sy-opa-rules/testdata/**"
+      - "docs/reference/agent-tools.*"
       - ".github/workflows/rust-tests.yml"
   push:
     branches: ["**"]
@@ -29,6 +31,7 @@ on:
       - "Cargo.lock"
       - "go/fluxbee-go-sdk/testdata/**"
       - "go/sy-opa-rules/testdata/**"
+      - "docs/reference/agent-tools.*"
       - ".github/workflows/rust-tests.yml"
 
 permissions:

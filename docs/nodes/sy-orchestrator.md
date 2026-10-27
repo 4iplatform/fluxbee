@@ -410,7 +410,7 @@ and it logs `service restart failed` every 5 s until `systemctl unmask`.
 **Admin commands** (`msg_type: admin`, sent by SY.admin), handled by `handle_admin`: hive_status,
 get_storage, set_storage, list_nodes, list_tenant_nodes, list_versions, get_versions,
 list_runtimes, get_runtime, run_node, start_node, restart_node, kill_node, remove_node_instance,
-get_node_config, set_node_config, get_node_state, get_node_status, list_deployments,
+get_node_config, set_node_config, get_node_state, get_node_status, node_help, list_deployments,
 get_deployments, list_drift_alerts, get_drift_alerts, record_drift_alert, list_hives, get_hive,
 add_hive, remove_hive, core_rollback. Anything else answers `NOT_IMPLEMENTED`. Every admin
 message, reads included, is accepted only from `SY.admin@<this hive>` as the router stamps the
@@ -442,12 +442,32 @@ the last hour keeps a new one out. The answer is `{status: "ok", recorded}`, wit
 **System messages** (`handle_system_message`), mostly between orchestrators: `SYSTEM_UPDATE`,
 `SYSTEM_CORE_ROLLBACK`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`, `KILL_NODE`, `START_NODE`,
 `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `NODE_STATE_GET`,
-`NODE_STATUS_GET`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
+`NODE_STATUS_GET`, `NODE_HELP`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
 `INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`. `RUNTIME_UPDATE` is refused.
 The router delivers these protected actions only from allowed origins (`policy/system.rego`:
 `SY.orchestrator@motherbee` for the node and handshake actions, and also this hive's own
 orchestrator for the reads, rule (3); `SY.admin@motherbee` for
 `SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)).
+
+**`node_help` and `NODE_HELP`** (`node_help_flow`): a node's self-description
+([agent-tools-v1](../agent-tools-v1.md) §3.3), asked the way its status is.
+
+- **Its own task:** the admin and system workers take one message at a time, so the flow runs in
+  a task of its own that sends the answer itself (`spawn_node_help`): an admin answer to SY.admin,
+  `NODE_HELP_RESPONSE` to an orchestrator. Inline, the node's probe (3 s) or another hive's forward
+  (7 s) held every request behind it, and SY.admin's 5 s reads (`hive_status`, `web_status`)
+  answered 504. add_hive's join leaves the admin worker the same way (PB-7).
+- **A node of another hive:** the motherbee forwards `NODE_HELP` to that hive's orchestrator and
+  waits 7 s (`NODE_HELP_FORWARD_TIMEOUT_SECS`); no answer is `NODE_HELP_FAILED`.
+- **A node of this hive:** whether it is here is decided as for `get_node_status`
+  (`local_node_view`), else `NODE_NOT_FOUND`. Only a node that `ai.generic` runs is asked
+  (`NODE_HELP_RUNTIMES`): its config.json's `_system.runtime_base`, else `_system.runtime`. Any
+  other node, a core node included, is answered at once with no help (`node_help_unasked_reason`).
+  A connected `ai.generic` node gets `NODE_HELP` and 3 s to answer (`NODE_HELP_PROBE_TIMEOUT_SECS`).
+- **The answer:** `{status: "ok", node_name, help, reason}`. `help` is the node's
+  `NODE_HELP_RESPONSE`, or null with the reason: what runs the node does not answer `NODE_HELP`, it
+  is not connected, it did not answer within 3 s, or it answered with an error. None of these is
+  an error, and a silence says only that: a busy AI node can miss the 3 s too.
 
 ## Config
 

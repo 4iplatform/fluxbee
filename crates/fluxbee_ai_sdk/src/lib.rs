@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod control_plane;
 pub mod errors;
 pub mod function_calling;
 pub mod immediate_memory;
@@ -14,13 +15,17 @@ pub mod thread_state_tools;
 pub mod usage;
 
 pub use agent::Agent;
+pub use control_plane::{
+    control_caller_authorized, control_request, ControlRequest, MSG_PING, MSG_STATUS,
+};
 pub use errors::{AiSdkError, Result};
 pub use fluxbee_sdk::{TenantSource, UsageWork};
 pub use function_calling::{
-    dispatch_tool_calls, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
-    FunctionLoopItem, FunctionLoopRunResult, FunctionModelTurnRequest, FunctionModelTurnResponse,
-    FunctionTool, FunctionToolCall, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, FunctionToolResult, ToolRunWatch, DEFAULT_MAX_TURNS,
+    dispatch_tool_calls, AgentTool, FunctionCallingConfig, FunctionCallingModel,
+    FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionModelTurnRequest,
+    FunctionModelTurnResponse, FunctionTool, FunctionToolCall, FunctionToolDefinition,
+    FunctionToolProvider, FunctionToolRegistry, FunctionToolResult, ToolCard, ToolCatalog,
+    ToolErrorCode, ToolRunWatch, DEFAULT_MAX_TURNS, TOOL_DESCRIPTION_MAX_CHARS,
 };
 pub use immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,

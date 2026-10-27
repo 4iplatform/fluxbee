@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{MSG_CONFIG_GET, MSG_CONFIG_SET};
+use crate::protocol::{MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_HELP};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +84,7 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "list_nodes"
         | "list_tenant_nodes"
         | "get_node_status"
+        | "node_help"
         | "get_node_config"
         | "get_node_state"
         | "get_versions"
@@ -144,8 +145,8 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
 pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
     match msg {
         MSG_CONFIG_GET | "STATUS" | "PING" | "NODE_CONFIG_GET" | "NODE_STATE_GET"
-        | "NODE_STATUS_GET" | "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME"
-        | "INVENTORY_REQUEST" | "ILK_LIST" | "ILK_GET" => Some(ActionClass::Read),
+        | "NODE_STATUS_GET" | MSG_NODE_HELP | "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES"
+        | "GET_RUNTIME" | "INVENTORY_REQUEST" | "ILK_LIST" | "ILK_GET" => Some(ActionClass::Read),
         MSG_CONFIG_SET | "NODE_CONFIG_SET" => Some(ActionClass::Write),
         "RUNTIME_UPDATE"
         | "SYSTEM_UPDATE"
@@ -216,6 +217,12 @@ mod tests {
             classify_admin_action("send_node_message"),
             Some(ActionClass::SendMessage)
         );
+        // A node's self-description is read as its status is (docs/agent-tools-v1.md §3.3).
+        assert_eq!(
+            classify_admin_action("node_help"),
+            classify_admin_action("get_node_status")
+        );
+        assert_eq!(classify_admin_action("node_help"), Some(ActionClass::Read));
     }
 
     #[test]
@@ -232,6 +239,12 @@ mod tests {
             classify_system_message("CONFIG_SET"),
             Some(ActionClass::Write)
         );
+        assert_eq!(
+            classify_system_message("NODE_HELP"),
+            Some(ActionClass::Read)
+        );
+        // The answer is no command.
+        assert_eq!(classify_system_message("NODE_HELP_RESPONSE"), None);
     }
 
     #[test]

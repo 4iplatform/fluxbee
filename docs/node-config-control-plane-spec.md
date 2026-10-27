@@ -224,6 +224,7 @@ Example:
       },
       "optional_fields": [
         "behavior.model_settings",
+        "behavior.provider",
         "runtime.immediate_memory"
     ],
     "resources": [
@@ -246,7 +247,7 @@ Example:
       }
     ],
     "notes": [
-      "The provider is the hive's (hive.yaml ai); its key is read from SY.vault by resource_type. behavior.model selects the model.",
+      "The provider is behavior.provider, or the hive's (hive.yaml ai) without it; its key is read from SY.vault by resource_type, in the node's tenant. behavior.model selects the model.",
       "CONFIG_SET may override in-memory behavior depending on node implementation."
     ]
   }

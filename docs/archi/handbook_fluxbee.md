@@ -169,15 +169,42 @@ Use when the work is conversational, interpretive, or agentic.
 Every AI node is an instance of the `ai.generic` runtime; there is no other AI runtime, and no AI
 node boots with the base install. To make one:
 - `run_node` with `runtime: ai.generic` and the node's tenant;
-- `CONFIG_SET` its operational config: `behavior.kind: ai_chat` and `model`. It carries no prompt:
-  `CONFIG_SET` refuses `instructions`;
+- `CONFIG_SET` its operational config: `behavior.kind: ai_chat` and `model`, a model of the node's
+  provider. Optional: `behavior.provider`, `openai` or `anthropic` (without it, the hive's
+  `ai.default_provider`), and `behavior.multimodal`, whether the model receives images (true when
+  absent; `behavior.capabilities` is refused). It carries no prompt: `CONFIG_SET` refuses
+  `instructions`;
 - give it its behavior through its ILK definition: a role, skills, handbooks and optionally a
   personality, created as agent assets and set with `set_ilk_definition` on its ILK (§8.1.2). The
   ILK definition is the agent's only prompt source.
 
-The node does not name a Vault key: it uses the AI provider key SY.vault gives it (resource_type
-`openai` or `anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no
-assigned node). The root tenant's keys are the core's; a tenant's node never falls back to them.
+The provider is the node's: two agents of one hive may run on different providers. The node does
+not name a Vault key: it uses the key SY.vault gives it for its provider (resource_type `openai` or
+`anthropic`): one it owns, one assigned to it, or its tenant's general one (no owner, no assigned
+node). The root tenant's keys are the core's; a tenant's node never falls back to them. So a node
+runs on a provider only when its tenant has that provider's key (`vault_list` shows the metadata).
+The SY nodes (Archi, cognition, the frontdesk) keep the hive's provider.
+
+### 4.1.1 Agent tools
+
+What an AI agent can do beyond answering is its **tools**: the functions its model calls while it
+works. Every AI agent loads the same **base tools**, built into `ai.generic`: no config adds or
+removes one, and you never choose tools per agent. Each tool has a card: what it does, when to use
+it, its limits, when it is present (some need the message to name its interlocutor, or the node to
+have its own identity), its input and output, and its errors.
+
+- **The catalog:** read it first with `fluxbee_system_get` on `/hives/motherbee/runtimes/ai.generic`
+  (`get_runtime`), which answers it as `tool_catalog`: the cards the installed version ships, even
+  before any AI agent runs. On a running AI node, `/hives/{hive}/nodes/{node_name}/help`
+  (`node_help`) answers the same cards in `help.tools`. Any other node (only `ai.generic` describes
+  itself) answers `help: null` at once, with the reason, and so do a stopped AI node and, after
+  3 s, a busy one. The same catalog is `docs/reference/agent-tools.md`, generated from the code
+  with each runtime version.
+- **Read it before you design a role, a skill or a handbook,** and design against it. Never write
+  one that promises a tool the catalog does not list.
+- **Roles stay reusable:** a role says what the agent does, never through which channel or tool, so
+  one "sales" role serves an agent on WhatsApp and another on email. Skills and handbooks may name
+  base tools, since every agent has them.
 
 ### 4.2 WF nodes and workflows
 
@@ -578,6 +605,7 @@ Use:
 - `node_control_config_get` to verify the running agent loaded or rejected the definition
 
 Rules:
+- design roles, skills and handbooks against the agent tools (§4.1.1): read their catalog first; a role names no channel and no tool, and no asset promises a tool the catalog does not list
 - when the operator asks to inspect or show an asset, read it with `get_agent_asset`; do not reconstruct it from chat memory
 - asset builder tools only write content-addressed files under `blob://agent-assets/<hash>.json`
 - deleting an asset does not update ILK definitions; first remove or replace the hash from any active definition if the asset is still referenced

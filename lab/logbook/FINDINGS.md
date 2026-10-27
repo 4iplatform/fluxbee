@@ -1078,6 +1078,72 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-104 🔴 OPEN (found 2026-10-26, 0.1.86 review) — An AI node's model must match a provider it may not know
+
+- **What happens:** since 0.1.86, `behavior.provider` is optional and defaults to the hive's
+  provider, but `behavior.model` is required and free text. SY.admin's examples say
+  `"model": "gpt-5.5"` with no provider. Copied on an Anthropic hive (8.x), the result is an OpenAI
+  model sent to Anthropic, and every message fails.
+- **Fix:** without `behavior.model`, the node uses the hive's model for its provider
+  (`hive.yaml ai.providers.<provider>.model`). The examples then name neither, unless the node
+  needs another model.
+
+### A-103 🔵 TO EVALUATE (found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
+
+- **What happens:** the cards repeat values that live elsewhere in the code:
+  - the 128-byte filename limit;
+  - the 24 h publication expiry (SY.admin's `PUBLICATION_DEFAULT_EXPIRES_SECS`);
+  - the 120 s publish wait;
+  - the 64–2400 image clamp.
+
+  The catalog's golden test compares the cards with themselves, so it cannot catch a change to any
+  of those values.
+- **Fix:** build the card text from the constants, or test the text against them.
+
+### A-102 🟡 OPEN, narrow (found 2026-10-26, 0.1.86 review) — A stopped node's first start can race the T9 conversion
+
+- **What happens:** `start_node` saves the relaunch flag into config.json after launching the node,
+  while the node converts the same file at boot. If the orchestrator's read-modify-write lands
+  first, `behavior.capabilities` comes back, and the node boots FAILED_CONFIG. A restart fixes it.
+- **Fix:** save the flag before launching, or convert in the orchestrator's launch step under the
+  node's lock.
+
+### A-101 🟡 OPEN (found 2026-10-26, 0.1.86 review) — NODE_HELP's runtime_version goes stale after a restart
+
+- **What happens:** `start_node` and `restart_node` launch the current version without saving
+  `_system.runtime_version`; only the boot reconcile saves it. A node restarted onto a newer
+  version reports the old one until the orchestrator's next boot.
+- **Fix:** save the version in start and restart, before launching.
+
+### A-100 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
+
+- **What happens:** the router's delivery gate checks protected verbs only on `msg_type: system`,
+  and only in exact case. A node that took `msg_type: admin`, or a verb in lower case, received a
+  CONFIG_SET from any sender.
+  - 0.1.86 closes it on the AI nodes: `ai.generic` and the frontdesk accept their control plane
+    only as `system`, in exact case, and only from their real authorities.
+  - The IO nodes already checked their callers.
+- **Fix, as defense in depth:** the router compares `meta.msg` without case, and gates protected
+  verbs on any `msg_type`.
+
+### A-99 🔴 OPEN (found 2026-10-26) — When a file generator runs, the model's own text is dropped
+
+- **What happens:** the reply is the generator call's `text`, or a fixed Spanish line. Whatever the
+  model writes after the call is lost.
+- **Fix:** decide which text the user gets, and keep the model's own.
+
+### A-98 🔴 OPEN (found 2026-10-26) — A generated file's bytes flow back into the model's context
+
+- **What happens:** each `generate_*_artifact` result carries the file's base64 back to the model.
+  That costs tokens on every later turn, and fills the context with bytes the model cannot use.
+- **Fix:** return a reference (the file name, its size, the blob reference), never the bytes.
+
+### A-97 🔴 OPEN (found 2026-10-26) — The PDF generator garbles non-ASCII text
+
+- **What happens:** `generate_pdf_artifact` prints only ASCII correctly, so accented Spanish comes
+  out broken. The users of 8.x write in Spanish.
+- **Fix:** embed a Unicode font, or use a PDF library that encodes text properly.
+
 ### A-96 🔵 TO EVALUATE (noted 2026-10-26) — How the SY nodes' tokens are measured per message
 
 - **What happens:** the SY nodes that call a model (cognition, Archi, the frontdesk) keep the

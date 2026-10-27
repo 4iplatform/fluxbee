@@ -8,7 +8,8 @@ It provides:
 
 - the only way to call a model: two factories that return an OpenAI or Anthropic client, and every
   call they make is charged to a tenant (usage records);
-- the tool loop: `FunctionCallingRunner`, `FunctionTool`, `FunctionToolRegistry`;
+- the tool loop: `FunctionCallingRunner`, `FunctionTool`, `FunctionToolRegistry`, and the card an
+  agent's tool is declared by (`AgentTool`, `ToolCard`, `ToolCatalog`);
 - immediate conversation memory and a helper that refreshes its summary;
 - thread-state tools and their LanceDB store;
 - the AI node runtime (`AiNode`, `NodeRuntime`), reply builders, and helpers for `text/v1` input
@@ -18,11 +19,13 @@ It provides:
 
 ### The provider and the key
 
-- **The provider is the hive's.** It is the `ai:` section of `/etc/fluxbee/hive.yaml`, read as a
+- **The hive's provider** is the `ai:` section of `/etc/fluxbee/hive.yaml`, read as a
   `HiveAiConfig`. `HiveAiConfig::effective()` returns the provider and the model configured for it.
   Without the section, `HiveAiConfig::fallback()` applies: OpenAI with `gpt-5.5`
-  (`DEFAULT_HIVE_OPENAI_MODEL`). An `ai.generic` node takes only the provider from it; its model is
-  its own `behavior.model`.
+  (`DEFAULT_HIVE_OPENAI_MODEL`). The SY nodes that call a model (SY.cognition, Archi, SY.admin's
+  executor, the frontdesk) use it. An `ai.generic` node names its own provider in
+  `behavior.provider` and takes the hive's only without it; its model is always its own
+  `behavior.model` (docs/agent-tools-v1.md T8).
 
   ```yaml
   ai:
@@ -73,6 +76,13 @@ pub fn create_function_calling_model(
 - **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (Anthropic's
   `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says `abandoned`.
   The bound is for stuck connections: a long reasoning answer or an Archi stage fits in it.
+- **Prompt caching on Anthropic:** a tool turn marks two cache breakpoints,
+  `cache_control: {"type": "ephemeral"}`, on the last tool definition and on the `system` prompt
+  given to the factory. The tools and that prompt are the same on every turn, so Anthropic reads
+  them from its prompt cache (5 min) instead of billing them in full; the usage record counts them
+  as `cache_read` and `cache_write`. The run's own system text (immediate memory) goes after the
+  breakpoints, in a block of its own. A prompt shorter than the model's minimum is sent uncached,
+  without an error. OpenAI caches a repeated prefix by itself. The plain path marks nothing.
 
 ### A tool loop
 
@@ -116,7 +126,8 @@ let answer = result.final_assistant_text;
 - **After a failed run, whether a tool ran:** run the loop through
   `ToolRunWatch::new(model.as_ref(), &tool_ran)` (an `AtomicBool`). Once a tool has run, a failure
   is not retryable: sending the same request again would run that tool again.
-- `result.tokens_used` sums what the provider reported over the run.
+- `result.tokens_used` sums what the provider reported over the run: each turn's whole prompt,
+  cached or not, and its answer.
 - The runner cuts a text input at 1,200 characters. A longer input has to go as
   `FunctionRunInput::current_user_parts`, which is sent as it is.
 
@@ -145,22 +156,36 @@ answer is checked against the schema.
 
 ### Writing a tool
 
+A tool an AI agent has is an `AgentTool`: it declares one `ToolCard` and nothing else
+([docs/agent-tools-v1.md](../../docs/agent-tools-v1.md) T2). The card says what the tool does,
+when to use it, its limits, when it is present, its input and output as JSON schemas, and its
+error codes.
+
 ```rust
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluxbee_ai_sdk::{FunctionTool, FunctionToolDefinition, FunctionToolRegistry};
+use fluxbee_ai_sdk::{AgentTool, FunctionToolRegistry, ToolCard, ToolErrorCode};
 use serde_json::{json, Value};
 
 struct HiveName;
 
 #[async_trait]
-impl FunctionTool for HiveName {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
+impl AgentTool for HiveName {
+    fn card() -> ToolCard {
+        ToolCard {
             name: "hive_name".to_string(),
-            description: "The name of the hive this node runs on.".to_string(),
-            parameters_json_schema: json!({"type": "object", "properties": {}}),
+            summary: "Say which hive this node runs on.".to_string(),
+            when_to_use: "When the user asks where the agent runs.".to_string(),
+            limits: vec!["Only the hive's name, nothing about its nodes.".to_string()],
+            present_when: "always".to_string(),
+            input: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            output: json!({
+                "description": "`{hive}`, the hive's name.",
+                "type": "object",
+                "properties": {"hive": {"type": "string"}}
+            }),
+            errors: vec![ToolErrorCode::new("no_hive", "The node has no hive.")],
         }
     }
 
@@ -173,8 +198,21 @@ let mut tools = FunctionToolRegistry::new();
 tools.register(Arc::new(HiveName))?; // an empty or duplicate name is refused
 ```
 
+- **The model receives the card** (`ToolCard::model_definition`): the summary, `When to use:`, the
+  limits, `Returns:` with the output schema's `description`, and the input schema. Provider APIs
+  take only a name, a description and the input; `present_when` and the error codes stay out.
+- **The same card** is the runtime's tool catalog (`ToolCatalog`, generated into
+  [docs/reference/agent-tools.json](../../docs/reference/agent-tools.json)) and its `NODE_HELP`
+  answer. `ToolCard::validate` lists what a card is missing.
+- **The rendered description fits in `TOOL_DESCRIPTION_MAX_CHARS` (1,024 characters):** OpenAI
+  refuses a longer one with 400 `string_above_max_length`, and `ToolCard::validate` reports it. The
+  descriptions inside the input schema do not count, so the rules of one argument go there.
+- **Every `AgentTool` is a `FunctionTool`** whose definition is rendered from its card. A SY node's
+  own tools (Archi's, SY.admin's executor's, the frontdesk's `ilk_register`) implement
+  `FunctionTool` directly, with a hand-written `FunctionToolDefinition`.
 - **Errors go back to the model.** A tool that returns `Err`, or a call to an unknown tool, becomes
-  a tool result with `is_error: true`, and the loop continues.
+  a tool result with `is_error: true`, and the loop continues. A failure the model should act on
+  is a result `{"status": "error", "error_code", "message", "retryable"}` with a code of its card.
 - **Providers of several tools** implement `FunctionToolProvider`, as the thread-state tools do.
 
 ### Testing without a provider
@@ -367,18 +405,29 @@ It does no advanced semantic compression; that belongs to cognition.
 
 ## Thread-state tools
 
-`ThreadStateToolsProvider` registers `thread_state_get`, `thread_state_put` and
-`thread_state_delete` over a `ThreadStateStore` (`LanceDbThreadStateStore`).
+`ThreadStateToolsProvider::new(store, src_ilk)` registers `thread_state_get`, `thread_state_put`
+and `thread_state_delete` over a `ThreadStateStore` (`LanceDbThreadStateStore`), bound to one record:
+the sender's. ai.generic builds it with the message's `src_ilk`. The frontdesk's tools are its own
+(agent-tools-v1 T10): it registers `ThreadStateGetTool` and `ThreadStatePutTool` alone, because a
+registered case ends saved as `completed` and is never deleted by the model.
 
-- **The key is `state_key`.** A call that passes the legacy `thread_id` argument is refused.
-- **In a scoped runtime the key is fixed.** ai.generic builds the provider with
-  `with_get_put_delete_scoped(store, src_ilk)`, so its tools always read and write the sender's
-  state, whatever key the model passes.
+- **The tools always read and write that record,** whatever key the model passes: the model never
+  reaches another person's state. The input still asks for a non-empty `state_key`, and a call
+  that passes the legacy `thread_id` argument is refused.
+- **A put replaces the whole record.** `ttl_seconds` is stored with it, but nothing expires it.
+- **Their cards** are the first three of [the tool catalog](../../docs/reference/agent-tools.md).
 
 ## Writing an AI node
 
 - **Implement `AiNode`:** `on_message(&self, msg) -> Result<Option<Message>>`. Return the reply built
   with `build_reply_message_runtime_src(&msg, payload)`; the runtime fills in `routing.src`.
+- **Its control plane:** `control_request(&msg, node_name, verbs)` says whether to run a control
+  verb (`ControlRequest::Run`), refuse it (`Refuse`, with the reason) or leave the message to the
+  node (`Other`). A verb runs only as the router's authority gate delivers it, a `system` message
+  with the verb in its own case, and only from the node that sends it today
+  (`control_caller_authorized`): `CONFIG_GET` and `CONFIG_SET` from SY.admin@motherbee,
+  `NODE_STATUS_GET` and `NODE_HELP` from the orchestrator of the node's hive, `PING` and `STATUS`
+  from either. ai.generic and the frontdesk answer a refusal with `unauthorized`.
 - **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:

@@ -11,15 +11,17 @@ use async_trait::async_trait;
 use base64::Engine;
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
-    build_output_schema_fallback_instruction, build_reply_message_runtime_src,
+    build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
     create_function_calling_model, create_llm_client, extract_text,
     resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
-    AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
-    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
-    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig,
-    TenantSource, ThreadStateStore, ThreadStateToolsProvider, ToolRunWatch, UsageRecorder,
+    AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact,
+    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
+    FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider, FunctionToolRegistry,
+    HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
+    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
+    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
+    MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -28,11 +30,14 @@ use fluxbee_sdk::managed_control_plane::{
     ManagedControlPlaneState, ManagedNodeConfigContract, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
 };
-use fluxbee_sdk::protocol::{MemoryPackage, Meta};
+use fluxbee_sdk::protocol::{
+    MemoryPackage, Meta, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP,
+    MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
+};
 use fluxbee_sdk::{
-    managed_node_instance_dir, managed_node_name, AdminCommandRequest, NodeConfig, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned,
-    VaultClient,
+    managed_node_config_path_with_root, managed_node_instance_dir, managed_node_name,
+    AdminCommandRequest, NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch,
+    RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,8 +45,6 @@ use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tracing_subscriber::EnvFilter;
 
-const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
-const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
@@ -108,12 +111,6 @@ struct CognitiveDefinitionSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct BehaviorCapabilities {
-    #[serde(default)]
-    multimodal: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RunnerModelSettings {
     #[serde(default)]
     temperature: Option<f32>,
@@ -160,10 +157,17 @@ struct EffectiveBehaviorSection {
     model: Option<String>,
     #[serde(default)]
     model_settings: Option<RunnerModelSettings>,
+    /// The node's AI provider (agent-tools-v1 T8): its API, and the vault resource its key is
+    /// read by. Without it, the hive's `ai.default_provider` at each request.
+    #[serde(default)]
+    provider: Option<AiProvider>,
+    /// The URL requests are posted to: one of `provider`'s, which it needs
+    /// (`validate_managed_base_url`).
     #[serde(default)]
     base_url: Option<String>,
+    /// Whether the model receives images and documents (true by default).
     #[serde(default)]
-    capabilities: Option<BehaviorCapabilities>,
+    multimodal: Option<bool>,
 }
 
 /// The `runtime` the node reads. Timeouts, worker pool and queue are the AI runtime's own
@@ -230,6 +234,8 @@ enum NodeBehavior {
 struct AiChatRuntime {
     model: String,
     model_settings: ModelSettings,
+    /// `behavior.provider`; `None` follows the hive's (`effective_ai_provider`).
+    provider: Option<AiProvider>,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
     multimodal: bool,
@@ -275,6 +281,9 @@ struct GenericAiNode {
     usage: UsageRecorder,
     control_plane: Arc<RwLock<ControlPlaneState>>,
     cognitive_definition: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+    /// The runtime version the orchestrator launched it at (`launched_runtime_version`), which it
+    /// names in its `NODE_HELP` answer. `None` for a node started by hand.
+    runtime_version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -299,6 +308,9 @@ struct GenerateHtmlArtifactTool;
 /// because publishing is tenant-scoped by the producer's router-stamped identity (admin-side).
 struct PublishHtmlTool {
     vault: VaultClient,
+    /// The blob store the page is written to before SY.admin publishes it: the node's own
+    /// (`BlobConfig::default()`).
+    blob: fluxbee_sdk::blob::BlobConfig,
 }
 
 #[derive(Clone)]
@@ -895,7 +907,7 @@ impl GenericAiNode {
         meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let credential = self
-            .resolve_ai_credential()
+            .resolve_ai_credential(ai)
             .await
             .map_err(fluxbee_ai_sdk::errors::AiSdkError::Protocol)?;
         let account = self.usage_account(ctx);
@@ -955,13 +967,7 @@ impl GenericAiNode {
                 .run_with_input(&watched, &tool_registry, run_input)
                 .await?;
             if let Some(output) = extract_final_output_from_tool_results(&result)? {
-                tracing::info!(
-                    node_name = %self.node_name,
-                    thread_id = ?ctx.thread_id,
-                    src_ilk = ?ctx.src_ilk,
-                    output_summary = %summarize_behavior_output(&output),
-                    "tool run produced explicit final_output with user-facing artifacts"
-                );
+                self.log_final_output(ctx, &output);
                 let summary_text = summarize_behavior_output(&output);
                 self.persist_immediate_turn(ai, ctx, user_text, &summary_text)
                     .await;
@@ -986,6 +992,31 @@ impl GenericAiNode {
         self.persist_immediate_turn(ai, ctx, user_text, &response.content)
             .await;
         Ok(AiBehaviorOutput::text(response.content))
+    }
+
+    /// The journal's line for a reply a tool made: the names of its files and the length of its
+    /// text, never the text. The text can carry the link of a page `publish_html_page` published,
+    /// and the link is the key to the page (FINDINGS A-95).
+    fn log_final_output(&self, ctx: &BehaviorContext, output: &AiBehaviorOutput) {
+        let (artifact_filenames, text_len) = match output {
+            AiBehaviorOutput::Text(text) => (Vec::new(), text.len()),
+            AiBehaviorOutput::Final(final_output) => (
+                final_output
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.filename.as_str())
+                    .collect::<Vec<_>>(),
+                final_output.text.as_deref().map_or(0, str::len),
+            ),
+        };
+        tracing::info!(
+            node_name = %self.node_name,
+            thread_id = ?ctx.thread_id,
+            src_ilk = ?ctx.src_ilk,
+            artifact_filenames = ?artifact_filenames,
+            text_len,
+            "tool run produced explicit final_output with user-facing artifacts"
+        );
     }
 
     /// Its own tenant pays for its calls (docs/router-stream-v1.md §7.3); the root tenant, as
@@ -1195,15 +1226,12 @@ impl GenericAiNode {
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
     ) -> fluxbee_ai_sdk::Result<()> {
-        // Thread state tools remain the source for node-level "hard state".
-        // In scoped AI runtimes the canonical key is src_ilk; thread_id is
-        // conversational metadata only.
+        // Every base tool there is (`base_tool_cards`, the catalog), each when its card's
+        // `present_when` holds. The state tools keep the sender's "hard state": bound to its
+        // src_ilk, never to a key the model names (thread_id is conversational metadata only).
         // Immediate memory is managed separately by the runner as short-horizon context.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
-            let provider = ThreadStateToolsProvider::with_get_put_delete_scoped(
-                store.clone(),
-                src_ilk.clone(),
-            );
+            let provider = ThreadStateToolsProvider::new(store.clone(), src_ilk.clone());
             provider.register_tools(registry)?;
         }
         registry.register(Arc::new(GenerateCsvArtifactTool))?;
@@ -1223,22 +1251,26 @@ impl GenericAiNode {
         if let Some(vault) = self.vault.as_ref() {
             registry.register(Arc::new(PublishHtmlTool {
                 vault: vault.clone(),
+                blob: fluxbee_sdk::blob::BlobConfig::default(),
             }))?;
         }
         Ok(())
     }
 
     /// The AI key comes from SY.vault by resource type, like every other AI consumer: the
-    /// provider is the hive's (hive.yaml `ai`, OpenAI when absent) and the key is one this node
-    /// owns, one assigned to it, or its tenant's general one (docs/ilk-tenant-model-v1.md §2.2).
-    /// The root tenant's keys are the core's. Nodes do not name a Vault key.
-    async fn resolve_ai_credential(&self) -> std::result::Result<ResolvedAiCredential, String> {
+    /// node's provider's (`effective_ai_provider`), and only in its tenant: one this node owns,
+    /// one assigned to it, or its tenant's general one (docs/ilk-tenant-model-v1.md §2.2). The
+    /// root tenant's keys are the core's. Nodes do not name a Vault key.
+    async fn resolve_ai_credential(
+        &self,
+        ai: &AiChatRuntime,
+    ) -> std::result::Result<ResolvedAiCredential, String> {
         let Some(vault) = self.vault.as_ref() else {
             return Err(
                 "missing AI api key: no vault client (the node has no self ILK)".to_string(),
             );
         };
-        let provider = hive_ai_provider(&self.config_dir)?;
+        let (provider, _) = effective_ai_provider(ai, &self.config_dir)?;
         let tenant = self
             .self_tenant_id
             .as_deref()
@@ -1260,42 +1292,90 @@ impl GenericAiNode {
         }
     }
 
+    /// A control verb runs only as the router's authority gate delivers it, from the node that
+    /// sends it (`control_request`): SY.admin@motherbee for the config, this hive's orchestrator for
+    /// the status and the help. Anything else that names a verb is refused with `unauthorized`.
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
-        let (response_msg, response_payload) = if command.eq_ignore_ascii_case(MSG_NODE_STATUS_GET)
-        {
-            (
-                MSG_NODE_STATUS_GET_RESPONSE,
-                self.build_node_status_get_response().await,
-            )
-        } else if command.eq_ignore_ascii_case("CONFIG_SET") {
-            ("CONFIG_RESPONSE", self.apply_config_set(&msg).await)
-        } else if command.eq_ignore_ascii_case("CONFIG_GET") {
-            ("CONFIG_RESPONSE", self.build_config_get_response().await)
-        } else if command.eq_ignore_ascii_case("PING") {
-            ("PONG", self.build_ping_response().await)
-        } else if command.eq_ignore_ascii_case("STATUS") {
-            ("STATUS_RESPONSE", self.build_status_response().await)
-        } else {
-            let state = self.control_plane.read().await.current_state;
-            (
-                "CONFIG_RESPONSE",
-                self.error_response(
-                    "unknown_system_msg",
-                    format!("Unsupported control-plane command: {command}"),
-                    1,
-                    0,
-                    state.as_str(),
+        let (response_msg, response_payload) =
+            match control_request(&msg, &self.node_name, &CONTROL_VERBS) {
+                ControlRequest::Run(MSG_NODE_STATUS_GET) => (
+                    MSG_NODE_STATUS_GET_RESPONSE,
+                    self.build_node_status_get_response().await,
                 ),
-            )
-        };
+                ControlRequest::Run(MSG_NODE_HELP) => {
+                    (MSG_NODE_HELP_RESPONSE, self.build_node_help_response())
+                }
+                ControlRequest::Run(MSG_CONFIG_SET) => {
+                    (MSG_CONFIG_RESPONSE, self.apply_config_set(&msg).await)
+                }
+                ControlRequest::Run(MSG_CONFIG_GET) => {
+                    (MSG_CONFIG_RESPONSE, self.build_config_get_response().await)
+                }
+                ControlRequest::Run(MSG_PING) => ("PONG", self.build_ping_response().await),
+                ControlRequest::Run(MSG_STATUS) => {
+                    ("STATUS_RESPONSE", self.build_status_response().await)
+                }
+                ControlRequest::Refuse { verb, reason } => {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        trace_id = %msg.routing.trace_id,
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        msg_type = %msg.meta.msg_type,
+                        msg = %command,
+                        reason = %reason,
+                        "control request refused (unauthorized)"
+                    );
+                    self.refused_control_response(verb, reason).await
+                }
+                ControlRequest::Run(_) | ControlRequest::Other => {
+                    let state = self.control_plane.read().await.current_state;
+                    (
+                        MSG_CONFIG_RESPONSE,
+                        self.error_response(
+                            "unknown_system_msg",
+                            format!("Unsupported control-plane command: {command}"),
+                            1,
+                            0,
+                            state.as_str(),
+                        ),
+                    )
+                }
+            };
         Ok(Some(build_control_plane_response(
             &msg,
             response_msg,
             response_payload,
         )))
+    }
+
+    /// The answer to a control request the node refuses: the response its verb names, so the
+    /// sender does not wait out its timeout, with the error code `unauthorized` in that response's
+    /// own shape.
+    async fn refused_control_response(&self, verb: &str, reason: String) -> (&'static str, Value) {
+        let response_msg = match verb {
+            MSG_NODE_STATUS_GET => MSG_NODE_STATUS_GET_RESPONSE,
+            MSG_NODE_HELP => MSG_NODE_HELP_RESPONSE,
+            MSG_PING => "PONG",
+            MSG_STATUS => "STATUS_RESPONSE",
+            _ => MSG_CONFIG_RESPONSE,
+        };
+        if response_msg != MSG_CONFIG_RESPONSE {
+            let refusal =
+                json!({"status": "error", "error_code": "unauthorized", "message": reason});
+            return (response_msg, refusal);
+        }
+        let state = self.control_plane.read().await;
+        let refusal = self.error_response(
+            "unauthorized",
+            reason,
+            state.schema_version,
+            state.config_version,
+            state.current_state.as_str(),
+        );
+        (response_msg, refusal)
     }
 
     async fn apply_config_set(&self, msg: &Message) -> Value {
@@ -1410,7 +1490,7 @@ impl GenericAiNode {
                 Some(schema_version),
                 Some(config_version),
                 format!(
-                    "Invalid payload.config: field '{field}' is not accepted by ai.generic; load OpenAI credentials through SY.vault with resource_type=openai"
+                    "Invalid payload.config: field '{field}' is not accepted by ai.generic; load the provider's key into SY.vault with resource_type openai or anthropic"
                 ),
             );
         }
@@ -1620,6 +1700,14 @@ impl GenericAiNode {
         } else {
             json!({"code":"node_not_configured","message":"No effective config available"})
         };
+        // The provider in effect: the node's own, or the hive's as hive.yaml says now.
+        let ai_provider = match self.behavior.read().await.as_ref() {
+            Some(NodeBehavior::AiChat(ai)) => match effective_ai_provider(ai, &self.config_dir) {
+                Ok((provider, source)) => json!({"name": provider.as_str(), "source": source}),
+                Err(err) => json!({"name": Value::Null, "source": "hive", "error": err}),
+            },
+            _ => Value::Null,
+        };
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
@@ -1627,6 +1715,7 @@ impl GenericAiNode {
             "state": state.current_state.as_str(),
             "config_source": config_source,
             "api_key_source": api_key_source.as_str(),
+            "ai_provider": ai_provider,
             "schema_version": state.schema_version,
             "config_version": state.config_version,
             "contract": {
@@ -1643,12 +1732,16 @@ impl GenericAiNode {
                     },
                     "config.behavior.model": {
                         "examples": ["gpt-5.5", "claude-sonnet-5-5"]
+                    },
+                    "config.behavior.provider": {
+                        "allowed": ["openai", "anthropic"]
                     }
                 },
                 "optional_fields": [
                     "config.behavior.model_settings",
+                    "config.behavior.provider",
                     "config.behavior.base_url",
-                    "config.behavior.capabilities.multimodal",
+                    "config.behavior.multimodal",
                     "config.runtime.immediate_memory",
                     "config.runtime.cognitive_definition"
                 ],
@@ -1663,10 +1756,12 @@ impl GenericAiNode {
                 ],
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
-                    "AI credentials are not config: the provider is the hive's (hive.yaml ai, OpenAI by default) and its key is read from SY.vault by resource_type openai|anthropic on each request: one this node owns, one assigned to it, or its tenant's general one.",
+                    "The AI provider is config.behavior.provider (openai or anthropic), or the hive's when it is absent (hive.yaml ai.default_provider, OpenAI without an ai section); ai_provider shows the one in effect.",
+                    "AI credentials are not config: the provider's key is read from SY.vault by resource_type openai|anthropic on each request, only in the node's tenant: one this node owns, one assigned to it, or its tenant's general one.",
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
-                    "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
+                    "config.behavior.base_url needs config.behavior.provider, and it must be https on that provider's host (api.openai.com or api.anthropic.com).",
+                    "ai.generic defaults behavior.multimodal=true unless explicitly overridden; behavior.capabilities is refused (it became behavior.multimodal).",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
                     "The prompt is the agent ILK's definition; while it has none (no hashes, no asset loaded, ILK not found) the model runs a fixed unconfigured prompt.",
                     "config.runtime.immediate_memory (enabled, recent_interactions_max, summary_max_chars) applies with CONFIG_SET; config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start."
@@ -1716,6 +1811,20 @@ impl GenericAiNode {
     async fn build_node_status_get_response(&self) -> Value {
         let state = self.control_plane.read().await;
         build_node_status_response_payload(state.current_state, state.last_error.as_ref())
+    }
+
+    /// `NODE_HELP` (docs/agent-tools-v1.md §3.3): the node describes itself with its runtime's
+    /// tool catalog, the cards of every base tool; each card's `present_when` says when a message
+    /// gets that tool. Answered in any lifecycle state, like `NODE_STATUS_GET`.
+    fn build_node_help_response(&self) -> Value {
+        let catalog = tool_catalog(self.runtime_version.as_deref());
+        json!({
+            "status": "ok",
+            "node_name": self.node_name.as_str(),
+            "runtime": catalog.runtime,
+            "runtime_version": catalog.runtime_version,
+            "tools": catalog.tools,
+        })
     }
 }
 
@@ -2807,15 +2916,42 @@ fn summarize_behavior_output(output: &AiBehaviorOutput) -> String {
     }
 }
 
+/// One CSV row: every cell quoted, with its quotes doubled, after `csv_cell`.
 fn csv_line(cells: &[String]) -> String {
     cells
         .iter()
         .map(|cell| {
-            let escaped = cell.replace('"', "\"\"");
+            let escaped = csv_cell(cell).replace('"', "\"\"");
             format!("\"{escaped}\"")
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// A cell as the CSV file holds it. Excel and LibreOffice run a cell that starts with `=`, `+`, `-`
+/// or `@` as a formula, quoted or not, so it gets a `'` in front (OWASP, CSV injection): a cell
+/// that starts with `=`, `+`, `@`, a tab or a carriage return, and one that starts with `-` unless
+/// it is a plain number.
+fn csv_cell(cell: &str) -> std::borrow::Cow<'_, str> {
+    let starts_a_formula = match cell.chars().next() {
+        Some('=' | '+' | '@' | '\t' | '\r') => true,
+        Some('-') => !is_plain_negative_number(cell),
+        _ => false,
+    };
+    if starts_a_formula {
+        std::borrow::Cow::Owned(format!("'{cell}"))
+    } else {
+        std::borrow::Cow::Borrowed(cell)
+    }
+}
+
+/// `-` and digits, with a `.` or a `,` between digits: `-12`, `-12.5`, `-1.234,56`.
+fn is_plain_negative_number(cell: &str) -> bool {
+    cell.strip_prefix('-').is_some_and(|digits| {
+        digits
+            .split(['.', ','])
+            .all(|group| !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_digit()))
+    })
 }
 
 fn default_true() -> bool {
@@ -3347,49 +3483,242 @@ fn build_raster_bytes(
     Ok(cursor.into_inner())
 }
 
-#[async_trait]
-impl FunctionTool for GenerateCsvArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_csv_artifact".to_string(),
-            description: "Generate a CSV file as a final user-facing artifact from tabular rows."
-                .to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "headers": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "rows": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "items": { "type": "string" }
+/// The card of every base tool of the runtime, in the order `register_common_tools` registers
+/// them: the tool catalog (docs/agent-tools-v1.md §3), which `NODE_HELP` answers and
+/// docs/reference/agent-tools.{json,md} hold (the test `the_tool_catalog_matches_the_cards`).
+fn base_tool_cards() -> Vec<ToolCard> {
+    vec![
+        ThreadStateGetTool::card(),
+        ThreadStatePutTool::card(),
+        ThreadStateDeleteTool::card(),
+        GenerateCsvArtifactTool::card(),
+        GenerateTextArtifactTool::card(),
+        GenerateJsonArtifactTool::card(),
+        GenerateMarkdownArtifactTool::card(),
+        GenerateHtmlArtifactTool::card(),
+        GeneratePdfArtifactTool::card(),
+        GenerateXlsxArtifactTool::card(),
+        GenerateDocxArtifactTool::card(),
+        GeneratePngArtifactTool::card(),
+        GenerateJpegArtifactTool::card(),
+        PublishHtmlTool::card(),
+    ]
+}
+
+/// The runtime's tool catalog, which `NODE_HELP` answers with the node's runtime version. The
+/// repository keeps it, without a version, as docs/reference/agent-tools.{json,md}, and the
+/// package ships the JSON next to the runtime with the version it ships
+/// (`dist/runtimes/ai.generic/<version>/tools.json`).
+fn tool_catalog(runtime_version: Option<&str>) -> ToolCatalog {
+    ToolCatalog {
+        runtime: AI_RUNTIME_KIND.to_string(),
+        runtime_version: runtime_version.map(str::to_string),
+        tools: base_tool_cards(),
+    }
+}
+
+/// What sets one file generator's card apart; `artifact_tool_card` adds what they all share.
+struct ArtifactToolSpec {
+    name: &'static str,
+    summary: &'static str,
+    when_to_use: &'static str,
+    /// What its file can and cannot hold.
+    limits: &'static [&'static str],
+    /// The filename endings its type takes, as the card says them (".md or .markdown").
+    extensions: &'static str,
+    mime: &'static str,
+    /// Its own arguments as JSON schema properties: `filename` and `text` are every generator's.
+    properties: Value,
+    /// Its own required arguments, besides `filename`.
+    required: &'static [&'static str],
+}
+
+/// What every file generator's card says, once and in one limit: the user gets the last file
+/// made, with that call's `text` as the reply (`extract_final_output_from_tool_results`; the
+/// model's own words after the call are dropped), and the file's bytes come back to the model in
+/// the result. The rules of `filename` and `text` are in their input descriptions, which do not
+/// count against the description's limit (`TOOL_DESCRIPTION_MAX_CHARS`).
+const ARTIFACT_TOOL_LIMIT: &str = "The file goes out with this call's `text` as your reply: what \
+    you write after the call is not sent. One file per reply: if several calls make files, only \
+    the last is sent. The file's bytes come back to you base64-encoded, so a large file fills \
+    your context.";
+
+/// The rules of a `filename`, which `AiUserArtifact` checks, for a file whose name ends in
+/// `extensions`.
+fn filename_rules(extensions: &str) -> String {
+    format!(
+        "it ends in {extensions}, with at most 128 bytes and no `/`, `\\`, `..` or control \
+         character"
+    )
+}
+
+fn artifact_tool_card(spec: ArtifactToolSpec) -> ToolCard {
+    let ArtifactToolSpec {
+        name,
+        summary,
+        when_to_use,
+        limits,
+        extensions,
+        mime,
+        mut properties,
+        required,
+    } = spec;
+    properties["filename"] = json!({
+        "type": "string",
+        "minLength": 1,
+        "description": format!("The file's name, as the user sees it: {}.", filename_rules(extensions))
+    });
+    properties["text"] = json!({
+        "type": "string",
+        "description": "Your reply, which the user reads with the file. Without it, a fixed line \
+            in Spanish naming the file."
+    });
+    let required: Vec<&str> = std::iter::once("filename")
+        .chain(required.iter().copied())
+        .collect();
+    let mut all_limits: Vec<String> = limits.iter().map(|limit| limit.to_string()).collect();
+    all_limits.push(ARTIFACT_TOOL_LIMIT.to_string());
+    ToolCard {
+        name: name.to_string(),
+        summary: summary.to_string(),
+        when_to_use: when_to_use.to_string(),
+        limits: all_limits,
+        present_when: "always".to_string(),
+        input: json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        }),
+        output: json!({
+            "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, \
+                bytes_base64}]}}`: the file and the reply's text.",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": { "const": "ok" },
+                        "final_output": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "description": "The reply's text." },
+                                "artifacts": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "filename": { "type": "string" },
+                                            "mime": { "const": mime },
+                                            "bytes_base64": {
+                                                "type": "string",
+                                                "description": "The file, base64-encoded."
+                                            }
+                                        },
+                                        "required": ["filename", "mime", "bytes_base64"]
+                                    }
+                                }
+                            },
+                            "required": ["text", "artifacts"]
                         }
                     },
-                    "text": { "type": "string" }
+                    "required": ["status", "final_output"]
                 },
-                "required": ["filename", "rows"],
-                "additionalProperties": false
-            }),
+                tool_error_output(&["artifact_filename_invalid"])
+            ]
+        }),
+        errors: vec![ToolErrorCode::new(
+            "artifact_filename_invalid",
+            format!(
+                "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control \
+                 character, or does not end in {extensions}. No file was made."
+            ),
+        )],
+    }
+}
+
+/// The `{status: "error"}` result of a tool whose failures carry these codes.
+fn tool_error_output(codes: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": { "const": "error" },
+            "error_code": { "enum": codes },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" }
+        },
+        "required": ["status", "error_code", "message", "retryable"]
+    })
+}
+
+/// A JSON schema for a list of table rows, each a list of cells.
+fn rows_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "array", "items": { "type": "string" } },
+        "description": description
+    })
+}
+
+fn strings_schema(description: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "string" }, "description": description })
+}
+
+/// The arguments of the two raster generators.
+fn raster_properties() -> Value {
+    json!({
+        "bands": strings_schema("One horizontal band per entry, top to bottom."),
+        "width": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 2400,
+            "description": "Pixels; 1200 by default."
+        },
+        "height": {
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 2400,
+            "description": "Pixels; 800 by default."
         }
+    })
+}
+
+/// What the PNG and JPEG generators can draw.
+const RASTER_TOOL_LIMITS: &[&str] = &[
+    "It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each \
+     entry's text picks its color and is not drawn. Without `bands`, one color fills the image.",
+    "1200 x 800 pixels by default; `width` and `height` are kept between 64 and 2400.",
+];
+
+#[async_trait]
+impl AgentTool for GenerateCsvArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_csv_artifact",
+            summary: "Make a CSV file from rows of text and send it to the user.",
+            when_to_use: "When the user wants a table as a file, to open in a spreadsheet or \
+                another program.",
+            limits: &[
+                "Every cell is written quoted. A cell that starts with `=`, `+`, `@`, a tab or a \
+                 carriage return, or with `-` and is not a plain number such as `-12.5`, gets a \
+                 `'` in front, so a spreadsheet takes it as text, never as a formula.",
+                "`headers`, when given, is the first row.",
+            ],
+            extensions: ".csv",
+            mime: "text/csv",
+            properties: json!({
+                "headers": strings_schema("The first row."),
+                "rows": rows_schema("The rows, each a list of cells.")
+            }),
+            required: &["rows"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
         let args: GenerateCsvArtifactArgs = serde_json::from_value(arguments)
             .map_err(|err| invalid_tool_args_error("generate_csv_artifact", err))?;
-
         let filename = args.filename.trim();
-        if filename.is_empty() {
-            return Ok(json!({
-                "status": "error",
-                "error_code": "invalid_filename",
-                "message": "filename is required",
-                "retryable": false
-            }));
-        }
 
         let mut lines = Vec::new();
         if let Some(headers) = args.headers.as_ref().filter(|headers| !headers.is_empty()) {
@@ -3425,22 +3754,21 @@ impl FunctionTool for GenerateCsvArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateTextArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_text_artifact".to_string(),
-            description: "Generate a plain text file as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "content": { "type": "string" },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename", "content"],
-                "additionalProperties": false
+impl AgentTool for GenerateTextArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_text_artifact",
+            summary: "Make a plain-text file and send it to the user.",
+            when_to_use: "When the user wants text as a file rather than in the message: notes, \
+                a log, a long answer to keep.",
+            limits: &[],
+            extensions: ".txt",
+            mime: "text/plain",
+            properties: json!({
+                "content": { "type": "string", "description": "The file's text." }
             }),
-        }
+            required: &["content"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3461,23 +3789,24 @@ impl FunctionTool for GenerateTextArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateJsonArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_json_artifact".to_string(),
-            description: "Generate a JSON file as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "data": {},
-                    "pretty": { "type": "boolean" },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename", "data"],
-                "additionalProperties": false
+impl AgentTool for GenerateJsonArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_json_artifact",
+            summary: "Make a JSON file and send it to the user.",
+            when_to_use: "When the user wants structured data as a file, for a program to read.",
+            limits: &[],
+            extensions: ".json",
+            mime: "application/json",
+            properties: json!({
+                "data": { "description": "Any JSON value: it is the file's content." },
+                "pretty": {
+                    "type": "boolean",
+                    "description": "Indent the file; true by default."
+                }
             }),
-        }
+            required: &["data"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3503,22 +3832,20 @@ impl FunctionTool for GenerateJsonArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateMarkdownArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_markdown_artifact".to_string(),
-            description: "Generate a Markdown file as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "content": { "type": "string" },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename", "content"],
-                "additionalProperties": false
+impl AgentTool for GenerateMarkdownArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_markdown_artifact",
+            summary: "Make a Markdown file and send it to the user.",
+            when_to_use: "When the user wants formatted text (headings, lists, tables) as a file.",
+            limits: &[],
+            extensions: ".md or .markdown",
+            mime: "text/markdown",
+            properties: json!({
+                "content": { "type": "string", "description": "The file's Markdown." }
             }),
-        }
+            required: &["content"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3544,22 +3871,21 @@ impl FunctionTool for GenerateMarkdownArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateHtmlArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_html_artifact".to_string(),
-            description: "Generate an HTML file as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "content": { "type": "string" },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename", "content"],
-                "additionalProperties": false
+impl AgentTool for GenerateHtmlArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_html_artifact",
+            summary: "Make an HTML file and send it to the user.",
+            when_to_use: "When the user wants a page as a file, to open in a browser. For a link \
+                to a page instead, use `publish_html_page` when you have it.",
+            limits: &["It is a file, not a link: the user opens it from the attachment."],
+            extensions: ".html or .htm",
+            mime: "text/html",
+            properties: json!({
+                "content": { "type": "string", "description": "The whole HTML document." }
             }),
-        }
+            required: &["content"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3591,27 +3917,86 @@ fn publish_tool_error(message: &str, retryable: bool) -> Value {
 }
 
 #[async_trait]
-impl FunctionTool for PublishHtmlTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
+impl AgentTool for PublishHtmlTool {
+    /// The link's life and the sandbox are SY.admin's and the edge's: `publish_artifact` without
+    /// `expires_in_secs` (PUBLICATION_DEFAULT_EXPIRES_SECS, 24 h) and the edge's
+    /// `sandboxed-html-v1` CSP.
+    fn card() -> ToolCard {
+        ToolCard {
             name: "publish_html_page".to_string(),
-            description: "Publish a self-contained HTML page as a public, read-only URL and \
-                return the link. Use ONLY when the user explicitly asks to publish or share a \
-                page publicly. The HTML must be self-contained (no external network); the \
-                returned URL is a capability link you should give back to the user."
+            summary: "Publish an HTML page at a public link, and get the link.".to_string(),
+            when_to_use: "Only when the user asks for a page to open or share by link. To hand \
+                over a file instead, use `generate_html_artifact`."
                 .to_string(),
-            parameters_json_schema: json!({
+            limits: [
+                "One self-contained HTML file, served under a sandbox: its inline scripts and \
+                 styles run, but it loads nothing from the network (no fetch, no outside \
+                 scripts, stylesheets, fonts or images); images and fonts only inline, as \
+                 `data:` URLs; forms do not submit.",
+                "The link is the key: anyone who has it can open the page, so put nothing \
+                 private in it. It expires 24 hours after publishing, and you cannot extend it \
+                 or take the page down earlier.",
+                "Publishing takes up to two minutes. Give the link in your reply; if a \
+                 `generate_*_artifact` call also makes a file for the same reply, only that \
+                 call's `text` is sent, so put the link there.",
+            ]
+            .map(String::from)
+            .into(),
+            present_when: "the node has its identity: it was launched with its ILK".to_string(),
+            input: json!({
                 "type": "object",
                 "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
+                    "filename": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!(
+                            "The page's file name: {}.",
+                            filename_rules(".html or .htm")
+                        )
+                    },
                     "content": {
                         "type": "string",
-                        "description": "the full self-contained HTML document"
+                        "description": "The whole HTML document, self-contained."
                     }
                 },
                 "required": ["filename", "content"],
                 "additionalProperties": false
             }),
+            output: json!({
+                "description": "`{status: \"ok\", url, publication_id, expires_at}`: the public \
+                    link, the publication's id and when it expires (Unix seconds).",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "status": { "const": "ok" },
+                            "url": { "type": "string", "description": "The public link." },
+                            "publication_id": { "type": "string" },
+                            "expires_at": {
+                                "type": "integer",
+                                "description": "Unix seconds."
+                            },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["status", "url"]
+                    },
+                    tool_error_output(&["artifact_filename_invalid", "publish_failed"])
+                ]
+            }),
+            errors: vec![
+                ToolErrorCode::new(
+                    "artifact_filename_invalid",
+                    "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a \
+                     control character, or does not end in .html or .htm. Nothing was published.",
+                ),
+                ToolErrorCode::new(
+                    "publish_failed",
+                    "The page was not published; `message` says why. `retryable: true` when this \
+                     node's blob store or SY.admin could not be reached; `false` when SY.admin \
+                     refused it (the message carries its code, such as BLOB_TOO_LARGE) or the \
+                     hive has no public address for links.",
+                ),
+            ],
         }
     }
 
@@ -3627,9 +4012,7 @@ impl FunctionTool for PublishHtmlTool {
         // Write bytes into the local blob store (staging -> active), mirroring
         // materialize_user_artifacts exactly so there is no divergence. Backend errors can carry
         // filesystem paths, so they are LOGGED, never handed to the model — it gets a coarse reason.
-        let blob = match fluxbee_sdk::blob::BlobToolkit::new(
-            fluxbee_sdk::blob::BlobConfig::default(),
-        ) {
+        let blob = match fluxbee_sdk::blob::BlobToolkit::new(self.blob.clone()) {
             Ok(blob) => blob,
             Err(err) => {
                 tracing::warn!(tool = "publish_html_page", error = %err, "blob store unavailable");
@@ -3699,7 +4082,19 @@ impl FunctionTool for PublishHtmlTool {
                         false,
                     ));
                 };
-                tracing::info!(tool = "publish_html_page", url = %url, "published HTML page");
+                // The link is the key to the page: the journal gets its id, never the link (A-95).
+                let publication_id = result
+                    .payload
+                    .get("publication_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let expires_at = result.payload.get("expires_at").and_then(Value::as_u64);
+                tracing::info!(
+                    tool = "publish_html_page",
+                    publication_id,
+                    expires_at,
+                    "published HTML page"
+                );
                 Ok(json!({
                     "status": "ok",
                     "url": url,
@@ -3734,26 +4129,33 @@ impl FunctionTool for PublishHtmlTool {
 }
 
 #[async_trait]
-impl FunctionTool for GeneratePdfArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_pdf_artifact".to_string(),
-            description: "Generate a PDF document as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "title": { "type": "string" },
-                    "lines": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "text": { "type": "string" }
+impl AgentTool for GeneratePdfArtifactTool {
+    /// What `build_pdf_bytes` makes: one Letter page of Helvetica 12 pt text, 14 pt apart from
+    /// 50 pt below the top, in the font's standard encoding.
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_pdf_artifact",
+            summary: "Make a one-page PDF of text lines and send it to the user.",
+            when_to_use: "When the user wants a short text document as a PDF.",
+            limits: &[
+                "One page (US Letter) of Helvetica 12 pt, the title first and then one line per \
+                 entry of `lines`. Lines do not wrap (about 90 characters fit) and nothing goes \
+                 past the page (about 50 lines fit). No images, tables or styles.",
+                "Only plain ASCII prints right: accented letters and other non-ASCII characters \
+                 come out garbled.",
+                "With no title and no lines, the page says \"Documento generado por AI\".",
+            ],
+            extensions: ".pdf",
+            mime: "application/pdf",
+            properties: json!({
+                "title": {
+                    "type": "string",
+                    "description": "The first line, followed by a blank one."
                 },
-                "required": ["filename"],
-                "additionalProperties": false
+                "lines": strings_schema("The page's lines, top to bottom.")
             }),
-        }
+            required: &[],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3775,34 +4177,28 @@ impl FunctionTool for GeneratePdfArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateXlsxArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_xlsx_artifact".to_string(),
-            description: "Generate an XLSX spreadsheet as a final user-facing artifact."
-                .to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "headers": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "rows": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "sheet_name": { "type": "string" },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename", "rows"],
-                "additionalProperties": false
+impl AgentTool for GenerateXlsxArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_xlsx_artifact",
+            summary: "Make an XLSX spreadsheet of text cells and send it to the user.",
+            when_to_use: "When the user wants a table as an Excel file.",
+            limits: &[
+                "One sheet, and every cell is text: numbers stay text, with no formulas or \
+                 formats. `headers`, when given, is the first row.",
+                "`sheet_name` loses `:`, `\\`, `/`, `?`, `*`, `[` and `]` and is cut at 31 \
+                 characters; it is Sheet1 without one.",
+                "With no headers and no rows, the sheet holds one cell: \"Generated by AI\".",
+            ],
+            extensions: ".xlsx",
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            properties: json!({
+                "headers": strings_schema("The first row."),
+                "rows": rows_schema("The rows, each a list of cells."),
+                "sheet_name": { "type": "string", "description": "Sheet1 by default." }
             }),
-        }
+            required: &["rows"],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3828,41 +4224,29 @@ impl FunctionTool for GenerateXlsxArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateDocxArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_docx_artifact".to_string(),
-            description: "Generate a DOCX document as a final user-facing artifact.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "title": { "type": "string" },
-                    "paragraphs": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "bullets": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "table_headers": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "table_rows": {
-                        "type": "array",
-                        "items": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename"],
-                "additionalProperties": false
+impl AgentTool for GenerateDocxArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_docx_artifact",
+            summary: "Make a DOCX document of plain paragraphs and send it to the user.",
+            when_to_use: "When the user wants a text document to edit in Word.",
+            limits: &[
+                "Plain text in a fixed order: the title, the paragraphs, the bullets, then one \
+                 table. No styles or headings: the title is a plain paragraph, and a bullet is a \
+                 paragraph that starts with \"- \".",
+                "With nothing to write, the document says \"Documento generado por AI\".",
+            ],
+            extensions: ".docx",
+            mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            properties: json!({
+                "title": { "type": "string", "description": "The first paragraph." },
+                "paragraphs": strings_schema("One paragraph per entry."),
+                "bullets": strings_schema("One \"- \" line per entry, after the paragraphs."),
+                "table_headers": strings_schema("The table's first row."),
+                "table_rows": rows_schema("The table's rows, each a list of cells.")
             }),
-        }
+            required: &[],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3888,27 +4272,19 @@ impl FunctionTool for GenerateDocxArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GeneratePngArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_png_artifact".to_string(),
-            description: "Generate a simple PNG raster artifact with colored bands.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "bands": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "width": { "type": "integer", "minimum": 64 },
-                    "height": { "type": "integer", "minimum": 64 },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename"],
-                "additionalProperties": false
-            }),
-        }
+impl AgentTool for GeneratePngArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_png_artifact",
+            summary: "Make a PNG image of colored horizontal bands and send it to the user.",
+            when_to_use: "Only when an image of colored bands will do, such as a placeholder: it \
+                cannot draw text, charts or pictures.",
+            limits: RASTER_TOOL_LIMITS,
+            extensions: ".png",
+            mime: "image/png",
+            properties: raster_properties(),
+            required: &[],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -3935,27 +4311,19 @@ impl FunctionTool for GeneratePngArtifactTool {
 }
 
 #[async_trait]
-impl FunctionTool for GenerateJpegArtifactTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "generate_jpeg_artifact".to_string(),
-            description: "Generate a simple JPEG raster artifact with colored bands.".to_string(),
-            parameters_json_schema: json!({
-                "type": "object",
-                "properties": {
-                    "filename": { "type": "string", "minLength": 1 },
-                    "bands": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "width": { "type": "integer", "minimum": 64 },
-                    "height": { "type": "integer", "minimum": 64 },
-                    "text": { "type": "string" }
-                },
-                "required": ["filename"],
-                "additionalProperties": false
-            }),
-        }
+impl AgentTool for GenerateJpegArtifactTool {
+    fn card() -> ToolCard {
+        artifact_tool_card(ArtifactToolSpec {
+            name: "generate_jpeg_artifact",
+            summary: "Make a JPEG image of colored horizontal bands and send it to the user.",
+            when_to_use: "Only when an image of colored bands will do, such as a placeholder: it \
+                cannot draw text, charts or pictures.",
+            limits: RASTER_TOOL_LIMITS,
+            extensions: ".jpg or .jpeg",
+            mime: "image/jpeg",
+            properties: raster_properties(),
+            required: &[],
+        })
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
@@ -4056,17 +4424,19 @@ impl ManagedNodeConfigContract for AiGenericContract {
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
             "behavior.model_settings",
+            "behavior.provider",
             "behavior.base_url",
-            "behavior.capabilities",
+            "behavior.multimodal",
             "runtime.immediate_memory",
             "runtime.cognitive_definition",
         ]
     }
     fn notes(&self) -> &'static [&'static str] {
         &[
-            "The OpenAI/Anthropic credential is NOT config: the node reads the hive AI provider's \
-             key from SY.vault by resource_type openai|anthropic (owned by it, assigned to it, or its \
-             tenant's general one).",
+            "The OpenAI/Anthropic credential is NOT config: the node reads its provider's key \
+             (behavior.provider, or the hive's without it) from SY.vault by resource_type \
+             openai|anthropic, in its tenant (owned by it, assigned to it, or its tenant's general \
+             one).",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
         ]
@@ -4116,10 +4486,155 @@ fn effective_cognitive_section(
         .unwrap_or_default()
 }
 
+/// The runtime version the node runs: `_system.runtime_version` of its config.json, which the
+/// orchestrator writes before it launches the node (and before it relaunches it at another
+/// version). `None` for a node started by hand.
+fn launched_runtime_version(node_name: &str, nodes_root: &Path) -> Option<String> {
+    let path = managed_node_config_path_with_root(node_name, nodes_root).ok()?;
+    let root: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    root.get("_system")?
+        .get("runtime_version")?
+        .as_str()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+}
+
+/// agent-tools-v1 T9 (FINDINGS A-94): `behavior.capabilities.multimodal` became
+/// `behavior.multimodal`, and the contract refuses the old key. A config.json written before that
+/// is rewritten once, here at boot, and the conversion is reported with the copy it kept.
+fn convert_persisted_multimodal_key(node_name: &str, nodes_root: &Path) {
+    let Ok(path) = managed_node_config_path_with_root(node_name, nodes_root) else {
+        return;
+    };
+    match convert_capabilities_multimodal(&path) {
+        Ok(Some(conversion)) => tracing::info!(
+            node_name = %node_name,
+            path = %path.display(),
+            capabilities = %conversion.capabilities,
+            original_copy = %conversion.original_copy.display(),
+            "config.json: behavior.capabilities converted to behavior.multimodal (agent-tools-v1 T9)"
+        ),
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            node_name = %node_name,
+            path = %path.display(),
+            error = %err,
+            "config.json: behavior.capabilities could not be converted to behavior.multimodal; the config is refused"
+        ),
+    }
+}
+
+/// What the T9 conversion did to a config.json: the `behavior.capabilities` it found, and where it
+/// kept the file as it was.
+#[derive(Debug, Clone, PartialEq)]
+struct MultimodalKeyConversion {
+    capabilities: Value,
+    original_copy: PathBuf,
+}
+
+/// Where the T9 conversion keeps a config.json as it found it, next to it: what a rollback to
+/// 0.1.85 restores (docs/ai-nodes-deploy-runbook.md).
+fn pre_conversion_copy_path(config_path: &Path) -> PathBuf {
+    let mut name = config_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".pre-0.1.86");
+    config_path.with_file_name(name)
+}
+
+/// Writes `content` as `path`, mode 0600, through a temp file beside it: created new, synced, then
+/// renamed over `path`. Once the temp file exists, any error removes it, so a failure leaves
+/// `path` as it was and nothing beside it.
+fn write_file_0600(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let written = file
+        .write_all(content)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Rewrites a config.json whose `behavior.capabilities` is the old shape, `{"multimodal": <bool
+/// or null>}` or `null`, as `behavior.multimodal` (absent when it said nothing). Before that it
+/// keeps the file as it was in `pre_conversion_copy_path` (0600), replacing an older copy, and it
+/// converts nothing when it cannot. Anything else under `capabilities`, or a value that meets a
+/// `behavior.multimodal` already there, is left as it is for the contract to refuse: nothing is
+/// dropped unseen.
+fn convert_capabilities_multimodal(
+    config_path: &Path,
+) -> Result<Option<MultimodalKeyConversion>, String> {
+    let raw = match fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot read it: {err}")),
+    };
+    // Not JSON: the control plane's bootstrap reports it.
+    let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    // The flat shape, or the one wrapped in `config` (`extract_effective_config`).
+    let behavior = if root.get("config").is_some() {
+        root.get_mut("config")
+            .and_then(|config| config.get_mut("behavior"))
+    } else {
+        root.get_mut("behavior")
+    };
+    let Some(behavior) = behavior.and_then(Value::as_object_mut) else {
+        return Ok(None);
+    };
+    let Some(capabilities) = behavior.get("capabilities").cloned() else {
+        return Ok(None);
+    };
+    let multimodal = match &capabilities {
+        // What the old runner saved for a behavior it did not default (an `echo` node): nothing.
+        Value::Null => Value::Null,
+        Value::Object(old) if old.keys().all(|key| key == "multimodal") => {
+            old.get("multimodal").cloned().unwrap_or(Value::Null)
+        }
+        _ => return Ok(None),
+    };
+    // A value to carry is a bool, and it does not meet a `multimodal` already there.
+    if !multimodal.is_null() && (!multimodal.is_boolean() || behavior.contains_key("multimodal")) {
+        return Ok(None);
+    }
+    behavior.remove("capabilities");
+    if multimodal.is_boolean() {
+        behavior.insert("multimodal".to_string(), multimodal);
+    }
+    let content = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    let original_copy = pre_conversion_copy_path(config_path);
+    write_file_0600(&original_copy, raw.as_bytes()).map_err(|err| {
+        format!(
+            "cannot keep it as it was in {}: {err}",
+            original_copy.display()
+        )
+    })?;
+    write_file_0600(config_path, content.as_bytes())
+        .map_err(|err| format!("cannot replace it: {err}"))?;
+    Ok(Some(MultimodalKeyConversion {
+        capabilities,
+        original_copy,
+    }))
+}
+
 async fn run_managed_node(
     node: NodeSection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
+    let nodes_root = Path::new(DEFAULT_MANAGED_NODES_ROOT);
+    convert_persisted_multimodal_key(&node_name, nodes_root);
+    let runtime_version = launched_runtime_version(&node_name, nodes_root);
     // Single-config control-plane: the node-dir config.json is the ONLY source of truth (SDK-owned,
     // WF model). No state/ai-nodes dynamic file, so a stale one can never shadow a fresh run_node.
     let contract = AiGenericContract {
@@ -4201,6 +4716,7 @@ async fn run_managed_node(
         usage,
         control_plane: Arc::new(RwLock::new(state)),
         cognitive_definition: cognitive_definition.clone(),
+        runtime_version,
     };
     spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
@@ -4341,20 +4857,37 @@ fn require_nonempty(
     Ok(())
 }
 
+/// The canonical API host of each provider: the only one a managed `behavior.base_url` may name.
+fn provider_api_host(provider: AiProvider) -> &'static str {
+    match provider {
+        AiProvider::OpenAi => "api.openai.com",
+        AiProvider::Anthropic => "api.anthropic.com",
+    }
+}
+
 /// Audit A1 (credential exfiltration): `behavior.base_url` arrives on the NON-secret
 /// CONFIG_SET plane but the vault-resolved provider api_key is then sent to it in the clear.
 /// An unvalidated base_url turns config-write access into plaintext key exfiltration and
 /// defeats Model D's plaintext confinement. A managed base_url may therefore ONLY be https
-/// pointing at a provider's canonical API host. An operator can deliberately relax this for a
+/// pointing at the canonical API host of the node's provider, whose key goes there: so it needs
+/// `behavior.provider` (agent-tools-v1 T8), and the hive's provider changing later can never send
+/// one provider's key to the other's host. An operator can deliberately relax the host check for a
 /// proxy/gateway via the process env `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` — env is set by
 /// whoever launches the node, NOT by a CONFIG_SET writer, so it is not reachable from the
 /// config plane.
 fn validate_managed_base_url(
+    provider: Option<AiProvider>,
     base_url: &Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const ALLOWED_HOSTS: &[&str] = &["api.openai.com", "api.anthropic.com"];
     let Some(raw) = base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(()); // no override -> provider default endpoint, always safe
+    };
+    let Some(provider) = provider else {
+        return Err(
+            "behavior.base_url needs behavior.provider: the URL is that provider's \
+             endpoint, and its key is sent there"
+                .into(),
+        );
     };
     if std::env::var_os("FLUXBEE_AI_ALLOW_INSECURE_BASE_URL").is_some() {
         return Ok(());
@@ -4376,14 +4909,12 @@ fn validate_managed_base_url(
     }
     // Strip an optional :port to get the real host.
     let host = authority.split(':').next().unwrap_or("");
-    if !ALLOWED_HOSTS
-        .iter()
-        .any(|allowed| host.eq_ignore_ascii_case(allowed))
-    {
+    let allowed = provider_api_host(provider);
+    if !host.eq_ignore_ascii_case(allowed) {
         return Err(format!(
-            "behavior.base_url host '{host}' is not an allowed provider endpoint \
-             (allowed: api.openai.com, api.anthropic.com); set FLUXBEE_AI_ALLOW_INSECURE_BASE_URL \
-             in the node process env to override for a trusted gateway"
+            "behavior.base_url host '{host}' is not the endpoint of behavior.provider {provider} \
+             (allowed: {allowed}); set FLUXBEE_AI_ALLOW_INSECURE_BASE_URL in the node process env \
+             to override for a trusted gateway"
         )
         .into());
     }
@@ -4412,21 +4943,20 @@ fn build_behavior_from_effective_config(
 
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let base_url = behavior.base_url.clone();
-            validate_managed_base_url(&base_url)?;
+            validate_managed_base_url(behavior.provider, &base_url)?;
             let immediate_memory = config
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.immediate_memory.clone())
                 .unwrap_or_default();
             let multimodal = behavior
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.multimodal)
+                .multimodal
                 .unwrap_or_else(default_multimodal_for_runtime);
 
             Ok(NodeBehavior::AiChat(AiChatRuntime {
                 model,
                 model_settings,
+                provider: behavior.provider,
                 base_url,
                 immediate_memory,
                 multimodal,
@@ -4490,14 +5020,26 @@ fn parse_effective_config_doc(
         )
         .into());
     }
-    if config
-        .get("behavior")
+    let behavior = config.get("behavior");
+    if behavior
         .and_then(|behavior| behavior.get("vault_key"))
         .is_some()
     {
         return Err(
-            "behavior.vault_key is not accepted: ai.generic reads the hive AI provider's \
-             key from SY.vault by resource_type (owned by it, assigned to it, or its tenant's general one)"
+            "behavior.vault_key is not accepted: ai.generic reads its provider's key from \
+             SY.vault by resource_type (owned by it, assigned to it, or its tenant's general one)"
+                .into(),
+        );
+    }
+    // agent-tools-v1 T9: "tools" is the AI node's word for what an agent can do, and whether the
+    // model takes images is `behavior.multimodal`.
+    if behavior
+        .and_then(|behavior| behavior.get("capabilities"))
+        .is_some()
+    {
+        return Err(
+            "behavior.capabilities is not accepted: whether the model receives images and \
+             documents is behavior.multimodal (true or false)"
                 .into(),
         );
     }
@@ -4524,16 +5066,9 @@ fn materialize_effective_defaults(
     if let Some(runtime) = config.runtime.as_mut() {
         materialize_runtime_defaults(runtime);
     }
-    if config.behavior.kind.eq_ignore_ascii_case("ai_chat") {
-        if config.behavior.capabilities.is_none() {
-            config.behavior.capabilities = Some(BehaviorCapabilities {
-                multimodal: Some(default_multimodal_for_runtime()),
-            });
-        } else if let Some(caps) = config.behavior.capabilities.as_mut() {
-            if caps.multimodal.is_none() {
-                caps.multimodal = Some(default_multimodal_for_runtime());
-            }
-        }
+    if config.behavior.kind.eq_ignore_ascii_case("ai_chat") && config.behavior.multimodal.is_none()
+    {
+        config.behavior.multimodal = Some(default_multimodal_for_runtime());
     }
     config
 }
@@ -4547,6 +5082,19 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
     }
 }
 
+/// The control verbs ai.generic answers. Each one runs only from the node that sends it
+/// (`control_request`).
+const CONTROL_VERBS: [&str; 6] = [
+    MSG_NODE_STATUS_GET,
+    MSG_NODE_HELP,
+    MSG_CONFIG_SET,
+    MSG_CONFIG_GET,
+    MSG_PING,
+    MSG_STATUS,
+];
+
+/// A message for the control plane, never for the model: a `system` or an `admin` one. Which of
+/// them run is `handle_control_plane`'s to say.
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
         || msg.meta.msg_type.eq_ignore_ascii_case("admin")
@@ -4615,7 +5163,7 @@ fn missing_ai_api_key_payload(reason: &str) -> Value {
     json!({
         "type": "error",
         "code": "missing_ai_api_key",
-        "message": "SY.vault has no usable key for the hive's AI provider (resource_type openai|anthropic): none owned by or assigned to this node, and no general one in its tenant.",
+        "message": "SY.vault has no usable key for this node's AI provider (resource_type openai or anthropic): none owned by or assigned to this node, and no general one in its tenant.",
         "retryable": true,
         "details": { "reason": reason }
     })
@@ -4627,8 +5175,21 @@ struct HiveAiFile {
     ai: Option<HiveAiConfig>,
 }
 
+/// The node's AI provider and where it comes from (agent-tools-v1 T8): `behavior.provider`, or the
+/// hive's as hive.yaml says at this moment. It decides the API the node speaks and the Vault
+/// resource type of its key.
+fn effective_ai_provider(
+    ai: &AiChatRuntime,
+    config_dir: &Path,
+) -> std::result::Result<(AiProvider, &'static str), String> {
+    match ai.provider {
+        Some(provider) => Ok((provider, "behavior.provider")),
+        None => hive_ai_provider(config_dir).map(|provider| (provider, "hive")),
+    }
+}
+
 /// The hive's AI provider: hive.yaml `ai`, the section every SY.* AI consumer reads, or OpenAI
-/// when it is absent. It decides which Vault resource type holds the key.
+/// when it is absent. An AI node without `behavior.provider` uses it.
 fn hive_ai_provider(config_dir: &Path) -> std::result::Result<AiProvider, String> {
     let path = config_dir.join("hive.yaml");
     let raw = fs::read_to_string(&path)
@@ -5146,25 +5707,87 @@ mod tests {
     #[test]
     fn validate_managed_base_url_allows_provider_hosts_rejects_arbitrary() {
         // A1: only https provider hosts pass; an arbitrary/http host is rejected (credential exfil).
-        assert!(validate_managed_base_url(&None).is_ok());
-        assert!(validate_managed_base_url(&Some(String::new())).is_ok());
-        assert!(validate_managed_base_url(&Some("https://api.openai.com/v1".into())).is_ok());
-        assert!(validate_managed_base_url(&Some("https://api.anthropic.com".into())).is_ok());
-        assert!(validate_managed_base_url(&Some("http://api.openai.com".into())).is_err()); // not https
-        assert!(validate_managed_base_url(&Some("https://attacker.example/v1".into())).is_err());
+        let openai = Some(AiProvider::OpenAi);
+        let base_url = |url: &str| Some(url.to_string());
+        assert!(validate_managed_base_url(openai, &None).is_ok());
+        assert!(validate_managed_base_url(openai, &Some(String::new())).is_ok());
+        assert!(validate_managed_base_url(openai, &base_url("https://api.openai.com/v1")).is_ok());
+        assert!(validate_managed_base_url(
+            Some(AiProvider::Anthropic),
+            &base_url("https://api.anthropic.com")
+        )
+        .is_ok());
+        assert!(validate_managed_base_url(openai, &base_url("http://api.openai.com")).is_err()); // not https
         assert!(
-            validate_managed_base_url(&Some("https://api.openai.com.evil.com".into())).is_err()
+            validate_managed_base_url(openai, &base_url("https://attacker.example/v1")).is_err()
         );
-        // userinfo bypass attempts (the real host is the attacker) MUST be rejected:
         assert!(
-            validate_managed_base_url(&Some("https://api.openai.com:x@evil.com/v1".into()))
+            validate_managed_base_url(openai, &base_url("https://api.openai.com.evil.com"))
                 .is_err()
         );
+        // userinfo bypass attempts (the real host is the attacker) MUST be rejected:
+        assert!(validate_managed_base_url(
+            openai,
+            &base_url("https://api.openai.com:x@evil.com/v1")
+        )
+        .is_err());
         assert!(
-            validate_managed_base_url(&Some("https://api.openai.com@evil.com".into())).is_err()
+            validate_managed_base_url(openai, &base_url("https://api.openai.com@evil.com"))
+                .is_err()
         );
-        assert!(validate_managed_base_url(&Some("https://api.openai.com:443".into())).is_ok());
+        assert!(validate_managed_base_url(openai, &base_url("https://api.openai.com:443")).is_ok());
         // explicit port OK
+    }
+
+    /// T8: a base_url is the endpoint of the node's own provider, whose key is sent there: it
+    /// needs `behavior.provider`, and the other provider's host is refused.
+    #[test]
+    fn a_base_url_is_the_endpoint_of_the_nodes_own_provider() {
+        let anthropic_url = Some("https://api.anthropic.com/v1/messages".to_string());
+        let err = validate_managed_base_url(None, &anthropic_url)
+            .expect_err("a base_url without a provider");
+        assert!(
+            err.to_string()
+                .contains("behavior.base_url needs behavior.provider"),
+            "{err}"
+        );
+        let err = validate_managed_base_url(Some(AiProvider::OpenAi), &anthropic_url)
+            .expect_err("anthropic's host for an openai node");
+        assert!(
+            err.to_string()
+                .contains("is not the endpoint of behavior.provider openai"),
+            "{err}"
+        );
+        assert!(validate_managed_base_url(Some(AiProvider::Anthropic), &anthropic_url).is_ok());
+        let err = validate_managed_base_url(
+            Some(AiProvider::Anthropic),
+            &Some("https://api.openai.com/v1/responses".to_string()),
+        )
+        .expect_err("openai's host for an anthropic node");
+        assert!(
+            err.to_string().contains("allowed: api.anthropic.com"),
+            "{err}"
+        );
+
+        // Through the config: the same rule, before the node takes the behavior.
+        let config = |behavior: Value| {
+            build_behavior_from_effective_config(
+                &parse_effective_config_doc(&json!({ "behavior": behavior })).expect("parses"),
+            )
+        };
+        assert!(config(json!({
+            "kind": "ai_chat",
+            "model": "claude-sonnet-5-5",
+            "base_url": "https://api.anthropic.com/v1/messages"
+        }))
+        .is_err());
+        assert!(config(json!({
+            "kind": "ai_chat",
+            "model": "claude-sonnet-5-5",
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1/messages"
+        }))
+        .is_ok());
     }
 
     #[test]
@@ -5206,11 +5829,12 @@ mod tests {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// A NODE_STATUS_GET from the orchestrator of the node's hive, the one that sends it.
     fn sample_request() -> Message {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
-                src_l2_name: None,
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
                 dst: Destination::Unicast("AI.generic@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
@@ -5272,6 +5896,7 @@ mod tests {
             cognitive_definition: Arc::new(RwLock::new(
                 CognitiveDefinitionRuntimeState::unresolved(),
             )),
+            runtime_version: Some("0.1.86".to_string()),
         }
     }
 
@@ -5717,7 +6342,7 @@ mod tests {
                 "name": "Support role",
                 "description": "Answer as a Fluxbee support agent.",
                 "tone": "direct",
-                "limits": ["Do not invent platform capabilities."]
+                "limits": ["Do not offer tools you do not have."]
             }),
         );
         let skill_hash = write_cognitive_asset(
@@ -6035,9 +6660,16 @@ mod tests {
         assert_eq!(healthy["lifecycle_state"], json!("CONFIGURED"));
     }
 
-    fn config_set_request(config: Value) -> Message {
+    /// A request from SY.admin@motherbee, the one that sends CONFIG_GET and CONFIG_SET.
+    fn admin_request(verb: &str) -> Message {
         let mut msg = sample_request();
-        msg.meta.msg = Some("CONFIG_SET".to_string());
+        msg.routing.src_l2_name = Some("SY.admin@motherbee".to_string());
+        msg.meta.msg = Some(verb.to_string());
+        msg
+    }
+
+    fn config_set_request(config: Value) -> Message {
+        let mut msg = admin_request(MSG_CONFIG_SET);
         msg.payload = json!({
             "subsystem": "ai_node",
             "node_name": "AI.generic@motherbee",
@@ -6173,6 +6805,7 @@ mod tests {
             *behavior = Some(NodeBehavior::AiChat(AiChatRuntime {
                 model: "gpt-5.5".to_string(),
                 model_settings: ModelSettings::default(),
+                provider: None,
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
                 multimodal: true,
@@ -6561,6 +7194,47 @@ mod tests {
             .contains("<h1>Hola</h1>"));
     }
 
+    /// Excel and LibreOffice run a quoted cell that starts with `=`, `+`, `-` or `@` as a formula:
+    /// such a cell gets a `'` in front (OWASP, CSV injection), and so does one that starts with a
+    /// tab or a carriage return; a plain negative number stays a number.
+    #[tokio::test]
+    async fn a_csv_cell_never_runs_as_a_formula() {
+        let output = GenerateCsvArtifactTool
+            .call(json!({
+                "filename": "datos.csv",
+                "headers": ["=HYPERLINK(\"http://x\")", "saldo"],
+                "rows": [
+                    ["+1+1", "-12"],
+                    ["@SUM(A1)", "-1.234,56"],
+                    ["\tinvisible", "-12.5"],
+                    ["\rreturn", "-2+3+cmd|' /C calc'!A0"],
+                    ["-", "-.5"],
+                    ["plain", "say \"hi\""],
+                    ["a=b", "12-3"]
+                ]
+            }))
+            .await
+            .expect("csv tool");
+        let (_, artifacts) = decode_tool_artifact(output);
+        let csv = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(&artifacts[0].bytes_base64)
+                .expect("base64"),
+        )
+        .expect("utf8");
+        let expected = [
+            r#""'=HYPERLINK(""http://x"")","saldo""#,
+            r#""'+1+1","-12""#,
+            r#""'@SUM(A1)","-1.234,56""#,
+            "\"'\tinvisible\",\"-12.5\"",
+            "\"'\rreturn\",\"'-2+3+cmd|' /C calc'!A0\"",
+            r#""'-","'-.5""#,
+            r#""plain","say ""hi""""#,
+            r#""a=b","12-3""#,
+        ];
+        assert_eq!(csv, format!("{}\n", expected.join("\n")));
+    }
+
     #[tokio::test]
     async fn generate_xlsx_artifact_tool_returns_zip_with_workbook_parts() {
         let tool = GenerateXlsxArtifactTool;
@@ -6725,7 +7399,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_chat_contract_needs_a_model_and_names_no_key_or_provider() {
+    fn ai_chat_contract_needs_a_model_and_names_no_key() {
         let minimal = parse_effective_config_doc(&json!({
             "behavior": {"kind": "ai_chat", "model": "gpt-5.5"}
         }))
@@ -6741,10 +7415,26 @@ mod tests {
             .to_string()
             .contains("behavior.vault_key is not accepted"));
 
-        let with_provider = json!({
-            "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "provider": "openai"}
-        });
-        assert!(parse_effective_config_doc(&with_provider).is_err());
+        // T8 (FINDINGS A-93): the node may name its provider, one of the two the SDK speaks.
+        for provider in ["openai", "anthropic"] {
+            let doc = parse_effective_config_doc(&json!({
+                "behavior": {"kind": "ai_chat", "model": "a-model", "provider": provider}
+            }))
+            .expect("a provider is config");
+            let Ok(NodeBehavior::AiChat(ai)) = build_behavior_from_effective_config(&doc) else {
+                panic!("{provider}: an ai_chat behavior");
+            };
+            assert_eq!(ai.provider.map(AiProvider::as_str), Some(provider));
+        }
+        for provider in ["gemini", "OpenAI", ""] {
+            let with_provider = json!({
+                "behavior": {"kind": "ai_chat", "model": "a-model", "provider": provider}
+            });
+            assert!(
+                parse_effective_config_doc(&with_provider).is_err(),
+                "{provider}"
+            );
+        }
 
         let missing_model = parse_effective_config_doc(&json!({
             "behavior": {"kind": "ai_chat"}
@@ -6783,5 +7473,853 @@ mod tests {
         assert!(hive_ai_provider(&dir).is_err());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- The tools' cards and the catalog (docs/agent-tools-v1.md §3) ---
+
+    /// How the repository keeps the catalog equal to the code: this command writes both files.
+    const TOOL_CATALOG_REGENERATE: &str = "UPDATE_AGENT_TOOLS_CATALOG=1 cargo test -p \
+        fluxbee-ai-nodes --bin ai_node_runner the_tool_catalog_matches_the_cards";
+
+    /// docs/reference/agent-tools.json: the catalog file, as the package ships it but without a
+    /// version.
+    fn tool_catalog_json(catalog: &ToolCatalog) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(catalog).expect("serialize the catalog")
+        )
+    }
+
+    /// docs/reference/agent-tools.md: the catalog as a page to read.
+    fn tool_catalog_markdown(catalog: &ToolCatalog) -> String {
+        let cell = |text: &str| text.replace('|', "\\|");
+        let pretty = |value: &Value| serde_json::to_string_pretty(value).expect("serialize");
+        let mut out = format!("# Tool catalog: `{}`\n\n", catalog.runtime);
+        out.push_str(
+            "Generated from the code; do not edit it. A test in `nodes/ai/ai-generic` checks this \
+             page and [agent-tools.json](agent-tools.json) against the tools' cards, and CI runs \
+             it. After changing a card, write both again:\n\n",
+        );
+        out.push_str(&format!("```bash\n{TOOL_CATALOG_REGENERATE}\n```\n\n"));
+        out.push_str(
+            "- **What it is:** every base tool of the runtime, as its card declares it \
+             ([agent-tools-v1](../agent-tools-v1.md)). Every AI agent loads every base tool; a \
+             message gets one when its *present when* holds.\n\
+             - **The same cards** are what the model receives (the summary, when to use the \
+             tool, its limits and what it returns, with the input schema), what an AI node \
+             answers to `NODE_HELP`, and `dist/runtimes/ai.generic/<version>/tools.json` in an \
+             installation. The repository's `agent-tools.json` has `runtime_version: null`: the \
+             package writes the version it ships.\n\
+             - **A failure** is a result `{\"status\": \"error\", \"error_code\", \"message\", \
+             \"retryable\"}` with one of the tool's codes. Arguments that do not fit the input \
+             schema, or a failure inside the tool, come back instead as an error result: a text \
+             that names the problem.\n\n",
+        );
+        out.push_str("| Tool | What it does | Present when |\n| --- | --- | --- |\n");
+        for card in &catalog.tools {
+            out.push_str(&format!(
+                "| [`{name}`](#{name}) | {} | {} |\n",
+                cell(&card.summary),
+                cell(&card.present_when),
+                name = card.name,
+            ));
+        }
+        for card in &catalog.tools {
+            out.push_str(&format!("\n## `{}`\n\n{}\n\n", card.name, card.summary));
+            out.push_str(&format!("- **When to use:** {}\n", card.when_to_use));
+            out.push_str(&format!("- **Present when:** {}\n", card.present_when));
+            if !card.limits.is_empty() {
+                out.push_str("- **Limits:**\n");
+                for limit in &card.limits {
+                    out.push_str(&format!("  - {limit}\n"));
+                }
+            }
+            if let Some(returns) = card.returns() {
+                out.push_str(&format!("- **Returns:** {returns}\n"));
+            }
+            if card.errors.is_empty() {
+                out.push_str("- **Errors:** no error code of its own.\n");
+            } else {
+                out.push_str("- **Errors:**\n");
+                for error in &card.errors {
+                    out.push_str(&format!("  - `{}`: {}\n", error.code, error.meaning));
+                }
+            }
+            out.push_str(&format!(
+                "\nInput:\n\n```json\n{}\n```\n\nOutput:\n\n```json\n{}\n```\n",
+                pretty(&card.input),
+                pretty(&card.output)
+            ));
+        }
+        out
+    }
+
+    /// The catalog in the repository is the code's: CI's Rust tests are the parity check. With
+    /// UPDATE_AGENT_TOOLS_CATALOG set, the test writes both files instead.
+    #[test]
+    fn the_tool_catalog_matches_the_cards() {
+        let catalog = tool_catalog(None);
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let files = [
+            (
+                "docs/reference/agent-tools.json",
+                tool_catalog_json(&catalog),
+            ),
+            (
+                "docs/reference/agent-tools.md",
+                tool_catalog_markdown(&catalog),
+            ),
+        ];
+        if std::env::var_os("UPDATE_AGENT_TOOLS_CATALOG").is_some() {
+            for (name, content) in &files {
+                fs::write(repo.join(name), content).expect("write the catalog");
+            }
+            return;
+        }
+        for (name, expected) in &files {
+            let written = fs::read_to_string(repo.join(name)).unwrap_or_default();
+            if written == *expected {
+                continue;
+            }
+            let line = written
+                .lines()
+                .zip(expected.lines())
+                .position(|(written, expected)| written != expected)
+                .unwrap_or_else(|| written.lines().count().min(expected.lines().count()))
+                + 1;
+            panic!(
+                "{name} is not the tools' cards in the code (they differ at line {line}). Write \
+                 it again, and commit it:\n  {TOOL_CATALOG_REGENERATE}"
+            );
+        }
+    }
+
+    /// Every card says all it has to, and a message that meets every `present_when` gets every
+    /// base tool, each exactly as its card renders it: the catalog is what the model receives.
+    #[tokio::test]
+    async fn a_message_gets_each_base_tool_as_its_card_declares_it() {
+        let cards = base_tool_cards();
+        for card in &cards {
+            assert_eq!(card.validate(), Ok(()), "{}", card.name);
+        }
+
+        let (dispatcher, _harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.generic@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let mut node = test_node();
+        node.vault = vault_client_for(
+            dispatcher,
+            "AI.generic@motherbee",
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        node.thread_state_store = Some(Arc::new(LanceDbThreadStateStore::new(
+            std::env::temp_dir().join(format!("ai-generic-tools-{}", Uuid::new_v4())),
+        )));
+        let every_condition = BehaviorContext {
+            src_ilk: Some("ilk:22222222-2222-4222-8222-222222222222".to_string()),
+            ..BehaviorContext::default()
+        };
+        let sorted = |mut definitions: Vec<fluxbee_ai_sdk::FunctionToolDefinition>| {
+            definitions.sort_by(|a, b| a.name.cmp(&b.name));
+            definitions
+        };
+        assert_eq!(
+            sorted(
+                node.build_tool_registry(&every_condition)
+                    .expect("registry")
+                    .definitions()
+            ),
+            sorted(cards.iter().map(ToolCard::model_definition).collect())
+        );
+
+        // No interlocutor and no identity: the state tools and publish_html_page are not there.
+        let mut names = test_node()
+            .build_tool_registry(&BehaviorContext::default())
+            .expect("registry")
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut always = cards
+            .iter()
+            .filter(|card| card.present_when == "always")
+            .map(|card| card.name.clone())
+            .collect::<Vec<_>>();
+        always.sort();
+        assert_eq!(always.len(), 10);
+        assert_eq!(names, always);
+    }
+
+    #[tokio::test]
+    async fn node_help_answers_the_tool_catalog_in_any_state() {
+        let node = test_node();
+        let mut request = sample_request();
+        request.meta.msg = Some(MSG_NODE_HELP.to_string());
+        let response = node
+            .handle_control_plane(request.clone())
+            .await
+            .expect("control plane")
+            .expect("NODE_HELP_RESPONSE");
+        assert_eq!(response.meta.msg.as_deref(), Some(MSG_NODE_HELP_RESPONSE));
+        assert!(matches!(
+            response.routing.dst,
+            Destination::Unicast(ref dst) if dst == &request.routing.src
+        ));
+        let help = &response.payload;
+        assert_eq!(help["status"], json!("ok"));
+        assert_eq!(help["node_name"], json!("AI.generic@motherbee"));
+        assert_eq!(help["runtime"], json!("ai.generic"));
+        assert_eq!(help["runtime_version"], json!("0.1.86"));
+        let tools: Vec<ToolCard> =
+            serde_json::from_value(help["tools"].clone()).expect("the cards");
+        assert_eq!(tools, base_tool_cards());
+        // The node is UNCONFIGURED, and the answer leaves room in one frame for the tools to come.
+        let frame = serde_json::to_vec(&response).expect("serialize").len();
+        assert!(
+            frame < fluxbee_sdk::socket::connection::MAX_FRAME_SIZE / 2,
+            "{frame} bytes"
+        );
+    }
+
+    #[test]
+    fn the_runtime_version_is_the_one_the_orchestrator_launched() {
+        let root = std::env::temp_dir().join(format!("ai-generic-version-{}", Uuid::new_v4()));
+        let node = "AI.sales@motherbee";
+        let path = managed_node_config_path_with_root(node, &root).expect("path");
+        assert_eq!(launched_runtime_version(node, &root), None);
+        fs::create_dir_all(path.parent().expect("dir")).expect("node dir");
+        fs::write(
+            &path,
+            r#"{"_system":{"runtime":"ai.generic","runtime_version":"0.1.86"},"behavior":{}}"#,
+        )
+        .expect("config.json");
+        assert_eq!(
+            launched_runtime_version(node, &root).as_deref(),
+            Some("0.1.86")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- T8: the AI provider per node (FINDINGS A-93) ---
+
+    fn ai_chat(provider: Option<AiProvider>) -> NodeBehavior {
+        NodeBehavior::AiChat(AiChatRuntime {
+            model: "a-model".to_string(),
+            model_settings: ModelSettings::default(),
+            provider,
+            base_url: None,
+            immediate_memory: ImmediateMemorySection::default(),
+            multimodal: true,
+        })
+    }
+
+    async fn ai_provider(node: &GenericAiNode) -> Value {
+        node.handle_control_plane(admin_request(MSG_CONFIG_GET))
+            .await
+            .expect("control plane")
+            .expect("CONFIG_RESPONSE")
+            .payload["ai_provider"]
+            .clone()
+    }
+
+    /// CONFIG_GET says which provider the node uses now, and why: its own, or the hive's.
+    #[tokio::test]
+    async fn config_get_shows_the_provider_in_effect() {
+        let dir = std::env::temp_dir().join(format!("ai-generic-provider-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: motherbee\nai:\n  default_provider: anthropic\n  providers:\n    anthropic:\n      model: claude-sonnet-5-5\n",
+        )
+        .expect("write hive.yaml");
+        let mut node = test_node();
+        node.config_dir = dir.clone();
+
+        assert_eq!(ai_provider(&node).await, Value::Null, "no behavior yet");
+        *node.behavior.write().await = Some(ai_chat(None));
+        assert_eq!(
+            ai_provider(&node).await,
+            json!({"name": "anthropic", "source": "hive"})
+        );
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi)));
+        assert_eq!(
+            ai_provider(&node).await,
+            json!({"name": "openai", "source": "behavior.provider"})
+        );
+
+        fs::write(dir.join("hive.yaml"), "hive_id: motherbee\nai: [\n").expect("break it");
+        assert_eq!(
+            ai_provider(&node).await,
+            json!({"name": "openai", "source": "behavior.provider"}),
+            "the node's own provider does not read hive.yaml"
+        );
+        *node.behavior.write().await = Some(ai_chat(None));
+        let broken = ai_provider(&node).await;
+        assert_eq!(broken["name"], Value::Null);
+        assert!(broken["error"].as_str().is_some(), "{broken}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The key is the node's provider's, looked up only in the node's tenant.
+    #[tokio::test]
+    async fn the_key_is_looked_up_for_the_nodes_provider_in_its_tenant() {
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.generic@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let mut node = test_node();
+        node.self_tenant_id = Some("tnt:33333333-3333-4333-8333-333333333333".to_string());
+        node.vault = vault_client_for(
+            dispatcher,
+            "AI.generic@motherbee",
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let node = Arc::new(node);
+        let lookup = tokio::spawn({
+            let node = node.clone();
+            async move {
+                let NodeBehavior::AiChat(ai) = ai_chat(Some(AiProvider::Anthropic)) else {
+                    unreachable!("an ai_chat behavior");
+                };
+                node.resolve_ai_credential(&ai).await
+            }
+        });
+        let request = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("a vault request");
+        lookup.abort();
+        assert_eq!(request.meta.msg.as_deref(), Some("VAULT_LIST"));
+        assert_eq!(
+            request.payload["filter"]["resource_type"],
+            json!("anthropic")
+        );
+        assert_eq!(
+            request.payload["filter"]["tenant_id"],
+            json!("tnt:33333333-3333-4333-8333-333333333333")
+        );
+    }
+
+    // --- T9: "tools" is the AI node's only word (FINDINGS A-94) ---
+
+    #[tokio::test]
+    async fn config_set_refuses_the_old_multimodal_key() {
+        let node = test_node();
+        let response = node
+            .handle_control_plane(config_set_request(json!({
+                "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": false}}
+            })))
+            .await
+            .expect("control plane")
+            .expect("CONFIG_RESPONSE");
+        assert_eq!(response.payload["ok"], json!(false));
+        assert_eq!(response.payload["error"]["code"], json!("invalid_config"));
+        let message = response.payload["error"]["message"]
+            .as_str()
+            .expect("message");
+        assert!(
+            message.contains("behavior.capabilities is not accepted")
+                && message.contains("behavior.multimodal"),
+            "{message}"
+        );
+        assert!(node.behavior.read().await.is_none());
+
+        // The new key, with its default.
+        let doc = |behavior: Value| {
+            materialize_effective_defaults(
+                "AI.sales@motherbee",
+                parse_effective_config_doc(&json!({ "behavior": behavior })).expect("parses"),
+            )
+        };
+        let off = doc(json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": false}));
+        assert_eq!(off.behavior.multimodal, Some(false));
+        let Ok(NodeBehavior::AiChat(ai)) = build_behavior_from_effective_config(&off) else {
+            panic!("an ai_chat behavior");
+        };
+        assert!(!ai.multimodal);
+        let default = doc(json!({"kind": "ai_chat", "model": "gpt-5.5"}));
+        assert_eq!(
+            serde_json::to_value(&default).expect("serialize")["behavior"]["multimodal"],
+            json!(true)
+        );
+    }
+
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// The names in `dir`, sorted.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// A config.json from before T9 is rewritten once at boot with the new key, and then the node
+    /// boots on it. The file as it was stays beside it for a rollback to 0.1.85. Any other shape
+    /// is left for the contract to refuse.
+    #[test]
+    fn an_old_config_json_is_converted_once_at_boot() {
+        let root = std::env::temp_dir().join(format!("ai-generic-convert-{}", Uuid::new_v4()));
+        let node = "AI.sales@motherbee";
+        let path = managed_node_config_path_with_root(node, &root).expect("path");
+        let dir = path.parent().expect("dir").to_path_buf();
+        fs::create_dir_all(&dir).expect("node dir");
+        let write = |config: Value| {
+            fs::write(&path, serde_json::to_string_pretty(&config).expect("json")).expect("write")
+        };
+        let read = || -> Value {
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json")
+        };
+        let converted_capabilities = || {
+            convert_capabilities_multimodal(&path)
+                .expect("converted")
+                .map(|conversion| conversion.capabilities)
+        };
+        let system = json!({"config_version": 7, "runtime_version": "0.1.85"});
+
+        write(json!({
+            "_system": system,
+            "tenant_id": "tnt:33333333-3333-4333-8333-333333333333",
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": false}}
+        }));
+        let original = fs::read_to_string(&path).expect("read");
+        let conversion = convert_capabilities_multimodal(&path)
+            .expect("converted")
+            .expect("a conversion");
+        assert_eq!(conversion.capabilities, json!({"multimodal": false}));
+        // The file as it was, 0600, beside the converted one, which is 0600 too; no temp file.
+        assert_eq!(conversion.original_copy, dir.join("config.json.pre-0.1.86"));
+        assert_eq!(
+            fs::read_to_string(&conversion.original_copy).expect("the copy"),
+            original
+        );
+        assert_eq!(file_mode(&conversion.original_copy), 0o600);
+        assert_eq!(file_mode(&path), 0o600);
+        assert_eq!(dir_names(&dir), ["config.json", "config.json.pre-0.1.86"]);
+        let converted = read();
+        assert_eq!(
+            converted["behavior"],
+            json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": false})
+        );
+        assert_eq!(converted["_system"], system);
+        assert_eq!(
+            converted["tenant_id"],
+            json!("tnt:33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(convert_capabilities_multimodal(&path), Ok(None), "once");
+        let contract = AiGenericContract {
+            node_name: node.to_string(),
+        };
+        let state = fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
+            node, &contract, &root,
+        )
+        .expect("bootstrap");
+        assert_eq!(state.current_state, NodeLifecycleState::Configured);
+        assert_eq!(state.config_version, 7);
+        assert_eq!(
+            state.effective_config.expect("effective")["behavior"]["multimodal"],
+            json!(false)
+        );
+
+        // The wrapped shape, and a capabilities that said nothing. A later conversion keeps the
+        // file it converted, over the older copy.
+        write(json!({
+            "_system": system,
+            "config": {"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {}}}
+        }));
+        let original = fs::read_to_string(&path).expect("read");
+        assert_eq!(converted_capabilities(), Some(json!({})));
+        assert_eq!(
+            read()["config"]["behavior"],
+            json!({"kind": "ai_chat", "model": "gpt-5.5"})
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.pre-0.1.86")).expect("the copy"),
+            original
+        );
+
+        // What the old runner saved for an echo node, which it gave no default.
+        write(json!({
+            "_system": system,
+            "behavior": {"kind": "echo", "model": null, "model_settings": null, "base_url": null, "capabilities": null}
+        }));
+        assert_eq!(converted_capabilities(), Some(Value::Null));
+        assert!(read()["behavior"].get("capabilities").is_none());
+        let state = fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
+            node, &contract, &root,
+        )
+        .expect("bootstrap");
+        assert_eq!(state.current_state, NodeLifecycleState::Configured);
+
+        // Anything else stays, and the contract refuses it with the reason.
+        for behavior in [
+            json!({"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": true, "vision": true}}),
+            json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": true, "capabilities": {"multimodal": false}}),
+        ] {
+            write(json!({"_system": system, "behavior": behavior}));
+            assert_eq!(convert_capabilities_multimodal(&path), Ok(None));
+            assert_eq!(read()["behavior"], behavior);
+            let state =
+                fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
+                    node, &contract, &root,
+                )
+                .expect("bootstrap");
+            assert_eq!(state.current_state, NodeLifecycleState::FailedConfig);
+            assert!(state
+                .last_error
+                .expect("its reason")
+                .message
+                .contains("behavior.capabilities is not accepted"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Without its copy of the file as it was, the conversion converts nothing; and a write that
+    /// fails leaves no temp file behind.
+    #[test]
+    fn a_config_json_whose_original_cannot_be_kept_is_not_converted() {
+        let root = std::env::temp_dir().join(format!("ai-generic-convert-{}", Uuid::new_v4()));
+        let path = managed_node_config_path_with_root("AI.sales@motherbee", &root).expect("path");
+        let dir = path.parent().expect("dir").to_path_buf();
+        // A directory where the copy goes: the rename onto it fails.
+        fs::create_dir_all(dir.join("config.json.pre-0.1.86").join("in-the-way")).expect("dirs");
+        let old = json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "capabilities": {"multimodal": true}}})
+            .to_string();
+        fs::write(&path, &old).expect("write");
+
+        let err = convert_capabilities_multimodal(&path).expect_err("no copy, no conversion");
+        assert!(err.contains("cannot keep it as it was"), "{err}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), old);
+        assert_eq!(dir_names(&dir), ["config.json", "config.json.pre-0.1.86"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- The tools' descriptions fit the model APIs ---
+
+    /// OpenAI refuses a tool whose description passes 1024 characters. Every card's fits: the
+    /// rules of a file's name are in the input schema, whose descriptions do not count.
+    #[test]
+    fn every_base_tool_description_fits_the_providers_limit() {
+        for card in base_tool_cards() {
+            let length = card.model_definition().description.chars().count();
+            assert!(
+                length <= fluxbee_ai_sdk::TOOL_DESCRIPTION_MAX_CHARS,
+                "{}: {length} characters",
+                card.name
+            );
+            assert_eq!(card.validate(), Ok(()), "{}", card.name);
+        }
+        for card in [GeneratePdfArtifactTool::card(), PublishHtmlTool::card()] {
+            let filename = card.input["properties"]["filename"]["description"]
+                .as_str()
+                .expect("the filename's description");
+            assert!(filename.contains("at most 128 bytes"), "{filename}");
+            assert!(!card.model_definition().description.contains("128 bytes"));
+        }
+    }
+
+    // --- Who runs the control plane ---
+
+    async fn control_answer(node: &GenericAiNode, msg: Message) -> Message {
+        node.handle_control_plane(msg)
+            .await
+            .expect("control plane")
+            .expect("an answer")
+    }
+
+    /// The config from SY.admin@motherbee, the status and the help from the orchestrator of the
+    /// node's hive: each verb runs from the node that sends it.
+    #[tokio::test]
+    async fn the_control_plane_runs_each_verb_from_the_node_that_sends_it() {
+        let node = test_node();
+        let config_get = control_answer(&node, admin_request(MSG_CONFIG_GET)).await;
+        assert_eq!(config_get.meta.msg.as_deref(), Some(MSG_CONFIG_RESPONSE));
+        assert_eq!(
+            config_get.payload["contract"]["node_kind"],
+            json!("ai.generic")
+        );
+
+        let status = control_answer(&node, sample_request()).await;
+        assert_eq!(
+            status.meta.msg.as_deref(),
+            Some(MSG_NODE_STATUS_GET_RESPONSE)
+        );
+        assert_eq!(status.payload["status"], json!("ok"));
+
+        let mut help = sample_request();
+        help.meta.msg = Some(MSG_NODE_HELP.to_string());
+        let help = control_answer(&node, help).await;
+        assert_eq!(help.payload["status"], json!("ok"));
+
+        // CONFIG_SET runs: it judges the config (applying a valid one would write the node's
+        // config.json under /var/lib/fluxbee).
+        let config = json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5", "params": {}}});
+        let set = control_answer(&node, config_set_request(config)).await;
+        assert_eq!(
+            set.payload["error"]["code"],
+            json!("invalid_config"),
+            "{}",
+            set.payload
+        );
+    }
+
+    /// A node, an `admin` message, a verb in another case and the orchestrator of another hive are
+    /// refused: a WARN, an `unauthorized` answer under the verb's own response, and nothing
+    /// changes. A system message that is no control verb is answered as before.
+    #[tokio::test]
+    async fn the_control_plane_refuses_every_other_caller() {
+        let node = test_node();
+        let config = json!({"behavior": {"kind": "echo"}});
+        let from_a_node = {
+            let mut msg = config_set_request(config.clone());
+            msg.routing.src_l2_name = Some("AI.other@motherbee".to_string());
+            msg
+        };
+        let as_admin = {
+            let mut msg = config_set_request(config.clone());
+            msg.meta.msg_type = "admin".to_string();
+            msg
+        };
+        let lowercase = {
+            let mut msg = config_set_request(config.clone());
+            msg.meta.msg = Some("config_set".to_string());
+            msg
+        };
+        let (logs, _guard) = LogCapture::start();
+        for msg in [from_a_node, as_admin, lowercase] {
+            let answer = control_answer(&node, msg).await;
+            assert_eq!(answer.meta.msg.as_deref(), Some(MSG_CONFIG_RESPONSE));
+            assert_eq!(answer.payload["ok"], json!(false));
+            assert_eq!(
+                answer.payload["error"]["code"],
+                json!("unauthorized"),
+                "{}",
+                answer.payload
+            );
+        }
+        assert!(node.behavior.read().await.is_none(), "nothing applied");
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
+
+        // The orchestrator of another hive asks for a node of the motherbee.
+        for (verb, response) in [
+            (MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE),
+            (MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE),
+        ] {
+            let mut msg = sample_request();
+            msg.routing.src_l2_name = Some("SY.orchestrator@worker1".to_string());
+            msg.meta.msg = Some(verb.to_string());
+            let answer = control_answer(&node, msg).await;
+            assert_eq!(answer.meta.msg.as_deref(), Some(response));
+            assert_eq!(answer.payload["status"], json!("error"));
+            assert_eq!(answer.payload["error_code"], json!("unauthorized"));
+        }
+        let text = logs.text();
+        assert_eq!(
+            text.matches("control request refused (unauthorized)")
+                .count(),
+            5,
+            "{text}"
+        );
+        assert!(text.contains("WARN"), "{text}");
+
+        // Not a control verb: answered as before, whoever sends it.
+        let mut notice = sample_request();
+        notice.routing.src_l2_name = None;
+        notice.meta.msg = Some("VAULT_SECRET_CHANGED".to_string());
+        let answer = control_answer(&node, notice).await;
+        assert_eq!(answer.payload["error"]["code"], json!("unknown_system_msg"));
+    }
+
+    // --- A-95: a published page's link never reaches the journal ---
+
+    /// Collects what the fmt layer writes on this thread while its guard lives.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    thread_local! {
+        static THREAD_CAPTURE: std::cell::RefCell<Option<LogCapture>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The writer of the one global test subscriber: this thread's capture, if any.
+    struct ThreadCaptureWriter;
+
+    impl std::io::Write for ThreadCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            THREAD_CAPTURE.with(|capture| {
+                if let Some(capture) = capture.borrow().as_ref() {
+                    capture
+                        .0
+                        .lock()
+                        .expect("log capture")
+                        .extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Ends this thread's capture.
+    struct LogCaptureGuard;
+
+    impl Drop for LogCaptureGuard {
+        fn drop(&mut self) {
+            THREAD_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+        }
+    }
+
+    impl LogCapture {
+        fn start() -> (Self, LogCaptureGuard) {
+            static GLOBAL_SUBSCRIBER: OnceLock<()> = OnceLock::new();
+            GLOBAL_SUBSCRIBER.get_or_init(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| ThreadCaptureWriter)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("the test log subscriber is the only global one");
+            });
+            tracing::callsite::rebuild_interest_cache();
+            let capture = Self::default();
+            THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(capture.clone()));
+            (capture, LogCaptureGuard)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log capture")).into_owned()
+        }
+    }
+
+    /// The link `publish_html_page` returns is the key to the page. The model gets it, and the
+    /// person gets it in the text of the reply a generator makes, as the card says; no line of the
+    /// journal on the way carries it: the publish, the file, the reply.
+    #[tokio::test]
+    async fn a_published_link_reaches_the_reply_but_never_the_journal() {
+        const KEY: &str = "k3y-of-the-published-page";
+        let link = format!("https://fluxbee.example/public/{KEY}");
+        let blob_root = std::env::temp_dir().join(format!("ai-generic-publish-{}", Uuid::new_v4()));
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let publish = PublishHtmlTool {
+            vault: vault_client_for(
+                dispatcher,
+                "AI.sales@motherbee",
+                Some("ilk:11111111-1111-4111-8111-111111111111"),
+            )
+            .expect("vault client"),
+            blob: fluxbee_sdk::blob::BlobConfig {
+                blob_root: blob_root.clone(),
+                ..fluxbee_sdk::blob::BlobConfig::default()
+            },
+        };
+        let (logs, _guard) = LogCapture::start();
+
+        let admin = async {
+            let request = harness.next_outgoing().await.expect("publish_artifact");
+            assert_eq!(request.meta.action.as_deref(), Some("publish_artifact"));
+            let answer = Message {
+                routing: Routing {
+                    src: "uuid-of-sy-admin".to_string(),
+                    src_l2_name: Some("SY.admin@motherbee".to_string()),
+                    dst: Destination::Unicast(harness.sender_uuid().to_string()),
+                    ttl: 16,
+                    trace_id: request.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: fluxbee_sdk::ADMIN_KIND.to_string(),
+                    msg: Some(fluxbee_sdk::MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+                    ..Meta::default()
+                },
+                payload: json!({
+                    "status": "ok",
+                    "action": "publish_artifact",
+                    "payload": {
+                        "public_url": link,
+                        "publication_id": "pub-7",
+                        "expires_at": 1_790_000_000u64
+                    }
+                }),
+            };
+            harness.inject(answer).await.expect("SY.admin's answer");
+        };
+        let (published, ()) = tokio::join!(
+            publish.call(json!({"filename": "page.html", "content": "<html>hola</html>"})),
+            admin
+        );
+        let published = published.expect("publish_html_page");
+        assert_eq!(published["status"], json!("ok"), "{published}");
+        assert_eq!(published["url"], json!(link));
+
+        let reply = GenerateTextArtifactTool
+            .call(json!({
+                "filename": "notas.txt",
+                "content": "notas",
+                "text": format!("Your page: {link}")
+            }))
+            .await
+            .expect("generate_text_artifact");
+        let tool_result = |name: &str, output: Value| FunctionLoopItem::ToolResult {
+            result: fluxbee_ai_sdk::FunctionToolResult {
+                call_id: format!("call-{name}"),
+                response_id: None,
+                name: name.to_string(),
+                arguments: json!({}),
+                output,
+                is_error: false,
+            },
+        };
+        let run = FunctionLoopRunResult {
+            final_assistant_text: None,
+            items: vec![
+                tool_result("publish_html_page", published),
+                tool_result("generate_text_artifact", reply),
+            ],
+            tokens_used: 0,
+        };
+        let output = extract_final_output_from_tool_results(&run)
+            .expect("the envelope")
+            .expect("a reply with its file");
+        test_node().log_final_output(&BehaviorContext::default(), &output);
+        let AiBehaviorOutput::Final(final_output) = &output else {
+            panic!("a reply with its file");
+        };
+        assert!(final_output
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains(&link)));
+
+        let text = logs.text();
+        assert!(text.contains("published HTML page"), "{text}");
+        assert!(text.contains("pub-7"), "{text}");
+        assert!(text.contains("notas.txt"), "{text}");
+        assert!(
+            text.contains(&format!("text_len={}", "Your page: ".len() + link.len())),
+            "{text}"
+        );
+        assert!(!text.contains(KEY), "the link reached the journal:\n{text}");
+        let _ = fs::remove_dir_all(blob_root);
     }
 }

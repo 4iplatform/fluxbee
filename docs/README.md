@@ -28,6 +28,7 @@ Start with the repository's [README](../README.md), then
 | [cognition](reference/cognition.md) | Memory per communication and the memory package |
 | [storage](reference/storage.md) | The router stream into SY.storage, the message log, LLM usage records |
 | [operations](reference/operations.md) | Install, join, publish, upgrade, node lifecycle, health |
+| [agent-tools](reference/agent-tools.md) | The tool catalog: what an `ai.generic` agent can do, each tool's card, generated from the code |
 
 ## System nodes
 

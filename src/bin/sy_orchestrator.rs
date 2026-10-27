@@ -27,7 +27,9 @@ use fluxbee_sdk::blob::{
 };
 use fluxbee_sdk::identity::IdentityError;
 use fluxbee_sdk::mesh::{LeafBundle, MeshCa, HIVE_REGISTRY_DIR, MESH_TLS_DIR};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE, SYSTEM_KIND,
+};
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::rpc::{
@@ -140,6 +142,17 @@ const DIST_SYNCTHING_VENDOR_SOURCE_PATH: &str = "/var/lib/fluxbee/dist/vendor/sy
 const CORE_SERVICE_HEALTH_TIMEOUT_SECS: u64 = 30;
 const NODE_STATUS_SCHEMA_VERSION: &str = "1";
 const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
+/// How long a node's own hive waits for its NODE_HELP_RESPONSE (`node_help_flow`). Only a node of
+/// NODE_HELP_RUNTIMES is asked, and one that does not answer in time is no error: a busy AI node
+/// may not (docs/agent-tools-v1.md §3.3).
+const NODE_HELP_PROBE_TIMEOUT_SECS: u64 = 3;
+/// The runtimes whose nodes answer NODE_HELP. A node runs its package's `runtime_base` when it has
+/// one, so a node of an ai.generic package is asked too; any other node is answered at once.
+const NODE_HELP_RUNTIMES: &[&str] = &["ai.generic"];
+/// How long the motherbee waits for another hive's answer to a forwarded NODE_HELP: that hive's
+/// probe of the node, and the way there and back. Under SY.admin's 10 s for `node_help`, so a hive
+/// that does not answer reads as NODE_HELP_FAILED, not as the admin's timeout.
+const NODE_HELP_FORWARD_TIMEOUT_SECS: u64 = 7;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
 const DEFAULT_BLOB_ENABLED: bool = true;
@@ -2761,14 +2774,26 @@ async fn send_admin_error(
     error_code: &str,
     reason: &str,
 ) -> Result<(), OrchestratorError> {
-    let action_class = classify_admin_action(action);
-    let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some("error"), Some(error_code));
     let payload = serde_json::json!({
         "status": "error",
         "error_code": error_code,
         "message": reason,
     });
+    send_admin_reply(sender, msg, action, payload).await
+}
+
+/// An admin command's answer, `payload`, to the SY.admin that sent `msg`, with the outcome its
+/// status and error code say.
+async fn send_admin_reply(
+    sender: &NodeSender,
+    msg: &Message,
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<(), OrchestratorError> {
+    let action_class = classify_admin_action(action);
+    let status = payload.get("status").and_then(|value| value.as_str());
+    let error_code = payload.get("error_code").and_then(|value| value.as_str());
+    let (action_result, result_origin) = derive_action_outcome(action_class, status, error_code);
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -2802,8 +2827,8 @@ async fn handle_admin(
     msg: &Message,
     state_arc: &Arc<OrchestratorState>,
 ) -> Result<(), OrchestratorError> {
-    // Only the add_hive arm needs the Arc (it hands a clone to a background join). Everything
-    // else in this 400-line body keeps working against the plain reference.
+    // Only the add_hive and node_help arms need the Arc (each hands a clone to its own task).
+    // Everything else in this 400-line body keeps working against the plain reference.
     let state: &OrchestratorState = state_arc.as_ref();
     let action = msg.meta.action.as_deref().unwrap_or("");
 
@@ -2881,6 +2906,11 @@ async fn handle_admin(
         "get_node_config" => get_node_config_flow(state, &msg.payload).await,
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
         "get_node_status" => get_node_status_flow(state, &msg.payload).await,
+        "node_help" => {
+            // Its own task answers it: asking the node must not hold this worker.
+            spawn_node_help(state_arc, sender, msg, NodeHelpAsker::Admin);
+            return Ok(());
+        }
         "set_node_config" => set_node_config_flow(state, &msg.payload).await,
         "start_node" => start_node_flow(state, &msg.payload).await,
         "restart_node" => restart_node_flow(state, &msg.payload).await,
@@ -3011,37 +3041,7 @@ async fn handle_admin(
             "message": format!("action '{action}' not implemented"),
         }),
     };
-    let action_class = classify_admin_action(action);
-    let status = payload.get("status").and_then(|value| value.as_str());
-    let error_code = payload.get("error_code").and_then(|value| value.as_str());
-    let (action_result, result_origin) = derive_action_outcome(action_class, status, error_code);
-
-    let reply = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(msg.routing.src.clone()),
-            ttl: 16,
-            trace_id: msg.routing.trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: "admin".to_string(),
-            msg: None,
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: Some(action.to_string()),
-            action_class,
-            action_result,
-            result_origin: result_origin.map(str::to_string),
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
-    sender.send(reply).await?;
-    Ok(())
+    send_admin_reply(sender, msg, action, payload).await
 }
 
 async fn handle_system_message(
@@ -3153,6 +3153,10 @@ async fn handle_system_message(
             tracing::info!(result = %result, "NODE_STATUS_GET processed");
             let _ =
                 send_system_action_response(sender, msg, "NODE_STATUS_GET_RESPONSE", result).await;
+        }
+        Some(MSG_NODE_HELP) => {
+            // Its own task answers it, as SY.admin's node_help (handle_admin).
+            spawn_node_help(state, sender, msg, NodeHelpAsker::Orchestrator);
         }
         Some("START_NODE") => {
             let result = start_node_flow(state, &msg.payload).await;
@@ -12944,6 +12948,53 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
     })
 }
 
+/// The largest `tools.json` `get_runtime` carries: its answer must stay well inside one mesh frame
+/// (128 KiB), whichever hive it comes from.
+const RUNTIME_TOOL_CATALOG_MAX_BYTES: u64 = 96 * 1024;
+
+/// The tool catalog a runtime version ships (`<root>/<runtime>/<version>/tools.json`, packaged
+/// with ai.generic: docs/agent-tools-v1.md §3.2), so Archi can design agents before any of them
+/// runs. Null when the version ships none, when it is too large, or when it is not valid JSON;
+/// a catalog is information, never a reason to fail the read.
+///
+/// A spoke's `dist/` is a Syncthing mirror its Syncthing user can write, and the orchestrator is
+/// root, so the name is not trusted, as in `read_syncthing_config`: `.` and `..` (which
+/// `valid_token` admits) name no runtime or version, a symlink is not followed, a FIFO does not
+/// block the open, only what the descriptor says is a regular file is read, and never more than
+/// RUNTIME_TOOL_CATALOG_MAX_BYTES of it.
+fn runtime_tool_catalog(root: &Path, runtime: &str, version: Option<&str>) -> serde_json::Value {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let component = |value: &str| valid_token(value) && value != "." && value != "..";
+    let Some(version) = version.filter(|version| component(version)) else {
+        return serde_json::Value::Null;
+    };
+    if !component(runtime) {
+        return serde_json::Value::Null;
+    }
+    let path = root.join(runtime).join(version).join("tools.json");
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(&path)
+    else {
+        return serde_json::Value::Null;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.file_type().is_file()) {
+        return serde_json::Value::Null;
+    }
+    let mut raw = Vec::new();
+    if file
+        .take(RUNTIME_TOOL_CATALOG_MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .is_err()
+        || raw.len() as u64 > RUNTIME_TOOL_CATALOG_MAX_BYTES
+    {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null)
+}
+
 fn runtime_api_entry(
     runtime: &str,
     entry: &RuntimeManifestEntry,
@@ -13064,6 +13115,11 @@ async fn local_runtime_snapshot(
                             "message": err.to_string(),
                         })
                     });
+            let tool_catalog = runtime_tool_catalog(
+                Path::new(DIST_RUNTIME_ROOT_DIR),
+                runtime,
+                version_filter.or(entry.current.as_deref()),
+            );
             serde_json::json!({
                 "status": "ok",
                 "hive_id": state.hive_id,
@@ -13071,6 +13127,7 @@ async fn local_runtime_snapshot(
                 "manifest_hash": manifest_hash,
                 "runtime": runtime_api_entry(runtime, entry, runtime_entries_snapshot.as_ref()),
                 "runtime_version_filter": version_filter,
+                "tool_catalog": tool_catalog,
                 "materialization": runtime_materialization_for_entry(
                     runtime,
                     entry,
@@ -19233,6 +19290,80 @@ fn extract_reported_health_state(response: &serde_json::Value) -> Option<&'stati
     normalize_reported_health_state(raw)
 }
 
+/// What this hive itself knows of one of its nodes, before the node is asked anything: the unit it
+/// runs as, its managed config and state, whether the unit runs or failed, and whether the router
+/// sees it.
+struct LocalNodeView {
+    unit: NodeUnit,
+    config_path: PathBuf,
+    state_path: PathBuf,
+    config_exists: bool,
+    state_exists: bool,
+    unit_active: bool,
+    unit_failed: bool,
+    inventory_visible: bool,
+}
+
+impl LocalNodeView {
+    fn lifecycle_state(&self) -> &'static str {
+        node_lifecycle_state(
+            &self.unit,
+            self.unit_active,
+            self.unit_failed,
+            self.inventory_visible,
+            self.config_exists || self.state_exists,
+        )
+    }
+}
+
+/// `node_name`, a node of this hive, as this hive knows it. `get_node_status_flow` and
+/// `node_help_flow` decide alike whether a node is here: a core node of this hive's role even
+/// stopped, a managed one only while something of it is (its config or state, its unit running or
+/// failed, the router seeing it). Otherwise the `Err` is the answer: NODE_NOT_FOUND, or
+/// INVALID_REQUEST for a name without paths.
+fn local_node_view(
+    state: &OrchestratorState,
+    node_name: &str,
+    target_hive: &str,
+) -> Result<LocalNodeView, serde_json::Value> {
+    let refusal = |error_code: &str, message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": error_code,
+            "message": message,
+            "target": target_hive,
+            "node_name": node_name,
+        })
+    };
+    let not_found = || refusal("NODE_NOT_FOUND", format!("node '{node_name}' not found"));
+    let unit = local_node_unit(state, node_name).ok_or_else(not_found)?;
+    let config_path = node_effective_config_path(state, node_name)
+        .map_err(|err| refusal("INVALID_REQUEST", err.to_string()))?;
+    let state_path = node_state_path(state, node_name)
+        .map_err(|err| refusal("INVALID_REQUEST", err.to_string()))?;
+    let managed = unit.is_managed();
+    let view = LocalNodeView {
+        config_exists: managed && config_path.exists(),
+        state_exists: managed && state_path.exists(),
+        unit_active: systemd_unit_is_active(unit.unit()).unwrap_or(false),
+        unit_failed: systemd_unit_is_failed(unit.unit()).unwrap_or(false),
+        inventory_visible: node_seen_by_router(state, node_name),
+        unit,
+        config_path,
+        state_path,
+    };
+    if managed
+        && !view.config_exists
+        && !view.state_exists
+        && !view.unit_active
+        && !view.unit_failed
+        && !view.inventory_visible
+    {
+        return Err(not_found());
+    }
+    Ok(view)
+}
+
 async fn get_node_status_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -19300,61 +19431,21 @@ async fn get_node_status_flow(
     if let Some(refusal) = node_requirements_refusal(state, &node_name, payload) {
         return refusal;
     }
-    let not_found = || {
-        serde_json::json!({
-            "status": "error",
-            "error_code": "NODE_NOT_FOUND",
-            "message": format!("node '{}' not found", node_name),
-            "target": target_hive,
-            "node_name": node_name,
-        })
-    };
-    let Some(node_unit) = local_node_unit(state, &node_name) else {
-        return not_found();
+    let LocalNodeView {
+        unit: node_unit,
+        config_path,
+        state_path,
+        config_exists,
+        state_exists,
+        unit_active,
+        unit_failed,
+        inventory_visible,
+    } = match local_node_view(state, &node_name, &target_hive) {
+        Ok(view) => view,
+        Err(answer) => return answer,
     };
     let managed = node_unit.is_managed();
-    let config_path = match node_effective_config_path(state, &node_name) {
-        Ok(path) => path,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-            });
-        }
-    };
-    let state_path = match node_state_path(state, &node_name) {
-        Ok(path) => path,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-            });
-        }
-    };
-
-    let config_exists = managed && config_path.exists();
-    let state_exists = managed && state_path.exists();
     let unit = node_unit.unit().to_string();
-    let unit_active = systemd_unit_is_active(&unit).unwrap_or(false);
-    let unit_failed = systemd_unit_is_failed(&unit).unwrap_or(false);
-    let inventory_visible = node_seen_by_router(state, &node_name);
-
-    // A core node of this role is here even stopped; a managed one, only while something of it is.
-    if managed
-        && !config_exists
-        && !state_exists
-        && !unit_active
-        && !unit_failed
-        && !inventory_visible
-    {
-        return not_found();
-    }
 
     let mut config_valid = false;
     let mut config_version: Option<u64> = None;
@@ -19631,6 +19722,242 @@ async fn get_node_status_flow(
         "node_name": node_name,
         "node_status": node_status,
     })
+}
+
+/// Who asked for a node's help, which says how the answer goes back: SY.admin's `node_help` gets
+/// an admin answer, another orchestrator's NODE_HELP a NODE_HELP_RESPONSE.
+#[derive(Debug, Clone, Copy)]
+enum NodeHelpAsker {
+    Admin,
+    Orchestrator,
+}
+
+/// Runs `node_help_flow` in its own task, which sends the answer itself. Asking the node takes up
+/// to NODE_HELP_PROBE_TIMEOUT_SECS, and another hive up to NODE_HELP_FORWARD_TIMEOUT_SECS, and the
+/// admin and system workers take one message at a time: run inline, it held every request behind
+/// it, and SY.admin's 5 s reads (`hive_status`, `web_status`) answered 504. add_hive's join leaves
+/// the admin worker the same way (PB-7).
+fn spawn_node_help(
+    state: &Arc<OrchestratorState>,
+    sender: &NodeSender,
+    msg: &Message,
+    asker: NodeHelpAsker,
+) {
+    let state = Arc::clone(state);
+    let sender = sender.clone();
+    let msg = msg.clone();
+    tokio::spawn(async move {
+        let result = node_help_flow(&state, &msg.payload).await;
+        // The help is the node's whole catalog: the log keeps whether it came, and why not.
+        tracing::info!(
+            asker = ?asker,
+            trace_id = %msg.routing.trace_id,
+            node_name = ?result.get("node_name"),
+            status = ?result.get("status"),
+            described = result.get("help").is_some_and(|help| !help.is_null()),
+            reason = ?result.get("reason").or_else(|| result.get("message")),
+            "node help processed"
+        );
+        let sent = match asker {
+            NodeHelpAsker::Admin => send_admin_reply(&sender, &msg, "node_help", result).await,
+            NodeHelpAsker::Orchestrator => {
+                send_system_action_response(&sender, &msg, MSG_NODE_HELP_RESPONSE, result).await
+            }
+        };
+        if let Err(err) = sent {
+            tracing::warn!(
+                asker = ?asker,
+                trace_id = %msg.routing.trace_id,
+                "node help answer not sent: {err}"
+            );
+        }
+    });
+}
+
+/// `node_help` (from SY.admin) and NODE_HELP (from the motherbee's orchestrator): a node's own
+/// self-description (docs/agent-tools-v1.md §3.3), asked the way `get_node_status_flow` asks for a
+/// node's status. A node of another hive is asked through that hive's orchestrator; a node of this
+/// hive gets NODE_HELP itself when its runtime answers it. A node that is here answers `ok`, with
+/// `help`, its NODE_HELP_RESPONSE, or `help: null` and the `reason`: its runtime does not describe
+/// itself (`node_help_unasked_reason`, answered at once), it is not connected, it did not answer
+/// within NODE_HELP_PROBE_TIMEOUT_SECS, or it answered with an error. A node that is not here
+/// answers NODE_NOT_FOUND, as for its status. It runs in its own task (`spawn_node_help`).
+async fn node_help_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive_with_timeout(
+            state,
+            &target_hive,
+            MSG_NODE_HELP,
+            MSG_NODE_HELP_RESPONSE,
+            forwarded_payload,
+            Duration::from_secs(NODE_HELP_FORWARD_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_HELP_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let view = match local_node_view(state, &node_name, &target_hive) {
+        Ok(view) => view,
+        Err(answer) => return answer,
+    };
+    let config = if view.config_exists {
+        load_node_effective_config(&view.config_path).ok()
+    } else {
+        None
+    };
+    let (help, reason) = if let Some(reason) =
+        node_help_unasked_reason(view.unit.is_managed(), config.as_ref())
+    {
+        (None, Some(reason))
+    } else if !view.inventory_visible {
+        (
+            None,
+            Some(format!(
+                "the node is not connected (lifecycle_state {}): only a running node describes itself",
+                view.lifecycle_state()
+            )),
+        )
+    } else {
+        match state.rpc() {
+            Ok(client) => {
+                let timeout = Duration::from_secs(NODE_HELP_PROBE_TIMEOUT_SECS);
+                let answer = client
+                    .send_system_rpc(SystemRpcRequest {
+                        target: &node_name,
+                        request_msg: MSG_NODE_HELP,
+                        response_msg: MSG_NODE_HELP_RESPONSE,
+                        payload: serde_json::json!({ "node_name": node_name }),
+                        timeout,
+                    })
+                    .await
+                    .map(|answer| answer.payload);
+                node_help_from_answer(answer, timeout)
+            }
+            Err(err) => (None, Some(format!("no answer to NODE_HELP: {err}"))),
+        }
+    };
+    serde_json::json!({
+        "status": "ok",
+        "node_name": node_name,
+        "help": help,
+        "reason": reason,
+    })
+}
+
+/// Why a node of this hive is not asked for its help, from its managed config.json (`_system`):
+/// only a node run by one of NODE_HELP_RUNTIMES answers NODE_HELP, so any other is answered at
+/// once instead of after NODE_HELP_PROBE_TIMEOUT_SECS of silence. A core node has no managed
+/// config and runs none of them. `None` when the node is to be asked.
+fn node_help_unasked_reason(managed: bool, config: Option<&serde_json::Value>) -> Option<String> {
+    let only = format!(
+        "only {} nodes answer NODE_HELP",
+        NODE_HELP_RUNTIMES.join(", ")
+    );
+    if !managed {
+        return Some(format!("the node is a core node: {only}"));
+    }
+    let system = config.and_then(|config| config.get("_system"));
+    let field = |key: &str| {
+        system
+            .and_then(|system| system.get(key))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    // A package's node runs its base runtime's binary.
+    let Some(runtime) = field("runtime_base").or_else(|| field("runtime")) else {
+        return Some(format!(
+            "the node has no config.json that names its runtime: {only}"
+        ));
+    };
+    if NODE_HELP_RUNTIMES
+        .iter()
+        .any(|answers| answers.eq_ignore_ascii_case(runtime))
+    {
+        return None;
+    }
+    Some(format!("the node runs {runtime}: {only}"))
+}
+
+/// The node's answer to NODE_HELP as `help` and `reason`: the NODE_HELP_RESPONSE when it says
+/// `ok`, else no help and why.
+fn node_help_from_answer(
+    answer: Result<serde_json::Value, RpcError>,
+    timeout: Duration,
+) -> (Option<serde_json::Value>, Option<String>) {
+    match answer {
+        Ok(help) if help.get("status").and_then(|v| v.as_str()) == Some("ok") => (Some(help), None),
+        Ok(refusal) => {
+            let field = |key: &str| refusal.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            let detail = [field("error_code"), field("message"), field("error_detail")]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(": ");
+            let reason = if detail.is_empty() {
+                "the node answered NODE_HELP without status ok".to_string()
+            } else {
+                format!("the node answered NODE_HELP with an error: {detail}")
+            };
+            (None, Some(reason))
+        }
+        // Neutral: only a node whose runtime answers NODE_HELP is asked, and a busy one can miss
+        // the deadline.
+        Err(err) if err.is_timeout() => (
+            None,
+            Some(format!(
+                "the node did not answer NODE_HELP within {} s",
+                timeout.as_secs()
+            )),
+        ),
+        Err(err) => (None, Some(format!("no answer to NODE_HELP: {err}"))),
+    }
 }
 
 async fn set_node_config_flow(
@@ -37083,6 +37410,443 @@ blob:
         assert_eq!(elsewhere["error_code"], "NODE_NOT_FOUND");
     }
 
+    /// A node's NODE_HELP_RESPONSE as docs/agent-tools-v1.md §3.3 shapes it, with one card.
+    fn node_help_response(node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "ok",
+            "node_name": node_name,
+            "runtime": "ai.generic",
+            "runtime_version": "0.1.86",
+            "tools": [{
+                "name": "generate_csv_artifact",
+                "summary": "Write a CSV file and return its blob reference.",
+                "when_to_use": "When the answer is a table the person opens in a spreadsheet.",
+                "limits": ["One file per call."],
+                "present_when": "always",
+                "input": {
+                    "type": "object",
+                    "properties": { "rows": { "type": "array" } },
+                    "required": ["rows"],
+                },
+                "output": {
+                    "type": "object",
+                    "properties": { "blob_ref": { "type": "object" } },
+                },
+                "errors": [{ "code": "too_large", "meaning": "the file passes the size limit" }],
+            }],
+        })
+    }
+
+    /// docs/agent-tools-v1.md §3.3: `node_help` travels as `get_node_status` does. For a node of
+    /// another hive the motherbee forwards NODE_HELP to that hive's orchestrator and answers with
+    /// what that hive says: the node's cards, or no help and why.
+    #[tokio::test]
+    async fn node_help_for_a_node_of_another_hive_is_asked_there() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        let node = "AI.sales@worker1";
+        let described = serde_json::json!({
+            "status": "ok",
+            "node_name": node,
+            "help": node_help_response(node),
+            "reason": null,
+        });
+        let silent = serde_json::json!({
+            "status": "ok",
+            "node_name": node,
+            "help": null,
+            "reason": "the node did not answer NODE_HELP within 3 s",
+        });
+        for (trace, answer) in [("help-described", described), ("help-silent", silent)] {
+            harness
+                .inject(test_admin_command(
+                    trace,
+                    "node_help",
+                    serde_json::json!({ "node_name": node, "target": "worker1" }),
+                ))
+                .await
+                .expect("inject admin command");
+            let forwarded = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+                .await
+                .expect("NODE_HELP forwarded")
+                .expect("forwarded message");
+            assert_unicast_destination(&forwarded.routing.dst, "SY.orchestrator@worker1");
+            assert_eq!(forwarded.meta.msg_type, SYSTEM_KIND);
+            assert_eq!(forwarded.meta.msg.as_deref(), Some("NODE_HELP"));
+            assert_eq!(forwarded.payload["node_name"], node);
+            assert_eq!(forwarded.payload["target"], "worker1");
+            harness
+                .inject(test_response_for(
+                    &forwarded,
+                    SYSTEM_KIND,
+                    "NODE_HELP_RESPONSE",
+                    answer.clone(),
+                ))
+                .await
+                .expect("inject the hive's answer");
+            let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+                .await
+                .expect("admin reply emitted")
+                .expect("admin reply");
+            assert_eq!(reply.meta.msg_type, ADMIN_KIND);
+            assert_eq!(reply.meta.action.as_deref(), Some("node_help"));
+            assert_eq!(reply.routing.trace_id, trace);
+            assert_eq!(reply.payload, answer);
+        }
+    }
+
+    /// On the node's own hive, NODE_HELP decides whether the node is here as a status read does.
+    /// A core node of this role answers ok at once, with no help and why: no core node describes
+    /// itself; a node that is not here answers NODE_NOT_FOUND. Only an orchestrator or the same
+    /// hive's admin may send it: the local guard (SO-05) refuses a node asking for another's.
+    #[tokio::test]
+    async fn node_help_on_the_nodes_hive_says_why_a_node_gives_no_help() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_system_worker(state, client, system_rx).await;
+            });
+        }
+        let ask = |trace: &str, node_name: &str, origin: &str| {
+            let mut msg = test_system_message(
+                trace,
+                "NODE_HELP",
+                serde_json::json!({ "node_name": node_name, "target": "motherbee" }),
+            );
+            msg.routing.src_l2_name = Some(origin.to_string());
+            msg
+        };
+        let orchestrator = "SY.orchestrator@motherbee";
+
+        harness
+            .inject(ask("help-core", "SY.timer@motherbee", orchestrator))
+            .await
+            .expect("inject NODE_HELP");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("NODE_HELP answered")
+            .expect("reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some("NODE_HELP_RESPONSE"));
+        assert_eq!(reply.routing.trace_id, "help-core");
+        assert_eq!(reply.payload["status"], "ok", "{}", reply.payload);
+        assert_eq!(reply.payload["node_name"], "SY.timer@motherbee");
+        assert!(reply.payload["help"].is_null());
+        assert_eq!(
+            reply.payload["reason"],
+            "the node is a core node: only ai.generic nodes answer NODE_HELP"
+        );
+
+        for (trace, node) in [
+            ("help-elsewhere", "SY.edge@motherbee"),
+            ("help-ghost", "AI.ghost@motherbee"),
+        ] {
+            harness
+                .inject(ask(trace, node, orchestrator))
+                .await
+                .expect("inject NODE_HELP");
+            let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+                .await
+                .expect("NODE_HELP answered")
+                .expect("reply");
+            assert_eq!(reply.routing.trace_id, trace);
+            assert_eq!(reply.payload["error_code"], "NODE_NOT_FOUND", "{node}");
+        }
+
+        harness
+            .inject(ask(
+                "help-rogue",
+                "SY.timer@motherbee",
+                "AI.sales@motherbee",
+            ))
+            .await
+            .expect("inject NODE_HELP");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("refusal emitted")
+            .expect("reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some("NODE_HELP_RESPONSE"));
+        assert_eq!(reply.payload["error_code"], "UNAUTHORIZED");
+    }
+
+    /// The node's answer to NODE_HELP: its cards when it says ok, else no help and why. Silence is
+    /// no error, and its reason says only that: a busy AI node can miss the deadline too.
+    #[test]
+    fn a_nodes_answer_to_node_help_is_its_cards_or_why_not() {
+        let timeout = Duration::from_secs(NODE_HELP_PROBE_TIMEOUT_SECS);
+        let cards = node_help_response("AI.sales@motherbee");
+        assert_eq!(
+            node_help_from_answer(Ok(cards.clone()), timeout),
+            (Some(cards), None)
+        );
+
+        let refused = serde_json::json!({
+            "status": "error",
+            "error_code": "NOT_CONFIGURED",
+            "message": "no catalog loaded",
+        });
+        assert_eq!(
+            node_help_from_answer(Ok(refused), timeout),
+            (
+                None,
+                Some(
+                    "the node answered NODE_HELP with an error: NOT_CONFIGURED: no catalog loaded"
+                        .to_string()
+                )
+            )
+        );
+        assert_eq!(
+            node_help_from_answer(Ok(serde_json::json!({ "tools": [] })), timeout),
+            (
+                None,
+                Some("the node answered NODE_HELP without status ok".to_string())
+            )
+        );
+
+        let silent = RpcError::Timeout {
+            trace_id: "help-trace".to_string(),
+            target: "AI.sales@motherbee".to_string(),
+            request_msg: "NODE_HELP".to_string(),
+            response_msg: "NODE_HELP_RESPONSE".to_string(),
+            timeout_ms: 3_000,
+        };
+        assert_eq!(
+            node_help_from_answer(Err(silent), timeout),
+            (
+                None,
+                Some("the node did not answer NODE_HELP within 3 s".to_string())
+            )
+        );
+
+        // A runtime from before NODE_HELP answers an unknown verb with something else.
+        let other = RpcError::InvalidResponse(
+            "unexpected response shape msg_type=system msg=Some(\"CONFIG_RESPONSE\")".to_string(),
+        );
+        let (help, reason) = node_help_from_answer(Err(other), timeout);
+        assert_eq!(help, None);
+        let reason = reason.expect("a reason");
+        assert!(
+            reason.starts_with("no answer to NODE_HELP: invalid response"),
+            "{reason}"
+        );
+    }
+
+    /// Only a node that ai.generic runs is asked for its help, its package's base runtime
+    /// included; any other answers at once, and the reason names what runs it.
+    #[test]
+    fn only_a_node_ai_generic_runs_is_asked_for_its_help() {
+        let config = |system: serde_json::Value| serde_json::json!({ "_system": system });
+        for asked in [
+            config(serde_json::json!({ "runtime": "ai.generic" })),
+            config(serde_json::json!({ "runtime": "AI.Generic" })),
+            config(serde_json::json!({ "runtime": "ai.billing", "runtime_base": "ai.generic" })),
+        ] {
+            assert_eq!(
+                node_help_unasked_reason(true, Some(&asked)),
+                None,
+                "{asked}"
+            );
+        }
+
+        let only = "only ai.generic nodes answer NODE_HELP";
+        for (managed, unasked, reason) in [
+            (false, None, format!("the node is a core node: {only}")),
+            (
+                true,
+                Some(config(serde_json::json!({ "runtime": "io.slack" }))),
+                format!("the node runs io.slack: {only}"),
+            ),
+            (
+                true,
+                Some(config(
+                    serde_json::json!({ "runtime": "wf.invoice", "runtime_base": "wf.engine" }),
+                )),
+                format!("the node runs wf.engine: {only}"),
+            ),
+            (
+                true,
+                Some(config(serde_json::json!({ "runtime": " " }))),
+                format!("the node has no config.json that names its runtime: {only}"),
+            ),
+            (
+                true,
+                None,
+                format!("the node has no config.json that names its runtime: {only}"),
+            ),
+        ] {
+            assert_eq!(
+                node_help_unasked_reason(managed, unasked.as_ref()),
+                Some(reason)
+            );
+        }
+    }
+
+    /// `node_help` runs in its own task, which answers SY.admin itself: while another hive is asked
+    /// for a node's help, the admin worker goes on, and `hive_status` (SY.admin's 5 s) answers at
+    /// once.
+    #[tokio::test]
+    async fn node_help_leaves_the_admin_worker_free() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        let node = "AI.sales@worker1";
+        harness
+            .inject(test_admin_command(
+                "help-pending",
+                "node_help",
+                serde_json::json!({ "node_name": node, "target": "worker1" }),
+            ))
+            .await
+            .expect("inject node_help");
+        let forwarded = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("NODE_HELP forwarded")
+            .expect("forwarded message");
+        assert_eq!(forwarded.meta.msg.as_deref(), Some("NODE_HELP"));
+
+        harness
+            .inject(test_admin_command(
+                "status-meanwhile",
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject hive_status");
+        let status = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("hive_status answered while the help is pending")
+            .expect("hive_status reply");
+        assert_eq!(status.meta.action.as_deref(), Some("hive_status"));
+        assert_eq!(status.routing.trace_id, "status-meanwhile");
+        assert_eq!(status.payload["status"], "ok");
+
+        let answer = serde_json::json!({
+            "status": "ok",
+            "node_name": node,
+            "help": node_help_response(node),
+            "reason": null,
+        });
+        harness
+            .inject(test_response_for(
+                &forwarded,
+                SYSTEM_KIND,
+                "NODE_HELP_RESPONSE",
+                answer.clone(),
+            ))
+            .await
+            .expect("inject the hive's answer");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("node_help answered by its task")
+            .expect("node_help reply");
+        assert_eq!(reply.meta.msg_type, ADMIN_KIND);
+        assert_eq!(reply.meta.action.as_deref(), Some("node_help"));
+        assert_eq!(reply.routing.trace_id, "help-pending");
+        assert_eq!(reply.payload, answer);
+    }
+
+    /// NODE_HELP runs in its own task too, which answers with NODE_HELP_RESPONSE: while it waits,
+    /// the system worker takes the next message.
+    #[tokio::test]
+    async fn node_help_leaves_the_system_worker_free() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_system_worker(state, client, system_rx).await;
+            });
+        }
+        let from_orchestrator = |trace: &str, msg_name: &str, payload: serde_json::Value| {
+            let mut msg = test_system_message(trace, msg_name, payload);
+            msg.routing.src_l2_name = Some("SY.orchestrator@motherbee".to_string());
+            msg
+        };
+        harness
+            .inject(from_orchestrator(
+                "help-pending",
+                "NODE_HELP",
+                serde_json::json!({ "node_name": "AI.sales@worker1", "target": "worker1" }),
+            ))
+            .await
+            .expect("inject NODE_HELP");
+        let forwarded = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("NODE_HELP forwarded")
+            .expect("forwarded message");
+        assert_unicast_destination(&forwarded.routing.dst, "SY.orchestrator@worker1");
+
+        harness
+            .inject(from_orchestrator(
+                "status-meanwhile",
+                "NODE_STATUS_GET",
+                serde_json::json!({ "node_name": "SY.timer@motherbee", "target": "motherbee" }),
+            ))
+            .await
+            .expect("inject NODE_STATUS_GET");
+        let status = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("NODE_STATUS_GET answered while the help is pending")
+            .expect("status reply");
+        assert_eq!(status.meta.msg.as_deref(), Some("NODE_STATUS_GET_RESPONSE"));
+        assert_eq!(status.routing.trace_id, "status-meanwhile");
+
+        let silent = serde_json::json!({
+            "status": "ok",
+            "node_name": "AI.sales@worker1",
+            "help": null,
+            "reason": "the node did not answer NODE_HELP within 3 s",
+        });
+        harness
+            .inject(test_response_for(
+                &forwarded,
+                SYSTEM_KIND,
+                "NODE_HELP_RESPONSE",
+                silent.clone(),
+            ))
+            .await
+            .expect("inject the hive's answer");
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("NODE_HELP answered by its task")
+            .expect("NODE_HELP reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some("NODE_HELP_RESPONSE"));
+        assert_eq!(reply.routing.trace_id, "help-pending");
+        assert_eq!(reply.payload, silent);
+    }
+
     /// The files an SY node keeps under nodes/SY are its own: the inventory lists it from its unit,
     /// with no managed config or state, and leaves out one this hive's role does not run.
     #[test]
@@ -38419,6 +39183,88 @@ blob:
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_runtime_version_answers_the_tool_catalog_it_ships() {
+        let root = std::env::temp_dir().join(format!("fluxbee-tool-catalog-{}", Uuid::new_v4()));
+        let dir = root.join("ai.generic").join("0.1.86");
+        fs::create_dir_all(&dir).expect("version dir");
+        let catalog = serde_json::json!({
+            "runtime": "ai.generic",
+            "runtime_version": "0.1.86",
+            "tools": [{"name": "publish_html_page"}],
+        });
+        fs::write(dir.join("tools.json"), catalog.to_string()).expect("tools.json");
+
+        assert_eq!(
+            runtime_tool_catalog(&root, "ai.generic", Some("0.1.86")),
+            catalog
+        );
+        // No version, a version without a catalog, a bad token: no catalog, never an error.
+        assert!(runtime_tool_catalog(&root, "ai.generic", None).is_null());
+        assert!(runtime_tool_catalog(&root, "ai.generic", Some("0.1.85")).is_null());
+        assert!(runtime_tool_catalog(&root, "ai.generic", Some("../0.1.86")).is_null());
+        // Not JSON, or larger than one frame can carry: null.
+        fs::write(dir.join("tools.json"), "not json").expect("rewrite");
+        assert!(runtime_tool_catalog(&root, "ai.generic", Some("0.1.86")).is_null());
+        let oversized = vec![b' '; RUNTIME_TOOL_CATALOG_MAX_BYTES as usize + 1];
+        fs::write(dir.join("tools.json"), oversized).expect("oversized");
+        assert!(runtime_tool_catalog(&root, "ai.generic", Some("0.1.86")).is_null());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A spoke's dist mirror is the Syncthing user's to write, so `tools.json` is read only as a
+    /// regular file under its own name: `.` and `..` are no runtime or version, and a symlink, a
+    /// FIFO or a directory planted as `tools.json` reads as no catalog, without blocking.
+    #[test]
+    fn a_tool_catalog_is_read_only_from_a_regular_file_under_its_name() {
+        let base = std::env::temp_dir().join(format!("fluxbee-tool-catalog-{}", Uuid::new_v4()));
+        let root = base.join("runtimes");
+        let dir = root.join("ai.generic").join("0.1.86");
+        fs::create_dir_all(&dir).expect("version dir");
+        let catalog = serde_json::json!({ "runtime": "ai.generic", "tools": [] }).to_string();
+        let elsewhere = base.join("catalog.json");
+        fs::write(&elsewhere, &catalog).expect("a catalog elsewhere");
+        let path = dir.join("tools.json");
+        let read = || runtime_tool_catalog(&root, "ai.generic", Some("0.1.86"));
+
+        // `.` and `..` reach catalogs outside a version's own directory.
+        fs::write(root.join("ai.generic").join("tools.json"), &catalog).expect("runtime level");
+        fs::write(root.join("tools.json"), &catalog).expect("root level");
+        fs::create_dir_all(base.join("0.1.86")).expect("beside the root");
+        fs::write(base.join("0.1.86").join("tools.json"), &catalog).expect("beside the root");
+        for (runtime, version) in [
+            ("ai.generic", "."),
+            ("ai.generic", ".."),
+            ("..", "0.1.86"),
+            (".", "ai.generic"),
+        ] {
+            assert!(
+                runtime_tool_catalog(&root, runtime, Some(version)).is_null(),
+                "{runtime}/{version}"
+            );
+        }
+
+        std::os::unix::fs::symlink(&elsewhere, &path).expect("symlink");
+        assert!(read().is_null(), "a symlink is not followed");
+        fs::remove_file(&path).expect("remove the symlink");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        assert!(read().is_null(), "a FIFO is refused without blocking");
+        fs::remove_file(&path).expect("remove the FIFO");
+
+        fs::create_dir(&path).expect("a directory");
+        assert!(read().is_null(), "a directory is no catalog");
+        fs::remove_dir(&path).expect("remove the directory");
+
+        fs::write(&path, &catalog).expect("the real catalog");
+        assert_eq!(read()["runtime"], "ai.generic");
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

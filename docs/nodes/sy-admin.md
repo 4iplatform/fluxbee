@@ -14,7 +14,11 @@ Source: `src/bin/sy_admin.rs`. The Fluxbee Cloud allowlist is `CLOUD_EXPOSED_ACT
 **Live schema.** `GET /admin/actions` returns every action with its routes, request contract,
 executor schema and an example; `GET /admin/actions/{action}` returns one
 (`build_admin_actions_catalog_response`, `build_admin_action_help_response`). The
-[action table](#action-table) at the end of this page is generated from the same functions.
+[action table](#action-table) at the end of this page is generated from the same functions. The
+AI node config examples (`set_node_config`, `node_control_config_set`) name no
+`behavior.provider`, so a copied one runs on the hive's `ai.default_provider`; their notes say
+to name a provider only when the node's tenant holds a key of it, since without one every message
+fails with `missing_ai_api_key`.
 
 | | |
 | --- | --- |
@@ -225,7 +229,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 
 | Actions | Sent to | How |
 | --- | --- | --- |
-| node lifecycle, node config/state/status, hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
+| node lifecycle, node config/state/status, a node's self-description (`node_help`), hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
 | routes, VPNs, taps | `SY.config.routes@<hive>` | `msg_type: admin` (`build_admin_request`) |
 | `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
 | identity actions | `SY.identity@<hive>` | `ILK_*`, `TNT_*` (`handle_identity_command`, `handle_identity_query`) |
@@ -248,6 +252,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hive` 30
 (`JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS`; the join itself runs in the background), `update` 60,
 `sync_hint` 45, `core_rollback` 300, `get_llm_usage` 20, `acme_reload` 90 (the edge has 75 s),
+`node_help` 10 (the node's hive gives the node 3 s, the motherbee gives that hive 7 s),
 `kill_node` and `remove_node_instance` 180 (a purge waits for the node's teardown: the
 orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
 catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEOUT_SECS`; for
@@ -302,6 +307,43 @@ same whatever happened:
 same payload: a step that failed says `error` with `error_code` and `error_detail` (per key in
 `errors`, or on `vault_secrets_purged` itself when the listing failed), and one that did not run
 says `skipped`.
+
+## A node's self-description
+
+`GET /hives/{hive}/nodes/{node_name}/help` (`node_help`) asks one node to describe itself and
+returns what it says ([agent-tools-v1](../agent-tools-v1.md) §3.3). An AI node answers with the
+cards of its tools. Every AI agent loads the same base tools, so any running AI node gives the
+whole catalog. Before it designs a role or a skill, Archi reads the same cards first from
+`get_runtime` on `ai.generic` (`GET /hives/motherbee/runtimes/ai.generic`, its `tool_catalog`),
+which needs no running node, and from a running AI node with `node_help`. The operator asks
+Archi, and over the mesh only Archi may ask for it (`mesh_access`).
+
+- **The way**, as `get_node_status`'s:
+  1. SY.admin sends `node_help` to `SY.orchestrator@motherbee` (`msg_type: admin`);
+  2. for a node of another hive, that orchestrator forwards `NODE_HELP` to the hive's
+     orchestrator and waits 7 s (`NODE_HELP_FORWARD_TIMEOUT_SECS`);
+  3. the node's own hive sends `NODE_HELP` to the node and waits 3 s
+     (`NODE_HELP_PROBE_TIMEOUT_SECS`, `node_help_flow` in `src/bin/sy_orchestrator.rs`), only
+     when `ai.generic` runs the node (its package's base runtime included). Any other node, a core
+     node included, is answered at once.
+
+  Each orchestrator runs it in a task of its own, so the wait holds no other admin or system
+  request ([SY.orchestrator, messages](sy-orchestrator.md#messages)). SY.admin waits 10 s. The
+  router delivers `NODE_HELP` only from an orchestrator (system policy rule (3), a read) or the
+  same hive's admin (rule (4)).
+- **The answer**, always 200 for a node that exists: `{status: "ok", node_name, help, reason}`.
+  - `help` is the node's `NODE_HELP_RESPONSE`, `{status: "ok", node_name, runtime,
+    runtime_version, tools: [card, ...]}`, and `reason` is null;
+  - or `help` is null, and `reason` says why: what runs the node does not answer `NODE_HELP`
+    (today only `ai.generic` does), the node is not connected (its lifecycle is named), it did not
+    answer within 3 s (a busy AI node may not), or it answered with an error.
+- **A card:** `{name, summary, when_to_use, limits: [...], present_when, input: <JSON schema>,
+  output: <JSON schema>, errors: [{code, meaning}]}`. `present_when` says when the tool is there.
+  The same cards make the generated catalog, `docs/reference/agent-tools.md`.
+- **Errors:** a node that does not exist answers `404 NODE_NOT_FOUND`, as `get_node_status`
+  does; a hive whose orchestrator does not answer, `500 NODE_HELP_FAILED`.
+
+SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_HELP` later.
 
 ## The executor
 
@@ -695,7 +737,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 16, 106 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 17, 107 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -712,7 +754,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `list_versions` | `GET /versions` | List core and runtime versions across hives. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
-| `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive. |
+| `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive; `tool_catalog` is the tool catalog its version ships (ai.generic's base tools), or null. |
 | `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}` | Delete one published runtime version from motherbee dist/manifest. |
 | `list_routes` | `GET /hives/{hive}/routes` | List route rules for a hive. |
 | `list_vpns` | `GET /hives/{hive}/vpns` | List VPN patterns for a hive. |
@@ -740,6 +782,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `set_node_config` | `PUT /hives/{hive}/nodes/{node_name}/config` | Persist node config changes. |
 | `get_node_state` | `GET /hives/{hive}/nodes/{node_name}/state` | Read the persisted state payload of one node. |
 | `get_node_status` | `GET /hives/{hive}/nodes/{node_name}/status` | Read the effective runtime status of one node. |
+| `node_help` | `GET /hives/{hive}/nodes/{node_name}/help` | Ask one node to describe itself (NODE_HELP) and return what it says. |
 | `list_tenant_nodes` | `GET /hives/{hive}/identity/tenants/{tenant_id}/nodes` | List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them. |
 | `send_node_message` | `POST /hives/{hive}/nodes/{node_name}/messages` | Send a system message to a node. |
 | `list_recent_commands` | `GET /hives/{hive}/commands` | Audit log: list the most recent admin commands executed on this backend (all origins — operator HTTP, internal L2 callers like SY.architect, and executor-plan steps), with redacted params, result status and duration. Read-only. |

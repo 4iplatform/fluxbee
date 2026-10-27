@@ -24,7 +24,7 @@ async fn thread_state_get_returns_found_false_when_record_is_missing() {
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
 
-    let tool = ThreadStateGetTool::new(Arc::new(store));
+    let tool = ThreadStateGetTool::new(Arc::new(store), "thr-missing");
     let out = tool
         .call(json!({ "state_key": "thr-missing" }))
         .await
@@ -50,7 +50,7 @@ async fn thread_state_get_returns_record_when_present() {
         .await
         .expect("seed record");
 
-    let tool = ThreadStateGetTool::new(Arc::new(store));
+    let tool = ThreadStateGetTool::new(Arc::new(store), "thr-1");
     let out = tool
         .call(json!({ "state_key": "thr-1" }))
         .await
@@ -77,7 +77,7 @@ async fn thread_state_put_writes_record_visible_to_store_get() {
     store.ensure_ready().await.expect("store ready");
 
     let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
-    let put_tool = ThreadStatePutTool::new(store_arc.clone());
+    let put_tool = ThreadStatePutTool::new(store_arc.clone(), "thr-put-1");
 
     let out = put_tool
         .call(json!({
@@ -119,7 +119,7 @@ async fn thread_state_put_overwrites_existing_record() {
         .await
         .expect("seed record");
 
-    let put_tool = ThreadStatePutTool::new(Arc::new(store.clone()));
+    let put_tool = ThreadStatePutTool::new(Arc::new(store.clone()), "thr-put-2");
     put_tool
         .call(json!({
             "state_key": "thr-put-2",
@@ -153,7 +153,7 @@ async fn thread_state_delete_removes_existing_record() {
         .await
         .expect("seed record");
 
-    let delete_tool = ThreadStateDeleteTool::new(Arc::new(store.clone()));
+    let delete_tool = ThreadStateDeleteTool::new(Arc::new(store.clone()), "thr-del-1");
     let out = delete_tool
         .call(json!({ "state_key": "thr-del-1" }))
         .await
@@ -180,7 +180,7 @@ async fn thread_state_delete_is_idempotent_for_missing_record() {
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
 
-    let delete_tool = ThreadStateDeleteTool::new(Arc::new(store));
+    let delete_tool = ThreadStateDeleteTool::new(Arc::new(store), "thr-del-missing");
     let out = delete_tool
         .call(json!({ "state_key": "thr-del-missing" }))
         .await
@@ -196,14 +196,15 @@ async fn thread_state_delete_is_idempotent_for_missing_record() {
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 
+/// The key the model passes never chooses the record: the tools reach only their own.
 #[tokio::test]
-async fn scoped_provider_overrides_model_supplied_thread_id() {
+async fn the_tools_keep_to_their_own_record_whatever_key_the_model_names() {
     let root = unique_temp_store_root();
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
     let store_arc: Arc<dyn ThreadStateStore> = Arc::new(store.clone());
 
-    let provider = ThreadStateToolsProvider::with_get_put_delete_scoped(store_arc, "sim-thread-1");
+    let provider = ThreadStateToolsProvider::new(store_arc, "sim-thread-1");
     let mut registry = fluxbee_ai_sdk::FunctionToolRegistry::new();
     provider
         .register_tools(&mut registry)
@@ -237,7 +238,7 @@ async fn thread_state_tools_reject_legacy_thread_id_alias() {
     let store = LanceDbThreadStateStore::new(root.clone());
     store.ensure_ready().await.expect("store ready");
 
-    let put_tool = ThreadStatePutTool::new(Arc::new(store));
+    let put_tool = ThreadStatePutTool::new(Arc::new(store), "legacy-thread-3");
     let err = put_tool
         .call(json!({
             "thread_id": "legacy-thread-3",

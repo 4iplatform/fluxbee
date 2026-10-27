@@ -4047,7 +4047,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "16";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "17";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4283,6 +4283,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "get_node_status",
         route: InternalActionRoute::Command("get_node_status"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "node_help",
+        route: InternalActionRoute::Command("node_help"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4760,6 +4766,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "start_node"
         | "remove_node_instance"
         | "get_node_state"
+        // A node's self-description: Archi reads the AI nodes' tool catalog to design roles and
+        // skills (docs/agent-tools-v1.md T4). A node never asks for another's.
+        | "node_help"
         | "list_tenant_nodes"
         | "send_node_message"
         | "list_recent_commands"
@@ -9369,6 +9378,14 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "get_node_status", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["nodes", name, "help"]) => {
+            let payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "node_help", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("POST", ["nodes", name, "messages"]) => {
             let mut payload = if body.is_empty() {
                 serde_json::json!({})
@@ -11918,6 +11935,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
         }
         "get_node_status" => "Read the effective runtime status of one node.",
+        "node_help" => "Ask one node to describe itself (NODE_HELP) and return what it says. An AI node answers with the cards of its tools, the base tools every AI agent has: what each tool does, when to use it, its limits, when it is present, its input and output schemas and its errors. A node without a self-description, or one not running, answers help null with the reason.",
         "get_node_state" => "Read the persisted state payload of one node.",
         "get_node_config" => "Read the stored effective config.json payload for a managed node.",
         "node_control_config_get" => {
@@ -11968,7 +11986,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "list_versions" => "List core and runtime versions across hives.",
         "get_versions" => "Read core and runtime versions for one hive.",
         "list_runtimes" => "List runtimes for one hive.",
-        "get_runtime" => "Read one runtime definition in a hive.",
+        "get_runtime" => "Read one runtime definition in a hive: its versions, readiness, materialization, health and usage, and as tool_catalog the tool cards its version ships (ai.generic's base tools; null for a runtime that ships none).",
         "remove_runtime_version" => {
             "Delete one published runtime version from motherbee dist/manifest."
         }
@@ -12157,6 +12175,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_llm_usage" => vec!["GET /hives/{hive}/usage"],
         "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
+        "node_help" => vec!["GET /hives/{hive}/nodes/{node_name}/help"],
         "get_node_state" => vec!["GET /hives/{hive}/nodes/{node_name}/state"],
         "get_node_config" => vec!["GET /hives/{hive}/nodes/{node_name}/config"],
         "node_control_config_get" => {
@@ -12377,6 +12396,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             ),
         ],
         "get_node_status"
+        | "node_help"
         | "get_node_state"
         | "get_node_config"
         | "kill_node"
@@ -13335,6 +13355,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "match_dst": "AI.sales@motherbee",
             "target": "IO.slack.sales@motherbee"
         }),
+        // No `behavior.provider`: a copied example runs on the hive's provider (the notes say when
+        // to name one).
         "set_node_config" => serde_json::json!({
             "config": {
                 "behavior": {
@@ -13586,6 +13608,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "list_tenant_nodes" => "curl -X GET /hives/motherbee/identity/tenants/tnt:.../nodes",
         "get_node_status" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/status",
+        "node_help" => "curl -X GET /hives/worker1/nodes/AI.sales@worker1/help",
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
         "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.sales@motherbee/config",
         "run_node" => {
@@ -13866,9 +13889,23 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "status ok only when every step was done; otherwise TEARDOWN_INCOMPLETE with the same payload. When a secret cannot be deleted the ILK is left in place, so a retry can still tie the remaining secrets to the node.",
             "SY.* and RT.* nodes are never torn down: run_node does not launch them.",
         ],
-        "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
+        "remove_node_instance" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+        ],
+        "set_node_config" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            "For ai.generic, config.behavior.provider (openai or anthropic) is optional: without it the node runs on the hive's ai.default_provider, as the example does. Name one only when the node's tenant holds a key of that provider in SY.vault; a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. config.behavior.model must be a model of the node's provider.",
+        ],
+        "node_help" => vec![
+            "The hive comes from the /hives/{hive} path in HTTP; the node_name path segment is a fully-qualified node name, for example AI.sales@worker1. Takes no body.",
+            "It travels as get_node_status does: SY.admin asks the motherbee's SY.orchestrator, which sends NODE_HELP to the orchestrator of the node's hive, which asks the node. Only a node that ai.generic runs (its package's base runtime included) is asked, and it has 3 s to answer; any other node, a core node included, is answered at once.",
+            "Always 200 for a node that exists: payload {status: \"ok\", node_name, help, reason}. help is the node's NODE_HELP_RESPONSE, {status: \"ok\", node_name, runtime, runtime_version, tools: [card, ...]}, and reason is null.",
+            "help is null, and reason says why, when the node's runtime does not answer NODE_HELP (today only ai.generic does), when it is not connected, when it did not answer within 3 s (a busy node may not), or when it answers with an error. None of these is an error of the action.",
+            "Each card: {name, summary, when_to_use, limits: [...], present_when, input: <JSON schema>, output: <JSON schema>, errors: [{code, meaning}]}. present_when says when the tool is there, for example only when the message names its interlocutor, or only for a node with its own identity.",
+            "Every AI agent (ai.generic) loads the same base tools. Read their catalog first with get_runtime on ai.generic (GET /hives/motherbee/runtimes/ai.generic), whose tool_catalog has the same cards and needs no running node; node_help gives them from a running AI node. docs/reference/agent-tools.md is the same catalog, generated from the code with each runtime version. Read it before designing a role or a skill, and never write one that promises a tool the catalog does not list.",
+            "A node that does not exist answers 404 NODE_NOT_FOUND, as get_node_status does; 500 NODE_HELP_FAILED when the node's hive does not answer. SY.timer describes itself with timer_help.",
         ],
         "get_node_config" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -13898,7 +13935,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat with a model. The key is not config: the node reads the hive AI provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
+            "For ai.generic chat, use config.behavior.kind=ai_chat with a model of the node's provider. config.behavior.provider (openai or anthropic) is optional: without it the node runs on the hive's ai.default_provider, as the example does. Name one only when the node's tenant holds a key of that provider; without one, every message fails with missing_ai_api_key. config.behavior.multimodal (true when absent) says whether the model receives images; config.behavior.capabilities is refused. The key is not config: the node reads its provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
@@ -17549,6 +17586,7 @@ fn build_admin_request(
         | "set_node_config"
         | "get_node_state"
         | "get_node_status"
+        | "node_help"
         | "list_tenant_nodes"
         | "remove_hive"
         | "core_rollback"
@@ -17786,6 +17824,10 @@ fn admin_action_timeout(action: &str) -> Duration {
         "core_rollback" => Duration::from_secs(
             env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
         ),
+        // The node's hive gives the node 3 s to answer NODE_HELP and the motherbee gives that hive
+        // 7 s: wait longer than both, so a silent node reads as `help: null` and a hive that does
+        // not answer as NODE_HELP_FAILED, never as this timeout.
+        "node_help" => Duration::from_secs(10),
         // A reload waits up to 75 s for the edge (docs/acme-edge-certificates-v1.md §6 step 7).
         "acme_reload" => Duration::from_secs(90),
         // The status asks the edge for its live status (20 s); renew and test answer 202 at once.
@@ -17906,6 +17948,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "set_node_config"
             | "get_node_state"
             | "get_node_status"
+            | "node_help"
             | "remove_hive"
             | "add_hive"
             | "record_drift_alert"
@@ -17987,6 +18030,7 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "node_control_config_set"
             | "get_node_state"
             | "get_node_status"
+            | "node_help"
             | "send_node_message"
             | "teardown_node"
     )
@@ -21952,6 +21996,42 @@ mod tests {
         assert!(definition.parameters_json_schema["properties"]["action_name"].is_null());
     }
 
+    /// The longest function description a model API takes: OpenAI refuses a longer one. A byte
+    /// count bounds every way of counting it. What does not fit goes in the parameters'
+    /// descriptions, which do not count.
+    const MODEL_TOOL_DESCRIPTION_MAX: usize = 1024;
+
+    /// Every tool the executor offers a model has a description a model API takes: a step's
+    /// action, whichever of the registry it is, its help lookup, and the plan review's report.
+    #[test]
+    fn every_executor_tool_description_fits_a_model_api() {
+        let mut definitions: Vec<FunctionToolDefinition> = INTERNAL_ACTION_REGISTRY
+            .iter()
+            .map(build_admin_executor_function_definition)
+            .collect();
+        definitions.push(
+            PlanStepReviewTool {
+                issues: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
+            .definition(),
+        );
+        // The step and help tools take their definitions from the registry: a tool of another
+        // kind would escape the bound.
+        let impls = include_str!("sy_admin.rs")
+            .lines()
+            .filter(|line| line.starts_with("impl FunctionTool for "))
+            .count();
+        assert_eq!(impls, 3, "every executor tool is checked here");
+        for definition in &definitions {
+            assert!(
+                definition.description.len() <= MODEL_TOOL_DESCRIPTION_MAX,
+                "{}: {} bytes",
+                definition.name,
+                definition.description.len()
+            );
+        }
+    }
+
     #[test]
     fn redact_executor_log_value_redacts_secret_like_fields() {
         let value = json!({
@@ -25523,7 +25603,208 @@ mod tests {
         assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"web_status"));
         // The orchestrator's view, which itself waits up to 2 s for the node's answer.
         assert_eq!(admin_action_timeout("web_status"), Duration::from_secs(5));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "16");
+    }
+
+    // --- GET /hives/{hive}/nodes/{node_name}/help (docs/agent-tools-v1.md §3.3) ---------------
+
+    const HELP_NODE: &str = "AI.sales@worker1";
+
+    /// A node's NODE_HELP_RESPONSE as docs/agent-tools-v1.md §3.3 shapes it, with one card.
+    fn node_help_response() -> Value {
+        json!({
+            "status": "ok",
+            "node_name": HELP_NODE,
+            "runtime": "ai.generic",
+            "runtime_version": "0.1.86",
+            "tools": [{
+                "name": "thread_state_get",
+                "summary": "Read what this conversation keeps under a key.",
+                "when_to_use": "Before answering, to recall what the conversation already settled.",
+                "limits": ["Only the state of the interlocutor of the current message."],
+                "present_when": "the message names its interlocutor (src_ilk)",
+                "input": {
+                    "type": "object",
+                    "properties": { "key": { "type": "string" } },
+                    "required": ["key"],
+                },
+                "output": {
+                    "type": "object",
+                    "properties": { "value": {} },
+                },
+                "errors": [{ "code": "not_found", "meaning": "nothing is kept under this key" }],
+            }],
+        })
+    }
+
+    /// One `node_help` through the dispatcher, as Archi asks for it over the mesh, with the
+    /// motherbee's orchestrator answering `answer`.
+    async fn node_help_with(
+        ctx: &AdminContext,
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        answer: Value,
+    ) -> InternalAdminDispatchResult {
+        let help = dispatch_internal_admin_command(
+            ctx,
+            &ctx.rpc,
+            "node_help",
+            Some("worker1"),
+            json!({ "node_name": HELP_NODE }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        );
+        let orchestrator = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("node_help to the orchestrator");
+            assert_eq!(sent.meta.msg_type, "admin");
+            assert_eq!(sent.meta.action.as_deref(), Some("node_help"));
+            assert_eq!(
+                dst_of(&sent),
+                json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
+            );
+            assert_eq!(
+                sent.routing.src_l2_name.as_deref(),
+                Some("SY.admin@motherbee")
+            );
+            assert_eq!(sent.payload["node_name"], HELP_NODE);
+            assert_eq!(sent.payload["target"], "worker1");
+            let mut reply = reply_to(&sent, "", answer);
+            reply.meta.msg_type = "admin".to_string();
+            reply.meta.msg = None;
+            harness.inject(reply).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(help, orchestrator);
+        result.expect("answered")
+    }
+
+    /// The answer is the orchestrator's, as for `get_node_status`: 200 with the node's
+    /// NODE_HELP_RESPONSE, 200 with `help: null` and the reason when it gives none (here, it did
+    /// not answer in time), and 404 for a node that does not exist.
+    #[tokio::test]
+    async fn node_help_answers_the_nodes_cards_or_why_not() {
+        let (ctx, mut harness) = opa_test_admin("node-help");
+
+        let described = json!({
+            "status": "ok",
+            "node_name": HELP_NODE,
+            "help": node_help_response(),
+            "reason": null,
+        });
+        let result = node_help_with(&ctx, &mut harness, described.clone()).await;
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(result.envelope["status"], "ok");
+        assert_eq!(result.envelope["action"], "node_help");
+        assert_eq!(result.envelope["payload"], described);
+        let card = &result.envelope["payload"]["help"]["tools"][0];
+        for field in [
+            "name",
+            "summary",
+            "when_to_use",
+            "limits",
+            "present_when",
+            "input",
+            "output",
+            "errors",
+        ] {
+            assert!(!card[field].is_null(), "the card carries {field}");
+        }
+
+        let silent = json!({
+            "status": "ok",
+            "node_name": HELP_NODE,
+            "help": null,
+            "reason": "the node did not answer NODE_HELP within 3 s",
+        });
+        let result = node_help_with(&ctx, &mut harness, silent.clone()).await;
+        assert_eq!(result.http_status, 200, "{}", result.envelope);
+        assert_eq!(result.envelope["status"], "ok");
+        assert_eq!(result.envelope["payload"], silent);
+
+        let missing = json!({
+            "status": "error",
+            "error_code": "NODE_NOT_FOUND",
+            "message": format!("node '{HELP_NODE}' not found"),
+            "target": "worker1",
+            "node_name": HELP_NODE,
+        });
+        let result = node_help_with(&ctx, &mut harness, missing).await;
+        assert_eq!(result.http_status, 404, "{}", result.envelope);
+        assert_eq!(result.envelope["error_code"], "NODE_NOT_FOUND");
+    }
+
+    /// `node_help` is in the catalog like `get_node_status`: a read of one node through the
+    /// orchestrator, with its route, help, example and timeout. Over the mesh Archi alone asks for
+    /// it: no node asks for another's self-description, and Cloud has no use for it.
+    #[test]
+    fn the_node_help_action_is_registered_with_its_contract() {
+        let spec = resolve_internal_action_spec("node_help").expect("node_help");
+        assert!(matches!(
+            spec.route,
+            InternalActionRoute::Command("node_help")
+        ));
+        assert!(spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], true);
+        assert_eq!(doc["confirmation_required"], false);
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["GET /hives/{hive}/nodes/{node_name}/help"])
+        );
+        assert_ne!(doc["summary"], "Admin action.");
+        assert_eq!(
+            doc["request_contract"]["path_params"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(doc["request_contract"]["body"]["kind"], "none");
+        assert!(admin_action_request_notes("node_help").len() >= 5);
+        assert_eq!(
+            admin_action_example_scmd("node_help").as_deref(),
+            Some("curl -X GET /hives/worker1/nodes/AI.sales@worker1/help")
+        );
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/worker1/nodes/AI.sales@worker1/help"),
+            vec!["GET"]
+        );
+        // Where get_node_status goes, with the node's hive as the target.
+        assert!(action_routes_via_local_orchestrator("node_help"));
+        assert!(is_node_scoped_action("node_help"));
+        assert_eq!(
+            normalize_admin_payload("node_help", json!({ "node_name": HELP_NODE }), None),
+            json!({ "node_name": HELP_NODE, "target": "worker1" })
+        );
+        assert_eq!(
+            classify_admin_action("node_help"),
+            classify_admin_action("get_node_status")
+        );
+        assert_eq!(mesh_access("node_help"), Some(MeshAccess::Archi));
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"node_help"));
+        let params = json!({ "node_name": HELP_NODE });
+        assert_eq!(
+            mesh_admits(
+                "SY.architect@motherbee",
+                "node_help",
+                Some("worker1"),
+                &params
+            ),
+            Ok(MeshAdmission::Admitted)
+        );
+        for caller in [
+            "AI.support@worker1",
+            "IO.cloud@motherbee",
+            "SY.wf-rules@worker1",
+            "SY.orchestrator@worker1",
+            "WF.invoice@worker1",
+        ] {
+            assert!(
+                mesh_admits(caller, "node_help", Some("worker1"), &params).is_err(),
+                "{caller}"
+            );
+        }
+        // Over both waits of the node's way: 3 s at its hive, 7 s for the motherbee's forward.
+        assert_eq!(admin_action_timeout("node_help"), Duration::from_secs(10));
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "17");
     }
 
     // --- A-81: a producer's blob reaches the motherbee before its curate -------------------

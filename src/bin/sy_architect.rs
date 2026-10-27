@@ -144,6 +144,8 @@ If you read live state to resolve a missing value for a mutation and the value b
 
 For `ai.generic` agents, use the handbook and tool schemas as the operational source of truth. Read persisted assets/config from the system when asked to inspect them; do not reconstruct source-of-truth content from chat memory. Identity stores cognitive definitions by hash reference, not embedded prompt text.
 
+Every AI agent loads the same base tools: beyond answering, an agent can do only what those tools do. Before you design a role or a skill, read their catalog: `GET /hives/motherbee/runtimes/ai.generic` (`get_runtime`) answers it as `tool_catalog`, with no AI node running. For a running AI node, `GET /hives/{hive}/nodes/{node_name}/help` (`node_help`) answers the same cards. Never write a role, skill or handbook that promises a tool the catalog does not list, and keep roles reusable: a role names no channel and no tool.
+
 ## Pipeline confirmation rules
 
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
@@ -955,22 +957,14 @@ impl FunctionTool for ArchitectSystemGetTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "fluxbee_system_get".to_string(),
+            // A model API takes at most 1024 characters here: the key paths are the `path`
+            // parameter's, whose description does not count.
             description: format!(
                 "Read live Fluxbee system state through SY.admin for hive {hive}. Read-only. \
                 Supports GET and the POST reads that change nothing: a node's live CONFIG_GET, an OPA policy check (POST /opa/policy/check) and the timer's conversions; every change goes through fluxbee_plan_compiler. \
-                Key paths: /inventory (all nodes), /versions, /hives/{{hive}}/runtimes, \
-                /hives/{{hive}}/nodes, /hives/{{hive}}/nodes/{{name}}/config (persisted), \
-                /hives/{{hive}}/identity/ilks, /hives/{{hive}}/identity/ilks/{{ilk_id}}, \
-                /hives/{{hive}}/identity/tenants, /hives/{{hive}}/identity/tenants/{{tenant_id}}, \
-                /hives/{{hive}}/vault/secrets (metadata list), \
-                /hives/{{hive}}/vault/secrets/{{key}}/metadata, \
-                /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
-                /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
-                /hives/{{hive}}/routes, /hives/{{hive}}/vpns, /hives/{{hive}}/taps, \
-                /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), \
-                /admin/actions/{{action}} (schema + example_scmd). \
+                The key paths are listed in the path parameter. What an AI agent can do: tool_catalog of /hives/motherbee/runtimes/ai.generic, with no AI node running; a running AI node answers the same cards at /hives/{{hive}}/nodes/{{name}}/help. \
                 Never execute paths with literal {{placeholders}}. \
-                For admin action schemas, prefer example_scmd over guessing. \
+                For admin action schemas, read /admin/actions/{{action}} and prefer its example_scmd over guessing. \
                 Do not use /admin/actions help lookups as the final step for requested mutations; call fluxbee_plan_compiler to stage executor plans.",
                 hive = self.context.hive_id,
             ),
@@ -985,7 +979,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions"
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions. Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
                     },
                     "body": {
                         "type": "object",
@@ -1249,7 +1243,7 @@ impl FunctionTool for CreateAgentRoleAssetTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "create_agent_role_asset".to_string(),
-            description: "Create an immutable role asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            description: "Create an immutable role asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity. A role stays reusable: it names no channel and no tool, so one role serves agents on any channel, and it never promises a tool the agents do not have (their catalog: tool_catalog of GET /hives/motherbee/runtimes/ai.generic; on a running AI node, GET /hives/{hive}/nodes/{node_name}/help).".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1292,7 +1286,7 @@ impl FunctionTool for CreateAgentSkillAssetTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "create_agent_skill_asset".to_string(),
-            description: "Create an immutable skill asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            description: "Create an immutable skill asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity. A skill may name the base tools every ai.generic agent has (their catalog: tool_catalog of GET /hives/motherbee/runtimes/ai.generic; on a running AI node, GET /hives/{hive}/nodes/{node_name}/help), never a tool that catalog does not list.".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1353,7 +1347,7 @@ impl FunctionTool for CreateAgentHandbookAssetTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "create_agent_handbook_asset".to_string(),
-            description: "Create an immutable handbook/reference asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            description: "Create an immutable handbook/reference asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity. A handbook may name the base tools every ai.generic agent has, never a tool their catalog does not list (tool_catalog of GET /hives/motherbee/runtimes/ai.generic; on a running AI node, GET /hives/{hive}/nodes/{node_name}/help).".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -2600,7 +2594,7 @@ For runtime_package, the artifact.files map must include at minimum:
 - `package.json` — JSON string with fields: name (lowercase), version (semver), type, runtime_base
 - `config/default-config.json` — JSON string with default node configuration
 
-For an ai.generic package, `config/default-config.json` is ai.generic's config: `behavior.kind: ai_chat` and `model`. It carries no prompt and no `instructions` (ai.generic refuses them): an agent's prompt is its ILK definition (role, skills, handbooks), not part of the package.
+For an ai.generic package, `config/default-config.json` is ai.generic's config: `behavior.kind: ai_chat` and `model`, a model of the node's provider; optionally `behavior.provider` (`openai` or `anthropic`, the hive's when absent; name one only when the nodes' tenant holds a key of that provider) and `behavior.multimodal` (whether the model receives images). It carries no prompt and no `instructions` (ai.generic refuses them): an agent's prompt is its ILK definition (role, skills, handbooks), not part of the package.
 
 `runtime_base` must be one of the values in `build_task_packet.known_context.available_runtimes`.
 If `target_kind` is `bundle_upload`, submit the same file map — the host will zip it.
@@ -12529,6 +12523,13 @@ fn translate_scmd(
         ("GET", ["hives", hive_id, "nodes", node_name, "status"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_node_status".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "node_name": node_name }),
+        }),
+        // A node's self-description: an AI node's tool cards (docs/agent-tools-v1.md §3.3).
+        ("GET", ["hives", hive_id, "nodes", node_name, "help"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "node_help".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({ "node_name": node_name }),
         }),
@@ -27119,6 +27120,88 @@ mod tests {
         assert!(prompt.contains("A user message such as \"reintenta\""));
     }
 
+    /// Archi designs roles and skills against the agent tools (docs/agent-tools-v1.md T4, T6):
+    /// first the catalog the runtime ships, which needs no running node, then a running node's.
+    #[test]
+    fn build_archi_prompt_sends_role_design_to_the_tool_catalog() {
+        let prompt = build_archi_prompt(None);
+        let catalog = prompt
+            .find("`GET /hives/motherbee/runtimes/ai.generic` (`get_runtime`)")
+            .expect("the runtime's tool_catalog");
+        let help = prompt
+            .find("`GET /hives/{hive}/nodes/{node_name}/help` (`node_help`)")
+            .expect("a running node's help");
+        assert!(catalog < help, "the catalog comes first");
+        assert!(prompt.contains("promises a tool the catalog does not list"));
+    }
+
+    /// The longest function description a model API takes: OpenAI refuses a longer one. A byte
+    /// count bounds every way of counting it. What does not fit goes in the parameters'
+    /// descriptions, which do not count.
+    const MODEL_TOOL_DESCRIPTION_MAX: usize = 1024;
+
+    /// Every tool Archi offers a model, whichever agent gets it (the chat, the designer, the
+    /// auditor, the programmer, the plan compiler), has a description a model API takes.
+    #[tokio::test]
+    async fn every_archi_tool_description_fits_a_model_api() {
+        let (rpc, _router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.architect@motherbee",
+            build_architect_rpc_profile().expect("architect rpc profile"),
+        );
+        let context = ArchitectAdminToolContext {
+            hive_id: PRIMARY_HIVE_ID.to_string(),
+            config_dir: PathBuf::from("/tmp/fluxbee-test-config"),
+            state_dir: PathBuf::from("/tmp/fluxbee-test-state"),
+            rpc,
+            ai_runtime: Arc::new(Mutex::new(None)),
+            node_name: "SY.architect@motherbee".to_string(),
+            self_ilk_id: "ilk:00000000-0000-4000-8000-000000000000".to_string(),
+            usage: UsageRecorder::disabled(),
+            session_id: None,
+            admin_actions_cache: Arc::new(Mutex::new(None)),
+            plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
+            active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
+            agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
+        };
+        let mut chat = FunctionToolRegistry::new();
+        ArchitectAdminReadToolsProvider::new(context.clone())
+            .register_tools(&mut chat)
+            .expect("the chat's tools");
+        let mut definitions = chat.definitions();
+        let store = Arc::new(LayerAssessmentStore::new());
+        definitions.extend([
+            AssessLayerTool {
+                store: Arc::clone(&store),
+            }
+            .definition(),
+            DesignerSubmitManifestTool { store }.definition(),
+            GetManifestCurrentTool::new(context.clone()).definition(),
+            DesignAuditorSubmitTool.definition(),
+            RealProgrammerSubmitArtifactTool.definition(),
+            PlanCompilerSubmitTool::new(json!({})).definition(),
+            PlanCompilerHelpTool {
+                context: context.clone(),
+            }
+            .definition(),
+            PlanCompilerLiveQueryTool { context }.definition(),
+        ]);
+
+        // A tool this test does not build would escape the bound.
+        let impls = include_str!("sy_architect.rs")
+            .lines()
+            .filter(|line| line.starts_with("impl FunctionTool for "))
+            .count();
+        assert_eq!(definitions.len(), impls, "every Archi tool is checked here");
+        for definition in &definitions {
+            assert!(
+                definition.description.len() <= MODEL_TOOL_DESCRIPTION_MAX,
+                "{}: {} bytes",
+                definition.name,
+                definition.description.len()
+            );
+        }
+    }
+
     #[test]
     fn pipeline_recovery_info_from_record_marks_interrupted_runs_resumable() {
         let run = PipelineRunRecord {
@@ -28196,6 +28279,24 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 6, "the admin catalog has six OPA write examples");
+    }
+
+    /// A node's self-description is a read next to its status (docs/agent-tools-v1.md §3.3), and
+    /// the admin catalog's example for it is one Archi runs.
+    #[test]
+    fn a_nodes_help_translates_to_node_help() {
+        let path = "/hives/worker1/nodes/AI.sales@worker1/help";
+        let translated = translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+            .unwrap_or_else(|err| panic!("{path}: {err}"));
+        assert_eq!(translated.action, "node_help");
+        assert_eq!(translated.target_hive, "worker1");
+        assert_eq!(
+            translated.params,
+            json!({ "node_name": "AI.sales@worker1" })
+        );
+        assert!(system_get_may_run("GET", &translated.action));
+        let admin_src = include_str!("sy_admin.rs");
+        assert!(admin_src.contains(&format!("\"node_help\" => \"curl -X GET {path}\"")));
     }
 
     #[test]

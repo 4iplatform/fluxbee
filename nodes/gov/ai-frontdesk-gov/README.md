@@ -19,6 +19,15 @@ registers them in SY.identity (`ILK_REGISTER`).
     `meta.msg = "frontdesk_handoff"`, never a payload shape alone, and it is taken only from an IO node (the
     sender the router stamps must start with `IO.`); any other sender gets `INVALID_REQUEST`.
   - conversational: the LLM gathers the data and calls the `ilk_register` tool.
+- **Its tools are its own** (agent-tools-v1 T10), outside the base-tool catalog: `thread_state_get`
+  and `thread_state_put` over the case's record, and `ilk_register`. There is no
+  `thread_state_delete`: a registered case ends saved with `status=completed`, and the turn's result
+  is read back from that state. Only the structured handoff deletes a registered case, in code.
+- **Its control plane:** `CONFIG_GET` and `CONFIG_SET` run only from SY.admin@motherbee,
+  `NODE_STATUS_GET` only from the orchestrator of its hive, and `PING` and `STATUS` from either,
+  each as a `system` message with the verb in its own case. Anything else that names one of them
+  (an `admin` message, the verb in another case, another sender) is refused with a WARN and an
+  `unauthorized` answer.
 - **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
   frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
   frontdesk never creates tenants, and never takes one from the person or from the LLM; with no tenant it answers

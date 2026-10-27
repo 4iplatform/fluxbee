@@ -30,11 +30,29 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 
 ## Control plane
 
+- **Who may ask:** a verb runs only as the router's authority gate delivers it, a `system` message
+  with the verb in its own case, and only from the node that sends it (the AI SDK's
+  `control_request`):
+  - `CONFIG_GET` and `CONFIG_SET` from SY.admin@motherbee, which sends them straight to the node on
+    any hive;
+  - `NODE_STATUS_GET` and `NODE_HELP` from the orchestrator of the node's own hive: SY.admin asks
+    the motherbee's orchestrator, which asks the node or the orchestrator of its hive;
+  - `PING` and `STATUS` from either.
+
+  Anything else that names a verb is refused, with a WARN in the journal and an `unauthorized`
+  answer under the verb's response: an `admin` message, the verb in another case (`config_set`),
+  another node, another hive's orchestrator.
 - **`CONFIG_GET`** returns:
   - the contract;
   - the effective config, redacted;
   - `api_key_source` (`vault` or `missing`);
+  - `ai_provider`: the provider in effect, `{name, source}`, where `source` is
+    `behavior.provider` or `hive` (with an `error` when hive.yaml cannot say);
   - the state of the agent definition (`definition_state`, `definition`, `active_prompt_chars`).
+- **`NODE_HELP`** returns the runtime's tool catalog: `{status: "ok", node_name, runtime,
+  runtime_version, tools}`, the cards of [Tools](#tools). `runtime_version` is the one the
+  orchestrator launched it at (`_system.runtime_version` of its `config.json`), `null` for a node
+  started by hand. Like `NODE_STATUS_GET`, it is answered in any state.
 - **`CONFIG_SET`** (`subsystem: "ai_node"`, `apply_mode: "replace"`) validates the config, applies it
   without a restart, and writes it to `config.json`.
   - A `config_version` lower than the current one is refused (`stale_config_version`).
@@ -45,14 +63,28 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 | Field | Meaning |
 | --- | --- |
 | `kind` | `ai_chat`, or `echo` (answers `Echo: <input>`, no model call) |
-| `model` | required for `ai_chat`: a model of the hive's provider, such as `gpt-5.5` on an OpenAI hive |
+| `model` | required for `ai_chat`: a model of the node's provider, such as `gpt-5.5` on OpenAI |
+| `provider` | `openai` or `anthropic`: the API the node speaks and the key it reads ([The key](#the-key)). Without it, the hive's, read on each request |
 | `model_settings` | `max_output_tokens`; an answer cut at it is a `provider_output_truncated` error. `temperature` and `top_p` are accepted too, but current models reject `temperature` (gpt-5.5, Claude 5): leave it out |
-| `base_url` | optional, and rarely needed: the full URL the request is posted to. Only `https` on `api.openai.com` or `api.anthropic.com`, unless the node's environment sets `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
-| `capabilities.multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory block included, and the SDK's tool loop cuts it at 1,200 characters |
+| `base_url` | optional, and rarely needed: the full URL the request is posted to. It needs `provider`, and it must be `https` on that provider's host (`api.openai.com` or `api.anthropic.com`); the node's environment can lift the host rule with `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
+| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory block included, and the SDK's tool loop cuts it at 1,200 characters |
 
 `behavior.vault_key`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`,
 `config.secrets` and `config.assets` are refused, as is any other unknown field under `behavior`,
 `behavior.instructions` included: the prompt is the agent definition (below), never config.
+
+`behavior.capabilities` is refused too: `capabilities.multimodal` became `multimodal`
+(agent-tools-v1 T9). A `config.json` that still has the old key is rewritten once when the node
+starts, when `capabilities` is `null` or holds `multimodal` alone, and the node's journal reports
+it:
+`config.json: behavior.capabilities converted to behavior.multimodal (agent-tools-v1 T9)`.
+
+- **The file as it was** stays next to it, `config.json.pre-0.1.86` (mode 0600), and the line names
+  it in `original_copy`: a rollback to 0.1.85 restores it
+  ([the runbook](../../../docs/ai-nodes-deploy-runbook.md#rolling-back-to-0185)).
+- **The rewrite is safe to interrupt:** each file is written to a temp file of its own (0600,
+  synced) and renamed into place; a failed write leaves `config.json` as it was. Without its copy,
+  nothing is converted, and the node boots FAILED_CONFIG with the reason.
 
 ### `config.runtime`
 
@@ -66,12 +98,12 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 
 ## The key
 
-On every request the node reads the key of the hive's provider from SY.vault:
+On every request the node reads the key of its provider from SY.vault:
 
-- **the provider** is `ai.default_provider` of `/etc/fluxbee/hive.yaml`, or OpenAI without an `ai:`
-  section;
-- **the lookup** is by `resource_type` `openai` or `anthropic`, in its tenant: a key the node owns,
-  else one assigned to it, else the tenant's general key (no owner, no assigned node);
+- **the provider** is `behavior.provider`; without it, `ai.default_provider` of
+  `/etc/fluxbee/hive.yaml`, or OpenAI without an `ai:` section;
+- **the lookup** is by `resource_type` `openai` or `anthropic`, only in its tenant: a key the node
+  owns, else one assigned to it, else the tenant's general key (no owner, no assigned node);
 - **a failed lookup** answers the message with a `missing_ai_api_key` error.
 
 ## The agent definition
@@ -128,11 +160,7 @@ On every request the node reads the key of the hive's provider from SY.vault:
   - other files go as documents, with `multimodal` on;
   - Anthropic takes only PDF documents;
   - limits: 8 attachments, 10 MB each.
-- **Tools:** the node always offers the model tools that make files: csv, text, json, markdown,
-  html, pdf, xlsx, docx, png, jpeg. The files go out as `attachments[]` of the reply.
-  - The thread-state tools are added when the message has a `src_ilk`.
-  - `publish_html_page` is added when the node has its ILK. It publishes a page through SY.admin and
-    returns its public URL.
+- **Tools:** see [Tools](#tools).
 - **Every model call** is recorded and charged to the node's tenant
   ([crates/fluxbee_ai_sdk/README.md](../../../crates/fluxbee_ai_sdk/README.md#usage-records-who-pays-for-each-call)).
 - **Time:** the AI runtime's defaults, not config:
@@ -144,3 +172,32 @@ On every request the node reads the key of the hive's provider from SY.vault:
 - **A message runs once.** When its handler fails or runs out of time, the sender gets an
   `ai_runtime_error` or `ai_runtime_timeout` error and the message is not run again: it may already
   have called the model or a tool such as `publish_html_page`.
+
+## Tools
+
+Every agent has every base tool of the runtime (agent-tools-v1 T5). Each tool declares one card in
+its code, an `AgentTool` of the AI SDK: what it does, when to use it, its limits, when it is
+present, its input and output schemas and its error codes. The model's definition of the tool is
+rendered from the card, and so are the catalog and the `NODE_HELP` answer.
+
+- **The catalog:** [docs/reference/agent-tools.md](../../../docs/reference/agent-tools.md), every
+  card with its limits, and its JSON, which the package ships next to the runtime as
+  `dist/runtimes/ai.generic/<version>/tools.json`. A test (`the_tool_catalog_matches_the_cards`)
+  fails when they differ from the code; it writes them again with
+  `UPDATE_AGENT_TOOLS_CATALOG=1`.
+- **Which tools a message gets:**
+  - always the ten file generators, csv, text, json, markdown, html, pdf, xlsx, docx, png and
+    jpeg. Their file goes out as `attachments[]` of the reply, with the text of the call that made
+    it; one file per reply;
+  - the thread-state tools when the message has a `src_ilk`: they read and write only that
+    sender's record;
+  - `publish_html_page` when the node has its ILK. It publishes a page through SY.admin and
+    returns its public URL, which expires after 24 h. The journal names the publication's id,
+    never the URL, which is the key to the page (FINDINGS A-95); the reply that carries the URL is
+    logged by its files' names and its text's length, never its text.
+- **A CSV cell never runs as a formula:** one that starts with `=`, `+`, `@`, a tab or a carriage
+  return, or with `-` and is not a plain number, gets a `'` in front (OWASP's CSV injection
+  advice).
+- **Each description fits the model APIs:** the description a card renders is at most 1,024
+  characters, which OpenAI enforces; the rules of an argument, such as a file's name, are in the
+  input schema.

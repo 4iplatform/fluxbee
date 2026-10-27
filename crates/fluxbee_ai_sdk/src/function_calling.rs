@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -13,11 +13,162 @@ use crate::immediate_memory::{
 use crate::text_payload::ModelContentPart;
 use crate::{AiSdkError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The longest description a provider API takes for one tool, in characters: OpenAI refuses a
+/// longer one with 400 `string_above_max_length`. A card's rendered description must fit
+/// ([`ToolCard::validate`]); the descriptions inside the input schema do not count.
+pub const TOOL_DESCRIPTION_MAX_CHARS: usize = 1024;
+
+/// What the model receives for one tool. Provider APIs take only these three: a name, a
+/// description and the input's JSON schema. An agent tool's is rendered from its card
+/// ([`ToolCard::model_definition`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters_json_schema: Value,
+}
+
+/// A tool's card (docs/agent-tools-v1.md T2, §3): the one declaration of a tool an AI agent has.
+/// The model's definition ([`Self::model_definition`]), the runtime's tool catalog and a node's
+/// `NODE_HELP` answer all come from it, so none of them can say something the others do not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCard {
+    /// The name the model calls it by.
+    pub name: String,
+    /// What it does, in one line.
+    pub summary: String,
+    /// When the agent should use it.
+    pub when_to_use: String,
+    /// What it cannot do, or does differently from what one would assume.
+    pub limits: Vec<String>,
+    /// When a message gets the tool: `always`, or the condition.
+    pub present_when: String,
+    /// The arguments, as a JSON schema: what the model receives.
+    pub input: Value,
+    /// The result, as a JSON schema. Its `description` is the "Returns:" line the model reads.
+    pub output: Value,
+    /// The codes of a `{"status": "error", "error_code": ..}` result.
+    pub errors: Vec<ToolErrorCode>,
+}
+
+/// A runtime's tool catalog (docs/agent-tools-v1.md §3.3): the cards of every base tool it has,
+/// generated from its code. It ships next to the runtime, as
+/// `dist/runtimes/<runtime>/<version>/tools.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCatalog {
+    pub runtime: String,
+    /// The version it ships with. `None` in the repository's copy: the package writes the version.
+    pub runtime_version: Option<String>,
+    pub tools: Vec<ToolCard>,
+}
+
+/// One `error_code` a tool returns, and what it means.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolErrorCode {
+    pub code: String,
+    pub meaning: String,
+}
+
+impl ToolErrorCode {
+    pub fn new(code: impl Into<String>, meaning: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            meaning: meaning.into(),
+        }
+    }
+}
+
+impl ToolCard {
+    /// What the model receives: the summary, when to use the tool, its limits and one line on what
+    /// it returns (the output schema's `description`), with the input schema. `present_when` and
+    /// `errors` stay out: the model gets a tool only when it is present, and reads an error's code
+    /// in the result.
+    pub fn model_definition(&self) -> FunctionToolDefinition {
+        let mut description = self.summary.trim().to_string();
+        let when_to_use = self.when_to_use.trim();
+        if !when_to_use.is_empty() {
+            description.push_str("\n\nWhen to use: ");
+            description.push_str(when_to_use);
+        }
+        if !self.limits.is_empty() {
+            description.push_str("\n\nLimits:");
+            for limit in &self.limits {
+                description.push_str("\n- ");
+                description.push_str(limit.trim());
+            }
+        }
+        if let Some(returns) = self.returns() {
+            description.push_str("\n\nReturns: ");
+            description.push_str(returns);
+        }
+        FunctionToolDefinition {
+            name: self.name.clone(),
+            description,
+            parameters_json_schema: self.input.clone(),
+        }
+    }
+
+    /// What the tool returns, in one line: the output schema's `description`.
+    pub fn returns(&self) -> Option<&str> {
+        self.output
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|returns| !returns.is_empty())
+    }
+
+    /// Whether the card says all it has to: a name, a one-line summary, when to use the tool and
+    /// when it is present, an object schema for the input, an output schema with its one-line
+    /// description, and each error code once with its meaning; and whether the description the
+    /// model receives fits in [`TOOL_DESCRIPTION_MAX_CHARS`]. Lists every gap.
+    pub fn validate(&self) -> std::result::Result<(), Vec<String>> {
+        let mut gaps = Vec::new();
+        let one_line = |text: &str| !text.trim().is_empty() && !text.contains('\n');
+        if self.name.trim().is_empty() {
+            gaps.push("name is empty".to_string());
+        }
+        if !one_line(&self.summary) {
+            gaps.push("summary must be one non-empty line".to_string());
+        }
+        if self.when_to_use.trim().is_empty() {
+            gaps.push("when_to_use is empty".to_string());
+        }
+        if self.present_when.trim().is_empty() {
+            gaps.push("present_when is empty".to_string());
+        }
+        if self.limits.iter().any(|limit| limit.trim().is_empty()) {
+            gaps.push("a limit is empty".to_string());
+        }
+        if self.input.get("type").and_then(Value::as_str) != Some("object") {
+            gaps.push("input must be an object schema".to_string());
+        }
+        if !self.returns().is_some_and(one_line) {
+            gaps.push("output needs a one-line description".to_string());
+        }
+        for (index, error) in self.errors.iter().enumerate() {
+            if error.code.trim().is_empty() || error.meaning.trim().is_empty() {
+                gaps.push(format!("error {index} needs a code and a meaning"));
+            }
+            if self.errors[..index]
+                .iter()
+                .any(|earlier| earlier.code == error.code)
+            {
+                gaps.push(format!("error code {} is listed twice", error.code));
+            }
+        }
+        let description = self.model_definition().description.chars().count();
+        if description > TOOL_DESCRIPTION_MAX_CHARS {
+            gaps.push(format!(
+                "the model's description has {description} characters, more than \
+                 {TOOL_DESCRIPTION_MAX_CHARS}"
+            ));
+        }
+        if gaps.is_empty() {
+            Ok(())
+        } else {
+            Err(gaps)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,10 +257,37 @@ impl Default for FunctionCallingConfig {
     }
 }
 
+/// A tool of the tool loop. A tool an AI agent has implements [`AgentTool`] instead, and gets this
+/// trait from its card; a SY node's own tools (Archi's, SY.admin's executor's, the frontdesk's
+/// `ilk_register`) implement it directly.
 #[async_trait]
 pub trait FunctionTool: Send + Sync {
     fn definition(&self) -> FunctionToolDefinition;
     async fn call(&self, arguments: Value) -> Result<Value>;
+}
+
+/// A tool an AI agent has (docs/agent-tools-v1.md T1, T2). Its card is its only declaration: it
+/// is a [`FunctionTool`] whose definition is rendered from the card, and it cannot declare another.
+#[async_trait]
+pub trait AgentTool: Send + Sync {
+    /// The tool's card. It belongs to the tool, not to one instance of it: a catalog is built
+    /// without one.
+    fn card() -> ToolCard
+    where
+        Self: Sized;
+
+    async fn call(&self, arguments: Value) -> Result<Value>;
+}
+
+#[async_trait]
+impl<T: AgentTool> FunctionTool for T {
+    fn definition(&self) -> FunctionToolDefinition {
+        T::card().model_definition()
+    }
+
+    async fn call(&self, arguments: Value) -> Result<Value> {
+        AgentTool::call(self, arguments).await
+    }
 }
 
 #[async_trait]
@@ -124,9 +302,11 @@ pub trait FunctionToolProvider: Send + Sync {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> Result<()>;
 }
 
+/// The tools one model turn offers. Kept in name order, so every message sends the same
+/// definitions in the same order: a stable prefix a provider can cache.
 #[derive(Default, Clone)]
 pub struct FunctionToolRegistry {
-    tools: HashMap<String, Arc<dyn FunctionTool>>,
+    tools: BTreeMap<String, Arc<dyn FunctionTool>>,
 }
 
 impl FunctionToolRegistry {
@@ -660,6 +840,51 @@ mod tests {
         }
     }
 
+    /// A tool known only by its name, for the order test.
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl FunctionTool for NamedTool {
+        fn definition(&self) -> FunctionToolDefinition {
+            FunctionToolDefinition {
+                name: self.0.to_string(),
+                description: "named".to_string(),
+                parameters_json_schema: json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _arguments: Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[test]
+    fn definitions_come_in_name_order_whatever_the_registration_order() {
+        let mut registry = FunctionToolRegistry::new();
+        for name in [
+            "publish_html_page",
+            "generate_csv_artifact",
+            "thread_state_get",
+        ] {
+            registry
+                .register(Arc::new(NamedTool(name)))
+                .expect("tool should register");
+        }
+        let names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "generate_csv_artifact",
+                "publish_html_page",
+                "thread_state_get"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn ignores_provisional_assistant_text_when_tool_calls_exist() {
         let model = SequencedModel::default();
@@ -749,6 +974,121 @@ mod tests {
         assert!(
             !tool_ran.load(Ordering::Relaxed),
             "no tool ran before the first turn"
+        );
+    }
+
+    struct CardedTool;
+
+    #[async_trait]
+    impl AgentTool for CardedTool {
+        fn card() -> ToolCard {
+            ToolCard {
+                name: "hive_name".to_string(),
+                summary: "Say which hive this node runs on.".to_string(),
+                when_to_use: "When the user asks where the agent runs.".to_string(),
+                limits: vec![
+                    "Only the hive's name.".to_string(),
+                    "Nothing about its nodes.".to_string(),
+                ],
+                present_when: "always".to_string(),
+                input: json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                output: json!({
+                    "description": "`{hive}`, the hive's name.",
+                    "type": "object",
+                    "properties": {"hive": {"type": "string"}}
+                }),
+                errors: vec![ToolErrorCode::new("no_hive", "The node has no hive.")],
+            }
+        }
+
+        async fn call(&self, _arguments: Value) -> Result<Value> {
+            Ok(json!({"hive": "motherbee"}))
+        }
+    }
+
+    /// The model reads the card: its summary, when to use the tool, its limits and what it
+    /// returns, with the input schema; not when it is present, nor its error codes.
+    #[tokio::test]
+    async fn an_agent_tool_is_offered_to_the_model_as_its_card_says() {
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(CardedTool))
+            .expect("tool should register");
+        let definitions = tools.definitions();
+        assert_eq!(definitions, vec![CardedTool::card().model_definition()]);
+        assert_eq!(definitions[0].name, "hive_name");
+        assert_eq!(
+            definitions[0].description,
+            "Say which hive this node runs on.\n\n\
+             When to use: When the user asks where the agent runs.\n\n\
+             Limits:\n- Only the hive's name.\n- Nothing about its nodes.\n\n\
+             Returns: `{hive}`, the hive's name."
+        );
+        assert_eq!(
+            definitions[0].parameters_json_schema,
+            CardedTool::card().input
+        );
+
+        let result = tools
+            .get("hive_name")
+            .expect("registered")
+            .call(json!({}))
+            .await
+            .expect("call");
+        assert_eq!(result, json!({"hive": "motherbee"}));
+    }
+
+    #[test]
+    fn a_card_without_its_parts_is_reported() {
+        assert_eq!(CardedTool::card().validate(), Ok(()));
+
+        let mut card = CardedTool::card();
+        card.summary = "Two\nlines.".to_string();
+        card.when_to_use = " ".to_string();
+        card.input = json!({"type": "string"});
+        card.output = json!({"type": "object"});
+        card.errors.push(ToolErrorCode::new("no_hive", "Again."));
+        let gaps = card.validate().expect_err("an incomplete card");
+        assert_eq!(
+            gaps,
+            vec![
+                "summary must be one non-empty line",
+                "when_to_use is empty",
+                "input must be an object schema",
+                "output needs a one-line description",
+                "error code no_hive is listed twice",
+            ]
+        );
+    }
+
+    /// OpenAI refuses a tool whose description passes 1024 characters, so a card that renders a
+    /// longer one is reported. The input schema's descriptions do not count.
+    #[test]
+    fn a_card_whose_description_passes_the_providers_limit_is_reported() {
+        let mut card = CardedTool::card();
+        let room = TOOL_DESCRIPTION_MAX_CHARS - card.model_definition().description.chars().count();
+        card.input["properties"]["note"] = json!({
+            "type": "string",
+            "description": "x".repeat(2 * TOOL_DESCRIPTION_MAX_CHARS)
+        });
+        card.limits.push("é".repeat(room - "\n- ".len()));
+        assert_eq!(
+            card.model_definition().description.chars().count(),
+            TOOL_DESCRIPTION_MAX_CHARS
+        );
+        assert_eq!(
+            card.validate(),
+            Ok(()),
+            "exactly the limit, counted in characters"
+        );
+
+        card.limits.push("!".to_string());
+        assert_eq!(
+            card.validate(),
+            Err(vec![format!(
+                "the model's description has {} characters, more than 1024",
+                TOOL_DESCRIPTION_MAX_CHARS + "\n- !".len()
+            )])
         );
     }
 

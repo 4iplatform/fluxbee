@@ -30,11 +30,13 @@ SY.vault and the identity writes live on the motherbee, so their calls below alw
 
 ## 2) Prerequisite: the provider's key
 
-- **The provider is the hive's:** `ai.default_provider` in `/etc/fluxbee/hive.yaml`, or `openai` when
-  there is no `ai:` section. When the section exists, it must name the provider's model
-  (`ai.providers.<provider>.model`).
-- **The node reads its key on every request,** from SY.vault, by the provider's `resource_type`
-  (`openai` or `anthropic`), in its own tenant:
+- **The provider is the node's** (agent-tools-v1 T8): `behavior.provider`, `openai` or `anthropic`
+  (step 4). Without it, the node uses the hive's: `ai.default_provider` in
+  `/etc/fluxbee/hive.yaml`, or `openai` when there is no `ai:` section, read on each request. When
+  the section exists, it must name the provider's model (`ai.providers.<provider>.model`). One node
+  may run on Claude and another on OpenAI; `CONFIG_GET` shows the one in effect in `ai_provider`.
+- **The node reads its key on every request,** from SY.vault, by its provider's `resource_type`
+  (`openai` or `anthropic`), only in its own tenant:
   - a key the node owns;
   - else a key assigned to it;
   - else the tenant's general key (no owner, no assigned node).
@@ -105,14 +107,19 @@ EOF
 ```
 
 - **The minimum for an `ai_chat` node** is `behavior.kind` and `behavior.model`. The model must
-  belong to the hive's provider.
+  belong to the node's provider.
 - **The config fields:**
   - `behavior.kind`: `ai_chat`, or `echo` (no model call; for tests);
   - `behavior.model`;
+  - `behavior.provider`: `openai` or `anthropic`; without it, the hive's (step 2);
   - `behavior.model_settings`: `max_output_tokens`. An answer cut at that limit is a
     `provider_output_truncated` error;
-  - `behavior.base_url`;
-  - `behavior.capabilities.multimodal`: `true` by default.
+  - `behavior.base_url`: it needs `behavior.provider`, and it must be `https` on that provider's
+    host (`api.openai.com` or `api.anthropic.com`);
+  - `behavior.multimodal`: `true` by default. The old `behavior.capabilities.multimodal` is refused;
+    a `config.json` that still has it is converted once when the node starts, and its journal says
+    so in one INFO line, which names the copy of the file as it was, `config.json.pre-0.1.86`
+    ([Rolling back to 0.1.85](#rolling-back-to-0185)).
 
   Each field is described in `nodes/ai/ai-generic/README.md`.
 - **Leave `temperature` out:** current models reject it (gpt-5.5, Claude 5; FINDINGS A-69).
@@ -127,6 +134,8 @@ EOF
 - **`CONFIG_SET` refuses:**
   - secrets: `config.secrets.*`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`;
   - `behavior.vault_key`;
+  - `behavior.capabilities` (now `behavior.multimodal`);
+  - a `behavior.base_url` without `behavior.provider`, or on the other provider's host;
   - cognitive assets (`config.assets`), which go through `set_ilk_definition`;
   - any unknown field under `behavior` or `runtime`, `behavior.instructions` included.
 - **`runtime` has two parts:**
@@ -234,6 +243,28 @@ node through SY.admin.
    - Do not restart the unit with a local `systemctl`: that relaunches the binary the unit was
      created with.
 
+### Rolling back to 0.1.85
+
+0.1.86 renamed `behavior.capabilities.multimodal` to `behavior.multimodal` and added
+`behavior.provider`, and 0.1.85 refuses both: a node that goes back to 0.1.85 with a 0.1.86
+`config.json` boots FAILED_CONFIG. Before its restart at 0.1.85, on the node's hive, in its
+directory:
+
+- **If 0.1.86 converted its `config.json`** when it first started, the file as it was is next to
+  it, `config.json.pre-0.1.86` (mode 0600); the conversion's INFO line names it. Restore it:
+
+  ```bash
+  cd "/var/lib/fluxbee/nodes/AI/$NODE"
+  sudo cp -p config.json.pre-0.1.86 config.json
+  ```
+
+  A `CONFIG_SET` applied under 0.1.86 is not in it: apply it again after the restart.
+- **Otherwise, edit `config.json`:** turn `behavior.multimodal` back into
+  `behavior.capabilities.multimodal`, and drop `behavior.provider`. The node then runs on the
+  hive's provider, so `behavior.model` and a `behavior.base_url` must be that provider's.
+
+Then restart the node through SY.admin (step 3 above), at 0.1.85.
+
 **A new node** with the new version is a `run_node` (step 3).
 
 **Removing a node** is a `kill_node` with `purge_instance`, the full teardown:
@@ -268,5 +299,9 @@ With `multimodal` off, only text attachments are accepted.
 
 - **The reply carries `attachments[]`,** and IO.slack uploads them to Slack.
 - **The runner's tools make the files:** csv, text, json, markdown, html, pdf, xlsx, docx, png, jpeg.
+  One file goes out per reply, with the text of the call that made it.
 - **`publish_html_page`** publishes an HTML page with a public URL, through SY.admin. It exists only
-  when the node has its ILK.
+  when the node has its ILK, and the link expires after 24 h.
+- **Every tool, with its limits:** the tool catalog,
+  [reference/agent-tools.md](reference/agent-tools.md), generated from the code. A running node
+  answers the same cards to `NODE_HELP`.

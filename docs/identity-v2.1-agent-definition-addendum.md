@@ -67,7 +67,7 @@ For this implementation:
 - `identity_ilks.definition` becomes the cognitive definition document shown below.
 - Legacy `roles` and `capabilities` in `ILK_REGISTER` / `ILK_UPDATE` are removed: SY.identity rejects them as unknown fields (`INVALID_REQUEST`). The controlled vocabulary of `10-identity-v2.md` §8 goes with them (superseded, never implemented).
 - OPA/routing consumes the new hash facts projected from SHM.
-- `behavior.capabilities.*` in AI node config remains operational runtime config and is unrelated to identity cognitive definition.
+- `behavior.multimodal` in AI node config (formerly `behavior.capabilities.multimodal`, agent-tools-v1 T9) is operational runtime config and is unrelated to identity cognitive definition.
 
 ---
 
@@ -871,7 +871,7 @@ These are used primarily by Archi's executor. Direct invocation by humans or by 
 
 ## 12. What is NOT in this scope
 
-- Tools/actions for agents (`tool_refs`). Deferred to a later iteration.
+- Tools/actions for agents (`tool_refs`). Superseded by [agent-tools-v1](agent-tools-v1.md): the tools are not part of the definition. Every agent has every base tool of its runtime, each declared by a card in the code ([reference/agent-tools.md](reference/agent-tools.md)); the cards reach the model as the tools' definitions, not in the composed prompt. Skills and handbooks may name base tools (T6).
 - Garbage collection of unreferenced assets in blob. Manual.
 - Multi-language assets (per-locale skills, per-locale personality `narrative.summary`). Not in scope.
 - Asset versioning beyond hash-based content addressing. Sufficient.

@@ -111,6 +111,18 @@ while IFS=$'\t' read -r rt crate bin ws lang boot inst; do
     --set-current
 done < <(mf runtimes)
 
+# ai.generic's tool catalog (docs/agent-tools-v1.md §3), the file Archi reads, goes next to the
+# runtime it describes: dist/runtimes/ai.generic/<version>/tools.json. It is the repository's
+# docs/reference/agent-tools.json, which a test keeps equal to the tools' cards in the code, with
+# the version this package ships.
+python3 -c 'import json, sys
+catalog = json.load(open(sys.argv[1], encoding="utf-8"))
+catalog["runtime_version"] = sys.argv[2]
+open(sys.argv[3], "w", encoding="utf-8").write(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n")' \
+  docs/reference/agent-tools.json "$VERSION" \
+  "$DEST/var/lib/fluxbee/dist/runtimes/ai.generic/$VERSION/tools.json"
+chmod 0644 "$DEST/var/lib/fluxbee/dist/runtimes/ai.generic/$VERSION/tools.json"
+
 # U-3: the runtimes manifest is OPERATOR STATE, never payload. Shipping it made every upgrade
 # replace the live manifest, orphaning hot-published runtimes (and the U-10 fix does not rescue
 # them: reconcile resolves the runtime KEY before the version). The .deb ships only the artifact

@@ -61,6 +61,9 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "CONFIG_GET",
     "NODE_STATE_GET",
     "NODE_STATUS_GET",
+    // A node's self-description (docs/agent-tools-v1.md §3.3): it travels as NODE_STATUS_GET does,
+    // from the orchestrators, and no node asks another for it directly.
+    "NODE_HELP",
     "GET_VERSIONS",
     "GET_RUNTIMES",
     "GET_RUNTIME",
@@ -556,10 +559,11 @@ mod tests {
     const SPOKE_ONLY_ACTIONS: [&str; 2] = ["ADD_HIVE_FINALIZE", "REMOVE_HIVE_CLEANUP"];
 
     /// Rule (3)'s reads (`orchestrator_reads`).
-    const ORCHESTRATOR_READS: [&str; 7] = [
+    const ORCHESTRATOR_READS: [&str; 8] = [
         "NODE_CONFIG_GET",
         "NODE_STATE_GET",
         "NODE_STATUS_GET",
+        "NODE_HELP",
         "LIST_NODES",
         "GET_VERSIONS",
         "GET_RUNTIMES",
@@ -732,8 +736,67 @@ mod tests {
         ));
     }
 
+    /// NODE_HELP (docs/agent-tools-v1.md §3.3) travels as NODE_STATUS_GET does: SY.admin asks the
+    /// motherbee's orchestrator, which forwards it to the node's hive, whose orchestrator asks the
+    /// node. The orchestrators send it (rule (3), a read) and the same hive's admin may (rule (4));
+    /// nobody else, not the vault's health probe of rule (5), and no node asks another directly.
     #[test]
-    fn protected_set_is_the_31_actions() {
+    fn node_help_travels_as_node_status_get() {
+        let hives = ["motherbee", "worker1", "ingress1"];
+        for receiving_hive in hives {
+            for sending_hive in hives {
+                for role in ["SY.orchestrator", "SY.admin"] {
+                    let sender = format!("{role}@{sending_hive}");
+                    assert_eq!(
+                        authorize_system("NODE_HELP", Some(&sender), receiving_hive),
+                        authorize_system("NODE_STATUS_GET", Some(&sender), receiving_hive),
+                        "{sender} sending NODE_HELP to {receiving_hive}"
+                    );
+                }
+            }
+        }
+        // The path itself: the motherbee's orchestrator to a spoke's, and each hive's orchestrator
+        // to its own nodes.
+        assert!(authorize_system(
+            "NODE_HELP",
+            Some("SY.orchestrator@motherbee"),
+            "worker1"
+        ));
+        assert!(authorize_system(
+            "NODE_HELP",
+            Some("SY.orchestrator@worker1"),
+            "worker1"
+        ));
+        assert!(!authorize_system(
+            "NODE_HELP",
+            Some("SY.orchestrator@worker1"),
+            "motherbee"
+        ));
+        for rogue in [
+            None,
+            Some(""),
+            Some("SY.vault@motherbee"),
+            Some("SY.architect@motherbee"),
+            Some("SY.wf-rules@worker1"),
+            Some("AI.sales@worker1"),
+            Some("IO.cloud@motherbee"),
+            Some("WF.invoice@worker1"),
+        ] {
+            assert!(
+                !authorize_system("NODE_HELP", rogue, "worker1"),
+                "{rogue:?} must not send NODE_HELP on worker1"
+            );
+            assert!(
+                !authorize_system("NODE_HELP", rogue, "motherbee"),
+                "{rogue:?} must not send NODE_HELP on the motherbee"
+            );
+        }
+        // The answer is no command: the node sends it back to whoever asked.
+        assert!(!is_protected_system_action("NODE_HELP_RESPONSE"));
+    }
+
+    #[test]
+    fn protected_set_is_the_32_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -759,6 +822,8 @@ mod tests {
             "CONFIG_GET",
             "NODE_STATE_GET",
             "NODE_STATUS_GET",
+            // A node's self-description (docs/agent-tools-v1.md §3.3).
+            "NODE_HELP",
             "GET_VERSIONS",
             "GET_RUNTIMES",
             "GET_RUNTIME",
@@ -776,7 +841,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 31);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 32);
         for action in [
             "RUNTIME_UPDATE",
             "HELLO",

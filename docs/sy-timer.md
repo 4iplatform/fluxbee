@@ -71,6 +71,8 @@ The owner-bound mutation operations stay outside `SY.admin` and remain as direct
 
 Future nodes with direct interaction (for example `WF.*`, invocable capabilities) must implement their own equivalent `HELP` operation. The generalization of the protocol, the common fields and the naming will be formalized in a separate document when the second or third case shows up.
 
+**The generic verb exists since 0.1.86:** `NODE_HELP` ([agent-tools-v1](agent-tools-v1.md) §3.3), which `SY.admin` exposes as `node_help` (`GET /hives/{hive}/nodes/{node_name}/help`). `ai.generic` answers it with its tool catalog. `SY.timer` keeps `TIMER_HELP`, and may answer `NODE_HELP` later.
+
 ---
 
 ## 4. Internal Architecture
