@@ -142,7 +142,8 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
 | Tool | What it does |
 |---|---|
 | `thread_state_get`, `thread_state_put`, `thread_state_delete` (AI SDK) | One saved record per person, across that person's conversations with the agent. |
-| `generate_{csv,text,json,markdown,html,pdf,xlsx,docx,png,jpeg}_artifact` | One file attached to the reply. |
+| `generate_{csv,text,json,markdown,html,pdf,xlsx,docx,png,jpeg}_artifact` | A file attached to the reply. Since 0.1.87, up to 8 a reply, and the bytes never go back to the model. |
+| `get_current_time` (0.1.87) | The time now, in UTC or an IANA zone, from SY.timer on the agent's hive. |
 | `publish_html_page` | A page at a public link that expires in 24 h (SY.admin's `publish_artifact`). |
 
 **B. The frontdesk's own tools (`SY.frontdesk.gov`, T10):** `ilk_register`, plus
@@ -226,6 +227,43 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
      call the same SY.admin action;
    - `query_hive` is one tool registered in two of Archi's sub-agents, which is no overlap.
 
-### 6.2 After 0.1.87: what needs the operator's call
+### 6.2 Iteration 2 (0.1.88): decided by the operator, 2026-10-27
 
-Items 3–6 act beyond the agent's own reply. Each needs its rule decided before it is built.
+Items 3–6 act beyond the agent's own reply. The operator decided their rules:
+*"la carga de programación decidila vos, lo que no quiero es dejar cosas escondidas, registrá si
+no se hace"*.
+
+1. **`read_blob`:** an agent reads a file from the hive's blob store by its reference.
+   - Text formats only (txt, csv, json, md, html), with a size cap that protects the model's
+     context.
+   - **Scope: the whole hive, for now.** A blob reference carries no tenant, and the store has no
+     per-tenant directory (FINDINGS A-106). The operator's interim choice: *"hoy prefiero que lea
+     todo lo del hive"*.
+   - **Not in it:**
+     - reading a PDF: today the model gets a PDF only when it arrives as an attachment;
+     - finding a blob: a search service, in a future hive of its own.
+
+     Both are recorded in FINDINGS A-106.
+2. **`set_reminder`, with list and cancel:** a reminder to the agent itself, through SY.timer.
+   - When it fires, it comes back to the agent in the same conversation. The agent's answer goes
+     to that conversation's destination, a human's channel included.
+   - Limits: at least 60 s, at most 30 days, and a cap of pending reminders per agent. The agent's
+     node owns them, and they are purged with it.
+   - Anything that is a flow belongs in a WF.
+3. **`send_message`:** a message to a destination in the agent's own tenant: another agent, a WF,
+   or a human's channel. *"Un mensaje con destino."*
+   - The destination's answer comes back to the agent as an incoming message.
+   - The user policy (OPA) decides what passes. The tool refuses a destination outside the tenant.
+   - A cap on back-and-forth between two agents in one thread stops loops.
+   - Checked 2026-10-27: today an agent can only reply. `AiBehaviorOutput` is a text or a final
+     output, sent back to whoever wrote.
+4. **`unpublish_html_page`:** takes down a page the agent published, by its `publication_id`,
+   through SY.admin's `unpublish_artifact`, which already admits an AI node on its own
+   publications.
+
+**Pending, by the operator's choice: `update_html_page`, the same link with new content**
+(FINDINGS A-107).
+- A link is content-addressed (`public/<sha256>`), and the edge refuses to rebind a key to other
+  facts. So updating today means publishing again and taking the old page down.
+- A stable link would need an explicit edge operation from SY.admin, for the publisher's own
+  publications.

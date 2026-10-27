@@ -1078,6 +1078,46 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-108 🔴 OPEN (found 2026-10-27) — io.slack fails a whole reply that carries an HTML file
+
+- **What happens:** io.slack's MIME list has no `text/html`. A reply with a
+  `generate_html_artifact` file is refused whole, the text and every other file, and Slack shows
+  "Error (unsupported_attachment_mime)". Since 0.1.87 a reply may carry several files, so one
+  unsupported file now takes the others down too.
+- **Fix (the IO track):**
+  - send what Slack accepts, and name what was left out in the text, rather than failing the
+    reply;
+  - or accept `text/html`.
+
+  io.wapp sends the text only and drops every attachment, an older deferral.
+
+### A-107 🔵 PENDING by the operator's choice (2026-10-27) — A published page cannot be updated under the same link
+
+- **What happens:** a link is content-addressed. IO.blob curates `public/<sha256>`, the edge binds
+  the key to that sha256 and size, and it refuses to rebind a key to different facts. Updating a
+  page means publishing again (a new link) and taking the old one down (`unpublish_html_page`,
+  0.1.88).
+- **A stable link would need:**
+  - an `update_html_page` tool;
+  - a SY.admin action that curates the new content for the same publication;
+  - an explicit edge operation that replaces the row's facts, from SY.admin only, for the
+    publisher's own publications.
+- **The operator:** *"dejalo pendiente, al final creo que es lo correcto pero tampoco es demasiado
+  importante ahora"*.
+
+### A-106 🟡 OPEN, interim decision (found 2026-10-27) — The blob store has no tenant; agents read the whole hive
+
+- **What happens:** a `BlobRef` carries no tenant, and the store has no per-tenant directory. From
+  0.1.88, `read_blob` lets an agent read any text blob of its hive by reference.
+- **The interim decision:** *"si no es por tenant, hoy prefiero que lea todo lo del hive"*. A blob's
+  name carries 16 hex of its content's hash, so a reference has to have reached the agent; it
+  cannot be guessed.
+- **Also open:**
+  - a per-tenant directory, or a tenant on the reference;
+  - reading a PDF from the blob (the model gets a PDF only when it arrives as an attachment);
+  - finding a blob: search, in a future hive of its own (the operator: *"todo un tema… nada para
+    ahora"*).
+
 ### A-105 ✅ VALIDATED ON 8.x (0.1.86, 2026-10-27) — What the 0.1.86 review found and the release fixed
 
 Found by the code review round of [agent-tools-v1](../../docs/agent-tools-v1.md) (security,
