@@ -1138,9 +1138,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       `target_ref`;
     - starts only on a message its `input_schema` accepts;
     - sets no `src_ilk`.
-- **Since the operator's decision (agent-tools-v1 §6.2):** agents only answer, and WFs do the
-  routing. So this matters for WFs: a WF that has to write first to a person meets the same
-  wall.
+- **Since the operator's decision (agent-tools-v1 §6.2, §6.3):** agents only answer, and WFs do
+  the routing.
+  - **Answering later a person who wrote before** is the WF's job: it keeps that message's
+    `context.io` (its `reply_target`) and later sends to the IO node with it. The WF review
+    confirms the engine allows it.
+  - **Writing first to a person who never wrote** is what remains here. It needs the IO family:
+    addressing a person, and delivering without an inbound message.
 - **Later:**
   - the IO track: addressing a person, and delivering without a pending request;
   - Archi's WF design.

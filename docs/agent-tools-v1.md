@@ -347,6 +347,19 @@ The work goes case by case.
   its own functions (CEL). Today it has *"dos o tres funciones nada más"*.
 - **The WF as a participant** whenever Archi's orchestration needs sequences, forwarding, timers
   or escalation.
+- **The pattern, in the operator's words (2026-10-27):** a timer fires, launched by the WF's own
+  logic. The WF sends the AI node a message. The AI node evaluates it and answers the WF, and the
+  WF sends the result to its final destination: *"es un pasamanos pero queda todo
+  determinístico"*.
+  - When the WF needs the agent's judgment, the agent answers with the state of its evaluation. It
+    *"puede colocar la variable con el valor correcto para que el CEL del WF ejecute y cambie
+    dependiendo de la respuesta evaluada"*.
+  - That is the structured answer (`response_envelope`): the WF names the fields, and its CEL
+    branches on them.
+- **Answering later a person who wrote before:** the WF keeps that message's `context.io` (its
+  `reply_target`) in its state. When the timer fires, it sends the result to the IO node with it.
+  The review confirms the engine allows it.
+- **Writing first to a person who never wrote** stays with the IO family (FINDINGS A-114).
 - **Already there:**
   - a WF can ask an agent for a structured answer (`meta.context.response_envelope`), so the
     agent returns fields (when to remind, whether to escalate) and the WF acts on them;
