@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ live | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
+| **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ live | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
+| **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ replaced by 0.1.86 | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
 | **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ replaced by 0.1.85 | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
 | **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ replaced by 0.1.84 | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
 | **0.1.82** | 2026-10-21 | `d2980cf` | motherbee + spokes (core) + `hive.yaml` (motherbee `acme:` + `reachability_url`, egress1 `reachability_url`) + the edge's certificate | ✅ replaced by 0.1.83 | snap `pre-acme-0-1-82` (all 4 VMs) · vault rollback of `edge_tls_fluxbee_ai` (the wildcard) · `apt install fluxbee=0.1.81` + core-update of the spokes |
@@ -94,6 +95,87 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.86 — An AI agent's tools declared once (cards, a catalog, NODE_HELP); the AI provider per node; "tools" the AI node's one word; the AI nodes' control plane only from its authorities (agent-tools-v1; A-93, A-94, A-95, A-105)
+
+- **Date:** 2026-10-27 (ART) · **Previous version:** 0.1.85 · **Commits:**
+  - `0e3f498`: the `NODE_HELP` constants;
+  - `89848d8`: the release.
+- **Scope:** motherbee and the three spokes (core update). Nothing by hand.
+- **Design:** [agent-tools-v1](../docs/agent-tools-v1.md) (T1–T10, §3). Built by agents in two
+  areas, the AI runtime and the `NODE_HELP` path with Archi. One review round (security,
+  operations); its fixes are FINDINGS A-105.
+- **What changed:**
+  - **The AI SDK:**
+    - a tool exists only with its card (`ToolCard`, `AgentTool`);
+    - the model's definition is rendered from the card, at most 1024 characters;
+    - the registry is in name order;
+    - Anthropic gets cache breakpoints on the tools and the system prompt.
+  - **ai.generic:**
+    - cards for its 14 base tools, and a catalog generated from them (`docs/reference/agent-tools.*`,
+      with a golden test), shipped as `dist/runtimes/ai.generic/<version>/tools.json`;
+    - `NODE_HELP` answered with the cards;
+    - **T8:** `behavior.provider` per node, with the key from the node's own tenant;
+    - **T9:** `behavior.multimodal`; the old key is refused;
+    - **A-95:** no log line carries a published link;
+    - CSV cells never run as formulas.
+  - **ai.generic and the frontdesk:** their control plane is accepted only from their real
+    authorities. The frontdesk keeps only the thread-state get and put tools.
+  - **The `NODE_HELP` path:**
+    - the router's protected actions (32) and rule (3)'s reads, with both wasm files rebuilt;
+    - SY.orchestrator's `node_help_flow` runs in its own task and answers at once for a node that
+      ai.generic does not run;
+    - SY.admin's `node_help`, for Archi.
+  - **`get_runtime`** answers the version's `tool_catalog`, read from a regular file, bounded.
+    Archi reads it first, then `node_help`.
+- **Deploy:**
+  - build of `89848d8` in 25 min, publish, deploy in 277 s;
+  - snapshots `pre-tools-0-1-86` on the 4 VMs (`pre-hardening-0-1-83` was deleted);
+  - 0.1.86 on all 4 (core manifest `151d8bab329a71c7`), with health clean;
+  - the web door was untouched: `route=acknowledged upstream=ready io.web=running`.
+- **Gate:**
+  - **The catalog:**
+    - `node_help` on `AI.pruebas@worker1` answered its 14 cards (ai.generic 0.1.86) in 3.2 s,
+      across three hops;
+    - on `IO.web@motherbee`, it answered at once: "the node runs io.web: only ai.generic nodes
+      answer NODE_HELP";
+    - `get_runtime ai.generic` answered `tool_catalog`: 14 tools, 32 KB;
+    - Archi reached both through its own translations (SCMD, no model).
+  - **The control plane, the same probe before and after** (`AI.intruso` on worker1):
+
+    | Probe | 0.1.85 | 0.1.86 |
+    |---|---|---|
+    | `CONFIG_GET` as `system` | dropped by the router | dropped by the router |
+    | `CONFIG_GET` as `admin` | **the agent answered its whole config** | refused: `unauthorized`, `effective_config: null` |
+    | `config_get` in lowercase | **passed the router and was answered** | refused by the agent |
+
+  - **A real agent, both providers.** `AI.pruebas` wrote its own page and published it:
+    - on Claude, the hive's provider, in 23 s;
+    - after a `config-set` with `provider: openai`, on gpt-5.5 with the tenant's OpenAI key, in
+      22 s. OpenAI accepted the new tool definitions;
+    - both links were served from outside;
+    - no line with `/public/` reached the agent's journal (A-95);
+    - `llm_usage` charged both to `pruebas` by provider: Anthropic shows cache writes and reads
+      (6,376 each), and OpenAI read 2,560 from its cache;
+    - the agent was set back to the hive's provider.
+  - **T9:**
+    - a `config-set` with `behavior.capabilities` was refused with a clear message;
+    - `AI.pruebas`'s saved config never had the key, so the boot conversion was not exercised
+      live (it is covered by tests).
+  - **The frontdesk:** RUNNING, HEALTHY.
+  - **Health:** `failed=0` on all 4. The one denial, on worker1, is the probe's `CONFIG_GET`.
+- **Cleanup:** none needed. The test tools stay: the tenant `pruebas`, its keys and
+  `AI.pruebas@worker1`.
+- **Upgrading another hive:**
+  - nothing by hand;
+  - before upgrading, check that no AI node has a saved `behavior.base_url` without
+    `behavior.provider`: since 0.1.86, such a node boots FAILED_CONFIG.
+- **Rollback:**
+  - snapshot `pre-tools-0-1-86`;
+  - or `apt install fluxbee=0.1.85` plus the core update of the spokes. Then put each AI node's
+    config back into the 0.1.85 shape, because 0.1.85 refuses the fields 0.1.86 writes
+    (`provider`, `multimodal`): restore `config.json.pre-0.1.86` where the conversion made one, or
+    send a `config-set` without them (the AI runbook, "Rolling back to 0.1.85").
 
 ## 0.1.85 — The edge proxies the web host to io.web, a new managed node on the motherbee behind mesh mTLS; web_status; core IO runtimes pinned (io-web-v2 §11.2; A-89, A-90, A-91, A-92)
 

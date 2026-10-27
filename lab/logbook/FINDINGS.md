@@ -1078,6 +1078,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-105 ✅ VALIDATED ON 8.x (0.1.86, 2026-10-27) — What the 0.1.86 review found and the release fixed
+
+Found by the code review round of [agent-tools-v1](../../docs/agent-tools-v1.md) (security,
+operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were seen on 8.x.
+
+- **Any node could reconfigure an AI agent.**
+  - **The problem:** ai.generic and the frontdesk accepted their control plane as `system` or
+    `admin`, verbs in any case, from any sender. The router gates only `system`, in exact case.
+  - **Fixed:** the control plane is accepted only from the real authorities: CONFIG_* from
+    `SY.admin@motherbee`, and NODE_STATUS_GET and NODE_HELP from the node's hive orchestrator.
+  - *Live:* before, an intruder got the whole config; after, `unauthorized`.
+- **Tool descriptions over 1024 characters,** which OpenAI rejects. The cards are now bounded
+  (the longest is 970), and so are Archi's and the executor's tools (`fluxbee_system_get` went from
+  1277 to 790). *Live:* gpt-5.5 took the definitions.
+- **A-95 had a second path:** the final-output log line.
+- **`node_help` held the orchestrator's one-at-a-time workers** for up to 7 s. It now runs in its
+  own task, and answers at once for a node that ai.generic does not run. *Live:* `IO.web` in 1.3 s.
+- **`tool_catalog`'s read** followed symlinks and was unbounded: now a regular file, read bounded.
+- **The frontdesk received the delete-state card,** which contradicts its flow. It now keeps get
+  and put only.
+- **CSV cells could run as formulas** in a spreadsheet: they are neutralized per OWASP.
+- **Cost:**
+  - the larger definitions are cached on Anthropic, with breakpoints on the tools and the system
+    prompt, and the cache tokens are counted;
+  - the registry is in name order, so OpenAI caches the prefix;
+  - *Live:* Anthropic cache writes and reads of 6,376 tokens; OpenAI read 2,560 from its cache.
+
 ### A-104 🔴 OPEN (found 2026-10-26, 0.1.86 review) — An AI node's model must match a provider it may not know
 
 - **What happens:** since 0.1.86, `behavior.provider` is optional and defaults to the hive's
@@ -1125,6 +1152,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The IO nodes already checked their callers.
 - **Fix, as defense in depth:** the router compares `meta.msg` without case, and gates protected
   verbs on any `msg_type`.
+- **Seen on 8.x (0.1.85, 2026-10-27):** an `AI.intruso` client on worker1 sent `config_get`, in
+  lowercase, as `system`. The router let it through, and the agent answered its whole config.
+  Since 0.1.86 the agent refuses it.
 
 ### A-99 🔴 OPEN (found 2026-10-26) — When a file generator runs, the model's own text is dropped
 
@@ -1151,14 +1181,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   open.
 - **The operator (2026-10-26):** *"después vemos cómo se miden los tokens por mensaje"*.
 
-### A-95 🔴 OPEN (found 2026-10-26) — ai.generic logs the full public link of a page it publishes
+### A-95 ✅ VALIDATED ON 8.x (0.1.86, 2026-10-27) — ai.generic logs the full public link of a page it publishes
+
+- **Fixed (0.1.86, `89848d8`):** the publish tool logs the publication id. The final-output line
+  logs only the file names and the text's length; the review found that this second path also
+  carried the link (A-105).
+- **Validated:** after two pages were published (on Claude and on OpenAI), no line with `/public/`
+  was in the agent's journal.
 
 - **What happens:** after `publish_html_page`, ai.generic writes an INFO line with the whole URL,
   capability key included (`published HTML page tool="publish_html_page" url=…/public/<key>`).
   Anyone who reads the worker's journal can open the page until it expires.
 - **Fix:** log the publication id only, as the edge does since A-82.
 
-### A-94 🔴 OPEN (found 2026-10-26) — "capabilities" means six different things
+### A-94 ✅ RESOLVED for the AI node (0.1.86; the refusal seen on 8.x) — "capabilities" means six different things
 
 - **What happens:** the word names six unrelated things, none of them what an agent can do:
   1. identity's `capabilities` arrays: retired and never implemented (identity addendum §2.4);
@@ -1174,8 +1210,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     `behavior.multimodal`, and the default role stops saying "capabilities".
   - **Infra nodes keep their own uses (2–6):** *"cada nodo puede tener las suyas"*.
   - **Identity's dead arrays (1) stay refused.**
+- **Fixed (0.1.86, `89848d8`):**
+  - `behavior.multimodal` in ai.generic and the frontdesk;
+  - the old key refused;
+  - a saved config converted once at boot (0600, a `config.json.pre-0.1.86` copy, one INFO line).
+- **Seen on 8.x:** a `config-set` with `behavior.capabilities` was refused with a clear message.
+  The boot conversion is covered by tests, since no PROD config held the key.
 
-### A-93 🔴 OPEN, decided (found 2026-10-26) — An AI node cannot choose its provider
+### A-93 ✅ VALIDATED ON 8.x (0.1.86, 2026-10-27) — An AI node cannot choose its provider
 
 - **What happens:** a node chooses its model (`behavior.model`) and its endpoint (`behavior.base_url`,
   `api.openai.com` or `api.anthropic.com` only). Its provider, and with it the API's format and the
@@ -1190,6 +1232,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   no al proveedor"*. The provider is per node, and the key comes from the node's tenant.
 - **Checked:** nothing in the code stops two nodes from running different providers. The change is
   in agent-tools-v1 (T8), for the proposed 0.1.86.
+- **Fixed (0.1.86, `89848d8`):**
+  - `behavior.provider` is optional and defaults to the hive's provider;
+  - the key comes from the node's own tenant;
+  - `base_url` is accepted only with the provider, and only that provider's host.
+- **Validated on 8.x:** `AI.pruebas` published a page on Claude, the hive's provider, then on
+  gpt-5.5 after one `config-set` with `provider: openai`, using its tenant's OpenAI key.
+  `llm_usage` charged both to the tenant, by provider.
 
 ### A-92 ✅ VALIDATED ON 8.x (0.1.85, 2026-10-24) — What the 0.1.85 review found and the release fixed
 

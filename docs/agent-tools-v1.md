@@ -1,7 +1,13 @@
 # Agent tools v1: what an AI agent can do, declared once
 
-**Status:** direction agreed with the operator on 2026-10-26. Nothing built. This is the single
-place for the track; the next iteration starts here.
+**Status:**
+
+- The direction was agreed with the operator on 2026-10-26.
+- The first release, 0.1.86, is validated on 8.x (2026-10-27; ledger 0.1.86). It covers §3.1–§3.4:
+  the cards for the 14 existing base tools, the catalog, `NODE_HELP`, and T8, T9 and A-95.
+- Next: the new base tools of §3.5, one per iteration.
+
+This is the single place for the track; the next iteration starts here.
 
 ---
 
