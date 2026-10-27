@@ -48,6 +48,8 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   - `api_key_source` (`vault` or `missing`);
   - `ai_provider`: the provider in effect, `{name, source}`, where `source` is
     `behavior.provider` or `hive` (with an `error` when hive.yaml cannot say);
+  - `ai_model`: the model in effect, `{name, source}`, where `source` is `behavior.model` or
+    `hive` (with an `error` when the hive has no model for the node's provider);
   - the state of the agent definition (`definition_state`, `definition`, `active_prompt_chars`).
 - **`NODE_HELP`** returns the runtime's tool catalog: `{status: "ok", node_name, runtime,
   runtime_version, tools}`, the cards of [Tools](#tools). `runtime_version` is the one the
@@ -57,13 +59,18 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   without a restart, and writes it to `config.json`.
   - A `config_version` lower than the current one is refused (`stale_config_version`).
   - An equal one changes nothing.
+  - A config whose model cannot be resolved then is refused (`invalid_config`, naming
+    `behavior.model` and `ai.providers.<provider>.model`): a provider other than the hive's
+    default needs `behavior.model`, unless the hive's hive.yaml lists a model for it. So is one
+    that leaves its provider or its model to a hive.yaml that cannot be read.
+  - Its answer shows `ai_provider` and `ai_model`, as `CONFIG_GET` does.
 
 ### `config.behavior`
 
 | Field | Meaning |
 | --- | --- |
 | `kind` | `ai_chat`, or `echo` (answers `Echo: <input>`, no model call) |
-| `model` | required for `ai_chat`: a model of the node's provider, such as `gpt-5.5` on OpenAI |
+| `model` | a model of the node's provider, such as `gpt-5.5` on OpenAI. Without it, the hive's model for the node's provider (`ai.providers.<provider>.model`), read on each request; with neither, every message fails with `missing_ai_model`, which names both. Name one only when the node needs its own |
 | `provider` | `openai` or `anthropic`: the API the node speaks and the key it reads ([The key](#the-key)). Without it, the hive's, read on each request |
 | `model_settings` | `max_output_tokens`; an answer cut at it is a `provider_output_truncated` error. `temperature` and `top_p` are accepted too, but current models reject `temperature` (gpt-5.5, Claude 5): leave it out |
 | `base_url` | optional, and rarely needed: the full URL the request is posted to. It needs `provider`, and it must be `https` on that provider's host (`api.openai.com` or `api.anthropic.com`); the node's environment can lift the host rule with `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
@@ -187,14 +194,24 @@ rendered from the card, and so are the catalog and the `NODE_HELP` answer.
   `UPDATE_AGENT_TOOLS_CATALOG=1`.
 - **Which tools a message gets:**
   - always the ten file generators, csv, text, json, markdown, html, pdf, xlsx, docx, png and
-    jpeg. Their file goes out as `attachments[]` of the reply, with the text of the call that made
-    it; one file per reply;
+    jpeg. Each keeps its file for the reply and answers the model only the file's name, type and
+    size, never its bytes. The reply is the model's own text with every file its calls made, in
+    the order made, as `attachments[]`; at most 8 (`REPLY_FILES_MAX`, the IO nodes' limit for one
+    message), and a call past that makes no file (`reply_files_full`). A file named as an earlier
+    one of the reply takes its place. The model's text is what it writes after its last tool
+    call, or, when that is blank, the last text it wrote alongside a call; without either, a fixed
+    line names the files. The PDF is Helvetica in WinAnsiEncoding: Western European text prints as
+    written, anything else as `?`, and long lines wrap onto as many pages as they need;
+  - always `get_current_time`: the date and time from SY.timer of the node's own hive
+    (`TIMER_NOW_IN`), in UTC and in an IANA zone, with the local weekday. Where SY.timer does not
+    answer (it runs on the motherbee and the workers), it is `time_unavailable`;
   - the thread-state tools when the message has a `src_ilk`: they read and write only that
     sender's record;
   - `publish_html_page` when the node has its ILK. It publishes a page through SY.admin and
-    returns its public URL, which expires after 24 h. The journal names the publication's id,
-    never the URL, which is the key to the page (FINDINGS A-95); the reply that carries the URL is
-    logged by its files' names and its text's length, never its text.
+    returns its public URL, which expires after 24 h. A reply whose text does not carry the URL
+    gets it on a line of its own. The journal names the publication's id, never the URL, which is
+    the key to the page (FINDINGS A-95); the reply that carries the URL is logged by its files'
+    names and its text's length, never its text.
 - **A CSV cell never runs as a formula:** one that starts with `=`, `+`, `@`, a tab or a carriage
   return, or with `-` and is not a plain number, gets a `'` in front (OWASP's CSV injection
   advice).

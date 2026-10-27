@@ -8,18 +8,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::Engine;
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
     create_function_calling_model, create_llm_client, extract_text,
     resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
     AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact,
-    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
-    FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider, FunctionToolRegistry,
-    HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
-    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
-    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
+    ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
+    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
+    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
+    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig,
+    TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
     ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
     MSG_PING, MSG_STATUS,
 };
@@ -36,8 +35,9 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     managed_node_config_path_with_root, managed_node_instance_dir, managed_node_name,
-    AdminCommandRequest, NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch,
-    RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    timer_node_name, AdminCommandRequest, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, TimerClient, TimerClientConfig, TimerClientError,
+    TimerNowInPayload, TimerNowInResult, VaultCallerOwned, VaultClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +51,11 @@ const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
 const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
+/// The files one reply carries at most: what an IO node sends out in one message
+/// (nodes/io/common text_v1_blob.rs, `DEFAULT_MAX_ATTACHMENTS`); io.slack refuses a reply with
+/// more, its text included. Its other two limits, 20 MiB a file and 40 MiB in all, are out of the
+/// generators' reach: a file holds what the model wrote in one call.
+const REPLY_FILES_MAX: usize = 8;
 /// The prompt of an agent with no definition: its ILK has no hashes, none of its assets loaded, or
 /// the node has not found its agent ILK (yet). The model then only answers that it is unconfigured.
 const DEFAULT_UNCONFIGURED_AGENT_PROMPT: &str = r#"You are an AI agent that has not yet received its operational configuration.
@@ -232,9 +237,11 @@ enum NodeBehavior {
 
 #[derive(Debug, Clone)]
 struct AiChatRuntime {
-    model: String,
+    /// `behavior.model`; `None` follows the hive's model for the node's provider
+    /// (`effective_ai_engine`, FINDINGS A-104).
+    model: Option<String>,
     model_settings: ModelSettings,
-    /// `behavior.provider`; `None` follows the hive's (`effective_ai_provider`).
+    /// `behavior.provider`; `None` follows the hive's (`effective_ai_engine`).
     provider: Option<AiProvider>,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
@@ -284,22 +291,85 @@ struct GenericAiNode {
     /// The runtime version the orchestrator launched it at (`launched_runtime_version`), which it
     /// names in its `NODE_HELP` answer. `None` for a node started by hand.
     runtime_version: Option<String>,
+    /// The node's connection to its router, for the tools that ask another node of the mesh:
+    /// `get_current_time` asks SY.timer of the node's hive. `None` only in a unit test.
+    router: Option<Arc<RouterDispatcher>>,
+}
+
+/// The files one message's tools make, for its reply (FINDINGS A-98, A-99). A file generator keeps
+/// its file here and answers the model only the file's name, type and size, so the bytes never go
+/// back into the model's context. The reply carries every file, in the order they were made, with
+/// the model's own text (`tool_loop_output`).
+#[derive(Default)]
+struct ReplyFiles(std::sync::Mutex<Vec<AiUserArtifact>>);
+
+/// What `ReplyFiles::keep` did with a file.
+#[derive(Debug, PartialEq)]
+enum KeptFile {
+    /// It goes after the files the reply already carries.
+    Added,
+    /// It took the place of the reply's file of the same name: one reply never carries a name
+    /// twice, and the new file takes no other place.
+    Replaced,
+    /// It was dropped: the reply already carries `REPLY_FILES_MAX` files.
+    Full,
+}
+
+impl ReplyFiles {
+    /// The files, whatever a call that panicked holding them left.
+    fn files(&self) -> std::sync::MutexGuard<'_, Vec<AiUserArtifact>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Keeps `file` for the reply (`KeptFile`).
+    fn keep(&self, file: AiUserArtifact) -> KeptFile {
+        let mut files = self.files();
+        if let Some(earlier) = files
+            .iter_mut()
+            .find(|earlier| earlier.filename == file.filename)
+        {
+            *earlier = file;
+            return KeptFile::Replaced;
+        }
+        if files.len() >= REPLY_FILES_MAX {
+            return KeptFile::Full;
+        }
+        files.push(file);
+        KeptFile::Added
+    }
+
+    /// Every file kept, in the order they were made; none is left.
+    fn take(&self) -> Vec<AiUserArtifact> {
+        std::mem::take(&mut *self.files())
+    }
 }
 
 #[derive(Clone)]
-struct GenerateCsvArtifactTool;
+struct GenerateCsvArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateTextArtifactTool;
+struct GenerateTextArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateJsonArtifactTool;
+struct GenerateJsonArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateMarkdownArtifactTool;
+struct GenerateMarkdownArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateHtmlArtifactTool;
+struct GenerateHtmlArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 /// Publishes an HTML page as a public, read-only URL. Unlike the `generate_*` tools (which
 /// only produce a downloadable artifact), this one ACTS: it writes the bytes to the blob
@@ -314,19 +384,36 @@ struct PublishHtmlTool {
 }
 
 #[derive(Clone)]
-struct GeneratePdfArtifactTool;
+struct GeneratePdfArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateXlsxArtifactTool;
+struct GenerateXlsxArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateDocxArtifactTool;
+struct GenerateDocxArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GeneratePngArtifactTool;
+struct GeneratePngArtifactTool {
+    files: Arc<ReplyFiles>,
+}
 
 #[derive(Clone)]
-struct GenerateJpegArtifactTool;
+struct GenerateJpegArtifactTool {
+    files: Arc<ReplyFiles>,
+}
+
+/// The current time, from SY.timer of the node's own hive (agent-tools-v1 §6.1).
+struct GetCurrentTimeTool {
+    router: Arc<RouterDispatcher>,
+    /// `SY.timer@<the node's hive>`.
+    timer: String,
+}
 
 #[derive(Debug, Default)]
 struct BehaviorContext {
@@ -344,16 +431,12 @@ struct GenerateCsvArtifactArgs {
     rows: Vec<Vec<String>>,
     #[serde(default)]
     headers: Option<Vec<String>>,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct GenerateTextArtifactArgs {
     filename: String,
     content: String,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,24 +445,19 @@ struct GenerateJsonArtifactArgs {
     data: Value,
     #[serde(default = "default_true")]
     pretty: bool,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct GenerateMarkdownArtifactArgs {
     filename: String,
     content: String,
-    #[serde(default)]
-    text: Option<String>,
 }
 
+/// `generate_html_artifact`'s arguments, and `publish_html_page`'s.
 #[derive(Debug, Clone, Deserialize)]
 struct GenerateHtmlArtifactArgs {
     filename: String,
     content: String,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,8 +467,6 @@ struct GeneratePdfArtifactArgs {
     title: Option<String>,
     #[serde(default)]
     lines: Vec<String>,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -401,8 +477,6 @@ struct GenerateXlsxArtifactArgs {
     headers: Option<Vec<String>>,
     #[serde(default)]
     sheet_name: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -418,8 +492,6 @@ struct GenerateDocxArtifactArgs {
     table_headers: Option<Vec<String>>,
     #[serde(default)]
     table_rows: Vec<Vec<String>>,
-    #[serde(default)]
-    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -431,23 +503,12 @@ struct GenerateRasterArtifactArgs {
     width: Option<u32>,
     #[serde(default)]
     height: Option<u32>,
-    #[serde(default)]
-    text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ToolFinalArtifactEnvelope {
+#[derive(Debug, Clone, Deserialize)]
+struct GetCurrentTimeArgs {
     #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    artifacts: Vec<ToolFinalArtifactItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ToolFinalArtifactItem {
-    filename: String,
-    mime: String,
-    bytes_base64: String,
+    timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -787,6 +848,22 @@ impl AiNode for GenericAiNode {
         let output = match &behavior {
             NodeBehavior::Echo => AiBehaviorOutput::text(format!("Echo: {input}")),
             NodeBehavior::AiChat(ai) => {
+                // What this request runs on: the node's provider and model, or the hive's.
+                let engine = match effective_ai_engine(ai, &self.config_dir).for_request() {
+                    Ok(engine) => engine,
+                    Err(err) => {
+                        tracing::warn!(
+                            node_name = %self.node_name,
+                            trace_id = %msg.routing.trace_id,
+                            error = %err,
+                            "AI request has no provider or no model; replying with the engine error payload"
+                        );
+                        return Ok(Some(build_reply_message_runtime_src(
+                            &msg,
+                            ai_engine_error_payload(&err),
+                        )));
+                    }
+                };
                 let input_parts = if ai.multimodal {
                     if let Some(resolved) = resolved_user_input.as_ref() {
                         match build_model_user_content_parts(resolved).await {
@@ -814,7 +891,15 @@ impl AiNode for GenericAiNode {
                     None
                 };
                 match self
-                    .run_ai_chat(ai, input, input_parts, &user_text, &behavior_ctx, &msg.meta)
+                    .run_ai_chat(
+                        ai,
+                        &engine,
+                        input,
+                        input_parts,
+                        &user_text,
+                        &behavior_ctx,
+                        &msg.meta,
+                    )
                     .await
                 {
                     Ok(output) => output,
@@ -836,7 +921,7 @@ impl AiNode for GenericAiNode {
                                 tracing::warn!(
                                     node_name = %self.node_name,
                                     trace_id = %msg.routing.trace_id,
-                                    model = %ai.model,
+                                    model = %engine.model,
                                     provider_status = status,
                                     provider_param = ?extract_openai_error_param(msg_text),
                                     provider_detail = %trim_chars(&detail, 280),
@@ -850,7 +935,7 @@ impl AiNode for GenericAiNode {
                                 tracing::warn!(
                                     node_name = %self.node_name,
                                     trace_id = %msg.routing.trace_id,
-                                    model = %ai.model,
+                                    model = %engine.model,
                                     attachment_count = attachment_summary.count,
                                     attachment_total_bytes = attachment_summary.total_bytes,
                                     attachment_mimes = ?attachment_summary.mimes,
@@ -862,7 +947,7 @@ impl AiNode for GenericAiNode {
                             tracing::warn!(
                                 node_name = %self.node_name,
                                 trace_id = %msg.routing.trace_id,
-                                model = %ai.model,
+                                model = %engine.model,
                                 attachment_count = attachment_summary.count,
                                 attachment_total_bytes = attachment_summary.total_bytes,
                                 attachment_mimes = ?attachment_summary.mimes,
@@ -900,6 +985,7 @@ impl GenericAiNode {
     async fn run_ai_chat(
         &self,
         ai: &AiChatRuntime,
+        engine: &AiEngine,
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         user_text: &str,
@@ -907,7 +993,7 @@ impl GenericAiNode {
         meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let credential = self
-            .resolve_ai_credential(ai)
+            .resolve_ai_credential(engine.provider)
             .await
             .map_err(fluxbee_ai_sdk::errors::AiSdkError::Protocol)?;
         let account = self.usage_account(ctx);
@@ -918,7 +1004,8 @@ impl GenericAiNode {
             account.clone(),
         );
         let output_schema = resolve_response_envelope_output_schema(meta)?;
-        let tool_registry = self.build_tool_registry(ctx)?;
+        let files = Arc::new(ReplyFiles::default());
+        let tool_registry = self.build_tool_registry(ctx, &files)?;
         let tool_count = tool_registry.definitions().len();
         let output_contract_mode = match (output_schema.as_ref(), tool_count > 0) {
             (Some(_), true) => "fallback_instruction",
@@ -933,6 +1020,7 @@ impl GenericAiNode {
             output_contract_mode,
             output_schema_name = ?output_schema.as_ref().map(|schema| schema.name()),
             provider = %credential.provider,
+            model = %engine.model,
             "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
@@ -948,39 +1036,31 @@ impl GenericAiNode {
                 credential.provider,
                 credential.api_key.clone(),
                 ai.base_url.clone(),
-                ai.model.clone(),
+                engine.model.clone(),
                 Some(system),
                 ai.model_settings.clone(),
                 account,
             );
-            let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-            let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
-            let run_input = self.build_function_run_input(
-                input.clone(),
-                input_parts.clone(),
-                ctx,
-                ai,
-                immediate_memory,
-            );
             let watched = ToolRunWatch::new(model.as_ref(), &ctx.tool_ran);
-            let result = runner
-                .run_with_input(&watched, &tool_registry, run_input)
-                .await?;
-            if let Some(output) = extract_final_output_from_tool_results(&result)? {
-                self.log_final_output(ctx, &output);
-                let summary_text = summarize_behavior_output(&output);
-                self.persist_immediate_turn(ai, ctx, user_text, &summary_text)
-                    .await;
+            if let Some(output) = self
+                .run_tool_loop(
+                    &watched,
+                    &tool_registry,
+                    &files,
+                    ai,
+                    ctx,
+                    input.clone(),
+                    input_parts.clone(),
+                    user_text,
+                )
+                .await?
+            {
                 return Ok(output);
-            }
-            if let Some(text) = result.final_assistant_text {
-                self.persist_immediate_turn(ai, ctx, user_text, &text).await;
-                return Ok(AiBehaviorOutput::text(text));
             }
         }
 
         let req = fluxbee_ai_sdk::llm::LlmRequest {
-            model: ai.model.clone(),
+            model: engine.model.clone(),
             system: Some(self.agent_prompt().await),
             input,
             input_parts,
@@ -994,9 +1074,45 @@ impl GenericAiNode {
         Ok(AiBehaviorOutput::text(response.content))
     }
 
-    /// The journal's line for a reply a tool made: the names of its files and the length of its
-    /// text, never the text. The text can carry the link of a page `publish_html_page` published,
-    /// and the link is the key to the page (FINDINGS A-95).
+    /// One message's tool loop, and its reply: the model's own text with every file its tools made
+    /// and the link of every page it published (`tool_loop_output`, FINDINGS A-98, A-99). `None`
+    /// when the model ended without text, made no file and published no page: the caller then asks
+    /// it once more, without tools.
+    async fn run_tool_loop(
+        &self,
+        model: &dyn FunctionCallingModel,
+        tools: &FunctionToolRegistry,
+        files: &ReplyFiles,
+        ai: &AiChatRuntime,
+        ctx: &BehaviorContext,
+        input: String,
+        input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
+        user_text: &str,
+    ) -> fluxbee_ai_sdk::Result<Option<AiBehaviorOutput>> {
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
+        let run_input =
+            self.build_function_run_input(input, input_parts, ctx, ai, immediate_memory);
+        let result = runner.run_with_input(model, tools, run_input).await?;
+        let Some(output) = tool_loop_output(
+            tool_loop_text(&result),
+            files.take(),
+            &published_links(&result.items),
+        ) else {
+            return Ok(None);
+        };
+        if matches!(output, AiBehaviorOutput::Final(_)) {
+            self.log_final_output(ctx, &output);
+        }
+        let summary_text = summarize_behavior_output(&output);
+        self.persist_immediate_turn(ai, ctx, user_text, &summary_text)
+            .await;
+        Ok(Some(output))
+    }
+
+    /// The journal's line for a reply that carries files: their names and the length of its text,
+    /// never the text. The text can carry the link of a page `publish_html_page` published, and
+    /// the link is the key to the page (FINDINGS A-95).
     fn log_final_output(&self, ctx: &BehaviorContext, output: &AiBehaviorOutput) {
         let (artifact_filenames, text_len) = match output {
             AiBehaviorOutput::Text(text) => (Vec::new(), text.len()),
@@ -1015,7 +1131,7 @@ impl GenericAiNode {
             src_ilk = ?ctx.src_ilk,
             artifact_filenames = ?artifact_filenames,
             text_len,
-            "tool run produced explicit final_output with user-facing artifacts"
+            "reply carries the files its tools made"
         );
     }
 
@@ -1212,12 +1328,14 @@ impl GenericAiNode {
         }
     }
 
+    /// One message's tools. The file generators keep their files in `files`, the reply's.
     fn build_tool_registry(
         &self,
         ctx: &BehaviorContext,
+        files: &Arc<ReplyFiles>,
     ) -> fluxbee_ai_sdk::Result<FunctionToolRegistry> {
         let mut registry = FunctionToolRegistry::new();
-        self.register_common_tools(&mut registry, ctx)?;
+        self.register_common_tools(&mut registry, ctx, files)?;
         Ok(registry)
     }
 
@@ -1225,6 +1343,7 @@ impl GenericAiNode {
         &self,
         registry: &mut FunctionToolRegistry,
         ctx: &BehaviorContext,
+        files: &Arc<ReplyFiles>,
     ) -> fluxbee_ai_sdk::Result<()> {
         // Every base tool there is (`base_tool_cards`, the catalog), each when its card's
         // `present_when` holds. The state tools keep the sender's "hard state": bound to its
@@ -1234,16 +1353,25 @@ impl GenericAiNode {
             let provider = ThreadStateToolsProvider::new(store.clone(), src_ilk.clone());
             provider.register_tools(registry)?;
         }
-        registry.register(Arc::new(GenerateCsvArtifactTool))?;
-        registry.register(Arc::new(GenerateTextArtifactTool))?;
-        registry.register(Arc::new(GenerateJsonArtifactTool))?;
-        registry.register(Arc::new(GenerateMarkdownArtifactTool))?;
-        registry.register(Arc::new(GenerateHtmlArtifactTool))?;
-        registry.register(Arc::new(GeneratePdfArtifactTool))?;
-        registry.register(Arc::new(GenerateXlsxArtifactTool))?;
-        registry.register(Arc::new(GenerateDocxArtifactTool))?;
-        registry.register(Arc::new(GeneratePngArtifactTool))?;
-        registry.register(Arc::new(GenerateJpegArtifactTool))?;
+        let files = || files.clone();
+        registry.register(Arc::new(GenerateCsvArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateTextArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateJsonArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateMarkdownArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateHtmlArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GeneratePdfArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateXlsxArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateDocxArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GeneratePngArtifactTool { files: files() }))?;
+        registry.register(Arc::new(GenerateJpegArtifactTool { files: files() }))?;
+        // The time, from SY.timer of the node's own hive.
+        if let Some(tool) = self
+            .router
+            .as_ref()
+            .and_then(|router| GetCurrentTimeTool::for_node(router.clone(), &self.node_name))
+        {
+            registry.register(Arc::new(tool))?;
+        }
         // Publishing ACTION: expose it only when the node has a resolved identity (vault).
         // Publishing is tenant-scoped by the producer's router-stamped identity (resolved
         // admin-side), and vault is Some exactly when that identity is present — so a node
@@ -1258,19 +1386,18 @@ impl GenericAiNode {
     }
 
     /// The AI key comes from SY.vault by resource type, like every other AI consumer: the
-    /// node's provider's (`effective_ai_provider`), and only in its tenant: one this node owns,
+    /// node's provider's (`effective_ai_engine`), and only in its tenant: one this node owns,
     /// one assigned to it, or its tenant's general one (docs/ilk-tenant-model-v1.md §2.2). The
     /// root tenant's keys are the core's. Nodes do not name a Vault key.
     async fn resolve_ai_credential(
         &self,
-        ai: &AiChatRuntime,
+        provider: AiProvider,
     ) -> std::result::Result<ResolvedAiCredential, String> {
         let Some(vault) = self.vault.as_ref() else {
             return Err(
                 "missing AI api key: no vault client (the node has no self ILK)".to_string(),
             );
         };
-        let (provider, _) = effective_ai_provider(ai, &self.config_dir)?;
         let tenant = self
             .self_tenant_id
             .as_deref()
@@ -1524,6 +1651,24 @@ impl GenericAiNode {
                 );
             }
         };
+        // A model the node cannot resolve now would fail every message (missing_ai_model), so the
+        // config is refused: a provider other than the hive's default needs its model, unless the
+        // hive's hive.yaml lists one for it (a worker add_hive made lists only the default's). So
+        // is a provider left to a hive.yaml that cannot be read.
+        let engine = match &next_behavior {
+            NodeBehavior::AiChat(ai) => {
+                let engine = effective_ai_engine(ai, &self.config_dir);
+                if let Err(err) = engine.provider.as_ref().and(engine.model.as_ref()) {
+                    return self.invalid_config_response(
+                        Some(schema_version),
+                        Some(config_version),
+                        format!("Invalid payload.config: {}", unresolved_model_reason(err)),
+                    );
+                }
+                engine.config_json()
+            }
+            NodeBehavior::Echo => (Value::Null, Value::Null),
+        };
         let materialized_config = match serde_json::to_value(&config_doc) {
             Ok(v) => v,
             Err(err) => {
@@ -1549,12 +1694,14 @@ impl GenericAiNode {
             );
         }
         if config_version == state.config_version && state.effective_config.is_some() {
+            let engine = self.engine_in_effect(self.behavior.read().await.as_ref());
             return self.ok_response(
                 subsystem,
                 state.schema_version,
                 state.config_version,
                 state.current_state.as_str(),
                 state.effective_config.as_ref(),
+                engine,
             );
         }
 
@@ -1604,6 +1751,7 @@ impl GenericAiNode {
             state.config_version,
             state.current_state.as_str(),
             state.effective_config.as_ref(),
+            engine,
         )
     }
 
@@ -1622,6 +1770,8 @@ impl GenericAiNode {
         )
     }
 
+    /// CONFIG_SET's answer to a config it holds: with `ai_provider` and `ai_model`, the `engine`
+    /// that config runs on, as CONFIG_GET shows them.
     fn ok_response(
         &self,
         subsystem: &str,
@@ -1629,6 +1779,7 @@ impl GenericAiNode {
         config_version: u64,
         state: &str,
         effective_config: Option<&Value>,
+        (ai_provider, ai_model): (Value, Value),
     ) -> Value {
         json!({
             "subsystem": subsystem,
@@ -1637,9 +1788,22 @@ impl GenericAiNode {
             "state": state,
             "schema_version": schema_version,
             "config_version": config_version,
+            "ai_provider": ai_provider,
+            "ai_model": ai_model,
             "error": Value::Null,
             "effective_config": effective_config.map(redact_secrets),
         })
+    }
+
+    /// CONFIG_GET's `ai_provider` and `ai_model` for `behavior`: the provider and the model it
+    /// runs on, its own or the hive's as hive.yaml says now; both null when it is not ai_chat.
+    fn engine_in_effect(&self, behavior: Option<&NodeBehavior>) -> (Value, Value) {
+        match behavior {
+            Some(NodeBehavior::AiChat(ai)) => {
+                effective_ai_engine(ai, &self.config_dir).config_json()
+            }
+            _ => (Value::Null, Value::Null),
+        }
     }
 
     fn error_response(
@@ -1700,14 +1864,9 @@ impl GenericAiNode {
         } else {
             json!({"code":"node_not_configured","message":"No effective config available"})
         };
-        // The provider in effect: the node's own, or the hive's as hive.yaml says now.
-        let ai_provider = match self.behavior.read().await.as_ref() {
-            Some(NodeBehavior::AiChat(ai)) => match effective_ai_provider(ai, &self.config_dir) {
-                Ok((provider, source)) => json!({"name": provider.as_str(), "source": source}),
-                Err(err) => json!({"name": Value::Null, "source": "hive", "error": err}),
-            },
-            _ => Value::Null,
-        };
+        // The provider and the model in effect: the node's own, or the hive's as hive.yaml says
+        // now.
+        let (ai_provider, ai_model) = self.engine_in_effect(self.behavior.read().await.as_ref());
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
@@ -1716,6 +1875,7 @@ impl GenericAiNode {
             "config_source": config_source,
             "api_key_source": api_key_source.as_str(),
             "ai_provider": ai_provider,
+            "ai_model": ai_model,
             "schema_version": state.schema_version,
             "config_version": state.config_version,
             "contract": {
@@ -1723,8 +1883,7 @@ impl GenericAiNode {
                 "node_kind": AI_RUNTIME_KIND,
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
-                    "config.behavior.kind",
-                    "config.behavior.model"
+                    "config.behavior.kind"
                 ],
                 "field_values": {
                     "config.behavior.kind": {
@@ -1738,6 +1897,7 @@ impl GenericAiNode {
                     }
                 },
                 "optional_fields": [
+                    "config.behavior.model",
                     "config.behavior.model_settings",
                     "config.behavior.provider",
                     "config.behavior.base_url",
@@ -1757,6 +1917,7 @@ impl GenericAiNode {
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
                     "The AI provider is config.behavior.provider (openai or anthropic), or the hive's when it is absent (hive.yaml ai.default_provider, OpenAI without an ai section); ai_provider shows the one in effect.",
+                    "The model is config.behavior.model, or the hive's model for the node's provider when it is absent (hive.yaml ai.providers.<provider>.model; gpt-5.5 for OpenAI without an ai section); ai_model shows the one in effect. Name a model only when the node needs its own, and always one of the node's provider. A provider other than the hive's default needs its model unless the hive's hive.yaml lists one (a worker added by add_hive lists only the default's): CONFIG_SET refuses a config whose model it cannot resolve (invalid_config), and its answer shows ai_provider and ai_model. Without either later (hive.yaml changed), every message fails with missing_ai_model.",
                     "AI credentials are not config: the provider's key is read from SY.vault by resource_type openai|anthropic on each request, only in the node's tenant: one this node owns, one assigned to it, or its tenant's general one.",
                     "config.behavior.vault_key is not accepted: nodes do not name a Vault key.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
@@ -2841,54 +3002,110 @@ fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
     value.truncate(end);
 }
 
-fn extract_final_output_from_tool_results(
-    result: &FunctionLoopRunResult,
-) -> fluxbee_ai_sdk::Result<Option<AiBehaviorOutput>> {
-    for item in result.items.iter().rev() {
+/// The reply of one message's tool loop (FINDINGS A-98, A-99): the model's `text`
+/// (`tool_loop_text`), with every file its tools made, in the order they were made, and with each
+/// of the `links` its pages were published at that the text does not carry, on a line of its own,
+/// so a published link reaches the person even when the model leaves it out. A loop that made
+/// files and left no text gets a fixed line naming them. `None` with no text, no file and no link.
+fn tool_loop_output(
+    text: Option<String>,
+    files: Vec<AiUserArtifact>,
+    links: &[String],
+) -> Option<AiBehaviorOutput> {
+    let text = text.filter(|text| !text.trim().is_empty());
+    let text = if files.is_empty() {
+        text
+    } else {
+        Some(text.unwrap_or_else(|| files_fallback_line(&files)))
+    };
+    let missing = links
+        .iter()
+        .map(String::as_str)
+        .filter(|link| !text.as_deref().is_some_and(|text| text.contains(link)))
+        .collect::<Vec<_>>();
+    let text = if missing.is_empty() {
+        text
+    } else {
+        Some(
+            text.as_deref()
+                .map(str::trim_end)
+                .into_iter()
+                .chain(missing)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    if files.is_empty() {
+        return text.map(AiBehaviorOutput::text);
+    }
+    Some(AiBehaviorOutput::final_output(AiFinalOutput::new(
+        text, files,
+    )))
+}
+
+/// The text of one tool loop's reply: the model's final text or, when that is blank, the last text
+/// it wrote alongside a tool call. The loop sends only the final turn's text; text in a turn that
+/// calls tools would be lost when the model ends without more.
+fn tool_loop_text(result: &FunctionLoopRunResult) -> Option<String> {
+    let written = |text: &String| !text.trim().is_empty();
+    result
+        .final_assistant_text
+        .clone()
+        .filter(written)
+        .or_else(|| {
+            result.items.iter().rev().find_map(|item| match item {
+                FunctionLoopItem::AssistantToolCalls {
+                    content: Some(text),
+                    ..
+                } if written(text) => Some(text.clone()),
+                _ => None,
+            })
+        })
+}
+
+/// The links of the pages `publish_html_page` published in one tool loop, in the order published,
+/// each once: the `url` of each of its results that says `ok`, as the tool answered the model.
+fn published_links(items: &[FunctionLoopItem]) -> Vec<String> {
+    let mut links: Vec<String> = Vec::new();
+    for item in items {
         let FunctionLoopItem::ToolResult { result } = item else {
             continue;
         };
-        if result.is_error {
+        if result.is_error
+            || result.name != "publish_html_page"
+            || result.output.get("status").and_then(Value::as_str) != Some("ok")
+        {
             continue;
         }
-        let Some(final_output_value) = result.output.get("final_output") else {
+        let Some(link) = result
+            .output
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|link| !link.is_empty())
+        else {
             continue;
         };
-        let envelope: ToolFinalArtifactEnvelope =
-            serde_json::from_value(final_output_value.clone()).map_err(|err| {
-                fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                    "tool final_output envelope is invalid: {err}"
-                ))
-            })?;
-        let mut artifacts = Vec::with_capacity(envelope.artifacts.len());
-        for artifact in envelope.artifacts {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(artifact.bytes_base64)
-                .map_err(|err| {
-                    fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                        "tool final_output artifact bytes_base64 is invalid: {err}"
-                    ))
-                })?;
-            artifacts.push(AiUserArtifact::new(bytes, artifact.mime, artifact.filename));
+        if !links.iter().any(|known| known == link) {
+            links.push(link.to_string());
         }
-        tracing::info!(
-            artifact_count = artifacts.len(),
-            artifact_filenames = ?artifacts
-                .iter()
-                .map(|artifact| artifact.filename.clone())
-                .collect::<Vec<_>>(),
-            artifact_mimes = ?artifacts
-                .iter()
-                .map(|artifact| artifact.mime.clone())
-                .collect::<Vec<_>>(),
-            "parsed explicit final_output artifact envelope from tool result"
-        );
-        return Ok(Some(AiBehaviorOutput::final_output(AiFinalOutput::new(
-            envelope.text,
-            artifacts,
-        ))));
     }
-    Ok(None)
+    links
+}
+
+/// The reply's text when the model wrote none: the generators' fixed line, in Spanish, naming the
+/// files.
+fn files_fallback_line(files: &[AiUserArtifact]) -> String {
+    let names = files
+        .iter()
+        .map(|file| file.filename.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if files.len() == 1 {
+        format!("Aca esta el archivo solicitado: {names}")
+    } else {
+        format!("Aca estan los archivos solicitados: {names}")
+    }
 }
 
 fn summarize_behavior_output(output: &AiBehaviorOutput) -> String {
@@ -2958,40 +3175,44 @@ fn default_true() -> bool {
     true
 }
 
-fn build_tool_success_artifact_response(
-    tool_name: &str,
-    text: Option<String>,
-    artifacts: Vec<AiUserArtifact>,
-) -> fluxbee_ai_sdk::Result<Value> {
+/// A generator's answer to the model once its file is made: the file is kept for the reply, and
+/// the model gets only its name, type and size (FINDINGS A-98). A file named as an earlier one
+/// takes its place. A reply that already carries `REPLY_FILES_MAX` files takes no more: the model
+/// is told, and the file is dropped.
+fn keep_reply_file(tool_name: &str, files: &ReplyFiles, file: AiUserArtifact) -> Value {
+    let (filename, mime, size_bytes) = (file.filename.clone(), file.mime.clone(), file.bytes.len());
+    let kept = files.keep(file);
+    if kept == KeptFile::Full {
+        tracing::warn!(
+            tool = %tool_name,
+            filename = %filename,
+            max = REPLY_FILES_MAX,
+            "the reply already carries the most files it can; this one was dropped"
+        );
+        return json!({
+            "status": "error",
+            "error_code": "reply_files_full",
+            "message": format!(
+                "{tool_name}: this reply already carries {REPLY_FILES_MAX} files, the most one \
+                 reply can; {filename} was not made"
+            ),
+            "retryable": false
+        });
+    }
     tracing::info!(
         tool = %tool_name,
-        artifact_count = artifacts.len(),
-        artifact_filenames = ?artifacts
-            .iter()
-            .map(|artifact| artifact.filename.clone())
-            .collect::<Vec<_>>(),
-        artifact_mimes = ?artifacts
-            .iter()
-            .map(|artifact| artifact.mime.clone())
-            .collect::<Vec<_>>(),
-        artifact_total_bytes = artifacts.iter().map(|artifact| artifact.bytes.len()).sum::<usize>(),
-        "tool produced final user-facing artifacts"
+        filename = %filename,
+        mime = %mime,
+        size_bytes,
+        replaced = kept == KeptFile::Replaced,
+        "file kept for the reply"
     );
-    let envelope = ToolFinalArtifactEnvelope {
-        text,
-        artifacts: artifacts
-            .into_iter()
-            .map(|artifact| ToolFinalArtifactItem {
-                filename: artifact.filename,
-                mime: artifact.mime,
-                bytes_base64: base64::engine::general_purpose::STANDARD.encode(artifact.bytes),
-            })
-            .collect(),
-    };
-    Ok(json!({
+    json!({
         "status": "ok",
-        "final_output": envelope
-    }))
+        "filename": filename,
+        "mime": mime,
+        "size_bytes": size_bytes
+    })
 }
 
 fn invalid_tool_args_error(tool_name: &str, err: serde_json::Error) -> fluxbee_ai_sdk::AiSdkError {
@@ -3031,72 +3252,244 @@ fn xml_escape(value: &str) -> String {
     escaped
 }
 
-fn pdf_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
+// The PDF `build_pdf_bytes` writes (FINDINGS A-97): US Letter pages, in points, with 50 pt
+// margins, of Helvetica 12 pt, a line every 14 pt.
+const PDF_PAGE_WIDTH: u32 = 612;
+const PDF_PAGE_HEIGHT: u32 = 792;
+const PDF_MARGIN: u32 = 50;
+const PDF_FONT_SIZE: u32 = 12;
+const PDF_LINE_HEIGHT: u32 = 14;
+/// The lines a page holds: the first baseline 50 pt below the top, the last one above the bottom
+/// margin. 50.
+const PDF_LINES_PER_PAGE: usize =
+    ((PDF_PAGE_HEIGHT - 2 * PDF_MARGIN) / PDF_LINE_HEIGHT + 1) as usize;
+/// The width a line may take, in the font's units (a thousandth of the font size): the page less
+/// its margins.
+const PDF_LINE_WIDTH_UNITS: u32 = (PDF_PAGE_WIDTH - 2 * PDF_MARGIN) * 1000 / PDF_FONT_SIZE;
+
+/// The advance width of each Helvetica glyph, by its byte in WinAnsiEncoding, in thousandths of
+/// the font size: Adobe's Helvetica metrics (the standard 14 fonts' AFM). Lines are measured with
+/// them rather than by counting characters, since an `m` is nearly four times an `i`. 0 marks a
+/// byte with no glyph, which the encoder never writes (`pdf_line_bytes`).
+const HELVETICA_WIDTHS: [u16; 256] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // 0x20
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, // 0x30
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, // 0x40
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, // 0x50
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, // 0x60
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584, 0, // 0x70
+    556, 0, 222, 556, 333, 1000, 556, 556, 333, 1000, 667, 333, 1000, 0, 611, 0, // 0x80
+    0, 222, 222, 333, 333, 350, 556, 1000, 333, 1000, 500, 333, 944, 0, 500, 667, // 0x90
+    278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 333, // 0xA0
+    400, 584, 333, 333, 333, 556, 537, 278, 333, 333, 365, 556, 834, 834, 834, 611, // 0xB0
+    667, 667, 667, 667, 667, 667, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278, // 0xC0
+    722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611, // 0xD0
+    556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556, 278, 278, 278, 278, // 0xE0
+    556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500, 556, 500, // 0xF0
+];
+
+/// Windows-1252's 0x80-0x9F, where it differs from Latin-1: the rest of WinAnsiEncoding is
+/// printable ASCII and U+00A0-U+00FF, each its own byte.
+const CP1252_HIGH: [(char, u8); 27] = [
+    ('\u{20AC}', 0x80), // €
+    ('\u{201A}', 0x82), // single low-9 quotation mark
+    ('\u{0192}', 0x83), // ƒ
+    ('\u{201E}', 0x84), // double low-9 quotation mark
+    ('\u{2026}', 0x85), // …
+    ('\u{2020}', 0x86), // †
+    ('\u{2021}', 0x87), // ‡
+    ('\u{02C6}', 0x88), // ˆ
+    ('\u{2030}', 0x89), // ‰
+    ('\u{0160}', 0x8A), // Š
+    ('\u{2039}', 0x8B), // ‹
+    ('\u{0152}', 0x8C), // Œ
+    ('\u{017D}', 0x8E), // Ž
+    ('\u{2018}', 0x91), // left single quotation mark
+    ('\u{2019}', 0x92), // right single quotation mark
+    ('\u{201C}', 0x93), // left double quotation mark
+    ('\u{201D}', 0x94), // right double quotation mark
+    ('\u{2022}', 0x95), // •
+    ('\u{2013}', 0x96), // –
+    ('\u{2014}', 0x97), // —
+    ('\u{02DC}', 0x98), // ˜
+    ('\u{2122}', 0x99), // ™
+    ('\u{0161}', 0x9A), // š
+    ('\u{203A}', 0x9B), // ›
+    ('\u{0153}', 0x9C), // œ
+    ('\u{017E}', 0x9E), // ž
+    ('\u{0178}', 0x9F), // Ÿ
+];
+
+/// One line of text in WinAnsiEncoding, the font's: Windows-1252, one byte a character. A tab is
+/// a space; any other character without a glyph there, a control character or one outside
+/// Windows-1252 (Cyrillic, Chinese, an emoji), is `?`.
+fn pdf_line_bytes(line: &str) -> Vec<u8> {
+    line.chars()
+        .map(|ch| match u32::from(ch) {
+            0x09 => b' ',
+            code @ (0x20..=0x7E | 0xA0..=0xFF) => code as u8,
+            _ => CP1252_HIGH
+                .iter()
+                .find(|(high, _)| *high == ch)
+                .map_or(b'?', |(_, byte)| *byte),
+        })
+        .collect()
 }
 
-fn build_pdf_bytes(title: Option<&str>, lines: &[String]) -> fluxbee_ai_sdk::Result<Vec<u8>> {
-    let mut content_lines = Vec::new();
-    if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
-        content_lines.push(title.to_string());
-        content_lines.push(String::new());
+/// A line, as `pdf_line_bytes` encodes it, cut into the lines that fit the page's width: at the
+/// last space that fits, or inside a word wider than a whole line. The spaces a cut falls on are
+/// dropped; the line's own leading spaces stay.
+fn wrap_pdf_line(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    loop {
+        let mut width = 0;
+        let mut end = start;
+        let mut last_space = None;
+        while let Some(&byte) = bytes.get(end) {
+            let glyph = u32::from(HELVETICA_WIDTHS[usize::from(byte)]);
+            if width + glyph > PDF_LINE_WIDTH_UNITS {
+                break;
+            }
+            width += glyph;
+            if byte == b' ' {
+                last_space = Some(end);
+            }
+            end += 1;
+        }
+        if end == bytes.len() {
+            lines.push(&bytes[start..]);
+            return lines;
+        }
+        // Every glyph is narrower than a line, so `end` is past `start` and so is the cut.
+        let cut = if bytes[end] == b' ' {
+            end
+        } else {
+            match last_space {
+                Some(space) if space > start => space,
+                _ => end,
+            }
+        };
+        lines.push(&bytes[start..cut]);
+        start = cut;
+        while bytes.get(start) == Some(&b' ') {
+            start += 1;
+        }
+        if start == bytes.len() {
+            return lines;
+        }
+    }
+}
+
+/// Every line the PDF prints, encoded and wrapped: the title and a blank line, then each entry of
+/// `lines`, an entry with line breaks being several lines.
+fn pdf_text_lines(title: Option<&str>, lines: &[String]) -> Vec<Vec<u8>> {
+    let title = title.map(str::trim).filter(|title| !title.is_empty());
+    let mut entries: Vec<&str> = Vec::new();
+    if let Some(title) = title {
+        entries.extend([title, ""]);
     }
     if lines.is_empty() && title.is_none() {
-        content_lines.push("Documento generado por AI".to_string());
+        entries.push("Documento generado por AI");
     } else {
-        content_lines.extend(lines.iter().cloned());
+        entries.extend(lines.iter().map(String::as_str));
     }
-
-    let mut content = String::from("BT\n/F1 12 Tf\n50 742 Td\n14 TL\n");
-    for line in content_lines {
-        content.push_str(&format!("({}) Tj\nT*\n", pdf_escape(&line)));
+    let mut printed = Vec::new();
+    for entry in entries {
+        let mut source: Vec<&str> = entry.lines().collect();
+        if source.is_empty() {
+            // A blank entry is a blank line, which `lines` does not give.
+            source.push("");
+        }
+        for line in source {
+            let bytes = pdf_line_bytes(line);
+            printed.extend(wrap_pdf_line(&bytes).into_iter().map(<[u8]>::to_vec));
+        }
     }
-    content.push_str("ET\n");
-    let content_bytes = content.into_bytes();
+    printed
+}
 
-    let mut pdf = Vec::new();
-    pdf.extend_from_slice(b"%PDF-1.4\n");
-    let mut offsets = Vec::new();
-    let objects = vec![
-        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".to_vec(),
-        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
-        format!(
-            "5 0 obj\n<< /Length {} >>\nstream\n",
-            content_bytes.len()
-        )
-        .into_bytes(),
+/// One page's content stream: its lines from the top margin down, each a literal string. `\`,
+/// `(` and `)` are escaped, and every byte from 0x80 is an octal escape (`\351` for é), so the
+/// stream stays ASCII.
+fn pdf_page_content(lines: &[Vec<u8>]) -> Vec<u8> {
+    let mut content = format!(
+        "BT\n/F1 {PDF_FONT_SIZE} Tf\n{PDF_MARGIN} {} Td\n{PDF_LINE_HEIGHT} TL\n",
+        PDF_PAGE_HEIGHT - PDF_MARGIN
+    )
+    .into_bytes();
+    for line in lines {
+        content.push(b'(');
+        for &byte in line {
+            match byte {
+                b'\\' | b'(' | b')' => content.extend_from_slice(&[b'\\', byte]),
+                0x80..=0xFF => content.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+                _ => content.push(byte),
+            }
+        }
+        content.extend_from_slice(b") Tj\nT*\n");
+    }
+    content.extend_from_slice(b"ET");
+    content
+}
+
+/// A PDF of `title` and `lines` (FINDINGS A-97): Helvetica in WinAnsiEncoding, so Spanish prints
+/// as written; lines wrapped to the page's width; as many pages as the text takes.
+fn build_pdf_bytes(title: Option<&str>, lines: &[String]) -> Vec<u8> {
+    let text = pdf_text_lines(title, lines);
+    let pages: Vec<&[Vec<u8>]> = text.chunks(PDF_LINES_PER_PAGE).collect();
+    // Objects 1 to 3 are the catalog, the page tree and the font; page `i` is object 4 + 2i and
+    // its content stream the next one.
+    let kids = (0..pages.len())
+        .map(|page| format!("{} 0 R", 4 + 2 * page))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()).into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
     ];
-
-    for object in objects.into_iter().take(4) {
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(&object);
+    for (page, lines) in pages.iter().enumerate() {
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_WIDTH} {PDF_PAGE_HEIGHT}] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                5 + 2 * page
+            )
+            .into_bytes(),
+        );
+        let content = pdf_page_content(lines);
+        let mut stream = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+        stream.extend_from_slice(&content);
+        stream.extend_from_slice(b"\nendstream");
+        objects.push(stream);
     }
-    offsets.push(pdf.len());
-    pdf.extend_from_slice(
-        format!("5 0 obj\n<< /Length {} >>\nstream\n", content_bytes.len()).as_bytes(),
-    );
-    pdf.extend_from_slice(&content_bytes);
-    pdf.extend_from_slice(b"endstream\nendobj\n");
 
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
     let xref_offset = pdf.len();
-    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
     pdf.extend_from_slice(b"0000000000 65535 f \n");
     for offset in offsets {
         pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
     }
     pdf.extend_from_slice(
         format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            6, xref_offset
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
         )
         .as_bytes(),
     );
-    Ok(pdf)
+    pdf
 }
 
 fn sanitize_sheet_name(raw: Option<&str>) -> String {
@@ -3501,6 +3894,7 @@ fn base_tool_cards() -> Vec<ToolCard> {
         GenerateDocxArtifactTool::card(),
         GeneratePngArtifactTool::card(),
         GenerateJpegArtifactTool::card(),
+        GetCurrentTimeTool::card(),
         PublishHtmlTool::card(),
     ]
 }
@@ -3527,21 +3921,27 @@ struct ArtifactToolSpec {
     /// The filename endings its type takes, as the card says them (".md or .markdown").
     extensions: &'static str,
     mime: &'static str,
-    /// Its own arguments as JSON schema properties: `filename` and `text` are every generator's.
+    /// Its own arguments as JSON schema properties: `filename` is every generator's.
     properties: Value,
     /// Its own required arguments, besides `filename`.
     required: &'static [&'static str],
 }
 
-/// What every file generator's card says, once and in one limit: the user gets the last file
-/// made, with that call's `text` as the reply (`extract_final_output_from_tool_results`; the
-/// model's own words after the call are dropped), and the file's bytes come back to the model in
-/// the result. The rules of `filename` and `text` are in their input descriptions, which do not
-/// count against the description's limit (`TOOL_DESCRIPTION_MAX_CHARS`).
-const ARTIFACT_TOOL_LIMIT: &str = "The file goes out with this call's `text` as your reply: what \
-    you write after the call is not sent. One file per reply: if several calls make files, only \
-    the last is sent. The file's bytes come back to you base64-encoded, so a large file fills \
-    your context.";
+/// What every file generator's card says, once and in one limit: the reply is the text the model
+/// writes after its last tool call (`tool_loop_text` takes a call's text only when that is
+/// blank), every file the reply's calls make goes with it, up to `REPLY_FILES_MAX`, a file named
+/// as an earlier one takes its place (`ReplyFiles::keep`), and the model gets back only the
+/// file's name, type and size (`keep_reply_file`, `tool_loop_output`). The rules of `filename`
+/// are in its input description, which does not count against the description's limit
+/// (`TOOL_DESCRIPTION_MAX_CHARS`).
+fn artifact_tool_limit() -> String {
+    format!(
+        "Your reply is the text you write after your last tool call; text written alongside a \
+         call is not sent. Every file this reply's calls make goes with it, in order, up to \
+         {REPLY_FILES_MAX}: a call past that makes none, and a file with an earlier one's name \
+         takes its place. You get back the file's name, type and size, never its content."
+    )
+}
 
 /// The rules of a `filename`, which `AiUserArtifact` checks, for a file whose name ends in
 /// `extensions`.
@@ -3568,16 +3968,11 @@ fn artifact_tool_card(spec: ArtifactToolSpec) -> ToolCard {
         "minLength": 1,
         "description": format!("The file's name, as the user sees it: {}.", filename_rules(extensions))
     });
-    properties["text"] = json!({
-        "type": "string",
-        "description": "Your reply, which the user reads with the file. Without it, a fixed line \
-            in Spanish naming the file."
-    });
     let required: Vec<&str> = std::iter::once("filename")
         .chain(required.iter().copied())
         .collect();
     let mut all_limits: Vec<String> = limits.iter().map(|limit| limit.to_string()).collect();
-    all_limits.push(ARTIFACT_TOOL_LIMIT.to_string());
+    all_limits.push(artifact_tool_limit());
     ToolCard {
         name: name.to_string(),
         summary: summary.to_string(),
@@ -3591,50 +3986,41 @@ fn artifact_tool_card(spec: ArtifactToolSpec) -> ToolCard {
             "additionalProperties": false
         }),
         output: json!({
-            "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, \
-                bytes_base64}]}}`: the file and the reply's text.",
+            "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for \
+                your reply.",
             "oneOf": [
                 {
                     "type": "object",
                     "properties": {
                         "status": { "const": "ok" },
-                        "final_output": {
-                            "type": "object",
-                            "properties": {
-                                "text": { "type": "string", "description": "The reply's text." },
-                                "artifacts": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "maxItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "filename": { "type": "string" },
-                                            "mime": { "const": mime },
-                                            "bytes_base64": {
-                                                "type": "string",
-                                                "description": "The file, base64-encoded."
-                                            }
-                                        },
-                                        "required": ["filename", "mime", "bytes_base64"]
-                                    }
-                                }
-                            },
-                            "required": ["text", "artifacts"]
+                        "filename": { "type": "string" },
+                        "mime": { "const": mime },
+                        "size_bytes": {
+                            "type": "integer",
+                            "description": "The file's size, in bytes."
                         }
                     },
-                    "required": ["status", "final_output"]
+                    "required": ["status", "filename", "mime", "size_bytes"]
                 },
-                tool_error_output(&["artifact_filename_invalid"])
+                tool_error_output(&["artifact_filename_invalid", "reply_files_full"])
             ]
         }),
-        errors: vec![ToolErrorCode::new(
-            "artifact_filename_invalid",
-            format!(
-                "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control \
-                 character, or does not end in {extensions}. No file was made."
+        errors: vec![
+            ToolErrorCode::new(
+                "artifact_filename_invalid",
+                format!(
+                    "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control \
+                     character, or does not end in {extensions}. No file was made."
+                ),
             ),
-        )],
+            ToolErrorCode::new(
+                "reply_files_full",
+                format!(
+                    "The reply already carries {REPLY_FILES_MAX} files, the most one reply can. No \
+                     file was made: say so in your reply, and make the rest in a later one."
+                ),
+            ),
+        ],
     }
 }
 
@@ -3744,12 +4130,11 @@ impl AgentTool for GenerateCsvArtifactTool {
                 Ok(artifact) => artifact,
                 Err(err) => return Ok(invalid_tool_artifact_error("generate_csv_artifact", err)),
             };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_csv_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -3779,12 +4164,11 @@ impl AgentTool for GenerateTextArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_text_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_text_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -3822,12 +4206,11 @@ impl AgentTool for GenerateJsonArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_json_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_json_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -3861,12 +4244,11 @@ impl AgentTool for GenerateMarkdownArtifactTool {
                 ))
             }
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_markdown_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -3896,12 +4278,11 @@ impl AgentTool for GenerateHtmlArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_html_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_html_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -3936,9 +4317,9 @@ impl AgentTool for PublishHtmlTool {
                 "The link is the key: anyone who has it can open the page, so put nothing \
                  private in it. It expires 24 hours after publishing, and you cannot extend it \
                  or take the page down earlier.",
-                "Publishing takes up to two minutes. Give the link in your reply; if a \
-                 `generate_*_artifact` call also makes a file for the same reply, only that \
-                 call's `text` is sent, so put the link there.",
+                "Publishing takes up to two minutes. Your reply is the text you write after your \
+                 last tool call; text written alongside a call is not sent. Give the link there: a \
+                 reply without it gets it added, on a line of its own.",
             ]
             .map(String::from)
             .into(),
@@ -4100,7 +4481,8 @@ impl AgentTool for PublishHtmlTool {
                     "url": url,
                     "publication_id": result.payload.get("publication_id"),
                     "expires_at": result.payload.get("expires_at"),
-                    "note": "Page published. Give this URL to the user in your reply."
+                    "note": "Page published. Give this URL to the user in your reply, the text \
+                        you write after your last tool call."
                 }))
             }
             Ok(result) => {
@@ -4130,19 +4512,22 @@ impl AgentTool for PublishHtmlTool {
 
 #[async_trait]
 impl AgentTool for GeneratePdfArtifactTool {
-    /// What `build_pdf_bytes` makes: one Letter page of Helvetica 12 pt text, 14 pt apart from
-    /// 50 pt below the top, in the font's standard encoding.
+    /// What `build_pdf_bytes` makes: Letter pages of Helvetica 12 pt text in WinAnsiEncoding,
+    /// `PDF_LINES_PER_PAGE` lines a page, each wrapped to the page's width (a test holds the
+    /// limits to those constants).
     fn card() -> ToolCard {
         artifact_tool_card(ArtifactToolSpec {
             name: "generate_pdf_artifact",
-            summary: "Make a one-page PDF of text lines and send it to the user.",
-            when_to_use: "When the user wants a short text document as a PDF.",
+            summary: "Make a PDF of text lines and send it to the user.",
+            when_to_use: "When the user wants a text document as a PDF.",
             limits: &[
-                "One page (US Letter) of Helvetica 12 pt, the title first and then one line per \
-                 entry of `lines`. Lines do not wrap (about 90 characters fit) and nothing goes \
-                 past the page (about 50 lines fit). No images, tables or styles.",
-                "Only plain ASCII prints right: accented letters and other non-ASCII characters \
-                 come out garbled.",
+                "US Letter pages of Helvetica 12 pt: the title, a blank line, then one line per \
+                 entry of `lines`. A line wider than the page wraps at a space (a longer word is \
+                 cut), and the text goes on to new pages, 50 lines a page. No images, tables or \
+                 styles.",
+                "Western European text prints as written (Windows-1252: accents, ñ, ¿, ¡, €, \
+                 curly quotes); any other character, such as Cyrillic, Chinese or an emoji, \
+                 prints as `?`.",
                 "With no title and no lines, the page says \"Documento generado por AI\".",
             ],
             extensions: ".pdf",
@@ -4152,7 +4537,10 @@ impl AgentTool for GeneratePdfArtifactTool {
                     "type": "string",
                     "description": "The first line, followed by a blank one."
                 },
-                "lines": strings_schema("The page's lines, top to bottom.")
+                "lines": strings_schema(
+                    "The document's lines, top to bottom; a line break inside an entry starts a \
+                     new line."
+                )
             }),
             required: &[],
         })
@@ -4162,17 +4550,16 @@ impl AgentTool for GeneratePdfArtifactTool {
         let args: GeneratePdfArtifactArgs = serde_json::from_value(arguments)
             .map_err(|err| invalid_tool_args_error("generate_pdf_artifact", err))?;
         let filename = args.filename.trim();
-        let bytes = build_pdf_bytes(args.title.as_deref(), &args.lines)?;
+        let bytes = build_pdf_bytes(args.title.as_deref(), &args.lines);
         let artifact = match AiUserArtifact::from_bytes(filename, "application/pdf", bytes) {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_pdf_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_pdf_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el PDF solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -4214,12 +4601,11 @@ impl AgentTool for GenerateXlsxArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_xlsx_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_xlsx_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta la planilla solicitada: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -4262,12 +4648,11 @@ impl AgentTool for GenerateDocxArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_docx_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_docx_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta el documento solicitado: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -4301,12 +4686,11 @@ impl AgentTool for GeneratePngArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_png_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_png_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta la imagen solicitada: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
     }
 }
 
@@ -4340,12 +4724,200 @@ impl AgentTool for GenerateJpegArtifactTool {
             Ok(artifact) => artifact,
             Err(err) => return Ok(invalid_tool_artifact_error("generate_jpeg_artifact", err)),
         };
-        build_tool_success_artifact_response(
+        Ok(keep_reply_file(
             "generate_jpeg_artifact",
-            args.text
-                .or_else(|| Some(format!("Aca esta la imagen solicitada: {}", filename))),
-            vec![artifact],
-        )
+            &self.files,
+            artifact,
+        ))
+    }
+}
+
+/// SY.timer's error code for a zone it does not know (go/sy-timer/main.go, `TIMER_NOW_IN`).
+const SY_TIMER_INVALID_TIMEZONE: &str = "TIMER_INVALID_TIMEZONE";
+
+impl GetCurrentTimeTool {
+    /// The tool of the node named `node_name` (`AI.sales@worker1`): it asks SY.timer of that
+    /// node's hive. `None` for a name without a hive.
+    fn for_node(router: Arc<RouterDispatcher>, node_name: &str) -> Option<Self> {
+        let (_, hive) = node_name.split_once('@')?;
+        let timer = timer_node_name(hive).ok()?;
+        Some(Self { router, timer })
+    }
+}
+
+/// A `get_current_time` failure, in the shape every tool's has.
+fn time_tool_error(code: &str, message: &str, retryable: bool) -> Value {
+    json!({
+        "status": "error",
+        "error_code": code,
+        "message": format!("get_current_time: {message}"),
+        "retryable": retryable
+    })
+}
+
+/// SY.timer's `TIMER_NOW_IN` answer, as the tool gives it: the instant in UTC and in the zone,
+/// the zone, its abbreviation and the local weekday. `None` when the answer is not a time.
+fn current_time_answer(now: &TimerNowInResult) -> Option<Value> {
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now.now_utc_ms)?;
+    let local = chrono::DateTime::parse_from_rfc3339(&now.now_local_iso).ok()?;
+    Some(json!({
+        "status": "ok",
+        "utc": utc.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "local": now.now_local_iso,
+        "timezone": now.tz,
+        "abbreviation": now.tz_abbrev,
+        // SY.timer gives the local date and not its weekday: the weekday is that date's.
+        "weekday": local.format("%A").to_string(),
+    }))
+}
+
+#[async_trait]
+impl AgentTool for GetCurrentTimeTool {
+    /// It asks with `TIMER_NOW_IN` (the SDK's `TimerClient`), which no policy gates: the router's
+    /// system gate covers only its protected verbs, and the user policy only Resolve. SY.timer runs
+    /// on the motherbee and every worker (docs/nodes/sy-timer.md), and the client tries a silent
+    /// one three times, 1.4 s in all, before the tool answers `time_unavailable`.
+    fn card() -> ToolCard {
+        ToolCard {
+            name: "get_current_time".to_string(),
+            summary: "Get the current date and time, in UTC and in a time zone.".to_string(),
+            when_to_use: "Whenever the answer depends on today's date or the time of day: what \
+                day it is, how long until a date, whether something is due or open now. You do \
+                not know the date: never guess it."
+                .to_string(),
+            limits: [
+                "`timezone` is an IANA zone name, such as `America/Argentina/Buenos_Aires` or \
+                 `Europe/Madrid`; without it, UTC. Use the user's zone when you know it.",
+                "It only reads the time: it cannot schedule anything or wait.",
+            ]
+            .map(String::from)
+            .into(),
+            present_when: "always: SY.timer of the agent's hive answers it, and SY.timer runs on \
+                the motherbee and on every worker"
+                .to_string(),
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "An IANA time zone name, such as \
+                            America/Argentina/Buenos_Aires. UTC when absent."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            output: json!({
+                "description": "`{status: \"ok\", utc, local, timezone, abbreviation, weekday}`: \
+                    the time in UTC and in the zone (ISO 8601, to the millisecond; the local one \
+                    with its offset), the zone and its abbreviation, and the local weekday in \
+                    English.",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "status": { "const": "ok" },
+                            "utc": {
+                                "type": "string",
+                                "description": "In UTC, such as 2026-10-27T15:04:05.123Z."
+                            },
+                            "local": {
+                                "type": "string",
+                                "description": "In the zone, with its offset, such as \
+                                    2026-10-27T12:04:05.123-03:00."
+                            },
+                            "timezone": {
+                                "type": "string",
+                                "description": "The IANA zone of `local`."
+                            },
+                            "abbreviation": {
+                                "type": "string",
+                                "description": "The zone's abbreviation at that moment, such as \
+                                    CET or -03."
+                            },
+                            "weekday": {
+                                "type": "string",
+                                "description": "The weekday of the local date, Monday to Sunday."
+                            }
+                        },
+                        "required": [
+                            "status", "utc", "local", "timezone", "abbreviation", "weekday"
+                        ]
+                    },
+                    tool_error_output(&["invalid_timezone", "time_unavailable"])
+                ]
+            }),
+            errors: vec![
+                ToolErrorCode::new(
+                    "invalid_timezone",
+                    "`timezone` is not an IANA time zone name. Call again with one, or without \
+                     it for UTC.",
+                ),
+                ToolErrorCode::new(
+                    "time_unavailable",
+                    "SY.timer did not answer: the agent's hive does not run it, or it is \
+                     restarting. `retryable: true`: try once more shortly, and never guess the \
+                     time.",
+                ),
+            ],
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GetCurrentTimeArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("get_current_time", err))?;
+        let timezone = args
+            .timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|timezone| !timezone.is_empty())
+            .unwrap_or("UTC");
+        let config = TimerClientConfig {
+            timer_target: Some(self.timer.clone()),
+            ..TimerClientConfig::default()
+        };
+        let now: Result<TimerNowInResult, TimerClientError> = async {
+            TimerClient::new_with_dispatcher(self.router.clone(), config)?
+                .now_in(TimerNowInPayload {
+                    tz: timezone.to_string(),
+                    ..TimerNowInPayload::default()
+                })
+                .await
+        }
+        .await;
+        match now {
+            Ok(now) => Ok(current_time_answer(&now).unwrap_or_else(|| {
+                tracing::warn!(
+                    tool = "get_current_time",
+                    timer = %self.timer,
+                    now_utc_ms = now.now_utc_ms,
+                    now_local_iso = %now.now_local_iso,
+                    "SY.timer answered something that is not a time"
+                );
+                time_tool_error("time_unavailable", "SY.timer's answer is not a time", true)
+            })),
+            Err(TimerClientError::ServiceError { code, .. })
+                if code == SY_TIMER_INVALID_TIMEZONE =>
+            {
+                Ok(time_tool_error(
+                    "invalid_timezone",
+                    &format!("'{timezone}' is not an IANA time zone name"),
+                    false,
+                ))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    tool = "get_current_time",
+                    timer = %self.timer,
+                    error = %err,
+                    "SY.timer did not answer"
+                );
+                Ok(time_tool_error(
+                    "time_unavailable",
+                    "SY.timer did not answer; try again shortly",
+                    true,
+                ))
+            }
+        }
     }
 }
 
@@ -4419,10 +4991,11 @@ impl ManagedNodeConfigContract for AiGenericContract {
         "AI.generic"
     }
     fn required_fields(&self) -> &'static [&'static str] {
-        &["behavior.kind", "behavior.model"]
+        &["behavior.kind"]
     }
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
+            "behavior.model",
             "behavior.model_settings",
             "behavior.provider",
             "behavior.base_url",
@@ -4437,6 +5010,8 @@ impl ManagedNodeConfigContract for AiGenericContract {
              (behavior.provider, or the hive's without it) from SY.vault by resource_type \
              openai|anthropic, in its tenant (owned by it, assigned to it, or its tenant's general \
              one).",
+            "Without behavior.model the node runs on the hive's model for its provider (hive.yaml \
+             ai.providers.<provider>.model); a model it names must be one of its provider.",
             "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
              set_ilk_definition, not through CONFIG_SET.",
         ]
@@ -4717,6 +5292,7 @@ async fn run_managed_node(
         control_plane: Arc::new(RwLock::new(state)),
         cognitive_definition: cognitive_definition.clone(),
         runtime_version,
+        router: Some(dispatcher.clone()),
     };
     spawn_cognitive_definition_poll(
         ai_node.node_name.clone(),
@@ -4935,11 +5511,11 @@ fn build_behavior_from_effective_config(
     match kind {
         "echo" => Ok(NodeBehavior::Echo),
         "ai_chat" => {
-            let model = behavior
-                .model
-                .clone()
-                .ok_or_else(|| "missing behavior.model for ai_chat".to_string())?;
-            require_nonempty("behavior.model", &model)?;
+            // Without it, the hive's model for the node's provider, at each request (A-104).
+            let model = behavior.model.clone();
+            if let Some(model) = model.as_deref() {
+                require_nonempty("behavior.model", model)?;
+            }
 
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let base_url = behavior.base_url.clone();
@@ -5175,35 +5751,170 @@ struct HiveAiFile {
     ai: Option<HiveAiConfig>,
 }
 
-/// The node's AI provider and where it comes from (agent-tools-v1 T8): `behavior.provider`, or the
-/// hive's as hive.yaml says at this moment. It decides the API the node speaks and the Vault
-/// resource type of its key.
-fn effective_ai_provider(
-    ai: &AiChatRuntime,
-    config_dir: &Path,
-) -> std::result::Result<(AiProvider, &'static str), String> {
-    match ai.provider {
-        Some(provider) => Ok((provider, "behavior.provider")),
-        None => hive_ai_provider(config_dir).map(|provider| (provider, "hive")),
+/// What one request of the node runs on: the API it speaks and the Vault resource type of its
+/// key (the provider), and the model it asks.
+#[derive(Debug, Clone, PartialEq)]
+struct AiEngine {
+    provider: AiProvider,
+    model: String,
+}
+
+/// Why a request of the node has no provider or no model.
+#[derive(Debug, Clone, PartialEq)]
+enum AiEngineError {
+    /// hive.yaml cannot be read, and the node leaves its provider or its model to the hive.
+    Hive(String),
+    /// Neither `behavior.model` nor the hive's model for the node's provider (FINDINGS A-104).
+    NoModel(AiProvider),
+}
+
+impl std::fmt::Display for AiEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hive(reason) => f.write_str(reason),
+            Self::NoModel(provider) => write!(
+                f,
+                "no model for the provider {provider}: behavior.model is not set, and hive.yaml \
+                 has no ai.providers.{provider}.model"
+            ),
+        }
     }
 }
 
-/// The hive's AI provider: hive.yaml `ai`, the section every SY.* AI consumer reads, or OpenAI
-/// when it is absent. An AI node without `behavior.provider` uses it.
-fn hive_ai_provider(config_dir: &Path) -> std::result::Result<AiProvider, String> {
+/// The node's provider and model as they stand now, each with where it comes from: its own
+/// `behavior.provider` and `behavior.model`, or else the hive's (agent-tools-v1 T8, FINDINGS
+/// A-104).
+struct AiEngineInEffect {
+    provider: Result<(AiProvider, &'static str), AiEngineError>,
+    model: Result<(String, &'static str), AiEngineError>,
+}
+
+impl AiEngineInEffect {
+    /// What a request runs on, or why it cannot run.
+    fn for_request(self) -> Result<AiEngine, AiEngineError> {
+        let (provider, _) = self.provider?;
+        let (model, _) = self.model?;
+        Ok(AiEngine { provider, model })
+    }
+
+    /// CONFIG_GET's `ai_provider` and `ai_model` (`in_effect_json`).
+    fn config_json(&self) -> (Value, Value) {
+        let provider = self.provider.as_ref();
+        let model = self.model.as_ref();
+        (
+            in_effect_json(provider.map(|(provider, source)| (provider.as_str(), *source))),
+            in_effect_json(model.map(|(model, source)| (model.as_str(), *source))),
+        )
+    }
+}
+
+/// Why CONFIG_SET refuses an ai_chat config whose model, or provider, cannot be resolved now: every
+/// message would fail with `missing_ai_model` (or `hive_ai_config_unreadable`).
+fn unresolved_model_reason(err: &AiEngineError) -> String {
+    match err {
+        AiEngineError::NoModel(provider) => format!(
+            "no model for the provider {provider}: behavior.model is not set, and this hive's \
+             hive.yaml has no ai.providers.{provider}.model; set behavior.model to a model of \
+             {provider}"
+        ),
+        AiEngineError::Hive(reason) => format!(
+            "it leaves its provider or its model to the hive, and {reason}; set behavior.provider \
+             and behavior.model"
+        ),
+    }
+}
+
+/// Resolves the node's provider, then its model: `behavior.provider`, or the hive's; then
+/// `behavior.model`, or the hive's model for that provider. hive.yaml is read as it is at this
+/// moment, once, and only for what the node leaves to the hive: a node that names both never
+/// reads it.
+fn effective_ai_engine(ai: &AiChatRuntime, config_dir: &Path) -> AiEngineInEffect {
+    let mut section = None;
+    let mut hive = || {
+        section
+            .get_or_insert_with(|| hive_ai_section(config_dir))
+            .clone()
+    };
+    let provider = match ai.provider {
+        Some(provider) => Ok((provider, "behavior.provider")),
+        None => hive().map(|section| (hive_ai_provider(section.as_ref()), "hive")),
+    };
+    let model = match (&ai.model, &provider) {
+        (Some(model), _) => Ok((model.clone(), "behavior.model")),
+        (None, Ok((provider, _))) => hive().and_then(|section| {
+            hive_ai_model(section.as_ref(), *provider)
+                .map(|model| (model, "hive"))
+                .ok_or(AiEngineError::NoModel(*provider))
+        }),
+        (None, Err(err)) => Err(err.clone()),
+    };
+    AiEngineInEffect { provider, model }
+}
+
+/// hive.yaml's `ai` section, the one every SY.* AI consumer reads; `None` when it has none.
+fn hive_ai_section(config_dir: &Path) -> Result<Option<HiveAiConfig>, AiEngineError> {
     let path = config_dir.join("hive.yaml");
     let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let hive: HiveAiFile =
-        serde_yaml::from_str(&raw).map_err(|err| format!("invalid {}: {err}", path.display()))?;
-    let engine = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| format!("invalid ai section in {}: {err}", path.display()))?
-        .unwrap_or_else(HiveAiConfig::fallback);
-    Ok(engine.provider)
+        .map_err(|err| AiEngineError::Hive(format!("cannot read {}: {err}", path.display())))?;
+    let hive: HiveAiFile = serde_yaml::from_str(&raw)
+        .map_err(|err| AiEngineError::Hive(format!("invalid {}: {err}", path.display())))?;
+    Ok(hive.ai)
+}
+
+/// The hive's provider: `ai.default_provider`, or OpenAI without an `ai` section, as for the SY
+/// nodes (`HiveAiConfig::fallback`).
+fn hive_ai_provider(section: Option<&HiveAiConfig>) -> AiProvider {
+    section.map_or(HiveAiConfig::fallback().provider, |ai| ai.default_provider)
+}
+
+/// The hive's model for `provider`: `ai.providers.<provider>.model`; without an `ai` section, the
+/// SY nodes' fallback, gpt-5.5, which is OpenAI's. `None` when the hive has none for it.
+fn hive_ai_model(section: Option<&HiveAiConfig>, provider: AiProvider) -> Option<String> {
+    let Some(ai) = section else {
+        let fallback = HiveAiConfig::fallback();
+        return (fallback.provider == provider).then_some(fallback.model);
+    };
+    let configured = match provider {
+        AiProvider::OpenAi => ai.providers.openai.as_ref(),
+        AiProvider::Anthropic => ai.providers.anthropic.as_ref(),
+    };
+    configured
+        .map(|config| config.model.trim())
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+/// One part of the engine in CONFIG_GET: `{name, source}`, or `{name: null, source: "hive",
+/// error}` when the hive cannot give it.
+fn in_effect_json(part: Result<(&str, &str), &AiEngineError>) -> Value {
+    match part {
+        Ok((name, source)) => json!({"name": name, "source": source}),
+        Err(err) => json!({"name": Value::Null, "source": "hive", "error": err.to_string()}),
+    }
+}
+
+/// What the sender gets for a request with no provider or no model. Either is the operator's to
+/// fix, in the node's config or in hive.yaml, so neither is retryable.
+fn ai_engine_error_payload(err: &AiEngineError) -> Value {
+    match err {
+        AiEngineError::NoModel(provider) => json!({
+            "type": "error",
+            "code": "missing_ai_model",
+            "message": format!(
+                "This AI node has no model for its provider, {provider}: set behavior.model in \
+                 its config, or ai.providers.{provider}.model in the hive's hive.yaml."
+            ),
+            "retryable": false
+        }),
+        AiEngineError::Hive(reason) => json!({
+            "type": "error",
+            "code": "hive_ai_config_unreadable",
+            "message": "This AI node takes its provider or its model from the hive, and the \
+                hive's hive.yaml cannot be read.",
+            "retryable": false,
+            "details": { "reason": reason }
+        }),
+    }
 }
 
 /// What the sender gets for a failed AI run. Once a tool has run, no failure is `retryable`
@@ -5695,6 +6406,7 @@ fn inject_memory_package_into_input_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use fluxbee_ai_sdk::{Destination, Meta, Routing};
     use fluxbee_sdk::protocol::{
         MemoryContextSummary, MemoryPackage, MemoryReasonSummary, MemorySummary,
@@ -5897,6 +6609,7 @@ mod tests {
                 CognitiveDefinitionRuntimeState::unresolved(),
             )),
             runtime_version: Some("0.1.86".to_string()),
+            router: None,
         }
     }
 
@@ -6801,11 +7514,12 @@ mod tests {
             state.current_state = NodeLifecycleState::Configured;
         }
         {
+            // Its own provider and model: the key is looked up without reading hive.yaml.
             let mut behavior = node.behavior.write().await;
             *behavior = Some(NodeBehavior::AiChat(AiChatRuntime {
-                model: "gpt-5.5".to_string(),
+                model: Some("gpt-5.5".to_string()),
                 model_settings: ModelSettings::default(),
-                provider: None,
+                provider: Some(AiProvider::OpenAi),
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
                 multimodal: true,
@@ -6938,7 +7652,7 @@ mod tests {
     fn default_mode_registry_does_not_expose_gov_tools() {
         let node = test_node();
         let registry = node
-            .build_tool_registry(&BehaviorContext::default())
+            .build_tool_registry(&BehaviorContext::default(), &Arc::default())
             .expect("registry");
         let names = registry
             .definitions()
@@ -6964,11 +7678,14 @@ mod tests {
     async fn default_mode_rejects_ilk_register_with_unknown_tool() {
         let node = test_node();
         let registry = node
-            .build_tool_registry(&BehaviorContext {
-                thread_id: Some("legacy-thread-1".to_string()),
-                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
-                ..BehaviorContext::default()
-            })
+            .build_tool_registry(
+                &BehaviorContext {
+                    thread_id: Some("legacy-thread-1".to_string()),
+                    src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+                    ..BehaviorContext::default()
+                },
+                &Arc::default(),
+            )
             .expect("registry");
 
         let results = fluxbee_ai_sdk::dispatch_tool_calls(
@@ -7042,156 +7759,92 @@ mod tests {
         assert_eq!(extract_thread_id(&msg), None);
     }
 
-    #[test]
-    fn extract_final_output_from_tool_results_parses_artifact_envelope() {
-        let csv_b64 = base64::engine::general_purpose::STANDARD.encode("a,b\n1,2\n");
-        let result = FunctionLoopRunResult {
-            final_assistant_text: Some("texto provisional".to_string()),
-            items: vec![FunctionLoopItem::ToolResult {
-                result: fluxbee_ai_sdk::FunctionToolResult {
-                    call_id: "call_1".to_string(),
-                    response_id: None,
-                    name: "generate_csv_artifact".to_string(),
-                    arguments: json!({}),
-                    output: json!({
-                        "status": "ok",
-                        "final_output": {
-                            "text": "aca esta",
-                            "artifacts": [{
-                                "filename": "reporte.csv",
-                                "mime": "text/csv",
-                                "bytes_base64": csv_b64
-                            }]
-                        }
-                    }),
-                    is_error: false,
-                },
-            }],
-            tokens_used: 0,
-        };
+    // --- The file generators and the reply (FINDINGS A-97, A-98, A-99) ---
 
-        let output = extract_final_output_from_tool_results(&result)
-            .expect("tool final output should parse")
-            .expect("final output should exist");
-        match output {
-            AiBehaviorOutput::Final(final_output) => {
-                assert_eq!(final_output.text.as_deref(), Some("aca esta"));
-                assert_eq!(final_output.artifacts.len(), 1);
-                assert_eq!(final_output.artifacts[0].filename, "reporte.csv");
-                assert_eq!(final_output.artifacts[0].mime, "text/csv");
-                assert_eq!(final_output.artifacts[0].bytes, b"a,b\n1,2\n".to_vec());
-            }
-            other => panic!("expected final output, got {other:?}"),
+    /// The one file a call kept for the reply.
+    fn kept_file(files: &ReplyFiles) -> AiUserArtifact {
+        let mut kept = files.take();
+        assert_eq!(kept.len(), 1, "one call, one file");
+        kept.remove(0)
+    }
+
+    /// A generator keeps its file for the reply and answers the model only its name, type and
+    /// size.
+    #[tokio::test]
+    async fn generate_pdf_artifact_tool_keeps_a_pdf_for_the_reply() {
+        let files = Arc::new(ReplyFiles::default());
+        let answer = GeneratePdfArtifactTool {
+            files: files.clone(),
         }
-    }
-
-    fn decode_tool_artifact(output: Value) -> (Option<String>, Vec<ToolFinalArtifactItem>) {
-        let final_output = output
-            .get("final_output")
-            .cloned()
-            .expect("tool should return final_output");
-        let envelope: ToolFinalArtifactEnvelope =
-            serde_json::from_value(final_output).expect("tool final_output should deserialize");
-        (envelope.text, envelope.artifacts)
-    }
-
-    #[tokio::test]
-    async fn generate_pdf_artifact_tool_returns_pdf_bytes() {
-        let tool = GeneratePdfArtifactTool;
-        let output = tool
-            .call(json!({
-                "filename": "reporte.pdf",
-                "title": "Reporte",
-                "lines": ["Linea 1", "Linea 2"]
-            }))
-            .await
-            .expect("pdf tool should succeed");
-        let (_text, artifacts) = decode_tool_artifact(output);
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].filename, "reporte.pdf");
-        assert_eq!(artifacts[0].mime, "application/pdf");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&artifacts[0].bytes_base64)
-            .expect("valid base64");
-        assert!(bytes.starts_with(b"%PDF-1.4"));
-    }
-
-    #[tokio::test]
-    async fn generate_textual_artifact_tools_return_expected_mime_and_filenames() {
-        let text_tool = GenerateTextArtifactTool;
-        let json_tool = GenerateJsonArtifactTool;
-        let markdown_tool = GenerateMarkdownArtifactTool;
-        let html_tool = GenerateHtmlArtifactTool;
-
-        let text_output = text_tool
-            .call(json!({
-                "filename": "nota.txt",
-                "content": "hola mundo"
-            }))
-            .await
-            .expect("text tool should succeed");
-        let json_output = json_tool
-            .call(json!({
-                "filename": "payload.json",
-                "data": {"ok": true, "count": 2}
-            }))
-            .await
-            .expect("json tool should succeed");
-        let markdown_output = markdown_tool
-            .call(json!({
-                "filename": "readme.md",
-                "content": "# Hola\n\n- uno\n- dos"
-            }))
-            .await
-            .expect("markdown tool should succeed");
-        let html_output = html_tool
-            .call(json!({
-                "filename": "page.html",
-                "content": "<h1>Hola</h1><p>Mundo</p>"
-            }))
-            .await
-            .expect("html tool should succeed");
-
-        let (_, text_artifacts) = decode_tool_artifact(text_output);
-        let (_, json_artifacts) = decode_tool_artifact(json_output);
-        let (_, markdown_artifacts) = decode_tool_artifact(markdown_output);
-        let (_, html_artifacts) = decode_tool_artifact(html_output);
-
-        assert_eq!(text_artifacts[0].filename, "nota.txt");
-        assert_eq!(text_artifacts[0].mime, "text/plain");
-        assert_eq!(json_artifacts[0].filename, "payload.json");
-        assert_eq!(json_artifacts[0].mime, "application/json");
-        assert_eq!(markdown_artifacts[0].filename, "readme.md");
-        assert_eq!(markdown_artifacts[0].mime, "text/markdown");
-        assert_eq!(html_artifacts[0].filename, "page.html");
-        assert_eq!(html_artifacts[0].mime, "text/html");
-
-        let text_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&text_artifacts[0].bytes_base64)
-            .expect("valid txt base64");
-        let json_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&json_artifacts[0].bytes_base64)
-            .expect("valid json base64");
-        let markdown_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&markdown_artifacts[0].bytes_base64)
-            .expect("valid markdown base64");
-        let html_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&html_artifacts[0].bytes_base64)
-            .expect("valid html base64");
-
+        .call(json!({
+            "filename": "reporte.pdf",
+            "title": "Reporte",
+            "lines": ["Linea 1", "Linea 2"]
+        }))
+        .await
+        .expect("pdf tool should succeed");
+        let file = kept_file(&files);
+        assert_eq!(file.filename, "reporte.pdf");
+        assert_eq!(file.mime, "application/pdf");
+        assert!(file.bytes.starts_with(b"%PDF-1.4"));
         assert_eq!(
-            String::from_utf8(text_bytes).expect("utf8 txt"),
-            "hola mundo"
+            answer,
+            json!({
+                "status": "ok",
+                "filename": "reporte.pdf",
+                "mime": "application/pdf",
+                "size_bytes": file.bytes.len()
+            })
         );
-        assert!(String::from_utf8(json_bytes)
-            .expect("utf8 json")
-            .contains("\"ok\": true"));
-        assert!(String::from_utf8(markdown_bytes)
-            .expect("utf8 markdown")
-            .contains("# Hola"));
-        assert!(String::from_utf8(html_bytes)
-            .expect("utf8 html")
-            .contains("<h1>Hola</h1>"));
+    }
+
+    #[tokio::test]
+    async fn generate_textual_artifact_tools_keep_their_mime_and_filenames() {
+        let files = Arc::new(ReplyFiles::default());
+        GenerateTextArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({"filename": "nota.txt", "content": "hola mundo"}))
+        .await
+        .expect("text tool should succeed");
+        GenerateJsonArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({"filename": "payload.json", "data": {"ok": true, "count": 2}}))
+        .await
+        .expect("json tool should succeed");
+        GenerateMarkdownArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({"filename": "readme.md", "content": "# Hola\n\n- uno\n- dos"}))
+        .await
+        .expect("markdown tool should succeed");
+        GenerateHtmlArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({"filename": "page.html", "content": "<h1>Hola</h1><p>Mundo</p>"}))
+        .await
+        .expect("html tool should succeed");
+
+        let kept = files.take();
+        let names = kept
+            .iter()
+            .map(|file| (file.filename.as_str(), file.mime.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                ("nota.txt", "text/plain"),
+                ("payload.json", "application/json"),
+                ("readme.md", "text/markdown"),
+                ("page.html", "text/html"),
+            ]
+        );
+        let text = |index: usize| String::from_utf8(kept[index].bytes.clone()).expect("utf8");
+        assert_eq!(text(0), "hola mundo");
+        assert!(text(1).contains("\"ok\": true"));
+        assert!(text(2).contains("# Hola"));
+        assert!(text(3).contains("<h1>Hola</h1>"));
     }
 
     /// Excel and LibreOffice run a quoted cell that starts with `=`, `+`, `-` or `@` as a formula:
@@ -7199,29 +7852,26 @@ mod tests {
     /// tab or a carriage return; a plain negative number stays a number.
     #[tokio::test]
     async fn a_csv_cell_never_runs_as_a_formula() {
-        let output = GenerateCsvArtifactTool
-            .call(json!({
-                "filename": "datos.csv",
-                "headers": ["=HYPERLINK(\"http://x\")", "saldo"],
-                "rows": [
-                    ["+1+1", "-12"],
-                    ["@SUM(A1)", "-1.234,56"],
-                    ["\tinvisible", "-12.5"],
-                    ["\rreturn", "-2+3+cmd|' /C calc'!A0"],
-                    ["-", "-.5"],
-                    ["plain", "say \"hi\""],
-                    ["a=b", "12-3"]
-                ]
-            }))
-            .await
-            .expect("csv tool");
-        let (_, artifacts) = decode_tool_artifact(output);
-        let csv = String::from_utf8(
-            base64::engine::general_purpose::STANDARD
-                .decode(&artifacts[0].bytes_base64)
-                .expect("base64"),
-        )
-        .expect("utf8");
+        let files = Arc::new(ReplyFiles::default());
+        GenerateCsvArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({
+            "filename": "datos.csv",
+            "headers": ["=HYPERLINK(\"http://x\")", "saldo"],
+            "rows": [
+                ["+1+1", "-12"],
+                ["@SUM(A1)", "-1.234,56"],
+                ["\tinvisible", "-12.5"],
+                ["\rreturn", "-2+3+cmd|' /C calc'!A0"],
+                ["-", "-.5"],
+                ["plain", "say \"hi\""],
+                ["a=b", "12-3"]
+            ]
+        }))
+        .await
+        .expect("csv tool");
+        let csv = String::from_utf8(kept_file(&files).bytes).expect("utf8");
         let expected = [
             r#""'=HYPERLINK(""http://x"")","saldo""#,
             r#""'+1+1","-12""#,
@@ -7236,28 +7886,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_xlsx_artifact_tool_returns_zip_with_workbook_parts() {
-        let tool = GenerateXlsxArtifactTool;
-        let output = tool
-            .call(json!({
-                "filename": "tabla.xlsx",
-                "headers": ["nombre", "edad"],
-                "rows": [["Ana", "30"], ["Luis", "41"]]
-            }))
-            .await
-            .expect("xlsx tool should succeed");
-        let (_text, artifacts) = decode_tool_artifact(output);
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].filename, "tabla.xlsx");
+    async fn generate_xlsx_artifact_tool_keeps_a_zip_with_workbook_parts() {
+        let files = Arc::new(ReplyFiles::default());
+        GenerateXlsxArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({
+            "filename": "tabla.xlsx",
+            "headers": ["nombre", "edad"],
+            "rows": [["Ana", "30"], ["Luis", "41"]]
+        }))
+        .await
+        .expect("xlsx tool should succeed");
+        let file = kept_file(&files);
+        assert_eq!(file.filename, "tabla.xlsx");
         assert_eq!(
-            artifacts[0].mime,
+            file.mime,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         );
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&artifacts[0].bytes_base64)
-            .expect("valid base64");
-        let cursor = Cursor::new(bytes);
-        let mut zip = zip::ZipArchive::new(cursor).expect("xlsx should be a zip archive");
+        let mut zip =
+            zip::ZipArchive::new(Cursor::new(file.bytes)).expect("xlsx should be a zip archive");
         zip.by_name("[Content_Types].xml")
             .expect("xlsx content types");
         zip.by_name("xl/workbook.xml").expect("xlsx workbook");
@@ -7265,29 +7913,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_docx_artifact_tool_returns_zip_with_document_parts() {
-        let tool = GenerateDocxArtifactTool;
-        let output = tool
-            .call(json!({
-                "filename": "nota.docx",
-                "title": "Nota",
-                "paragraphs": ["Parrafo 1", "Parrafo 2"],
-                "bullets": ["Uno", "Dos"]
-            }))
-            .await
-            .expect("docx tool should succeed");
-        let (_text, artifacts) = decode_tool_artifact(output);
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].filename, "nota.docx");
+    async fn generate_docx_artifact_tool_keeps_a_zip_with_document_parts() {
+        let files = Arc::new(ReplyFiles::default());
+        GenerateDocxArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({
+            "filename": "nota.docx",
+            "title": "Nota",
+            "paragraphs": ["Parrafo 1", "Parrafo 2"],
+            "bullets": ["Uno", "Dos"]
+        }))
+        .await
+        .expect("docx tool should succeed");
+        let file = kept_file(&files);
+        assert_eq!(file.filename, "nota.docx");
         assert_eq!(
-            artifacts[0].mime,
+            file.mime,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&artifacts[0].bytes_base64)
-            .expect("valid base64");
-        let cursor = Cursor::new(bytes);
-        let mut zip = zip::ZipArchive::new(cursor).expect("docx should be a zip archive");
+        let mut zip =
+            zip::ZipArchive::new(Cursor::new(file.bytes)).expect("docx should be a zip archive");
         zip.by_name("[Content_Types].xml")
             .expect("docx content types");
         zip.by_name("word/document.xml").expect("docx document");
@@ -7295,48 +7941,692 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_png_and_jpeg_artifact_tools_return_decodable_images() {
-        let png_tool = GeneratePngArtifactTool;
-        let jpeg_tool = GenerateJpegArtifactTool;
+    async fn generate_png_and_jpeg_artifact_tools_keep_decodable_images() {
+        let files = Arc::new(ReplyFiles::default());
+        GeneratePngArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({
+            "filename": "grafico.png",
+            "bands": ["rojo", "verde", "azul"],
+            "width": 320,
+            "height": 180
+        }))
+        .await
+        .expect("png tool should succeed");
+        let png = kept_file(&files);
+        GenerateJpegArtifactTool {
+            files: files.clone(),
+        }
+        .call(json!({
+            "filename": "grafico.jpg",
+            "bands": ["uno", "dos"],
+            "width": 320,
+            "height": 180
+        }))
+        .await
+        .expect("jpeg tool should succeed");
+        let jpeg = kept_file(&files);
 
-        let png_output = png_tool
-            .call(json!({
-                "filename": "grafico.png",
-                "bands": ["rojo", "verde", "azul"],
-                "width": 320,
-                "height": 180
-            }))
-            .await
-            .expect("png tool should succeed");
-        let jpeg_output = jpeg_tool
-            .call(json!({
-                "filename": "grafico.jpg",
-                "bands": ["uno", "dos"],
-                "width": 320,
-                "height": 180
-            }))
-            .await
-            .expect("jpeg tool should succeed");
-
-        let (_, png_artifacts) = decode_tool_artifact(png_output);
-        let (_, jpeg_artifacts) = decode_tool_artifact(jpeg_output);
-
-        let png_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&png_artifacts[0].bytes_base64)
-            .expect("valid png base64");
-        let jpeg_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&jpeg_artifacts[0].bytes_base64)
-            .expect("valid jpeg base64");
-
-        let png = image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png)
+        let png = image::load_from_memory_with_format(&png.bytes, image::ImageFormat::Png)
             .expect("png should decode");
-        let jpeg = image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg)
+        let jpeg = image::load_from_memory_with_format(&jpeg.bytes, image::ImageFormat::Jpeg)
             .expect("jpeg should decode");
+        assert_eq!((png.width(), png.height()), (320, 180));
+        assert_eq!((jpeg.width(), jpeg.height()), (320, 180));
+    }
 
-        assert_eq!(png.width(), 320);
-        assert_eq!(png.height(), 180);
-        assert_eq!(jpeg.width(), 320);
-        assert_eq!(jpeg.height(), 180);
+    /// The content of each stream of a PDF `build_pdf_bytes` wrote, each checked against its
+    /// `/Length`.
+    fn pdf_streams(pdf: &str) -> Vec<&str> {
+        pdf.match_indices("<< /Length ")
+            .map(|(at, prefix)| {
+                let (length, rest) = pdf[at + prefix.len()..]
+                    .split_once(" >>\nstream\n")
+                    .expect("a stream");
+                let length: usize = length.parse().expect("its length");
+                assert!(
+                    rest[length..].starts_with("\nendstream"),
+                    "the stream's /Length is its own"
+                );
+                &rest[..length]
+            })
+            .collect()
+    }
+
+    /// A-97: the font is Helvetica in WinAnsiEncoding, and each line goes in as its bytes there,
+    /// every one from 0x80 an octal escape: the file stays ASCII, and the PDF prints Spanish.
+    #[test]
+    fn a_pdf_prints_spanish() {
+        let pdf = build_pdf_bytes(
+            Some("Información"),
+            &["¿Año (nuevo)? ¡Sí! Ñandú, pingüino, €5 — «ok»".to_string()],
+        );
+        assert!(pdf.is_ascii());
+        let pdf = String::from_utf8(pdf).expect("ASCII");
+        assert!(pdf.contains(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        ));
+        let streams = pdf_streams(&pdf);
+        assert_eq!(streams.len(), 1);
+        assert!(
+            streams[0].contains("(Informaci\\363n) Tj\nT*\n() Tj\n"),
+            "{}",
+            streams[0]
+        );
+        assert!(
+            streams[0].contains(
+                "(\\277A\\361o \\(nuevo\\)? \\241S\\355! \\321and\\372, ping\\374ino, \\2005 \
+                 \\227 \\253ok\\273) Tj"
+            ),
+            "{}",
+            streams[0]
+        );
+
+        let empty = String::from_utf8(build_pdf_bytes(None, &[])).expect("ASCII");
+        assert!(pdf_streams(&empty)[0].contains("(Documento generado por AI) Tj"));
+    }
+
+    /// A character Windows-1252 does not have prints as `?`; a tab is a space, a control character
+    /// a `?`, and a line break inside an entry starts a new line.
+    #[test]
+    fn a_character_outside_windows_1252_prints_as_a_question_mark() {
+        assert_eq!(pdf_line_bytes("Привет 日本 ✓ 😀 ok"), b"?????? ?? ? ? ok");
+        assert_eq!(pdf_line_bytes("a\tb\u{7}c\u{85}"), b"a b?c?");
+        assert_eq!(
+            pdf_line_bytes("“curly” ‘quotes’ – …"),
+            b"\x93curly\x94 \x91quotes\x92 \x96 \x85"
+        );
+
+        let pdf = String::from_utf8(build_pdf_bytes(None, &["Привет 😀\nsegunda".to_string()]))
+            .expect("ASCII");
+        let stream = pdf_streams(&pdf)[0];
+        assert!(
+            stream.contains("(?????? ?) Tj\nT*\n(segunda) Tj"),
+            "{stream}"
+        );
+    }
+
+    /// A line wider than the page wraps at a space, measured with Helvetica's widths, and the text
+    /// goes on to new pages: every page is in the page tree, and every object where the
+    /// cross-reference table says.
+    #[test]
+    fn a_long_text_wraps_and_takes_several_pages() {
+        let width = |line: &[u8]| {
+            line.iter()
+                .map(|byte| u32::from(HELVETICA_WIDTHS[usize::from(*byte)]))
+                .sum::<u32>()
+        };
+        let words = (0..60)
+            .map(|word| format!("palabra{word}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wrapped = wrap_pdf_line(words.as_bytes());
+        assert!(wrapped.len() > 1);
+        for line in &wrapped {
+            assert!(width(line) <= PDF_LINE_WIDTH_UNITS);
+            assert!(!line.starts_with(b" ") && !line.ends_with(b" "));
+        }
+        assert_eq!(wrapped.join(&b' '), words.as_bytes());
+        // Narrow letters fit more than wide ones: the widths, not a count of characters.
+        assert!(wrap_pdf_line("i".repeat(150).as_bytes()).len() == 1);
+        assert!(wrap_pdf_line("m".repeat(150).as_bytes()).len() > 1);
+        // A word wider than a line is cut.
+        let long = "m".repeat(200);
+        let cut = wrap_pdf_line(long.as_bytes());
+        assert!(cut.len() > 1);
+        assert!(cut.iter().all(|line| width(line) <= PDF_LINE_WIDTH_UNITS));
+        assert_eq!(cut.concat(), long.as_bytes());
+
+        // A title, its blank line and 120 lines: 122 lines, on pages of 50.
+        let lines = (1..=120)
+            .map(|line| format!("Línea {line}"))
+            .collect::<Vec<_>>();
+        let pdf = String::from_utf8(build_pdf_bytes(Some("Informe"), &lines)).expect("ASCII");
+        assert!(pdf.contains("<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R] /Count 3 >>"));
+        let streams = pdf_streams(&pdf);
+        let lines_per_page = streams
+            .iter()
+            .map(|stream| stream.matches(") Tj").count())
+            .collect::<Vec<_>>();
+        assert_eq!(lines_per_page, [PDF_LINES_PER_PAGE, PDF_LINES_PER_PAGE, 22]);
+        assert!(streams[2].contains("(L\\355nea 120) Tj"));
+
+        let xref = pdf.rfind("\nxref\n").expect("xref") + 1;
+        assert!(pdf.ends_with(&format!("startxref\n{xref}\n%%EOF\n")));
+        let offsets = pdf[xref..]
+            .lines()
+            .skip(3)
+            .take_while(|line| line.ends_with(" n "))
+            .map(|line| line[..10].parse::<usize>().expect("an offset"))
+            .collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 3 + 2 * 3);
+        for (index, offset) in offsets.iter().enumerate() {
+            assert!(pdf[*offset..].starts_with(&format!("{} 0 obj\n", index + 1)));
+        }
+
+        // The card says what the code does.
+        let card = GeneratePdfArtifactTool::card();
+        assert!(card.limits[0].contains(&format!("{PDF_LINES_PER_PAGE} lines a page")));
+    }
+
+    /// A model that asks for `calls` in its first turn, with `call_text` alongside them, then ends
+    /// with `final_text`; it keeps what each turn showed it.
+    struct ScriptedModel {
+        calls: Vec<(&'static str, Value)>,
+        call_text: Option<&'static str>,
+        final_text: Option<&'static str>,
+        seen: Mutex<Vec<fluxbee_ai_sdk::FunctionModelTurnRequest>>,
+    }
+
+    impl ScriptedModel {
+        fn new(calls: Vec<(&'static str, Value)>, final_text: Option<&'static str>) -> Self {
+            Self {
+                calls,
+                call_text: None,
+                final_text,
+                seen: Mutex::default(),
+            }
+        }
+
+        fn with_call_text(self, call_text: &'static str) -> Self {
+            Self {
+                call_text: Some(call_text),
+                ..self
+            }
+        }
+
+        /// What the model got back from its calls: the tool results of its second turn.
+        fn results(&self) -> Vec<Value> {
+            let seen = self.seen.lock().expect("seen");
+            assert_eq!(seen.len(), 2, "one turn of calls, one to answer");
+            seen[1]
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    fluxbee_ai_sdk::FunctionLoopItem::ToolResult { result } => {
+                        Some(result.output.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for ScriptedModel {
+        async fn run_turn(
+            &self,
+            request: fluxbee_ai_sdk::FunctionModelTurnRequest,
+        ) -> fluxbee_ai_sdk::Result<fluxbee_ai_sdk::FunctionModelTurnResponse> {
+            let first = {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.push(request);
+                seen.len() == 1
+            };
+            let tool_calls = if first {
+                self.calls
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, (name, arguments))| fluxbee_ai_sdk::FunctionToolCall {
+                            call_id: format!("call-{index}"),
+                            response_id: None,
+                            name: name.to_string(),
+                            arguments: arguments.clone(),
+                        },
+                    )
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let text = if first {
+                self.call_text
+            } else {
+                self.final_text
+            };
+            Ok(fluxbee_ai_sdk::FunctionModelTurnResponse {
+                assistant_text: text.map(str::to_string),
+                tool_calls,
+                tokens_used: 0,
+            })
+        }
+    }
+
+    /// One message's tool loop with `model`, through the tools every message gets.
+    async fn tool_loop_reply(model: &ScriptedModel) -> AiBehaviorOutput {
+        let ctx = BehaviorContext::default();
+        let files = Arc::new(ReplyFiles::default());
+        let tools = test_node()
+            .build_tool_registry(&ctx, &files)
+            .expect("registry");
+        run_tool_loop_with(model, &tools, &files)
+            .await
+            .expect("a reply")
+    }
+
+    /// One message's tool loop with `model`, through `tools`, whose generators keep their files in
+    /// `files`.
+    async fn run_tool_loop_with(
+        model: &ScriptedModel,
+        tools: &FunctionToolRegistry,
+        files: &ReplyFiles,
+    ) -> Option<AiBehaviorOutput> {
+        test_node()
+            .run_tool_loop(
+                model,
+                tools,
+                files,
+                &chat_runtime(None, None),
+                &BehaviorContext::default(),
+                "send both".to_string(),
+                None,
+                "send both",
+            )
+            .await
+            .expect("the tool loop")
+    }
+
+    /// A-98, A-99: a turn that makes two files. The model gets back each file's name, type and
+    /// size, never its bytes, and the reply is the model's own text with both files, in the order
+    /// they were made, down to the text/v1 payload an IO node receives.
+    #[tokio::test]
+    async fn the_reply_is_the_models_text_with_every_file_and_no_bytes_reach_the_model() {
+        let model = ScriptedModel::new(
+            vec![
+                (
+                    "generate_csv_artifact",
+                    json!({"filename": "ventas.csv", "rows": [["enero", "10"]]}),
+                ),
+                (
+                    "generate_pdf_artifact",
+                    json!({"filename": "informe.pdf", "title": "Informe", "lines": ["Año 2026"]}),
+                ),
+            ],
+            Some("Aquí tienes la tabla y el informe."),
+        );
+        let output = tool_loop_reply(&model).await;
+        let AiBehaviorOutput::Final(reply) = &output else {
+            panic!("a reply with files: {output:?}");
+        };
+        assert_eq!(
+            reply.text.as_deref(),
+            Some("Aquí tienes la tabla y el informe.")
+        );
+        let names = reply
+            .artifacts
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["ventas.csv", "informe.pdf"]);
+
+        assert_eq!(
+            model.results(),
+            [
+                json!({
+                    "status": "ok",
+                    "filename": "ventas.csv",
+                    "mime": "text/csv",
+                    "size_bytes": reply.artifacts[0].bytes.len()
+                }),
+                json!({
+                    "status": "ok",
+                    "filename": "informe.pdf",
+                    "mime": "application/pdf",
+                    "size_bytes": reply.artifacts[1].bytes.len()
+                }),
+            ]
+        );
+        let seen = serde_json::to_string(&*model.seen.lock().expect("seen")).expect("serialize");
+        for file in &reply.artifacts {
+            let base64 = base64::engine::general_purpose::STANDARD.encode(&file.bytes);
+            assert!(
+                !seen.contains(&base64),
+                "{} reached the model",
+                file.filename
+            );
+        }
+        assert!(!seen.contains("%PDF") && !seen.contains("bytes_base64"));
+
+        // Both files reach the payload an IO node gets, with the model's text.
+        let blob_root = std::env::temp_dir().join(format!("ai-generic-reply-{}", Uuid::new_v4()));
+        let payload = fluxbee_ai_sdk::build_ai_behavior_response_with_options(
+            output.clone(),
+            &fluxbee_ai_sdk::TextResponseOptions {
+                blob_root: Some(blob_root.clone()),
+                ..fluxbee_ai_sdk::TextResponseOptions::default()
+            },
+        )
+        .expect("the reply's payload");
+        let text = fluxbee_sdk::payload::TextV1Payload::from_value(&payload).expect("text/v1");
+        assert_eq!(
+            text.content.as_deref(),
+            Some("Aquí tienes la tabla y el informe.")
+        );
+        let attachments = text
+            .attachments
+            .iter()
+            .map(|blob| (blob.filename_original.as_str(), blob.mime.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attachments,
+            [
+                ("ventas.csv", "text/csv"),
+                ("informe.pdf", "application/pdf")
+            ]
+        );
+        let _ = fs::remove_dir_all(blob_root);
+    }
+
+    /// A reply carries at most `REPLY_FILES_MAX` files, the IO nodes' limit for one message: a
+    /// call past it makes no file and tells the model, and the reply keeps the first ones.
+    #[tokio::test]
+    async fn the_reply_files_cap_holds() {
+        let calls = (0..=REPLY_FILES_MAX)
+            .map(|index| {
+                (
+                    "generate_text_artifact",
+                    json!({"filename": format!("nota-{index}.txt"), "content": "hola"}),
+                )
+            })
+            .collect();
+        let model = ScriptedModel::new(calls, Some("Listo."));
+        let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
+            panic!("a reply with files");
+        };
+        assert_eq!(reply.artifacts.len(), REPLY_FILES_MAX);
+        assert_eq!(
+            reply.artifacts.last().map(|file| file.filename.clone()),
+            Some(format!("nota-{}.txt", REPLY_FILES_MAX - 1))
+        );
+        let results = model.results();
+        assert!(results[..REPLY_FILES_MAX]
+            .iter()
+            .all(|result| result["status"] == json!("ok")));
+        let refused = &results[REPLY_FILES_MAX];
+        assert_eq!(refused["error_code"], json!("reply_files_full"));
+        assert_eq!(refused["retryable"], json!(false));
+    }
+
+    /// A model that writes no text after its files gets a fixed line naming them; a loop that made
+    /// no file leaves the reply to the model's text, and one with no text either has no reply.
+    #[test]
+    fn a_reply_without_the_models_text_names_its_files() {
+        let file = |name: &str| AiUserArtifact::new(b"x".to_vec(), "text/plain", name);
+        assert_eq!(
+            tool_loop_output(Some("hola".to_string()), Vec::new(), &[]),
+            Some(AiBehaviorOutput::text("hola"))
+        );
+        assert_eq!(
+            tool_loop_output(Some(" ".to_string()), Vec::new(), &[]),
+            None
+        );
+        assert_eq!(tool_loop_output(None, Vec::new(), &[]), None);
+        let Some(AiBehaviorOutput::Final(one)) = tool_loop_output(None, vec![file("a.txt")], &[])
+        else {
+            panic!("a reply with its file");
+        };
+        assert_eq!(
+            one.text.as_deref(),
+            Some("Aca esta el archivo solicitado: a.txt")
+        );
+        let Some(AiBehaviorOutput::Final(two)) = tool_loop_output(
+            Some("  ".to_string()),
+            vec![file("a.txt"), file("b.txt")],
+            &[],
+        ) else {
+            panic!("a reply with its files");
+        };
+        assert_eq!(
+            two.text.as_deref(),
+            Some("Aca estan los archivos solicitados: a.txt, b.txt")
+        );
+    }
+
+    /// The reply is the model's final text, and text it writes alongside a tool call is not sent;
+    /// but when the final text is blank, the last text it wrote alongside a call is the reply,
+    /// before the fixed line, with files or without.
+    #[tokio::test]
+    async fn a_blank_final_text_falls_back_to_the_text_written_alongside_a_call() {
+        let note = || {
+            vec![(
+                "generate_text_artifact",
+                json!({"filename": "nota.txt", "content": "hola"}),
+            )]
+        };
+        let text_of = |output: AiBehaviorOutput| match output {
+            AiBehaviorOutput::Final(reply) => (reply.text, reply.artifacts.len()),
+            AiBehaviorOutput::Text(text) => (Some(text), 0),
+        };
+
+        for final_text in [None, Some(""), Some("  \n")] {
+            let model = ScriptedModel::new(note(), final_text).with_call_text("Aquí va tu nota.");
+            assert_eq!(
+                text_of(tool_loop_reply(&model).await),
+                (Some("Aquí va tu nota.".to_string()), 1),
+                "{final_text:?}"
+            );
+        }
+        let model = ScriptedModel::new(note(), Some("Listo.")).with_call_text("Un momento.");
+        assert_eq!(
+            text_of(tool_loop_reply(&model).await),
+            (Some("Listo.".to_string()), 1),
+            "the final text is the reply"
+        );
+        let model = ScriptedModel::new(note(), None);
+        assert_eq!(
+            text_of(tool_loop_reply(&model).await),
+            (
+                Some("Aca esta el archivo solicitado: nota.txt".to_string()),
+                1
+            ),
+            "no text at all: the fixed line"
+        );
+
+        // Without a file: a call that fails, and its text is the reply.
+        let model = ScriptedModel::new(vec![("no_such_tool", json!({}))], None)
+            .with_call_text("Lo busco y te aviso.");
+        assert_eq!(
+            text_of(tool_loop_reply(&model).await),
+            (Some("Lo busco y te aviso.".to_string()), 0)
+        );
+        let model = ScriptedModel::new(vec![("no_such_tool", json!({}))], None);
+        let ctx = BehaviorContext::default();
+        let files = Arc::new(ReplyFiles::default());
+        let tools = test_node()
+            .build_tool_registry(&ctx, &files)
+            .expect("registry");
+        assert_eq!(
+            run_tool_loop_with(&model, &tools, &files).await,
+            None,
+            "no text, no file, no link: the caller asks once more, without tools"
+        );
+    }
+
+    /// Stands in for `publish_html_page`: answers each call with `answer`, as the tool does.
+    struct PublishedPage {
+        answer: Value,
+    }
+
+    #[async_trait]
+    impl fluxbee_ai_sdk::FunctionTool for PublishedPage {
+        fn definition(&self) -> fluxbee_ai_sdk::FunctionToolDefinition {
+            PublishHtmlTool::card().model_definition()
+        }
+
+        async fn call(&self, _arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+            Ok(self.answer.clone())
+        }
+    }
+
+    /// The link of a page published in the turn always reaches the person: a reply that does not
+    /// carry it gets it on a line of its own, from what the tool answered; one that carries it is
+    /// left as it is, and a failed publish adds nothing.
+    #[tokio::test]
+    async fn the_link_of_a_published_page_always_reaches_the_reply() {
+        const LINK: &str = "https://fluxbee.example/public/k3y";
+        let page = || {
+            vec![(
+                "publish_html_page",
+                json!({"filename": "page.html", "content": "<html>hola</html>"}),
+            )]
+        };
+        let reply = |answer: Value, model: ScriptedModel| async move {
+            let mut tools = FunctionToolRegistry::new();
+            tools
+                .register(Arc::new(PublishedPage { answer }))
+                .expect("register");
+            let files = ReplyFiles::default();
+            run_tool_loop_with(&model, &tools, &files).await
+        };
+        let published = json!({
+            "status": "ok",
+            "url": LINK,
+            "publication_id": "pub-7",
+            "expires_at": 1_790_000_000u64
+        });
+        let text = |text: String| Some(AiBehaviorOutput::text(text));
+
+        assert_eq!(
+            reply(
+                published.clone(),
+                ScriptedModel::new(page(), Some("Listo.\n"))
+            )
+            .await,
+            text(format!("Listo.\n{LINK}"))
+        );
+        assert_eq!(
+            reply(
+                published.clone(),
+                ScriptedModel::new(
+                    page(),
+                    Some("Tu página: https://fluxbee.example/public/k3y")
+                )
+            )
+            .await,
+            text(format!("Tu página: {LINK}"))
+        );
+        assert_eq!(
+            reply(
+                published.clone(),
+                ScriptedModel::new(page(), None).with_call_text("La publico.")
+            )
+            .await,
+            text(format!("La publico.\n{LINK}"))
+        );
+        assert_eq!(
+            reply(published, ScriptedModel::new(page(), None)).await,
+            text(LINK.to_string()),
+            "no text: the link is the reply"
+        );
+        let failed = json!({
+            "status": "error",
+            "error_code": "publish_failed",
+            "message": "publish_html_page: could not reach the publishing service",
+            "retryable": true
+        });
+        assert_eq!(
+            reply(
+                failed,
+                ScriptedModel::new(page(), Some("No pude publicarla."))
+            )
+            .await,
+            text("No pude publicarla.".to_string())
+        );
+
+        // With files: after the fixed line, and each link once.
+        let file = AiUserArtifact::new(b"x".to_vec(), "text/plain", "a.txt");
+        let links = [LINK.to_string()];
+        let Some(AiBehaviorOutput::Final(with_file)) = tool_loop_output(None, vec![file], &links)
+        else {
+            panic!("a reply with its file");
+        };
+        assert_eq!(
+            with_file.text,
+            Some(format!("Aca esta el archivo solicitado: a.txt\n{LINK}"))
+        );
+        let ok = |url: &str| FunctionLoopItem::ToolResult {
+            result: fluxbee_ai_sdk::FunctionToolResult {
+                call_id: "call-0".to_string(),
+                response_id: None,
+                name: "publish_html_page".to_string(),
+                arguments: json!({}),
+                output: json!({"status": "ok", "url": url}),
+                is_error: false,
+            },
+        };
+        assert_eq!(
+            published_links(&[
+                ok(LINK),
+                ok(LINK),
+                ok("https://fluxbee.example/public/other")
+            ]),
+            [LINK, "https://fluxbee.example/public/other"]
+        );
+    }
+
+    /// A file named as an earlier one of the same reply takes its place, in the earlier one's
+    /// position, and takes no other of the reply's `REPLY_FILES_MAX` places: the person never gets
+    /// one name twice.
+    #[tokio::test]
+    async fn a_file_named_as_an_earlier_one_takes_its_place() {
+        let text_file = |name: &str, content: &str| {
+            (
+                "generate_text_artifact",
+                json!({"filename": name, "content": content}),
+            )
+        };
+        let model = ScriptedModel::new(
+            vec![
+                text_file("a.txt", "uno"),
+                (
+                    "generate_csv_artifact",
+                    json!({"filename": "b.csv", "rows": [["1"]]}),
+                ),
+                text_file("a.txt", "dos"),
+            ],
+            Some("Listo."),
+        );
+        let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
+            panic!("a reply with files");
+        };
+        let files = reply
+            .artifacts
+            .iter()
+            .map(|file| (file.filename.as_str(), file.bytes.as_slice()))
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], ("a.txt", b"dos".as_slice()));
+        assert_eq!(files[1].0, "b.csv");
+        assert!(model
+            .results()
+            .iter()
+            .all(|result| result["status"] == json!("ok")));
+
+        // A full reply still takes a file of a name it carries, and no other.
+        let mut calls = (0..REPLY_FILES_MAX)
+            .map(|index| {
+                (
+                    "generate_text_artifact",
+                    json!({"filename": format!("nota-{index}.txt"), "content": "uno"}),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.push(text_file("nota-0.txt", "dos"));
+        calls.push(text_file("otra.txt", "tres"));
+        let model = ScriptedModel::new(calls, Some("Listo."));
+        let AiBehaviorOutput::Final(reply) = tool_loop_reply(&model).await else {
+            panic!("a reply with files");
+        };
+        assert_eq!(reply.artifacts.len(), REPLY_FILES_MAX);
+        assert_eq!(reply.artifacts[0].filename, "nota-0.txt");
+        assert_eq!(reply.artifacts[0].bytes, b"dos");
+        let results = model.results();
+        assert_eq!(results[REPLY_FILES_MAX]["status"], json!("ok"));
+        assert_eq!(
+            results[REPLY_FILES_MAX + 1]["error_code"],
+            json!("reply_files_full")
+        );
     }
 
     #[test]
@@ -7398,13 +8688,30 @@ mod tests {
         }
     }
 
+    /// A-104: `behavior.kind` is a complete ai_chat config. A model the node names is its own,
+    /// and an empty one is refused.
     #[test]
-    fn ai_chat_contract_needs_a_model_and_names_no_key() {
-        let minimal = parse_effective_config_doc(&json!({
-            "behavior": {"kind": "ai_chat", "model": "gpt-5.5"}
-        }))
-        .expect("kind + model is a complete ai_chat config");
-        assert!(build_behavior_from_effective_config(&minimal).is_ok());
+    fn an_ai_chat_config_may_leave_its_model_to_the_hive_and_names_no_key() {
+        let behavior = |behavior: Value| {
+            build_behavior_from_effective_config(
+                &parse_effective_config_doc(&json!({ "behavior": behavior })).expect("parses"),
+            )
+        };
+        let Ok(NodeBehavior::AiChat(minimal)) = behavior(json!({"kind": "ai_chat"})) else {
+            panic!("kind alone is a complete ai_chat config");
+        };
+        assert_eq!((minimal.provider, minimal.model), (None, None));
+        let Ok(NodeBehavior::AiChat(own)) =
+            behavior(json!({"kind": "ai_chat", "model": "gpt-5.5"}))
+        else {
+            panic!("an ai_chat config with its model");
+        };
+        assert_eq!(own.model.as_deref(), Some("gpt-5.5"));
+        let err = behavior(json!({"kind": "ai_chat", "model": " "})).expect_err("an empty model");
+        assert!(
+            err.to_string().contains("behavior.model must not be empty"),
+            "{err}"
+        );
 
         let with_key_name = json!({
             "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"}
@@ -7436,12 +8743,6 @@ mod tests {
             );
         }
 
-        let missing_model = parse_effective_config_doc(&json!({
-            "behavior": {"kind": "ai_chat"}
-        }))
-        .expect("document shape parses");
-        assert!(build_behavior_from_effective_config(&missing_model).is_err());
-
         let legacy = parse_effective_config_doc(&json!({
             "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"}
         }))
@@ -7449,30 +8750,119 @@ mod tests {
         assert!(build_behavior_from_effective_config(&legacy).is_err());
     }
 
+    /// T8, A-104: the provider is the node's or the hive's, and the model the node's or the hive's
+    /// for that provider; without an `ai` section the hive's are OpenAI and gpt-5.5, as for the SY
+    /// nodes. hive.yaml is read only for what the node leaves to it.
     #[test]
-    fn the_ai_provider_is_the_hives_and_openai_without_an_ai_section() {
+    fn the_model_is_the_nodes_or_the_hives_for_its_provider() {
         let dir = std::env::temp_dir().join(format!("ai-generic-hive-ai-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("temp dir");
+        let hive = |yaml: &str| {
+            fs::write(dir.join("hive.yaml"), format!("hive_id: motherbee\n{yaml}"))
+                .expect("write hive.yaml")
+        };
+        let engine = |provider: Option<AiProvider>, model: Option<&str>| {
+            effective_ai_engine(&chat_runtime(provider, model), &dir).for_request()
+        };
+        let runs = |provider: AiProvider, model: &str| {
+            Ok(AiEngine {
+                provider,
+                model: model.to_string(),
+            })
+        };
 
-        fs::write(dir.join("hive.yaml"), "hive_id: motherbee\n").expect("write hive.yaml");
-        assert_eq!(hive_ai_provider(&dir), Ok(AiProvider::OpenAi));
+        hive("ai:\n  default_provider: anthropic\n  providers:\n    openai:\n      model: gpt-5.5\n    anthropic:\n      model: claude-sonnet-5-5\n");
+        assert_eq!(
+            engine(None, None),
+            runs(AiProvider::Anthropic, "claude-sonnet-5-5")
+        );
+        assert_eq!(
+            engine(Some(AiProvider::OpenAi), None),
+            runs(AiProvider::OpenAi, "gpt-5.5")
+        );
+        assert_eq!(
+            engine(None, Some("claude-opus-5")),
+            runs(AiProvider::Anthropic, "claude-opus-5")
+        );
 
-        fs::write(
-            dir.join("hive.yaml"),
-            "hive_id: motherbee\nai:\n  default_provider: anthropic\n  providers:\n    anthropic:\n      model: claude-sonnet-4-5\n",
-        )
-        .expect("write hive.yaml");
-        assert_eq!(hive_ai_provider(&dir), Ok(AiProvider::Anthropic));
+        // The hive names its provider without a model for it.
+        hive("ai:\n  default_provider: anthropic\n");
+        assert_eq!(
+            engine(None, None),
+            Err(AiEngineError::NoModel(AiProvider::Anthropic))
+        );
+        assert_eq!(
+            engine(None, Some("claude-opus-5")),
+            runs(AiProvider::Anthropic, "claude-opus-5")
+        );
+        hive("ai:\n  default_provider: openai\n  providers:\n    openai:\n      model: \" \"\n");
+        assert_eq!(
+            engine(None, None),
+            Err(AiEngineError::NoModel(AiProvider::OpenAi))
+        );
 
-        // The selected provider must be configured: a broken ai section is an error, not OpenAI.
-        fs::write(
-            dir.join("hive.yaml"),
-            "hive_id: motherbee\nai:\n  default_provider: anthropic\n",
-        )
-        .expect("write hive.yaml");
-        assert!(hive_ai_provider(&dir).is_err());
+        // No ai section: the SY nodes' OpenAI and gpt-5.5, and no model for Anthropic.
+        hive("");
+        assert_eq!(engine(None, None), runs(AiProvider::OpenAi, "gpt-5.5"));
+        let err = engine(Some(AiProvider::Anthropic), None).expect_err("no model for anthropic");
+        assert_eq!(err, AiEngineError::NoModel(AiProvider::Anthropic));
+        assert_eq!(
+            err.to_string(),
+            "no model for the provider anthropic: behavior.model is not set, and hive.yaml has no \
+             ai.providers.anthropic.model"
+        );
 
+        // Without hive.yaml, only what the node leaves to the hive fails.
+        fs::remove_file(dir.join("hive.yaml")).expect("remove hive.yaml");
+        assert!(matches!(
+            engine(None, Some("gpt-5.5")),
+            Err(AiEngineError::Hive(reason)) if reason.contains("hive.yaml")
+        ));
+        assert!(matches!(
+            engine(Some(AiProvider::OpenAi), None),
+            Err(AiEngineError::Hive(_))
+        ));
+        assert_eq!(
+            engine(Some(AiProvider::OpenAi), Some("gpt-5.5")),
+            runs(AiProvider::OpenAi, "gpt-5.5")
+        );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A-104: a request whose node names no model, on a hive with none for its provider, fails
+    /// before any key or model call, with an error that names both settings.
+    #[tokio::test]
+    async fn a_request_without_a_model_names_both_settings() {
+        let dir = std::env::temp_dir().join(format!("ai-generic-no-model-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: motherbee\nai:\n  default_provider: openai\n  providers:\n    openai:\n      model: gpt-5.5\n",
+        )
+        .expect("write hive.yaml");
+        let mut node = test_node();
+        node.config_dir = dir.clone();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::Anthropic), None));
+
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "sim-thread-1" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
+        let reply = node
+            .on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(reply.payload["code"], json!("missing_ai_model"));
+        assert_eq!(reply.payload["retryable"], json!(false));
+        let message = reply.payload["message"].as_str().expect("message");
+        assert!(
+            message.contains("behavior.model") && message.contains("ai.providers.anthropic.model"),
+            "{message}"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     // --- The tools' cards and the catalog (docs/agent-tools-v1.md §3) ---
@@ -7608,8 +8998,9 @@ mod tests {
             build_ai_generic_rpc_profile().expect("profile"),
         );
         let mut node = test_node();
+        node.router = Some(dispatcher.clone());
         node.vault = vault_client_for(
-            dispatcher,
+            dispatcher.clone(),
             "AI.generic@motherbee",
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
@@ -7626,16 +9017,19 @@ mod tests {
         };
         assert_eq!(
             sorted(
-                node.build_tool_registry(&every_condition)
+                node.build_tool_registry(&every_condition, &Arc::default())
                     .expect("registry")
                     .definitions()
             ),
             sorted(cards.iter().map(ToolCard::model_definition).collect())
         );
 
-        // No interlocutor and no identity: the state tools and publish_html_page are not there.
-        let mut names = test_node()
-            .build_tool_registry(&BehaviorContext::default())
+        // No interlocutor and no identity: the state tools and publish_html_page are not there;
+        // the generators and get_current_time always are.
+        let mut bare = test_node();
+        bare.router = Some(dispatcher);
+        let mut names = bare
+            .build_tool_registry(&BehaviorContext::default(), &Arc::default())
             .expect("registry")
             .definitions()
             .into_iter()
@@ -7644,11 +9038,11 @@ mod tests {
         names.sort();
         let mut always = cards
             .iter()
-            .filter(|card| card.present_when == "always")
+            .filter(|card| card.present_when.starts_with("always"))
             .map(|card| card.name.clone())
             .collect::<Vec<_>>();
         always.sort();
-        assert_eq!(always.len(), 10);
+        assert_eq!(always.len(), 11);
         assert_eq!(names, always);
     }
 
@@ -7702,31 +9096,38 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    // --- T8: the AI provider per node (FINDINGS A-93) ---
+    // --- T8 and A-104: the AI provider and the model per node (FINDINGS A-93, A-104) ---
 
-    fn ai_chat(provider: Option<AiProvider>) -> NodeBehavior {
-        NodeBehavior::AiChat(AiChatRuntime {
-            model: "a-model".to_string(),
+    fn chat_runtime(provider: Option<AiProvider>, model: Option<&str>) -> AiChatRuntime {
+        AiChatRuntime {
+            model: model.map(str::to_string),
             model_settings: ModelSettings::default(),
             provider,
             base_url: None,
             immediate_memory: ImmediateMemorySection::default(),
             multimodal: true,
-        })
+        }
     }
 
-    async fn ai_provider(node: &GenericAiNode) -> Value {
-        node.handle_control_plane(admin_request(MSG_CONFIG_GET))
+    fn ai_chat(provider: Option<AiProvider>, model: Option<&str>) -> NodeBehavior {
+        NodeBehavior::AiChat(chat_runtime(provider, model))
+    }
+
+    /// CONFIG_GET's `ai_provider` and `ai_model`.
+    async fn engine_in_effect(node: &GenericAiNode) -> (Value, Value) {
+        let config = node
+            .handle_control_plane(admin_request(MSG_CONFIG_GET))
             .await
             .expect("control plane")
             .expect("CONFIG_RESPONSE")
-            .payload["ai_provider"]
-            .clone()
+            .payload;
+        (config["ai_provider"].clone(), config["ai_model"].clone())
     }
 
-    /// CONFIG_GET says which provider the node uses now, and why: its own, or the hive's.
+    /// CONFIG_GET says which provider and which model the node uses now, and why: its own, or the
+    /// hive's.
     #[tokio::test]
-    async fn config_get_shows_the_provider_in_effect() {
+    async fn config_get_shows_the_provider_and_the_model_in_effect() {
         let dir = std::env::temp_dir().join(format!("ai-generic-provider-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("temp dir");
         fs::write(
@@ -7736,29 +9137,156 @@ mod tests {
         .expect("write hive.yaml");
         let mut node = test_node();
         node.config_dir = dir.clone();
+        let named = |name: &str, source: &str| json!({"name": name, "source": source});
 
-        assert_eq!(ai_provider(&node).await, Value::Null, "no behavior yet");
-        *node.behavior.write().await = Some(ai_chat(None));
         assert_eq!(
-            ai_provider(&node).await,
-            json!({"name": "anthropic", "source": "hive"})
+            engine_in_effect(&node).await,
+            (Value::Null, Value::Null),
+            "no behavior yet"
         );
-        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi)));
+        *node.behavior.write().await = Some(ai_chat(None, None));
         assert_eq!(
-            ai_provider(&node).await,
-            json!({"name": "openai", "source": "behavior.provider"})
+            engine_in_effect(&node).await,
+            (
+                named("anthropic", "hive"),
+                named("claude-sonnet-5-5", "hive")
+            )
+        );
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), Some("gpt-5.5")));
+        assert_eq!(
+            engine_in_effect(&node).await,
+            (
+                named("openai", "behavior.provider"),
+                named("gpt-5.5", "behavior.model")
+            )
+        );
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), None));
+        let (provider, model) = engine_in_effect(&node).await;
+        assert_eq!(provider, named("openai", "behavior.provider"));
+        assert_eq!(
+            model,
+            json!({
+                "name": null,
+                "source": "hive",
+                "error": "no model for the provider openai: behavior.model is not set, and \
+                    hive.yaml has no ai.providers.openai.model"
+            })
         );
 
         fs::write(dir.join("hive.yaml"), "hive_id: motherbee\nai: [\n").expect("break it");
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), Some("gpt-5.5")));
         assert_eq!(
-            ai_provider(&node).await,
-            json!({"name": "openai", "source": "behavior.provider"}),
-            "the node's own provider does not read hive.yaml"
+            engine_in_effect(&node).await,
+            (
+                named("openai", "behavior.provider"),
+                named("gpt-5.5", "behavior.model")
+            ),
+            "a node's own provider and model do not read hive.yaml"
         );
-        *node.behavior.write().await = Some(ai_chat(None));
-        let broken = ai_provider(&node).await;
-        assert_eq!(broken["name"], Value::Null);
-        assert!(broken["error"].as_str().is_some(), "{broken}");
+        *node.behavior.write().await = Some(ai_chat(None, None));
+        let (provider, model) = engine_in_effect(&node).await;
+        for broken in [provider, model] {
+            assert_eq!(broken["name"], Value::Null);
+            assert!(broken["error"].as_str().is_some(), "{broken}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A hive whose hive.yaml lists only its default provider's model, as `add_hive` writes a
+    /// worker's: Anthropic, with claude-sonnet-5-5.
+    fn anthropic_only_hive(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-generic-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: worker1\nrole: worker\nai:\n  default_provider: anthropic\n  providers:\n    anthropic:\n      model: \"claude-sonnet-5-5\"\n",
+        )
+        .expect("write hive.yaml");
+        dir
+    }
+
+    /// A model the hive cannot supply is refused at CONFIG_SET, not at every message after it: a
+    /// provider other than the hive's default without `behavior.model`, on a hive that lists only
+    /// the default's model, or a config that leaves its model or its provider to an unreadable
+    /// hive.yaml. Nothing is applied.
+    #[tokio::test]
+    async fn config_set_refuses_a_model_the_hive_cannot_supply() {
+        let dir = anthropic_only_hive("unresolved-model");
+        let mut node = test_node();
+        node.config_dir = dir.clone();
+        let refused = |response: Message| {
+            assert_eq!(response.payload["ok"], json!(false), "{}", response.payload);
+            assert_eq!(response.payload["error"]["code"], json!("invalid_config"));
+            response.payload["error"]["message"]
+                .as_str()
+                .expect("message")
+                .to_string()
+        };
+
+        let message = refused(
+            control_answer(
+                &node,
+                config_set_request(json!({"behavior": {"kind": "ai_chat", "provider": "openai"}})),
+            )
+            .await,
+        );
+        assert!(
+            message.contains("behavior.model") && message.contains("ai.providers.openai.model"),
+            "{message}"
+        );
+
+        fs::remove_file(dir.join("hive.yaml")).expect("remove hive.yaml");
+        for behavior in [
+            json!({"kind": "ai_chat", "provider": "openai"}),
+            json!({"kind": "ai_chat", "model": "gpt-5.5"}),
+        ] {
+            let message = refused(
+                control_answer(&node, config_set_request(json!({ "behavior": behavior }))).await,
+            );
+            assert!(
+                message.contains("behavior.model") && message.contains("hive.yaml"),
+                "{message}"
+            );
+        }
+        assert!(node.behavior.read().await.is_none());
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// CONFIG_SET's answer to a config it holds shows the provider and the model it runs on, as
+    /// CONFIG_GET does.
+    #[tokio::test]
+    async fn config_set_answers_the_provider_and_the_model_in_effect() {
+        let dir = anthropic_only_hive("config-set-engine");
+        let mut node = test_node();
+        node.config_dir = dir.clone();
+        let config = json!({"behavior": {"kind": "ai_chat"}});
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+            state.config_version = 2;
+            state.effective_config = Some(config.clone());
+        }
+        *node.behavior.write().await = Some(ai_chat(None, None));
+
+        // The same config_version applies nothing, and answers what holds (writing a new one
+        // would write the node's config.json under /var/lib/fluxbee).
+        let answer = control_answer(&node, config_set_request(config))
+            .await
+            .payload;
+        assert_eq!(answer["ok"], json!(true), "{answer}");
+        let in_effect = (answer["ai_provider"].clone(), answer["ai_model"].clone());
+        assert_eq!(
+            in_effect,
+            (
+                json!({"name": "anthropic", "source": "hive"}),
+                json!({"name": "claude-sonnet-5-5", "source": "hive"})
+            )
+        );
+        assert_eq!(in_effect, engine_in_effect(&node).await);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7779,12 +9307,7 @@ mod tests {
         let node = Arc::new(node);
         let lookup = tokio::spawn({
             let node = node.clone();
-            async move {
-                let NodeBehavior::AiChat(ai) = ai_chat(Some(AiProvider::Anthropic)) else {
-                    unreachable!("an ai_chat behavior");
-                };
-                node.resolve_ai_credential(&ai).await
-            }
+            async move { node.resolve_ai_credential(AiProvider::Anthropic).await }
         });
         let request = harness
             .next_outgoing_within(Duration::from_secs(5))
@@ -7800,6 +9323,141 @@ mod tests {
             request.payload["filter"]["tenant_id"],
             json!("tnt:33333333-3333-4333-8333-333333333333")
         );
+    }
+
+    // --- get_current_time: SY.timer of the agent's own hive ---
+
+    /// What SY.timer, or the router for it, sends back to `request`.
+    fn timer_reply(request: &Message, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "uuid-of-sy-timer".to_string(),
+                src_l2_name: Some("SY.timer@worker1".to_string()),
+                dst: Destination::Unicast(request.routing.src.clone()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: fluxbee_sdk::protocol::SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// The tool asked with `arguments`, and its answer once a stubbed SY.timer has answered its
+    /// request with `answer`, a TIMER_RESPONSE or the router's UNREACHABLE; with the request.
+    async fn time_asked(arguments: Value, msg: &str, answer: Value) -> (Value, Message) {
+        let (router, mut timer) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@worker1",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let tool = GetCurrentTimeTool::for_node(router, "AI.sales@worker1").expect("the tool");
+        let sy_timer = async {
+            let request = timer.next_outgoing().await.expect("a request to SY.timer");
+            timer
+                .inject(timer_reply(&request, msg, answer))
+                .await
+                .expect("SY.timer's answer");
+            request
+        };
+        let (asked, request) = tokio::join!(tool.call(arguments), sy_timer);
+        (asked.expect("get_current_time"), request)
+    }
+
+    /// The tool asks SY.timer of the agent's own hive with TIMER_NOW_IN, through the SDK's
+    /// TimerClient, and gives the time in UTC and in the zone, the zone and the local weekday;
+    /// without a zone, UTC.
+    #[tokio::test]
+    async fn get_current_time_asks_sy_timer_of_its_hive() {
+        let (asked, request) = time_asked(
+            json!({"timezone": "America/Argentina/Buenos_Aires"}),
+            fluxbee_sdk::MSG_TIMER_RESPONSE,
+            json!({
+                "ok": true,
+                "verb": "TIMER_NOW_IN",
+                "now_utc_ms": 1_793_113_445_123_i64,
+                "tz": "America/Argentina/Buenos_Aires",
+                "now_local_iso": "2026-10-27T12:04:05.123-03:00",
+                "tz_offset_seconds": -10_800,
+                "tz_abbrev": "-03"
+            }),
+        )
+        .await;
+        assert!(matches!(
+            request.routing.dst,
+            Destination::Unicast(ref dst) if dst == "SY.timer@worker1"
+        ));
+        assert_eq!(request.meta.msg_type, "system");
+        assert_eq!(request.meta.msg.as_deref(), Some("TIMER_NOW_IN"));
+        assert_eq!(
+            request.payload["tz"],
+            json!("America/Argentina/Buenos_Aires")
+        );
+        assert_eq!(
+            asked,
+            json!({
+                "status": "ok",
+                "utc": "2026-10-27T15:04:05.123Z",
+                "local": "2026-10-27T12:04:05.123-03:00",
+                "timezone": "America/Argentina/Buenos_Aires",
+                "abbreviation": "-03",
+                "weekday": "Tuesday"
+            })
+        );
+
+        let (asked, request) = time_asked(
+            json!({}),
+            fluxbee_sdk::MSG_TIMER_RESPONSE,
+            json!({
+                "ok": true,
+                "verb": "TIMER_NOW_IN",
+                "now_utc_ms": 1_793_113_445_123_i64,
+                "tz": "UTC",
+                "now_local_iso": "2026-10-27T15:04:05.123Z",
+                "tz_offset_seconds": 0,
+                "tz_abbrev": "UTC"
+            }),
+        )
+        .await;
+        assert_eq!(request.payload["tz"], json!("UTC"));
+        assert_eq!(asked["local"], json!("2026-10-27T15:04:05.123Z"));
+        assert_eq!(asked["weekday"], json!("Tuesday"));
+    }
+
+    /// A zone SY.timer does not know is `invalid_timezone`; a SY.timer that does not answer, as on
+    /// a hive without one, is `time_unavailable`, which may be retried.
+    #[tokio::test]
+    async fn get_current_time_reports_a_bad_zone_and_a_missing_sy_timer() {
+        let (asked, _) = time_asked(
+            json!({"timezone": "Mars/Olympus"}),
+            fluxbee_sdk::MSG_TIMER_RESPONSE,
+            json!({
+                "ok": false,
+                "verb": "TIMER_NOW_IN",
+                "error": {"code": "TIMER_INVALID_TIMEZONE", "message": "unknown time zone Mars/Olympus"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            asked,
+            json!({
+                "status": "error",
+                "error_code": "invalid_timezone",
+                "message": "get_current_time: 'Mars/Olympus' is not an IANA time zone name",
+                "retryable": false
+            })
+        );
+
+        let (asked, _) = time_asked(
+            json!({"timezone": "Europe/Madrid"}),
+            fluxbee_sdk::protocol::MSG_UNREACHABLE,
+            json!({"original_dst": "SY.timer@worker1", "reason": "NODE_NOT_FOUND"}),
+        )
+        .await;
+        assert_eq!(asked["error_code"], json!("time_unavailable"));
+        assert_eq!(asked["retryable"], json!(true));
     }
 
     // --- T9: "tools" is the AI node's only word (FINDINGS A-94) ---
@@ -8212,8 +9870,8 @@ mod tests {
     }
 
     /// The link `publish_html_page` returns is the key to the page. The model gets it, and the
-    /// person gets it in the text of the reply a generator makes, as the card says; no line of the
-    /// journal on the way carries it: the publish, the file, the reply.
+    /// person gets it in the reply, which carries a file too, even when the model's text leaves it
+    /// out; no line of the journal on the way carries it: the publish, the file, the reply.
     #[tokio::test]
     async fn a_published_link_reaches_the_reply_but_never_the_journal() {
         const KEY: &str = "k3y-of-the-published-page";
@@ -8223,18 +9881,40 @@ mod tests {
             "AI.sales@motherbee",
             build_ai_generic_rpc_profile().expect("profile"),
         );
-        let publish = PublishHtmlTool {
-            vault: vault_client_for(
-                dispatcher,
-                "AI.sales@motherbee",
-                Some("ilk:11111111-1111-4111-8111-111111111111"),
-            )
-            .expect("vault client"),
-            blob: fluxbee_sdk::blob::BlobConfig {
-                blob_root: blob_root.clone(),
-                ..fluxbee_sdk::blob::BlobConfig::default()
-            },
-        };
+        let files = Arc::new(ReplyFiles::default());
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(PublishHtmlTool {
+                vault: vault_client_for(
+                    dispatcher,
+                    "AI.sales@motherbee",
+                    Some("ilk:11111111-1111-4111-8111-111111111111"),
+                )
+                .expect("vault client"),
+                blob: fluxbee_sdk::blob::BlobConfig {
+                    blob_root: blob_root.clone(),
+                    ..fluxbee_sdk::blob::BlobConfig::default()
+                },
+            }))
+            .expect("register");
+        tools
+            .register(Arc::new(GenerateTextArtifactTool {
+                files: files.clone(),
+            }))
+            .expect("register");
+        let model = ScriptedModel::new(
+            vec![
+                (
+                    "publish_html_page",
+                    json!({"filename": "page.html", "content": "<html>hola</html>"}),
+                ),
+                (
+                    "generate_text_artifact",
+                    json!({"filename": "notas.txt", "content": "notas"}),
+                ),
+            ],
+            Some("Your page is ready."),
+        );
         let (logs, _guard) = LogCapture::start();
 
         let admin = async {
@@ -8265,58 +9945,24 @@ mod tests {
             };
             harness.inject(answer).await.expect("SY.admin's answer");
         };
-        let (published, ()) = tokio::join!(
-            publish.call(json!({"filename": "page.html", "content": "<html>hola</html>"})),
-            admin
-        );
-        let published = published.expect("publish_html_page");
+        let (output, ()) = tokio::join!(run_tool_loop_with(&model, &tools, &files), admin);
+        let published = &model.results()[0];
         assert_eq!(published["status"], json!("ok"), "{published}");
         assert_eq!(published["url"], json!(link));
 
-        let reply = GenerateTextArtifactTool
-            .call(json!({
-                "filename": "notas.txt",
-                "content": "notas",
-                "text": format!("Your page: {link}")
-            }))
-            .await
-            .expect("generate_text_artifact");
-        let tool_result = |name: &str, output: Value| FunctionLoopItem::ToolResult {
-            result: fluxbee_ai_sdk::FunctionToolResult {
-                call_id: format!("call-{name}"),
-                response_id: None,
-                name: name.to_string(),
-                arguments: json!({}),
-                output,
-                is_error: false,
-            },
+        let Some(AiBehaviorOutput::Final(reply)) = output else {
+            panic!("a reply with its file: {output:?}");
         };
-        let run = FunctionLoopRunResult {
-            final_assistant_text: None,
-            items: vec![
-                tool_result("publish_html_page", published),
-                tool_result("generate_text_artifact", reply),
-            ],
-            tokens_used: 0,
-        };
-        let output = extract_final_output_from_tool_results(&run)
-            .expect("the envelope")
-            .expect("a reply with its file");
-        test_node().log_final_output(&BehaviorContext::default(), &output);
-        let AiBehaviorOutput::Final(final_output) = &output else {
-            panic!("a reply with its file");
-        };
-        assert!(final_output
-            .text
-            .as_deref()
-            .is_some_and(|text| text.contains(&link)));
+        let reply_text = format!("Your page is ready.\n{link}");
+        assert_eq!(reply.text.as_deref(), Some(reply_text.as_str()));
+        assert_eq!(reply.artifacts.len(), 1);
 
         let text = logs.text();
         assert!(text.contains("published HTML page"), "{text}");
         assert!(text.contains("pub-7"), "{text}");
         assert!(text.contains("notas.txt"), "{text}");
         assert!(
-            text.contains(&format!("text_len={}", "Your page: ".len() + link.len())),
+            text.contains(&format!("text_len={}", reply_text.len())),
             "{text}"
         );
         assert!(!text.contains(KEY), "the link reached the journal:\n{text}");

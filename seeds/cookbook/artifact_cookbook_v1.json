@@ -13,14 +13,14 @@
       "artifact": {
         "files": {
           "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
-          "config/default-config.json": "{\"behavior\":{\"kind\":\"ai_chat\",\"model\":\"gpt-5.5\"}}"
+          "config/default-config.json": "{\"behavior\":{\"kind\":\"ai_chat\"}}"
         }
       }
     },
     "constraints": [
       "package.json must include: name (lowercase, dots/hyphens allowed), version (semver), type, runtime_base",
       "runtime_base must match one of the available runtimes in known_context.available_runtimes",
-      "config/default-config.json must be valid JSON: ai.generic's config, behavior.kind ai_chat and model",
+      "config/default-config.json must be valid JSON: ai.generic's config, behavior.kind ai_chat; it names a provider or a model only when the agent needs its own (the hive's otherwise), and a model always of the node's provider",
       "the package carries no prompt: an agent's prompt is its ILK definition (role, skills, handbooks)",
       "name in package.json must be lowercase with no spaces"
     ],
@@ -33,7 +33,8 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "artifact",
@@ -125,7 +126,8 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "artifact",
@@ -156,6 +158,7 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   }
 ]

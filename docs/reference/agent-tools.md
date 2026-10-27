@@ -20,11 +20,12 @@ UPDATE_AGENT_TOOLS_CATALOG=1 cargo test -p fluxbee-ai-nodes --bin ai_node_runner
 | [`generate_json_artifact`](#generate_json_artifact) | Make a JSON file and send it to the user. | always |
 | [`generate_markdown_artifact`](#generate_markdown_artifact) | Make a Markdown file and send it to the user. | always |
 | [`generate_html_artifact`](#generate_html_artifact) | Make an HTML file and send it to the user. | always |
-| [`generate_pdf_artifact`](#generate_pdf_artifact) | Make a one-page PDF of text lines and send it to the user. | always |
+| [`generate_pdf_artifact`](#generate_pdf_artifact) | Make a PDF of text lines and send it to the user. | always |
 | [`generate_xlsx_artifact`](#generate_xlsx_artifact) | Make an XLSX spreadsheet of text cells and send it to the user. | always |
 | [`generate_docx_artifact`](#generate_docx_artifact) | Make a DOCX document of plain paragraphs and send it to the user. | always |
 | [`generate_png_artifact`](#generate_png_artifact) | Make a PNG image of colored horizontal bands and send it to the user. | always |
 | [`generate_jpeg_artifact`](#generate_jpeg_artifact) | Make a JPEG image of colored horizontal bands and send it to the user. | always |
+| [`get_current_time`](#get_current_time) | Get the current date and time, in UTC and in a time zone. | always: SY.timer of the agent's hive answers it, and SY.timer runs on the motherbee and on every worker |
 | [`publish_html_page`](#publish_html_page) | Publish an HTML page at a public link, and get the link. | the node has its identity: it was launched with its ILK |
 
 ## `thread_state_get`
@@ -220,10 +221,11 @@ Make a CSV file from rows of text and send it to the user.
 - **Limits:**
   - Every cell is written quoted. A cell that starts with `=`, `+`, `@`, a tab or a carriage return, or with `-` and is not a plain number such as `-12.5`, gets a `'` in front, so a spreadsheet takes it as text, never as a formula.
   - `headers`, when given, is the first row.
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .csv. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -252,10 +254,6 @@ Input:
         "type": "array"
       },
       "type": "array"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -270,47 +268,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "text/csv"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "text/csv"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -318,7 +288,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -326,7 +298,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -358,10 +331,11 @@ Make a plain-text file and send it to the user.
 - **When to use:** When the user wants text as a file rather than in the message: notes, a log, a long answer to keep.
 - **Present when:** always
 - **Limits:**
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .txt. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -377,10 +351,6 @@ Input:
       "description": "The file's name, as the user sees it: it ends in .txt, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
       "minLength": 1,
       "type": "string"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -395,47 +365,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "text/plain"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "text/plain"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -443,7 +385,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -451,7 +395,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -483,10 +428,11 @@ Make a JSON file and send it to the user.
 - **When to use:** When the user wants structured data as a file, for a program to read.
 - **Present when:** always
 - **Limits:**
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .json. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -505,10 +451,6 @@ Input:
     "pretty": {
       "description": "Indent the file; true by default.",
       "type": "boolean"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -523,47 +465,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "application/json"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "application/json"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -571,7 +485,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -579,7 +495,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -611,10 +528,11 @@ Make a Markdown file and send it to the user.
 - **When to use:** When the user wants formatted text (headings, lists, tables) as a file.
 - **Present when:** always
 - **Limits:**
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .md or .markdown. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -630,10 +548,6 @@ Input:
       "description": "The file's name, as the user sees it: it ends in .md or .markdown, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
       "minLength": 1,
       "type": "string"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -648,47 +562,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "text/markdown"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "text/markdown"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -696,7 +582,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -704,7 +592,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -737,10 +626,11 @@ Make an HTML file and send it to the user.
 - **Present when:** always
 - **Limits:**
   - It is a file, not a link: the user opens it from the attachment.
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .html or .htm. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -756,10 +646,6 @@ Input:
       "description": "The file's name, as the user sees it: it ends in .html or .htm, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
       "minLength": 1,
       "type": "string"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -774,47 +660,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "text/html"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "text/html"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -822,7 +680,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -830,7 +690,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -857,18 +718,19 @@ Output:
 
 ## `generate_pdf_artifact`
 
-Make a one-page PDF of text lines and send it to the user.
+Make a PDF of text lines and send it to the user.
 
-- **When to use:** When the user wants a short text document as a PDF.
+- **When to use:** When the user wants a text document as a PDF.
 - **Present when:** always
 - **Limits:**
-  - One page (US Letter) of Helvetica 12 pt, the title first and then one line per entry of `lines`. Lines do not wrap (about 90 characters fit) and nothing goes past the page (about 50 lines fit). No images, tables or styles.
-  - Only plain ASCII prints right: accented letters and other non-ASCII characters come out garbled.
+  - US Letter pages of Helvetica 12 pt: the title, a blank line, then one line per entry of `lines`. A line wider than the page wraps at a space (a longer word is cut), and the text goes on to new pages, 50 lines a page. No images, tables or styles.
+  - Western European text prints as written (Windows-1252: accents, ñ, ¿, ¡, €, curly quotes); any other character, such as Cyrillic, Chinese or an emoji, prints as `?`.
   - With no title and no lines, the page says "Documento generado por AI".
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .pdf. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -882,15 +744,11 @@ Input:
       "type": "string"
     },
     "lines": {
-      "description": "The page's lines, top to bottom.",
+      "description": "The document's lines, top to bottom; a line break inside an entry starts a new line.",
       "items": {
         "type": "string"
       },
       "type": "array"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     },
     "title": {
       "description": "The first line, followed by a blank one.",
@@ -908,47 +766,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "application/pdf"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "application/pdf"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -956,7 +786,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -964,7 +796,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -999,10 +832,11 @@ Make an XLSX spreadsheet of text cells and send it to the user.
   - One sheet, and every cell is text: numbers stay text, with no formulas or formats. `headers`, when given, is the first row.
   - `sheet_name` loses `:`, `\`, `/`, `?`, `*`, `[` and `]` and is cut at 31 characters; it is Sheet1 without one.
   - With no headers and no rows, the sheet holds one cell: "Generated by AI".
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .xlsx. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -1035,10 +869,6 @@ Input:
     "sheet_name": {
       "description": "Sheet1 by default.",
       "type": "string"
-    },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
     }
   },
   "required": [
@@ -1053,47 +883,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -1101,7 +903,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -1109,7 +913,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -1143,10 +948,11 @@ Make a DOCX document of plain paragraphs and send it to the user.
 - **Limits:**
   - Plain text in a fixed order: the title, the paragraphs, the bullets, then one table. No styles or headings: the title is a plain paragraph, and a bullet is a paragraph that starts with "- ".
   - With nothing to write, the document says "Documento generado por AI".
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .docx. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -1190,10 +996,6 @@ Input:
       },
       "type": "array"
     },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
-    },
     "title": {
       "description": "The first paragraph.",
       "type": "string"
@@ -1210,47 +1012,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -1258,7 +1032,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -1266,7 +1042,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -1300,10 +1077,11 @@ Make a PNG image of colored horizontal bands and send it to the user.
 - **Limits:**
   - It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each entry's text picks its color and is not drawn. Without `bands`, one color fills the image.
   - 1200 x 800 pixels by default; `width` and `height` are kept between 64 and 2400.
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .png. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -1329,10 +1107,6 @@ Input:
       "minimum": 64,
       "type": "integer"
     },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
-    },
     "width": {
       "description": "Pixels; 1200 by default.",
       "maximum": 2400,
@@ -1351,47 +1125,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "image/png"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "image/png"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -1399,7 +1145,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -1407,7 +1155,8 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
           ]
         },
         "message": {
@@ -1441,10 +1190,11 @@ Make a JPEG image of colored horizontal bands and send it to the user.
 - **Limits:**
   - It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each entry's text picks its color and is not drawn. Without `bands`, one color fills the image.
   - 1200 x 800 pixels by default; `width` and `height` are kept between 64 and 2400.
-  - The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context.
-- **Returns:** `{status: "ok", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.
+  - Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content.
+- **Returns:** `{status: "ok", filename, mime, size_bytes}`: the file is kept for your reply.
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .jpg or .jpeg. No file was made.
+  - `reply_files_full`: The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one.
 
 Input:
 
@@ -1470,10 +1220,6 @@ Input:
       "minimum": 64,
       "type": "integer"
     },
-    "text": {
-      "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-      "type": "string"
-    },
     "width": {
       "description": "Pixels; 1200 by default.",
       "maximum": 2400,
@@ -1492,47 +1238,19 @@ Output:
 
 ```json
 {
-  "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+  "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
   "oneOf": [
     {
       "properties": {
-        "final_output": {
-          "properties": {
-            "artifacts": {
-              "items": {
-                "properties": {
-                  "bytes_base64": {
-                    "description": "The file, base64-encoded.",
-                    "type": "string"
-                  },
-                  "filename": {
-                    "type": "string"
-                  },
-                  "mime": {
-                    "const": "image/jpeg"
-                  }
-                },
-                "required": [
-                  "filename",
-                  "mime",
-                  "bytes_base64"
-                ],
-                "type": "object"
-              },
-              "maxItems": 1,
-              "minItems": 1,
-              "type": "array"
-            },
-            "text": {
-              "description": "The reply's text.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "text",
-            "artifacts"
-          ],
-          "type": "object"
+        "filename": {
+          "type": "string"
+        },
+        "mime": {
+          "const": "image/jpeg"
+        },
+        "size_bytes": {
+          "description": "The file's size, in bytes.",
+          "type": "integer"
         },
         "status": {
           "const": "ok"
@@ -1540,7 +1258,9 @@ Output:
       },
       "required": [
         "status",
-        "final_output"
+        "filename",
+        "mime",
+        "size_bytes"
       ],
       "type": "object"
     },
@@ -1548,7 +1268,109 @@ Output:
       "properties": {
         "error_code": {
           "enum": [
-            "artifact_filename_invalid"
+            "artifact_filename_invalid",
+            "reply_files_full"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "status": {
+          "const": "error"
+        }
+      },
+      "required": [
+        "status",
+        "error_code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    }
+  ]
+}
+```
+
+## `get_current_time`
+
+Get the current date and time, in UTC and in a time zone.
+
+- **When to use:** Whenever the answer depends on today's date or the time of day: what day it is, how long until a date, whether something is due or open now. You do not know the date: never guess it.
+- **Present when:** always: SY.timer of the agent's hive answers it, and SY.timer runs on the motherbee and on every worker
+- **Limits:**
+  - `timezone` is an IANA zone name, such as `America/Argentina/Buenos_Aires` or `Europe/Madrid`; without it, UTC. Use the user's zone when you know it.
+  - It only reads the time: it cannot schedule anything or wait.
+- **Returns:** `{status: "ok", utc, local, timezone, abbreviation, weekday}`: the time in UTC and in the zone (ISO 8601, to the millisecond; the local one with its offset), the zone and its abbreviation, and the local weekday in English.
+- **Errors:**
+  - `invalid_timezone`: `timezone` is not an IANA time zone name. Call again with one, or without it for UTC.
+  - `time_unavailable`: SY.timer did not answer: the agent's hive does not run it, or it is restarting. `retryable: true`: try once more shortly, and never guess the time.
+
+Input:
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "timezone": {
+      "description": "An IANA time zone name, such as America/Argentina/Buenos_Aires. UTC when absent.",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+Output:
+
+```json
+{
+  "description": "`{status: \"ok\", utc, local, timezone, abbreviation, weekday}`: the time in UTC and in the zone (ISO 8601, to the millisecond; the local one with its offset), the zone and its abbreviation, and the local weekday in English.",
+  "oneOf": [
+    {
+      "properties": {
+        "abbreviation": {
+          "description": "The zone's abbreviation at that moment, such as CET or -03.",
+          "type": "string"
+        },
+        "local": {
+          "description": "In the zone, with its offset, such as 2026-10-27T12:04:05.123-03:00.",
+          "type": "string"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "timezone": {
+          "description": "The IANA zone of `local`.",
+          "type": "string"
+        },
+        "utc": {
+          "description": "In UTC, such as 2026-10-27T15:04:05.123Z.",
+          "type": "string"
+        },
+        "weekday": {
+          "description": "The weekday of the local date, Monday to Sunday.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "utc",
+        "local",
+        "timezone",
+        "abbreviation",
+        "weekday"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "error_code": {
+          "enum": [
+            "invalid_timezone",
+            "time_unavailable"
           ]
         },
         "message": {
@@ -1582,7 +1404,7 @@ Publish an HTML page at a public link, and get the link.
 - **Limits:**
   - One self-contained HTML file, served under a sandbox: its inline scripts and styles run, but it loads nothing from the network (no fetch, no outside scripts, stylesheets, fonts or images); images and fonts only inline, as `data:` URLs; forms do not submit.
   - The link is the key: anyone who has it can open the page, so put nothing private in it. It expires 24 hours after publishing, and you cannot extend it or take the page down earlier.
-  - Publishing takes up to two minutes. Give the link in your reply; if a `generate_*_artifact` call also makes a file for the same reply, only that call's `text` is sent, so put the link there.
+  - Publishing takes up to two minutes. Your reply is the text you write after your last tool call; text written alongside a call is not sent. Give the link there: a reply without it gets it added, on a line of its own.
 - **Returns:** `{status: "ok", url, publication_id, expires_at}`: the public link, the publication's id and when it expires (Unix seconds).
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .html or .htm. Nothing was published.

@@ -316,13 +316,13 @@ fn scaffold_full_runtime(pkg_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(created)
 }
 
-/// An agent on `ai.generic`: its behavior (`kind` and `model` are required; the model is one of
-/// the hive's AI provider, no `temperature`). What the agent is told comes from its ILK: the role,
-/// skills and handbooks of its definition.
+/// An agent on `ai.generic`: its behavior, `kind` alone. Without `provider` and `model` it runs on
+/// the hive's provider and that provider's model (FINDINGS A-104); name them only for an agent that
+/// needs its own, the model always one of its provider, and no `temperature`. What the agent is
+/// told comes from its ILK: the role, skills and handbooks of its definition.
 const AI_GENERIC_DEFAULT_CONFIG: &str = r#"{
   "behavior": {
-    "kind": "ai_chat",
-    "model": "gpt-5.5"
+    "kind": "ai_chat"
   }
 }
 "#;

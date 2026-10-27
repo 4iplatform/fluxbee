@@ -1,8 +1,10 @@
 hive_id: "motherbee"
 role: motherbee
 
-# Hive-wide AI engine used by SY.* consumers. If this section is omitted,
-# the runtime falls back to OpenAI with model gpt-5.5.
+# Hive-wide AI engine used by SY.* consumers, and by every AI node (ai.generic)
+# that names no provider or model of its own: such a node takes the model listed
+# here for its provider. If this section is omitted, the runtime falls back to
+# OpenAI with model gpt-5.5.
 ai:
   default_provider: openai
   providers:

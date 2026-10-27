@@ -1877,9 +1877,17 @@ fn write_artifact_cookbook(state_dir: &Path, entries: &[CookbookEntryV2]) {
     }
 }
 
+/// An entry the pipeline appends is observed, whatever it says: a cookbook's only manual entries
+/// are its built-in seeds, which `seed_cookbooks_from_defaults` replaces when newer ones ship.
+fn observed_entry(mut entry: CookbookEntryV2) -> CookbookEntryV2 {
+    entry.seed_kind = "observed".to_string();
+    entry.seed_version = None;
+    entry
+}
+
 fn append_plan_compile_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) {
     let mut entries = read_plan_compile_cookbook(state_dir);
-    entries.push(normalize_plan_compile_cookbook_entry(entry));
+    entries.push(normalize_plan_compile_cookbook_entry(observed_entry(entry)));
     if entries.len() > PLAN_COMPILE_COOKBOOK_MAX_ENTRIES {
         let drop = entries.len() - PLAN_COMPILE_COOKBOOK_MAX_ENTRIES;
         entries.drain(0..drop);
@@ -1889,7 +1897,7 @@ fn append_plan_compile_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) 
 
 fn append_artifact_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) {
     let mut entries = read_artifact_cookbook(state_dir);
-    entries.push(normalize_artifact_cookbook_entry(entry));
+    entries.push(normalize_artifact_cookbook_entry(observed_entry(entry)));
     if entries.len() > PLAN_COMPILE_COOKBOOK_MAX_ENTRIES {
         let drop = entries.len() - PLAN_COMPILE_COOKBOOK_MAX_ENTRIES;
         entries.drain(0..drop);
@@ -1919,7 +1927,7 @@ fn write_design_cookbook(state_dir: &Path, entries: &[CookbookEntryV2]) {
 
 fn append_design_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) {
     let mut entries = read_design_cookbook(state_dir);
-    entries.push(entry);
+    entries.push(observed_entry(entry));
     if entries.len() > PLAN_COMPILE_COOKBOOK_MAX_ENTRIES {
         let drop = entries.len() - PLAN_COMPILE_COOKBOOK_MAX_ENTRIES;
         entries.drain(0..drop);
@@ -1945,9 +1953,12 @@ fn read_handbook_text() -> Option<String> {
 }
 
 // ── TF: Seed cookbooks from the built-in defaults on startup ─────────────────
-// Each cookbook is seeded once from its seed if the runtime file is missing or
-// empty. Once the pipeline appends observed patterns, the seeds are never
-// overwritten — they are bootstrapping data, not configuration.
+// A cookbook's built-in seeds are its "manual" entries, each with its seed's `seed_version`; the
+// pipeline appends "observed" ones. At start, a cookbook missing or empty gets the seeds, and one
+// whose manual entries are older than the built-in seeds (an entry without seed_version counts as
+// 0) gets them replaced by the built-in ones, in their place, with its observed entries kept as they
+// are: a seed fixed in the code reaches an installed Archi once, with one INFO line. A seed edit
+// raises the seed's version (`a_changed_seed_raises_its_seed_version`).
 
 /// The cookbook seeds (`seeds/cookbook/`), built into the binary: the `.deb` ships no seeds and the
 /// unit sets no working directory, so seeds read relative to the current directory never reached an
@@ -1971,32 +1982,147 @@ const COOKBOOK_SEEDS: [(&str, &str); 4] = [
     ),
 ];
 
+/// What a start did to one cookbook (`seed_cookbook`).
+#[derive(Debug, PartialEq)]
+enum CookbookSeeding {
+    /// Nothing: its manual entries are as new as the built-in seeds or newer, or it has none (its
+    /// observed entries pushed them out).
+    Unchanged,
+    /// It was missing or empty, and now holds the built-in seeds.
+    Seeded,
+    /// Its manual entries, `replaced` (their pattern keys) at `from_version`, gave their place to
+    /// the `seeds` built-in seeds at `seed_version`; its `observed_kept` observed entries stayed.
+    Upgraded {
+        replaced: Vec<String>,
+        from_version: u64,
+        seed_version: u64,
+        seeds: usize,
+        observed_kept: usize,
+    },
+}
+
 fn seed_cookbooks_from_defaults(state_dir: &Path) {
     for (runtime_rel, seed) in COOKBOOK_SEEDS {
-        let runtime_path = state_dir.join(runtime_rel);
-        let is_empty = !runtime_path.exists()
-            || std::fs::metadata(&runtime_path)
-                .map(|m| m.len() <= 2)
-                .unwrap_or(true);
-        if !is_empty {
-            continue;
-        }
-        if let Some(parent) = runtime_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(err) = std::fs::write(&runtime_path, seed) {
-            tracing::warn!(
-                target = %runtime_path.display(),
-                error = %err,
-                "cookbook seed write failed"
-            );
-        } else {
-            tracing::info!(
-                target = %runtime_path.display(),
-                "cookbook seeded from defaults"
-            );
+        let path = state_dir.join(runtime_rel);
+        match seed_cookbook(&path, seed) {
+            Ok(CookbookSeeding::Unchanged) => {}
+            Ok(CookbookSeeding::Seeded) => {
+                tracing::info!(cookbook = %path.display(), "cookbook seeded from defaults");
+            }
+            Ok(CookbookSeeding::Upgraded {
+                replaced,
+                from_version,
+                seed_version,
+                seeds,
+                observed_kept,
+            }) => {
+                tracing::info!(
+                    cookbook = %path.display(),
+                    replaced = %replaced.join(", "),
+                    from_seed_version = from_version,
+                    seed_version,
+                    seeds,
+                    observed_kept,
+                    "cookbook seeds upgraded: its manual entries were replaced by the built-in seeds, its observed entries kept"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    cookbook = %path.display(),
+                    error = %err,
+                    "cookbook not seeded: left as it is"
+                );
+            }
         }
     }
+}
+
+/// Brings the cookbook at `path` to its built-in `seed` (`CookbookSeeding`), writing it only when
+/// that changes it. A cookbook that is not a JSON array is an error, and is left as it is.
+fn seed_cookbook(path: &Path, seed: &str) -> std::io::Result<CookbookSeeding> {
+    let current = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    let entries: Vec<Value> = if current.iter().all(u8::is_ascii_whitespace) {
+        Vec::new()
+    } else {
+        serde_json::from_slice(&current)?
+    };
+    if entries.is_empty() {
+        write_cookbook_atomically(path, seed.as_bytes())?;
+        return Ok(CookbookSeeding::Seeded);
+    }
+    let seeds: Vec<Value> = serde_json::from_str(seed)?;
+    let seed_version = seeds.iter().map(cookbook_seed_version).max().unwrap_or(0);
+    let replaced: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| is_manual_cookbook_entry(entry))
+        .collect();
+    let Some(from_version) = replaced
+        .iter()
+        .map(|entry| cookbook_seed_version(entry))
+        .min()
+    else {
+        return Ok(CookbookSeeding::Unchanged);
+    };
+    if from_version >= seed_version {
+        return Ok(CookbookSeeding::Unchanged);
+    }
+    let seeding = CookbookSeeding::Upgraded {
+        replaced: replaced
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("pattern_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect(),
+        from_version,
+        seed_version,
+        seeds: seeds.len(),
+        observed_kept: entries.len() - replaced.len(),
+    };
+    // The seeds go where the first manual entry was; every other entry stays where it was.
+    let mut seeds = Some(seeds);
+    let mut upgraded = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !is_manual_cookbook_entry(&entry) {
+            upgraded.push(entry);
+        } else if let Some(seeds) = seeds.take() {
+            upgraded.extend(seeds);
+        }
+    }
+    write_cookbook_atomically(path, &serde_json::to_vec_pretty(&upgraded)?)?;
+    Ok(seeding)
+}
+
+fn is_manual_cookbook_entry(entry: &Value) -> bool {
+    entry.get("seed_kind").and_then(Value::as_str) == Some("manual")
+}
+
+/// A cookbook entry's `seed_version`; 0 for one without it, as every seed before versions was.
+fn cookbook_seed_version(entry: &Value) -> u64 {
+    entry
+        .get("seed_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Writes a cookbook through a temporary file and a rename: a crash leaves the old cookbook or the
+/// new one, never half of one.
+fn write_cookbook_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(&tmp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })
 }
 
 // ── TE-2: Residual AI failure classifier ─────────────────────────────────────
@@ -2594,7 +2720,7 @@ For runtime_package, the artifact.files map must include at minimum:
 - `package.json` — JSON string with fields: name (lowercase), version (semver), type, runtime_base
 - `config/default-config.json` — JSON string with default node configuration
 
-For an ai.generic package, `config/default-config.json` is ai.generic's config: `behavior.kind: ai_chat` and `model`, a model of the node's provider; optionally `behavior.provider` (`openai` or `anthropic`, the hive's when absent; name one only when the nodes' tenant holds a key of that provider) and `behavior.multimodal` (whether the model receives images). It carries no prompt and no `instructions` (ai.generic refuses them): an agent's prompt is its ILK definition (role, skills, handbooks), not part of the package.
+For an ai.generic package, `config/default-config.json` is ai.generic's config: `behavior.kind: ai_chat`. Optional: `behavior.provider` (`openai` or `anthropic`) and `behavior.model`, which default to the hive's provider and that provider's model, so name them only when the agent needs its own (a provider only when the nodes' tenant holds a key of that provider; a model always of the node's provider); and `behavior.multimodal` (whether the model receives images). It carries no prompt and no `instructions` (ai.generic refuses them): an agent's prompt is its ILK definition (role, skills, handbooks), not part of the package.
 
 `runtime_base` must be one of the values in `build_task_packet.known_context.available_runtimes`.
 If `target_kind` is `bundle_upload`, submit the same file map — the host will zip it.
@@ -22176,6 +22302,7 @@ fn observed_artifact_cookbook_entry(
         failure_class: None,
         recorded_from_run: Some(pipeline_run_id.to_string()),
         seed_kind: "observed".to_string(),
+        seed_version: None,
     })
 }
 
@@ -22234,6 +22361,7 @@ fn observed_design_cookbook_entry_from_run_state(
         failure_class: None,
         recorded_from_run: Some(pipeline_run_id.to_string()),
         seed_kind: "observed".to_string(),
+        seed_version: None,
     })
 }
 
@@ -22249,9 +22377,8 @@ fn observed_plan_compile_cookbook_entry(
     entry: &CookbookEntryV2,
     pipeline_run_id: &str,
 ) -> CookbookEntryV2 {
-    let mut observed = normalize_plan_compile_cookbook_entry(entry.clone());
+    let mut observed = normalize_plan_compile_cookbook_entry(observed_entry(entry.clone()));
     observed.recorded_from_run = Some(pipeline_run_id.to_string());
-    observed.seed_kind = "observed".to_string();
     observed
 }
 
@@ -26519,8 +26646,9 @@ mod tests {
     }
 
     /// The artifact and plan-compile seeds teach today's shapes: ai.generic configs without a
-    /// prompt, the workflow definition the design seed deploys (SY.wf-rules compiles it), and no WF
-    /// node, which SY.wf-rules creates.
+    /// prompt, and with no provider or model, so a copy runs on the hive's (FINDINGS A-104); the
+    /// workflow definition the design seed deploys (SY.wf-rules compiles it), and no WF node,
+    /// which SY.wf-rules creates.
     #[test]
     fn the_artifact_and_plan_compile_seeds_show_todays_shapes() {
         let entries = |index: usize| -> Vec<CookbookEntryV2> {
@@ -26532,13 +26660,9 @@ mod tests {
                 Some("ai_chat"),
                 "{what}"
             );
-            assert!(
-                config
-                    .pointer("/behavior/model")
-                    .and_then(Value::as_str)
-                    .is_some_and(|model| !model.is_empty()),
-                "{what}"
-            );
+            for named in ["/behavior/provider", "/behavior/model"] {
+                assert!(config.pointer(named).is_none(), "{what}: {named}");
+            }
             assert!(!config.to_string().contains("instructions"), "{what}");
         };
         let deployed = entries(0)
@@ -27060,7 +27184,8 @@ mod tests {
     }
 
     /// The seeds are built in (an installed Archi has no seeds/ next to it): each parses as its
-    /// layer's cookbook, and seeding writes one only where the cookbook is missing or empty.
+    /// layer's cookbook, every entry is manual and carries its seed's one version, and seeding
+    /// writes one only where the cookbook is missing or empty, or its manual entries are older.
     #[test]
     fn the_built_in_cookbook_seeds_parse_and_fill_only_empty_cookbooks() {
         let layers = [
@@ -27077,6 +27202,14 @@ mod tests {
                 entries.iter().all(|entry| entry.layer == layer),
                 "{runtime_rel}"
             );
+            let version = entries[0].seed_version;
+            assert!(version.is_some_and(|version| version >= 1), "{runtime_rel}");
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.seed_kind == "manual" && entry.seed_version == version),
+                "{runtime_rel}: every seed is manual, with the seed's one version"
+            );
         }
 
         let state_dir = test_temp_dir("cookbook-seeds");
@@ -27088,12 +27221,199 @@ mod tests {
         for (runtime_rel, seed) in COOKBOOK_SEEDS {
             let written = std::fs::read_to_string(state_dir.join(runtime_rel)).expect("read");
             if runtime_rel == cookbook_paths::REPAIR {
-                assert_eq!(written, observed, "a cookbook with entries is kept");
+                assert_eq!(
+                    written, observed,
+                    "a cookbook without manual entries is kept"
+                );
             } else {
                 assert_eq!(written, seed, "{runtime_rel}");
             }
         }
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// The 0.1.87 review: PROD's artifact cookbook, seeded at 0.1.81, kept teaching
+    /// `"model": "gpt-5.5"`. A cookbook whose manual entries are older than the built-in seeds gets
+    /// the seeds once, in those entries' place, and keeps its observed entries as they were; the
+    /// next start changes nothing, nor does an entry the pipeline appends after it.
+    #[test]
+    fn an_older_cookbook_gets_the_built_in_seeds_once_and_keeps_its_observed_entries() {
+        let state_dir = test_temp_dir("cookbook-upgrade");
+        std::fs::create_dir_all(state_dir.join("cookbook")).expect("cookbook dir");
+        let path = state_dir.join(cookbook_paths::ARTIFACT);
+        let seed = COOKBOOK_SEEDS
+            .iter()
+            .find(|(runtime_rel, _)| *runtime_rel == cookbook_paths::ARTIFACT)
+            .map(|(_, seed)| *seed)
+            .expect("the artifact seed");
+        // A seed from before versions: no seed_version.
+        let old_seed = |pattern_key: &str| {
+            json!({
+                "layer": "artifact",
+                "pattern_key": pattern_key,
+                "trigger": "Build a config_only runtime package for an AI node.",
+                "inputs_signature": {"artifact_kind": "runtime_package"},
+                "successful_shape": {"artifact": {"files": {
+                    "config/default-config.json": "{\"behavior\":{\"kind\":\"ai_chat\",\"model\":\"gpt-5.5\"}}"
+                }}},
+                "constraints": [],
+                "do_not_repeat": [],
+                "failure_class": null,
+                "recorded_from_run": null,
+                "seed_kind": "manual"
+            })
+        };
+        let observed = |pattern_key: &str| {
+            json!({
+                "layer": "artifact",
+                "pattern_key": pattern_key,
+                "trigger": "When reconciler requires a runtime_package artifact.",
+                "inputs_signature": {"artifact_kind": "runtime_package"},
+                "successful_shape": {"summary": "a config_only package"},
+                "constraints": [],
+                "do_not_repeat": [],
+                "failure_class": null,
+                "recorded_from_run": format!("run-{pattern_key}"),
+                "seed_kind": "observed",
+                "a_field_of_its_own": true
+            })
+        };
+        let older = vec![
+            old_seed("config_only_ai_runtime"),
+            old_seed("opa_policy_bundle"),
+            observed("runtime_package_ai_sales"),
+            observed("runtime_package_ai_support"),
+        ];
+        std::fs::write(&path, serde_json::to_vec_pretty(&older).expect("json")).expect("write");
+        let read_back = || -> Vec<Value> {
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("a JSON array")
+        };
+
+        assert_eq!(
+            seed_cookbook(&path, seed).expect("seeding"),
+            CookbookSeeding::Upgraded {
+                replaced: vec![
+                    "config_only_ai_runtime".to_string(),
+                    "opa_policy_bundle".to_string()
+                ],
+                from_version: 0,
+                seed_version: 1,
+                seeds: 3,
+                observed_kept: 2,
+            }
+        );
+        let seeds: Vec<Value> = serde_json::from_str(seed).expect("seed");
+        let expected: Vec<Value> = seeds.into_iter().chain(older[2..].to_vec()).collect();
+        assert_eq!(read_back(), expected);
+        assert!(!std::fs::read_to_string(&path)
+            .expect("read")
+            .contains("gpt-5.5"));
+
+        // The next start changes nothing.
+        let written = std::fs::read(&path).expect("read");
+        seed_cookbooks_from_defaults(&state_dir);
+        assert_eq!(std::fs::read(&path).expect("read"), written);
+
+        // An entry the pipeline appends is observed, even one its model wrote as manual, and the
+        // seeds keep their version through the write: the next start still changes nothing.
+        let mut appended: CookbookEntryV2 =
+            serde_json::from_value(observed("runtime_package_ai_billing")).expect("an entry");
+        appended.seed_kind = "manual".to_string();
+        append_artifact_cookbook_entry(&state_dir, appended);
+        assert_eq!(
+            seed_cookbook(&path, seed).expect("seeding"),
+            CookbookSeeding::Unchanged
+        );
+        let entries = read_artifact_cookbook(&state_dir);
+        assert_eq!(entries.len(), 6);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.seed_kind == "manual" && entry.seed_version == Some(1))
+                .count(),
+            3
+        );
+        assert_eq!(
+            entries.last().map(|entry| entry.seed_kind.as_str()),
+            Some("observed")
+        );
+
+        // Manual entries newer than the built-in seeds (an older Archi started) are left as they
+        // are, and so is a cookbook whose observed entries pushed its seeds out.
+        let mut newer = old_seed("config_only_ai_runtime");
+        newer["seed_version"] = json!(2);
+        for kept in [
+            vec![newer, observed("runtime_package_ai_sales")],
+            vec![observed("runtime_package_ai_sales")],
+        ] {
+            std::fs::write(&path, serde_json::to_vec_pretty(&kept).expect("json")).expect("write");
+            assert_eq!(
+                seed_cookbook(&path, seed).expect("seeding"),
+                CookbookSeeding::Unchanged
+            );
+            assert_eq!(read_back(), kept);
+        }
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// A seed edit must raise the seed's `seed_version`: an installed Archi replaces its manual
+    /// entries only with newer seeds (`seed_cookbook`). Each seed is pinned here with its version
+    /// and the SHA-256 of its entries without their versions (compact JSON, keys sorted, so its
+    /// layout does not count): a seed whose content changes fails here until its version is raised
+    /// and its pin updated.
+    #[test]
+    fn a_changed_seed_raises_its_seed_version() {
+        const PINS: [(&str, u64, &str); 4] = [
+            (
+                cookbook_paths::DESIGN,
+                1,
+                "6a2c3287a15298193cd46cd8d8a6e32256ff5023ba00c0dd9bf003eefbf61d59",
+            ),
+            (
+                cookbook_paths::ARTIFACT,
+                1,
+                "72afd01d5bad0e49d01cc748ef85f51ce20f3b836c2a1752fde4b7f836e6c559",
+            ),
+            (
+                cookbook_paths::PLAN_COMPILE,
+                1,
+                "a4b58ec2e04140c2af0bdd1bf719439559f6c150929cefc0f5c342177d4c3b7e",
+            ),
+            (
+                cookbook_paths::REPAIR,
+                1,
+                "09e66b5e5e7d20b882976964b14bbc67f301351bbe5bd770a763745349e4219e",
+            ),
+        ];
+        let mut changed = Vec::new();
+        for ((runtime_rel, seed), (pinned_rel, pinned_version, pinned_digest)) in
+            COOKBOOK_SEEDS.iter().zip(PINS)
+        {
+            assert_eq!(*runtime_rel, pinned_rel);
+            let mut entries: Vec<Value> = serde_json::from_str(seed).expect("seed");
+            let version = entries.iter().map(cookbook_seed_version).max().unwrap_or(0);
+            for entry in &mut entries {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.remove("seed_version");
+                }
+            }
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&entries).expect("json"))
+            );
+            if (version, digest.as_str()) != (pinned_version, pinned_digest) {
+                changed.push(format!(
+                    "{runtime_rel}: seed_version {version}, digest {digest}; pinned \
+                     ({pinned_version}, {pinned_digest})"
+                ));
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "a changed seed raises every one of its entries' seed_version above its pin, and its \
+             pin here takes the new version and digest:\n{}",
+            changed.join("\n")
+        );
     }
 
     #[test]
@@ -27709,11 +28029,13 @@ mod tests {
             failure_class: None,
             recorded_from_run: None,
             seed_kind: "manual".to_string(),
+            seed_version: Some(1),
         };
 
         let observed = observed_plan_compile_cookbook_entry(&entry, "run-123");
         assert_eq!(observed.recorded_from_run.as_deref(), Some("run-123"));
         assert_eq!(observed.seed_kind, "observed");
+        assert_eq!(observed.seed_version, None);
         assert_eq!(observed.layer, CookbookLayer::PlanCompile);
     }
 

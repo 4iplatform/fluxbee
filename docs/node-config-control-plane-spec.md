@@ -205,8 +205,7 @@ Example:
   "state": "configured",
   "config": {
     "behavior": {
-      "kind": "ai_chat",
-      "model": "gpt-5.5"
+      "kind": "ai_chat"
     }
   },
     "contract": {
@@ -214,8 +213,7 @@ Example:
       "node_kind": "AI.generic",
       "supports": ["CONFIG_GET", "CONFIG_SET"],
       "required_fields": [
-        "behavior.kind",
-        "behavior.model"
+        "behavior.kind"
       ],
       "field_values": {
         "behavior.kind": {
@@ -223,6 +221,7 @@ Example:
         }
       },
       "optional_fields": [
+        "behavior.model",
         "behavior.model_settings",
         "behavior.provider",
         "runtime.immediate_memory"
@@ -240,14 +239,13 @@ Example:
         "apply_mode": "replace",
         "config": {
           "behavior": {
-            "kind": "ai_chat",
-            "model": "gpt-5.5"
+            "kind": "ai_chat"
           }
         }
       }
     ],
     "notes": [
-      "The provider is behavior.provider, or the hive's (hive.yaml ai) without it; its key is read from SY.vault by resource_type, in the node's tenant. behavior.model selects the model.",
+      "The provider is behavior.provider, or the hive's (hive.yaml ai) without it; its key is read from SY.vault by resource_type, in the node's tenant. The model is behavior.model, or the hive's for that provider (ai.providers.<provider>.model) without it.",
       "CONFIG_SET may override in-memory behavior depending on node implementation."
     ]
   }
@@ -297,7 +295,7 @@ Example error:
   "state": "failed_config",
   "error": {
     "code": "invalid_config",
-    "message": "behavior.model is required"
+    "message": "behavior.model must not be empty"
   }
 }
 ```

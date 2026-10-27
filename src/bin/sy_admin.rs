@@ -1858,6 +1858,7 @@ fn build_admin_executor_override_definition(
     spec: &InternalActionSpec,
 ) -> Option<FunctionToolDefinition> {
     match spec.action {
+        // `action_name`, as Archi's plan compiler names it for the same SY.admin action.
         "get_admin_action_help" => Some(FunctionToolDefinition {
             name: spec.action.to_string(),
             description: admin_action_summary(spec.action).to_string(),
@@ -1865,12 +1866,12 @@ fn build_admin_executor_override_definition(
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "action": {
+                    "action_name": {
                         "type": "string",
                         "description": "Admin action name, for example add_hive."
                     }
                 },
-                "required": ["action"]
+                "required": ["action_name"]
             }),
         }),
         _ => None,
@@ -2653,13 +2654,13 @@ impl FunctionTool for AdminExecutorHelpTool {
         )
         .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
         let requested_action = arguments
-            .get("action")
+            .get("action_name")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "get_admin_action_help requires non-empty action".to_string(),
+                    "get_admin_action_help requires non-empty action_name".to_string(),
                 )
             })?;
         if requested_action != self.step.action {
@@ -2673,10 +2674,7 @@ impl FunctionTool for AdminExecutorHelpTool {
             &self.client,
             "get_admin_action_help",
             None,
-            serde_json::json!({
-                "action": requested_action,
-                "action_name": requested_action
-            }),
+            serde_json::json!({ "action_name": requested_action }),
             AdminOrigin::Executor,
         )
         .await
@@ -13355,13 +13353,12 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "match_dst": "AI.sales@motherbee",
             "target": "IO.slack.sales@motherbee"
         }),
-        // No `behavior.provider`: a copied example runs on the hive's provider (the notes say when
-        // to name one).
+        // No `behavior.provider` and no `behavior.model`: a copied example runs on the hive's
+        // provider and that provider's model (the notes say when to name them, FINDINGS A-104).
         "set_node_config" => serde_json::json!({
             "config": {
                 "behavior": {
-                    "kind": "ai_chat",
-                    "model": "gpt-5.5"
+                    "kind": "ai_chat"
                 }
             },
             "replace": false
@@ -13639,7 +13636,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"ai_chat\",\"model\":\"gpt-5.5\"}}}""#
+            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"ai_chat\"}}}""#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -13896,7 +13893,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "set_node_config" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "For ai.generic, config.behavior.provider (openai or anthropic) is optional: without it the node runs on the hive's ai.default_provider, as the example does. Name one only when the node's tenant holds a key of that provider in SY.vault; a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. config.behavior.model must be a model of the node's provider.",
+            "For ai.generic, config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the hive's ai.default_provider and on that provider's model (hive.yaml ai.providers.<provider>.model), as the example does. Name them only when the node needs its own. A provider only when the node's tenant holds a key of that provider in SY.vault: a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. A model must be one of the node's provider; with neither the node's nor the hive's, every message fails with missing_ai_model.",
+            "Naming a provider other than the hive's default needs its config.behavior.model too, unless that hive's hive.yaml lists a model for it (ai.providers.<provider>.model); a worker added by add_hive lists only the default provider's. set_node_config stores the config without checking this; node_control_config_set refuses such a config (invalid_config).",
         ],
         "node_help" => vec![
             "The hive comes from the /hives/{hive} path in HTTP; the node_name path segment is a fully-qualified node name, for example AI.sales@worker1. Takes no body.",
@@ -13935,7 +13933,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat with a model of the node's provider. config.behavior.provider (openai or anthropic) is optional: without it the node runs on the hive's ai.default_provider, as the example does. Name one only when the node's tenant holds a key of that provider; without one, every message fails with missing_ai_api_key. config.behavior.multimodal (true when absent) says whether the model receives images; config.behavior.capabilities is refused. The key is not config: the node reads its provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
+            "For ai.generic chat, use config.behavior.kind=ai_chat. config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the hive's ai.default_provider and that provider's model (hive.yaml ai.providers.<provider>.model), as the example does; CONFIG_GET shows both in ai_provider and ai_model. Name them only when the node needs its own: a provider only when the node's tenant holds a key of that provider (without one, every message fails with missing_ai_api_key), and a model always of the node's provider. config.behavior.multimodal (true when absent) says whether the model receives images; config.behavior.capabilities is refused. The key is not config: the node reads its provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
+            "For ai.generic, naming a provider other than the hive's default needs its config.behavior.model too, unless that hive's hive.yaml lists a model for it (ai.providers.<provider>.model); a worker added by add_hive lists only the default provider's. The node refuses a config whose model it cannot resolve (invalid_config, naming behavior.model and ai.providers.<provider>.model), and its ok answer shows ai_provider and ai_model, as CONFIG_GET does.",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
@@ -21981,8 +21980,10 @@ mod tests {
         assert!(err.to_string().contains("invalid action"));
     }
 
+    /// The executor's help lookup takes `action_name`, as Archi's plan compiler does for the same
+    /// SY.admin action (docs/agent-tools-v1.md §6.1).
     #[test]
-    fn admin_executor_help_definition_uses_action_override() {
+    fn admin_executor_help_definition_takes_action_name() {
         let spec =
             resolve_internal_action_spec("get_admin_action_help").expect("help action present");
         let definition = build_admin_executor_function_definition(spec);
@@ -21990,10 +21991,10 @@ mod tests {
         assert_eq!(definition.name, "get_admin_action_help");
         assert_eq!(
             definition.parameters_json_schema["required"],
-            json!(["action"])
+            json!(["action_name"])
         );
-        assert!(definition.parameters_json_schema["properties"]["action"].is_object());
-        assert!(definition.parameters_json_schema["properties"]["action_name"].is_null());
+        assert!(definition.parameters_json_schema["properties"]["action_name"].is_object());
+        assert!(definition.parameters_json_schema["properties"]["action"].is_null());
     }
 
     /// The longest function description a model API takes: OpenAI refuses a longer one. A byte

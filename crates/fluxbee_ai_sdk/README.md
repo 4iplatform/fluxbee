@@ -23,9 +23,10 @@ It provides:
   `HiveAiConfig`. `HiveAiConfig::effective()` returns the provider and the model configured for it.
   Without the section, `HiveAiConfig::fallback()` applies: OpenAI with `gpt-5.5`
   (`DEFAULT_HIVE_OPENAI_MODEL`). The SY nodes that call a model (SY.cognition, Archi, SY.admin's
-  executor, the frontdesk) use it. An `ai.generic` node names its own provider in
-  `behavior.provider` and takes the hive's only without it; its model is always its own
-  `behavior.model` (docs/agent-tools-v1.md T8).
+  executor, the frontdesk) use it. An `ai.generic` node takes the hive's provider and the hive's
+  model for that provider (`ai.providers.<provider>.model`; the fallback's `gpt-5.5` for OpenAI
+  without the section) unless it names its own in `behavior.provider` and `behavior.model`
+  (docs/agent-tools-v1.md T8, FINDINGS A-104).
 
   ```yaml
   ai:

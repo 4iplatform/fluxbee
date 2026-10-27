@@ -35,7 +35,8 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "plan_compile",
@@ -76,7 +77,8 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "plan_compile",
@@ -99,14 +101,14 @@
             "config_version": 4,
             "apply_mode": "replace",
             "config": {
-              "behavior": { "kind": "ai_chat", "model": "gpt-5.5" }
+              "behavior": { "kind": "ai_chat" }
             }
           }
         }
       ]
     },
     "constraints": [
-      "the config is the node's whole config (apply_mode replace): for ai.generic, behavior.kind ai_chat and model; it carries no prompt — the agent's prompt is its ILK definition",
+      "the config is the node's whole config (apply_mode replace): for ai.generic, behavior.kind ai_chat, with a provider or a model only when the node needs its own (the hive's otherwise; a model always of the node's provider); it carries no prompt — the agent's prompt is its ILK definition",
       "config_version is the node's current config_version plus one: read it with node_control_config_get while compiling the plan",
       "subsystem is ai_node for an AI node"
     ],
@@ -117,6 +119,7 @@
     ],
     "failure_class": null,
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   }
 ]

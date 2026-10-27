@@ -28,7 +28,8 @@
     ],
     "failure_class": "ARTIFACT_LAYOUT_INVALID",
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "repair",
@@ -57,7 +58,8 @@
     ],
     "failure_class": "ARTIFACT_CONTRACT_INVALID",
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   },
   {
     "layer": "repair",
@@ -89,6 +91,7 @@
     ],
     "failure_class": "PLAN_INVALID",
     "recorded_from_run": null,
-    "seed_kind": "manual"
+    "seed_kind": "manual",
+    "seed_version": 1
   }
 ]

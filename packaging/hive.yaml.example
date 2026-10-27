@@ -1,8 +1,10 @@
 hive_id: "motherbee"
 role: motherbee
 
-# Hive-wide AI engine used by SY.* consumers. Credentials remain in SY.vault
-# under the selected provider's resource_type (openai or anthropic).
+# Hive-wide AI engine used by SY.* consumers, and by every AI node (ai.generic)
+# that names no provider or model of its own: such a node takes the model listed
+# here for its provider. Credentials remain in SY.vault under the selected
+# provider's resource_type (openai or anthropic).
 ai:
   default_provider: openai
   providers:

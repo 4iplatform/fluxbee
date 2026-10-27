@@ -32,9 +32,13 @@ SY.vault and the identity writes live on the motherbee, so their calls below alw
 
 - **The provider is the node's** (agent-tools-v1 T8): `behavior.provider`, `openai` or `anthropic`
   (step 4). Without it, the node uses the hive's: `ai.default_provider` in
-  `/etc/fluxbee/hive.yaml`, or `openai` when there is no `ai:` section, read on each request. When
-  the section exists, it must name the provider's model (`ai.providers.<provider>.model`). One node
-  may run on Claude and another on OpenAI; `CONFIG_GET` shows the one in effect in `ai_provider`.
+  `/etc/fluxbee/hive.yaml`, or `openai` when there is no `ai:` section, read on each request. One
+  node may run on Claude and another on OpenAI; `CONFIG_GET` shows the one in effect in
+  `ai_provider`.
+- **So is the model** (FINDINGS A-104): `behavior.model`, or else the hive's model for the node's
+  provider, `ai.providers.<provider>.model`, read on each request too (`gpt-5.5` for OpenAI when
+  there is no `ai:` section). `CONFIG_GET` shows it in `ai_model`. With neither, every message
+  fails with `missing_ai_model`, which names both settings.
 - **The node reads its key on every request,** from SY.vault, by its provider's `resource_type`
   (`openai` or `anthropic`), only in its own tenant:
   - a key the node owns;
@@ -98,7 +102,6 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/control/config-set" \
   "config": {
     "behavior": {
       "kind": "ai_chat",
-      "model": "gpt-5.5",
       "model_settings": { "max_output_tokens": 1024 }
     }
   }
@@ -106,12 +109,13 @@ curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE/control/config-set" \
 EOF
 ```
 
-- **The minimum for an `ai_chat` node** is `behavior.kind` and `behavior.model`. The model must
-  belong to the node's provider.
+- **The minimum for an `ai_chat` node** is `behavior.kind`: the node then runs on the hive's
+  provider and model (step 2). Name a provider or a model only when the node needs its own.
 - **The config fields:**
   - `behavior.kind`: `ai_chat`, or `echo` (no model call; for tests);
-  - `behavior.model`;
   - `behavior.provider`: `openai` or `anthropic`; without it, the hive's (step 2);
+  - `behavior.model`: without it, the hive's for the node's provider (step 2). A model must belong
+    to the node's provider;
   - `behavior.model_settings`: `max_output_tokens`. An answer cut at that limit is a
     `provider_output_truncated` error;
   - `behavior.base_url`: it needs `behavior.provider`, and it must be `https` on that provider's
@@ -243,6 +247,13 @@ node through SY.admin.
    - Do not restart the unit with a local `systemctl`: that relaunches the binary the unit was
      created with.
 
+### Rolling back to 0.1.86
+
+0.1.87 lets a node leave `behavior.model` to the hive, and 0.1.86 requires it: a node whose
+`config.json` has no `behavior.model` boots FAILED_CONFIG at 0.1.86. Before its restart at 0.1.86,
+give it the model it runs on, which `CONFIG_GET` shows in `ai_model`, or send a `CONFIG_SET` with a
+`behavior.model` after the restart.
+
 ### Rolling back to 0.1.85
 
 0.1.86 renamed `behavior.capabilities.multimodal` to `behavior.multimodal` and added
@@ -297,9 +308,15 @@ With `multimodal` off, only text attachments are accepted.
 
 **Out:**
 
-- **The reply carries `attachments[]`,** and IO.slack uploads them to Slack.
+- **The reply carries `attachments[]`,** and IO.slack uploads them to Slack, one upload each.
+  IO.wapp sends the text only, for now.
 - **The runner's tools make the files:** csv, text, json, markdown, html, pdf, xlsx, docx, png, jpeg.
-  One file goes out per reply, with the text of the call that made it.
+  - Every file the reply's tool calls make goes out with the model's own reply text, in the order
+    made, up to 8, the IO nodes' limit for one message (`REPLY_FILES_MAX`). A call past that makes
+    no file, and the model is told (`reply_files_full`).
+  - The model gets back each file's name, type and size, never its bytes (FINDINGS A-98, A-99).
+  - The PDF prints Western European text (Windows-1252), wraps long lines and takes as many pages
+    as the text needs (FINDINGS A-97).
 - **`publish_html_page`** publishes an HTML page with a public URL, through SY.admin. It exists only
   when the node has its ILK, and the link expires after 24 h.
 - **Every tool, with its limits:** the tool catalog,

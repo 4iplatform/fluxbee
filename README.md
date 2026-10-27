@@ -97,9 +97,10 @@ primary, backed by PostgreSQL; each worker keeps a replica. The full model is in
 An agent is an `AI.*` node on `ai.generic`, the generic AI runtime. Two things define it:
 
 - **Its config:** `behavior.kind` (`ai_chat`, or `echo`, which replies with the input and calls
-  no model) and `behavior.model`, a model of its AI provider. The agent may name its provider,
-  OpenAI or Anthropic, in `behavior.provider`; without it, it uses its hive's, picked in
-  `hive.yaml` (`ai.default_provider`). A fresh install uses OpenAI with `gpt-5.5`.
+  no model). The agent runs on its hive's AI provider and model, picked in `hive.yaml`
+  (`ai.default_provider`, `ai.providers.<provider>.model`); a fresh install uses OpenAI with
+  `gpt-5.5`. An agent that needs its own names them in `behavior.provider` (OpenAI or
+  Anthropic) and `behavior.model`, a model of its provider.
 - **Its cognitive definition, on its ILK:** `role_hash`, `skill_hashes`, `handbook_hashes` and
   `personality_hash`. Each hash names a JSON asset in `blob://agent-assets/<hash>.json`, and the
   runtime refuses an asset whose content does not match its hash. Archi writes the assets. The
@@ -386,8 +387,7 @@ type, `runtime_base: "ai.generic"`, `config_template`) and `ai.billing/config/de
 ```json
 {
   "behavior": {
-    "kind": "ai_chat",
-    "model": "gpt-5.5"
+    "kind": "ai_chat"
   }
 }
 ```
@@ -395,8 +395,9 @@ type, `runtime_base: "ai.generic"`, `config_template`) and `ai.billing/config/de
 ### 2. Edit it
 
 - Fill in `description`. Raise `version` for every new publish.
-- `behavior.kind` and `behavior.model` are required. The model must belong to the hive's
-  provider (`gpt-5.5` with the default OpenAI).
+- `behavior.kind` is required. Without `behavior.provider` and `behavior.model`, the agent runs on
+  the hive's provider and that provider's model (`gpt-5.5` with the default OpenAI). Name them
+  only when the agent needs its own; the model must belong to the agent's provider.
 - Leave out `temperature`: the current models reject it.
 - Put no keys in the config. `ai.generic` rejects `secrets`, `behavior.api_key` and
   `behavior.openai`.

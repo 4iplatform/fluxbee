@@ -160,7 +160,7 @@
       "limits": [
         "Every cell is written quoted. A cell that starts with `=`, `+`, `@`, a tab or a carriage return, or with `-` and is not a plain number such as `-12.5`, gets a `'` in front, so a spreadsheet takes it as text, never as a formula.",
         "`headers`, when given, is the first row.",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -187,10 +187,6 @@
               "type": "array"
             },
             "type": "array"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -200,47 +196,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "text/csv"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "text/csv"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -248,7 +216,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -256,7 +226,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -283,6 +254,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .csv. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -291,7 +266,7 @@
       "summary": "Make a plain-text file and send it to the user.",
       "when_to_use": "When the user wants text as a file rather than in the message: notes, a log, a long answer to keep.",
       "limits": [
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -305,10 +280,6 @@
             "description": "The file's name, as the user sees it: it ends in .txt, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
             "minLength": 1,
             "type": "string"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -318,47 +289,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "text/plain"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "text/plain"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -366,7 +309,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -374,7 +319,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -401,6 +347,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .txt. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -409,7 +359,7 @@
       "summary": "Make a JSON file and send it to the user.",
       "when_to_use": "When the user wants structured data as a file, for a program to read.",
       "limits": [
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -426,10 +376,6 @@
           "pretty": {
             "description": "Indent the file; true by default.",
             "type": "boolean"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -439,47 +385,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "application/json"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "application/json"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -487,7 +405,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -495,7 +415,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -522,6 +443,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .json. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -530,7 +455,7 @@
       "summary": "Make a Markdown file and send it to the user.",
       "when_to_use": "When the user wants formatted text (headings, lists, tables) as a file.",
       "limits": [
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -544,10 +469,6 @@
             "description": "The file's name, as the user sees it: it ends in .md or .markdown, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
             "minLength": 1,
             "type": "string"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -557,47 +478,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "text/markdown"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "text/markdown"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -605,7 +498,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -613,7 +508,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -640,6 +536,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .md or .markdown. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -649,7 +549,7 @@
       "when_to_use": "When the user wants a page as a file, to open in a browser. For a link to a page instead, use `publish_html_page` when you have it.",
       "limits": [
         "It is a file, not a link: the user opens it from the attachment.",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -663,10 +563,6 @@
             "description": "The file's name, as the user sees it: it ends in .html or .htm, with at most 128 bytes and no `/`, `\\`, `..` or control character.",
             "minLength": 1,
             "type": "string"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -676,47 +572,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "text/html"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "text/html"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -724,7 +592,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -732,7 +602,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -759,18 +630,22 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .html or .htm. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
     {
       "name": "generate_pdf_artifact",
-      "summary": "Make a one-page PDF of text lines and send it to the user.",
-      "when_to_use": "When the user wants a short text document as a PDF.",
+      "summary": "Make a PDF of text lines and send it to the user.",
+      "when_to_use": "When the user wants a text document as a PDF.",
       "limits": [
-        "One page (US Letter) of Helvetica 12 pt, the title first and then one line per entry of `lines`. Lines do not wrap (about 90 characters fit) and nothing goes past the page (about 50 lines fit). No images, tables or styles.",
-        "Only plain ASCII prints right: accented letters and other non-ASCII characters come out garbled.",
+        "US Letter pages of Helvetica 12 pt: the title, a blank line, then one line per entry of `lines`. A line wider than the page wraps at a space (a longer word is cut), and the text goes on to new pages, 50 lines a page. No images, tables or styles.",
+        "Western European text prints as written (Windows-1252: accents, ñ, ¿, ¡, €, curly quotes); any other character, such as Cyrillic, Chinese or an emoji, prints as `?`.",
         "With no title and no lines, the page says \"Documento generado por AI\".",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -782,15 +657,11 @@
             "type": "string"
           },
           "lines": {
-            "description": "The page's lines, top to bottom.",
+            "description": "The document's lines, top to bottom; a line break inside an entry starts a new line.",
             "items": {
               "type": "string"
             },
             "type": "array"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           },
           "title": {
             "description": "The first line, followed by a blank one.",
@@ -803,47 +674,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "application/pdf"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "application/pdf"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -851,7 +694,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -859,7 +704,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -886,6 +732,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .pdf. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -897,7 +747,7 @@
         "One sheet, and every cell is text: numbers stay text, with no formulas or formats. `headers`, when given, is the first row.",
         "`sheet_name` loses `:`, `\\`, `/`, `?`, `*`, `[` and `]` and is cut at 31 characters; it is Sheet1 without one.",
         "With no headers and no rows, the sheet holds one cell: \"Generated by AI\".",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -928,10 +778,6 @@
           "sheet_name": {
             "description": "Sheet1 by default.",
             "type": "string"
-          },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
           }
         },
         "required": [
@@ -941,47 +787,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -989,7 +807,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -997,7 +817,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -1024,6 +845,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .xlsx. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -1034,7 +859,7 @@
       "limits": [
         "Plain text in a fixed order: the title, the paragraphs, the bullets, then one table. No styles or headings: the title is a plain paragraph, and a bullet is a paragraph that starts with \"- \".",
         "With nothing to write, the document says \"Documento generado por AI\".",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -1076,10 +901,6 @@
             },
             "type": "array"
           },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
-          },
           "title": {
             "description": "The first paragraph.",
             "type": "string"
@@ -1091,47 +912,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -1139,7 +932,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -1147,7 +942,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -1174,6 +970,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .docx. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -1184,7 +984,7 @@
       "limits": [
         "It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each entry's text picks its color and is not drawn. Without `bands`, one color fills the image.",
         "1200 x 800 pixels by default; `width` and `height` are kept between 64 and 2400.",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -1208,10 +1008,6 @@
             "minimum": 64,
             "type": "integer"
           },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
-          },
           "width": {
             "description": "Pixels; 1200 by default.",
             "maximum": 2400,
@@ -1225,47 +1021,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "image/png"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "image/png"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -1273,7 +1041,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -1281,7 +1051,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -1308,6 +1079,10 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .png. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
         }
       ]
     },
@@ -1318,7 +1093,7 @@
       "limits": [
         "It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each entry's text picks its color and is not drawn. Without `bands`, one color fills the image.",
         "1200 x 800 pixels by default; `width` and `height` are kept between 64 and 2400.",
-        "The file goes out with this call's `text` as your reply: what you write after the call is not sent. One file per reply: if several calls make files, only the last is sent. The file's bytes come back to you base64-encoded, so a large file fills your context."
+        "Your reply is the text you write after your last tool call; text written alongside a call is not sent. Every file this reply's calls make goes with it, in order, up to 8: a call past that makes none, and a file with an earlier one's name takes its place. You get back the file's name, type and size, never its content."
       ],
       "present_when": "always",
       "input": {
@@ -1342,10 +1117,6 @@
             "minimum": 64,
             "type": "integer"
           },
-          "text": {
-            "description": "Your reply, which the user reads with the file. Without it, a fixed line in Spanish naming the file.",
-            "type": "string"
-          },
           "width": {
             "description": "Pixels; 1200 by default.",
             "maximum": 2400,
@@ -1359,47 +1130,19 @@
         "type": "object"
       },
       "output": {
-        "description": "`{status: \"ok\", final_output: {text, artifacts: [{filename, mime, bytes_base64}]}}`: the file and the reply's text.",
+        "description": "`{status: \"ok\", filename, mime, size_bytes}`: the file is kept for your reply.",
         "oneOf": [
           {
             "properties": {
-              "final_output": {
-                "properties": {
-                  "artifacts": {
-                    "items": {
-                      "properties": {
-                        "bytes_base64": {
-                          "description": "The file, base64-encoded.",
-                          "type": "string"
-                        },
-                        "filename": {
-                          "type": "string"
-                        },
-                        "mime": {
-                          "const": "image/jpeg"
-                        }
-                      },
-                      "required": [
-                        "filename",
-                        "mime",
-                        "bytes_base64"
-                      ],
-                      "type": "object"
-                    },
-                    "maxItems": 1,
-                    "minItems": 1,
-                    "type": "array"
-                  },
-                  "text": {
-                    "description": "The reply's text.",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "text",
-                  "artifacts"
-                ],
-                "type": "object"
+              "filename": {
+                "type": "string"
+              },
+              "mime": {
+                "const": "image/jpeg"
+              },
+              "size_bytes": {
+                "description": "The file's size, in bytes.",
+                "type": "integer"
               },
               "status": {
                 "const": "ok"
@@ -1407,7 +1150,9 @@
             },
             "required": [
               "status",
-              "final_output"
+              "filename",
+              "mime",
+              "size_bytes"
             ],
             "type": "object"
           },
@@ -1415,7 +1160,8 @@
             "properties": {
               "error_code": {
                 "enum": [
-                  "artifact_filename_invalid"
+                  "artifact_filename_invalid",
+                  "reply_files_full"
                 ]
               },
               "message": {
@@ -1442,6 +1188,107 @@
         {
           "code": "artifact_filename_invalid",
           "meaning": "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control character, or does not end in .jpg or .jpeg. No file was made."
+        },
+        {
+          "code": "reply_files_full",
+          "meaning": "The reply already carries 8 files, the most one reply can. No file was made: say so in your reply, and make the rest in a later one."
+        }
+      ]
+    },
+    {
+      "name": "get_current_time",
+      "summary": "Get the current date and time, in UTC and in a time zone.",
+      "when_to_use": "Whenever the answer depends on today's date or the time of day: what day it is, how long until a date, whether something is due or open now. You do not know the date: never guess it.",
+      "limits": [
+        "`timezone` is an IANA zone name, such as `America/Argentina/Buenos_Aires` or `Europe/Madrid`; without it, UTC. Use the user's zone when you know it.",
+        "It only reads the time: it cannot schedule anything or wait."
+      ],
+      "present_when": "always: SY.timer of the agent's hive answers it, and SY.timer runs on the motherbee and on every worker",
+      "input": {
+        "additionalProperties": false,
+        "properties": {
+          "timezone": {
+            "description": "An IANA time zone name, such as America/Argentina/Buenos_Aires. UTC when absent.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "output": {
+        "description": "`{status: \"ok\", utc, local, timezone, abbreviation, weekday}`: the time in UTC and in the zone (ISO 8601, to the millisecond; the local one with its offset), the zone and its abbreviation, and the local weekday in English.",
+        "oneOf": [
+          {
+            "properties": {
+              "abbreviation": {
+                "description": "The zone's abbreviation at that moment, such as CET or -03.",
+                "type": "string"
+              },
+              "local": {
+                "description": "In the zone, with its offset, such as 2026-10-27T12:04:05.123-03:00.",
+                "type": "string"
+              },
+              "status": {
+                "const": "ok"
+              },
+              "timezone": {
+                "description": "The IANA zone of `local`.",
+                "type": "string"
+              },
+              "utc": {
+                "description": "In UTC, such as 2026-10-27T15:04:05.123Z.",
+                "type": "string"
+              },
+              "weekday": {
+                "description": "The weekday of the local date, Monday to Sunday.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "utc",
+              "local",
+              "timezone",
+              "abbreviation",
+              "weekday"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "error_code": {
+                "enum": [
+                  "invalid_timezone",
+                  "time_unavailable"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "status": {
+                "const": "error"
+              }
+            },
+            "required": [
+              "status",
+              "error_code",
+              "message",
+              "retryable"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "errors": [
+        {
+          "code": "invalid_timezone",
+          "meaning": "`timezone` is not an IANA time zone name. Call again with one, or without it for UTC."
+        },
+        {
+          "code": "time_unavailable",
+          "meaning": "SY.timer did not answer: the agent's hive does not run it, or it is restarting. `retryable: true`: try once more shortly, and never guess the time."
         }
       ]
     },
@@ -1452,7 +1299,7 @@
       "limits": [
         "One self-contained HTML file, served under a sandbox: its inline scripts and styles run, but it loads nothing from the network (no fetch, no outside scripts, stylesheets, fonts or images); images and fonts only inline, as `data:` URLs; forms do not submit.",
         "The link is the key: anyone who has it can open the page, so put nothing private in it. It expires 24 hours after publishing, and you cannot extend it or take the page down earlier.",
-        "Publishing takes up to two minutes. Give the link in your reply; if a `generate_*_artifact` call also makes a file for the same reply, only that call's `text` is sent, so put the link there."
+        "Publishing takes up to two minutes. Your reply is the text you write after your last tool call; text written alongside a call is not sent. Give the link there: a reply without it gets it added, on a line of its own."
       ],
       "present_when": "the node has its identity: it was launched with its ILK",
       "input": {

@@ -169,11 +169,19 @@ Use when the work is conversational, interpretive, or agentic.
 Every AI node is an instance of the `ai.generic` runtime; there is no other AI runtime, and no AI
 node boots with the base install. To make one:
 - `run_node` with `runtime: ai.generic` and the node's tenant;
-- `CONFIG_SET` its operational config: `behavior.kind: ai_chat` and `model`, a model of the node's
-  provider. Optional: `behavior.provider`, `openai` or `anthropic` (without it, the hive's
-  `ai.default_provider`), and `behavior.multimodal`, whether the model receives images (true when
-  absent; `behavior.capabilities` is refused). It carries no prompt: `CONFIG_SET` refuses
-  `instructions`;
+- `CONFIG_SET` its operational config: `behavior.kind: ai_chat`. Optional:
+  - `behavior.provider`, `openai` or `anthropic`, and `behavior.model`: without them the node runs
+    on the hive's `ai.default_provider` and on that provider's model
+    (`ai.providers.<provider>.model` in hive.yaml). Name them only when the agent needs its own,
+    and a model always of the node's provider. Naming a provider other than the hive's default
+    needs its `behavior.model` too, unless that hive's hive.yaml lists a model for it: a worker
+    added by `add_hive` lists only the default provider's. `CONFIG_SET` refuses a config whose
+    model it cannot resolve (`invalid_config`); its answer and `CONFIG_GET` show both in effect,
+    in `ai_provider` and `ai_model`;
+  - `behavior.multimodal`, whether the model receives images (true when absent;
+    `behavior.capabilities` is refused).
+
+  It carries no prompt: `CONFIG_SET` refuses `instructions`;
 - give it its behavior through its ILK definition: a role, skills, handbooks and optionally a
   personality, created as agent assets and set with `set_ilk_definition` on its ILK (§8.1.2). The
   ILK definition is the agent's only prompt source.

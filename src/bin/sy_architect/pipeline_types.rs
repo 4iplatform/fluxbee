@@ -474,6 +474,11 @@ pub struct CookbookEntryV2 {
     pub recorded_from_run: Option<String>,
     /// "manual" for hand-written seeds; "observed" for pipeline-generated.
     pub seed_kind: String,
+    /// The version of the built-in seed a "manual" entry comes from; none on an "observed" one.
+    /// Archi replaces a cookbook's manual entries when its built-in seeds are newer
+    /// (`seed_cookbooks_from_defaults`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_version: Option<u32>,
 }
 
 // ── CFZ-9 — get_manifest_current path constants ─────────────────────────────

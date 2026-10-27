@@ -40,6 +40,13 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
 5. Opens its LanceDB, seeds each cookbook that is missing or empty from the seeds built into the
    binary (`COOKBOOK_SEEDS`, the files of `seeds/cookbook/`; the `.deb` ships no seeds), and marks
    pipeline runs left `in_progress` as `interrupted` (`mark_interrupted_pipeline_runs`).
+   - A seed is a `manual` entry with its seed's `seed_version`; the pipeline appends `observed`
+     ones.
+   - A cookbook whose manual entries are older than the built-in seeds (no `seed_version` counts
+     as 0) gets them replaced by the built-in ones, in their place, and keeps its observed entries
+     as they are. The file is rewritten atomically, and the journal gets one INFO line
+     (`cookbook seeds upgraded`) naming the entries replaced and both versions.
+   - A seed edit raises that seed's `seed_version` (`a_changed_seed_raises_its_seed_version`).
 6. Starts the system and incoming workers and a status refresh every 60 s
    (`STATUS_REFRESH_INTERVAL_SECS`), then binds HTTP: `JSR_ARCHITECT_LISTEN`, else
    `architect.listen`, else `127.0.0.1:3000` (`DEFAULT_ARCHITECT_LISTEN`).
