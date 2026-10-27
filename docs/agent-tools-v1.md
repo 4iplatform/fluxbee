@@ -6,7 +6,9 @@
 - The first release, 0.1.86, is validated on 8.x (2026-10-27; ledger 0.1.86). It covers §3.1–§3.4:
   the cards for the 14 existing base tools, the catalog, `NODE_HELP`, and T8, T9 and A-95.
 - Iteration 1 of §6, 0.1.87, is validated on 8.x (2026-10-27).
-- Next: A-109, then iteration 2 (§6.2).
+- 0.1.88 fixed what that gate found (FINDINGS A-109, with A-101 and A-102): running agents move onto
+  a new runtime by themselves. Validated on 8.x (2026-10-27).
+- Next: iteration 2 (§6.2), 0.1.89.
 
 This is the single place for the track; the next iteration starts here.
 
@@ -231,39 +233,197 @@ leaves running agents on the old binary.
      call the same SY.admin action;
    - `query_hive` is one tool registered in two of Archi's sub-agents, which is no overlap.
 
-### 6.2 Iteration 2 (0.1.88): decided by the operator, 2026-10-27
+### 6.2 Iteration 2 (0.1.89): decided by the operator, 2026-10-27
 
 Items 3–6 act beyond the agent's own reply. The operator decided their rules:
 *"la carga de programación decidila vos, lo que no quiero es dejar cosas escondidas, registrá si
 no se hace"*.
 
-1. **`read_blob`:** an agent reads a file from the hive's blob store by its reference.
-   - Text formats only (txt, csv, json, md, html), with a size cap that protects the model's
-     context.
-   - **Scope: the whole hive, for now.** A blob reference carries no tenant, and the store has no
-     per-tenant directory (FINDINGS A-106). The operator's interim choice: *"hoy prefiero que lea
-     todo lo del hive"*.
-   - **Not in it:**
-     - reading a PDF: today the model gets a PDF only when it arrives as an attachment;
-     - finding a blob: a search service, in a future hive of its own.
+- **`read_blob`:** text formats, the whole hive (*"hoy prefiero que lea todo lo del hive"*).
+- **A reminder:** for the agent itself. It returns to the same conversation, whose destination
+  gets the answer.
+- **`send_message`:** to a destination in the agent's own tenant, *"un mensaje con destino"*; the
+  destination can answer; OPA decides.
+- **`unpublish_html_page`.**
 
-     Both are recorded in FINDINGS A-106.
-2. **`set_reminder`, with list and cancel:** a reminder to the agent itself, through SY.timer.
-   - When it fires, it comes back to the agent in the same conversation. The agent's answer goes
-     to that conversation's destination, a human's channel included.
-   - Limits: at least 60 s, at most 30 days, and a cap of pending reminders per agent. The agent's
-     node owns them, and they are purged with it.
-   - Anything that is a flow belongs in a WF.
-3. **`send_message`:** a message to a destination in the agent's own tenant: another agent, a WF,
-   or a human's channel. *"Un mensaje con destino."*
-   - The destination's answer comes back to the agent as an incoming message.
-   - The user policy (OPA) decides what passes. The tool refuses a destination outside the tenant.
-   - A cap on back-and-forth between two agents in one thread stops loops.
-   - Checked 2026-10-27: today an agent can only reply. `AiBehaviorOutput` is a text or a final
-     output, sent back to whoever wrote.
-4. **`unpublish_html_page`:** takes down a page the agent published, by its `publication_id`,
-   through SY.admin's `unpublish_artifact`, which already admits an AI node on its own
-   publications.
+The details below were checked in the code on 2026-10-27 and proposed by Claude. Three facts
+differ from what the decisions assumed:
+- **OPA does not see a message that has a destination.**
+  - The user policy only picks a destination for a message without one.
+  - PROD has no user policy.
+  - So "OPA decides" has no place to run today (FINDINGS A-113).
+- **No IO node can write to a person first.**
+  - An IO node answers only inside the conversation it brought in: the Slack thread, the
+    WhatsApp customer.
+  - Nothing maps a person to a channel (FINDINGS A-114).
+- **A fired timer never reaches the model, and it carries no conversation.**
+  - The AI node's control plane refuses `TIMER_FIRED`.
+  - SY.timer returns only the payload it was given.
+
+#### 6.2.1 The shared piece: answering a conversation later
+
+A fired reminder and an answer to a `send_message` both start a turn whose output does not go to
+what triggered it. It goes to the conversation the agent was in.
+
+- **The conversation's address** holds what a reply in that conversation needs:
+  - the node that brought the conversation in (an IO node or an agent), by the name the router
+    stamped;
+  - the `thread_id`;
+  - the counterpart's ILK;
+  - `ich`;
+  - `context.io`, with its `reply_target`.
+
+  The runner takes the address from the message of an ordinary turn and hands it to the tools.
+- **A turn for a reminder or an answer:**
+  - its memory and state are the conversation's (keyed by the counterpart, as today);
+  - its input says what happened: *"Reminder you set on <date>: <note>"*, or *"Answer from
+    AI.sales@worker1 to your message: <text>"*;
+  - its output is a new message to the conversation's address;
+  - what triggered the turn gets no reply.
+- **The node can send a message that is not a reply.** The runtime stamps it as it stamps a
+  reply: the node's UUID and its ILK.
+- **Whether a person gets it depends on the IO node:**
+  - io.slack posts it in the thread;
+  - io.wapp sends it to the customer;
+  - io.api drops it, because no request is waiting for it (FINDINGS A-114).
+
+#### 6.2.2 `read_blob`
+
+- **Input:**
+  - `blob_name`, as an attachment shows it (`<stem>_<hash16>.<ext>`);
+  - `offset` in bytes, optional.
+- **Text only:**
+  - txt, csv, json, md and html, by the name's extension;
+  - bytes that are not UTF-8 are refused.
+- **What it reads:**
+  - its hive's store, which the motherbee and the workers share through Syncthing (on in PROD);
+  - across tenants (A-106);
+  - it waits up to 20 s for a blob still on its way from another hive.
+- **Limits:**
+  - files up to 10 MiB, the attachment cap;
+  - each call returns at most 64 KiB of text from `offset`, cut on a character boundary;
+  - with `size_bytes`, and `next_offset` (null at the end).
+- **Errors:** `invalid_blob_name`, `not_text`, `not_found`, `too_large`.
+- **The SDK reads a blob by its name:** without following links, and checking the hash in the
+  name.
+- **Where the model gets names to read:**
+  - an attachment now shows its blob name;
+  - an attached text cut at 100,000 characters says so and names its blob.
+- **With it (FINDINGS A-111):** a CSV or HTML attachment becomes text, as txt, md and json are.
+  - Today it reaches the model as a document.
+  - Claude accepts only PDF documents, so the whole message fails.
+
+#### 6.2.3 `unpublish_html_page`
+
+- **Input:** `publication_id` (`pub:<uuid>`) or the page's `url`.
+  - The link is what a person has.
+  - The agent keeps no list of its pages. It serves many people, and a list would show one
+    person another's pages.
+- **SY.admin's `unpublish_artifact`:**
+  - also takes the link's key;
+  - checks the owner as today: the exact node that published;
+  - answers `NOT_FOUND` for a publication that does not exist, where today it answers
+    `INVALID_REQUEST`.
+- **Answers:**
+  - `unpublished: true`;
+  - `false` when the page was already down or had expired.
+- **Errors:**
+  - `not_found`;
+  - `not_yours`;
+  - `unpublish_failed`, retryable: unpublishing twice is harmless.
+- **Present** wherever `publish_html_page` is. The publish card no longer says a page cannot be
+  taken down early.
+- **Fixed with it:**
+  - a page taken down in the same turn is not added to the reply;
+  - when SY.admin returns no public address, the tool tells the model the page was not
+    published. Today that page stays live until it expires. Now the tool takes it down.
+
+#### 6.2.4 `set_reminder`, `list_reminders`, `cancel_reminder`
+
+- **`set_reminder`'s input:**
+  - `note`, up to 500 characters, written to stand alone;
+  - exactly one of `in_minutes` or `at` (ISO 8601 with its offset).
+- **Limits:**
+  - at least 1 minute (SY.timer's minimum), at most 30 days;
+  - at most 20 pending reminders per agent, counted at SY.timer.
+- **Mechanism:** `TIMER_SCHEDULE` on the agent's hive.
+  - `client_ref` is `reminder:<uuid>`.
+  - The payload holds the note, when it was set, and the conversation's address.
+  - `missed_policy` is `fire`, so a reminder due while SY.timer was down fires when it returns.
+- **When it fires:**
+  - the runner accepts `TIMER_FIRED` only from `SY.timer@<its hive>`, and only for a reminder it
+    knows;
+  - it runs the turn of §6.2.1.
+- **A missed fire:**
+  - SY.timer does not retry, so a fire is lost while the agent is down: on a hive reboot (SY.timer
+    starts before the agents), or during a relaunch.
+  - The agent keeps a record of the reminders it handled. At start it asks SY.timer for its fired
+    reminders. Those it missed in the last 24 h it handles, saying they are late; older ones it
+    drops with a log line.
+  - The record also drops a duplicate fire.
+- **`list_reminders` and `cancel_reminder`** see only the current conversation's reminders. An
+  agent serves many people.
+- **Purge:** a purged node's reminders go with it (SY.orchestrator's `TIMER_PURGE_OWNER`).
+- **Visibility:** SY.timer shows every timer, payload included, to the nodes of its hive and
+  through SY.admin. A reminder is not hidden from the operator (FINDINGS A-115).
+
+#### 6.2.5 `send_message`
+
+- **Input:**
+  - `to`: an agent or a WF by its full name (`AI.<name>@<hive>`, `WF.<name>@<hive>`);
+  - `text`.
+- **Refused:**
+  - any other kind of node: SY, RT and IO (a person cannot be addressed yet, A-114);
+  - the agent itself;
+  - a destination outside the agent's tenant, as the operator decided. The tool reads the
+    destination's tenant through its ILK in the identity shared memory, and it refuses a node
+    without one.
+
+  [ilk-tenant-model-v1](ilk-tenant-model-v1.md) calls a tenant a cost center, not a
+  permission. This is a rule of the tool, not of routing.
+- **The send:**
+  - a user message in the current conversation's thread;
+  - the tool records a pending send, for 24 h, across restarts;
+  - it waits up to 2 s for the router's `UNREACHABLE`, then answers `not_delivered` or `sent`.
+- **The answer:**
+  - a message from that destination, with the send's `trace_id` or in that thread, is the
+    answer;
+  - it starts the turn of §6.2.1, so the agent tells its own conversation, not the other agent;
+  - an agent answers another agent's `send_message` with an ordinary reply, and that reply
+    returns to the sender's conversation.
+
+  That is what keeps two agents from answering each other forever.
+- **The cap:**
+  - in one thread, an agent sends at most 10 messages to agents or WFs, its replies included;
+  - the count restarts when a person writes in that thread, or after an hour without such
+    messages;
+  - past it, the tool answers `limit_reached`, and the agent stops replying to agents and WFs in
+    that thread, with one log line;
+  - answers to its own sends still reach its conversation.
+- **A WF:**
+  - a message starts a WF only if the WF's `input_schema` accepts the agent's text;
+  - the WF answers in the agent's conversation only if its definition replies on the caller's
+    thread (`thread_id_ref`) to the caller (`target_ref`).
+
+  Archi designs that (FINDINGS A-114).
+- **OPA** is not in the path; the router's VPN check is (A-113).
+- **The name:** `send_message` is also the WF action's name and the router's `action_class`
+  label, with the same meaning. It stays.
+
+#### 6.2.6 Fixed on the way
+
+- **FINDINGS A-112:** a router notice that reaches the AI node's control plane is answered.
+  - The notices are `UNREACHABLE` and `TTL_EXCEEDED`; the answer is a `CONFIG_RESPONSE` to the
+    router.
+  - This most likely loops while a reply cannot be delivered. The build confirms it with a test.
+  - The node now never answers a router notice: it logs it, and `send_message` reads it as its
+    failure.
+- **FINDINGS A-110:** the publish script writes every file of a version first and moves the
+  manifest last. The catalog's source is a parameter.
+- **The docs this iteration relies on match the code again:**
+  - docs/sy-timer.md (FINDINGS A-115);
+  - docs/blob-annex-spec.md;
+  - the unpublish messages in docs/nodes/sy-admin.md.
 
 **Pending, by the operator's choice: `update_html_page`, the same link with new content**
 (FINDINGS A-107).

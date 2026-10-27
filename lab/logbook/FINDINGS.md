@@ -1078,6 +1078,95 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
+
+- **What happens:**
+  - **A fire is sent once.** If its owner is down, SY.timer ignores the router's `UNREACHABLE`
+    and the fire is lost.
+  - **A one-shot can fire twice** if SY.timer stops between sending it and saving it (read in the
+    code).
+  - **After a hive reboot, overdue timers fire before the agents are relaunched.**
+  - **No limits:** no maximum delay, no cap per owner or in total, no payload size check (only
+    the 128 KiB frame).
+  - **Open listing:** `TIMER_LIST` and `TIMER_GET` answer any node of the hive, payload
+    included, and SY.admin shows them.
+  - **The doc drifted:** docs/sy-timer.md disagrees with the code in ten places. Among them: the
+    Rust SDK's `TimerClient`, recurring catch-up, the history GC (at start only), the purge order
+    and its failure, the size limits, and the envelope's keys.
+- **In 0.1.89** ([agent-tools-v1](../../docs/agent-tools-v1.md) §6.2.4):
+  - reminders cover a lost fire in the agent: a record of the reminders it handled, and a
+    reconcile at its start;
+  - the doc is corrected.
+- **Later:** delivery retries and caps in SY.timer.
+
+### A-114 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
+
+- **What happens:**
+  - **No IO node writes to a person first.** Each answers only inside the conversation it brought
+    in, by its `reply_target`:
+    - io.slack posts in its bound conversation;
+    - io.wapp drops a message that has none.
+  - **Nothing routes by person:** the router never maps an ILK or a channel to a node, and no IO
+    node reads `dst_ilk`.
+  - **io.api drops an unsolicited message,** so a reminder's or an answer's turn cannot reach its
+    client.
+  - **A WF:**
+    - answers on its instance's thread, unless its definition sets `thread_id_ref` and
+      `target_ref`;
+    - starts only on a message its `input_schema` accepts;
+    - sets no `src_ilk`.
+- **In 0.1.89:** an agent reaches the person of its own conversation (agent-tools-v1 §6.2.1), and
+  `send_message` takes agents and WFs.
+- **Later:**
+  - the IO track: addressing a person, and delivering without a pending request;
+  - Archi's WF design.
+
+### A-113 🟡 OPEN (found 2026-10-27, iteration 2 design) — OPA never sees a message that has a destination
+
+- **What happens:**
+  - **Only for a message without a destination:** the router runs the user policy only on
+    `Resolve` (src/router/mod.rs). Its output is a target, not an allow or a deny.
+  - **A unicast**, by UUID or by name, passes only:
+    - the VPN check;
+    - the system-authority gate on protected verbs.
+  - **PROD has no user policy loaded:** `GET /opa/policy` is empty.
+  - **The policy's input** has no destination and no tenant. Its `src_ilk` is whatever the sender
+    wrote.
+- **So:** the operator's rule for `send_message`, *"que OPA decida"*, has no place to run.
+  - In 0.1.89 the tool applies its own rule: agents and WFs of its own tenant.
+  - The router's VPN check still applies.
+- **To decide, by the operator:** an allow-or-deny step for user messages that have a
+  destination. Every message would pass through it, and it would need a default policy.
+
+### A-112 🔴 OPEN, probable (found 2026-10-27, iteration 2 design) — The AI node answers router notices
+
+- **What happens:**
+  1. A router notice (`UNREACHABLE`, `TTL_EXCEEDED`) that no waiter takes reaches
+     `GenericAiNode::on_message`.
+  2. Its control plane answers any system message that is not a control verb, with a
+     `CONFIG_RESPONSE` `unknown_system_msg` to the sender. Here the sender is the router's own
+     UUID; a unit test answers a notice like that.
+  3. The router cannot deliver to its own UUID, so it sends `UNREACHABLE` back, and the node
+     answers it again.
+
+  This was read in the code, not seen running. Today it needs a reply that cannot be delivered,
+  because its sender is gone. With `send_message` and reminders it becomes common.
+- **Fix (0.1.89):**
+  - a test confirms the loop first;
+  - the node never answers a router notice, and logs it;
+  - `send_message` reads the notice as its failure.
+
+### A-111 🔴 OPEN (found 2026-10-27, iteration 2 design) — A CSV or HTML attachment fails the whole message on Claude
+
+- **What happens:**
+  - ai.generic reads as text only the `text/plain`, `text/markdown` and `application/json`
+    attachments (crates/fluxbee_ai_sdk/src/text_payload.rs).
+  - Every other attachment reaches the model as a document part, CSV and HTML included.
+  - The Anthropic provider accepts only PDF documents, so a message with a CSV or HTML attachment
+    fails there. On OpenAI it goes as an `input_file`.
+- **Fix (0.1.89, agent-tools-v1 §6.2.2):** CSV and HTML become text, and an attachment shows its
+  blob name, for `read_blob`.
+
 ### A-110 🟡 OPEN (found 2026-10-27, 0.1.88 gate) — publish-ia-runtime.sh moves `current` before its last step
 
 - **What happens:**
@@ -1130,7 +1219,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **What happens:** a link is content-addressed. IO.blob curates `public/<sha256>`, the edge binds
   the key to that sha256 and size, and it refuses to rebind a key to different facts. Updating a
   page means publishing again (a new link) and taking the old one down (`unpublish_html_page`,
-  0.1.88).
+  0.1.89).
 - **A stable link would need:**
   - an `update_html_page` tool;
   - a SY.admin action that curates the new content for the same publication;
@@ -1142,7 +1231,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 ### A-106 🟡 OPEN, interim decision (found 2026-10-27) — The blob store has no tenant; agents read the whole hive
 
 - **What happens:** a `BlobRef` carries no tenant, and the store has no per-tenant directory. From
-  0.1.88, `read_blob` lets an agent read any text blob of its hive by reference.
+  0.1.89, `read_blob` lets an agent read any text blob of its hive by reference.
 - **The interim decision:** *"si no es por tenant, hoy prefiero que lea todo lo del hive"*. A blob's
   name carries 16 hex of its content's hash, so a reference has to have reached the agent; it
   cannot be guessed.
