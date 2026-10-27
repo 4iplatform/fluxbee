@@ -8,7 +8,8 @@
 - Iteration 1 of §6, 0.1.87, is validated on 8.x (2026-10-27).
 - 0.1.88 fixed what that gate found (FINDINGS A-109, with A-101 and A-102): running agents move onto
   a new runtime by themselves. Validated on 8.x (2026-10-27).
-- Next: iteration 2 (§6.2), 0.1.89.
+- Next: iteration 2 (§6.2), 0.1.89: `read_blob`, `unpublish_html_page` and fixes. The operator
+  moved reminders and messages to others to WFs (§6.3).
 
 This is the single place for the track; the next iteration starts here.
 
@@ -233,61 +234,45 @@ leaves running agents on the old binary.
      call the same SY.admin action;
    - `query_hive` is one tool registered in two of Archi's sub-agents, which is no overlap.
 
-### 6.2 Iteration 2 (0.1.89): decided by the operator, 2026-10-27
+### 6.2 Iteration 2 (0.1.89): decided by the operator, 2026-10-27, in two steps
 
-Items 3–6 act beyond the agent's own reply. The operator decided their rules:
-*"la carga de programación decidila vos, lo que no quiero es dejar cosas escondidas, registrá si
-no se hace"*.
+**First,** the operator decided four tools, each acting beyond the agent's own reply:
+- `read_blob`, with text formats, from the whole hive (*"hoy prefiero que lea todo lo del hive"*);
+- a reminder for the agent itself;
+- `send_message`, to a destination in the agent's own tenant;
+- `unpublish_html_page`.
 
-- **`read_blob`:** text formats, the whole hive (*"hoy prefiero que lea todo lo del hive"*).
-- **A reminder:** for the agent itself. It returns to the same conversation, whose destination
-  gets the answer.
-- **`send_message`:** to a destination in the agent's own tenant, *"un mensaje con destino"*; the
-  destination can answer; OPA decides.
-- **`unpublish_html_page`.**
+The rule for all four: *"la carga de programación decidila vos, lo que no quiero es dejar cosas
+escondidas, registrá si no se hace"*.
 
-The details below were checked in the code on 2026-10-27 and proposed by Claude. Three facts
-differ from what the decisions assumed:
-- **OPA does not see a message that has a destination.**
-  - The user policy only picks a destination for a message without one.
-  - PROD has no user policy.
-  - So "OPA decides" has no place to run today (FINDINGS A-113).
-- **No IO node can write to a person first.**
-  - An IO node answers only inside the conversation it brought in: the Slack thread, the
-    WhatsApp customer.
-  - Nothing maps a person to a channel (FINDINGS A-114).
-- **A fired timer never reaches the model, and it carries no conversation.**
-  - The AI node's control plane refuses `TIMER_FIRED`.
-  - SY.timer returns only the payload it was given.
+**Then, once the code was checked, the operator decided that the AI node stays a pure
+responder.**
+- **An agent has two kinds of event:** it answers a message, which is reactive, and a timer
+  fires, which is active.
+- **A destination other than the sender belongs to a WF.** The operator: *"si queremos hacer el
+  timer se pone un WF, se programa ahí el routeo y se lanza un timer… el WF cuando se despierta
+  le manda al nodo AI el mensaje, luego el nodo AI evalúa y responde al WF, no cambia nada en el
+  nodo AI, queda clara la programación del routeo"*.
+  - The alternative was a timer that carries a destination named in the agent's prompt. It lost:
+    *"la 2da es la forma más ortodoxa de hacerlo, más visible también"*.
+  - Archi orchestrates with WFs: *"el WF es la interconexión inevitable determinística hecha con
+    workflows… no queda otra"*.
+- **OPA stays for rules of substance:** security, general systems, and implementations that need
+  clear rules. It is not for agents' messages. A rule for each pair of nodes that talk would end
+  as *"una enredadera de reglas OPA imposible de debug"* (FINDINGS A-113, decided).
 
-#### 6.2.1 The shared piece: answering a conversation later
+So the reminders and `send_message` leave the AI node, together with the machinery they needed:
+a send that is not a reply, and a turn that answers a conversation later. Their WF side is §6.3.
+Two of the checked facts still stand:
+- no IO node can write to a person first (FINDINGS A-114);
+- a fired timer is sent once and never retried (FINDINGS A-115).
 
-A fired reminder and an answer to a `send_message` both start a turn whose output does not go to
-what triggered it. It goes to the conversation the agent was in.
+**0.1.89 builds the rest:**
+- §6.2.1 `read_blob`;
+- §6.2.2 `unpublish_html_page`;
+- §6.2.3, the fixes found on the way.
 
-- **The conversation's address** holds what a reply in that conversation needs:
-  - the node that brought the conversation in (an IO node or an agent), by the name the router
-    stamped;
-  - the `thread_id`;
-  - the counterpart's ILK;
-  - `ich`;
-  - `context.io`, with its `reply_target`.
-
-  The runner takes the address from the message of an ordinary turn and hands it to the tools.
-- **A turn for a reminder or an answer:**
-  - its memory and state are the conversation's (keyed by the counterpart, as today);
-  - its input says what happened: *"Reminder you set on <date>: <note>"*, or *"Answer from
-    AI.sales@worker1 to your message: <text>"*;
-  - its output is a new message to the conversation's address;
-  - what triggered the turn gets no reply.
-- **The node can send a message that is not a reply.** The runtime stamps it as it stamps a
-  reply: the node's UUID and its ILK.
-- **Whether a person gets it depends on the IO node:**
-  - io.slack posts it in the thread;
-  - io.wapp sends it to the customer;
-  - io.api drops it, because no request is waiting for it (FINDINGS A-114).
-
-#### 6.2.2 `read_blob`
+#### 6.2.1 `read_blob`
 
 - **Input:**
   - `blob_name`, as an attachment shows it (`<stem>_<hash16>.<ext>`);
@@ -313,7 +298,7 @@ what triggered it. It goes to the conversation the agent was in.
   - Today it reaches the model as a document.
   - Claude accepts only PDF documents, so the whole message fails.
 
-#### 6.2.3 `unpublish_html_page`
+#### 6.2.2 `unpublish_html_page`
 
 - **Input:** `publication_id` (`pub:<uuid>`) or the page's `url`.
   - The link is what a person has.
@@ -338,92 +323,39 @@ what triggered it. It goes to the conversation the agent was in.
   - when SY.admin returns no public address, the tool tells the model the page was not
     published. Today that page stays live until it expires. Now the tool takes it down.
 
-#### 6.2.4 `set_reminder`, `list_reminders`, `cancel_reminder`
+#### 6.2.3 Fixed on the way
 
-- **`set_reminder`'s input:**
-  - `note`, up to 500 characters, written to stand alone;
-  - exactly one of `in_minutes` or `at` (ISO 8601 with its offset).
-- **Limits:**
-  - at least 1 minute (SY.timer's minimum), at most 30 days;
-  - at most 20 pending reminders per agent, counted at SY.timer.
-- **Mechanism:** `TIMER_SCHEDULE` on the agent's hive.
-  - `client_ref` is `reminder:<uuid>`.
-  - The payload holds the note, when it was set, and the conversation's address.
-  - `missed_policy` is `fire`, so a reminder due while SY.timer was down fires when it returns.
-- **When it fires:**
-  - the runner accepts `TIMER_FIRED` only from `SY.timer@<its hive>`, and only for a reminder it
-    knows;
-  - it runs the turn of §6.2.1.
-- **A missed fire:**
-  - SY.timer does not retry, so a fire is lost while the agent is down: on a hive reboot (SY.timer
-    starts before the agents), or during a relaunch.
-  - The agent keeps a record of the reminders it handled. At start it asks SY.timer for its fired
-    reminders. Those it missed in the last 24 h it handles, saying they are late; older ones it
-    drops with a log line.
-  - The record also drops a duplicate fire.
-- **`list_reminders` and `cancel_reminder`** see only the current conversation's reminders. An
-  agent serves many people.
-- **Purge:** a purged node's reminders go with it (SY.orchestrator's `TIMER_PURGE_OWNER`).
-- **Visibility:** SY.timer shows every timer, payload included, to the nodes of its hive and
-  through SY.admin. A reminder is not hidden from the operator (FINDINGS A-115).
-
-#### 6.2.5 `send_message`
-
-- **Input:**
-  - `to`: an agent or a WF by its full name (`AI.<name>@<hive>`, `WF.<name>@<hive>`);
-  - `text`.
-- **Refused:**
-  - any other kind of node: SY, RT and IO (a person cannot be addressed yet, A-114);
-  - the agent itself;
-  - a destination outside the agent's tenant, as the operator decided. The tool reads the
-    destination's tenant through its ILK in the identity shared memory, and it refuses a node
-    without one.
-
-  [ilk-tenant-model-v1](ilk-tenant-model-v1.md) calls a tenant a cost center, not a
-  permission. This is a rule of the tool, not of routing.
-- **The send:**
-  - a user message in the current conversation's thread;
-  - the tool records a pending send, for 24 h, across restarts;
-  - it waits up to 2 s for the router's `UNREACHABLE`, then answers `not_delivered` or `sent`.
-- **The answer:**
-  - a message from that destination, with the send's `trace_id` or in that thread, is the
-    answer;
-  - it starts the turn of §6.2.1, so the agent tells its own conversation, not the other agent;
-  - an agent answers another agent's `send_message` with an ordinary reply, and that reply
-    returns to the sender's conversation.
-
-  That is what keeps two agents from answering each other forever.
-- **The cap:**
-  - in one thread, an agent sends at most 10 messages to agents or WFs, its replies included;
-  - the count restarts when a person writes in that thread, or after an hour without such
-    messages;
-  - past it, the tool answers `limit_reached`, and the agent stops replying to agents and WFs in
-    that thread, with one log line;
-  - answers to its own sends still reach its conversation.
-- **A WF:**
-  - a message starts a WF only if the WF's `input_schema` accepts the agent's text;
-  - the WF answers in the agent's conversation only if its definition replies on the caller's
-    thread (`thread_id_ref`) to the caller (`target_ref`).
-
-  Archi designs that (FINDINGS A-114).
-- **OPA** is not in the path; the router's VPN check is (A-113).
-- **The name:** `send_message` is also the WF action's name and the router's `action_class`
-  label, with the same meaning. It stays.
-
-#### 6.2.6 Fixed on the way
-
-- **FINDINGS A-112:** a router notice that reaches the AI node's control plane is answered.
-  - The notices are `UNREACHABLE` and `TTL_EXCEEDED`; the answer is a `CONFIG_RESPONSE` to the
-    router.
-  - This most likely loops while a reply cannot be delivered. The build confirms it with a test.
-  - The node now never answers a router notice: it logs it, and `send_message` reads it as its
-    failure.
+- **FINDINGS A-112:** a router notice (`UNREACHABLE`, `TTL_EXCEEDED`) that reaches the AI node's
+  control plane is answered with a `CONFIG_RESPONSE` to the router. This most likely loops while a
+  reply cannot be delivered; the build confirms it with a test. The node now never answers a
+  router notice: it logs it.
 - **FINDINGS A-110:** the publish script writes every file of a version first and moves the
-  manifest last. The catalog's source is a parameter.
+  manifest last. The catalog's source is a parameter. The IO publish scripts had the same defect
+  and get the same fix.
 - **The docs this iteration relies on match the code again:**
   - docs/sy-timer.md (FINDINGS A-115);
   - docs/blob-annex-spec.md;
   - the unpublish messages in docs/nodes/sy-admin.md.
+
+### 6.3 Timers and routing in a WF (next; the operator, 2026-10-27)
+
+The operator: the WF is *"el menos desarrollado y el que más trabajo complejo va a necesitar"*.
+The work goes case by case.
+
+- **The WF as a forwarder.** It rebuilds the message as it received it and never breaks its
+  format. It may change the destination, and, when its logic requires it, some content, through
+  its own functions (CEL). Today it has *"dos o tres funciones nada más"*.
+- **The WF as a participant** whenever Archi's orchestration needs sequences, forwarding, timers
+  or escalation.
+- **Already there:**
+  - a WF can ask an agent for a structured answer (`meta.context.response_envelope`), so the
+    agent returns fields (when to remind, whether to escalate) and the WF acts on them;
+  - a WF sees the IO node's `context.io`, with its `reply_target`.
+- **Broken today (FINDINGS A-116):** a WF placed in front of a conversation loses the person and
+  the conversation for the agent.
+- **A full review of the WF** (its engine, its definition language and CEL, how it is deployed,
+  authored and observed) goes into a document of its own, from which the cases are taken one by
+  one.
 
 **Pending, by the operator's choice: `update_html_page`, the same link with new content**
 (FINDINGS A-107).

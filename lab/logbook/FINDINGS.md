@@ -1078,6 +1078,28 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-116 🔴 OPEN (found 2026-10-27) — A WF in front of a conversation loses the person and the conversation for the agent
+
+- **What happens** (go/nodes/wf/wf-generic/node/):
+  - **What an instance sees** of a message (`messageToMap`, instance.go): `trace_id`, `msg`,
+    `type`, `thread_id`, `src`, `context` and `payload`. It does not see `src_ilk`, `dst_ilk` or
+    `ich`.
+  - **Its `send_message`** (actions.go) builds a new message from the definition, with `type`,
+    `msg`, `thread_id` and `context`:
+    - it sets no `src_ilk`, so the agent keeps one memory for everyone the WF brings (its memory is
+      keyed by `src_ilk`);
+    - its `thread_id` is the instance's, so every message is a new conversation for the agent (its
+      cognition is keyed by thread and agent).
+  - **`thread_id_ref`** sends on the person's thread, but only as a terminal reply: an answer comes
+    back correlated by `thread_id == instance_id` (correlate.go). So the agent's answer to that
+    message finds no instance, and the WF tries to start a new one.
+  - **Instances:** each message from a person starts a new instance. An instance is found only by
+    its own id, never by the conversation's thread.
+- **Why it matters:** the operator's direction (agent-tools-v1 §6.2, §6.3) puts a WF between an IO
+  node and an agent whenever a solution needs timers or routing. For that the WF must forward the
+  message as received, and keep the person and the conversation.
+- **Next:** the WF review of §6.3, case by case.
+
 ### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
 - **What happens:**
@@ -1093,10 +1115,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **The doc drifted:** docs/sy-timer.md disagrees with the code in ten places. Among them: the
     Rust SDK's `TimerClient`, recurring catch-up, the history GC (at start only), the purge order
     and its failure, the size limits, and the envelope's keys.
-- **In 0.1.89** ([agent-tools-v1](../../docs/agent-tools-v1.md) §6.2.4):
-  - reminders cover a lost fire in the agent: a record of the reminders it handled, and a
-    reconcile at its start;
-  - the doc is corrected.
+- **In 0.1.89:** the doc is corrected.
+  - The reminders that would have covered a lost fire in the agent moved to WFs, by the operator's
+    decision ([agent-tools-v1](../../docs/agent-tools-v1.md) §6.2).
+  - A WF reconciles its own timers at start (go/nodes/wf/wf-generic/node/recover.go). Whether that
+    covers a fire lost while it was down is part of the WF review (§6.3).
 - **Later:** delivery retries and caps in SY.timer.
 
 ### A-114 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
@@ -1115,13 +1138,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       `target_ref`;
     - starts only on a message its `input_schema` accepts;
     - sets no `src_ilk`.
-- **In 0.1.89:** an agent reaches the person of its own conversation (agent-tools-v1 §6.2.1), and
-  `send_message` takes agents and WFs.
+- **Since the operator's decision (agent-tools-v1 §6.2):** agents only answer, and WFs do the
+  routing. So this matters for WFs: a WF that has to write first to a person meets the same
+  wall.
 - **Later:**
   - the IO track: addressing a person, and delivering without a pending request;
   - Archi's WF design.
 
-### A-113 🟡 OPEN (found 2026-10-27, iteration 2 design) — OPA never sees a message that has a destination
+### A-113 ✅ DECIDED by the operator (2026-10-27) — OPA never sees a message that has a destination
 
 - **What happens:**
   - **Only for a message without a destination:** the router runs the user policy only on
@@ -1135,8 +1159,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **So:** the operator's rule for `send_message`, *"que OPA decida"*, has no place to run.
   - In 0.1.89 the tool applies its own rule: agents and WFs of its own tenant.
   - The router's VPN check still applies.
-- **To decide, by the operator:** an allow-or-deny step for user messages that have a
-  destination. Every message would pass through it, and it would need a default policy.
+- **Decided by the operator:** OPA stays for rules of substance: security, general systems, and
+  implementations that need clear rules. It does not gate agents' messages.
+  - A rule for each pair of nodes that talk would end as *"una enredadera de reglas OPA imposible
+    de debug"*.
+  - Agents do not send at all: the AI node stays a pure responder, and routing belongs to WFs
+    (agent-tools-v1 §6.2).
 
 ### A-112 🔴 OPEN, probable (found 2026-10-27, iteration 2 design) — The AI node answers router notices
 
