@@ -356,10 +356,22 @@ The work goes case by case.
     dependiendo de la respuesta evaluada"*.
   - That is the structured answer (`response_envelope`): the WF names the fields, and its CEL
     branches on them.
+- **Routing is by node name, written in the definition** (the operator, 2026-10-27).
+  - A person enters and leaves Fluxbee only through an IO node, and exists only once registered,
+    through the frontdesk or cloud identity.
+  - So a WF never routes by ILK. Its CEL chooses among node names written in the definition, and
+    nothing is computed.
+  - The ILK travels intact inside the message, for the agent's memory and the IO node's delivery.
+  - Today the engine also accepts `target_ref`, a destination computed from data. By this rule it
+    does not fit, and the WF review decides whether it goes or is limited to names written in the
+    definition.
 - **Answering later a person who wrote before:** the WF keeps that message's `context.io` (its
   `reply_target`) in its state. When the timer fires, it sends the result to the IO node with it.
   The review confirms the engine allows it.
 - **Writing first to a person who never wrote** stays with the IO family (FINDINGS A-114).
+  - The WF sends to the IO node by its name, with the person's ILK, which is known because the
+    person is registered.
+  - The IO node then delivers to that ILK on its channel, without an inbound message.
 - **Already there:**
   - a WF can ask an agent for a structured answer (`meta.context.response_envelope`), so the
     agent returns fields (when to remind, whether to escalate) and the WF acts on them;

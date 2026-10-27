@@ -1143,8 +1143,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Answering later a person who wrote before** is the WF's job: it keeps that message's
     `context.io` (its `reply_target`) and later sends to the IO node with it. The WF review
     confirms the engine allows it.
-  - **Writing first to a person who never wrote** is what remains here. It needs the IO family:
-    addressing a person, and delivering without an inbound message.
+  - **Writing first to a person who never wrote** is what remains here.
+    - The person is registered (the frontdesk or cloud identity), so the ILK is known.
+    - The WF sends to the IO node by the name written in its definition.
+    - The IO node must deliver to that ILK on its channel without an inbound message.
+
+    That is the IO family's work.
 - **Later:**
   - the IO track: addressing a person, and delivering without a pending request;
   - Archi's WF design.
