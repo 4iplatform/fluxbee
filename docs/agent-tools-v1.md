@@ -378,9 +378,9 @@ The work goes case by case.
   - a WF sees the IO node's `context.io`, with its `reply_target`.
 - **Broken today (FINDINGS A-116):** a WF placed in front of a conversation loses the person and
   the conversation for the agent.
-- **A full review of the WF** (its engine, its definition language and CEL, how it is deployed,
-  authored and observed) goes into a document of its own, from which the cases are taken one by
-  one.
+- **The full review of the WF** is in [wf-orchestration-v1](wf-orchestration-v1.md) (2026-10-27).
+  It covers its engine, its definition language and CEL, and how it is deployed, authored and
+  observed. The cases are taken from it one by one.
 
 **Pending, by the operator's choice: `update_html_page`, the same link with new content**
 (FINDINGS A-107).

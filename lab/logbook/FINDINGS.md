@@ -1078,6 +1078,55 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-119 🔴 OPEN (found 2026-10-27, WF review) — The WF engine's control verbs and timer fires accept anyone
+
+- **What happens:**
+  - The engine checks no caller on `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_GET_CODE` or
+    `WF_CANCEL_INSTANCE` (go/nodes/wf/wf-generic/node/dispatch.go). The router does not protect
+    them either.
+  - So any node of the VPN can read an instance's state, which holds people's reply targets, or
+    cancel it.
+  - A `TIMER_FIRED` is correlated by its `client_ref` from any sender.
+  - An `INVALID_INPUT` answer carries no thread, so two WFs could bounce it back and forth (read,
+    not run).
+- **Fix:** with the WF track, Case 0 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.3,
+  §5).
+
+### A-118 🔴 OPEN (found 2026-10-27, WF review) — The WF engine: a panic, an unbounded loop, lost and repeated events, instances moved by a redeploy
+
+Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, read in the code at
+`e49ffeaa`.
+
+- **A CEL map literal in `set_variable` panics the node** (read, not run).
+  - The receive loop has no recover.
+  - From an internal event, it replays at every start.
+- **An `emit_internal_event` that re-emits itself never stops,** and it blocks the node's only
+  receive loop.
+- **A crash loses the event in progress,** and one during creation leaves a half-started instance.
+- **A redeploy moves running instances onto the new definition,** where the docs say they keep
+  theirs. An instance whose state was removed errors forever.
+- **A fired timer can fire again after a restart.**
+- **The WF crash-loops at start while SY.timer is unreachable.**
+- **Numbers change type across a restart.**
+- **A `$ref` to a missing key fails the instance.**
+
+**Fix:** with the WF track, Case 0.
+
+### A-117 🔴 OPEN (found 2026-10-27, WF review) — Every shipped WF timeout is dead, and a send to an agent hangs
+
+- **No timeout ever fires.**
+  - SY.timer puts the key at `payload.user_payload.timer_key`.
+  - The example packages (`wf.router`, `wf.invoice`) test `event.payload.timer_key`, and the
+    docs test `event.user_payload.timer_key`. Both are always false.
+- **A send to an agent hangs without a trace.**
+  - `send_message` defaults to `meta.type: system`. The agent answers that from its control plane,
+    and the WF drops the answer.
+  - Archi's two seeds, `wf.invoice` and SY.admin's help example all send without a type.
+- **`wf.router`'s error branches never fire:** an agent's error arrives as `<msg>.error`.
+- **`wf.invoice` relies on a JSON-Schema default** that is never applied.
+- **Fix:** with the WF track, Case 0 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.1,
+  §5).
+
 ### A-116 🔴 OPEN (found 2026-10-27) — A WF in front of a conversation loses the person and the conversation for the agent
 
 - **What happens** (go/nodes/wf/wf-generic/node/):
