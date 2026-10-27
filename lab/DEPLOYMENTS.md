@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ live | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
+| **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ live | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
+| **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ replaced by 0.1.87 | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
 | **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ replaced by 0.1.86 | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
 | **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ replaced by 0.1.85 | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
 | **0.1.83** | 2026-10-22 | `5fb8dab` | motherbee + spokes (core) | ✅ replaced by 0.1.84 | snap `pre-hardening-0-1-83` (all 4 VMs) · `apt install fluxbee=0.1.82` + core-update of the spokes (the ingress keeps its SSH table: see the entry) |
@@ -95,6 +96,60 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.87 — Consolidating the agents' tools, iteration 1: the PDF writes Spanish, files stay out of the model's context, the model's own reply with every file, the model defaults to the hive's, the time (agent-tools-v1 §6.1; A-97, A-98, A-99, A-104, A-109)
+
+- **Date:** 2026-10-27 (ART) · **Previous version:** 0.1.86 · **Commit:** `6772df4`.
+- **Scope:** motherbee and the three spokes (core update). One step by hand on the test agent:
+  `restart_node AI.pruebas`, explained below.
+- **Design:** [agent-tools-v1](../docs/agent-tools-v1.md) §6.1. Built by one agent; one review round
+  (every lens) found two medium and two low issues, all fixed before the build.
+- **What changed:**
+  - **A-97:** the PDF declares WinAnsiEncoding, wraps by Helvetica's widths, and continues on new
+    pages.
+  - **A-98 and A-99:** a generated file stays out of the model's context.
+    - The reply is the model's own text, with every file of the turn (at most 8; the same name
+      replaces the earlier file).
+    - A link published in the turn is appended when the reply lacks it.
+  - **A-104:**
+    - `behavior.model` is optional and defaults to the hive's model for the node's provider;
+    - `CONFIG_SET` refuses a model the hive cannot supply;
+    - the examples name neither provider nor model.
+  - **`get_current_time`:** a new base tool, through SY.timer on the agent's hive.
+  - **Archi's cookbook seeds are versioned.** A newer built-in seed replaces the manual entries
+    once and keeps the observed ones. PROD's were seeded at 0.1.81 with `"model": "gpt-5.5"`.
+  - **SY.admin's executor:** `get_admin_action_help` takes `action_name`.
+- **Deploy:**
+  - build of `6772df4` in 13 min, deploy in 219 s;
+  - snapshots `pre-tools1-0-1-87` on the 4 VMs (`pre-door-0-1-84` was deleted);
+  - 0.1.87 on all 4 (core manifest `802a28c0a7f40072`), with health clean;
+  - Archi logged the seed upgrade of its four cookbooks: design, artifact, plan_compile and repair.
+- **Found in the gate: A-109.**
+  - `AI.pruebas` kept running the 0.1.86 binary, whose directory dpkg had already removed. The
+    orchestrator moves a node that follows `current` only at its own start, and this release did
+    not change the orchestrator, so worker1's never restarted.
+  - `restart_node AI.pruebas` (SY.admin, the operator's path) put it on 0.1.87.
+  - `node_help` then still reported 0.1.86: that is A-101, seen live.
+- **Gate (`AI.pruebas`, Claude):**
+  - **A-104:** a `config-set` with neither provider nor model was accepted, with `ai_model` set to
+    `claude-sonnet-5-5` from the hive.
+  - **One reply with two files:** asked for a long Spanish PDF and a CSV, the agent answered in its
+    own words with both attached.
+    - The PDF is 2 pages and 82 lines, and declares WinAnsiEncoding.
+    - Every accent, ñ, ¿ and ¡ is written as an octal escape (á 47, ó 34, ñ 12, ¿ 10…).
+    - No raw byte is ≥ 0x80.
+  - **The time:** "martes 27 de octubre de 2026, 14:29 (UTC-3)", which matched the clock.
+  - **A page and a file in one reply:** the reply carried the link, with its expiry, and the CSV.
+  - **A-95:** no `/public/` line in the agent's journal.
+  - **Health:** `failed=0`, `denials=0` on all 4; the web door is acknowledged and ready.
+- **Upgrading another hive:**
+  - nothing by hand for the core;
+  - until A-109 is fixed, restart each running AI node that follows `current`
+    (`restart_node`), or it stays on the old binary.
+- **Rollback:**
+  - snapshot `pre-tools1-0-1-87`;
+  - or `apt install fluxbee=0.1.86` plus the core update. 0.1.86 requires `behavior.model`, so first
+    give every AI node one. `AI.pruebas` now has none (the AI runbook, "Rolling back to 0.1.86").
 
 ## 0.1.86 — An AI agent's tools declared once (cards, a catalog, NODE_HELP); the AI provider per node; "tools" the AI node's one word; the AI nodes' control plane only from its authorities (agent-tools-v1; A-93, A-94, A-95, A-105)
 

@@ -1078,6 +1078,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-109 🔴 OPEN (found 2026-10-27, 0.1.87 gate) — A release that does not change the orchestrator leaves running nodes on the old runtime
+
+- **What happens:**
+  - A node that follows `current` moves to the new runtime only when its hive's orchestrator
+    starts: "running node follows 'current' and the pointer moved; relaunching it".
+  - A core update restarts only the services whose binary changed. In 0.1.87 the orchestrator's
+    did not change, so worker1's orchestrator never restarted.
+  - `AI.pruebas` kept the 0.1.86 binary, whose directory dpkg had removed (`/proc/<pid>/exe` read
+    "(deleted)"). It went on answering with the old tools until `restart_node`.
+- **Fix:** when `current` moves, the orchestrator relaunches the running nodes that follow it after
+  every core update, and on its periodic reconcile, not only at its own start. With it, save
+  `_system.runtime_version` (A-101).
+
 ### A-108 🔴 OPEN (found 2026-10-27) — io.slack fails a whole reply that carries an HTML file
 
 - **What happens:** io.slack's MIME list has no `text/html`. A reply with a
@@ -1145,7 +1158,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   - the registry is in name order, so OpenAI caches the prefix;
   - *Live:* Anthropic cache writes and reads of 6,376 tokens; OpenAI read 2,560 from its cache.
 
-### A-104 🔴 OPEN (found 2026-10-26, 0.1.86 review) — An AI node's model must match a provider it may not know
+### A-104 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — An AI node's model must match a provider it may not know
 
 - **What happens:** since 0.1.86, `behavior.provider` is optional and defaults to the hive's
   provider, but `behavior.model` is required and free text. SY.admin's examples say
@@ -1154,6 +1167,12 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Fix:** without `behavior.model`, the node uses the hive's model for its provider
   (`hive.yaml ai.providers.<provider>.model`). The examples then name neither, unless the node
   needs another model.
+- **Fixed (0.1.87, `6772df4`):**
+  - the default model;
+  - CONFIG_GET and CONFIG_SET show `ai_model`;
+  - CONFIG_SET refuses a model the hive cannot supply;
+  - the examples, Archi's prompts and its versioned cookbook seeds name neither provider nor model.
+- **Validated:** a `config-set` with neither was accepted, with `claude-sonnet-5-5` from the hive.
 
 ### A-103 🔵 TO EVALUATE (found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
 
@@ -1175,12 +1194,14 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Fix:** save the flag before launching, or convert in the orchestrator's launch step under the
   node's lock.
 
-### A-101 🟡 OPEN (found 2026-10-26, 0.1.86 review) — NODE_HELP's runtime_version goes stale after a restart
+### A-101 🟡 OPEN, seen on 8.x (found 2026-10-26, 0.1.86 review) — NODE_HELP's runtime_version goes stale after a restart
 
 - **What happens:** `start_node` and `restart_node` launch the current version without saving
   `_system.runtime_version`; only the boot reconcile saves it. A node restarted onto a newer
   version reports the old one until the orchestrator's next boot.
 - **Fix:** save the version in start and restart, before launching.
+- **Seen on 8.x (0.1.87, 2026-10-27):** after `restart_node AI.pruebas`, the node ran 0.1.87 and
+  `node_help` said 0.1.86. To fix with A-109.
 
 ### A-100 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
 
@@ -1196,23 +1217,36 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   lowercase, as `system`. The router let it through, and the agent answered its whole config.
   Since 0.1.86 the agent refuses it.
 
-### A-99 🔴 OPEN (found 2026-10-26) — When a file generator runs, the model's own text is dropped
+### A-99 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — When a file generator runs, the model's own text is dropped
 
 - **What happens:** the reply is the generator call's `text`, or a fixed Spanish line. Whatever the
   model writes after the call is lost.
 - **Fix:** decide which text the user gets, and keep the model's own.
+- **Fixed (0.1.87):** the reply is the model's text after its last tool call, else its text
+  alongside a call. It carries every file of the turn, and a published link the text lacks is
+  appended.
+- **Validated:** a PDF and a CSV came in one reply, with the model's own sentence, and a page's
+  link came with a CSV.
 
-### A-98 🔴 OPEN (found 2026-10-26) — A generated file's bytes flow back into the model's context
+### A-98 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — A generated file's bytes flow back into the model's context
 
 - **What happens:** each `generate_*_artifact` result carries the file's base64 back to the model.
   That costs tokens on every later turn, and fills the context with bytes the model cannot use.
 - **Fix:** return a reference (the file name, its size, the blob reference), never the bytes.
+- **Fixed (0.1.87):** a per-message collector keeps the file. The model gets `{status, filename,
+  mime, size_bytes}`. Tested on 8.x through the two-file reply.
 
-### A-97 🔴 OPEN (found 2026-10-26) — The PDF generator garbles non-ASCII text
+### A-97 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — The PDF generator garbles non-ASCII text
 
 - **What happens:** `generate_pdf_artifact` prints only ASCII correctly, so accented Spanish comes
   out broken. The users of 8.x write in Spanish.
 - **Fix:** embed a Unicode font, or use a PDF library that encodes text properly.
+- **Fixed (0.1.87):**
+  - WinAnsiEncoding (Windows-1252), with octal escapes;
+  - lines wrapped by Helvetica's widths;
+  - new pages.
+- **Validated:** a 2-page Spanish PDF had every accent, ñ, ¿ and ¡ escaped, and no raw byte
+  ≥ 0x80.
 
 ### A-96 🔵 TO EVALUATE (noted 2026-10-26) — How the SY nodes' tokens are measured per message
 

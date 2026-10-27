@@ -5,7 +5,8 @@
 - The direction was agreed with the operator on 2026-10-26.
 - The first release, 0.1.86, is validated on 8.x (2026-10-27; ledger 0.1.86). It covers §3.1–§3.4:
   the cards for the 14 existing base tools, the catalog, `NODE_HELP`, and T8, T9 and A-95.
-- Next: the new base tools of §3.5, one per iteration.
+- Iteration 1 of §6, 0.1.87, is validated on 8.x (2026-10-27).
+- Next: A-109, then iteration 2 (§6.2).
 
 This is the single place for the track; the next iteration starts here.
 
@@ -198,6 +199,9 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
 7. The overlaps.
 
 ### 6.1 Iteration 1 (0.1.87): the defects, the time, the overlaps
+
+**Validated on 8.x (2026-10-27; ledger 0.1.87).** The gate found A-109: a runtime-only release
+leaves running agents on the old binary.
 
 1. **A-97: the PDF writes Spanish.**
    - The font declares `WinAnsiEncoding`, and the text is encoded into it, so accents, ñ, ¿ and ¡
