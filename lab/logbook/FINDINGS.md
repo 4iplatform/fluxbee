@@ -1078,7 +1078,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-109 🔴 OPEN (found 2026-10-27, 0.1.87 gate) — A release that does not change the orchestrator leaves running nodes on the old runtime
+### A-110 🟡 OPEN (found 2026-10-27, 0.1.88 gate) — publish-ia-runtime.sh moves `current` before its last step
+
+- **What happens:**
+  - `scripts/publish-ia-runtime.sh` calls `publish-runtime.sh`, which writes the manifest, `current`
+    included, and only then writes the version's `tools.json` from the repo's
+    `docs/reference/agent-tools.json`.
+  - Run outside a full checkout, the catalog step fails after `current` has already moved. The
+    version is live without its catalog, so `get_runtime` answers `tool_catalog: null` to Archi.
+  - Running nodes were safe: the reconcile checks the version's files.
+- **Fix:** write every file of the version first and move the manifest last; fail before touching
+  the manifest when an input is missing.
+
+### A-109 ✅ VALIDATED ON 8.x (0.1.88, 2026-10-27) — A release that does not change the orchestrator leaves running nodes on the old runtime
 
 - **What happens:**
   - A node that follows `current` moves to the new runtime only when its hive's orchestrator
@@ -1090,6 +1102,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** when `current` moves, the orchestrator relaunches the running nodes that follow it after
   every core update, and on its periodic reconcile, not only at its own start. With it, save
   `_system.runtime_version` (A-101).
+- **Fixed (0.1.88, `d01ba1d`):** see the ledger.
+  - One reconcile pass, at boot and every 60 s, relaunches a running node that follows a moved
+    `current`, or whose unit does not run what its runtime names (live ExecStart plus a version
+    stamp). Package nodes move with their base.
+  - Only once the target is ready; otherwise it waits, logged once.
+- **Validated:**
+  - a runtime published without a .deb moved `AI.pruebas` within 28 s;
+  - a node pinned to 0.1.88 stayed;
+  - a same-version republish relaunched nothing.
 
 ### A-108 🔴 OPEN (found 2026-10-27) — io.slack fails a whole reply that carries an HTML file
 
@@ -1186,15 +1207,17 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   of those values.
 - **Fix:** build the card text from the constants, or test the text against them.
 
-### A-102 🟡 OPEN, narrow (found 2026-10-26, 0.1.86 review) — A stopped node's first start can race the T9 conversion
+### A-102 ✅ RESOLVED (0.1.88; covered by tests) — A stopped node's first start can race the T9 conversion
 
 - **What happens:** `start_node` saves the relaunch flag into config.json after launching the node,
   while the node converts the same file at boot. If the orchestrator's read-modify-write lands
   first, `behavior.capabilities` comes back, and the node boots FAILED_CONFIG. A restart fixes it.
 - **Fix:** save the flag before launching, or convert in the orchestrator's launch step under the
   node's lock.
+- **Fixed (0.1.88):** start and restart write the version and the relaunch flag before launching,
+  in one write, under the node's lock.
 
-### A-101 🟡 OPEN, seen on 8.x (found 2026-10-26, 0.1.86 review) — NODE_HELP's runtime_version goes stale after a restart
+### A-101 ✅ VALIDATED ON 8.x (0.1.88, 2026-10-27) — NODE_HELP's runtime_version goes stale after a restart
 
 - **What happens:** `start_node` and `restart_node` launch the current version without saving
   `_system.runtime_version`; only the boot reconcile saves it. A node restarted onto a newer
@@ -1202,6 +1225,10 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Fix:** save the version in start and restart, before launching.
 - **Seen on 8.x (0.1.87, 2026-10-27):** after `restart_node AI.pruebas`, the node ran 0.1.87 and
   `node_help` said 0.1.86. To fix with A-109.
+- **Fixed (0.1.88):** every launch path records `_system.runtime_version` before launching, and the
+  unit carries `FLUXBEE_NODE_RUNTIME_VERSION`.
+- **Validated:** after the deploy, and after the A-109 relaunch, `node_help`, the binary, the stamp
+  and `_system` all agreed.
 
 ### A-100 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
 

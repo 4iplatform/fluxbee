@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ live | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
+| **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ live | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
+| **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ replaced by 0.1.88 | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
 | **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ replaced by 0.1.87 | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
 | **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ replaced by 0.1.86 | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
 | **0.1.84** | 2026-10-23 | `5be9e7b` | motherbee + spokes (core) + motherbee `hive.yaml` (`web:`) + the edge's certificate (two names) | ✅ replaced by 0.1.85 | snap `pre-door-0-1-84` (all 4 VMs) · `apt install fluxbee=0.1.83` + core-update of the spokes (`acme.json` and the edge's publications: see the entry) |
@@ -96,6 +97,61 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.88 — A running node moves onto what its runtime names now, on every reconcile pass, once that is ready; every launch records and stamps its version (A-109, A-101, A-102)
+
+- **Date:** 2026-10-27 (ART) · **Previous version:** 0.1.87 · **Commit:** `d01ba1d`.
+- **Scope:**
+  - motherbee and the three spokes (core update);
+  - in the gate, ai.generic `0.1.88-gate1` was published as `current` (the same binary as 0.1.88).
+- **Design:** the fixes of FINDINGS A-109 (found in the 0.1.87 gate), A-101 and A-102. Built by one
+  agent; one review round (every lens) passed it with five low findings, all fixed before the
+  build.
+- **What changed (SY.orchestrator):**
+  - **One reconcile for boot and the 60 s loop,** serialized by a pass lock, with the manifest read
+    per node under its lock. A running node is relaunched when either:
+    - it follows `current` and the pointer moved;
+    - its unit does not run what its runtime names now, judged by the live ExecStart and the
+      `FLUXBEE_NODE_RUNTIME_VERSION` stamp. This is how a package node moves with its base: WF on
+      wf.engine, config-only AI packages on ai.generic.
+
+    A unit already on the target only has its config corrected.
+  - **Readiness before any launch** (reconcile, run_node, start, restart): the version's directory,
+    its start script, the binary the script execs (fail-closed), `package.json` and a workflow's
+    definition.
+    - The reconcile waits, logged once.
+    - An operator's launch is refused with `RUNTIME_NOT_PRESENT` before anything is stopped.
+  - **Every launch path records `_system.runtime_version`** (and `package_path`, and
+    `relaunch_on_boot`) under the node's lock before launching (A-101, A-102). The unit carries the
+    version stamp.
+- **Deploy:**
+  - build of `d01ba1d` in 8 min, deploy in 227 s;
+  - snapshots `pre-reconcile-0-1-88` on the 4 VMs (`pre-web-0-1-85` was deleted);
+  - 0.1.88 on all 4 (core manifest `cb87576b59941ef1`), with health clean.
+- **Gate:**
+  - **After the deploy (A-101):** `AI.pruebas` reported 0.1.88 consistently in `node_help`, its
+    binary, its stamp and `_system`.
+  - **A-109, live:**
+    - `AI.gate0188@worker1` was started pinned to 0.1.88;
+    - then `publish-ia-runtime.sh --version 0.1.88-gate1 --set-current --skip-build`, with the
+      installed binary, on the motherbee: no .deb, no orchestrator restart;
+    - worker1 had the manifest and the version 5 s later;
+    - its orchestrator's periodic pass relaunched `AI.pruebas` (which follows `current`) onto
+      0.1.88-gate1 within 28 s, and it reported 0.1.88-gate1 everywhere;
+    - the pinned `AI.gate0188` stayed on 0.1.88, with both versions on one hive.
+  - **Republishing the same version** (to add the catalog the first run missed, A-110) relaunched
+    nothing. `get_runtime` then answered the 15-tool catalog of 0.1.88-gate1.
+  - **Health:** `failed=0`, `denials=0` on all 4; the web door is acknowledged.
+- **Cleanup:**
+  - `AI.gate0188` was killed and purged, and the scripts copied to the motherbee were removed;
+  - `AI.pruebas` stays, on 0.1.88-gate1;
+  - **ai.generic's `current` stays 0.1.88-gate1 until the next release.** Its directory is not
+    dpkg's, so remove it after that release.
+- **Upgrading another hive:** nothing by hand. Running nodes now move by themselves within a pass.
+- **Rollback:**
+  - snapshot `pre-reconcile-0-1-88`;
+  - or `apt install fluxbee=0.1.87` plus the core update of the spokes. A-109 returns: restart each
+    following node by hand.
 
 ## 0.1.87 — Consolidating the agents' tools, iteration 1: the PDF writes Spanish, files stay out of the model's context, the model's own reply with every file, the model defaults to the hive's, the time (agent-tools-v1 §6.1; A-97, A-98, A-99, A-104, A-109)
 
