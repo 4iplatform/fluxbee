@@ -159,6 +159,7 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
 | The plan compiler | `query_hive`, `get_admin_action_help`, `submit_executor_plan` |
 
 **D. SY.admin's executor (runs Archi's plans, `src/bin/sy_admin.rs`):**
+
 - one tool per plan step, named after its admin action and built from the action registry;
 - `get_admin_action_help` and `report_step_issue`.
 
@@ -173,6 +174,7 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
 | Taking a page down | SY.admin's `unpublish_artifact` already admits an AI node on its own publications. |
 
 **Overlaps found:**
+
 - `get_admin_action_help` exists twice, in Archi's plan compiler and in SY.admin's executor.
 - `query_hive` serves both the designer and the plan compiler.
 - Archi's and the executor's tools have no cards: T2 covers the agents' tools only.
