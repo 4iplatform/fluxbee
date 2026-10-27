@@ -178,3 +178,54 @@ The starting point for consolidating them one by one (the operator, 2026-10-27).
 - `get_admin_action_help` exists twice, in Archi's plan compiler and in SY.admin's executor.
 - `query_hive` serves both the designer and the plan compiler.
 - Archi's and the executor's tools have no cards: T2 covers the agents' tools only.
+
+## 6. Consolidating A, one iteration at a time (the operator, 2026-10-27)
+
+**The criterion:**
+- only A (`ai.generic`) gets an ordered toolbox; it is the node that grows with the product;
+- B, C and D keep their own tools: they are specific, and integrating them buys nothing;
+- the mechanism of §3 is shared, and the toolboxes are not;
+- the overlaps of §5 get aligned.
+
+**The order:** least risk first.
+1. The four defects of A's tools.
+2. The current time.
+3. Reading from the blob.
+4. Timers.
+5. A message to another node.
+6. Taking a page down.
+7. The overlaps.
+
+### 6.1 Iteration 1 (0.1.87): the defects, the time, the overlaps
+
+1. **A-97: the PDF writes Spanish.**
+   - The font declares `WinAnsiEncoding`, and the text is encoded into it, so accents, ñ, ¿ and ¡
+     print. A character outside that set becomes `?`.
+   - Lines wrap to the page width, and the text continues on new pages.
+2. **A-98 and A-99: a generated file stays out of the model's context, and the model's own reply
+   is kept.**
+   - A generator keeps the file aside, for the reply, and answers the model only
+     `{status, filename, mime, size_bytes}`.
+   - The reply is the model's own final text, carrying every file the turn made, not only the
+     last one, up to a cap.
+   - The generators' `text` input goes away: the model writes its reply as it always does. The
+     publish card no longer has to tell it where to put the link.
+3. **A-104: the model defaults to the hive's.**
+   - Without `behavior.model`, the node uses the hive's model for its provider
+     (`hive.yaml ai.providers.<provider>.model`).
+   - CONFIG_GET shows the model and where it came from.
+   - SY.admin's and Archi's examples name neither the provider nor the model, unless a node needs
+     one of its own.
+4. **The time:** a base tool, `get_current_time`.
+   - Input: an IANA time zone, optional; UTC by default.
+   - It answers through SY.timer on the agent's own hive (`TIMER_NOW_IN`, the SDK's
+     `TimerClient`).
+   - It is present when the hive runs SY.timer: the motherbee and the workers.
+5. **The overlaps:**
+   - the executor's `get_admin_action_help` takes `action_name`, as Archi's does; both already
+     call the same SY.admin action;
+   - `query_hive` is one tool registered in two of Archi's sub-agents, which is no overlap.
+
+### 6.2 After 0.1.87: what needs the operator's call
+
+Items 3–6 act beyond the agent's own reply. Each needs its rule decided before it is built.
