@@ -9,7 +9,8 @@
   - deploy, authoring and operation.
 
   Everything below was read in the code; a point marked *(read, not run)* was not exercised.
-- **Next:** the operator picks the first case (§5).
+- **Next:** Case 0 (§5.1), decided by the operator on 2026-10-28, as 0.1.90. The operator: close
+  the WF topic completely, case by case; Archi through Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -279,6 +280,61 @@ This is the single place for the track. The cases are worked here one at a time.
   - a check before deploy, with `COMPILE_ERROR` back to the designer;
   - instances visible through SY.admin.
 - **Later, in the IO family:** writing first to a person who never wrote (FINDINGS A-114).
+
+### 5.1 Case 0 (0.1.90): what is broken today. Decided by the operator, 2026-10-28
+
+1. **A WF always sends `user`.**
+   - `meta.type` leaves the definition, and validation refuses it.
+   - SY.\* and RT.\* are already refused as destinations, so a `system` send had no legitimate
+     destination left. It only hung the instance.
+   - **Decided in principle, for the forwarding case (§5, Cases 1–2):** the operator's idea of a
+     trail. A field in the message's meta lists the nodes it passed through, and each forwarding
+     WF adds its own name. It serves the logs, debugging, and the agent, which then knows where a
+     message comes from. *"Si es complicado, como lo propusiste vos por ahora sirve."*
+2. **`event.timer_key`.** The engine exposes a fired timer's key directly, and `event.payload`
+   stays as it is. The examples, the docs and Archi's seeds use it.
+   - The operator: *"esto es causa de evolución de ideas, estandarizar la herramienta es lo
+     correcto"*.
+   - A test fires SY.timer's real `TIMER_FIRED` shape against a guard.
+3. **Each instance finishes on the definition it was born with.**
+   - Each instance records its definition's hash, and the engine keeps every definition a running
+     instance still uses.
+   - Recovery binds by hash. A new instance takes the current definition.
+4. **At least once.**
+   - The engine saves an inbound event before it processes it, and drops it once the transition
+     has committed.
+   - Recovery processes again whatever is left. Creation is covered too.
+   - A repeated send keeps its `trace_id`.
+5. **A `$ref` to a missing field still fails the instance.** A new optional form gives a default:
+   `{"$ref": "event.context", "default": {}}`. The spec is corrected: it said the field was left
+   out.
+6. **Who may talk to the WF's controls** (FINDINGS A-119; the operator: a security topic that
+   stays open):
+   - the instance verbs answer only SY.admin@motherbee and SY.wf-rules of the WF's hive;
+   - a `TIMER_FIRED` is taken only from SY.timer of the WF's hive;
+   - an error answer, a `*_RESPONSE` or a router notice is never answered, so two WFs cannot
+     bounce an `INVALID_INPUT`. This is the rule SY.timer and the AI nodes follow.
+7. **`target_ref` goes.**
+   - A WF that chooses among destinations does it with guards and names written in the definition,
+     one transition per destination. `wf.router` is rewritten that way.
+   - `thread_id_ref` stays: it is not routing.
+   - The operator: *"mejor ir de lo simple a lo complejo… si quieren routing nuevo cambien el
+     CEL"*.
+
+**Fixed with them, no decision needed:**
+- **The CEL map panic:** CEL values are converted to plain JSON before they are stored, and a
+  panic in a transition fails that instance, never the node.
+- **A cap on internal events per transition.** Past it, the instance fails with that cause.
+- **A fired timer's index row** goes when the fire arrives, so a restart cannot fire it again.
+- **Numbers keep one type,** live and after a restart.
+- **Recovery is no longer fatal when SY.timer does not answer.** The WF starts degraded and
+  reconciles when SY.timer answers.
+- **The examples, the seeds and the docs:**
+  - the examples use the new key and `user`;
+  - `wf.router`'s error branches match `<msg>.error`;
+  - `wf.invoice` no longer relies on a schema default, which the engine does not apply;
+  - SY.admin's help example is a valid definition;
+  - the spec and the quickstart match the code (§6).
 
 ## 6. Docs that drift from the code
 
