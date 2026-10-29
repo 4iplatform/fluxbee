@@ -928,7 +928,58 @@ impl BlobToolkit {
             metrics_record_error();
             return Err(err);
         }
+        let blob_ref = blob_ref.clone();
+        self.read_while_missing(cfg, move |toolkit| toolkit.read_blob_checked(&blob_ref))
+            .await
+    }
+
+    /// Reads a blob by its name alone, for a reader that has no BlobRef: an AI agent that has the
+    /// name an attachment showed it (agent-tools-v1 §6.2.1). It is checked as `read_blob` checks
+    /// one, but for the size a BlobRef would give: every directory under blob/ and the file are
+    /// opened without following a link, the file must be a regular file of at most `max_bytes`
+    /// (refused unread, `TooLarge`), and its SHA-256 must start with the hash in its name.
+    pub fn read_blob_by_name(&self, blob_name: &str, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        let result = validate_blob_name(blob_name).and_then(|()| {
+            metrics_record_resolve();
+            self.read_named_blob_checked(blob_name, max_bytes)
+        });
+        if result.is_err() {
+            metrics_record_error();
+        }
+        result
+    }
+
+    /// `read_blob_by_name`, waiting with backoff for a blob that has not arrived yet, as
+    /// `read_blob_with_retry` does: one still on its way from another hive.
+    pub async fn read_blob_by_name_with_retry(
+        &self,
+        blob_name: &str,
+        max_bytes: u64,
+        cfg: ResolveRetryConfig,
+    ) -> Result<Vec<u8>, BlobError> {
+        if let Err(err) = validate_blob_name(blob_name) {
+            metrics_record_error();
+            return Err(err);
+        }
+        let blob_name = blob_name.to_string();
+        self.read_while_missing(cfg, move |toolkit| {
+            toolkit.read_named_blob_checked(&blob_name, max_bytes)
+        })
+        .await
+    }
+
+    /// Runs `read` on the blocking pool until it finds its blob or `cfg.max_wait_ms` passes,
+    /// with backoff between attempts. Only a missing blob is tried again.
+    async fn read_while_missing<F>(
+        &self,
+        cfg: ResolveRetryConfig,
+        read: F,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        F: Fn(&BlobToolkit) -> Result<Vec<u8>, BlobError> + Send + Sync + 'static,
+    {
         metrics_record_resolve();
+        let read = std::sync::Arc::new(read);
         let started = Instant::now();
         let max_wait = Duration::from_millis(cfg.max_wait_ms);
         let mut delay_ms = cfg.initial_delay_ms.max(1);
@@ -936,12 +987,11 @@ impl BlobToolkit {
         let mut retry_attempts: u64 = 0;
         loop {
             let toolkit = self.clone();
-            let attempt_ref = blob_ref.clone();
-            let attempt =
-                tokio::task::spawn_blocking(move || toolkit.read_blob_checked(&attempt_ref))
-                    .await
-                    .map_err(|err| BlobError::Io(format!("blob read task failed: {err}")))
-                    .and_then(|result| result);
+            let attempt_read = read.clone();
+            let attempt = tokio::task::spawn_blocking(move || attempt_read(&toolkit))
+                .await
+                .map_err(|err| BlobError::Io(format!("blob read task failed: {err}")))
+                .and_then(|result| result);
             match attempt {
                 Err(BlobError::NotFound(_)) if started.elapsed() < max_wait => {}
                 result => {
@@ -967,28 +1017,7 @@ impl BlobToolkit {
     pub fn open_blob(&self, blob_ref: &BlobRef) -> Result<std::fs::File, BlobError> {
         Self::validate_blob_ref(blob_ref)?;
         let name = blob_ref.blob_name.as_str();
-        let not_found_or = |ctx: &'static str| {
-            move |err: std::io::Error| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    BlobError::NotFound(name.to_string())
-                } else {
-                    map_io_error(err, ctx)
-                }
-            }
-        };
-        let root = safe_fs::open_dir_no_follow(None, &self.cfg.blob_root)
-            .map_err(not_found_or("open blob root"))?;
-        let active = safe_fs::open_dir_no_follow(Some(&root), Path::new("active"))
-            .map_err(not_found_or("open active directory"))?;
-        let dir = safe_fs::open_dir_no_follow(Some(&active), Path::new(Self::prefix(name)))
-            .map_err(not_found_or("open active prefix directory"))?;
-        let fd = safe_fs::open_file_no_follow(&dir, name).map_err(not_found_or("open blob"))?;
-        if !safe_fs::is_regular_file(&fd).map_err(|err| map_io_error(err, "read blob type"))? {
-            return Err(BlobError::Integrity(format!(
-                "'{name}' is not a regular file"
-            )));
-        }
-        let file = std::fs::File::from(fd);
+        let file = self.open_active_file(name)?;
         let size = file
             .metadata()
             .map_err(|err| map_io_error(err, "read blob size"))?
@@ -1026,6 +1055,70 @@ impl BlobToolkit {
             )));
         }
         Ok(data)
+    }
+
+    /// `read_blob_by_name` once the name is valid: at most `max_bytes`, and the configured
+    /// `max_blob_bytes` when that is lower.
+    fn read_named_blob_checked(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        let max = self
+            .cfg
+            .max_blob_bytes
+            .map_or(max_bytes, |configured| configured.min(max_bytes));
+        let file = self.open_active_file(name)?;
+        let size = file
+            .metadata()
+            .map_err(|err| map_io_error(err, "read blob size"))?
+            .len();
+        if size > max {
+            return Err(BlobError::TooLarge { size, max });
+        }
+        let mut data = Vec::with_capacity(size as usize);
+        // Never more than `max` plus one byte, whatever the file grows to meanwhile.
+        file.take(max.saturating_add(1))
+            .read_to_end(&mut data)
+            .map_err(|err| map_io_error(err, "read blob"))?;
+        if data.len() as u64 > max {
+            return Err(BlobError::TooLarge {
+                size: data.len() as u64,
+                max,
+            });
+        }
+        let expected = parse_blob_name(name)
+            .map(|parts| parts.hash)
+            .ok_or_else(|| BlobError::InvalidName(name.to_string()))?;
+        if !sha256_hex(&data)[..BLOB_HASH_LEN].eq_ignore_ascii_case(expected) {
+            return Err(BlobError::Integrity(format!(
+                "the bytes of '{name}' do not match the hash in its name"
+            )));
+        }
+        Ok(data)
+    }
+
+    /// Opens `active/<prefix>/<name>` without following a link anywhere under blob/ (FINDINGS
+    /// A-56): a regular file, or `Integrity`. Anything missing on the way is `NotFound`.
+    fn open_active_file(&self, name: &str) -> Result<std::fs::File, BlobError> {
+        let not_found_or = |ctx: &'static str| {
+            move |err: std::io::Error| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    BlobError::NotFound(name.to_string())
+                } else {
+                    map_io_error(err, ctx)
+                }
+            }
+        };
+        let root = safe_fs::open_dir_no_follow(None, &self.cfg.blob_root)
+            .map_err(not_found_or("open blob root"))?;
+        let active = safe_fs::open_dir_no_follow(Some(&root), Path::new("active"))
+            .map_err(not_found_or("open active directory"))?;
+        let dir = safe_fs::open_dir_no_follow(Some(&active), Path::new(Self::prefix(name)))
+            .map_err(not_found_or("open active prefix directory"))?;
+        let fd = safe_fs::open_file_no_follow(&dir, name).map_err(not_found_or("open blob"))?;
+        if !safe_fs::is_regular_file(&fd).map_err(|err| map_io_error(err, "read blob type"))? {
+            return Err(BlobError::Integrity(format!(
+                "'{name}' is not a regular file"
+            )));
+        }
+        Ok(std::fs::File::from(fd))
     }
 
     fn enforce_size_limit(&self, size: u64) -> Result<(), BlobError> {
@@ -1964,6 +2057,99 @@ mod tests {
         assert!(matches!(
             toolkit.read_blob(&blob_ref),
             Err(BlobError::Integrity(_))
+        ));
+    }
+
+    /// agent-tools-v1 §6.2.1: a blob read by its name alone is checked as one read by its BlobRef,
+    /// with a size cap where the BlobRef gave a size: a link is never followed, a FIFO never
+    /// blocks, the bytes must match the hash in the name, and a file over the cap is refused
+    /// unread.
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_read_by_its_name_is_checked_as_one_read_by_its_ref() {
+        let (toolkit, root) = test_toolkit();
+        let blob_ref = toolkit
+            .put_bytes(b"named bytes", "named.txt", "text/plain")
+            .expect("put_bytes");
+        let name = blob_ref.blob_name.clone();
+        assert!(matches!(
+            toolkit.read_blob_by_name(&name, 1024),
+            Err(BlobError::NotFound(_))
+        ));
+        toolkit.promote(&blob_ref).expect("promote");
+        assert_eq!(
+            toolkit.read_blob_by_name(&name, 1024).expect("read"),
+            b"named bytes"
+        );
+        assert!(matches!(
+            toolkit.read_blob_by_name(&name, 4),
+            Err(BlobError::TooLarge { size: 11, max: 4 })
+        ));
+        for invalid in ["named.txt", "../named_0123456789abcdef.txt", ""] {
+            assert!(
+                matches!(
+                    toolkit.read_blob_by_name(invalid, 1024),
+                    Err(BlobError::InvalidName(_))
+                ),
+                "{invalid}"
+            );
+        }
+
+        let path = toolkit.resolve(&blob_ref);
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::write(&path, b"other bytes").expect("swap");
+        assert!(matches!(
+            toolkit.read_blob_by_name(&name, 1024),
+            Err(BlobError::Integrity(_))
+        ));
+        std::fs::remove_file(&path).expect("remove");
+        let secret = root.path.join("secret");
+        std::fs::write(&secret, b"root only!").expect("secret");
+        std::os::unix::fs::symlink(&secret, &path).expect("plant link");
+        assert!(
+            toolkit.read_blob_by_name(&name, 1024).is_err(),
+            "a link is never read"
+        );
+        std::fs::remove_file(&path).expect("remove");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("mkfifo");
+        assert!(matches!(
+            toolkit.read_blob_by_name(&name, 1024),
+            Err(BlobError::Integrity(_))
+        ));
+    }
+
+    /// A blob read by its name that is still on its way is waited for, up to the wait given.
+    #[tokio::test]
+    async fn a_blob_read_by_its_name_waits_for_one_on_its_way() {
+        let (toolkit, _root) = test_toolkit();
+        let (scratch, _scratch_root) = test_toolkit();
+        let blob_ref = scratch
+            .put_bytes(b"late bytes", "late.txt", "text/plain")
+            .expect("name the late blob");
+        let target = toolkit.resolve(&blob_ref);
+        std::fs::create_dir_all(target.parent().expect("prefix")).expect("prefix dir");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&target, b"late bytes").expect("arrive");
+        });
+        let wait = |max_wait_ms| ResolveRetryConfig {
+            max_wait_ms,
+            initial_delay_ms: 10,
+            backoff_factor: 1.4,
+        };
+        assert_eq!(
+            toolkit
+                .read_blob_by_name_with_retry(&blob_ref.blob_name, 1024, wait(2_000))
+                .await
+                .expect("the late blob"),
+            b"late bytes"
+        );
+        assert!(matches!(
+            toolkit
+                .read_blob_by_name_with_retry("missing_0123456789abcdef.txt", 1024, wait(30))
+                .await,
+            Err(BlobError::NotFound(_))
         ));
     }
 

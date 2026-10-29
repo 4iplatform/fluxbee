@@ -163,12 +163,15 @@ one SY.identity answers, the identity map (an older map's other forms are read c
   reports it (`runtime.resolved_version`; FINDINGS A-101). A launch whose version cannot be
   written does not happen: start and restart answer `CONFIG_WRITE_FAILED`, and the reconcile logs
   "could not record the runtime version in the node's config; not launching it".
-- **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false`. `start_node` and
-  `restart_node` set it `true` before they launch the node, in the same write as the version, so
-  it cannot race a conversion the node makes of its config at boot (FINDINGS A-102); a start of a
-  node that already runs sets it alone (`set_node_relaunch_on_boot`). A crash does not change it,
-  nor a launch that fails: after `START_FAILED` or `RESTART_FAILED` the reconcile tries the node
-  again every pass until `kill_node`, as the answer's `hint` says.
+- **`relaunch_on_boot`** is `true` at spawn. `kill_node` sets it `false` once the unit is
+  stopped (`clear_relaunch_on_boot`); with `purge_instance`, and in `remove_node_instance`, that is
+  before the purge's first step, so a purge that stops partway leaves the node stopped (FINDINGS
+  A-121). A node with no config has nothing to clear. `start_node` and `restart_node` set it
+  `true` before they launch the node, in the same write as the version, so it cannot race a
+  conversion the node makes of its config at boot (FINDINGS A-102); a start of a node that already
+  runs sets it alone (`set_node_relaunch_on_boot`). A crash does not change it, nor a launch that
+  fails: after `START_FAILED` or `RESTART_FAILED` the reconcile tries the node again every pass
+  until `kill_node`, as the answer's `hint` says.
 - **`launched_by`** is the request's `launched_by` (up to 128 characters of `[A-Za-z0-9._-@]`),
   else `system` (`launched_by_from_payload`). SY.admin always stamps it: `cloud`, `archi`,
   `operator`, or the caller's name. For Cloud's node actions SY.admin also sends
@@ -256,10 +259,11 @@ The move:
     `flow/definition.json`);
   - the binary the start script runs (`start_script_entry`). Every publish script
     (`scripts/publish-runtime.sh` and the `publish-*-runtime.sh` built on it) writes the line
-    `exec "$SCRIPT_DIR/<binary>" "$@"`, and a start script in a version without a `package.json`
-    must have it: one that does not is not ready, and the reason says the binary is not known. A
-    package's own start script (its version has the `package.json` every package carries) is the
-    package's business.
+    `exec "$SCRIPT_DIR/<binary>" "$@"`, and `start_script_entry` reads the first such line;
+    `publish-runtime.sh` refuses a `--start-script` whose first such line does not run the binary
+    it publishes. A start script in a version without a `package.json` must have it: one that does
+    not is not ready, and the reason says the binary is not known. A package's own start script
+    (its version has the `package.json` every package carries) is the package's business.
 
   A spoke gets the manifest and the files through Syncthing, in any order. Until then the node
   stays as it is, and the orchestrator logs once per target "running node is not on what its

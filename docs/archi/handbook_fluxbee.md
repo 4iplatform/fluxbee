@@ -254,8 +254,9 @@ The ownership and call path are fixed:
    `RouterDispatcher::send_admin_rpc(AdminCommandRequest { action: "publish_artifact", target: None, ... })`.
 3. The router-stamped producer identity is authoritative. Admin resolves its tenant, authorizes and
    records the publication, `IO.blob` curates the bytes, and `SY.edge` serves `/public/<key>`.
-4. The producer retains the returned `publication_id` and calls `unpublish_artifact` with that id
-   when the link must be revoked.
+4. To revoke the link before it expires, an `AI.*` producer calls `unpublish_artifact` on its own
+   publication, with the returned `publication_id` or the key of the link (`/public/<key>`). Over
+   the mesh only `AI.*` may: an `IO.*` or `WF.*` publication ends at its expiry or by the operator.
 
 Rules for Archi:
 

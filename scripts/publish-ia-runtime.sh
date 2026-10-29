@@ -15,6 +15,9 @@ Required:
 
 Options:
   --binary <path>          Binary path (default: target/release/ai_node_runner)
+  --catalog <path>         ai.generic's tool catalog, published as the version's tools.json
+                           (default: docs/reference/agent-tools.json of this checkout;
+                           ai.generic only)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --set-current            Set current version in manifest
   --sudo                   Use sudo for writes
@@ -23,12 +26,16 @@ Options:
 
 Notes:
   - Source home for the generic AI runner: nodes/ai/ai-generic
+  - Every file of the version is in place before the manifest names it: the binary, the AI
+    start.sh and, for ai.generic, tools.json (the catalog with this version in it). A missing
+    or unreadable input fails before anything is written (publish-runtime.sh).
 EOF
 }
 
 RUNTIME=""
 VERSION=""
 BINARY="$ROOT_DIR/target/release/ai_node_runner"
+CATALOG=""
 DIST_ROOT=""
 SET_CURRENT=0
 USE_SUDO=0
@@ -46,6 +53,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --binary)
       BINARY="${2:-}"
+      shift 2
+      ;;
+    --catalog)
+      CATALOG="${2:-}"
       shift 2
       ;;
     --dist-root)
@@ -82,6 +93,18 @@ if [[ -z "$RUNTIME" || -z "$VERSION" ]]; then
   exit 1
 fi
 
+# ai.generic's tool catalog goes next to the runtime, as the .deb ships it (packaging/build-deb.sh).
+if [[ "$RUNTIME" == "ai.generic" ]]; then
+  CATALOG="${CATALOG:-$ROOT_DIR/docs/reference/agent-tools.json}"
+  if [[ ! -f "$CATALOG" ]]; then
+    echo "Error: tool catalog does not exist: $CATALOG" >&2
+    exit 1
+  fi
+elif [[ -n "$CATALOG" ]]; then
+  echo "Error: --catalog is ai.generic's tool catalog; $RUNTIME ships none" >&2
+  exit 1
+fi
+
 if [[ "$SKIP_BUILD" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
@@ -90,27 +113,13 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
   (cd "$ROOT_DIR" && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner)
 fi
 
-cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
-if [[ -n "$DIST_ROOT" ]]; then
-  cmd+=(--dist-root "$DIST_ROOT")
-fi
-if [[ "$SET_CURRENT" == "1" ]]; then
-  cmd+=(--set-current)
-fi
-if [[ "$USE_SUDO" == "1" ]]; then
-  cmd+=(--sudo)
-fi
-
-"${cmd[@]}"
-
-DIST_ROOT_EFFECTIVE="${DIST_ROOT:-/var/lib/fluxbee/dist}"
-RUNTIME_DIR="$DIST_ROOT_EFFECTIVE/runtimes/$RUNTIME/$VERSION"
-BIN_DIR="$RUNTIME_DIR/bin"
-START_SH="$BIN_DIR/start.sh"
+# The version's own files are written here first and handed to publish-runtime.sh, which installs
+# them before it writes the manifest.
+STAGE_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGE_DIR"' EXIT
 BINARY_NAME="$(basename "$BINARY")"
 
-tmp_start="$(mktemp)"
-cat >"$tmp_start" <<EOF
+cat >"$STAGE_DIR/start.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -n "\${FLUXBEE_NODE_NAME:-}" && -z "\${AI_NODE_NAME:-}" ]]; then
@@ -143,29 +152,34 @@ SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
 EOF
 
-if [[ "$USE_SUDO" == "1" ]]; then
-  sudo install -m 0755 "$tmp_start" "$START_SH"
-else
-  install -m 0755 "$tmp_start" "$START_SH"
-fi
-rm -f "$tmp_start"
-
-echo "Configured AI start.sh runtime profile: $RUNTIME"
-
-# ai.generic's tool catalog goes next to the runtime, as the .deb ships it (packaging/build-deb.sh):
-# the repository's docs/reference/agent-tools.json with this version.
+cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY"
+  --start-script "$STAGE_DIR/start.sh")
 if [[ "$RUNTIME" == "ai.generic" ]]; then
-  tmp_tools="$(mktemp)"
-  python3 -c 'import json, sys
+  # The catalog with this version in it, as the .deb ships it. A catalog that does not parse
+  # stops here, before anything is written.
+  if ! python3 -c 'import json, sys
 catalog = json.load(open(sys.argv[1], encoding="utf-8"))
 catalog["runtime_version"] = sys.argv[2]
 open(sys.argv[3], "w", encoding="utf-8").write(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n")' \
-    "$ROOT_DIR/docs/reference/agent-tools.json" "$VERSION" "$tmp_tools"
-  if [[ "$USE_SUDO" == "1" ]]; then
-    sudo install -m 0644 "$tmp_tools" "$RUNTIME_DIR/tools.json"
-  else
-    install -m 0644 "$tmp_tools" "$RUNTIME_DIR/tools.json"
+    "$CATALOG" "$VERSION" "$STAGE_DIR/tools.json"; then
+    echo "Error: tool catalog is not readable JSON: $CATALOG" >&2
+    exit 1
   fi
-  rm -f "$tmp_tools"
-  echo "Published the tool catalog: $RUNTIME_DIR/tools.json"
+  cmd+=(--file "$STAGE_DIR/tools.json")
+fi
+if [[ -n "$DIST_ROOT" ]]; then
+  cmd+=(--dist-root "$DIST_ROOT")
+fi
+if [[ "$SET_CURRENT" == "1" ]]; then
+  cmd+=(--set-current)
+fi
+if [[ "$USE_SUDO" == "1" ]]; then
+  cmd+=(--sudo)
+fi
+
+"${cmd[@]}"
+
+echo "Configured AI start.sh runtime profile: $RUNTIME"
+if [[ "$RUNTIME" == "ai.generic" ]]; then
+  echo "Published the tool catalog from $CATALOG"
 fi

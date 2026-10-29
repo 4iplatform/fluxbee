@@ -17143,6 +17143,15 @@ fn set_node_relaunch_on_boot(state: &OrchestratorState, node_name: &str, relaunc
     }
 }
 
+/// A stop that lasts, for a node of this hive: clears `relaunch_on_boot`, so the relaunches leave
+/// the node down until it is started again. Returns the flag as it stands after, which the stop
+/// reports: `true` only when the node's config is there and could not be written (logged). A node
+/// with no config has nothing the relaunches read, and nothing to clear.
+fn clear_relaunch_on_boot(state: &OrchestratorState, node_name: &str) -> bool {
+    node_effective_config_path(state, node_name).is_ok_and(|path| path.is_file())
+        && !set_node_relaunch_on_boot(state, node_name, false)
+}
+
 fn build_node_system_block(
     node_name: &str,
     hive_id: &str,
@@ -21975,7 +21984,7 @@ async fn kill_node_flow(
                         "purge_instance": purge_instance,
                     });
                 }
-                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
+                let relaunch_on_boot = clear_relaunch_on_boot(state, node_name_ref);
                 return serde_json::json!({
                     "status": "ok",
                     "state": "stopped",
@@ -21985,7 +21994,7 @@ async fn kill_node_flow(
                     "unit": unit,
                     "purge_instance": purge_instance,
                     "unit_was_active": false,
-                    "relaunch_on_boot": !recorded,
+                    "relaunch_on_boot": relaunch_on_boot,
                 });
             }
             if !should_purge_inactive_kill_target(purge_instance, validated_node_name.as_deref()) {
@@ -22019,6 +22028,11 @@ async fn kill_node_flow(
 
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => {
+            // A stop lasts: the relaunches leave the node down until it is started again. A purge
+            // records it too, before its first step, so one that stops partway (SY.timer down)
+            // leaves the node stopped with its files, not relaunched by the next reconcile
+            // (FINDINGS A-121).
+            let relaunch_on_boot = clear_relaunch_on_boot(state, node_name_ref);
             let mut response = serde_json::json!({
                 "status": "ok",
                 "hive": target_hive.clone(),
@@ -22032,10 +22046,8 @@ async fn kill_node_flow(
                 "pre_stop_state": if unit_was_active { "active" } else { "inactive_or_not_found" },
             });
             if !purge_instance {
-                // A stop lasts: the relaunches leave the node down until it is started again.
-                let recorded = set_node_relaunch_on_boot(state, node_name_ref, false);
                 response["state"] = serde_json::json!("stopped");
-                response["relaunch_on_boot"] = serde_json::json!(!recorded);
+                response["relaunch_on_boot"] = serde_json::json!(relaunch_on_boot);
             }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
@@ -22056,6 +22068,7 @@ async fn kill_node_flow(
                             "force": force,
                             "purge_instance": purge_instance,
                             "timer_purge": timer_purge,
+                            "relaunch_on_boot": relaunch_on_boot,
                         });
                     }
                     match remove_node_instance_dir_with_root(node_name, &node_files_root()) {
@@ -22141,6 +22154,7 @@ async fn kill_node_flow(
                                     "signal": signal,
                                     "force": force,
                                     "purge_instance": purge_instance,
+                                    "relaunch_on_boot": relaunch_on_boot,
                                 });
                             }
                         }
@@ -22355,6 +22369,10 @@ async fn remove_node_instance_flow(
             "unit": unit,
         });
     }
+    // A node down without a stop (a crash) still has its flag, and the next reconcile would launch
+    // it again. Cleared before the removal's first step, so a removal that stops partway (SY.timer
+    // down) leaves the node down with its files (FINDINGS A-121).
+    let relaunch_on_boot = clear_relaunch_on_boot(state, &node_name);
 
     let (persisted_ilk_id, _persisted_tenant_id) = load_persisted_node_identity(state, &node_name);
     let timer_purge = purge_owner_timers_before_teardown(state, &target_hive, &node_name).await;
@@ -22367,6 +22385,7 @@ async fn remove_node_instance_flow(
             "node_name": node_name,
             "unit": unit,
             "timer_purge": timer_purge,
+            "relaunch_on_boot": relaunch_on_boot,
         });
     }
     match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
@@ -22429,6 +22448,7 @@ async fn remove_node_instance_flow(
                     "node_name": node_name,
                     "unit": unit,
                     "timer_purge": timer_purge,
+                    "relaunch_on_boot": relaunch_on_boot,
                 })
             }
         }
@@ -36350,7 +36370,7 @@ blob:
         // restart included) and running: each stops the unit, then clears the flag.
         let kill = body("async fn kill_node_flow(");
         let clears: Vec<&str> = kill
-            .split("set_node_relaunch_on_boot(state, node_name_ref, false)")
+            .split("clear_relaunch_on_boot(state, node_name_ref)")
             .collect();
         assert_eq!(clears.len(), 3, "two ways a stop clears the flag");
         for before in &clears[..2] {
@@ -36359,6 +36379,32 @@ blob:
                 "a stop before the flag is cleared"
             );
         }
+        // A purge clears it too, as soon as the unit is stopped and before its timer purge, and so
+        // does a removal: one that stops partway (SY.timer down) leaves the node stopped, where
+        // the reconcile used to launch it again within 60 s (FINDINGS A-121).
+        let stopped = &kill[kill.find("Ok(()) => {").expect("the stop's arm")..];
+        let cleared = stopped
+            .find("clear_relaunch_on_boot(state, node_name_ref)")
+            .expect("the flag cleared after the stop");
+        assert!(
+            !stopped[..cleared].contains("purge_instance"),
+            "the flag is cleared for a stop and a purge alike"
+        );
+        assert!(
+            cleared
+                < stopped
+                    .find("purge_owner_timers_before_teardown(")
+                    .expect("the timer purge"),
+            "a purge clears the flag before its timer purge"
+        );
+        in_order(
+            "async fn remove_node_instance_flow(",
+            &[
+                "execute_on_hive(",
+                "clear_relaunch_on_boot(state, &node_name)",
+                "purge_owner_timers_before_teardown(",
+            ],
+        );
         // A node on another hive is checked here before the request goes there: a hive whose core
         // predates the check would act without it.
         // (A purge's KILL_NODE forwards with the teardown's longer window: the prefix matches both.)
@@ -37061,15 +37107,20 @@ blob:
     }
 
     /// Runs one of the repository's publish scripts with `args`.
-    fn run_publish_script(script: &str, args: &[&str]) {
+    fn publish_script(script: &str, args: &[&str]) -> std::process::Output {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("scripts")
             .join(script);
-        let output = Command::new("bash")
+        Command::new("bash")
             .arg(&path)
             .args(args)
             .output()
-            .expect("bash runs");
+            .expect("bash runs")
+    }
+
+    /// Runs one of the repository's publish scripts with `args`, which must succeed.
+    fn run_publish_script(script: &str, args: &[&str]) {
+        let output = publish_script(script, args);
         assert!(
             output.status.success(),
             "{script}: {}\n{}",
@@ -37131,6 +37182,159 @@ blob:
                 "{script}"
             );
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// FINDINGS A-110: ai.generic's version carries the catalog it is published with, its version
+    /// in it, by the time the manifest names it; a catalog that is not there or does not parse
+    /// fails the publish before anything is written.
+    #[test]
+    fn the_ai_publish_ships_its_catalog_or_writes_nothing() {
+        let root = std::env::temp_dir().join(format!("fluxbee-publish-ai-{}", Uuid::new_v4()));
+        let binary = root.join("build").join("ai_node_runner");
+        fs::create_dir_all(binary.parent().expect("build dir")).expect("build dir");
+        fs::write(&binary, "binary").expect("dummy binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let catalog = root.join("agent-tools.json");
+        fs::write(&catalog, r#"{"tools": [], "runtime_version": "0.0.0"}"#).expect("catalog");
+        let broken = root.join("broken.json");
+        fs::write(&broken, "{").expect("broken catalog");
+        let dist = root.join("dist");
+        let (binary_arg, dist_arg) = (binary.display().to_string(), dist.display().to_string());
+        let publish = |catalog: &Path| {
+            publish_script(
+                "publish-ia-runtime.sh",
+                &[
+                    "--runtime",
+                    "ai.generic",
+                    "--version",
+                    "1.0.0",
+                    "--binary",
+                    &binary_arg,
+                    "--dist-root",
+                    &dist_arg,
+                    "--catalog",
+                    &catalog.display().to_string(),
+                    "--set-current",
+                    "--skip-build",
+                ],
+            )
+        };
+
+        for refused in [root.join("missing.json"), broken] {
+            assert!(!publish(&refused).status.success(), "{}", refused.display());
+            assert!(!dist.exists(), "{}: nothing is written", refused.display());
+        }
+
+        let output = publish(&catalog);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let version = dist.join("runtimes").join("ai.generic").join("1.0.0");
+        let read_json = |path: PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&path).expect("file")).expect("JSON")
+        };
+        assert_eq!(
+            read_json(version.join("tools.json")),
+            serde_json::json!({ "tools": [], "runtime_version": "1.0.0" })
+        );
+        assert_eq!(
+            read_json(dist.join("runtimes").join("manifest.json"))["runtimes"]["ai.generic"]
+                ["current"],
+            "1.0.0"
+        );
+        assert_eq!(
+            start_script_entry(&version.join("bin").join("start.sh")),
+            Ok(StartScriptEntry::Binary(
+                version.join("bin").join("ai_node_runner")
+            ))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A `--start-script` is taken only when the line `start_script_entry` reads, the first one of
+    /// the form `exec "$SCRIPT_DIR/<binary>" "$@"`, runs the binary published. One that runs
+    /// another binary first, or none, writes nothing.
+    #[test]
+    fn a_start_script_must_run_the_published_binary_first() {
+        let root = std::env::temp_dir().join(format!("fluxbee-publish-start-{}", Uuid::new_v4()));
+        let binary = root.join("build").join("dummy-node");
+        fs::create_dir_all(binary.parent().expect("build dir")).expect("build dir");
+        fs::write(&binary, "binary").expect("dummy binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod");
+        // In a `bin/` of their own, where `start_script_entry` reads them as a publish script's.
+        let scripts = root.join("scripts").join("bin");
+        fs::create_dir_all(&scripts).expect("scripts dir");
+        let script = |name: &str, exec_lines: &str| {
+            let path = scripts.join(name);
+            fs::write(
+                &path,
+                format!("#!/usr/bin/env bash\nset -euo pipefail\n{exec_lines}"),
+            )
+            .expect("script");
+            path
+        };
+        let another_first = script(
+            "another-first.sh",
+            "  exec \"$SCRIPT_DIR/other-node\" \"$@\"\nexec \"$SCRIPT_DIR/dummy-node\" \"$@\"\n",
+        );
+        let none = script("none.sh", "exec dummy-node \"$@\"\n");
+        let ours_first = script(
+            "ours-first.sh",
+            "\t exec \"$SCRIPT_DIR/dummy-node\" \"$@\"  \nexec \"$SCRIPT_DIR/other-node\" \"$@\"\n",
+        );
+        assert_eq!(
+            start_script_entry(&another_first),
+            Ok(StartScriptEntry::Binary(scripts.join("other-node")))
+        );
+        assert!(start_script_entry(&none).is_err());
+        assert_eq!(
+            start_script_entry(&ours_first),
+            Ok(StartScriptEntry::Binary(scripts.join("dummy-node")))
+        );
+
+        let dist = root.join("dist");
+        let (binary_arg, dist_arg) = (binary.display().to_string(), dist.display().to_string());
+        let publish = |start_script: &Path| {
+            publish_script(
+                "publish-runtime.sh",
+                &[
+                    "--runtime",
+                    "test.start",
+                    "--version",
+                    "1.0.0",
+                    "--binary",
+                    &binary_arg,
+                    "--dist-root",
+                    &dist_arg,
+                    "--start-script",
+                    &start_script.display().to_string(),
+                ],
+            )
+        };
+        for refused in [&another_first, &none] {
+            assert!(!publish(refused).status.success(), "{}", refused.display());
+            assert!(!dist.exists(), "{}: nothing is written", refused.display());
+        }
+        let output = publish(&ours_first);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bin = dist
+            .join("runtimes")
+            .join("test.start")
+            .join("1.0.0")
+            .join("bin");
+        assert_eq!(
+            start_script_entry(&bin.join("start.sh")),
+            Ok(StartScriptEntry::Binary(bin.join("dummy-node")))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

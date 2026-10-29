@@ -132,12 +132,13 @@ pub async fn build_model_user_content_parts_with_options(
         validate_model_attachment(attachment)?;
 
         if let Some(text) = &attachment.text_content {
+            let blob_name = &attachment.blob_ref.blob_name;
             parts.push(ModelContentPart::Text {
                 text: format!(
-                    "Attachment ({}, {}):\n{}",
+                    "Attachment ({}, {}, blob {blob_name}):\n{}",
                     attachment.blob_ref.filename_original,
                     attachment.blob_ref.mime,
-                    truncate_chars(text, options.max_text_chars)
+                    attachment_text(text, options.max_text_chars, blob_name)
                 ),
             });
             continue;
@@ -348,15 +349,19 @@ pub async fn resolve_model_input_from_payload_with_options(
 
         let slot = idx + 1;
         let mut block = format!(
-            "[attachment #{slot}: {} | {} | {}]",
-            attachment.filename_original, attachment.mime, attachment.size
+            "[attachment #{slot}: {} | {} | {} | blob {}]",
+            attachment.filename_original, attachment.mime, attachment.size, attachment.blob_name
         );
         if let Some(text) = resolved_attachments
             .last()
             .and_then(|resolved| resolved.text_content.as_ref())
         {
             block.push('\n');
-            block.push_str(&truncate_chars(text, options.max_attachment_text_chars));
+            block.push_str(&attachment_text(
+                text,
+                options.max_attachment_text_chars,
+                &attachment.blob_name,
+            ));
         }
         block.push_str("\n[attachment_end]");
         attachment_blocks.push(block);
@@ -434,8 +439,14 @@ async fn read_blob_bytes(
     })
 }
 
+/// The attachments that reach the model as text: plain text, Markdown, JSON, CSV and HTML. Any
+/// other goes as an image or a document part, and Anthropic takes only PDF documents: a CSV or an
+/// HTML file sent as a document failed the whole message there (FINDINGS A-111).
 fn is_textual_mime(mime: &str) -> bool {
-    matches!(mime, "text/plain" | "text/markdown" | "application/json")
+    matches!(
+        mime,
+        "text/plain" | "text/markdown" | "application/json" | "text/csv" | "text/html"
+    )
 }
 
 /// Image MIMEs both providers' vision APIs accept (audit B3): the OpenAI-only png/jpeg/webp set
@@ -475,8 +486,20 @@ fn validate_model_attachment(
     Ok(())
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
+/// An attachment's text as the model reads it: whole, or cut at `max_chars` with a last line that
+/// says so, names its blob, which holds all of it, and gives the byte offset of the text where the
+/// cut is, to read on from (agent-tools-v1 §6.2.1: ai.generic's `read_blob` reads the rest, in the
+/// same bytes: the text decoded as here). The line names no tool: SY.frontdesk.gov reads its
+/// attachments here too, and has none.
+fn attachment_text(text: &str, max_chars: usize, blob_name: &str) -> String {
+    match text.char_indices().nth(max_chars) {
+        None => text.to_string(),
+        Some((cut, _)) => format!(
+            "{}\n[cut at {max_chars} characters: the whole text is the blob {blob_name}; read on \
+             from offset {cut}]",
+            &text[..cut]
+        ),
+    }
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -1121,6 +1144,118 @@ mod tests {
             ModelContentPart::Document { filename, .. } if filename == "report.docx"
         ));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// FINDINGS A-111: a CSV or an HTML attachment reaches the model as text, as txt, md and json
+    /// do, never as a document part (Anthropic takes only PDF documents, and one other document
+    /// failed the whole message). It is text with multimodal off too. Every attachment shows its
+    /// blob name.
+    #[tokio::test]
+    async fn csv_and_html_attachments_reach_the_model_as_text_with_their_blob_names() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let csv = toolkit
+            .put_bytes(b"mes,ventas\nenero,10\n", "ventas.csv", "text/csv")
+            .expect("csv");
+        let html = toolkit
+            .put_bytes(b"<p>hola</p>", "pagina.html", "text/html")
+            .expect("html");
+        for blob in [&csv, &html] {
+            toolkit.promote(blob).expect("promote");
+        }
+        let payload = json!({
+            "type": "text",
+            "content": "mira",
+            "attachments": [csv, html]
+        });
+        for multimodal in [false, true] {
+            let options = ModelInputOptions {
+                multimodal,
+                blob_root: Some(root.clone()),
+                ..ModelInputOptions::default()
+            };
+            let resolved = resolve_model_input_from_payload_with_options(&payload, &options)
+                .await
+                .expect("text attachments");
+            assert_eq!(
+                resolved.attachments[0].text_content.as_deref(),
+                Some("mes,ventas\nenero,10\n")
+            );
+            assert_eq!(
+                resolved.attachments[1].text_content.as_deref(),
+                Some("<p>hola</p>")
+            );
+            assert!(resolved.prompt_text.contains(&format!(
+                "[attachment #1: ventas.csv | text/csv | {} | blob {}]\nmes,ventas",
+                csv.size, csv.blob_name
+            )));
+            let parts = build_model_user_content_parts(&resolved)
+                .await
+                .expect("parts");
+            assert_eq!(parts.len(), 3);
+            assert!(
+                parts
+                    .iter()
+                    .all(|part| matches!(part, ModelContentPart::Text { .. })),
+                "{parts:?}"
+            );
+            assert!(matches!(
+                &parts[2],
+                ModelContentPart::Text { text }
+                    if text == &format!("Attachment (pagina.html, text/html, blob {}):\n<p>hola</p>", html.blob_name)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An attachment's text cut for the model says where it was cut, names the blob that holds all
+    /// of it and gives the byte offset to read on from, in the prompt and in the model's parts
+    /// alike. It names no tool.
+    #[tokio::test]
+    async fn an_attachment_cut_for_the_model_says_so_and_names_its_blob() {
+        let root = temp_blob_root();
+        let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
+        let notes = toolkit
+            .put_bytes("año uno dos".as_bytes(), "notas.txt", "text/plain")
+            .expect("notes");
+        toolkit.promote(&notes).expect("promote");
+        // Five characters, six bytes: "ñ" takes two.
+        let cut_line = format!(
+            "año u\n[cut at 5 characters: the whole text is the blob {}; read on from offset 6]",
+            notes.blob_name
+        );
+        assert_eq!("año uno dos".get(6..), Some("no dos"));
+        let options = ModelInputOptions {
+            max_attachment_text_chars: 5,
+            blob_root: Some(root.clone()),
+            ..ModelInputOptions::default()
+        };
+        let resolved = resolve_model_input_from_payload_with_options(
+            &json!({"type": "text", "content": "lee", "attachments": [notes]}),
+            &options,
+        )
+        .await
+        .expect("resolved");
+        assert!(
+            resolved.prompt_text.contains(&cut_line),
+            "{}",
+            resolved.prompt_text
+        );
+        let parts = build_model_user_content_parts_with_options(
+            &resolved,
+            &ModelUserContentOptions {
+                max_text_chars: 5,
+                ..ModelUserContentOptions::default()
+            },
+        )
+        .await
+        .expect("parts");
+        assert!(matches!(&parts[1], ModelContentPart::Text { text } if text.ends_with(&cut_line)));
+        // The frontdesk reads the same line, and has no read_blob: it names no tool.
+        assert!(!resolved.prompt_text.contains("read_blob"));
+        // Text within the limit goes whole, with no line.
+        assert_eq!(attachment_text("año", 3, "x_0123456789abcdef.txt"), "año");
         let _ = std::fs::remove_dir_all(root);
     }
 

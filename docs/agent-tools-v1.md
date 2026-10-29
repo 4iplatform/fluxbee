@@ -277,9 +277,14 @@ Two of the checked facts still stand:
 - **Input:**
   - `blob_name`, as an attachment shows it (`<stem>_<hash16>.<ext>`);
   - `offset` in bytes, optional.
-- **Text only:**
-  - txt, csv, json, md and html, by the name's extension;
-  - bytes that are not UTF-8 are refused.
+- **Text only, judged by its content** (changed by the review, 2026-10-27):
+  - a blob whose bytes look binary (a NUL byte) is refused;
+  - the rest is decoded as attachments are, so invalid UTF-8 shows as `�`;
+  - so a log, a YAML file or a CSV exported in Windows-1252 reads too. The operator's txt, csv,
+    json, md and html are examples, not a list.
+
+  The first build judged by the name's extension and refused bytes that were not UTF-8. A cut
+  attachment then named a blob that `read_blob` refused.
 - **What it reads:**
   - its hive's store, which the motherbee and the workers share through Syncthing (on in PROD);
   - across tenants (A-106);
@@ -287,13 +292,22 @@ Two of the checked facts still stand:
 - **Limits:**
   - files up to 10 MiB, the attachment cap;
   - each call returns at most 64 KiB of text from `offset`, cut on a character boundary;
-  - with `size_bytes`, and `next_offset` (null at the end).
-- **Errors:** `invalid_blob_name`, `not_text`, `not_found`, `too_large`.
+  - with `size_bytes`, and `next_offset` (null at the end);
+  - at most 192 KiB of `read_blob` text per message. The tool loop sends every earlier piece
+    again on each of its turns, so an unbounded read of a large file costs hundreds of thousands
+    of tokens.
+- **Errors:** `invalid_blob_name`, `not_text`, `not_found`, `too_large`,
+  `read_budget_exhausted`.
 - **The SDK reads a blob by its name:** without following links, and checking the hash in the
   name.
 - **Where the model gets names to read:**
   - an attachment now shows its blob name;
-  - an attached text cut at 100,000 characters says so and names its blob.
+  - an attached text cut at 100,000 characters says so, names its blob, and gives the byte offset
+    to read on from.
+- **The journal carries neither a live link nor a blob name.** The incoming message's preview
+  redacts both.
+  - A person pastes a page's link to have it taken down.
+  - A blob's name lets an agent read it across tenants (A-106).
 - **With it (FINDINGS A-111):** a CSV or HTML attachment becomes text, as txt, md and json are.
   - Today it reaches the model as a document.
   - Claude accepts only PDF documents, so the whole message fails.
@@ -326,9 +340,12 @@ Two of the checked facts still stand:
 #### 6.2.3 Fixed on the way
 
 - **FINDINGS A-112:** a router notice (`UNREACHABLE`, `TTL_EXCEEDED`) that reaches the AI node's
-  control plane is answered with a `CONFIG_RESPONSE` to the router. This most likely loops while a
-  reply cannot be delivered; the build confirms it with a test. The node now never answers a
-  router notice: it logs it.
+  control plane was answered with a `CONFIG_RESPONSE` to the router.
+  - A test confirmed the loop.
+  - The node now never answers a router notice or any infrastructure message: it logs it.
+  - The frontdesk shares that control plane and gets the same fix.
+- **FINDINGS A-121:** a node whose purge failed on SY.timer came back within 60 s. The purge now
+  records "do not relaunch" right after the stop.
 - **FINDINGS A-110:** the publish script writes every file of a version first and moves the
   manifest last. The catalog's source is a parameter. The IO publish scripts had the same defect
   and get the same fix.

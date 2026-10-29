@@ -26,7 +26,9 @@ UPDATE_AGENT_TOOLS_CATALOG=1 cargo test -p fluxbee-ai-nodes --bin ai_node_runner
 | [`generate_png_artifact`](#generate_png_artifact) | Make a PNG image of colored horizontal bands and send it to the user. | always |
 | [`generate_jpeg_artifact`](#generate_jpeg_artifact) | Make a JPEG image of colored horizontal bands and send it to the user. | always |
 | [`get_current_time`](#get_current_time) | Get the current date and time, in UTC and in a time zone. | always: SY.timer of the agent's hive answers it, and SY.timer runs on the motherbee and on every worker |
+| [`read_blob`](#read_blob) | Read a text file from this hive's blob store, by its blob name. | always: every hive with agents has a blob store |
 | [`publish_html_page`](#publish_html_page) | Publish an HTML page at a public link, and get the link. | the node has its identity: it was launched with its ILK |
+| [`unpublish_html_page`](#unpublish_html_page) | Take down a page you published with `publish_html_page`, before it expires. | the node has its identity: it was launched with its ILK |
 
 ## `thread_state_get`
 
@@ -1395,6 +1397,125 @@ Output:
 }
 ```
 
+## `read_blob`
+
+Read a text file from this hive's blob store, by its blob name.
+
+- **When to use:** When an attachment's text was cut, or you need an attached text file again: every attachment shows its blob name, `<name>_<hash16>.<ext>`, and a cut one also the offset to read on from. Read a long file a piece at a time.
+- **Present when:** always: every hive with agents has a blob store
+- **Limits:**
+  - A text file (csv, json, md, html, txt, logs…), judged by its content, whatever its name: a piece with a NUL byte, as binary files have, is `not_text`. Bytes that are not UTF-8 become U+FFFD, as in an attachment.
+  - Files up to 10 MiB. Each call returns up to 64 KiB of text from `offset`, in bytes of the text, cut where a character starts; read on from `next_offset`.
+  - Up to 192 KiB of text in all for one message, over all its calls.
+  - It waits up to 20 s for a blob still on its way from another hive.
+- **Returns:** `{status: "ok", blob_name, size_bytes, offset, text, next_offset}`: the text from `offset`, the whole text's size in bytes, and where the next piece starts (null at the end).
+- **Errors:**
+  - `invalid_blob_name`: `blob_name` is not a blob's name, `<name>_<hash16>.<ext>`: use the name an attachment shows, whole.
+  - `not_text`: The piece read has a NUL byte: the file is binary, not text. It cannot be read.
+  - `not_found`: No blob of this hive has that name, after waiting 20 s for one on its way, or what is there is not that blob.
+  - `too_large`: The file is over 10 MiB, the most it reads.
+  - `read_budget_exhausted`: This message has read 192 KiB of blob text, the most one message reads. Not retryable within this message: answer with what you have read; a later message can read on.
+
+Input:
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "blob_name": {
+      "description": "The blob's name, `<name>_<hash16>.<ext>`, as an attachment shows it.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "offset": {
+      "description": "Where to start, in bytes of the text: 0 by default, the `next_offset` of the piece before, or the offset a cut attachment gives.",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "blob_name"
+  ],
+  "type": "object"
+}
+```
+
+Output:
+
+```json
+{
+  "description": "`{status: \"ok\", blob_name, size_bytes, offset, text, next_offset}`: the text from `offset`, the whole text's size in bytes, and where the next piece starts (null at the end).",
+  "oneOf": [
+    {
+      "properties": {
+        "blob_name": {
+          "type": "string"
+        },
+        "next_offset": {
+          "description": "Where the next piece starts; null at the end.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Where `text` starts, in bytes: the offset asked for, moved back to the start of a character.",
+          "type": "integer"
+        },
+        "size_bytes": {
+          "description": "The whole text's size, in bytes: the file's, when it is UTF-8.",
+          "type": "integer"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "blob_name",
+        "size_bytes",
+        "offset",
+        "text",
+        "next_offset"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "error_code": {
+          "enum": [
+            "invalid_blob_name",
+            "not_text",
+            "not_found",
+            "too_large",
+            "read_budget_exhausted"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "status": {
+          "const": "error"
+        }
+      },
+      "required": [
+        "status",
+        "error_code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    }
+  ]
+}
+```
+
 ## `publish_html_page`
 
 Publish an HTML page at a public link, and get the link.
@@ -1403,7 +1524,7 @@ Publish an HTML page at a public link, and get the link.
 - **Present when:** the node has its identity: it was launched with its ILK
 - **Limits:**
   - One self-contained HTML file, served under a sandbox: its inline scripts and styles run, but it loads nothing from the network (no fetch, no outside scripts, stylesheets, fonts or images); images and fonts only inline, as `data:` URLs; forms do not submit.
-  - The link is the key: anyone who has it can open the page, so put nothing private in it. It expires 24 hours after publishing, and you cannot extend it or take the page down earlier.
+  - The link is the key: anyone who has it can open the page, so put nothing private in it. It expires 24 hours after publishing, and you cannot extend it; `unpublish_html_page` takes it down sooner.
   - Publishing takes up to two minutes. Your reply is the text you write after your last tool call; text written alongside a call is not sent. Give the link there: a reply without it gets it added, on a line of its own.
 - **Returns:** `{status: "ok", url, publication_id, expires_at}`: the public link, the publication's id and when it expires (Unix seconds).
 - **Errors:**
@@ -1472,6 +1593,96 @@ Output:
           "enum": [
             "artifact_filename_invalid",
             "publish_failed"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "status": {
+          "const": "error"
+        }
+      },
+      "required": [
+        "status",
+        "error_code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    }
+  ]
+}
+```
+
+## `unpublish_html_page`
+
+Take down a page you published with `publish_html_page`, before it expires.
+
+- **When to use:** When the user asks to take a page down, or a page you published is wrong: publish the right one and take the old one down. Name it by the link the user has, or by its publication_id.
+- **Present when:** the node has its identity: it was launched with its ILK
+- **Limits:**
+  - Only pages this agent published. Give exactly one of `url` or `publication_id`.
+  - Taking a page down twice is harmless: a page already down, or expired, answers `unpublished: false`.
+- **Returns:** `{status: "ok", publication_id, unpublished}`: `unpublished` is false when the page was already down or had expired.
+- **Errors:**
+  - `not_found`: No page was published with that link or publication_id, or it is not one: a link's key is 64 lowercase hex characters after `/public/`.
+  - `not_yours`: Another node published that page: an agent takes down only its own.
+  - `unpublish_failed`: SY.admin could not take the page down now. `retryable: true`: try again shortly; taking it down twice is harmless.
+
+Input:
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "publication_id": {
+      "description": "The page's publication_id, `pub:<uuid>`, as `publish_html_page` gave it.",
+      "type": "string"
+    },
+    "url": {
+      "description": "The page's link, as `publish_html_page` gave it: https://<host>/public/<key>, the key 64 lowercase hex characters.",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+Output:
+
+```json
+{
+  "description": "`{status: \"ok\", publication_id, unpublished}`: `unpublished` is false when the page was already down or had expired.",
+  "oneOf": [
+    {
+      "properties": {
+        "publication_id": {
+          "type": "string"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "unpublished": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "status",
+        "publication_id",
+        "unpublished"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "error_code": {
+          "enum": [
+            "not_found",
+            "not_yours",
+            "unpublish_failed"
           ]
         },
         "message": {

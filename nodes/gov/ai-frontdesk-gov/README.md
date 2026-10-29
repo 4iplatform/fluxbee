@@ -27,7 +27,10 @@ registers them in SY.identity (`ILK_REGISTER`).
   `NODE_STATUS_GET` only from the orchestrator of its hive, and `PING` and `STATUS` from either,
   each as a `system` message with the verb in its own case. Anything else that names one of them
   (an `admin` message, the verb in another case, another sender) is refused with a WARN and an
-  `unauthorized` answer.
+  `unauthorized` answer. A notice or a reply is never answered, only logged, as in ai.generic: a
+  message the router made (`UNREACHABLE`, `TTL_EXCEEDED`) or one named as a notice or a reply (any
+  `*_RESPONSE`). An answer to the router's notice would bounce between the two forever (FINDINGS
+  A-112).
 - **Tenant:** the registration goes to the tenant of the case, the one SY.identity holds for the temporary ILK (the
   frontdesk reads it from the identity SHM). The `tenant_id` of a handoff only has to match. The
   frontdesk never creates tenants, and never takes one from the person or from the LLM; with no tenant it answers

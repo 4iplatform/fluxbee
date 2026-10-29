@@ -1,7 +1,7 @@
 # Technical Annex: Blob Storage and Attachments
 
 **Status:** v1.1
-**Date:** 2026-03-09
+**Date:** 2026-03-09; checked against the code on 2026-10-27
 **Audience:** Node developers, `fluxbee_sdk` developers
 **Complements:** `02-protocolo.md` §4 and §11, `07-operaciones.md`, `blob_tasks.md`
 
@@ -29,8 +29,10 @@ All nodes access the same blob repository through the local filesystem.
 ├── active/            ← ready files, referenced by messages
 │   └── a1/
 │       └── factura_a1b2c3d4e5f6a7b8.png
-└── <future: GC runs over active/ by time>
+└── public/            ← copies of published artifacts, by full SHA-256 (IO.blob; §11.1)
 ```
+
+A GC removes old files from `staging/` and `active/` (§9).
 
 **`staging/`** — The nodes' working directory. Each node writes here the files it is processing, generating, downloading or transforming. A file in staging is not ready to be referenced by a message. Examples:
 
@@ -118,7 +120,7 @@ The `blob_name` is the unique identifier of the blob. There is no separate hash 
 | `size` | integer | Yes | Size in bytes of the original file |
 | `mime` | string | Yes | MIME type (`image/png`, `application/pdf`, etc.) |
 | `filename_original` | string | Yes | Original name of the file as the user/system sent it. Not sanitized. For display |
-| `spool_day` | string | Yes | ISO date of the day it was created. For future GC by time |
+| `spool_day` | string | Yes | ISO date of the day it was created. The GC of `active/` goes by the file's age instead (§9) |
 
 **Path resolution from a BlobRef:**
 
@@ -320,13 +322,44 @@ impl BlobToolkit {
     /// The producer decides when to promote.
     pub fn promote(&self, blob_ref: &BlobRef) -> Result<()>;
 
-    /// Resolve the full path of a blob in active/.
-    /// Returns the path immediately without checking that it exists.
+    /// Read a blob, checked against its BlobRef: every directory under blob/ and the file are
+    /// opened without following a link, the file must be a regular file of the BlobRef's size,
+    /// and its SHA-256 must start with the hash in its name (BLOB_INTEGRITY otherwise).
+    pub fn read_blob(&self, blob_ref: &BlobRef) -> Result<Vec<u8>>;
+    /// The same, on the blocking pool, for async callers.
+    pub async fn read_blob_async(&self, blob_ref: &BlobRef) -> Result<Vec<u8>>;
+    /// The same, waiting with backoff for a blob that has not arrived yet (multi-island):
+    /// only a missing blob is tried again, up to max_wait_ms.
+    pub async fn read_blob_with_retry(
+        &self,
+        blob_ref: &BlobRef,
+        config: ResolveRetryConfig,
+    ) -> Result<Vec<u8>>;
+
+    /// Read a blob by its name alone, for a reader that has no BlobRef: the same checks as
+    /// read_blob, but for the size, which no BlobRef gives. The file must be at most max_bytes
+    /// (and BlobConfig.max_blob_bytes), or it is refused (BLOB_TOO_LARGE).
+    pub fn read_blob_by_name(&self, blob_name: &str, max_bytes: u64) -> Result<Vec<u8>>;
+    /// The same, waiting with backoff for a blob that has not arrived yet (multi-island):
+    /// only a missing blob is tried again, up to max_wait_ms.
+    pub async fn read_blob_by_name_with_retry(
+        &self,
+        blob_name: &str,
+        max_bytes: u64,
+        config: ResolveRetryConfig,
+    ) -> Result<Vec<u8>>;
+
+    /// Open a blob to read it as a stream: the same checks as read_blob but the hash, which
+    /// a caller that streams the file checks itself.
+    pub fn open_blob(&self, blob_ref: &BlobRef) -> Result<std::fs::File>;
+
+    /// Where a blob lives in active/. Returns the path immediately without checking that it
+    /// exists. Never read a blob through this path: a name in active/ can be a link
+    /// (FINDINGS A-56). Read it with read_blob.
     pub fn resolve(&self, blob_ref: &BlobRef) -> PathBuf;
 
-    /// Resolve the path with retry and backoff.
-    /// For multi-island environments where Syncthing may not have replicated yet.
-    /// Retries up to max_wait_ms with exponential backoff.
+    /// The path, waiting with backoff until it exists (multi-island), up to max_wait_ms.
+    /// For a presence check; the bytes are read with read_blob.
     pub async fn resolve_with_retry(
         &self,
         blob_ref: &BlobRef,
@@ -342,8 +375,15 @@ impl BlobToolkit {
     /// Extract the subdirectory prefix from blob_name.
     /// Takes the 2 chars after the last '_' (first 2 hex of the hash).
     pub fn prefix(blob_name: &str) -> &str;
+
+    /// One GC pass over staging/ and active/ (§9).
+    pub fn run_gc(&self, options: BlobGcOptions) -> Result<BlobGcReport>;
 }
 ```
+
+An AI agent reads a blob by its name alone, the one an attachment showed it: its `read_blob` tool
+takes text only, judged by the content, and ai.generic reads it with
+`read_blob_by_name_with_retry` ([agent-tools-v1](agent-tools-v1.md) §6.2.1).
 
 ### 5.2 Internal flow of `put`
 
@@ -415,26 +455,26 @@ promote(blob_ref)
 
 > **Note:** `staging/` and `active/` are on the same filesystem (`/var/lib/fluxbee/blob/`), so `rename()` is atomic and O(1). There is no data copy.
 
-### 5.4 Internal flow of `resolve_with_retry`
+### 5.4 Internal flow of `read_blob_with_retry` (and `resolve_with_retry`)
 
 ```
-resolve_with_retry(blob_ref, config)
+read_blob_with_retry(blob_ref, config)
   │
-  ├─ 1. path = resolve(blob_ref)
+  ├─ 1. Read the blob as read_blob does
   │
-  ├─ 2. If path exists → return Ok(path)
+  ├─ 2. Read, or failed for any reason but BLOB_NOT_FOUND → return that
   │
   ├─ 3. Loop with backoff:
   │     delay = initial_delay_ms (100ms)
-  │     total = 0
-  │     while total < max_wait_ms:
+  │     while elapsed < max_wait_ms:
   │       sleep(delay)
-  │       total += delay
-  │       if path exists → return Ok(path)
+  │       read again; anything but BLOB_NOT_FOUND → return it
   │       delay = delay * backoff_factor
   │
   └─ 4. If timeout → return Err(BLOB_NOT_FOUND)
 ```
+
+`resolve_with_retry` waits the same way for the path to exist, and returns the path.
 
 ---
 
@@ -454,9 +494,9 @@ resolve_with_retry(blob_ref, config)
 7. IO sends the message to the router
 8. The router routes it to the AI node
 9. AI receives the message, reads blob_ref from attachments
-10. AI calls blob.resolve(blob_ref) → local path
-    (or blob.resolve_with_retry if multi-island)
-11. AI reads the file from the path
+10. AI reads the bytes with blob.read_blob(blob_ref), checked against the BlobRef.
+    ai.generic reads each attachment once (read_blob_async): it does not wait for a blob still
+    on its way from another hive (read_blob_with_retry would)
 ```
 
 ### 6.2 AI node generates a file (system → WhatsApp)
@@ -473,8 +513,9 @@ resolve_with_retry(blob_ref, config)
 6. AI sends the message to the router
 7. The router routes it to the IO node
 8. IO receives the message, reads blob_ref
-9. IO calls blob.resolve(blob_ref) → local path
-10. IO reads the file and sends it over WhatsApp
+9. IO checks the blob is there (io-common's resolve_text_v1_for_outbound, which can wait for
+   one still on its way) and reads the bytes with blob.read_blob(blob_ref)
+10. IO sends it over WhatsApp
 ```
 
 ### 6.3 WF node assembles a report from multiple sources
@@ -508,13 +549,13 @@ Island A (producer):
 
 Island B (consumer):
 5. AI node receives the message via the router
-6. AI calls blob.resolve_with_retry(blob_ref)
+6. AI calls blob.read_blob_with_retry(blob_ref, config)
 7. If Syncthing has not finished → retry with backoff
 8. Syncthing completes replication → the file shows up in island B's active/
-9. AI reads the file
+9. AI gets the bytes, checked against the BlobRef
 ```
 
-**Rule:** the message (via router/L2 channel) can arrive before the file (via Syncthing). The consumer handles this with `resolve_with_retry`.
+**Rule:** the message (via router/L2 channel) can arrive before the file (via Syncthing). A consumer that may get such a message waits with `read_blob_with_retry`; one that reads with `read_blob` alone, as ai.generic does for attachments, fails it with `BLOB_NOT_FOUND`.
 
 ### 6.6 Recommended v2.x flow (prior confirmation of propagation)
 
@@ -527,11 +568,11 @@ Island A (producer):
 5. only then send the message with the BlobRef
 
 Island B (consumer):
-6. receives the message and resolves the BlobRef (resolve/resolve_with_retry)
+6. receives the message and reads the BlobRef (read_blob/read_blob_with_retry)
 ```
 
 **Recommended v2.x rule:** do not send a message with a `BlobRef` before propagation is confirmed (when the flow supports it).
-`resolve_with_retry` stays as a defensive fallback.
+`read_blob_with_retry` stays as a defensive fallback.
 
 ---
 
@@ -546,7 +587,7 @@ In multi-island v2.x, it is also recommended to confirm propagation before emitt
 
 **When to promote?** When the node decides that the file is ready. There is no timing restriction — it can be immediate (IO receives a complete file) or delayed (AI generating a long document).
 
-**Is there a race?** No. The rename is atomic: the file is in `staging/` or in `active/`, never in an intermediate state. If a consumer tries to read before the file arrives (multi-island), `resolve_with_retry` handles the case.
+**Is there a race?** No. The rename is atomic: the file is in `staging/` or in `active/`, never in an intermediate state. If a consumer tries to read before the file arrives (multi-island), `read_blob_with_retry` handles the case.
 
 ---
 
@@ -554,34 +595,39 @@ In multi-island v2.x, it is also recommended to confirm propagation before emitt
 
 | Error | Description |
 |-------|-------------|
-| `BLOB_NOT_FOUND` | The file does not exist in active/. In multi-island, Syncthing may not have replicated yet — use `resolve_with_retry` |
+| `BLOB_NOT_FOUND` | The file does not exist in active/. In multi-island, Syncthing may not have replicated yet — use `read_blob_with_retry` |
 | `BLOB_IO_ERROR` | Filesystem read/write error (disk full, permissions, etc.) |
-| `BLOB_INVALID_NAME` | The name does not pass sanitization (it is empty after sanitizing). Fallback: use `"blob"` |
+| `BLOB_INVALID_NAME` | The name is not `<name>_<hash16>.<ext>`, or tries a path (`/`, `\`, `..`) |
+| `BLOB_INVALID_REF` | The BlobRef itself is not valid |
 | `BLOB_TOO_LARGE` | The file exceeds the limit configured by policy (e.g.: 100MB) |
+| `BLOB_INTEGRITY` | What is stored under the name is not the blob its BlobRef names: not a regular file, another size, or (`read_blob`) bytes whose SHA-256 does not start with the hash in the name (FINDINGS A-56) |
 
-> **Note:** `BLOB_HASH_MISMATCH` from the previous draft is removed. There is no post-write hash check because the hash only serves for uniqueness in the naming, not for cryptographic integrity.
+> **Note:** a read checks the hash. `read_blob` refuses bytes whose SHA-256 does not start with the hash16 in the name: `active/` belongs to the Syncthing user and takes entries from other hives, so the name alone proves nothing. `open_blob` checks the file but not its bytes; a caller that streams them checks the hash itself.
 > The limit is configurable via `BlobConfig.max_blob_bytes`.
 
 ---
 
 ## 9. GC (Garbage Collection)
 
-Initial GC implemented in `fluxbee_sdk::blob` and runnable from `SY.orchestrator` (watchdog), with two phases:
+The GC is implemented in `fluxbee_sdk::blob` (`BlobToolkit::run_gc`) and run by `SY.orchestrator`'s watchdog on its own hive (`run_blob_gc_housekeeping`), with two phases:
 
-- `staging/` cleanup by TTL (`staging_ttl_hours`, default `24h`).
+- `staging/` cleanup by TTL (`staging_ttl_hours`, default `24h`), unfinished puts' temporaries included.
 - Conservative `active/` GC by retention (`active_retain_days`, default `30d`).
 
-Operating mode:
+It is set in `hive.yaml`, `blob.gc`:
 
-- `apply=false` (default): dry-run, it only reports candidates.
-- `apply=true`: it runs the deletions.
+- `enabled` (default `false`): the GC runs only when it is on;
+- `interval_secs` (default `3600`, at least `60`);
+- `apply`: `false` (default) is a dry run that only reports candidates; `true` runs the deletions;
+- `staging_ttl_hours` and `active_retain_days` (at least `1`).
 
 Conservative semantics:
 
-- In this initial phase, the retention of `active/` is based on the file age (mtime) as an approximation of `spool_day`.
+- The retention of `active/` is based on the file age (mtime) as an approximation of `spool_day`.
+- **Publication pins:** an `active/` blob that a live publication still references is never deleted, whatever its age. The orchestrator reads them from IO.blob's publication ledger (`/var/lib/fluxbee/state/io-blob/publications.json`, or `IO_BLOB_LEDGER_PATH`; `published_blob_names`) and logs a warning when the ledger is missing, then runs on mtime alone.
 - The TTL must stay conservative to minimize the risk of deleting blobs that are still referenced.
 
-**Pending future topic:** referential GC (check live references in storage/flow before deleting for good).
+**Pending future topic:** referential GC beyond publications (check live references in storage/flow before deleting for good).
 
 ---
 
@@ -589,7 +635,7 @@ Conservative semantics:
 
 | Aspect | Rule |
 |---------|-------|
-| Owner | `fluxbee:fluxbee` (same user as the services) |
+| Owner | `blob/` is root's, group `fluxbee` (the Syncthing user only traverses it); `staging/` is root's; `active/` and `public/` are the Syncthing user's (`fluxbee`), who serves them. The nodes run as root (A-60) and hand each blob to the owner of the folder it lands in (§5.3) |
 | Directory permissions | `750` (owner rwx, group rx) |
 | File permissions | `640` (owner rw, group r) |
 | Path traversal | The `fluxbee_sdk` blob module rejects names with `/`, `..`, `\` |
@@ -605,7 +651,7 @@ Conservative semantics:
 | **Transport channel** | Does not touch blobs. Carries messages with a `BlobRef` without inspecting the content |
 | **OPA** | Does not touch blobs. Does not read the payload |
 | **Syncthing** | Replicates `active/` between internal hives and, through a separate one-way folder, `public/` to ingress. `staging/` is local |
-| **Nodes (all)** | Use `fluxbee_sdk::blob` for put/promote/resolve |
+| **Nodes (all)** | Use `fluxbee_sdk::blob` for put/promote/read_blob |
 | **SY.storage** | Persists the metadata of messages that contain a `BlobRef` (not the blob itself) |
 
 ---

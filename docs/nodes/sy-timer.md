@@ -57,7 +57,8 @@ the caller's own name for it), `kind` (`oneshot` or `recurring`), `fire_at_utc` 
 Rules enforced in `main.go`:
 
 - **Owner.** The owner is the router-stamped `routing.src_l2_name` of the request
-  (`resolveSourceL2NameFromMsg`); a request without it fails with `TIMER_INTERNAL`.
+  (`resolveSourceL2NameFromMsg`). A message without it is one the router made itself
+  (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line (`isInfrastructureMessage`).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
 - **Minimum duration: 60 s** (`MinTimerDuration` in `go/fluxbee-go-sdk/timer_schedule.go`). A
@@ -85,7 +86,9 @@ due, `fireTimerByUUID` re-reads it, skips it unless still `pending`, and sends:
 
 Delivery is fire-and-forget. A send error is logged (`timer_fire_emit_failed`) and the timer is
 still recorded as fired. A one-shot then becomes `fired`; a recurring timer gets its next fire
-time from the cron and goes back on the heap.
+time from the cron and goes back on the heap. Nothing retries: the router's `UNREACHABLE` for a
+target that is down is ignored like any notice. A one-shot is saved `fired` after its send, so one
+whose save a stop interrupted fires again at the next start.
 
 ### After a restart
 
@@ -131,9 +134,14 @@ Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON
 
 ### Teardown
 
-When the orchestrator purges a node, it first sends `TIMER_PURGE_OWNER` for that node to the
-`SY.timer` of the node's hive, with a 3 s timeout, and reports the result in its reply
-(`purge_owner_timers_before_teardown` in `src/bin/sy_orchestrator.rs`).
+When the orchestrator purges a node (`kill_node` with `purge_instance`, `remove_node_instance`),
+it stops the node's unit first and clears its `relaunch_on_boot` (`clear_relaunch_on_boot`), then
+sends `TIMER_PURGE_OWNER` for that node to the `SY.timer` of the node's hive, with a 3 s timeout,
+and reports the result in its reply as `timer_purge` (`purge_owner_timers_before_teardown` in
+`src/bin/sy_orchestrator.rs`). A purge that is not `ok` or gets no answer stops the teardown there
+with `TIMER_PURGE_FAILED`, which reports `relaunch_on_boot: false`: the node stays stopped, with
+its files and its identity, until the purge is run again. The 60 s reconcile does not launch it
+again (FINDINGS A-121).
 
 ## SY.admin HTTP routes
 

@@ -211,6 +211,11 @@ follows `current` then moves on its own; a restart through SY.admin moves it at 
 
    - It builds `ai_node_runner` (`--skip-build` publishes `target/release/ai_node_runner` as it is)
      into `/var/lib/fluxbee/dist/runtimes/ai.generic/0.1.99/`.
+   - It writes every file of the version first: the binary, its `bin/start.sh` and `tools.json`,
+     the tool catalog with the version in it (`docs/reference/agent-tools.json` of the checkout,
+     or `--catalog <path>`), which `get_runtime` answers to Archi. The manifest goes last, so the
+     orchestrator never moves a node onto a version that is not all there (FINDINGS A-110). A
+     missing or unreadable input fails before anything is written.
    - `--set-current` makes it the version `current` points at.
    - It prints `manifest_version=` and `manifest_hash=`; the update takes both.
 2. **Update the node's hive** (`POST /hives/{hive}/update`):
@@ -308,7 +313,7 @@ attachments of 10 MB each.
 
 | Attachment | Reaches the model as |
 | --- | --- |
-| text (`text/plain`, `text/markdown`, `application/json`) | text |
+| text (`text/plain`, `text/markdown`, `application/json`, `text/csv`, `text/html`) | text, with its blob name; cut at 100,000 characters with a line that names the blob and the byte offset to read on from, where `read_blob` reads on (FINDINGS A-111) |
 | an image (`png`, `jpeg`, `webp`, `gif`) | an image: OpenAI `input_image` with a data URL, Anthropic an `image` block |
 | any other file, with `multimodal` on | a document: OpenAI `input_file` (`file_data` as a data URL, plus `filename`); Anthropic takes PDF only |
 
@@ -326,7 +331,8 @@ With `multimodal` off, only text attachments are accepted.
   - The PDF prints Western European text (Windows-1252), wraps long lines and takes as many pages
     as the text needs (FINDINGS A-97).
 - **`publish_html_page`** publishes an HTML page with a public URL, through SY.admin. It exists only
-  when the node has its ILK, and the link expires after 24 h.
+  when the node has its ILK, and the link expires after 24 h; `unpublish_html_page` takes it down
+  sooner.
 - **Every tool, with its limits:** the tool catalog,
   [reference/agent-tools.md](reference/agent-tools.md), generated from the code. A running node
   answers the same cards to `NODE_HELP`.

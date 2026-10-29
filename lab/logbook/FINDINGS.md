@@ -1078,6 +1078,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-121 🔴 OPEN (found 2026-10-27, 0.1.89 review) — A node whose purge failed on SY.timer comes back within 60 s
+
+- **What happens:**
+  - `kill_node` with `purge_instance` stops the unit, then purges the node's timers.
+  - When SY.timer does not answer, it returns `TIMER_PURGE_FAILED` with `relaunch_on_boot` still
+    set. Only the plain stop clears it.
+  - Since 0.1.88 the 60 s reconcile relaunches such a node. So the operator's "purge" leaves the
+    node answering people again a minute later. Each retry stops it, and it comes back again.
+- **Fix (0.1.89):** the purge records "do not relaunch" right after the stop, before the timer
+  purge (`clear_relaunch_on_boot`). The docs already said the node stays stopped.
+  - `remove_node_instance` had the same hole: a node down after a crash keeps its flag. It gets
+    the same fix.
+  - Both `TIMER_PURGE_FAILED` answers report `relaunch_on_boot: false`.
+
+### A-120 🟡 OPEN (found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
+
+- **What happens:** `unpublish_artifact` is reachable only:
+  - by an AI node, on its own pages, over the mesh;
+  - by the operator's loopback route.
+
+  Archi's mesh access refuses it, and its executor excludes mesh-only actions.
+- **Why it matters:** the operator's rule that every operator feature is reachable by Archi: *"nadie
+  va a mandar curls nunca más"*.
+- **Fix:** later, with Archi's admin actions. Taking down any page is an operator power, so it goes
+  through Archi's confirmation flow.
+
 ### A-119 🔴 OPEN (found 2026-10-27, WF review) — The WF engine's control verbs and timer fires accept anyone
 
 - **What happens:**
@@ -1236,10 +1262,14 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 
   This was read in the code, not seen running. Today it needs a reply that cannot be delivered,
   because its sender is gone. With `send_message` and reminders it becomes common.
-- **Fix (0.1.89):**
-  - a test confirms the loop first;
-  - the node never answers a router notice, and logs it;
-  - `send_message` reads the notice as its failure.
+- **Fix (0.1.89):** the node never answers a router notice, or any infrastructure message (no
+  sender's name, HELLO, ANNOUNCE, WITHDRAW, ECHO, any `*_RESPONSE`). It logs it. This is the rule
+  SY.timer and the WF engine already follow.
+  - A test confirmed the loop first, before the fix: on the unchanged node it answered the notice
+    and the emulated router answered back, three times in a row, until the test stopped it.
+  - It also closes a latent `CONFIG_RESPONSE` ping-pong between two AI nodes.
+  - The review found the same control plane in SY.frontdesk.gov. The rule moved to the AI SDK, and
+    both use it.
 
 ### A-111 🔴 OPEN (found 2026-10-27, iteration 2 design) — A CSV or HTML attachment fails the whole message on Claude
 

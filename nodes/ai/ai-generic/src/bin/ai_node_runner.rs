@@ -11,14 +11,15 @@ use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
-    create_function_calling_model, create_llm_client, extract_text,
-    resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
-    AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact,
-    ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
-    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
-    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
-    Message, ModelInputOptions, ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig,
-    TenantSource, ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
+    create_function_calling_model, create_llm_client, extract_text, is_infrastructure_message,
+    note_infrastructure_message, resolve_model_input_from_payload_with_options,
+    resolve_response_envelope_output_schema, AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput,
+    AiNode, AiProvider, AiUserArtifact, ControlRequest, FunctionCallingConfig,
+    FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
+    FunctionRunInput, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
+    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
+    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
     ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
     MSG_PING, MSG_STATUS,
 };
@@ -35,9 +36,10 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     managed_node_config_path_with_root, managed_node_instance_dir, managed_node_name,
-    timer_node_name, AdminCommandRequest, NodeConfig, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, TimerClient, TimerClientConfig, TimerClientError,
-    TimerNowInPayload, TimerNowInResult, VaultCallerOwned, VaultClient,
+    timer_node_name, AdminCommandRequest, AdminCommandResult, NodeConfig, NodeUuidMode,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, TimerClient,
+    TimerClientConfig, TimerClientError, TimerNowInPayload, TimerNowInResult, VaultCallerOwned,
+    VaultClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +53,15 @@ const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
 const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
+/// The largest file `read_blob` reads: an attachment's cap (the AI SDK's text_payload).
+const READ_BLOB_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// The most text one `read_blob` call returns, in bytes.
+const READ_BLOB_PIECE_BYTES: usize = 64 * 1024;
+/// The most text `read_blob` returns to one message, in bytes, over all its calls: the tool loop
+/// sends every piece back to the model on each of its turns, up to `DEFAULT_MAX_TURNS`.
+const READ_BLOB_BUDGET_BYTES: usize = 192 * 1024;
+/// How long `read_blob` waits for a blob still on its way from another hive.
+const READ_BLOB_WAIT: Duration = Duration::from_secs(20);
 /// The files one reply carries at most: what an IO node sends out in one message
 /// (nodes/io/common text_v1_blob.rs, `DEFAULT_MAX_ATTACHMENTS`); io.slack refuses a reply with
 /// more, its text included. Its other two limits, 20 MiB a file and 40 MiB in all, are out of the
@@ -383,6 +394,14 @@ struct PublishHtmlTool {
     blob: fluxbee_sdk::blob::BlobConfig,
 }
 
+/// Takes down a page this node published with `publish_html_page`, before it expires
+/// (agent-tools-v1 §6.2.2): SY.admin's `unpublish_artifact`, which checks the caller is the exact
+/// node that published it. Registered with `publish_html_page`.
+struct UnpublishHtmlTool {
+    /// The node's connection to its router, to SY.admin.
+    router: Arc<RouterDispatcher>,
+}
+
 #[derive(Clone)]
 struct GeneratePdfArtifactTool {
     files: Arc<ReplyFiles>,
@@ -413,6 +432,37 @@ struct GetCurrentTimeTool {
     router: Arc<RouterDispatcher>,
     /// `SY.timer@<the node's hive>`.
     timer: String,
+}
+
+/// Reads a text file of the hive's blob store by its blob name, a piece at a time
+/// (agent-tools-v1 §6.2.1). It is one message's: the tools are built for each message
+/// (`build_tool_registry`), so its budget starts whole with each one.
+struct ReadBlobTool {
+    /// The store: the node's own (`BlobConfig::default()`), which the motherbee and the workers
+    /// share through Syncthing.
+    blob: fluxbee_sdk::blob::BlobConfig,
+    /// How long it waits for a blob still on its way from another hive (`READ_BLOB_WAIT`).
+    wait: Duration,
+    /// The text, in bytes, it may still return to this message (`READ_BLOB_BUDGET_BYTES`).
+    budget: std::sync::Mutex<usize>,
+}
+
+impl ReadBlobTool {
+    /// `read_blob` for one message, with the whole budget.
+    fn new(blob: fluxbee_sdk::blob::BlobConfig, wait: Duration) -> Self {
+        Self {
+            blob,
+            wait,
+            budget: std::sync::Mutex::new(READ_BLOB_BUDGET_BYTES),
+        }
+    }
+
+    /// What is left of the budget, whatever a call that panicked holding it left.
+    fn budget(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -509,6 +559,21 @@ struct GenerateRasterArtifactArgs {
 struct GetCurrentTimeArgs {
     #[serde(default)]
     timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReadBlobArgs {
+    blob_name: String,
+    #[serde(default)]
+    offset: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UnpublishHtmlArgs {
+    #[serde(default)]
+    publication_id: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1372,6 +1437,10 @@ impl GenericAiNode {
         {
             registry.register(Arc::new(tool))?;
         }
+        registry.register(Arc::new(ReadBlobTool::new(
+            fluxbee_sdk::blob::BlobConfig::default(),
+            READ_BLOB_WAIT,
+        )))?;
         // Publishing ACTION: expose it only when the node has a resolved identity (vault).
         // Publishing is tenant-scoped by the producer's router-stamped identity (resolved
         // admin-side), and vault is Some exactly when that identity is present — so a node
@@ -1380,6 +1449,9 @@ impl GenericAiNode {
             registry.register(Arc::new(PublishHtmlTool {
                 vault: vault.clone(),
                 blob: fluxbee_sdk::blob::BlobConfig::default(),
+            }))?;
+            registry.register(Arc::new(UnpublishHtmlTool {
+                router: vault.dispatcher().clone(),
             }))?;
         }
         Ok(())
@@ -1421,8 +1493,13 @@ impl GenericAiNode {
 
     /// A control verb runs only as the router's authority gate delivers it, from the node that
     /// sends it (`control_request`): SY.admin@motherbee for the config, this hive's orchestrator for
-    /// the status and the help. Anything else that names a verb is refused with `unauthorized`.
+    /// the status and the help. Anything else that names a verb is refused with `unauthorized`. A
+    /// notice or a reply is never answered (`is_infrastructure_message`, FINDINGS A-112).
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
+        if is_infrastructure_message(&msg) {
+            note_infrastructure_message(&self.node_name, &msg);
+            return Ok(None);
+        }
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
@@ -3065,20 +3142,36 @@ fn tool_loop_text(result: &FunctionLoopRunResult) -> Option<String> {
 
 /// The links of the pages `publish_html_page` published in one tool loop, in the order published,
 /// each once: the `url` of each of its results that says `ok`, as the tool answered the model.
+/// A page `unpublish_html_page` took down in the same loop is left out: its result names the
+/// page's `publication_id`.
 fn published_links(items: &[FunctionLoopItem]) -> Vec<String> {
+    let succeeded = |name: &'static str| {
+        items.iter().filter_map(move |item| match item {
+            FunctionLoopItem::ToolResult { result }
+                if !result.is_error
+                    && result.name == name
+                    && result.output.get("status").and_then(Value::as_str) == Some("ok") =>
+            {
+                Some(&result.output)
+            }
+            _ => None,
+        })
+    };
+    let publication_id = |output: &Value| {
+        output
+            .get("publication_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let taken_down = succeeded("unpublish_html_page")
+        .filter_map(publication_id)
+        .collect::<Vec<_>>();
     let mut links: Vec<String> = Vec::new();
-    for item in items {
-        let FunctionLoopItem::ToolResult { result } = item else {
-            continue;
-        };
-        if result.is_error
-            || result.name != "publish_html_page"
-            || result.output.get("status").and_then(Value::as_str) != Some("ok")
-        {
+    for output in succeeded("publish_html_page") {
+        if publication_id(output).is_some_and(|id| taken_down.contains(&id)) {
             continue;
         }
-        let Some(link) = result
-            .output
+        let Some(link) = output
             .get("url")
             .and_then(Value::as_str)
             .map(str::trim)
@@ -3895,7 +3988,9 @@ fn base_tool_cards() -> Vec<ToolCard> {
         GeneratePngArtifactTool::card(),
         GenerateJpegArtifactTool::card(),
         GetCurrentTimeTool::card(),
+        ReadBlobTool::card(),
         PublishHtmlTool::card(),
+        UnpublishHtmlTool::card(),
     ]
 }
 
@@ -4315,8 +4410,8 @@ impl AgentTool for PublishHtmlTool {
                  scripts, stylesheets, fonts or images); images and fonts only inline, as \
                  `data:` URLs; forms do not submit.",
                 "The link is the key: anyone who has it can open the page, so put nothing \
-                 private in it. It expires 24 hours after publishing, and you cannot extend it \
-                 or take the page down earlier.",
+                 private in it. It expires 24 hours after publishing, and you cannot extend it; \
+                 `unpublish_html_page` takes it down sooner.",
                 "Publishing takes up to two minutes. Your reply is the text you write after your \
                  last tool call; text written alongside a call is not sent. Give the link there: a \
                  reply without it gets it added, on a line of its own.",
@@ -4422,14 +4517,7 @@ impl AgentTool for PublishHtmlTool {
         }
         // Publish via SY.admin over the mesh socket. Admin resolves THIS node's tenant from its
         // router-stamped identity (never asserted here), curates the bytes, and pushes the edge row.
-        // SY.admin + the io.blob curator are motherbee-local, so the target defaults to
-        // SY.admin@motherbee (overridable via AI_ADMIN_TARGET) — NOT this node's own hive, which may
-        // be a spoke with no admin/curator (mirrors io-api's admin_target default).
-        let admin_target = std::env::var("AI_ADMIN_TARGET")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "SY.admin@motherbee".to_string());
+        let admin_target = publishing_admin_target();
         match self
             .vault
             .dispatcher()
@@ -4456,8 +4544,20 @@ impl AgentTool for PublishHtmlTool {
                 let Some(url) = url else {
                     tracing::warn!(
                         tool = "publish_html_page",
-                        "admin returned no absolute public_url (public_base_url unset); page stored but unreachable"
+                        "admin returned no absolute public_url (public_base_url unset); taking the page down"
                     );
+                    // The model is told it was not published, so it is not: the publication
+                    // would stay live, at a link no one has, until it expires.
+                    match result.payload.get("publication_id").and_then(Value::as_str) {
+                        Some(publication_id) => {
+                            take_down_unreachable_page(self.vault.dispatcher(), publication_id)
+                                .await
+                        }
+                        None => tracing::warn!(
+                            tool = "publish_html_page",
+                            "admin named no publication_id either; nothing to take down"
+                        ),
+                    }
                     return Ok(publish_tool_error(
                         "publishing is not fully configured on this hive (no public URL); the page was not published",
                         false,
@@ -4502,6 +4602,275 @@ impl AgentTool for PublishHtmlTool {
             Err(err) => {
                 tracing::warn!(tool = "publish_html_page", error = %err, target = %admin_target, "publish request failed");
                 Ok(publish_tool_error(
+                    "could not reach the publishing service",
+                    true,
+                ))
+            }
+        }
+    }
+}
+
+/// The SY.admin pages are published and taken down through: SY.admin@motherbee, where the io.blob
+/// curator runs, never the node's own hive, which may be a worker with neither (as io-api's
+/// `admin_target`). `AI_ADMIN_TARGET` names another.
+fn publishing_admin_target() -> String {
+    std::env::var("AI_ADMIN_TARGET")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "SY.admin@motherbee".to_string())
+}
+
+/// How long `unpublish_artifact` may take: SY.admin removes the edge's row, then releases the
+/// curated blob.
+const UNPUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// SY.admin's `unpublish_artifact` with `params`, `{publication_id}` or `{key}`: it takes down a
+/// publication of the calling node's, by its router-stamped name.
+async fn unpublish_artifact(
+    router: &RouterDispatcher,
+    params: Value,
+) -> Result<AdminCommandResult, fluxbee_sdk::RpcError> {
+    let admin_target = publishing_admin_target();
+    router
+        .send_admin_rpc(AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "unpublish_artifact",
+            target: None,
+            params,
+            request_id: None,
+            timeout: UNPUBLISH_TIMEOUT,
+        })
+        .await
+}
+
+/// Takes down a page `publish_html_page` published but has no public link for, which the model is
+/// told was not published; the journal says whether it went.
+async fn take_down_unreachable_page(router: &RouterDispatcher, publication_id: &str) {
+    match unpublish_artifact(router, json!({ "publication_id": publication_id })).await {
+        Ok(result) if result.status == "ok" => tracing::info!(
+            tool = "publish_html_page",
+            publication_id,
+            "the page without a public link was taken down"
+        ),
+        Ok(result) => tracing::warn!(
+            tool = "publish_html_page",
+            publication_id,
+            error_code = ?result.error_code,
+            detail = ?result.error_detail,
+            "the page without a public link could not be taken down; it expires on its own"
+        ),
+        Err(err) => tracing::warn!(
+            tool = "publish_html_page",
+            publication_id,
+            error = %err,
+            "the page without a public link could not be taken down; it expires on its own"
+        ),
+    }
+}
+
+/// The key of a page's link, `<public base>/public/<key>`: what `public_key_len` takes after
+/// `/public/`, so what follows the key is left out: a `)` or a `.` of the sentence around the link,
+/// Slack's `|label>`, a `/`, a `?query` or a `#fragment`. `None` for a link without `/public/`, or
+/// whose key is not 64 lowercase hex characters, the only key SY.admin takes: no call with it can
+/// take a page down.
+fn publication_key(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("/public/")?;
+    let key = &rest[..public_key_len(rest)];
+    let is_key = key.len() == 64
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    is_key.then_some(key)
+}
+
+/// The length of the key at the start of `rest`, the text right after a link's `/public/`: its
+/// ASCII letters and digits, up to the first other character.
+fn public_key_len(rest: &str) -> usize {
+    rest.find(|ch: char| !ch.is_ascii_alphanumeric())
+        .unwrap_or(rest.len())
+}
+
+/// Whether `publication_id` is one SY.admin mints: `pub:<uuid>`.
+fn is_publication_id(publication_id: &str) -> bool {
+    publication_id
+        .strip_prefix("pub:")
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+}
+
+#[async_trait]
+impl AgentTool for UnpublishHtmlTool {
+    /// SY.admin answers `NOT_FOUND` for a publication that does not exist and `UNAUTHORIZED` for
+    /// one another node published; it takes a publication by its id or by its link's key.
+    fn card() -> ToolCard {
+        ToolCard {
+            name: "unpublish_html_page".to_string(),
+            summary: "Take down a page you published with `publish_html_page`, before it expires."
+                .to_string(),
+            when_to_use: "When the user asks to take a page down, or a page you published is \
+                wrong: publish the right one and take the old one down. Name it by the link the \
+                user has, or by its publication_id."
+                .to_string(),
+            limits: [
+                "Only pages this agent published. Give exactly one of `url` or `publication_id`.",
+                "Taking a page down twice is harmless: a page already down, or expired, answers \
+                 `unpublished: false`.",
+            ]
+            .map(String::from)
+            .into(),
+            present_when: "the node has its identity: it was launched with its ILK".to_string(),
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The page's link, as `publish_html_page` gave it: \
+                            https://<host>/public/<key>, the key 64 lowercase hex characters."
+                    },
+                    "publication_id": {
+                        "type": "string",
+                        "description": "The page's publication_id, `pub:<uuid>`, as \
+                            `publish_html_page` gave it."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            output: json!({
+                "description": "`{status: \"ok\", publication_id, unpublished}`: `unpublished` is \
+                    false when the page was already down or had expired.",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "status": { "const": "ok" },
+                            "publication_id": { "type": "string" },
+                            "unpublished": { "type": "boolean" }
+                        },
+                        "required": ["status", "publication_id", "unpublished"]
+                    },
+                    tool_error_output(&["not_found", "not_yours", "unpublish_failed"])
+                ]
+            }),
+            errors: vec![
+                ToolErrorCode::new(
+                    "not_found",
+                    "No page was published with that link or publication_id, or it is not one: a \
+                     link's key is 64 lowercase hex characters after `/public/`.",
+                ),
+                ToolErrorCode::new(
+                    "not_yours",
+                    "Another node published that page: an agent takes down only its own.",
+                ),
+                ToolErrorCode::new(
+                    "unpublish_failed",
+                    "SY.admin could not take the page down now. `retryable: true`: try again \
+                     shortly; taking it down twice is harmless.",
+                ),
+            ],
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: UnpublishHtmlArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("unpublish_html_page", err))?;
+        let not_found = |message: &str| {
+            Ok(tool_error(
+                "unpublish_html_page",
+                "not_found",
+                message,
+                false,
+            ))
+        };
+        let given = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        // The link is the key to the page: neither the journal nor an error repeats it (A-95).
+        let params = match (given(args.publication_id), given(args.url)) {
+            (Some(publication_id), None) => {
+                if !is_publication_id(&publication_id) {
+                    return not_found(
+                        "a publication_id is pub:<uuid>, as publish_html_page gave it",
+                    );
+                }
+                json!({ "publication_id": publication_id })
+            }
+            (None, Some(url)) => {
+                match publication_key(&url) {
+                    Some(key) => json!({ "key": key }),
+                    None => return not_found(
+                        "that is not the link of a published page: its key, after /public/, is 64 \
+                         lowercase hex characters",
+                    ),
+                }
+            }
+            _ => {
+                return Err(fluxbee_ai_sdk::errors::AiSdkError::Protocol(
+                    "unpublish_html_page: give exactly one of url or publication_id".to_string(),
+                ))
+            }
+        };
+        match unpublish_artifact(&self.router, params).await {
+            Ok(result) if result.status == "ok" => {
+                let publication_id = result
+                    .payload
+                    .get("publication_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let unpublished = result
+                    .payload
+                    .get("unpublished")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                tracing::info!(
+                    tool = "unpublish_html_page",
+                    publication_id,
+                    unpublished,
+                    "page taken down"
+                );
+                Ok(json!({
+                    "status": "ok",
+                    "publication_id": publication_id,
+                    "unpublished": unpublished
+                }))
+            }
+            Ok(result) => {
+                tracing::warn!(
+                    tool = "unpublish_html_page",
+                    error_code = ?result.error_code,
+                    detail = ?result.error_detail,
+                    "unpublish refused"
+                );
+                Ok(match result.error_code.as_deref() {
+                    Some("NOT_FOUND") => tool_error(
+                        "unpublish_html_page",
+                        "not_found",
+                        "no page was published with that link or publication_id",
+                        false,
+                    ),
+                    Some("UNAUTHORIZED") => tool_error(
+                        "unpublish_html_page",
+                        "not_yours",
+                        "another node published that page",
+                        false,
+                    ),
+                    code => tool_error(
+                        "unpublish_html_page",
+                        "unpublish_failed",
+                        &format!(
+                            "SY.admin could not take it down now ({})",
+                            code.unwrap_or("no code")
+                        ),
+                        true,
+                    ),
+                })
+            }
+            Err(err) => {
+                tracing::warn!(tool = "unpublish_html_page", error = %err, "unpublish request failed");
+                Ok(tool_error(
+                    "unpublish_html_page",
+                    "unpublish_failed",
                     "could not reach the publishing service",
                     true,
                 ))
@@ -4918,6 +5287,242 @@ impl AgentTool for GetCurrentTimeTool {
                 ))
             }
         }
+    }
+}
+
+/// A failure of the tool `tool`, in the shape every tool's has: its code, a message that starts
+/// with the tool's name, and whether trying again may help.
+fn tool_error(tool: &str, code: &str, message: &str, retryable: bool) -> Value {
+    json!({
+        "status": "error",
+        "error_code": code,
+        "message": format!("{tool}: {message}"),
+        "retryable": retryable
+    })
+}
+
+/// The piece of `text` from byte `offset`, at most `max_bytes`, with both ends moved back to the
+/// start of a character: where it starts and where it ends. An offset at or past the end is the
+/// empty piece at the end.
+fn text_piece(text: &str, offset: u64, max_bytes: usize) -> (usize, usize) {
+    let size = text.len();
+    let mut start = usize::try_from(offset).unwrap_or(usize::MAX).min(size);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = start.saturating_add(max_bytes).min(size);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (start, end)
+}
+
+#[async_trait]
+impl AgentTool for ReadBlobTool {
+    /// It reads with the SDK's `read_blob_by_name`: no link followed, the bytes checked against the
+    /// hash in the name, and a file over the cap refused unread. The store has no tenant: an agent
+    /// reads any text blob of its hive whose name reached it (FINDINGS A-106). Text is decided by
+    /// the content, as an attachment's is decoded (the AI SDK's text_payload): bytes that are not
+    /// UTF-8 become U+FFFD, and the offsets count the bytes of that text, those of a cut
+    /// attachment's line.
+    fn card() -> ToolCard {
+        ToolCard {
+            name: "read_blob".to_string(),
+            summary: "Read a text file from this hive's blob store, by its blob name.".to_string(),
+            when_to_use: "When an attachment's text was cut, or you need an attached text file \
+                again: every attachment shows its blob name, `<name>_<hash16>.<ext>`, and a cut \
+                one also the offset to read on from. Read a long file a piece at a time."
+                .to_string(),
+            limits: [
+                "A text file (csv, json, md, html, txt, logs…), judged by its content, whatever \
+                 its name: a piece with a NUL byte, as binary files have, is `not_text`. Bytes \
+                 that are not UTF-8 become U+FFFD, as in an attachment.",
+                "Files up to 10 MiB. Each call returns up to 64 KiB of text from `offset`, in bytes \
+                 of the text, cut where a character starts; read on from `next_offset`.",
+                "Up to 192 KiB of text in all for one message, over all its calls.",
+                "It waits up to 20 s for a blob still on its way from another hive.",
+            ]
+            .map(String::from)
+            .into(),
+            present_when: "always: every hive with agents has a blob store".to_string(),
+            input: json!({
+                "type": "object",
+                "properties": {
+                    "blob_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "The blob's name, `<name>_<hash16>.<ext>`, as an \
+                            attachment shows it."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Where to start, in bytes of the text: 0 by default, the \
+                            `next_offset` of the piece before, or the offset a cut attachment \
+                            gives."
+                    }
+                },
+                "required": ["blob_name"],
+                "additionalProperties": false
+            }),
+            output: json!({
+                "description": "`{status: \"ok\", blob_name, size_bytes, offset, text, \
+                    next_offset}`: the text from `offset`, the whole text's size in bytes, and \
+                    where the next piece starts (null at the end).",
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "status": { "const": "ok" },
+                            "blob_name": { "type": "string" },
+                            "size_bytes": {
+                                "type": "integer",
+                                "description": "The whole text's size, in bytes: the file's, \
+                                    when it is UTF-8."
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Where `text` starts, in bytes: the offset asked \
+                                    for, moved back to the start of a character."
+                            },
+                            "text": { "type": "string" },
+                            "next_offset": {
+                                "type": ["integer", "null"],
+                                "description": "Where the next piece starts; null at the end."
+                            }
+                        },
+                        "required": [
+                            "status", "blob_name", "size_bytes", "offset", "text", "next_offset"
+                        ]
+                    },
+                    tool_error_output(&[
+                        "invalid_blob_name",
+                        "not_text",
+                        "not_found",
+                        "too_large",
+                        "read_budget_exhausted"
+                    ])
+                ]
+            }),
+            errors: vec![
+                ToolErrorCode::new(
+                    "invalid_blob_name",
+                    "`blob_name` is not a blob's name, `<name>_<hash16>.<ext>`: use the name an \
+                     attachment shows, whole.",
+                ),
+                ToolErrorCode::new(
+                    "not_text",
+                    "The piece read has a NUL byte: the file is binary, not text. It cannot be \
+                     read.",
+                ),
+                ToolErrorCode::new(
+                    "not_found",
+                    "No blob of this hive has that name, after waiting 20 s for one on its way, \
+                     or what is there is not that blob.",
+                ),
+                ToolErrorCode::new(
+                    "too_large",
+                    "The file is over 10 MiB, the most it reads.",
+                ),
+                ToolErrorCode::new(
+                    "read_budget_exhausted",
+                    "This message has read 192 KiB of blob text, the most one message reads. Not \
+                     retryable within this message: answer with what you have read; a later \
+                     message can read on.",
+                ),
+            ],
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: ReadBlobArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("read_blob", err))?;
+        let blob_name = args.blob_name.trim();
+        let failed = |code: &str, message: &str| Ok(tool_error("read_blob", code, message, false));
+        let exhausted = || {
+            failed(
+                "read_budget_exhausted",
+                &format!(
+                    "this message has read {} KiB of blob text, the most one message reads; \
+                     answer with what you have read",
+                    READ_BLOB_BUDGET_BYTES / 1024
+                ),
+            )
+        };
+        let spent = *self.budget() == 0;
+        if spent {
+            return exhausted();
+        }
+        if let Err(err) = fluxbee_sdk::blob::BlobToolkit::validate_blob_name(blob_name) {
+            return failed(
+                "invalid_blob_name",
+                &format!("'{blob_name}' is not a blob name, <name>_<hash16>.<ext> ({err})"),
+            );
+        }
+        let read = async {
+            let blob = fluxbee_sdk::blob::BlobToolkit::new(self.blob.clone())?;
+            let wait = fluxbee_sdk::blob::ResolveRetryConfig {
+                max_wait_ms: self.wait.as_millis() as u64,
+                ..fluxbee_sdk::blob::ResolveRetryConfig::default()
+            };
+            blob.read_blob_by_name_with_retry(blob_name, READ_BLOB_MAX_BYTES, wait)
+                .await
+        };
+        let bytes = match read.await {
+            Ok(bytes) => bytes,
+            Err(fluxbee_sdk::blob::BlobError::TooLarge { size, .. }) => {
+                return failed(
+                    "too_large",
+                    &format!("'{blob_name}' has {size} bytes; the most it reads is 10 MiB"),
+                );
+            }
+            Err(fluxbee_sdk::blob::BlobError::NotFound(_)) => {
+                return failed(
+                    "not_found",
+                    &format!("no blob named '{blob_name}' in this hive's store"),
+                );
+            }
+            Err(err) => {
+                // An integrity or I/O failure: the journal gets it, without the blob's name, which
+                // is the permission to read the blob (A-106); the model only that nothing
+                // readable is there.
+                tracing::warn!(
+                    tool = "read_blob",
+                    error = %redact_blob_names(&err.to_string()),
+                    "blob not read"
+                );
+                return failed(
+                    "not_found",
+                    &format!("nothing readable is stored as '{blob_name}'"),
+                );
+            }
+        };
+        // Text as an attachment's text is: whatever its name, decoded with U+FFFD for bytes that
+        // are not UTF-8 (text_payload), so the offset a cut attachment gives starts here at the
+        // same character.
+        let text = String::from_utf8_lossy(&bytes);
+        let mut budget = self.budget();
+        let (start, end) = text_piece(&text, args.offset, READ_BLOB_PIECE_BYTES.min(*budget));
+        let piece = &text[start..end];
+        if piece.contains('\0') {
+            return failed(
+                "not_text",
+                &format!("'{blob_name}' is not text: the piece read has a NUL byte"),
+            );
+        }
+        if piece.is_empty() && start < text.len() {
+            // What is left of the budget does not hold the next character.
+            return exhausted();
+        }
+        *budget -= piece.len();
+        Ok(json!({
+            "status": "ok",
+            "blob_name": blob_name,
+            "size_bytes": text.len(),
+            "offset": start,
+            "text": piece,
+            "next_offset": (end < text.len()).then_some(end),
+        }))
     }
 }
 
@@ -6301,8 +6906,14 @@ fn incoming_sender_hint(msg: &Message) -> Option<String> {
     }
 }
 
+/// What the journal shows of a text: its words, at most `max_chars` characters, and no permission
+/// to read anything. A page's link carries its key, the permission to open the page (FINDINGS A-95:
+/// no live link in the journal), and a blob's name is the permission to read the blob with
+/// `read_blob`, from any tenant (A-106). So every `/public/<key>` becomes `/public/<redacted>`, and
+/// every `<stem>_<hash16>.<ext>` becomes `<blob>`, before the cut, which could leave part of one.
 fn text_preview(text: &str, max_chars: usize) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_blob_names(&redact_public_keys(text));
+    let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
         return compact;
     }
@@ -6312,6 +6923,71 @@ fn text_preview(text: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+/// `text` with the key of every `/public/<key>` link in it (`public_key_len`) replaced by
+/// `<redacted>`.
+fn redact_public_keys(text: &str) -> String {
+    const PUBLIC: &str = "/public/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(PUBLIC) {
+        let (head, tail) = rest.split_at(at + PUBLIC.len());
+        out.push_str(head);
+        let key_len = public_key_len(tail);
+        if key_len > 0 {
+            out.push_str("<redacted>");
+        }
+        rest = &tail[key_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `text` with every blob name in it replaced by `<blob>`: a name as the blob store makes it,
+/// `<stem>_<hash16>.<ext>` (`blob_name_end`), with the stem's characters before the `_`.
+fn redact_blob_names(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let is_stem_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some(end) = blob_name_end(bytes, at) else {
+            at += 1;
+            continue;
+        };
+        let mut start = at;
+        while start > copied && is_stem_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        out.push_str(&text[copied..start]);
+        out.push_str("<blob>");
+        copied = end;
+        at = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Where a blob name ends whose `_` before the hash is `bytes[underscore]`: past the hash's 16 hex
+/// digits, a `.` and the extension's letters and digits. `None` when no blob name has its hash
+/// there.
+fn blob_name_end(bytes: &[u8], underscore: usize) -> Option<usize> {
+    if bytes[underscore] != b'_' {
+        return None;
+    }
+    let dot = underscore + 1 + fluxbee_sdk::blob::BLOB_HASH_LEN;
+    let hash = bytes.get(underscore + 1..dot)?;
+    if !hash.iter().all(u8::is_ascii_hexdigit) || bytes.get(dot) != Some(&b'.') {
+        return None;
+    }
+    let extension = bytes[dot + 1..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    (extension > 0).then_some(dot + 1 + extension)
 }
 
 fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) -> Option<String> {
@@ -9024,8 +9700,8 @@ mod tests {
             sorted(cards.iter().map(ToolCard::model_definition).collect())
         );
 
-        // No interlocutor and no identity: the state tools and publish_html_page are not there;
-        // the generators and get_current_time always are.
+        // No interlocutor and no identity: the state tools and the publishing tools are not
+        // there; the generators, get_current_time and read_blob always are.
         let mut bare = test_node();
         bare.router = Some(dispatcher);
         let mut names = bare
@@ -9042,7 +9718,7 @@ mod tests {
             .map(|card| card.name.clone())
             .collect::<Vec<_>>();
         always.sort();
-        assert_eq!(always.len(), 11);
+        assert_eq!(always.len(), 12);
         assert_eq!(names, always);
     }
 
@@ -9736,7 +10412,8 @@ mod tests {
 
     /// A node, an `admin` message, a verb in another case and the orchestrator of another hive are
     /// refused: a WARN, an `unauthorized` answer under the verb's own response, and nothing
-    /// changes. A system message that is no control verb is answered as before.
+    /// changes. A system message from a node that is no control verb is answered as before; one the
+    /// router made gets no answer (A-112).
     #[tokio::test]
     async fn the_control_plane_refuses_every_other_caller() {
         let node = test_node();
@@ -9796,12 +10473,712 @@ mod tests {
         );
         assert!(text.contains("WARN"), "{text}");
 
-        // Not a control verb: answered as before, whoever sends it.
-        let mut notice = sample_request();
-        notice.routing.src_l2_name = None;
-        notice.meta.msg = Some("VAULT_SECRET_CHANGED".to_string());
-        let answer = control_answer(&node, notice).await;
+        // Not a control verb, from a node: answered as before.
+        let mut unknown = sample_request();
+        unknown.routing.src_l2_name = Some("SY.vault@motherbee".to_string());
+        unknown.meta.msg = Some("VAULT_SECRET_CHANGED".to_string());
+        let answer = control_answer(&node, unknown.clone()).await;
         assert_eq!(answer.payload["error"]["code"], json!("unknown_system_msg"));
+        // The same without a sender's name is the router's: no answer.
+        unknown.routing.src_l2_name = None;
+        assert!(node
+            .handle_control_plane(unknown)
+            .await
+            .expect("control plane")
+            .is_none());
+    }
+
+    // --- agent-tools-v1 §6.2.1: read_blob ---
+
+    /// `read_blob` for one message, over a blob store of its own, waiting `wait` for a missing
+    /// blob.
+    fn read_blob_tool(blob_root: &Path, wait: Duration) -> ReadBlobTool {
+        ReadBlobTool::new(
+            fluxbee_sdk::blob::BlobConfig {
+                blob_root: blob_root.to_path_buf(),
+                ..fluxbee_sdk::blob::BlobConfig::default()
+            },
+            wait,
+        )
+    }
+
+    /// A blob store of its own, under the temp directory, and its root.
+    fn temp_blob_store() -> (fluxbee_sdk::blob::BlobToolkit, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ai-generic-read-blob-{}", Uuid::new_v4()));
+        let store = fluxbee_sdk::blob::BlobToolkit::new(fluxbee_sdk::blob::BlobConfig {
+            blob_root: root.clone(),
+            ..fluxbee_sdk::blob::BlobConfig::default()
+        })
+        .expect("store");
+        (store, root)
+    }
+
+    /// `bytes` in `store` as the file `filename` of type `mime`, as an attachment arrives.
+    fn stored(
+        store: &fluxbee_sdk::blob::BlobToolkit,
+        bytes: &[u8],
+        filename: &str,
+        mime: &str,
+    ) -> fluxbee_sdk::blob::BlobRef {
+        let blob = store.put_bytes(bytes, filename, mime).expect("put");
+        store.promote(&blob).expect("promote");
+        blob
+    }
+
+    /// `tool`'s answer for `blob_name` from `offset`.
+    async fn read_blob_at(tool: &ReadBlobTool, blob_name: &str, offset: usize) -> Value {
+        AgentTool::call(tool, json!({"blob_name": blob_name, "offset": offset}))
+            .await
+            .expect("read_blob")
+    }
+
+    /// A text blob is read by its name, at most 64 KiB a call, each piece cut where a character
+    /// starts, and the next piece starts where the last one ended, until `next_offset` is null.
+    #[tokio::test]
+    async fn read_blob_reads_a_text_blob_a_piece_at_a_time() {
+        let (store, root) = temp_blob_store();
+        // One byte, then two-byte characters: 64 KiB falls inside one.
+        let text = format!("a{}", "ñ".repeat(40_000));
+        let blob = stored(&store, text.as_bytes(), "informe.csv", "text/csv");
+        let tool = read_blob_tool(&root, Duration::from_millis(50));
+        let name = blob.blob_name.as_str();
+
+        let first = read_blob_at(&tool, name, 0).await;
+        assert_eq!(first["status"], json!("ok"));
+        assert_eq!(first["size_bytes"], json!(80_001));
+        assert_eq!(first["offset"], json!(0));
+        assert_eq!(
+            first["next_offset"],
+            json!(65_535),
+            "moved back to a character"
+        );
+        let second = read_blob_at(&tool, name, 65_535).await;
+        assert_eq!(second["next_offset"], Value::Null);
+        let whole = format!(
+            "{}{}",
+            first["text"].as_str().expect("text"),
+            second["text"].as_str().expect("text")
+        );
+        assert_eq!(whole, text);
+        // An offset inside a character starts at that character; one past the end reads nothing.
+        assert_eq!(read_blob_at(&tool, name, 2).await["offset"], json!(1));
+        let past = read_blob_at(&tool, name, 90_000).await;
+        assert_eq!(
+            (past["text"].clone(), past["next_offset"].clone()),
+            (json!(""), Value::Null)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Text is judged by the content, not the name: YAML, XML, SQL, a file that had no extension
+    /// (stored as `.bin`) and Windows-1252 text read, the bytes that are not UTF-8 as U+FFFD, as in
+    /// an attachment.
+    #[tokio::test]
+    async fn read_blob_reads_any_text_whatever_its_name() {
+        let (store, root) = temp_blob_store();
+        let tool = read_blob_tool(&root, Duration::from_millis(50));
+        for (bytes, filename, text) in [
+            (&b"modelo: claude\n"[..], "config.yaml", "modelo: claude\n"),
+            (
+                &b"<rss version=\"2.0\"/>"[..],
+                "feed.xml",
+                "<rss version=\"2.0\"/>",
+            ),
+            (&b"SELECT 1;"[..], "consulta.sql", "SELECT 1;"),
+            (&b"leeme primero"[..], "LEEME", "leeme primero"),
+            (
+                &b"caf\xe9 con le\xf1a"[..],
+                "notas.txt",
+                "caf\u{FFFD} con le\u{FFFD}a",
+            ),
+        ] {
+            let blob = stored(&store, bytes, filename, "application/octet-stream");
+            let answer = read_blob_at(&tool, &blob.blob_name, 0).await;
+            assert_eq!(answer["status"], json!("ok"), "{filename}: {answer}");
+            assert_eq!(answer["text"], json!(text), "{filename}");
+            assert_eq!(answer["size_bytes"], json!(text.len()), "{filename}");
+        }
+        assert!(stored(&store, b"x", "LEEME", "text/plain")
+            .blob_name
+            .ends_with(".bin"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Each failure has its code: a name that is not a blob's, a piece with a NUL byte (a binary
+    /// file, whatever its name), a blob not there after the wait, whatever its extension, and one
+    /// over 10 MiB, refused unread.
+    #[tokio::test]
+    async fn read_blob_refuses_what_it_cannot_read() {
+        let (store, root) = temp_blob_store();
+        let binary = stored(&store, &[0xff, 0xfe, 0x00], "datos.txt", "text/plain");
+        let png = stored(
+            &store,
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR",
+            "grafico.png",
+            "image/png",
+        );
+        let big = "grande_0123456789abcdef.txt";
+        let big_path = root.join("active").join("01").join(big);
+        fs::create_dir_all(big_path.parent().expect("prefix")).expect("prefix dir");
+        fs::File::create(&big_path)
+            .and_then(|file| file.set_len(READ_BLOB_MAX_BYTES + 1))
+            .expect("a file over the cap");
+        let tool = read_blob_tool(&root, Duration::from_millis(50));
+        for (blob_name, code) in [
+            ("informe.csv", "invalid_blob_name"),
+            ("../x_0123456789abcdef.txt", "invalid_blob_name"),
+            (binary.blob_name.as_str(), "not_text"),
+            (png.blob_name.as_str(), "not_text"),
+            ("ausente_0123456789abcdef.txt", "not_found"),
+            ("informe_0123456789abcdef.pdf", "not_found"),
+            (big, "too_large"),
+        ] {
+            let answer = AgentTool::call(&tool, json!({ "blob_name": blob_name }))
+                .await
+                .expect("read_blob");
+            assert_eq!(answer["error_code"], json!(code), "{blob_name}: {answer}");
+            assert_eq!(answer["retryable"], json!(false));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The line of a cut attachment names its blob and the byte offset where the text stopped, and
+    /// `read_blob` reads the rest from there: a Slack log, `server_<h>.log` as text/plain, and a
+    /// Windows-1252 CSV, which is not UTF-8. Both read its bytes as U+FFFD where they are not
+    /// UTF-8, so the offset counts the same bytes.
+    #[tokio::test]
+    async fn read_blob_reads_on_where_a_cut_attachment_stops() {
+        let (store, root) = temp_blob_store();
+        let log = stored(
+            &store,
+            b"2026-10-27 10:00:01 INFO start\n2026-10-27 10:00:02 WARN slow disk\n",
+            "server_7f3a9c.log",
+            "text/plain",
+        );
+        let csv = stored(
+            &store,
+            b"producto;precio\nca\xf1a;5\nni\xf1o;7\nespa\xf1a;9\n",
+            "ventas.csv",
+            "text/csv",
+        );
+        let tool = read_blob_tool(&root, Duration::from_millis(50));
+        let options = ModelInputOptions {
+            max_attachment_text_chars: 30,
+            blob_root: Some(root.clone()),
+            ..ModelInputOptions::default()
+        };
+        // 30 characters of the CSV hold two U+FFFD, of three bytes each, where the file has one.
+        for (attachment, cut) in [(&log, 30), (&csv, 34)] {
+            let resolved = resolve_model_input_from_payload_with_options(
+                &json!({"type": "text", "content": "mirá", "attachments": [attachment]}),
+                &options,
+            )
+            .await
+            .expect("resolved");
+            let whole = resolved.attachments[0].text_content.clone().expect("text");
+            let (inline, line) = resolved
+                .prompt_text
+                .split_once(&format!(" | blob {}]\n", attachment.blob_name))
+                .and_then(|(_, block)| block.split_once("\n[cut at 30 characters: "))
+                .expect("a cut attachment");
+            assert_eq!(
+                line,
+                format!(
+                    "the whole text is the blob {}; read on from offset {cut}]\n\
+                     [attachment_end]\n--- end attachments ---",
+                    attachment.blob_name
+                )
+            );
+            let rest = read_blob_at(&tool, &attachment.blob_name, cut).await;
+            assert_eq!(rest["status"], json!("ok"), "{rest}");
+            assert_eq!(rest["next_offset"], Value::Null);
+            assert_eq!(
+                format!("{inline}{}", rest["text"].as_str().expect("text")),
+                whole
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// One message reads 192 KiB of blob text at most, over all its calls: the piece that reaches
+    /// the budget is cut there, and every call after it is `read_budget_exhausted`, not retryable,
+    /// whatever it asks; so is one the rest of the budget cannot hold a character for. The next
+    /// message's `read_blob` starts with the whole budget.
+    #[tokio::test]
+    async fn read_blob_reads_at_most_192_kib_a_message() {
+        let (store, root) = temp_blob_store();
+        let short = stored(
+            &store,
+            "s".repeat(51_201).as_bytes(),
+            "corto.txt",
+            "text/plain",
+        );
+        let long = stored(
+            &store,
+            "x".repeat(300 * 1024).as_bytes(),
+            "largo.txt",
+            "text/plain",
+        );
+        let wide = stored(
+            &store,
+            "ñ".repeat(100_000).as_bytes(),
+            "ancho.txt",
+            "text/plain",
+        );
+        let (short, long, wide) = (
+            short.blob_name.as_str(),
+            long.blob_name.as_str(),
+            wide.blob_name.as_str(),
+        );
+        let text_len = |answer: &Value| answer["text"].as_str().expect("text").len();
+
+        let message = read_blob_tool(&root, Duration::from_millis(50));
+        let mut read_so_far = 0;
+        for (name, offset, length) in [
+            (short, 0, 51_201),
+            (long, 0, 65_536),
+            (long, 65_536, 65_536),
+            // The rest of the budget: the piece is cut there.
+            (long, 131_072, 14_335),
+        ] {
+            let answer = read_blob_at(&message, name, offset).await;
+            assert_eq!(text_len(&answer), length, "{offset}");
+            read_so_far += length;
+        }
+        assert_eq!(read_so_far, READ_BLOB_BUDGET_BYTES);
+        for (name, offset) in [
+            (long, 145_407),
+            (short, 0),
+            ("ausente_0123456789abcdef.txt", 0),
+        ] {
+            let answer = read_blob_at(&message, name, offset).await;
+            assert_eq!(
+                answer["error_code"],
+                json!("read_budget_exhausted"),
+                "{answer}"
+            );
+            assert_eq!(answer["retryable"], json!(false));
+        }
+
+        // The next message.
+        let next = read_blob_tool(&root, Duration::from_millis(50));
+        assert_eq!(text_len(&read_blob_at(&next, long, 145_407).await), 65_536);
+
+        // One byte of budget left, and the next character takes two.
+        let third = read_blob_tool(&root, Duration::from_millis(50));
+        for (name, offset, length) in [
+            (short, 0, 51_201),
+            (wide, 0, 65_536),
+            (wide, 65_536, 65_536),
+            (wide, 131_072, 14_334),
+        ] {
+            assert_eq!(text_len(&read_blob_at(&third, name, offset).await), length);
+        }
+        let answer = read_blob_at(&third, wide, 145_406).await;
+        assert_eq!(
+            answer["error_code"],
+            json!("read_budget_exhausted"),
+            "{answer}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- agent-tools-v1 §6.2.2: unpublish_html_page ---
+
+    const PUBLICATION: &str = "pub:3b0e8f52-1d4c-4a8e-9f6b-2c7d5e1a9b04";
+    const PAGE_KEY: &str = "9c4f1e2d7a6b5c8d0e3f2a1b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f";
+
+    /// SY.admin's answer to `request`, an ADMIN_COMMAND sent through `harness`: `body` is the
+    /// whole payload.
+    fn admin_reply(
+        harness: &fluxbee_sdk::RouterDispatcherTestHarness,
+        request: &Message,
+        body: Value,
+    ) -> Message {
+        Message {
+            routing: Routing {
+                src: "uuid-of-sy-admin".to_string(),
+                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                dst: Destination::Unicast(harness.sender_uuid().to_string()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: fluxbee_sdk::ADMIN_KIND.to_string(),
+                msg: Some(fluxbee_sdk::MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload: body,
+        }
+    }
+
+    /// `unpublish_html_page` called with `arguments`, and the ADMIN_COMMAND it sent, once a stubbed
+    /// SY.admin has answered it with `body`.
+    async fn unpublish_asked(arguments: Value, body: Value) -> (Value, Message) {
+        let (router, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let tool = UnpublishHtmlTool { router };
+        let admin = async {
+            let request = harness.next_outgoing().await.expect("unpublish_artifact");
+            let answer = admin_reply(&harness, &request, body);
+            harness.inject(answer).await.expect("SY.admin's answer");
+            request
+        };
+        let (answer, request) = tokio::join!(AgentTool::call(&tool, arguments), admin);
+        (answer.expect("unpublish_html_page"), request)
+    }
+
+    /// A page is taken down by its publication_id or by its link, whose key SY.admin takes, also
+    /// when the link comes with what surrounds it in a chat: Slack's `<link|label>`, a `)`. A page
+    /// already down answers `unpublished: false`, and SY.admin's refusals have their codes.
+    #[tokio::test]
+    async fn unpublish_html_page_takes_a_page_down_by_its_link_or_its_id() {
+        let done = |unpublished: bool| {
+            json!({
+                "status": "ok",
+                "action": "unpublish_artifact",
+                "payload": {"publication_id": PUBLICATION, "unpublished": unpublished}
+            })
+        };
+        let (answer, request) =
+            unpublish_asked(json!({ "publication_id": PUBLICATION }), done(true)).await;
+        assert_eq!(request.meta.action.as_deref(), Some("unpublish_artifact"));
+        assert!(matches!(
+            request.routing.dst,
+            Destination::Unicast(ref dst) if dst == "SY.admin@motherbee"
+        ));
+        assert_eq!(
+            request.payload["params"],
+            json!({ "publication_id": PUBLICATION })
+        );
+        assert_eq!(
+            answer,
+            json!({"status": "ok", "publication_id": PUBLICATION, "unpublished": true})
+        );
+
+        for link in [
+            format!("https://fluxbee.example/public/{PAGE_KEY}?utm=x"),
+            format!("<https://fluxbee.example/public/{PAGE_KEY}|la página>"),
+            format!("(https://fluxbee.example/public/{PAGE_KEY})"),
+            format!("https://fluxbee.example/public/{PAGE_KEY}/."),
+        ] {
+            let (answer, request) = unpublish_asked(json!({ "url": link }), done(false)).await;
+            assert_eq!(
+                request.payload["params"],
+                json!({ "key": PAGE_KEY }),
+                "{link}"
+            );
+            assert_eq!(answer["unpublished"], json!(false));
+        }
+
+        for (code, error_code, retryable) in [
+            ("NOT_FOUND", "not_found", false),
+            ("UNAUTHORIZED", "not_yours", false),
+            ("EDGE_UNPUBLISH_FAILED", "unpublish_failed", true),
+        ] {
+            let (answer, _) = unpublish_asked(
+                json!({ "publication_id": PUBLICATION }),
+                json!({
+                    "status": "error",
+                    "action": "unpublish_artifact",
+                    "error_code": code,
+                    "error_detail": "refused"
+                }),
+            )
+            .await;
+            assert_eq!(answer["error_code"], json!(error_code), "{code}");
+            assert_eq!(answer["retryable"], json!(retryable), "{code}");
+        }
+    }
+
+    /// What names no page is refused before SY.admin is asked, as `not_found`, which no retry
+    /// changes: a publication_id that is not `pub:<uuid>`, a link without `/public/<key>`, a key
+    /// that is not 64 lowercase hex characters (SY.admin's `INVALID_REQUEST` would have been
+    /// `unpublish_failed`, retryable), both or neither.
+    #[tokio::test]
+    async fn unpublish_html_page_refuses_what_names_no_page() {
+        let (router, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let tool = UnpublishHtmlTool { router };
+        let link = |key: &str| json!({ "url": format!("https://fluxbee.example/public/{key}") });
+        for arguments in [
+            json!({"publication_id": "pub-7"}),
+            json!({"url": "https://fluxbee.example/e/page"}),
+            json!({"url": "https://fluxbee.example/public/"}),
+            link("abc"),
+            link(&PAGE_KEY[1..]),
+            link(&format!("{PAGE_KEY}0")),
+            link(&PAGE_KEY.to_ascii_uppercase()),
+            link(&format!("{}g", &PAGE_KEY[1..])),
+            json!({"url": "<https://fluxbee.example/public/abc|la página>"}),
+            json!({"url": "https://fluxbee.example/public/abc)"}),
+        ] {
+            let answer = AgentTool::call(&tool, arguments.clone())
+                .await
+                .expect("unpublish_html_page");
+            assert_eq!(answer["error_code"], json!("not_found"), "{arguments}");
+            assert_eq!(answer["retryable"], json!(false), "{arguments}");
+        }
+        for arguments in [
+            json!({}),
+            json!({"publication_id": PUBLICATION, "url": "https://x/public/k"}),
+        ] {
+            assert!(AgentTool::call(&tool, arguments).await.is_err());
+        }
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+        assert_eq!(
+            publication_key(&format!("https://h/public/{PAGE_KEY}/#top")),
+            Some(PAGE_KEY),
+            "the key, without what follows it"
+        );
+    }
+
+    /// SY.admin is not reached: the router's UNREACHABLE fails the request (`Err(RpcError)`), and
+    /// the answer is `unpublish_failed`, retryable: taking a page down twice is harmless.
+    #[tokio::test]
+    async fn unpublish_html_page_is_retryable_when_sy_admin_is_not_reached() {
+        let (router, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let tool = UnpublishHtmlTool { router };
+        let (logs, _guard) = LogCapture::start();
+        let router = async {
+            let request = harness.next_outgoing().await.expect("unpublish_artifact");
+            let notice = fluxbee_sdk::protocol::build_unreachable(
+                ROUTER_UUID,
+                harness.sender_uuid(),
+                &request.routing.trace_id,
+                "SY.admin@motherbee",
+                "NODE_NOT_FOUND",
+            );
+            harness.inject(notice).await.expect("the router's notice");
+        };
+        let (answer, ()) = tokio::join!(
+            AgentTool::call(&tool, json!({ "publication_id": PUBLICATION })),
+            router
+        );
+        let answer = answer.expect("unpublish_html_page");
+        assert_eq!(answer["error_code"], json!("unpublish_failed"), "{answer}");
+        assert_eq!(answer["retryable"], json!(true));
+        // The notice failed the request, not UNPUBLISH_TIMEOUT.
+        let text = logs.text();
+        assert!(
+            text.contains("transport unreachable: reason=NODE_NOT_FOUND"),
+            "{text}"
+        );
+    }
+
+    /// Stands in for `unpublish_html_page`: answers each call with `answer`, as the tool does.
+    struct TakenDownPage {
+        answer: Value,
+    }
+
+    #[async_trait]
+    impl fluxbee_ai_sdk::FunctionTool for TakenDownPage {
+        fn definition(&self) -> fluxbee_ai_sdk::FunctionToolDefinition {
+            UnpublishHtmlTool::card().model_definition()
+        }
+
+        async fn call(&self, _arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+            Ok(self.answer.clone())
+        }
+    }
+
+    /// A page taken down in the same turn it was published in is not added to the reply.
+    #[tokio::test]
+    async fn a_page_taken_down_in_its_turn_is_not_added_to_the_reply() {
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(PublishedPage {
+                answer: json!({
+                    "status": "ok",
+                    "url": "https://fluxbee.example/public/k3y",
+                    "publication_id": PUBLICATION,
+                }),
+            }))
+            .expect("register");
+        tools
+            .register(Arc::new(TakenDownPage {
+                answer: json!({"status": "ok", "publication_id": PUBLICATION, "unpublished": true}),
+            }))
+            .expect("register");
+        let model = ScriptedModel::new(
+            vec![
+                (
+                    "publish_html_page",
+                    json!({"filename": "page.html", "content": "<html>v1</html>"}),
+                ),
+                (
+                    "unpublish_html_page",
+                    json!({ "publication_id": PUBLICATION }),
+                ),
+            ],
+            Some("Listo, la quité."),
+        );
+        let files = ReplyFiles::default();
+        assert_eq!(
+            run_tool_loop_with(&model, &tools, &files).await,
+            Some(AiBehaviorOutput::text("Listo, la quité.")),
+        );
+    }
+
+    /// SY.admin publishes a page but has no public address for its link: the model is told the
+    /// page was not published, and the tool takes it down rather than leave it live until it
+    /// expires.
+    #[tokio::test]
+    async fn a_page_published_without_a_public_link_is_taken_down() {
+        let blob_root = std::env::temp_dir().join(format!("ai-generic-publish-{}", Uuid::new_v4()));
+        let (dispatcher, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.sales@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
+        );
+        let tool = PublishHtmlTool {
+            vault: vault_client_for(
+                dispatcher,
+                "AI.sales@motherbee",
+                Some("ilk:11111111-1111-4111-8111-111111111111"),
+            )
+            .expect("vault client"),
+            blob: fluxbee_sdk::blob::BlobConfig {
+                blob_root: blob_root.clone(),
+                ..fluxbee_sdk::blob::BlobConfig::default()
+            },
+        };
+        let admin = async {
+            let publish = harness.next_outgoing().await.expect("publish_artifact");
+            assert_eq!(publish.meta.action.as_deref(), Some("publish_artifact"));
+            let answer = admin_reply(
+                &harness,
+                &publish,
+                json!({
+                    "status": "ok",
+                    "action": "publish_artifact",
+                    "payload": {
+                        "publication_id": PUBLICATION,
+                        "url": format!("/public/{PAGE_KEY}"),
+                        "public_url": null,
+                        "expires_at": 1_790_000_000u64
+                    }
+                }),
+            );
+            harness.inject(answer).await.expect("publish answer");
+            let unpublish = harness.next_outgoing().await.expect("unpublish_artifact");
+            let answer = admin_reply(
+                &harness,
+                &unpublish,
+                json!({
+                    "status": "ok",
+                    "action": "unpublish_artifact",
+                    "payload": {"publication_id": PUBLICATION, "unpublished": true}
+                }),
+            );
+            harness.inject(answer).await.expect("unpublish answer");
+            unpublish
+        };
+        let (answer, unpublish) = tokio::join!(
+            AgentTool::call(
+                &tool,
+                json!({"filename": "page.html", "content": "<html>hola</html>"})
+            ),
+            admin
+        );
+        let answer = answer.expect("publish_html_page");
+        assert_eq!(answer["error_code"], json!("publish_failed"));
+        assert!(answer["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the page was not published")));
+        assert_eq!(unpublish.meta.action.as_deref(), Some("unpublish_artifact"));
+        assert_eq!(
+            unpublish.payload["params"],
+            json!({ "publication_id": PUBLICATION })
+        );
+        let _ = fs::remove_dir_all(blob_root);
+    }
+
+    // --- A-112: a router notice is never answered ---
+
+    /// The router's own UUID, which it stamps as `routing.src` on a notice it makes.
+    const ROUTER_UUID: &str = "1b1c3e40-8f2a-4c1e-9d55-6a1f0b7c2d10";
+    /// The UUID the runtime stamps on what the node sends.
+    const NODE_UUID: &str = "5d2e9a71-3c4b-4f8e-a1d2-7b6c5e4f3a21";
+
+    /// FINDINGS A-112. The router answers a message it cannot deliver with UNREACHABLE to its
+    /// sender (`send_unreachable_to`, src/router/mod.rs): from its own UUID, without
+    /// `src_l2_name`. An answer to that notice goes to the router's UUID, which no node has, so the
+    /// router answers it UNREACHABLE in turn, and so on. The node answers no notice: the bounce
+    /// ends at the first one, and the journal says what was not delivered, and why.
+    #[tokio::test]
+    async fn a_router_notice_is_never_answered() {
+        let node = test_node();
+        let (logs, _guard) = LogCapture::start();
+        // A reply the node sent to an IO node that is gone comes back.
+        let mut notice = fluxbee_sdk::protocol::build_unreachable(
+            ROUTER_UUID,
+            NODE_UUID,
+            "trace-a112",
+            "IO.gone@motherbee",
+            "NODE_NOT_FOUND",
+        );
+        let mut answers = 0;
+        while let Some(mut answer) = node.on_message(notice).await.expect("on_message") {
+            answers += 1;
+            assert!(matches!(
+                answer.routing.dst,
+                Destination::Unicast(ref dst) if dst == ROUTER_UUID
+            ));
+            if answers == 3 {
+                break;
+            }
+            // The runtime sends the answer as the node (`process_one`), and no node has the
+            // router's UUID: the router answers it UNREACHABLE (`send_unreachable_to`).
+            answer.routing.src = NODE_UUID.to_string();
+            notice = fluxbee_sdk::protocol::build_unreachable(
+                ROUTER_UUID,
+                &answer.routing.src,
+                &answer.routing.trace_id,
+                ROUTER_UUID,
+                "NODE_NOT_FOUND",
+            );
+        }
+        assert_eq!(
+            answers, 0,
+            "the node answered the router's notice and the router answered back, {answers} times \
+             in a row"
+        );
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("trace_id=trace-a112"), "{text}");
+        assert!(text.contains("reason=NODE_NOT_FOUND"), "{text}");
+        assert!(text.contains("original_dst=IO.gone@motherbee"), "{text}");
+
+        // TTL_EXCEEDED, any other system message the router made, and a node's reply: no answer.
+        let ttl = fluxbee_sdk::protocol::build_ttl_exceeded(
+            ROUTER_UUID,
+            NODE_UUID,
+            "trace-ttl",
+            "AI.far@worker2",
+            "router-worker1",
+        );
+        let mut from_the_router = sample_request();
+        from_the_router.routing.src_l2_name = None;
+        let mut a_reply = sample_request();
+        a_reply.meta.msg = Some(MSG_CONFIG_RESPONSE.to_string());
+        for msg in [ttl, from_the_router, a_reply] {
+            let name = msg.meta.msg.clone();
+            assert!(
+                node.on_message(msg).await.expect("on_message").is_none(),
+                "{name:?}"
+            );
+        }
+        assert!(logs.text().contains("last_hop=router-worker1"));
     }
 
     // --- A-95: a published page's link never reaches the journal ---
@@ -9967,5 +11344,117 @@ mod tests {
         );
         assert!(!text.contains(KEY), "the link reached the journal:\n{text}");
         let _ = fs::remove_dir_all(blob_root);
+    }
+
+    /// A-95 and A-106: the journal's line for an incoming message previews it with no permission
+    /// to read in it. A person who asks to take a page down pastes its link, as Slack writes it,
+    /// and names a file by its blob name: the line has `/public/<redacted>` and `<blob>`, and the
+    /// model still gets both.
+    #[tokio::test]
+    async fn the_preview_of_an_incoming_message_has_no_page_key_and_no_blob_name() {
+        const BLOB: &str = "ventas_2026_0123456789abcdef.csv";
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "sim-thread-1" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
+        msg.payload = json!({
+            "type": "text",
+            "content": format!(
+                "Bajá <https://fluxbee.example/public/{PAGE_KEY}|la página> y leé {BLOB}, gracias"
+            )
+        });
+        let (logs, _guard) = LogCapture::start();
+        let reply = node
+            .on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert!(
+            reply.payload["content"]
+                .as_str()
+                .is_some_and(|echo| echo.contains(PAGE_KEY) && echo.contains(BLOB)),
+            "the model gets the message whole: {}",
+            reply.payload
+        );
+        let text = logs.text();
+        assert!(
+            text.contains(
+                "input_preview=Bajá <https://fluxbee.example/public/<redacted>|la página> y leé \
+                 <blob>, gracias"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains(PAGE_KEY),
+            "a page's key reached the journal:\n{text}"
+        );
+        assert!(
+            !text.contains("0123456789abcdef"),
+            "a blob's name reached the journal:\n{text}"
+        );
+    }
+
+    /// The preview redacts before it cuts, which would leave part of a key or a name; it redacts
+    /// an attachment's header and the line of its cut, which name its blob; and it leaves what only
+    /// looks like a blob name.
+    #[tokio::test]
+    async fn the_preview_redacts_before_it_cuts_and_redacts_attachments() {
+        assert_eq!(
+            text_preview(&format!("ver https://h/public/{PAGE_KEY}"), 40),
+            "ver https://h/public/<redacted>"
+        );
+        assert_eq!(
+            text_preview("ver ventas_0123456789abcdef.csv ahora", 12),
+            "ver <blob> a..."
+        );
+        for (text, preview) in [
+            ("informe_0123456789ABCDEF.txt.", "<blob>."),
+            (
+                "a_b-c.d_0123456789abcdef.md,x_fedcba9876543210.json",
+                "<blob>,<blob>",
+            ),
+            ("(server_7f3a9c_0123456789abcdef.log)", "(<blob>)"),
+            ("_0123456789abcdef.txt", "<blob>"),
+            // 15 or 17 hex digits, no extension, no dot: no blob name.
+            ("x_0123456789abcde.txt", "x_0123456789abcde.txt"),
+            ("x_0123456789abcdef0.txt", "x_0123456789abcdef0.txt"),
+            ("x_0123456789abcdef.", "x_0123456789abcdef."),
+            ("x_0123456789abcdef", "x_0123456789abcdef"),
+            ("/public/ and /public/-x", "/public/ and /public/-x"),
+            ("ñ_0123456789abcdef.txt", "ñ<blob>"),
+        ] {
+            assert_eq!(text_preview(text, 240), preview, "{text}");
+        }
+
+        let (store, root) = temp_blob_store();
+        let csv = stored(
+            &store,
+            b"mes,ventas\nenero,10\nfebrero,20\n",
+            "ventas.csv",
+            "text/csv",
+        );
+        let resolved = resolve_model_input_from_payload_with_options(
+            &json!({"type": "text", "content": "mirá", "attachments": [csv]}),
+            &ModelInputOptions {
+                max_attachment_text_chars: 12,
+                blob_root: Some(root.clone()),
+                ..ModelInputOptions::default()
+            },
+        )
+        .await
+        .expect("resolved");
+        assert_eq!(resolved.prompt_text.matches(&csv.blob_name).count(), 2);
+        let preview = text_preview(&resolved.prompt_text, 10_000);
+        assert!(!preview.contains(&csv.blob_name), "{preview}");
+        assert!(
+            preview.contains("| blob <blob>]")
+                && preview.contains("the whole text is the blob <blob>; read on from offset 12]"),
+            "{preview}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

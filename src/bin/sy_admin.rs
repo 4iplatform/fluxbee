@@ -360,10 +360,23 @@ struct PublishArtifactParams {
     expires_in_secs: Option<u64>,
 }
 
+/// `unpublish_artifact` names its publication by exactly one of these
+/// (`parse_unpublish_artifact_params`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnpublishArtifactParams {
-    publication_id: String,
+    #[serde(default)]
+    publication_id: Option<String>,
+    /// The key of the publication's link: the last segment of `/public/<key>`.
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// The publication an `unpublish_artifact` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicationRef {
+    Id(String),
+    Key(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5525,7 +5538,7 @@ async fn handle_publish_artifact(
         .get("size")
         .and_then(|value| value.as_u64())
         .unwrap_or(u64::MAX);
-    if !is_lower_sha256(&public_name) || public_name != sha256 || size != request.blob_ref.size {
+    if !is_lower_hex_64(&public_name) || public_name != sha256 || size != request.blob_ref.size {
         let _ = release_curated_blob(client, ctx, &publication_id).await;
         return Ok(internal_service_error(
             action,
@@ -5663,9 +5676,11 @@ async fn handle_unpublish_artifact(
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "unpublish_artifact";
-    // Producer path (mesh, caller_l2_name = Some): gated to an IO./AI./WF. node and
-    // owner-checked below. Operator path (caller_l2_name = None, the trusted localhost HTTP
-    // server): may unpublish ANY publication (D2 — a deliberate operator escape hatch so a
+    // Producer path (mesh, caller_l2_name = Some): the A-62 table lets only an AI.* node ask
+    // (`MeshAccess::AiPublisher`; Archi, which it admits to every action, is no producer and is
+    // refused here), and only for its own publication: the exact router-stamped name that
+    // published it, checked below. Operator path (caller_l2_name = None, the trusted localhost
+    // HTTP server): may unpublish ANY publication (D2 — a deliberate operator escape hatch so a
     // retired/renamed producer's publication can still be revoked; mirrors the None-bypass of
     // the channel/externalize seams).
     let caller: Option<String> = match caller_l2_name {
@@ -5675,23 +5690,22 @@ async fn handle_unpublish_artifact(
         },
         None => None,
     };
-    let request: UnpublishArtifactParams = match serde_json::from_value(params) {
-        Ok(request) => request,
-        Err(err) => return Ok(internal_invalid_request(action, &err.to_string())),
+    let publication = match parse_unpublish_artifact_params(params) {
+        Ok(publication) => publication,
+        Err(detail) => return Ok(internal_invalid_request(action, &detail)),
     };
-    if !valid_prefixed_uuid(&request.publication_id, "pub") {
-        return Ok(internal_invalid_request(
-            action,
-            "publication_id must be pub:<uuid>",
-        ));
-    }
     let _publication_guard = ctx.publication_lock.lock().await;
     let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
         Ok(ledger) => ledger,
         Err(err) => return Ok(internal_service_error(action, "LEDGER_FAILED", &err)),
     };
-    let Some(mut record) = ledger.publications.get(&request.publication_id).cloned() else {
-        return Ok(internal_invalid_request(action, "publication not found"));
+    let Some(mut record) = find_publication(&ledger, &publication).cloned() else {
+        let detail = match &publication {
+            PublicationRef::Id(publication_id) => format!("publication {publication_id} not found"),
+            // The key is a capability: the answer does not repeat it.
+            PublicationRef::Key(_) => "no publication has this key".to_string(),
+        };
+        return Ok(internal_not_found(action, &detail));
     };
     if let Some(caller) = &caller {
         if record.publisher_l2_name != *caller {
@@ -5701,17 +5715,18 @@ async fn handle_unpublish_artifact(
             ));
         }
     }
-    // Both retired states are terminal no-ops: "unpublished" (explicit revoke) AND "expired" (the
-    // TTL sweep already reclaimed edge row + blob). Re-running the edge/blob RPCs on an expired
-    // record would be wasteful and would overwrite its terminal "expired" audit status with
-    // "unpublished".
-    if record.status == "unpublished" || record.status == "expired" {
+    // A page already down is a no-op: "unpublished" (explicit revoke), "expired" (the TTL sweep
+    // already reclaimed edge row + blob), or past its `expires_at` and not swept yet, which the
+    // edge no longer serves. That last one is left to the sweep (`run_publication_expiry_sweep`),
+    // which records its terminal "expired": taking it down here would record "unpublished".
+    let now = Utc::now().timestamp().max(0) as u64;
+    if record.status == "unpublished" || record.status == "expired" || record.expires_at <= now {
         return Ok(InternalAdminDispatchResult {
             http_status: 200,
             envelope: serde_json::json!({
                 "status": "ok",
                 "action": action,
-                "payload": {"publication_id": request.publication_id, "unpublished": false}
+                "payload": {"publication_id": record.publication_id, "unpublished": false}
             }),
         });
     }
@@ -5748,6 +5763,82 @@ async fn handle_unpublish_artifact(
             "payload": {"publication_id": record.publication_id, "unpublished": true}
         }),
     })
+}
+
+/// What `unpublish_artifact` names: exactly one of `publication_id` (`pub:<uuid>`, taken in its
+/// canonical form) or `key`, the last segment of the link, in the form `mint_public_capability`
+/// gives it and the edge serves (64 lowercase hex characters).
+fn parse_unpublish_artifact_params(params: serde_json::Value) -> Result<PublicationRef, String> {
+    let request: UnpublishArtifactParams = serde_json::from_value(params)
+        .map_err(|err| format!("invalid unpublish_artifact params: {err}"))?;
+    match (request.publication_id, request.key) {
+        (Some(publication_id), None) => canonical_publication_id(&publication_id)
+            .map(PublicationRef::Id)
+            .ok_or_else(|| "publication_id must be pub:<uuid>".to_string()),
+        (None, Some(key)) => {
+            let key = key.trim();
+            if !is_lower_hex_64(key) {
+                return Err(
+                    "key must be 64 lowercase hex characters, the last segment of /public/<key>"
+                        .to_string(),
+                );
+            }
+            Ok(PublicationRef::Key(key.to_string()))
+        }
+        _ => Err("name the publication by exactly one of publication_id or key".to_string()),
+    }
+}
+
+/// A `pub:<uuid>` in the one form `publish_artifact` mints and the ledger is keyed by, the UUID
+/// lowercase and hyphenated: `Uuid::parse_str` also takes uppercase, no hyphens, braces and a
+/// urn. `None` when it is no `pub:<uuid>`.
+fn canonical_publication_id(value: &str) -> Option<String> {
+    let uuid = Uuid::parse_str(value.trim().strip_prefix("pub:")?).ok()?;
+    Some(format!("pub:{}", uuid.hyphenated()))
+}
+
+/// What the command log keeps of an `unpublish_artifact`. A link's key is the permission to read
+/// its page, and a request can carry one in any field, so the log keeps only (A-95):
+/// - a `publication_id` that is one, in its canonical form;
+/// - a `key` as its SHA-256, `key_sha256`, the form the edge keeps (A-82);
+/// - of anything else, the field's name, its value redacted. Params that are neither an object
+///   nor null are redacted whole.
+fn unpublish_artifact_log_params(params: &serde_json::Value) -> serde_json::Value {
+    let redacted = || serde_json::json!(NODE_SECRET_REDACTION_TOKEN);
+    let fields = match params {
+        serde_json::Value::Object(fields) => fields,
+        serde_json::Value::Null => return serde_json::Value::Null,
+        _ => return redacted(),
+    };
+    let mut logged = serde_json::Map::new();
+    for (name, value) in fields {
+        let kept = match (name.as_str(), value.as_str()) {
+            ("publication_id", Some(publication_id)) => canonical_publication_id(publication_id)
+                .map(|publication_id| (name.clone(), serde_json::json!(publication_id))),
+            ("key", Some(key)) => Some((
+                "key_sha256".to_string(),
+                serde_json::json!(format!("{:x}", Sha256::digest(key.trim().as_bytes()))),
+            )),
+            _ => None,
+        };
+        let (name, value) = kept.unwrap_or_else(|| (name.clone(), redacted()));
+        logged.insert(name, value);
+    }
+    serde_json::Value::Object(logged)
+}
+
+/// The ledger's record of `publication`. Keys are unique: each is 256 random bits.
+fn find_publication<'a>(
+    ledger: &'a AdminPublicationLedger,
+    publication: &PublicationRef,
+) -> Option<&'a AdminPublicationRecord> {
+    match publication {
+        PublicationRef::Id(publication_id) => ledger.publications.get(publication_id),
+        PublicationRef::Key(key) => ledger
+            .publications
+            .values()
+            .find(|record| record.key == *key),
+    }
 }
 
 fn authorize_artifact_publisher(caller_l2_name: Option<&str>) -> Result<String, String> {
@@ -5927,7 +6018,8 @@ fn mint_public_capability() -> String {
     hex::encode(bytes)
 }
 
-fn is_lower_sha256(value: &str) -> bool {
+/// A lowercase SHA-256, or a link's key (`mint_public_capability`): the edge's `is_lower_hex_64`.
+fn is_lower_hex_64(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -7102,7 +7194,7 @@ async fn dispatch_internal_admin_command(
                     "payload.target is not accepted for unpublish_artifact",
                 ));
             }
-            let logged_params = admin_command_log_params(&params);
+            let logged_params = admin_command_log_params(&unpublish_artifact_log_params(&params));
             let started = Instant::now();
             let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
             append_internal_dispatch_log(ctx, action, origin, logged_params, started, &result);
@@ -7630,6 +7722,19 @@ fn internal_unauthorized(action: &str, detail: &str) -> InternalAdminDispatchRes
             "action": action,
             "payload": serde_json::Value::Null,
             "error_code": "UNAUTHORIZED",
+            "error_detail": detail,
+        }),
+    }
+}
+
+fn internal_not_found(action: &str, detail: &str) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 404,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "NOT_FOUND",
             "error_detail": detail,
         }),
     }
@@ -8706,7 +8811,7 @@ async fn handle_http(
         // Operator revoke of a public artifact (D2). The HTTP origin has no caller, which routes to
         // handle_unpublish_artifact's operator escape hatch: the localhost HTTP path may
         // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
-        // Body: {"publication_id":"pub:<uuid>"}.
+        // Body: {"publication_id":"pub:<uuid>"} or {"key":"<key>"}, the key of its /public/<key>.
         ("POST", "/artifacts/unpublish") => {
             let payload: serde_json::Value = if body.is_empty() {
                 serde_json::json!({})
@@ -11915,7 +12020,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner."
         }
         "unpublish_artifact" => {
-            "Revoke a public artifact the calling AI.* producer published. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish."
+            "Revoke a public artifact the calling AI.* producer published, by its publication_id or the key of its link. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish."
         }
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
@@ -12557,11 +12662,6 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "object",
             "Active BlobRef object with type, blob_name, size, mime, filename_original and spool_day. Bytes and filesystem paths are not accepted.",
         )],
-        "unpublish_artifact" => vec![admin_action_body_field(
-            "publication_id",
-            "string",
-            "Publication id returned by publish_artifact, in pub:<uuid> form.",
-        )],
         "add_hive" => vec![
             admin_action_body_field("hive_id", "string", "Unique hive id to create."),
             admin_action_body_field(
@@ -12800,6 +12900,18 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "expires_in_secs",
                 "u64",
                 "Capability lifetime in seconds. Defaults to 86400 and is clamped to 60..2592000.",
+            ),
+        ],
+        "unpublish_artifact" => vec![
+            admin_action_body_field(
+                "publication_id",
+                "string",
+                "Publication id returned by publish_artifact, in pub:<uuid> form. Exactly one of publication_id or key.",
+            ),
+            admin_action_body_field(
+                "key",
+                "string",
+                "The key of the publication's link, the last segment of /public/<key>: 64 lowercase hex characters. Exactly one of publication_id or key.",
             ),
         ],
         "publish_runtime_package" => vec![
@@ -13819,9 +13931,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "unpublish_artifact" => vec![
             "Mesh-only producer operation for AI.* nodes (A-62); the operator revokes any publication with POST /artifacts/unpublish, and there is no SCMD or admin-executor unpublish.",
-            "Only the same router-stamped producer L2 name that created the publication may revoke it.",
-            "Call RouterDispatcher::send_admin_rpc with target=None and the publication_id returned by publish_artifact.",
-            "The operation is idempotent after a completed unpublish and waits for edge removal before returning success.",
+            "Only the same router-stamped producer L2 name that created the publication may revoke it; any other caller gets 403 UNAUTHORIZED.",
+            "Call RouterDispatcher::send_admin_rpc with target=None and exactly one of publication_id (returned by publish_artifact) or key (the last segment of the page's /public/<key> link).",
+            "A publication that does not exist answers 404 NOT_FOUND.",
+            "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
         ],
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
@@ -23777,6 +23890,13 @@ mod tests {
         assert_eq!(optional.len(), 2);
         assert_eq!(optional[0]["name"], json!("presentation"));
         assert_eq!(optional[1]["name"], json!("expires_in_secs"));
+        // Exactly one of the two names a publication, so neither is required alone.
+        assert!(admin_action_body_required_fields("unpublish_artifact").is_empty());
+        let names: Vec<Value> = admin_action_body_optional_fields("unpublish_artifact")
+            .into_iter()
+            .map(|field| field["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("publication_id"), json!("key")]);
 
         let (status, body) = build_admin_action_help_response("unpublish_artifact");
         assert_eq!(status, 200);
@@ -26034,5 +26154,354 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    // --- unpublish_artifact: by its id or its link's key, by its publisher only -------------
+
+    const PAGE_PUBLISHER: &str = "AI.sales@worker1";
+    const PAGE_EDGE: &str = "SY.edge@ingress1";
+
+    /// A live page of `publisher`, as `publish_artifact` records it.
+    fn published_page(publisher: &str) -> AdminPublicationRecord {
+        AdminPublicationRecord {
+            publication_id: format!("pub:{}", Uuid::new_v4()),
+            key: mint_public_capability(),
+            tenant_id: "tnt:43d576a3-d712-4d91-9245-5d5463dd693e".to_string(),
+            publisher_l2_name: publisher.to_string(),
+            blob_ref: page_blob_ref(),
+            public_name: "ab".repeat(32),
+            sha256: "ab".repeat(32),
+            size: 3,
+            content_type: "text/html; charset=utf-8".to_string(),
+            presentation: "inline".to_string(),
+            content_policy: "sandboxed-html-v1".to_string(),
+            expires_at: u64::MAX,
+            edge_node: PAGE_EDGE.to_string(),
+            status: "published".to_string(),
+            created_at: 1,
+            released_at: None,
+        }
+    }
+
+    fn seed_publications(ctx: &AdminContext, pages: &[&AdminPublicationRecord]) {
+        let mut ledger = AdminPublicationLedger::default();
+        for page in pages {
+            ledger
+                .publications
+                .insert(page.publication_id.clone(), (*page).clone());
+        }
+        persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger).expect("ledger");
+    }
+
+    fn publication_status(ctx: &AdminContext, publication_id: &str) -> String {
+        load_admin_publication_ledger(&ctx.publication_ledger_path)
+            .expect("ledger")
+            .publications[publication_id]
+            .status
+            .clone()
+    }
+
+    /// What the edge and IO.blob answer while `page` comes down.
+    async fn take_down(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness, page: &str) {
+        let wait = Duration::from_secs(5);
+        let unpublish = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the edge's unpublish");
+        assert_eq!(unpublish.meta.msg.as_deref(), Some(MSG_EDGE_UNPUBLISH_BLOB));
+        assert_eq!(dst_of(&unpublish), json!(PAGE_EDGE));
+        assert_eq!(unpublish.payload, json!({ "publication_id": page }));
+        harness
+            .inject(reply_to(
+                &unpublish,
+                MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+                json!({ "status": "ok", "publication_id": page, "removed": true }),
+            ))
+            .await
+            .unwrap();
+        let release = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("IO.blob's release");
+        assert_eq!(release.meta.msg.as_deref(), Some(MSG_BLOB_RELEASE));
+        assert_eq!(
+            dst_of(&release),
+            json!(format!("IO.blob@{PRIMARY_HIVE_ID}"))
+        );
+        assert_eq!(release.payload, json!({ "publication_id": page }));
+        harness
+            .inject(reply_to(
+                &release,
+                MSG_BLOB_RELEASE_RESPONSE,
+                json!({ "status": "ok", "released": true }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The publisher takes its page down by the id `publish_artifact` returned, in any form a UUID
+    /// is written, or by the key of its link, which is what a person has; the operator by either,
+    /// for any publisher.
+    #[tokio::test]
+    async fn a_page_comes_down_by_its_id_or_by_its_links_key() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-own");
+        let by_id = published_page(PAGE_PUBLISHER);
+        let by_id_written_otherwise = published_page(PAGE_PUBLISHER);
+        let by_key = published_page(PAGE_PUBLISHER);
+        let by_operator = published_page("AI.support@motherbee");
+        seed_publications(
+            &ctx,
+            &[&by_id, &by_id_written_otherwise, &by_key, &by_operator],
+        );
+        // Uppercase and without hyphens: the ledger holds it lowercase and hyphenated.
+        let written_otherwise = format!(
+            "pub:{}",
+            by_id_written_otherwise.publication_id["pub:".len()..]
+                .replace('-', "")
+                .to_ascii_uppercase()
+        );
+        for (page, params, caller) in [
+            (
+                &by_id,
+                json!({ "publication_id": by_id.publication_id }),
+                Some(PAGE_PUBLISHER),
+            ),
+            (
+                &by_id_written_otherwise,
+                json!({ "publication_id": written_otherwise }),
+                Some(PAGE_PUBLISHER),
+            ),
+            (&by_key, json!({ "key": by_key.key }), Some(PAGE_PUBLISHER)),
+            (&by_operator, json!({ "key": by_operator.key }), None),
+        ] {
+            let unpublish = handle_unpublish_artifact(&ctx, &ctx.rpc, params, caller);
+            let (result, ()) =
+                tokio::join!(unpublish, take_down(&mut harness, &page.publication_id));
+            let result = result.expect("dispatch");
+            assert_eq!(result.http_status, 200, "{}", result.envelope);
+            assert_eq!(
+                result.envelope["payload"],
+                json!({ "publication_id": page.publication_id, "unpublished": true })
+            );
+            assert_eq!(
+                publication_status(&ctx, &page.publication_id),
+                "unpublished"
+            );
+        }
+    }
+
+    /// A page already down, taken down or expired, answers `unpublished: false` and asks the edge
+    /// and IO.blob for nothing; its ledger row keeps its status. A page past its `expires_at` is
+    /// down too, before the expiry sweep gets to it (the edge no longer serves it): the sweep
+    /// takes it down and records it `expired`.
+    #[tokio::test]
+    async fn a_page_already_down_answers_unpublished_false() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-down");
+        let mut taken_down = published_page(PAGE_PUBLISHER);
+        taken_down.status = "unpublished".to_string();
+        let mut expired = published_page(PAGE_PUBLISHER);
+        expired.status = "expired".to_string();
+        let mut lapsed = published_page(PAGE_PUBLISHER);
+        lapsed.expires_at = Utc::now().timestamp().max(0) as u64;
+        seed_publications(&ctx, &[&taken_down, &expired, &lapsed]);
+        for (page, params) in [
+            (
+                &taken_down,
+                json!({ "publication_id": taken_down.publication_id }),
+            ),
+            (&taken_down, json!({ "key": taken_down.key })),
+            (&expired, json!({ "key": expired.key })),
+            (&lapsed, json!({ "key": lapsed.key })),
+        ] {
+            let result = handle_unpublish_artifact(&ctx, &ctx.rpc, params, Some(PAGE_PUBLISHER))
+                .await
+                .expect("dispatch");
+            assert_eq!(result.http_status, 200, "{}", result.envelope);
+            assert_eq!(
+                result.envelope["payload"],
+                json!({ "publication_id": page.publication_id, "unpublished": false })
+            );
+        }
+        assert_eq!(
+            publication_status(&ctx, &taken_down.publication_id),
+            "unpublished"
+        );
+        assert_eq!(publication_status(&ctx, &expired.publication_id), "expired");
+        assert_eq!(
+            publication_status(&ctx, &lapsed.publication_id),
+            "published"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let (swept, ()) = tokio::join!(
+            sweep_expired_publications_once(&ctx, &ctx.rpc),
+            take_down(&mut harness, &lapsed.publication_id)
+        );
+        swept.expect("sweep");
+        assert_eq!(publication_status(&ctx, &lapsed.publication_id), "expired");
+    }
+
+    /// A publication the ledger does not hold answers 404 NOT_FOUND, by id and by key, and the
+    /// answer never repeats a key.
+    #[tokio::test]
+    async fn an_unknown_publication_answers_not_found() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-unknown");
+        let page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&page]);
+        let unknown_id = format!("pub:{}", Uuid::new_v4());
+        let unknown_key = mint_public_capability();
+        for (caller, params) in [
+            (
+                Some(PAGE_PUBLISHER),
+                json!({ "publication_id": unknown_id }),
+            ),
+            (Some(PAGE_PUBLISHER), json!({ "key": unknown_key })),
+            (None, json!({ "key": unknown_key })),
+        ] {
+            let result = handle_unpublish_artifact(&ctx, &ctx.rpc, params, caller)
+                .await
+                .expect("dispatch");
+            assert_eq!(result.http_status, 404, "{}", result.envelope);
+            assert_eq!(result.envelope["error_code"], "NOT_FOUND");
+            assert!(!result.envelope.to_string().contains(&unknown_key));
+        }
+        assert_eq!(error_code_to_http_status("NOT_FOUND"), 404);
+        assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// Only the exact node that published a page takes it down: another agent, of the same name
+    /// on another hive included, gets 403 UNAUTHORIZED, and the page stays up.
+    #[tokio::test]
+    async fn only_its_publisher_takes_a_page_down() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-owner");
+        let page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&page]);
+        for (caller, params) in [
+            (
+                "AI.support@worker1",
+                json!({ "publication_id": page.publication_id }),
+            ),
+            ("AI.support@worker1", json!({ "key": page.key })),
+            ("AI.sales@motherbee", json!({ "key": page.key })),
+        ] {
+            let result = handle_unpublish_artifact(&ctx, &ctx.rpc, params, Some(caller))
+                .await
+                .expect("dispatch");
+            assert_eq!(result.http_status, 403, "{caller}: {}", result.envelope);
+            assert_eq!(result.envelope["error_code"], "UNAUTHORIZED");
+        }
+        assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// Exactly one of `publication_id` or `key`, each in the form SY.admin mints it; an id written
+    /// in another form a UUID takes is read in that one.
+    #[test]
+    fn an_unpublish_names_its_publication_by_exactly_one_of_id_or_key() {
+        let uuid = Uuid::new_v4();
+        let id = format!("pub:{uuid}");
+        let key = mint_public_capability();
+        for written in [
+            format!(" {id} "),
+            format!("pub:{}", uuid.to_string().to_ascii_uppercase()),
+            format!("pub:{}", uuid.simple()),
+            format!("pub:{}", uuid.braced()),
+            format!("pub:{}", uuid.urn()),
+        ] {
+            assert_eq!(
+                parse_unpublish_artifact_params(json!({ "publication_id": written })),
+                Ok(PublicationRef::Id(id.clone())),
+                "{written}"
+            );
+        }
+        assert_eq!(
+            parse_unpublish_artifact_params(json!({ "key": key })),
+            Ok(PublicationRef::Key(key.clone()))
+        );
+        for refused in [
+            json!({}),
+            json!({ "publication_id": id, "key": key }),
+            json!({ "publication_id": Uuid::new_v4().to_string() }),
+            json!({ "publication_id": "pub:not-a-uuid" }),
+            json!({ "key": key.to_ascii_uppercase() }),
+            json!({ "key": &key[..63] }),
+            json!({ "key": format!("/public/{key}") }),
+            json!({ "key": key, "url": format!("/public/{key}") }),
+            json!({ "key": 7 }),
+        ] {
+            assert!(
+                parse_unpublish_artifact_params(refused.clone()).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// The command log keeps a link's key as its SHA-256 and a publication id in its canonical
+    /// form, never a key: of anything else, a key sent under another field or as the params
+    /// themselves included, it keeps the field's name only, refused requests too (A-82, A-95).
+    #[tokio::test]
+    async fn the_command_log_never_keeps_a_links_key() {
+        let (ctx, _harness) = opa_test_admin("unpublish-log");
+        let key = mint_public_capability();
+        let key_sha256 = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let uuid = Uuid::new_v4();
+        let redacted = json!(NODE_SECRET_REDACTION_TOKEN);
+        for (params, logged) in [
+            (
+                json!({ "key": format!(" {key} ") }),
+                json!({ "key_sha256": key_sha256 }),
+            ),
+            (
+                json!({ "publication_id": format!("pub:{}", uuid.simple()) }),
+                json!({ "publication_id": format!("pub:{uuid}") }),
+            ),
+            (
+                json!({ "url": format!("https://edge.example/public/{key}") }),
+                json!({ "url": redacted }),
+            ),
+            (
+                json!({ "publication_id": key }),
+                json!({ "publication_id": redacted }),
+            ),
+            (
+                json!({ "key": key, "link": format!("/public/{key}") }),
+                json!({ "key_sha256": key_sha256, "link": redacted }),
+            ),
+            (json!({ "key": [key] }), json!({ "key": redacted })),
+            (json!(format!("/public/{key}")), redacted.clone()),
+        ] {
+            let result = dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "unpublish_artifact",
+                None,
+                params.clone(),
+                AdminOrigin::Http,
+            )
+            .await
+            .expect("dispatch");
+            // Nothing is published: a request that names a publication finds none.
+            assert!(
+                matches!(result.http_status, 400 | 404),
+                "{params}: {}",
+                result.envelope
+            );
+            let log = fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("log");
+            assert!(!log.contains(&key), "{params} logged {log}");
+            let entry: Value =
+                serde_json::from_str(log.lines().last().expect("an entry")).expect("JSON");
+            assert_eq!(entry["action"], "unpublish_artifact");
+            assert_eq!(entry["params"], logged, "{params}");
+        }
     }
 }

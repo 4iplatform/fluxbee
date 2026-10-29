@@ -220,10 +220,17 @@ the identity key of every hive with no `hives/<id>/`.
 Runtimes are versioned artifacts under `/var/lib/fluxbee/dist/runtimes/<runtime>/<version>/`,
 listed in `dist/runtimes/manifest.json` with `available` versions and a `current` pointer.
 
-- `scripts/publish-runtime.sh --runtime <name> --version <v> --binary <path> [--set-current]
-  [--prune-missing] [--dist-root <dir>]` copies a binary, writes `bin/start.sh` and merges the
-  manifest. `fluxbee-publish <package dir> [--deploy <hive>]` (`src/bin/fluxbee-publish.rs`)
-  publishes a package directory and always sets it current.
+- `scripts/publish-runtime.sh --runtime <name> --version <v> --binary <path> [--start-script
+  <path>] [--file <path>]... [--set-current] [--prune-missing] [--dist-root <dir>]` copies a
+  binary, writes `bin/start.sh` (or installs the one given, which must run the binary with the
+  line `exec "$SCRIPT_DIR/<binary>" "$@"`), installs each `--file` next to `bin/`, and merges the
+  manifest last. It checks every input before it writes anything, and the manifest never names a
+  version that is not all there: the orchestrator moves running nodes onto it on its next pass
+  (FINDINGS A-110). The `publish-*-runtime.sh` scripts build on it with their own start script;
+  `publish-ia-runtime.sh` also hands it ai.generic's `tools.json`, the catalog of
+  `docs/reference/agent-tools.json` (or `--catalog <path>`) with the version in it.
+  `fluxbee-publish <package dir> [--deploy <hive>]` (`src/bin/fluxbee-publish.rs`) publishes a
+  package directory and always sets it current.
 - Over HTTP: `POST /admin/runtime-packages/publish` (`publish_runtime_package`, motherbee only)
   with an `inline_package` or `bundle_upload` source; optional `sync_to[]` and `update_to[]`
   follow-ups.
@@ -340,10 +347,13 @@ boot relaunch refuse the same root-tenant cases.
 
 **Full teardown** (`kill_node` with `purge_instance`, plus `force` to send SIGKILL first):
 
-1. `TIMER_PURGE_OWNER` to the hive's SY.timer (a failure stops the purge:
-   `TIMER_PURGE_FAILED`);
-2. stops the unit, deletes the node directory, its UUID file and its identity-map entry;
-3. one `teardown_node {node_name, ilk_id}` to `SY.admin@motherbee`, which checks that the node is
+1. stops the unit and clears `relaunch_on_boot`, so whatever fails after, the reconcile does not
+   launch the node again;
+2. `TIMER_PURGE_OWNER` to the hive's SY.timer, 3 s (a failure stops the purge there:
+   `TIMER_PURGE_FAILED`, with `relaunch_on_boot: false`, and the node stays stopped with its files
+   and identity until the purge runs again);
+3. deletes the node directory, its UUID file and its identity-map entry;
+4. one `teardown_node {node_name, ilk_id}` to `SY.admin@motherbee`, which checks that the node is
    on the caller's hive and the ILK is the node's, deletes the secrets dedicated to the ILK, each
    in its own tenant, then marks and purges the ILK, and reports each step (`ilk_deleted`,
    `ilk_delete`, `ilk_delete_error`, `vault_secrets_purged`; an error answer never reads `ok`;
@@ -352,7 +362,7 @@ boot relaunch refuse the same root-tenant cases.
    the ILK to check, since SY.admin may still finish. The node's identity-map entry is already gone
    then, so a failed or unknown step is not finished by purging again: once the node is gone from
    the mesh, run `teardown_node` again with the reported `ilk_id`;
-4. reports routes, VPNs and taps that still name the node (`routing_references`); it does not
+5. reports routes, VPNs and taps that still name the node (`routing_references`); it does not
    remove them.
 
 Keeping nodes alive: every 60 s the orchestrator relaunches a managed node that should run

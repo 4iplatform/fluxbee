@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use fluxbee_ai_sdk::{
     build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
     control_request, create_function_calling_model, create_llm_client, extract_response_envelope,
-    extract_text, resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider,
-    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    extract_text, is_infrastructure_message, note_infrastructure_message,
+    resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider, ControlRequest,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
     LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
     ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool, ThreadStatePutTool,
@@ -2021,8 +2022,13 @@ impl GenericAiNode {
 
     /// A control verb runs only as the router's authority gate delivers it, from the node that
     /// sends it (`control_request`): SY.admin@motherbee for the config, this hive's orchestrator for
-    /// the status. Anything else that names a verb is refused with `unauthorized`.
+    /// the status. Anything else that names a verb is refused with `unauthorized`. A notice or a
+    /// reply is never answered (`is_infrastructure_message`, FINDINGS A-112).
     async fn handle_control_plane(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
+        if is_infrastructure_message(&msg) {
+            note_infrastructure_message(&self.node_name, &msg);
+            return Ok(None);
+        }
         let Some(command) = msg.meta.msg.as_deref() else {
             return Ok(None);
         };
@@ -4022,6 +4028,88 @@ mod tests {
         );
         assert_eq!(answer.payload["status"], json!("error"));
         assert_eq!(answer.payload["error_code"], json!("unauthorized"));
+    }
+
+    /// The router's own UUID, which it stamps as `routing.src` on a notice it makes.
+    const ROUTER_UUID: &str = "1b1c3e40-8f2a-4c1e-9d55-6a1f0b7c2d10";
+    /// The UUID the runtime stamps on what the frontdesk sends.
+    const NODE_UUID: &str = "5d2e9a71-3c4b-4f8e-a1d2-7b6c5e4f3a21";
+
+    /// FINDINGS A-112, as in ai.generic. The router answers a message it cannot deliver with
+    /// UNREACHABLE to its sender (`send_unreachable_to`, src/router/mod.rs): from its own UUID,
+    /// without `src_l2_name`. An answer to that notice goes to the router's UUID, which no node has,
+    /// so the router answers it UNREACHABLE in turn, and so on. The frontdesk answers no notice: the
+    /// bounce ends at the first one, and the journal says what was not delivered, and why.
+    #[tokio::test]
+    async fn a_router_notice_is_never_answered() {
+        let node = test_node();
+        let (logs, _guard) = LogCapture::start();
+        // A reply the frontdesk sent to an IO node that is gone comes back.
+        let mut notice = fluxbee_sdk::protocol::build_unreachable(
+            ROUTER_UUID,
+            NODE_UUID,
+            "trace-a112",
+            "IO.gone@motherbee",
+            "NODE_NOT_FOUND",
+        );
+        let mut answers = 0;
+        while let Some(mut answer) = node.on_message(notice).await.expect("on_message") {
+            answers += 1;
+            assert!(matches!(
+                answer.routing.dst,
+                Destination::Unicast(ref dst) if dst == ROUTER_UUID
+            ));
+            if answers == 3 {
+                break;
+            }
+            // The runtime sends the answer as the node (`process_one`), and no node has the
+            // router's UUID: the router answers it UNREACHABLE (`send_unreachable_to`).
+            answer.routing.src = NODE_UUID.to_string();
+            notice = fluxbee_sdk::protocol::build_unreachable(
+                ROUTER_UUID,
+                &answer.routing.src,
+                &answer.routing.trace_id,
+                ROUTER_UUID,
+                "NODE_NOT_FOUND",
+            );
+        }
+        assert_eq!(
+            answers, 0,
+            "the frontdesk answered the router's notice and the router answered back, {answers} \
+             times in a row"
+        );
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("trace_id=trace-a112"), "{text}");
+        assert!(text.contains("reason=NODE_NOT_FOUND"), "{text}");
+        assert!(text.contains("original_dst=IO.gone@motherbee"), "{text}");
+
+        // TTL_EXCEEDED, any other system message the router made, and a node's reply: no answer.
+        let ttl = fluxbee_sdk::protocol::build_ttl_exceeded(
+            ROUTER_UUID,
+            NODE_UUID,
+            "trace-ttl",
+            "AI.far@worker2",
+            "router-worker1",
+        );
+        let mut from_the_router = sample_request();
+        from_the_router.routing.src_l2_name = None;
+        let mut a_reply = sample_request();
+        a_reply.meta.msg = Some(MSG_CONFIG_RESPONSE.to_string());
+        for msg in [ttl, from_the_router, a_reply] {
+            let name = msg.meta.msg.clone();
+            assert!(
+                node.on_message(msg).await.expect("on_message").is_none(),
+                "{name:?}"
+            );
+        }
+        assert!(logs.text().contains("last_hop=router-worker1"));
+
+        // A system message from a node that is no control verb is answered as before.
+        let mut unknown = sample_request();
+        unknown.meta.msg = Some("NODE_RESTARTED".to_string());
+        let answer = control_answer(&node, unknown).await;
+        assert_eq!(answer.payload["error"]["code"], json!("unknown_system_msg"));
     }
 
     /// The frontdesk's tools are its own (agent-tools-v1 T10): it reads and saves its case and

@@ -244,7 +244,8 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `get_llm_usage`, `GET /config/storage/metrics` | `SY.storage@motherbee` | `USAGE_QUERY`, `STORAGE_METRICS_GET` |
 | `node_control_config_get/set` | the node | `CONFIG_GET`, `CONFIG_SET` |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
-| `publish_artifact`, `unpublish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT` (publish only), `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` and back |
+| `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
+| `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
 | `acme_status`, `acme_renew`, `acme_test`, `acme_reload` | answered by SY.admin's ACME client, which asks the public edge, SY.vault, the CA and SY.orchestrator | `EDGE_TLS_STATUS`, `EDGE_TLS_RELOAD`, `EDGE_ACME_CHALLENGE`, `VAULT_*`, `record_drift_alert` ([The ACME client](#the-acme-client)) |
 | `web_status` | answered by SY.admin from what it holds, plus two reads of io.web: `SY.orchestrator@motherbee` and `IO.web@motherbee` | `get_node_status` (`msg_type: admin`), `NODE_STATUS_GET` ([The web door's status](#the-web-doors-status)) |
 | catalog, help, `list_recent_commands` | answered by SY.admin | |
@@ -425,6 +426,30 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   its answer: the wait for the blob, the publication lock, the curate (30 s at most) and the
   edge's publish (75 s at most) each get what is left. A step with nothing left answers
   `TIMEOUT`; at the edge's step, after releasing what was curated.
+- **Taking a page down.** `unpublish_artifact` (`handle_unpublish_artifact`) names the
+  publication by exactly one of `publication_id` (`pub:<uuid>`) or `key`, the last segment of its
+  `/public/<key>` link: 64 lowercase hex characters, as `mint_public_capability` makes it. A
+  `publication_id` is read in the form the ledger keeps, lowercase and hyphenated, whatever form
+  of the UUID it comes in (`canonical_publication_id`). Over the mesh only an `AI.*` node may ask
+  (A-62), and only for its own publication: the record's publisher must be its exact
+  router-stamped name, else `403 UNAUTHORIZED`. The operator's `POST /artifacts/unpublish` takes
+  either field for any publication. Under the publication lock:
+  - a publication the ledger does not hold answers `404 NOT_FOUND`;
+  - one already down answers ok, `unpublished: false`, and asks no one: `unpublished`, `expired`,
+    or past its `expires_at`, which the edge no longer serves. That last one keeps its row for the
+    expiry sweep, which takes it down and records it `expired`;
+  - otherwise `EDGE_UNPUBLISH_BLOB` to the publication's edge (the row goes to `edge_removed`),
+    then `BLOB_RELEASE` to `IO.blob@motherbee` (the row goes to `unpublished`), each with 30 s,
+    and the answer is `unpublished: true`. A failed step answers `EDGE_UNPUBLISH_FAILED` or
+    `BLOB_RELEASE_FAILED`; the same request again finishes it.
+
+  The answer carries the `publication_id` either way. A request can carry a live link in any
+  field, so the command log keeps only a `publication_id` that is one, in its canonical form, and
+  a `key` as `key_sha256`, the form the edge keeps (A-82). Of anything else, a `publication_id`
+  that is not one included, it keeps the field's name with the value `***REDACTED***`, and of
+  params that are neither an object nor null only `***REDACTED***`
+  (`unpublish_artifact_log_params`). So the command log carries no live link, refused requests
+  included (A-95).
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048
@@ -750,7 +775,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
-| `unpublish_artifact` | — (mesh only) | Revoke a public artifact the calling AI.* producer published. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish. |
+| `unpublish_artifact` | — (mesh only) | Revoke a public artifact the calling AI.* producer published, by its publication_id or the key of its link. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
@@ -860,7 +885,7 @@ Served by `handle_http`, `handle_hive_paths` and `handle_modules_paths` but not 
 | `GET /health` | Liveness, answered locally |
 | `GET /admin/executor/functions` | The executor's function catalog |
 | `POST /channels/externalize`, `POST /channels/unexternalize`, `GET /channels/externalized?edge_node=` | Edge channels as the operator (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) |
-| `POST /artifacts/unpublish` | Revoke any publication, body `{"publication_id": "pub:<uuid>"}` |
+| `POST /artifacts/unpublish` | Revoke any publication, body `{"publication_id": "pub:<uuid>"}` or `{"key": "<key>"}`, the key of its `/public/<key>` link |
 | `GET /config/storage/metrics` | SY.storage inbox metrics |
 | `GET /inventory/nodes` | Global inventory, nodes |
 | `GET /versions?hive=`, `GET /deployments?hive=`, `GET /drift-alerts?hive=` | The per-hive form of the global route |

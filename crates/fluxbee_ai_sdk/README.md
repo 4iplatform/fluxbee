@@ -429,6 +429,12 @@ registered case ends saved as `completed` and is never deleted by the model.
   (`control_caller_authorized`): `CONFIG_GET` and `CONFIG_SET` from SY.admin@motherbee,
   `NODE_STATUS_GET` and `NODE_HELP` from the orchestrator of the node's hive, `PING` and `STATUS`
   from either. ai.generic and the frontdesk answer a refusal with `unauthorized`.
+- **What it never answers:** `is_infrastructure_message(&msg)`, checked first, says the message is
+  a notice or a reply: one the router made, without `src_l2_name` (`UNREACHABLE`,
+  `TTL_EXCEEDED`), or one named as a notice or a reply (`HELLO`, `ECHO_REPLY`, any `*_RESPONSE`).
+  `note_infrastructure_message(node_name, &msg)` logs it, a router notice as a WARN with its reason.
+  An answer to the router's notice would go to the router's own UUID, and the two would bounce it
+  forever (FINDINGS A-112). SY.timer and the WF engine follow the same rule.
 - **Run it:** `NodeRuntime::new(dispatcher, node).run_with_config(RuntimeConfig::default())`.
   - The runtime drains the dispatcher's `AI_RUNTIME_CHANNEL` (`"incoming"`). Declare that channel in
     the dispatcher's profile:

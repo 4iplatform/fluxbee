@@ -26,7 +26,7 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 - **A `user` message needs `meta.thread_id`.** Without it the node answers an `invalid_payload`
   error.
 - **Without `FLUXBEE_NODE_ILK_ID`** the node has no SY.vault client: it cannot read its key, and it
-  has no `publish_html_page` tool.
+  has neither `publish_html_page` nor `unpublish_html_page`.
 
 ## Control plane
 
@@ -42,6 +42,12 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   Anything else that names a verb is refused, with a WARN in the journal and an `unauthorized`
   answer under the verb's response: an `admin` message, the verb in another case (`config_set`),
   another node, another hive's orchestrator.
+- **A notice or a reply is never answered,** only logged (the AI SDK's
+  `is_infrastructure_message`, which SY.frontdesk.gov runs too; SY.timer's and wf-generic's rule): a
+  message the router made, which carries no `src_l2_name` (`UNREACHABLE`, `TTL_EXCEEDED`), or one
+  named as a notice or a reply (`HELLO`, `ECHO_REPLY`, any `*_RESPONSE`). A router notice is a
+  WARN with its trace and its reason. An answer to one would go to the router's own UUID, and the
+  two would bounce it forever (FINDINGS A-112).
 - **`CONFIG_GET`** returns:
   - the contract;
   - the effective config, redacted;
@@ -74,7 +80,7 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 | `provider` | `openai` or `anthropic`: the API the node speaks and the key it reads ([The key](#the-key)). Without it, the hive's, read on each request |
 | `model_settings` | `max_output_tokens`; an answer cut at it is a `provider_output_truncated` error. `temperature` and `top_p` are accepted too, but current models reject `temperature` (gpt-5.5, Claude 5): leave it out |
 | `base_url` | optional, and rarely needed: the full URL the request is posted to. It needs `provider`, and it must be `https` on that provider's host (`api.openai.com` or `api.anthropic.com`); the node's environment can lift the host rule with `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
-| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory block included, and the SDK's tool loop cuts it at 1,200 characters |
+| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory block included, and whole: the tool loop cuts only the history before it, 1,200 characters an interaction |
 
 `behavior.vault_key`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`,
 `config.secrets` and `config.assets` are refused, as is any other unknown field under `behavior`,
@@ -162,7 +168,12 @@ On every request the node reads the key of its provider from SY.vault:
   front of the user input as a text block.
 - **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`.
 - **Attachments** (`text/v1` `attachments[]` and `content_ref`):
-  - text (`text/plain`, `text/markdown`, `application/json`) goes in as text;
+  - text (`text/plain`, `text/markdown`, `application/json`, `text/csv`, `text/html`) goes in as
+    text, decoded with U+FFFD for bytes that are not UTF-8, and cut at 100,000 characters with a
+    line that says so, names its blob and gives the byte offset to read on from (FINDINGS A-111: a
+    CSV or HTML file sent as a document failed the whole message on Claude). The line names no
+    tool: SY.frontdesk.gov reads attachments the same way and has no `read_blob`;
+  - every attachment shows its blob name, `<name>_<hash16>.<ext>`, which `read_blob` reads;
   - images (`png`, `jpeg`, `webp`, `gif`) go as image parts;
   - other files go as documents, with `multimodal` on;
   - Anthropic takes only PDF documents;
@@ -205,13 +216,33 @@ rendered from the card, and so are the catalog and the `NODE_HELP` answer.
   - always `get_current_time`: the date and time from SY.timer of the node's own hive
     (`TIMER_NOW_IN`), in UTC and in an IANA zone, with the local weekday. Where SY.timer does not
     answer (it runs on the motherbee and the workers), it is `time_unavailable`;
+  - always `read_blob`: a text file of the hive's blob store (csv, json, md, html, txt, logs…), by
+    its blob name, as an attachment shows it. Text is judged by its content, whatever the name: the
+    file is decoded as an attachment is, with U+FFFD for bytes that are not UTF-8, and a piece with
+    a NUL byte, as binary files have, is `not_text`. Up to 10 MiB, 64 KiB of text a call from a
+    byte `offset` of that text (the offset a cut attachment's line gives), cut where a character
+    starts, with `next_offset`. One message reads 192 KiB of text at most, over all its calls: the
+    tool loop sends every piece back to the model on each turn. Past it, `read_budget_exhausted`,
+    not retryable within the message; the next message starts again. It reads with the SDK's
+    `read_blob_by_name` (no link followed, the bytes checked against the hash in the name) and
+    waits up to 20 s for a blob on its way from another hive. The store has no tenant: an agent
+    reads any text blob of its hive whose name reached it in an attachment (FINDINGS A-106);
   - the thread-state tools when the message has a `src_ilk`: they read and write only that
     sender's record;
-  - `publish_html_page` when the node has its ILK. It publishes a page through SY.admin and
-    returns its public URL, which expires after 24 h. A reply whose text does not carry the URL
-    gets it on a line of its own. The journal names the publication's id, never the URL, which is
-    the key to the page (FINDINGS A-95); the reply that carries the URL is logged by its files'
-    names and its text's length, never its text.
+  - `publish_html_page` and `unpublish_html_page` when the node has its ILK. The first publishes a
+    page through SY.admin and returns its public URL, which expires after 24 h. A reply whose text
+    does not carry the URL gets it on a line of its own, unless the turn took the page down. A page
+    SY.admin publishes without a public URL is taken down, and the model told it was not
+    published. `unpublish_html_page` takes down a page this node published, by its link or its
+    `publication_id` (`unpublish_artifact`). Of the link it sends SY.admin the key: the letters and
+    digits after `/public/`, so a `)`, a `.` or Slack's `|label>` after it are left out. A key that
+    is not 64 lowercase hex characters is `not_found` before SY.admin is asked, never a retryable
+    failure. The journal names the publication's id, never the URL, which is the key to the page
+    (FINDINGS A-95); the reply that carries the URL is logged by its files' names and its text's
+    length, never its text.
+- **The journal holds no permission to read:** the "incoming user message" line previews the
+  input with every `/public/<key>` as `/public/<redacted>` and every blob name as `<blob>` (A-95,
+  A-106), and `read_blob` logs a failure without the blob's name.
 - **A CSV cell never runs as a formula:** one that starts with `=`, `+`, `@`, a tab or a carriage
   return, or with `-` and is not a plain number, gets a `'` in front (OWASP's CSV injection
   advice).

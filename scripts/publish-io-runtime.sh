@@ -117,23 +117,6 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
   (cd "$ROOT_DIR" && cargo build --release --manifest-path nodes/io/Cargo.toml -p "$build_pkg")
 fi
 
-cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY")
-if [[ -n "$DIST_ROOT" ]]; then
-  cmd+=(--dist-root "$DIST_ROOT")
-fi
-if [[ "$SET_CURRENT" == "1" ]]; then
-  cmd+=(--set-current)
-fi
-if [[ "$USE_SUDO" == "1" ]]; then
-  cmd+=(--sudo)
-fi
-
-"${cmd[@]}"
-
-DIST_ROOT_EFFECTIVE="${DIST_ROOT:-/var/lib/fluxbee/dist}"
-RUNTIME_DIR="$DIST_ROOT_EFFECTIVE/runtimes/$RUNTIME/$VERSION"
-BIN_DIR="$RUNTIME_DIR/bin"
-START_SH="$BIN_DIR/start.sh"
 BINARY_NAME="$(basename "$BINARY")"
 
 case "$KIND" in
@@ -148,7 +131,9 @@ case "$KIND" in
     ;;
 esac
 
+# The start script goes to publish-runtime.sh, which installs it before it writes the manifest.
 tmp_start="$(mktemp)"
+trap 'rm -f "$tmp_start"' EXIT
 cat >"$tmp_start" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -159,11 +144,18 @@ SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
 EOF
 
-if [[ "$USE_SUDO" == "1" ]]; then
-  sudo install -m 0755 "$tmp_start" "$START_SH"
-else
-  install -m 0755 "$tmp_start" "$START_SH"
+cmd=(bash "$PUBLISH_SCRIPT" --runtime "$RUNTIME" --version "$VERSION" --binary "$BINARY"
+  --start-script "$tmp_start")
+if [[ -n "$DIST_ROOT" ]]; then
+  cmd+=(--dist-root "$DIST_ROOT")
 fi
-rm -f "$tmp_start"
+if [[ "$SET_CURRENT" == "1" ]]; then
+  cmd+=(--set-current)
+fi
+if [[ "$USE_SUDO" == "1" ]]; then
+  cmd+=(--sudo)
+fi
+
+"${cmd[@]}"
 
 echo "Configured IO start.sh default RUST_LOG: $DEFAULT_RUST_LOG"

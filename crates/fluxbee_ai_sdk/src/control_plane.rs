@@ -1,10 +1,12 @@
 //! The control plane of an AI node (ai.generic, SY.frontdesk.gov): which `system` requests it runs,
-//! and from whom.
+//! and from whom, and which messages it never answers.
 
 use fluxbee_sdk::protocol::{
-    is_system_kind, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_STATUS_GET,
+    is_system_kind, MSG_ANNOUNCE, MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_ECHO, MSG_ECHO_REPLY,
+    MSG_HELLO, MSG_NODE_HELP, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
     PRIMARY_HIVE_ID,
 };
+use serde_json::Value;
 
 use crate::message::Message;
 
@@ -95,6 +97,63 @@ pub fn control_caller_authorized(verb: &str, node_name: &str, sender: Option<&st
         MSG_PING | MSG_STATUS => admin || own_orchestrator,
         _ => false,
     }
+}
+
+/// Whether `msg`, a message of an AI node's control plane, is a notice or a reply rather than a
+/// request, so it gets no answer: the router made it (it carries no `src_l2_name`, which the router
+/// stamps on every message a node sends), as UNREACHABLE and TTL_EXCEEDED, or its name is a
+/// notice's or a reply's. SY.timer's rule (`isInfrastructureMessage`) and wf-generic's. An answer
+/// to the router's own notice would go to the router's UUID, which no node has: the router would
+/// answer UNREACHABLE again, and the two would bounce it forever (FINDINGS A-112). The node checks
+/// it before anything else (`note_infrastructure_message` logs it).
+pub fn is_infrastructure_message(msg: &Message) -> bool {
+    let from_a_node = msg
+        .routing
+        .src_l2_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+    if !from_a_node {
+        return true;
+    }
+    match msg.meta.msg.as_deref().unwrap_or_default() {
+        "" | MSG_HELLO | MSG_ANNOUNCE | MSG_WITHDRAW | MSG_ECHO | MSG_ECHO_REPLY
+        | MSG_UNREACHABLE | MSG_TTL_EXCEEDED => true,
+        name => name.ends_with("_RESPONSE"),
+    }
+}
+
+/// The journal's line for `msg`, a notice or a reply that reached the control plane of the AI node
+/// `node_name` (`is_infrastructure_message`), which gets no answer. The router's notice that a
+/// message of the node's was not delivered is a warning, with its reason.
+pub fn note_infrastructure_message(node_name: &str, msg: &Message) {
+    let name = msg.meta.msg.as_deref().unwrap_or_default();
+    if matches!(name, MSG_UNREACHABLE | MSG_TTL_EXCEEDED) {
+        let field = |key: &str| {
+            msg.payload
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        tracing::warn!(
+            node_name = %node_name,
+            trace_id = %msg.routing.trace_id,
+            notice = %name,
+            original_dst = %field("original_dst"),
+            reason = %field("reason"),
+            last_hop = %field("last_hop"),
+            "router notice: a message this node sent was not delivered; not answered"
+        );
+        return;
+    }
+    tracing::info!(
+        node_name = %node_name,
+        trace_id = %msg.routing.trace_id,
+        msg_type = %msg.meta.msg_type,
+        msg = %name,
+        src_l2_name = ?msg.routing.src_l2_name,
+        "a notice or a reply, not a request; not answered"
+    );
 }
 
 #[cfg(test)]
@@ -233,5 +292,48 @@ mod tests {
             ),
             ControlRequest::Other
         );
+    }
+
+    /// FINDINGS A-112: what the router made (no sender's name) and what is named as a notice or a
+    /// reply gets no answer; a request from a node, verb or not, is the control plane's to answer.
+    #[test]
+    fn a_notice_or_a_reply_is_infrastructure_and_a_nodes_request_is_not() {
+        let notice = fluxbee_sdk::protocol::build_unreachable(
+            "uuid-of-the-router",
+            "uuid-of-the-node",
+            "trace-1",
+            "IO.gone@motherbee",
+            "NODE_NOT_FOUND",
+        );
+        assert!(is_infrastructure_message(&notice));
+        for (msg, sender) in [
+            (MSG_CONFIG_SET, None),
+            (MSG_CONFIG_SET, Some(" ")),
+            (MSG_HELLO, Some("SY.admin@motherbee")),
+            (MSG_ECHO_REPLY, Some("SY.admin@motherbee")),
+            (MSG_TTL_EXCEEDED, Some("SY.admin@motherbee")),
+            ("CONFIG_RESPONSE", Some("AI.other@worker1")),
+            ("ADMIN_COMMAND_RESPONSE", Some("SY.admin@motherbee")),
+        ] {
+            assert!(
+                is_infrastructure_message(&request("system", msg, sender)),
+                "{msg} from {sender:?}"
+            );
+        }
+        let mut no_msg = request("system", MSG_CONFIG_SET, Some("SY.admin@motherbee"));
+        no_msg.meta.msg = None;
+        assert!(is_infrastructure_message(&no_msg));
+
+        for (msg, sender) in [
+            (MSG_CONFIG_SET, "SY.admin@motherbee"),
+            (MSG_NODE_STATUS_GET, "SY.orchestrator@worker1"),
+            ("VAULT_SECRET_CHANGED", "SY.vault@motherbee"),
+            (MSG_CONFIG_SET, "AI.other@worker1"),
+        ] {
+            assert!(
+                !is_infrastructure_message(&request("system", msg, Some(sender))),
+                "{msg} from {sender}"
+            );
+        }
     }
 }

@@ -13,6 +13,13 @@ Required:
 
 Options:
   --dist-root <path>       Dist root path (default: /var/lib/fluxbee/dist)
+  --start-script <path>    The version's start script, instead of the plain one this script
+                           writes. Its first line of the form exec "$SCRIPT_DIR/<binary>" "$@"
+                           must run the binary published:
+                             exec "$SCRIPT_DIR/<binary name>" "$@"
+                           SY.orchestrator reads that line to know what the version runs.
+  --file <path>            A file of the version, installed next to bin/ under its own name
+                           (repeatable; ai.generic's tools.json, say)
   --set-current            Set this version as manifest.runtimes.<runtime>.current
   --prune-missing          Drop `available` versions of THIS runtime whose directory is gone
                            (requires --set-current). Used by the .deb install-time seed to
@@ -21,9 +28,13 @@ Options:
   -h, --help               Show this help
 
 Notes:
+  - Every input is checked before anything is written.
   - Publishes binary to: <dist-root>/runtimes/<runtime>/<version>/bin/
   - Creates start script at: <dist-root>/runtimes/<runtime>/<version>/bin/start.sh
-  - Updates manifest atomically: <dist-root>/runtimes/manifest.json
+  - Installs each --file at: <dist-root>/runtimes/<runtime>/<version>/<its name>
+  - Writes the manifest last, once every file of the version is in place:
+    <dist-root>/runtimes/manifest.json. SY.orchestrator moves running nodes onto a version as
+    soon as the manifest names it, so the manifest never names a version that is not all there.
 EOF
 }
 
@@ -38,6 +49,8 @@ RUNTIME=""
 VERSION=""
 BINARY=""
 DIST_ROOT="/var/lib/fluxbee/dist"
+START_SCRIPT=""
+FILES=()
 SET_CURRENT=0
 PRUNE_MISSING=0
 USE_SUDO=0
@@ -58,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dist-root)
       DIST_ROOT="${2:-}"
+      shift 2
+      ;;
+    --start-script)
+      START_SCRIPT="${2:-}"
+      shift 2
+      ;;
+    --file)
+      FILES+=("${2:-}")
       shift 2
       ;;
     --prune-missing)
@@ -100,6 +121,35 @@ if [[ ! -f "$BINARY" ]]; then
   exit 1
 fi
 
+BINARY_NAME="$(basename "$BINARY")"
+
+if [[ -n "$START_SCRIPT" ]]; then
+  if [[ ! -f "$START_SCRIPT" ]]; then
+    echo "Error: start script does not exist: $START_SCRIPT" >&2
+    exit 1
+  fi
+  # SY.orchestrator's `start_script_entry` reads what a version runs from the FIRST line that,
+  # trimmed, has the form exec "$SCRIPT_DIR/<binary>" "$@". That line must run this binary: with
+  # another one the version runs it, and with none the version is never ready.
+  exec_line="exec \"\$SCRIPT_DIR/$BINARY_NAME\" \"\$@\""
+  first_exec_line="$(sed -n \
+    's/^[[:space:]]*//; s/[[:space:]]*$//; /^exec "\$SCRIPT_DIR\/.*" "\$@"$/{p;q;}' \
+    "$START_SCRIPT")"
+  if [[ "$first_exec_line" != "$exec_line" ]]; then
+    echo "Error: start script $START_SCRIPT must run the binary with its first line of the form" \
+      "exec \"\$SCRIPT_DIR/<binary>\" \"\$@\": $exec_line (found: ${first_exec_line:-none})" >&2
+    exit 1
+  fi
+fi
+
+# `${FILES[@]+...}`: an empty array under `set -u` is an error before bash 4.4.
+for file in ${FILES[@]+"${FILES[@]}"}; do
+  if [[ ! -f "$file" ]]; then
+    echo "Error: file does not exist: $file" >&2
+    exit 1
+  fi
+done
+
 require_cmd python3
 require_cmd sha256sum
 
@@ -112,7 +162,6 @@ RUNTIMES_ROOT="$DIST_ROOT/runtimes"
 RUNTIME_DIR="$RUNTIMES_ROOT/$RUNTIME/$VERSION"
 BIN_DIR="$RUNTIME_DIR/bin"
 MANIFEST_PATH="$RUNTIMES_ROOT/manifest.json"
-BINARY_NAME="$(basename "$BINARY")"
 START_SH="$BIN_DIR/start.sh"
 
 $SUDO install -d "$BIN_DIR"
@@ -123,16 +172,26 @@ if [[ ! "$BINARY" -ef "$BIN_DIR/$BINARY_NAME" ]]; then
   $SUDO install -m 0755 "$BINARY" "$BIN_DIR/$BINARY_NAME"
 fi
 
-tmp_start="$(mktemp)"
-cat >"$tmp_start" <<EOF
+if [[ -n "$START_SCRIPT" ]]; then
+  $SUDO install -m 0755 "$START_SCRIPT" "$START_SH"
+else
+  tmp_start="$(mktemp)"
+  cat >"$tmp_start" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 exec "\$SCRIPT_DIR/$BINARY_NAME" "\$@"
 EOF
-$SUDO install -m 0755 "$tmp_start" "$START_SH"
-rm -f "$tmp_start"
+  $SUDO install -m 0755 "$tmp_start" "$START_SH"
+  rm -f "$tmp_start"
+fi
 
+for file in ${FILES[@]+"${FILES[@]}"}; do
+  $SUDO install -m 0644 "$file" "$RUNTIME_DIR/$(basename "$file")"
+done
+
+# The manifest last: from here on SY.orchestrator may launch the version, and Syncthing carries
+# it to the workers.
 tmp_manifest="$(mktemp)"
 python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" >"$tmp_manifest" <<'PY'
 import datetime
@@ -219,6 +278,9 @@ manifest_hash="$($SUDO sha256sum "$MANIFEST_PATH" | awk '{print $1}')"
 echo "Published runtime: $RUNTIME@$VERSION"
 echo "Binary path: $BIN_DIR/$BINARY_NAME"
 echo "Start script: $START_SH"
+for file in ${FILES[@]+"${FILES[@]}"}; do
+  echo "File: $RUNTIME_DIR/$(basename "$file")"
+done
 echo "Manifest: $MANIFEST_PATH"
 echo "manifest_version=$manifest_version"
 echo "manifest_hash=$manifest_hash"
