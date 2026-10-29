@@ -20,8 +20,8 @@ Commands
   publish VERSION                  publish the built .deb to the apt repo on the build VM; the
                                    repo keeps the newest 10 versions, dist/ drops the older .debs
   deploy VERSION --snapshot NAME [--drop OLD]
-                                   snapshot every VM (max 3 per VM: name the one to drop, which
-                                   must be the oldest), apt install on the motherbee, wait for
+                                   snapshot every VM (one per VM: the new one replaces the one
+                                   named in --drop), apt install on the motherbee, wait for
                                    its admin, core-update every spoke, wait for all to report
                                    VERSION, then health
 
@@ -38,7 +38,7 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MAX_SNAPSHOTS = 3
+MAX_SNAPSHOTS = 1
 DEFAULT_HIVES = "motherbee=100,worker1=101,ingress1=102,egress1=103"
 PRIMARY = "motherbee"
 pve = None  # lab/pve.py, imported after the env is loaded (it reads PVE_* at import)
@@ -334,12 +334,13 @@ def snapshot_all(new, drop):
                 sys.exit("vm%s (%s) has %d snapshots: name the oldest to drop: --drop %s"
                          % (vm, hive, len(have), oldest))
             plans[vm] = oldest
+    # The new snapshot first, then the old one goes: a VM is never left without its backup.
     for hive, vm in hives().items():
+        pve.wait_task(pve.api("POST", "/nodes/%s/qemu/%s/snapshot" % (n, vm), {"snapname": new, "vmstate": 0}))
+        print("  vm%s: snapshot %s" % (vm, new))
         if vm in plans:
             pve.wait_task(pve.api("DELETE", "/nodes/%s/qemu/%s/snapshot/%s" % (n, vm, plans[vm])))
             print("  vm%s: dropped %s" % (vm, plans[vm]))
-        pve.wait_task(pve.api("POST", "/nodes/%s/qemu/%s/snapshot" % (n, vm), {"snapname": new, "vmstate": 0}))
-        print("  vm%s: snapshot %s" % (vm, new))
 
 
 def wait_for(what, check, timeout, every=6):

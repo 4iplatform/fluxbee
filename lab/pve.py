@@ -28,8 +28,8 @@ Examples:
   pve.py exec 201 -- 'curl -s localhost:8080/hives'
   pve.py push 201 ./packaging/fluxbee-firstboot /usr/local/bin/x
   pve.py snapshots 201                        # oldest first, with dates
-  pve.py snapshot 201 clean-install           # refuses a 4th (rule: max 3 per VM)
-  pve.py delsnapshot 201 <oldest>             # irreversible: always on purpose
+  pve.py snapshot 201 clean-install           # refuses a 2nd (rule: one per VM)
+  pve.py delsnapshot 201 <the old one>        # irreversible: always on purpose
   pve.py rollback 201 clean-install
   pve.py ip 201
   pve.py destroy 201
@@ -225,11 +225,12 @@ def cmd_destroy(a):
     print("  destroyed %s" % a.id)
 
 
-# Operator rule (2026-09-25): never more than 3 snapshots per VM. On LVM-thin each snapshot keeps
-# every block the VM has changed since it was taken, in the pool that ALL the VMs share (fb-mb had
-# 14, one per release: deleting 11 freed 19 GiB). So `snapshot` refuses a 4th. Deleting the oldest
-# is irreversible, so it stays an explicit step (`delsnapshot`), never a side effect of creating.
-MAX_SNAPSHOTS = 3
+# Operator rule (2026-09-25, lowered from 3 to 1 on 2026-10-29): one snapshot per VM, the backup.
+# On LVM-thin each snapshot keeps every block the VM has changed since it was taken, in the pool
+# that ALL the VMs share (fb-mb had 14, one per release: deleting 11 freed 19 GiB; the pool reached
+# 94% in FINDINGS B-17). So `snapshot` refuses a 2nd. Deleting the old one is irreversible, so it
+# stays an explicit step (`delsnapshot`), never a side effect of creating.
+MAX_SNAPSHOTS = 1
 
 
 def _snapshots_by_age(n, vmid):

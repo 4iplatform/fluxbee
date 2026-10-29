@@ -25,7 +25,7 @@
 | Proxmox | `192.168.4.165` (PC-004-165), `192.168.4.157` (PC-004-157) | **`192.168.8.207`** (node `pve`) |
 | Use | experiment, break, validate | real service |
 | Build box | fb-build VM210 @165 · apt repo `192.168.4.200:8900` | fb-build VM110 (outside the cluster) · `10.10.10.50` (fbint) + `192.168.8.180` (vmbr0, DHCP) · apt repo `:8900` — devs: `http://192.168.8.180:8900` |
-| Hives | 240–243 @157 | *(to be built)* |
+| Hives | 240–243 @157 | VMs 100 `motherbee` · 101 `worker1` · 102 `ingress1` · 103 `egress1` |
 | Network | 192.168.4.0/24 | 192.168.8.0/24, gw `192.168.8.1`, bridge `vmbr0` |
 | Host timezone | — | `America/New_York` (**the host journal is in EDT, the logbook in ART −03**) |
 
@@ -60,6 +60,16 @@ websocket, the privilege is available), but they are not convenient to script.
 What would be left out is something very specific (editing a single file in the host's `/etc`, running an
 ad-hoc script). If that need comes up, **it is raised and decided together** — an access
 mechanism is not improvised.
+
+### Who decides on each infrastructure (the operator, 2026-10-29)
+- **8.x, the PROD host `192.168.8.207`: the agent administers it.** It decides and acts on its own
+  judgment (VMs, storage, snapshots, network, users), the irreversible included, and records each
+  change in the day's logbook (§5) with its reason. The rules of §3 still hold. When the host is
+  shared with the dev team, how it is split gets decided then.
+- **4.x, the DEV cluster: outside the agent's scope for now.** It is where the dev team works
+  (Noelia's VMs 270 and 271; VM 260 is not ours).
+- **In practice,** Claude Code's permission classifier can still stop an irreversible action (a
+  deleted snapshot or VM). The agent then asks the operator, and never works around the block.
 
 ---
 
@@ -113,11 +123,12 @@ mechanism is not improvised.
    privileged position. Reason: the recipes must be **portable** (the next prod may be
    bare-metal, with no Proxmox or guest-agent) and must exercise **the path that is tested**.
 1. **Snapshot before every destructive or doubtful change.** Name: `pre-<action>-YYYYMMDD`.
-   **Never more than 3 per VM:** if there are already 3, the oldest is deleted first. `lab/pve.py` enforces
-   it (HANDBOOK §12).
+   **One per VM, the backup** (the operator lowered it from 3 on 2026-10-29): the old one is deleted
+   first. `lab/pve.py` enforces it (HANDBOOK §12).
 2. **One change at a time**, verified before the next one. No blind batches.
 3. **Every change goes into the day's logbook** (§5), including the one that goes wrong.
-4. **What is irreversible is asked first** (§4). Even if the token can do it.
+4. **What is irreversible is asked first** (§4). Even if the token can do it. On the 8.x host it
+   is the agent's call since 2026-10-29 (§2, "Who decides").
 5. **Verify with evidence**, not with assumption: if a service was brought up, its state is shown.
 6. **No lab credentials in prod** — see §6.
 7. When in doubt between "test in prod" and "test in lab": **test in lab**.
@@ -133,8 +144,8 @@ It can be broken. Even so, whatever is useful as learning is recorded (the findi
 |---|---|---|---|
 | **Read** | inventory, `config-get`, logs, permissions | no | no |
 | **Reversible** | create VM, snapshot, start/stop node, `config-set` | no (give notice) | recommended |
-| **Irreversible** | destroy VM, delete storage pool, change host network, delete data | **YES** | **YES** |
-| **State-destructive** | `cleanall`, drop DB, reinstall hive | **YES** | **YES** |
+| **Irreversible** | destroy VM, delete storage pool, change host network, delete data | **YES** (on 8.x the agent's call, §2) | **YES** |
+| **State-destructive** | `cleanall`, drop DB, reinstall hive | **YES** (on 8.x the agent's call, §2) | **YES** |
 
 Rule: *can do it* (permission) is not *should do it*. The token is Administrator; the method sets the criteria.
 

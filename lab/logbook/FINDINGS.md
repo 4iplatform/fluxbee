@@ -3677,7 +3677,7 @@ router reviews.
   describe what is available, not what is running. The fleet comparison already solves it, but
   read on its own it is confusing.
 
-### B-17 🟡 OPEN (found 2026-10-29) — The PROD host's disk pool is at 94%, and the VM disks never give space back
+### B-17 🟡 MITIGATED (2026-10-29, 94% → 71%; two deletions wait for the operator) — The PROD host's disk pool reached 94%, and the VM disks never gave space back
 
 - **What was observed (API reads and `df` in the VMs, 2026-10-29):**
   - `local-lvm` (LVM-thin, 186.4 GiB) holds every VM disk: 175.1 GiB used (93.9%), 11.3 GiB
@@ -3697,18 +3697,35 @@ router reviews.
     `/var/lib/fluxbee-apt` (21 G, all 90 versions).
 - **Risk:** when an LVM-thin pool fills, every VM on it fails its writes at once: the four hives
   and the build box.
-- **Options (the operator's decision), in order of yield:**
-  1. Delete fb-build's `pre-lan-nic-20260925` (irreversible; its NIC has worked for a month).
-  2. `discard=on` on fb-build's disk, a reboot through Proxmox (it applies the pending change),
-     `fstrim -av` inside, and the old `.deb`s under `dist/` deleted (the repo keeps them).
-  3. `discard=on` on the hives' disks and the template. A snapshot keeps every block it shares,
-     so their gain comes as their snapshots rotate out.
-  4. Destroy VM 104 `fb-worker2` (stopped; out of the mesh since 2026-10-06).
-  5. Grow the pool: the volume group's 16 GiB (`lvextend` at the host's console), or a larger
-     VMware disk.
-  6. A retention for the apt repo, which keeps all 90 versions; a rollback uses the previous one.
-- **Also blocks:** a second environment on this host (the Cloud team's dev hive) needs the space
-  back first, and memory too: 27.4 GiB, of which up to 22.9 GiB were used this week.
+- **What was done (2026-10-29, 15:05–15:28; the operator handed the host to the agent that day,
+  METHOD §2):**
+  1. **`discard=on` on every VM disk** (100–103, 110) and on the template 9000, so every clone is
+     born with it. A running VM takes it at its next start: each one was rebooted through
+     Proxmox, one at a time (fb-build, egress1, worker1, ingress1, motherbee), and `fstrim -av`
+     ran inside. The guests' weekly `fstrim.timer` was already on: until now QEMU dropped the
+     discards.
+  2. **The apt repo keeps the newest 10 versions, and `dist/` only the `.deb` just published**
+     (`ops publish`, commit `71620322`): 80 versions and 90 `.deb`s gone, fb-build from 65 G to
+     24 G used.
+  3. **One snapshot per VM** (the operator's rule, lowered from 3): the hives kept
+     `pre-wfcase0-0-1-90`, the backup of 0.1.90, and their 8 older snapshots were deleted.
+  4. **Memory: a balloon floor on the hives** (motherbee 4 GiB, worker1 2 GiB, ingress1 and
+     egress1 1 GiB; fb-build already had 2 GiB, B-15). The guests' processes use 0.4–0.8 GiB
+     each, and the rest of their RAM is page cache that the host could not take back. Now
+     Proxmox reclaims it when the host goes over 80%.
+  - **The pool:** 93.9% → 87.7% (fb-build trimmed) → 81.8% (the retention) → 71.2% (the hives'
+    snapshots): 53.6 GiB free. Each reboot was checked with `ops health` and `ops versions`
+    (0.1.90 everywhere, no failed unit, the edge certificate and the web door fine).
+- **Still open:**
+  - **fb-build's `pre-lan-nic-20260925`:** Claude Code's permission classifier refused its
+    deletion, so it waits for the operator's explicit OK. It holds what fb-build wrote before
+    09-25 and has rewritten since. The API shows no per-volume usage; the estimate is tens of GiB.
+  - **VM 104 `fb-worker2`:** its destruction was refused the same way, and waits too.
+  - **The hives' remaining snapshot** holds most of what they trimmed (the guests issued
+    motherbee 49.6 GiB, worker1 25, ingress1 15.5, egress1 15.7). It comes back when the next
+    deploy replaces it.
+- **A second environment now fits:** 53.6 GiB free in the pool, and the balloon floors leave
+  room in memory without new hardware.
 
 ---
 

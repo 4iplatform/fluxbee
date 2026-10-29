@@ -810,9 +810,9 @@ audit ledger. It applies to the `apt install` on motherbee **and** to each core-
 
 ```bash
 # BEFORE the apt install: snapshot motherbee (the name goes in the ledger row).
-# Never more than 3 per VM (see below): if there are already 3, delete the oldest first.
-python3 lab/pve.py snapshots 100                       # the oldest comes first
-python3 lab/pve.py delsnapshot 100 <the-oldest>        # only if there are already 3
+# One per VM, the backup (see below): delete the old one first.
+python3 lab/pve.py snapshots 100                       # the one it has
+python3 lab/pve.py delsnapshot 100 <the-old-one>       # only if it has one
 python3 lab/pve.py snapshot 100 pre-<something>-<version>
 # ... build + publish + apt install ...
 # AFTER: add to the ledger a row in the table + an entry with:
@@ -824,25 +824,27 @@ The audit entry does **not** replace the logbook (`YYYY-MM-DD.md`, the journey) 
 (the bugs): the ledger is only "which version ended up in prod and why it can be trusted". There
 is a ready-made template at the end of `DEPLOYMENTS.md`.
 
-### Snapshots: never more than 3 per VM · operator's rule (2026-09-25)
+### Snapshots: one per VM, the backup · operator's rule (2026-09-25, lowered from 3 to 1 on 2026-10-29)
 
-**No VM has more than 3 snapshots, ever.** Before taking a new one, if there are already 3, the
-oldest is deleted. `lab/pve.py snapshot` **refuses** to create the fourth and tells you which one
-to delete. The deletion stays an explicit step (`delsnapshot`) because it is irreversible.
+**No VM keeps more than one snapshot: its backup.** Before taking a new one, the old one is
+deleted. `lab/pve.py snapshot` **refuses** a second and tells you which one to delete. `ops deploy`
+takes the new one first and then drops the one named in `--drop`, so a VM is never left without
+its backup. The deletion stays explicit (`delsnapshot`, `--drop`) because it is irreversible.
 
 - **Why:** on LVM-thin each snapshot retains every block that the VM changed since it was taken,
   and it grows with use inside the pool that **all** the VMs share. If the pool fills up, they all
   freeze. On 2026-09-25 fb-mb had 14, one per release since 0.1.19, and the first one with RAM.
-  Deleting 11 freed **19 GiB** (the pool went from 64% to 54%).
-- **The snapshot is for undoing the immediate past,** not for archiving versions. To go down to an
-  old version, the path is the apt repo, which keeps them all: `apt install fluxbee=<previous>`.
-  That is why the "by snapshot" rollbacks in the old entries of `DEPLOYMENTS.md` no longer exist.
-- **Deleting is irreversible:** you delete the oldest one, named explicitly, never in a blind
-  batch.
+  Deleting 11 freed **19 GiB** (the pool went from 64% to 54%). On 2026-10-29 the pool reached 94%
+  (FINDINGS B-17), and the operator lowered the rule to one.
+- **The snapshot is for undoing the last release,** not for archiving versions. To go down to an
+  older version, the path is the apt repo, which keeps the newest 10:
+  `apt install fluxbee=<previous>`. That is why the "by snapshot" rollbacks in the old entries of
+  `DEPLOYMENTS.md` no longer exist.
+- **Deleting is irreversible:** you delete the old one, named explicitly, never in a blind batch.
 
 ```bash
-python3 lab/pve.py snapshots <id>                  # by date, the oldest first
-python3 lab/pve.py delsnapshot <id> <the-oldest>
+python3 lab/pve.py snapshots <id>                  # the one it has
+python3 lab/pve.py delsnapshot <id> <the-old-one>
 ```
 
 ### Commits and versions · operator's rule (2026-09-25)
@@ -1067,8 +1069,8 @@ Three paths:
    hive whose orchestrator is what is broken, use the next two. If it restores `sy-orchestrator`,
    the response may be `FORWARD_UNKNOWN`: check `core.installed.source = core_rollback` in
    `/versions`.
-2. **Cold snapshot of the VMs** — see §1 on why cold. With the maximum of 3 per VM (§12), it
-   covers only the recent past.
+2. **Cold snapshot of the VMs** — see §1 on why cold. With one per VM (§12), it undoes only the
+   last release.
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
 
