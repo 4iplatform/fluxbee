@@ -3677,6 +3677,39 @@ router reviews.
   describe what is available, not what is running. The fleet comparison already solves it, but
   read on its own it is confusing.
 
+### B-17 🟡 OPEN (found 2026-10-29) — The PROD host's disk pool is at 94%, and the VM disks never give space back
+
+- **What was observed (API reads and `df` in the VMs, 2026-10-29):**
+  - `local-lvm` (LVM-thin, 186.4 GiB) holds every VM disk: 175.1 GiB used (93.9%), 11.3 GiB
+    free. The volume group `pve` has 16 GiB more, not allocated to the pool.
+  - Its history (the storage's RRD): 56% on 2026-09-29, 80% on 10-10, 94% on 10-25. Since 10-22
+    it moves between 92.6% and 94.5%: each deploy drops the oldest snapshots and takes new ones.
+  - What the guests use: fb-mb 7.5 G, worker1 3.1 G, ingress 2.9 G, egress 2.7 G, fb-build 65 G.
+    The pool holds about twice that.
+- **Why:**
+  - **No VM disk has `discard=on`** (100–104, 110 and the template 9000). The blocks a guest
+    frees never go back to the pool, so each volume grows toward its full size:
+    60 + 30 + 20 + 20 + 20 + 80 + 20 = 250 GiB, on a 186 GiB pool. Every clone of the template
+    inherits it.
+  - **fb-build keeps the snapshot `pre-lan-nic-20260925`,** taken before its second NIC was added.
+    Every block a build has rewritten since then is held by it.
+  - **fb-build stores each `.deb` twice:** `/opt/fluxbee/dist` (21 G) and the apt repo
+    `/var/lib/fluxbee-apt` (21 G, all 90 versions).
+- **Risk:** when an LVM-thin pool fills, every VM on it fails its writes at once: the four hives
+  and the build box.
+- **Options (the operator's decision), in order of yield:**
+  1. Delete fb-build's `pre-lan-nic-20260925` (irreversible; its NIC has worked for a month).
+  2. `discard=on` on fb-build's disk, a reboot through Proxmox (it applies the pending change),
+     `fstrim -av` inside, and the old `.deb`s under `dist/` deleted (the repo keeps them).
+  3. `discard=on` on the hives' disks and the template. A snapshot keeps every block it shares,
+     so their gain comes as their snapshots rotate out.
+  4. Destroy VM 104 `fb-worker2` (stopped; out of the mesh since 2026-10-06).
+  5. Grow the pool: the volume group's 16 GiB (`lvextend` at the host's console), or a larger
+     VMware disk.
+  6. A retention for the apt repo, which keeps all 90 versions; a rollback uses the previous one.
+- **Also blocks:** a second environment on this host (the Cloud team's dev hive) needs the space
+  back first, and memory too: 27.4 GiB, of which up to 22.9 GiB were used this week.
+
 ---
 
 ## How this document is used
