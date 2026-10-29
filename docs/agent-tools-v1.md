@@ -8,8 +8,11 @@
 - Iteration 1 of §6, 0.1.87, is validated on 8.x (2026-10-27).
 - 0.1.88 fixed what that gate found (FINDINGS A-109, with A-101 and A-102): running agents move onto
   a new runtime by themselves. Validated on 8.x (2026-10-27).
-- Next: iteration 2 (§6.2), 0.1.89: `read_blob`, `unpublish_html_page` and fixes. The operator
-  moved reminders and messages to others to WFs (§6.3).
+- Iteration 2 (§6.2), 0.1.89, is validated on 8.x (2026-10-28; ledger 0.1.89): `read_blob`,
+  `unpublish_html_page` and the fixes. The operator moved reminders and messages to others to WFs
+  (§6.3).
+- Next: the WF track, [wf-orchestration-v1](wf-orchestration-v1.md), starting with its Case 0
+  (0.1.90).
 
 This is the single place for the track; the next iteration starts here.
 
@@ -309,8 +312,8 @@ Two of the checked facts still stand:
   - A person pastes a page's link to have it taken down.
   - A blob's name lets an agent read it across tenants (A-106).
 - **With it (FINDINGS A-111):** a CSV or HTML attachment becomes text, as txt, md and json are.
-  - Today it reaches the model as a document.
-  - Claude accepts only PDF documents, so the whole message fails.
+  - Before 0.1.89 it reached the model as a document.
+  - Claude accepts only PDF documents, so the whole message failed.
 
 #### 6.2.2 `unpublish_html_page`
 
@@ -321,8 +324,8 @@ Two of the checked facts still stand:
 - **SY.admin's `unpublish_artifact`:**
   - also takes the link's key;
   - checks the owner as today: the exact node that published;
-  - answers `NOT_FOUND` for a publication that does not exist, where today it answers
-    `INVALID_REQUEST`.
+  - answers `NOT_FOUND` for a publication that does not exist, where it answered
+    `INVALID_REQUEST` before 0.1.89.
 - **Answers:**
   - `unpublished: true`;
   - `false` when the page was already down or had expired.
@@ -335,7 +338,7 @@ Two of the checked facts still stand:
 - **Fixed with it:**
   - a page taken down in the same turn is not added to the reply;
   - when SY.admin returns no public address, the tool tells the model the page was not
-    published. Today that page stays live until it expires. Now the tool takes it down.
+    published. Before 0.1.89 that page stayed live until it expired. Now the tool takes it down.
 
 #### 6.2.3 Fixed on the way
 

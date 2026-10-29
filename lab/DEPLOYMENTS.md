@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ live | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
+| **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ live | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
+| **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ replaced by 0.1.89 | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
 | **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ replaced by 0.1.88 | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
 | **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ replaced by 0.1.87 | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
 | **0.1.85** | 2026-10-24 | `95bacd3` | motherbee + spokes (core) + `IO.web@motherbee` started (root tenant) | ✅ replaced by 0.1.86 | snap `pre-web-0-1-85` (all 4 VMs) · kill + purge `IO.web@motherbee`, then `apt install fluxbee=0.1.84` + core-update of the spokes |
@@ -97,6 +98,96 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.89 — Agent tools, iteration 2: `read_blob` and `unpublish_html_page`, CSV and HTML attachments as text, router notices never answered (agent-tools-v1 §6.2; A-110, A-111, A-112, A-121)
+
+- **Date:** 2026-10-28 (ART) · **Previous version:** 0.1.88 · **Commit:** `694becc`.
+- **Scope:**
+  - motherbee and the three spokes (core update);
+  - just before the deploy, the gate's `ai.generic 0.1.88-gate1` was deleted on the motherbee.
+    Otherwise the package would have kept it as `current` (A-122).
+- **Design:** [agent-tools-v1](../docs/agent-tools-v1.md) §6.2.
+  - The operator first decided four tools. Once the code was checked, the AI node stayed a pure
+    responder.
+  - Reminders and `send_message` were built, then removed. They move to WFs (§6.3 and
+    [wf-orchestration-v1](../docs/wf-orchestration-v1.md)).
+  - Built by two agents, one for the AI side and one for the platform side. One review round
+    (every lens), all of it fixed before the build:
+    - **Platform:**
+      - A-121;
+      - the command log kept a page's key;
+      - a publication id not in its canonical form;
+      - an expired page reported as taken down;
+      - the start-script check read any exec line;
+      - docs.
+    - **AI:**
+      - the same notice loop in SY.frontdesk.gov;
+      - text judged by the name's extension;
+      - no budget per message;
+      - links and blob names in the journal;
+      - a malformed key;
+      - the cut note's offset.
+- **What changed:**
+  - **`read_blob` (§6.2.1):**
+    - reads a text blob by the name an attachment shows, in pieces of 64 KiB with
+      `next_offset`;
+    - text is judged by content (a NUL byte = `not_text`);
+    - at most 10 MiB, and 192 KiB per message;
+    - the SDK reads only `active/`, without following links, and checks the hash in the name.
+  - **`unpublish_html_page` (§6.2.2):**
+    - takes a page down by its `publication_id` or its link;
+    - SY.admin's `unpublish_artifact` takes exactly one of a canonical id or the link's key,
+      and answers `NOT_FOUND` for a page that does not exist;
+    - its command log keeps only the canonical id and the key's sha256.
+  - **A-111:** CSV and HTML attachments reach the model as text. An attachment shows its blob
+    name, and a cut text says where to read on.
+  - **A-112:** router notices, `*_RESPONSE` and other infrastructure messages are never
+    answered. The rule lives in the AI SDK; ai.generic and SY.frontdesk.gov use it.
+  - **A-110:** the publish scripts write the manifest last; the catalog is a parameter.
+  - **A-121:** a purge records "do not relaunch" right after the stop.
+  - **The journal's preview** redacts live links and blob names.
+- **Deploy:**
+  - build of `694becc` in 24 min, deploy in 238 s;
+  - snapshots `pre-tools2-0-1-89` on the 4 VMs (`pre-tools-0-1-86` was deleted);
+  - 0.1.89 on all 4 (core manifest `f566d4ecfa367c7e`), with health clean.
+  - The seed logged "ai.generic 'current' moved 0.1.88-gate1 -> 0.1.89 (package authority)".
+  - `AI.pruebas` moved onto 0.1.89 by itself, within the reconcile pass (A-109).
+- **Gate,** on `AI.pruebas@worker1` (Claude), with messages through the admin:
+  - **A-111:** a 5-row CSV attachment, which had answered `provider_error` on 0.1.88.
+    - Asked for the rows of 2026-10 and their sum, the agent listed all three: 305.
+    - Asked for "only the number", it first answered 245, leaving out the last row. That was
+      the model's slip: the input held the whole CSV.
+  - **`read_blob`:** a 148,037-character text with a random code only in its last line.
+    - The attachment was cut at 100,000 characters.
+    - Two model turns (`llm_usage`): the first called `read_blob` from the cut, and the second
+      answered the right code.
+  - **Unpublish:**
+    - the agent published a page, which answered HTTP 200 from the internet;
+    - in another conversation, given only the link, it took the page down: 404;
+    - the admin's command log keeps only `key_sha256` for it.
+  - **A-112:**
+    - a throwaway mesh client sent a message and left at once;
+    - the router's `UNREACHABLE` reached the agent;
+    - it was logged once as a router notice, "not answered", with no `unknown_system_msg`.
+  - **The catalog:** `get_runtime ai.generic` answers `current` 0.1.89, with the 17-tool
+    catalog.
+    - The agent offered 14 tools to a message without a person.
+    - The three thread-state tools need `src_ilk` (their cards' `present_when`).
+  - **Health:** `failed=0`, `denials=0` on all 4; the web door is acknowledged.
+- **Cleanup:**
+  - the gate's two blobs and its folder on worker1 were removed;
+  - the page is down;
+  - `AI.pruebas` stays, on 0.1.89, following `current`.
+- **Noted:**
+  - The 0.1.88 entry said to remove `0.1.88-gate1` *after* this release. It had to be before:
+    after the seed, `current` would have dangled (A-122).
+  - The admin's command log keeps a `send_node_message`'s text. So the link typed into the
+    gate's message is there: the operator's own route, and the page is down.
+- **Upgrading another hive:** nothing by hand.
+- **Rollback:**
+  - snapshot `pre-tools2-0-1-89`;
+  - or `apt install fluxbee=0.1.88` plus the core update of the spokes. The agents lose
+    `read_blob` and `unpublish_html_page`, and A-111 and A-112 return.
 
 ## 0.1.88 — A running node moves onto what its runtime names now, on every reconcile pass, once that is ready; every launch records and stamps its version (A-109, A-101, A-102)
 

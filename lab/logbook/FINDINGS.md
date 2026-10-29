@@ -1078,7 +1078,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-121 🔴 OPEN (found 2026-10-27, 0.1.89 review) — A node whose purge failed on SY.timer comes back within 60 s
+### A-122 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
+
+- **What happens:**
+  - The 0.1.88 gate published `ai.generic 0.1.88-gate1` with publish-ia-runtime.sh, which made it
+    `current`. AI.pruebas ran on it from then on.
+  - The package's seed (`fluxbee-seed-runtimes`) forces a base runtime's `current` only when the
+    version it names is gone from disk. A hand-published version still on disk keeps `current`.
+    The package's version is published as available only, and the only trace is a NOTE in
+    dpkg's output.
+  - So the 0.1.89 upgrade would have left AI.pruebas on the gate's build, and the gate would
+    have tested 0.1.88 code.
+  - The admin cannot hand `current` back:
+    - `remove_runtime_version` refuses the current version while another one exists
+      (`RUNTIME_CURRENT_CONFLICT`);
+    - no action sets a base runtime's `current`.
+- **Why it matters:**
+  - Since 0.1.89 (A-110), publishing a base runtime by hand is a supported tool. After one such
+    publish, every later package leaves that runtime behind without saying so where the operator
+    looks.
+  - The only way back is a delete by hand, outside the admin and out of Archi's reach.
+  - The 0.1.88 ledger even said to remove the version *after* the next release. That would have
+    left `current` dangling, because the seed had already run.
+- **Done for 0.1.89:**
+  - the gate's `0.1.88-gate1` directory was deleted on the motherbee just before the deploy;
+  - the seed took `current` back ("moved 0.1.88-gate1 -> 0.1.89 (package authority)") and pruned
+    the version from the manifest;
+  - AI.pruebas moved onto 0.1.89 by itself, within the reconcile pass.
+- **Fix:** later, explicit and visible:
+  - an admin action, reachable by Archi, that sets a runtime's `current`, or returns a base
+    runtime to its package's version;
+  - and the deploy reporting a kept hot-published `current` in its result.
+
+### A-121 ✅ RESOLVED (0.1.89; by tests, not exercised on 8.x) — A node whose purge failed on SY.timer comes back within 60 s
 
 - **What happens:**
   - `kill_node` with `purge_instance` stops the unit, then purges the node's timers.
@@ -1091,6 +1123,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - `remove_node_instance` had the same hole: a node down after a crash keeps its flag. It gets
     the same fix.
   - Both `TIMER_PURGE_FAILED` answers report `relaunch_on_boot: false`.
+- **Status:** the orchestrator's tests cover it. It was not exercised on 8.x, because that needs
+  SY.timer down.
 
 ### A-120 🟡 OPEN (found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
 
@@ -1249,7 +1283,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - Agents do not send at all: the AI node stays a pure responder, and routing belongs to WFs
     (agent-tools-v1 §6.2).
 
-### A-112 🔴 OPEN, probable (found 2026-10-27, iteration 2 design) — The AI node answers router notices
+### A-112 ✅ VALIDATED ON 8.x (0.1.89, 2026-10-28) — The AI node answers router notices
 
 - **What happens:**
   1. A router notice (`UNREACHABLE`, `TTL_EXCEEDED`) that no waiter takes reaches
@@ -1270,8 +1304,14 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - It also closes a latent `CONFIG_RESPONSE` ping-pong between two AI nodes.
   - The review found the same control plane in SY.frontdesk.gov. The rule moved to the AI SDK, and
     both use it.
+- **Validated on 8.x (0.1.89):**
+  - a throwaway mesh client sent `AI.pruebas` a message and left at once, so the agent's reply
+    could not be delivered;
+  - the router's `UNREACHABLE` reached the agent, which logged it once as a router notice, "not
+    answered";
+  - no `unknown_system_msg`, and nothing more.
 
-### A-111 🔴 OPEN (found 2026-10-27, iteration 2 design) — A CSV or HTML attachment fails the whole message on Claude
+### A-111 ✅ VALIDATED ON 8.x (0.1.89, 2026-10-28) — A CSV or HTML attachment fails the whole message on Claude
 
 - **What happens:**
   - ai.generic reads as text only the `text/plain`, `text/markdown` and `application/json`
@@ -1279,10 +1319,17 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - Every other attachment reaches the model as a document part, CSV and HTML included.
   - The Anthropic provider accepts only PDF documents, so a message with a CSV or HTML attachment
     fails there. On OpenAI it goes as an `input_file`.
-- **Fix (0.1.89, agent-tools-v1 §6.2.2):** CSV and HTML become text, and an attachment shows its
+- **Fix (0.1.89, agent-tools-v1 §6.2.1):** CSV and HTML become text, and an attachment shows its
   blob name, for `read_blob`.
+- **Validated on 8.x (0.1.89), on Claude:**
+  - on 0.1.88 the gate's CSV had answered `provider_error`;
+  - on 0.1.89, asked for the rows of a month and their sum, the agent listed all three and the
+    right total, 305;
+  - asked for "only the number", it first answered 245, leaving out the last row. That was the
+    model's slip, with no room to work, not the input's: the preview and the input's length
+    show the whole CSV.
 
-### A-110 🟡 OPEN (found 2026-10-27, 0.1.88 gate) — publish-ia-runtime.sh moves `current` before its last step
+### A-110 ✅ RESOLVED (0.1.89; by tests) — publish-ia-runtime.sh moves `current` before its last step
 
 - **What happens:**
   - `scripts/publish-ia-runtime.sh` calls `publish-runtime.sh`, which writes the manifest, `current`
@@ -1291,8 +1338,16 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - Run outside a full checkout, the catalog step fails after `current` has already moved. The
     version is live without its catalog, so `get_runtime` answers `tool_catalog: null` to Archi.
   - Running nodes were safe: the reconcile checks the version's files.
-- **Fix:** write every file of the version first and move the manifest last; fail before touching
-  the manifest when an input is missing.
+- **Fix (0.1.89):**
+  - publish-runtime.sh writes every file of the version first (`--start-script`, `--file`) and
+    the manifest last;
+  - publish-ia-runtime.sh takes the catalog as `--catalog`, and fails before touching the
+    manifest when an input is missing;
+  - the IO publish scripts use `--start-script`.
+- **Status:**
+  - the scripts' tests cover it; the failing case was not run by hand on 8.x;
+  - there, the package published 0.1.89 with its 17-tool catalog, which `get_runtime` answers;
+  - the hand publish now hits A-122 on the next upgrade.
 
 ### A-109 ✅ VALIDATED ON 8.x (0.1.88, 2026-10-27) — A release that does not change the orchestrator leaves running nodes on the old runtime
 
@@ -1345,8 +1400,8 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 
 ### A-106 🟡 OPEN, interim decision (found 2026-10-27) — The blob store has no tenant; agents read the whole hive
 
-- **What happens:** a `BlobRef` carries no tenant, and the store has no per-tenant directory. From
-  0.1.89, `read_blob` lets an agent read any text blob of its hive by reference.
+- **What happens:** a `BlobRef` carries no tenant, and the store has no per-tenant directory. Since
+  0.1.89 (live 2026-10-28), `read_blob` lets an agent read any text blob of its hive by reference.
 - **The interim decision:** *"si no es por tenant, hoy prefiero que lea todo lo del hive"*. A blob's
   name carries 16 hex of its content's hash, so a reference has to have reached the agent; it
   cannot be guessed.
