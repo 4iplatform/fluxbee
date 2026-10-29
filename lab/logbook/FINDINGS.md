@@ -1112,6 +1112,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Options, to decide with the operator in Cases 2–3:**
   - take an event on a thread only from the nodes the instance sent to;
   - or have the definitions guard on `event.src`.
+- **Decided (the operator, 2026-10-29, WF Case 1):** only the nodes involved drive an instance:
+  those written in the definition, and SY.timer for the WF's own timers. Nothing adaptable. It is
+  built with Case 1 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2).
 
 ### A-122 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 

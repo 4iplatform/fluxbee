@@ -12,9 +12,8 @@
 - **Case 0 (§5.1)** was decided by the operator on 2026-10-28. It was built, and validated on 8.x
   in 0.1.90 (2026-10-29; ledger 0.1.90).
 - **Case 1 (§5.2)** is the operator's circuit of 2026-10-29: a sale handed to invoicing, then a
-  due-date timer and a payment check. Decided so far: one instance per conversation. Next: what the
-  forward may change. The operator: close the WF topic completely, case by case; Archi through
-  Cloud waits.
+  due-date timer and a payment check. All its decisions were taken on 2026-10-29. Next: its build
+  design. The operator: close the WF topic completely, case by case; Archi through Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -265,8 +264,9 @@ This is the single place for the track. The cases are worked here one at a time.
   - one instance per message, with the conversation carried through to the agent.
 
   **Decided (§5.2):** one instance per conversation, on 2026-10-29.
-- **What "forward as received" may change:** the destination only, or named fields too. Being
-  decided in §5.2.
+- **What "forward as received" may change:** the destination only, or named fields too.
+
+  **Decided (§5.2):** the metadata only, on 2026-10-29. The message's content is never touched.
 
 ## 5. Case by case (proposed; the operator picks)
 
@@ -381,9 +381,12 @@ This is the single place for the track. The cases are worked here one at a time.
 3. `AI.invoice` issues the invoice and answers with its data, the due date included.
 4. The WF keeps the invoice in the instance's state and sets a timer at its due date. The time
    comes from invoice's answer, not from the definition.
-5. At the due date, the WF sends the invoice to `AI.payments`, which checks the payment and
-   answers.
+5. At the due date, the WF writes to `AI.payments`: the payment period has ended, and the customer
+   must be told the invoice was not paid. The agent decides what to say.
 6. The WF delivers that answer to the person through the IO node.
+
+The timer stands in for checking the payment's real state through an API. It is a simplification,
+though a realistic case for an agent.
 
 Every hop is the WF's, because the agents only answer (§1). The names (`AI.sales`, `AI.invoice`,
 `AI.payments` and the IO node) are written in the definition.
@@ -416,13 +419,34 @@ come later.
   trace.
 - The due date is a few minutes away; SY.timer's floor is 60 s.
 
-**Open, one at a time:**
-1. **What the forward may change** (§4.9). In step 2 the person writes *"dale, facturámelo"*. If
-   only the destination changes, invoice receives that sentence alone, and the order (10 licenses
-   at their price) was said to sales.
-2. **When control goes back to sales,** and when the instance ends. It must outlive the due date.
-3. **Who may drive a conversation's instance** (A-123). The proposal: only the names written in the
-   definition, and SY.timer.
+**Decided: a forward changes only the metadata.**
+- The message's content, its text and its attachments, is never touched.
+- The example that raised it: in step 2 the person writes *"dale, facturámelo"*. Invoice receives
+  that sentence alone, and the order (10 licenses at their price) was said to sales.
+- When an agent needs more to answer, the WF gives it deterministic context in the metadata, and
+  the agent reads it. Named so far:
+  - the path the message took (Case 0's trail);
+  - variables of the WF's state, named in the definition;
+  - whatever other metadata a case needs.
+- A message the WF writes itself, as in step 5, has its text written in the definition and its
+  data in the metadata.
+- The operator: *"este tema es el más profundo"*. Which metadata, and how an agent reads it, will
+  be worked out with real cases. Case 1 builds the least it needs.
+
+**Decided: control goes back to sales in two ways,** and Archi's guide recommends both:
+- the agent hands the case back, for example `AI.payments` closing it;
+- an inactivity timer.
+
+Which of them a WF uses is its author's choice (*"flavor del programador"*).
+
+**Decided: only the nodes involved drive an instance** (A-123): those written in the definition,
+and SY.timer for the WF's own timers. *"Determinístico… no veo por qué algo adaptable."*
+
+**Next:** Case 1's build design, in this doc:
+- what changes in the WF engine, in ai.generic and in the definition language;
+- Case 1's definition itself.
+
+Then one review round, the release, and the validation on 8.x.
 
 ## 6. Docs that drift from the code
 
