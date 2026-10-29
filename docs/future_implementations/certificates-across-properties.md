@@ -11,6 +11,28 @@
   valid until 2027-02-12. It is copied on several hosts, and its key can impersonate any name under
   the domain. The public website `fluxbee.ai` serves it today.
 
+- **The root `fluxbee.ai`** (checked 2026-10-29) resolves to `71.182.182.108`, an nginx 1.24 that is
+  none of the installation's VMs. It serves the website and passes `/api/` to an application that
+  answers JSON. It serves the Sectigo wildcard, and its port 80 is closed. The DNS is Azure DNS,
+  managed by hand: no CAA, and no `www`, `app`, `cloud` or `api` record.
+- **Cloud needs the root** (the operator, 2026-10-29: "cloud necesita el dominio fluxbee.ai que es
+  el raíz, eso hay que revisarlo"). To review, in this order:
+  - what serves the root, and whether Cloud shares it with the website or takes a name of its own;
+  - where Cloud's production runs;
+  - who issues the root's certificate. SY.admin's ACME client certifies only an installation's own
+    names from `hive.yaml` (acme-edge-certificates-v1, O6 and D1), so it is not the issuer here.
+    Whoever serves the root issues its own, with the same rule: TLS-ALPN-01 on :443, no DNS
+    credentials, no wildcard.
+- **What else depends on the root:**
+  - PROD's egress probe checks `https://fluxbee.ai` (`egress.reachability_url`).
+  - Every installation under `*.fluxbee.ai` is the same site as the root for browsers. Two
+    defences hold today:
+    - published pages are sandboxed (CSP `sandbox` without `allow-same-origin`,
+      `connect-src 'none'`);
+    - Archi's cookie is `__Host-`.
+
+    Cloud's cookies should be `__Host-` too.
+
 ## What is wanted
 
 - **Replace every Sectigo certificate** with automatically issued and renewed ones (Let's Encrypt or
