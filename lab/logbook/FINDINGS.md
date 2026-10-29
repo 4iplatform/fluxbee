@@ -1078,6 +1078,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-123 🟡 OPEN (found 2026-10-29, 0.1.90 review) — A message on a running WF instance's thread drives it, whoever sends it
+
+- **What happens** (go/nodes/wf/wf-generic/node/correlate.go): correlation by thread does not look
+  at the sender, and an `event_match` names no sender either.
+  - An instance's id is the thread of every message it sends, so its targets know it, and so do
+    the logs.
+  - A node that knows it can send, say, a `HOST_TURN` on that thread, and `wf.router` relays that
+    content to the customer.
+- **Why it matters:** decision 6 of Case 0 left it open; the operator called it a security topic
+  that stays open ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.1).
+- **Options, to decide with the operator in Cases 2–3:**
+  - take an event on a thread only from the nodes the instance sent to;
+  - or have the definitions guard on `event.src`.
+
 ### A-122 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 
 - **What happens:**
@@ -1138,7 +1152,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** later, with Archi's admin actions. Taking down any page is an operator power, so it goes
   through Archi's confirmation flow.
 
-### A-119 🔴 OPEN (found 2026-10-27, WF review) — The WF engine's control verbs and timer fires accept anyone
+### A-119 ✅ VALIDATED ON 8.x (0.1.90, 2026-10-29) — The WF engine's control verbs and timer fires accept anyone
 
 - **What happens:**
   - The engine checks no caller on `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_GET_CODE` or
@@ -1149,10 +1163,30 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - A `TIMER_FIRED` is correlated by its `client_ref` from any sender.
   - An `INVALID_INPUT` answer carries no thread, so two WFs could bounce it back and forth (read,
     not run).
-- **Fix:** with the WF track, Case 0 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.3,
-  §5).
+- **Fixed (0.1.90, [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.1 item 6):**
+  - **The WF_\* verbs** (`WF_HELP` and `WF_GET_CODE` too) answer only SY.admin@motherbee and
+    SY.wf-rules of the WF's hive, by the router-stamped name. Anyone else gets `UNAUTHORIZED`.
+  - **A `TIMER_FIRED`** is taken only from SY.timer of the hive, and only for a timer the WF
+    scheduled (its `owner_l2_name`). SY.timer lets any node schedule a timer whose fire goes to
+    another node, under SY.timer's own name (A-115).
+  - **Never answered, and never the start of an instance:**
+    - an error answer, a `*_RESPONSE` or a router notice;
+    - a system message other than `TIMER_FIRED`;
+    - a late answer on the thread of an instance that ended. An agent answers with the request's
+      own name, so before this rule the answer started a new instance, which asked the agent
+      again: a WF↔AI loop the review reproduced.
+- **Validated on 8.x (2026-10-29),** on `WF.gate0190@worker1`, from a throwaway node
+  `IO.gate0190p@worker1`:
+  - **`WF_LIST_INSTANCES`** got `UNAUTHORIZED`, naming who may ask. SY.wf-rules@worker1 still
+    counted the instances.
+  - **A forged `TIMER_FIRED`** was refused and not answered.
+  - **A timer the probe scheduled at SY.timer@worker1** with an instance's `client_ref`: SY.timer
+    accepted it, and the WF refused its fire ("the timer was scheduled by IO.gate0190p@worker1").
+  - **A message on an ended instance's thread** was dropped as a late answer.
+- **Still open** (the operator: a security topic that stays open): a message on a running
+  instance's thread drives it, whoever sends it (A-123).
 
-### A-118 🔴 OPEN (found 2026-10-27, WF review) — The WF engine: a panic, an unbounded loop, lost and repeated events, instances moved by a redeploy
+### A-118 ✅ RESOLVED (0.1.90; the restart and the redeploy validated on 8.x, the rest by tests) — The WF engine: a panic, an unbounded loop, lost and repeated events, instances moved by a redeploy
 
 Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, read in the code at
 `e49ffeaa`.
@@ -1170,9 +1204,52 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **Numbers change type across a restart.**
 - **A `$ref` to a missing key fails the instance.**
 
-**Fix:** with the WF track, Case 0.
+**Fixed (0.1.90, wf-orchestration-v1 §5.1):**
 
-### A-117 🔴 OPEN (found 2026-10-27, WF review) — Every shipped WF timeout is dead, and a send to an agent hangs
+- **The panic:** a CEL value is kept as plain JSON, and a panic fails its instance, never the node.
+  - The review found a fatal error that no recover catches: a guard left running past its timeout
+    read the state while the next transition wrote it. Guards now evaluate on the caller's
+    goroutine.
+  - `set_variable` has a cost limit.
+- **The loop:** at most 100 internal events per inbound event. Past that, the instance fails
+  (`internal_event_cap`).
+- **At least once:**
+  - an inbound journal, and a creation in one commit;
+  - recovery runs again what a crash left;
+  - an event that does not finish in 3 starts fails its instance (`replay_exhausted`), so one bad
+    event cannot crash-loop the node.
+- **A redeploy:**
+  - each instance records its definition's hash and ends on it;
+  - recovery binds by hash;
+  - an instance whose state its definition lacks fails at load (`state_not_in_definition`).
+- **Timers:**
+  - a fired timer's row goes with its fire;
+  - recovery fires the lost ones in time order, from the store;
+  - a start without SY.timer runs DEGRADED, and schedules again what SY.timer lacks once it
+    answers.
+- **Numbers** keep their type live, after a restart, and as written in a definition (an integer
+  literal used to go out as `3.0`).
+- **`$ref`:** `{"$ref": p, "default": v}` gives a default.
+- **SQLite** runs FULL sync, as SY.timer does.
+
+**Validated on 8.x (2026-10-29):**
+
+- **A restart** of the WF node while an instance waited on its timer: recovery loaded it,
+  SY.timer fired once, and there was one answer.
+- **A redeploy** while an instance ran: it ended on its own definition (v1's reply). The old
+  definition was dropped when it ended, and the next instance took v2.
+- **The journal** was empty after every transition.
+
+**Left (low; found by tests or by reading):**
+
+- recovery reads at most 1000 timers (`TIMER_LIST` has no pages);
+- a database error during a commit leaves the live instance ahead of the store until the next
+  start;
+- a past-due timer can fire twice when SY.timer's own fire races recovery's synthetic one;
+- a timer scheduled again by the degraded reconcile takes `missed_policy` `fire`;
+- a creation whose failure handling also panics leaves no instance row.
+
+### A-117 ✅ VALIDATED ON 8.x (0.1.90, 2026-10-29) — Every shipped WF timeout is dead, and a send to an agent hangs
 
 - **No timeout ever fires.**
   - SY.timer puts the key at `payload.user_payload.timer_key`.
@@ -1184,8 +1261,24 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - Archi's two seeds, `wf.invoice` and SY.admin's help example all send without a type.
 - **`wf.router`'s error branches never fire:** an agent's error arrives as `<msg>.error`.
 - **`wf.invoice` relies on a JSON-Schema default** that is never applied.
-- **Fix:** with the WF track, Case 0 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.1,
-  §5).
+- **Fixed (0.1.90, [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.1):**
+  - a WF always sends `user`: `meta.type` and `event_match.type` left the language;
+  - `event.timer_key` carries a fired timer's key;
+  - the examples, Archi's seeds (`seed_version` 2), SY.admin's help, the spec and the quickstart
+    guard on it;
+  - `wf.router` matches `<msg>.error`;
+  - `wf.invoice` gives its currency a `$ref` default;
+  - a test validates every definition in the docs.
+- **Validated on 8.x (2026-10-29):**
+  - **The exchange:**
+    - `WF.gate0190@worker1` sent `GATE_TURN` to `AI.pruebas@worker1` as a user message, and the
+      agent answered in 2 s (Claude Sonnet 5.5);
+    - a 60 s timer fired from SY.timer, and the guard `event.timer_key == 'hold'` took it;
+    - the reply reached the gate client by its name, written in the definition.
+  - **Archi's seeds** upgraded to `seed_version` 2, on `event.timer_key`.
+  - **Refused definitions:** five that the language refuses each got `COMPILE_ERROR` through
+    SY.admin, naming the path. They covered `meta.type`, `target_ref`, `event_match.type`, a
+    `$ref` with another root, and one with an extra key.
 
 ### A-116 🔴 OPEN (found 2026-10-27) — A WF in front of a conversation loses the person and the conversation for the agent
 
@@ -1207,7 +1300,14 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **Why it matters:** the operator's direction (agent-tools-v1 §6.2, §6.3) puts a WF between an IO
   node and an agent whenever a solution needs timers or routing. For that the WF must forward the
   message as received, and keep the person and the conversation.
-- **Next:** the WF review of §6.3, case by case.
+- **Seen in 0.1.90:**
+  - **The review:** a send to an agent with `thread_id_ref` loops. Each answer comes back on the
+    other thread, starts an instance, and is forwarded again (a test: 4 instances after 3
+    answers). No shipped definition does that.
+  - **The gate:** the agent logs `missing src_ilk` on every message a WF sends it, and its
+    `llm_usage` row has no counterpart.
+- **Next:** [wf-orchestration-v1](../../docs/wf-orchestration-v1.md), Cases 1–2: the forward, and
+  the correlation by conversation.
 
 ### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
@@ -1229,6 +1329,14 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
     decision ([agent-tools-v1](../../docs/agent-tools-v1.md) §6.2).
   - A WF reconciles its own timers at start (go/nodes/wf/wf-generic/node/recover.go). Whether that
     covers a fire lost while it was down is part of the WF review (§6.3).
+- **In 0.1.90 (A-118):** a WF fires the timers whose fire was lost while it was down, and schedules
+  again what SY.timer lacks.
+- **Found in the 0.1.90 review, and seen on 8.x:** any node can schedule a timer whose fire goes to
+  another node, under SY.timer's own name. SY.timer does not check `target_l2_name` against the
+  requester.
+  - A WF refuses a fire it did not schedule, since 0.1.90 (A-119).
+  - Whether SY.timer should refuse such a timer for a requester that is not a SY node is for the
+    operator.
 - **Later:** delivery retries and caps in SY.timer.
 
 ### A-114 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default

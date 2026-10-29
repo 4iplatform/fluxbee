@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ live | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
+| **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ live | snap `pre-wfcase0-0-1-90` (all 4 VMs) · `apt install fluxbee=0.1.89` + core-update of the spokes |
+| **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ replaced by 0.1.90 | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
 | **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ replaced by 0.1.89 | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
 | **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ replaced by 0.1.88 | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
 | **0.1.86** | 2026-10-27 | `89848d8` | motherbee + spokes (core) | ✅ replaced by 0.1.87 | snap `pre-tools-0-1-86` (all 4 VMs) · `apt install fluxbee=0.1.85` + core-update of the spokes, then each AI node's config back to the 0.1.85 shape (see the entry) |
@@ -98,6 +99,117 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.90 — The WF track, Case 0: a WF always sends `user`, `event.timer_key`, an instance ends on its own definition, at least once, `$ref` with a default, the WF's controls answer only SY.admin and SY.wf-rules, `target_ref` goes (wf-orchestration-v1 §5.1; A-117, A-118, A-119)
+
+- **Date:** 2026-10-29 (ART) · **Previous version:** 0.1.89 · **Commit:** `e6b07fc`.
+- **Scope:** motherbee and the three spokes (core update). No WF ran in PROD before it.
+- **Design:** [wf-orchestration-v1](../docs/wf-orchestration-v1.md) §5.1, the operator's seven
+  decisions (2026-10-28) and what was fixed with them.
+  - Built by one agent. One review round, with four reviewers: the engine, security, the language
+    and the docs.
+  - Fixed before the build (27 items). Among them:
+    - **Engine:**
+      - an event that crashed the node ran again at every start. The trigger was a guard left
+        running past its timeout, which read the state while the next transition wrote it: a fatal
+        error;
+      - the reconcile dropped timers scheduled while the node was degraded;
+      - recovery fired timers from a stale snapshot.
+    - **Security:**
+      - an agent's late answer started a new instance, which asked the agent again (a WF↔AI loop);
+      - a timer another node scheduled at SY.timer passed the `TIMER_FIRED` check;
+      - a system message was taken as a workflow event.
+    - **Language:**
+      - an integer literal in a definition went out as `3.0`;
+      - a mistyped `$ref` went out as a literal;
+      - `event_match.type` left with `meta.type`.
+    - **Docs:**
+      - the spec's and the quickstart's main example waited for answers an agent never sends;
+      - the quickstart's first step would have pinned `wf.engine` by hand (A-122);
+      - the instance answers' keys.
+  - **After the round, by me:** a `$ref` with a mistyped root is refused again (the round had made
+    it a literal).
+  - **Archi's workflow hash** follows SY.wf-rules, which now stores numbers as written.
+- **What changed:**
+  - **A WF always sends `user`:** `meta.type` and `event_match.type` left the language, and a
+    definition that has them is refused by path. A system message other than `TIMER_FIRED` is no
+    workflow event.
+  - **`event.timer_key`** carries a fired timer's key, read from SY.timer's `client_ref`.
+  - **An instance ends on its own definition:** store schema v3 keeps definitions by hash, and
+    recovery binds each instance to its hash.
+  - **At least once:**
+    - an inbound journal, and a creation in one commit;
+    - an event that does not finish in 3 starts fails its instance (`replay_exhausted`).
+  - **`$ref`:** a missing field fails; `{"$ref": p, "default": v}` takes `v` when `p` is missing or
+    null.
+  - **The WF's controls:**
+    - the `WF_*` verbs answer only SY.admin@motherbee and SY.wf-rules of the hive;
+    - a `TIMER_FIRED` is taken only from SY.timer of the hive, for a timer the WF scheduled;
+    - errors, `*_RESPONSE`, router notices and late answers are never answered.
+  - **`target_ref` goes:** `wf.router` 0.0.5 replies with one transition per IO node written in it.
+  - **Robustness:**
+    - a panic fails its instance;
+    - 100 internal events per inbound event;
+    - numbers keep their type;
+    - a start without SY.timer runs DEGRADED;
+    - SQLite runs FULL sync.
+  - **The examples, the docs and the help follow:**
+    - `wf.invoice` 0.1.1;
+    - Archi's seeds (`seed_version` 2);
+    - SY.admin's help example, which the Go suite validates;
+    - the spec, the quickstart, sy-wf-rules-spec, the READMEs and the handbook;
+    - a test validates every definition in the docs.
+- **Deploy:**
+  - build of `e6b07fc` in 13 min, deploy in 217 s;
+  - snapshots `pre-wfcase0-0-1-90` on the 4 VMs (`pre-tools1-0-1-87` was deleted);
+  - 0.1.90 on all 4 (core manifest `4d9b2b240b8fab77`), with health clean;
+  - `wf.engine` `current` is 0.1.90 on the motherbee and worker1, its only version;
+  - Archi logged "cookbook seeds upgraded" for its design and artifact cookbooks.
+- **Gate,** a real WF through SY.admin: `wf_rules_compile_apply` with `auto_spawn` made
+  `WF.gate0190@worker1`, in tenant `gate0190w`. It asks `AI.pruebas@worker1`, holds the answer for a
+  60 s timer, and replies to the gate client `IO.gate0190@worker1` by its name. Its v2 replies with
+  another message name.
+  - **Language:** five definitions it refuses (`meta.type`, `target_ref`, `event_match.type`, a
+    `$ref` with another root, one with an extra key) each got `COMPILE_ERROR` through SY.admin,
+    naming the path.
+  - **The exchange:**
+    - the WF sent `GATE_TURN` as a user message;
+    - the agent answered "ok" in 2 s (one `function_turn` on Claude Sonnet 5.5);
+    - the 60 s timer fired from SY.timer, and `event.timer_key == 'hold'` took it;
+    - the client got `GATE_REPLY` "ok".
+  - **A late answer:** a message on the ended instance's thread was dropped, and started nothing.
+  - **The WF's controls,** from a throwaway node `IO.gate0190p@worker1`:
+    - `WF_LIST_INSTANCES` got `UNAUTHORIZED`, naming who may ask;
+    - a forged `TIMER_FIRED` was refused and not answered;
+    - a timer the probe scheduled at SY.timer@worker1 with an instance's `client_ref` was accepted
+      by SY.timer, and the WF refused its fire;
+    - SY.wf-rules@worker1 still counted the instances.
+  - **A restart** of the WF node while an instance held its answer: recovery loaded it, SY.timer
+    fired once, and the client got one reply in its whole window.
+  - **A redeploy to v2** while an instance held its answer:
+    - recovery loaded it on 2 definitions;
+    - it ended on v1 (`GATE_REPLY`), and v1 was dropped when it ended;
+    - the next instance took v2 (`GATE_REPLY_V2`).
+  - **The store:** the inbound journal and the timer index were empty after every transition.
+  - **Health:** `failed=0`, `denials=0` on all 4.
+- **Cleanup:**
+  - the workflow `gate0190` deleted with `force` (node and package). worker1's dist copy left
+    with Syncthing's usual delay, 1.5 min;
+  - the tenant `gate0190w` deleted and purged;
+  - the gate's folder on worker1 removed;
+  - the probe's one-shot timer at SY.timer fired, and is gone.
+  - `AI.pruebas` stays.
+- **Noted:**
+  - The agent logs `missing src_ilk` on every message a WF sends it (A-116, Cases 1–2).
+  - SY.timer takes a timer for another node from any node (A-115).
+- **Upgrading another hive:** nothing by hand.
+  - A hive with WFs whose definitions hold `meta.type`, `target_ref` or `event_match.type` needs
+    them recompiled. After the upgrade, such a definition does not load, and its running instances
+    fail (`definition_unavailable`).
+- **Rollback:**
+  - snapshot `pre-wfcase0-0-1-90`;
+  - or `apt install fluxbee=0.1.89` plus the core update of the spokes. A WF database written by
+    0.1.90 (schema v3) is not one 0.1.89 reads; PROD has none.
 
 ## 0.1.89 — Agent tools, iteration 2: `read_blob` and `unpublish_html_page`, CSV and HTML attachments as text, router notices never answered (agent-tools-v1 §6.2; A-110, A-111, A-112, A-121)
 

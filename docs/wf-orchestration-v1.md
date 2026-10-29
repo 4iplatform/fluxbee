@@ -9,8 +9,11 @@
   - deploy, authoring and operation.
 
   Everything below was read in the code; a point marked *(read, not run)* was not exercised.
-- **Next:** Case 0 (§5.1), decided by the operator on 2026-10-28, as 0.1.90. The operator: close
-  the WF topic completely, case by case; Archi through Cloud waits.
+- **Case 0 (§5.1)** was decided by the operator on 2026-10-28. It was built, and validated on 8.x
+  in 0.1.90 (2026-10-29; ledger 0.1.90).
+- **Next:** Case 1 (§5). The operator's decisions still open are in §4.9: the conversation model,
+  what the forward may change, and the trail's design. The operator: close the WF topic
+  completely, case by case; Archi through Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -249,9 +252,13 @@ This is the single place for the track. The cases are worked here one at a time.
   - remove it;
   - limit it to a list of names written in the definition. The 2026-07-24 design had that
     allowlist as optional, and it was never built.
+
+  **Decided (§5.1, item 7):** removed, in 0.1.90.
 - **A redeploy and running instances:**
   - keep each instance on the definition it was born with, as the docs promise; or
   - move it explicitly, and report the states that no longer exist.
+
+  **Decided (§5.1, item 3):** each instance keeps its definition, in 0.1.90.
 - **The conversation model (§4.2):**
   - one instance per conversation, keyed by the IO node's thread; or
   - one instance per message, with the conversation carried through to the agent.
@@ -261,7 +268,7 @@ This is the single place for the track. The cases are worked here one at a time.
 
 - **Case 0, before anything: what is broken today** (§3, FINDINGS A-117 to A-119). The timeouts,
   `user` by default, the examples, the seeds, the panic, the unbounded loop, the duplicate fire
-  and the open verbs.
+  and the open verbs. **Done in 0.1.90 (§5.1).**
 - **Case 1, the operator's pass-through.** A WF timer asks an agent for an evaluation, and delivers
   the result to a person who wrote before. It needs:
   - a timer time taken from state;
@@ -336,9 +343,29 @@ This is the single place for the track. The cases are worked here one at a time.
   - SY.admin's help example is a valid definition;
   - the spec and the quickstart match the code (§6).
 
+**Built and validated on 8.x in 0.1.90 (2026-10-29; ledger 0.1.90).**
+- **The review round added, beyond this list:**
+  - a late answer on an ended instance's thread starts no instance (an agent answers with the
+    request's name, so it used to start one: a WF↔AI loop);
+  - a `TIMER_FIRED` is taken only for a timer the WF scheduled, because SY.timer fires a timer
+    another node scheduled under its own name;
+  - a system message other than `TIMER_FIRED` is no workflow event, as in the AI and IO nodes;
+  - `event_match.type` left with `meta.type`;
+  - an event that does not finish in 3 starts fails its instance, so one bad event cannot
+    crash-loop the node;
+  - integer literals in a definition stay integers on the wire;
+  - a malformed `$ref` is refused;
+  - a test validates every definition in the docs.
+- **Left open, recorded:**
+  - a message on a running instance's thread drives it, whoever sends it (FINDINGS A-123, the
+    security topic decision 6 left open);
+  - a send to an agent with `thread_id_ref` loops (A-116, Case 2's correlation);
+  - SY.timer takes a timer for another node from any node (A-115).
+
 ## 6. Docs that drift from the code
 
-To fix as each case touches them:
+**Fixed in 0.1.90,** every item below and more that the review found. A test now validates every
+definition in the docs (go/pkg/wfcel/shipped_definitions_test.go). The list as it was:
 - **docs/spec-systemnode-wf-v1_1.md:**
   - `event` is a flat map, not a Message;
   - `now()` is the node's clock;
@@ -368,7 +395,8 @@ To fix as each case touches them:
 
 - [agent-tools-v1](agent-tools-v1.md) §6.2–§6.3: how this direction was decided.
 - FINDINGS A-113 (OPA, decided), A-114 (writing first to a person), A-115 (SY.timer), A-116 (the
-  person and the conversation), A-117 to A-119 (§3).
+  person and the conversation), A-117 to A-119 (§3, resolved in 0.1.90), A-123 (an instance's
+  thread and its senders).
 - [wf-standard-path-v1](wf-standard-path-v1.md) (A-68, the deploy path).
 - docs/audits/2026-07-23-sy-timer-wf-audit.md: G1, G2, G4, G5 and G9 are still open.
 - docs/audits/2026-07-24-wf-dynamic-target-opa-design.md: the allowlist was never built.
