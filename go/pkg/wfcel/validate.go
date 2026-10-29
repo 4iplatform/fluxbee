@@ -28,19 +28,94 @@ func LoadDefinitionFile(path string, clock ClockFunc) (*WorkflowDefinition, erro
 }
 
 func LoadDefinitionBytes(data []byte, source string, clock ClockFunc) (*WorkflowDefinition, error) {
+	if errs := removedFieldErrors(data); len(errs) > 0 {
+		return nil, errs
+	}
 	var def WorkflowDefinition
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
+	dec.UseNumber()
 	if err := dec.Decode(&def); err != nil {
 		if source == "" {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
+	normalizeActionNumbers(&def)
 	if errs := ValidateDefinition(&def, clock); len(errs) > 0 {
 		return nil, errs
 	}
 	return &def, nil
+}
+
+// normalizeActionNumbers gives the literals of the definition's actions (payloads, meta.context,
+// set_variable values, $ref defaults) DecodeJSON's types: an integer literal is an int64 and any
+// other number a float64, so a send puts 3 on the wire as 3, and 1.0 as 1.0 (decoded as float64,
+// 3 went out as 3.0, which a Rust u64 field refuses). The input_schema keeps its numbers as written
+// (json.Number), which is how they reach the schema compiler and WF_HELP.
+func normalizeActionNumbers(def *WorkflowDefinition) {
+	normalize := func(actions []ActionDefinition) {
+		for i := range actions {
+			actions[i].Payload = normalizeNumbers(actions[i].Payload)
+			actions[i].Value = normalizeNumbers(actions[i].Value)
+			if actions[i].Meta != nil {
+				actions[i].Meta.Context = normalizeNumbers(actions[i].Meta.Context)
+			}
+		}
+	}
+	for i := range def.States {
+		normalize(def.States[i].EntryActions)
+		normalize(def.States[i].ExitActions)
+		for j := range def.States[i].Transitions {
+			normalize(def.States[i].Transitions[j].Actions)
+		}
+	}
+}
+
+// removedFieldErrors names, by their paths, the fields that left the definition language in 0.1.90
+// (wf-orchestration-v1 §5.1): the strict decoder refuses them too, but only as an unknown field,
+// without saying where or why. A definition that is not JSON is the decoder's to report.
+func removedFieldErrors(data []byte) ValidationErrors {
+	var doc struct {
+		States []struct {
+			EntryActions []map[string]any `json:"entry_actions"`
+			ExitActions  []map[string]any `json:"exit_actions"`
+			Transitions  []struct {
+				EventMatch map[string]any   `json:"event_match"`
+				Actions    []map[string]any `json:"actions"`
+			} `json:"transitions"`
+		} `json:"states"`
+	}
+	if json.Unmarshal(data, &doc) != nil {
+		return nil
+	}
+	var errs ValidationErrors
+	check := func(path string, actions []map[string]any) {
+		for i, action := range actions {
+			actionPath := fmt.Sprintf("%s[%d]", path, i)
+			if _, ok := action["target_ref"]; ok {
+				errs = append(errs, ValidationError{Path: actionPath + ".target_ref", Message: "is not part of the definition language: a WF sends to node names written in the definition, one transition per destination"})
+			}
+			if meta, ok := action["meta"].(map[string]any); ok {
+				if _, ok := meta["type"]; ok {
+					errs = append(errs, ValidationError{Path: actionPath + ".meta.type", Message: "is not part of the definition language: every message a WF sends is a user message"})
+				}
+			}
+		}
+	}
+	for i, state := range doc.States {
+		path := fmt.Sprintf("states[%d]", i)
+		check(path+".entry_actions", state.EntryActions)
+		check(path+".exit_actions", state.ExitActions)
+		for j, transition := range state.Transitions {
+			tPath := fmt.Sprintf("%s.transitions[%d]", path, j)
+			if _, ok := transition.EventMatch["type"]; ok {
+				errs = append(errs, ValidationError{Path: tPath + ".event_match.type", Message: "is not part of the definition language: every message a WF takes is a user message, but a TIMER_FIRED, which event_match.msg names"})
+			}
+			check(tPath+".actions", transition.Actions)
+		}
+	}
+	return errs
 }
 
 func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErrors {
@@ -88,9 +163,6 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 			tPath := fmt.Sprintf("%s.transitions[%d]", path, j)
 			if strings.TrimSpace(transition.EventMatch.Msg) == "" {
 				errs = append(errs, ValidationError{Path: tPath + ".event_match.msg", Message: "must not be empty"})
-			}
-			if transition.EventMatch.Type != nil && strings.TrimSpace(*transition.EventMatch.Type) == "" {
-				errs = append(errs, ValidationError{Path: tPath + ".event_match.type", Message: "must not be empty when present"})
 			}
 			if strings.TrimSpace(transition.TargetState) == "" {
 				errs = append(errs, ValidationError{Path: tPath + ".target_state", Message: "must not be empty"})
@@ -181,8 +253,7 @@ func IsValidL2Name(value string) bool {
 }
 
 // IsForbiddenSystemTarget reports whether an L2 name is a SY.* / RT.* system/router node — which a WF
-// send_message must never target (those names bypass VPN isolation at the router). Exported so the
-// runtime send path can re-block a dynamically-resolved target, not just publish-time validation.
+// send_message must never target (those names bypass VPN isolation at the router).
 func IsForbiddenSystemTarget(name string) bool {
 	// Case-INSENSITIVE: block "sy.vault" / "rt.gateway" evasion attempts too. (Node-name casing is not
 	// a reliable isolation boundary, so do not let a lowercased system name slip through.)
@@ -191,7 +262,7 @@ func IsForbiddenSystemTarget(name string) bool {
 }
 
 // isValidRefPath reports whether s is a well-formed $ref dot-path rooted at state/input/event with at
-// least one field (e.g. "state.chosen_target") — the form a dynamic target_ref is resolved against.
+// least one field (e.g. "event.payload.thread_id") — the form a thread_id_ref is resolved against.
 func isValidRefPath(s string) bool {
 	parts := strings.Split(strings.TrimSpace(s), ".")
 	if len(parts) < 2 {
@@ -242,31 +313,16 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 	}
 	switch action.Type {
 	case "send_message":
-		// Exactly one of target (static literal) / target_ref (dynamic $ref dot-path). A WF may NOT
-		// message SY.*/RT.* system nodes via send_message (that path bypasses VPN isolation in the
-		// router; timers use schedule_timer, not send_message). For a dynamic target the meta.type
-		// must be "user" so a runtime-computed destination can never emit a VPN-bypassing system frame;
-		// the resolved value is re-validated + SY./RT.-blocked again at send time (execSendMessage).
-		hasTarget := strings.TrimSpace(action.Target) != ""
-		hasTargetRef := strings.TrimSpace(action.TargetRef) != ""
+		// The target is a node name written in the definition. A WF may NOT message SY.*/RT.*
+		// system nodes via send_message (that path bypasses VPN isolation in the router; timers use
+		// schedule_timer, not send_message).
 		switch {
-		case hasTarget && hasTargetRef:
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "set exactly one of target or target_ref, not both"})
-		case !hasTarget && !hasTargetRef:
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must set target (static) or target_ref (dynamic)"})
-		case hasTarget:
-			if !IsValidL2Name(action.Target) {
-				errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
-			} else if IsForbiddenSystemTarget(action.Target) {
-				errs = append(errs, ValidationError{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"})
-			}
-		case hasTargetRef:
-			if !isValidRefPath(action.TargetRef) {
-				errs = append(errs, ValidationError{Path: path + ".target_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "state.chosen_target")`})
-			}
-			if action.Meta == nil || action.Meta.Type != "user" {
-				errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "user" when target_ref (dynamic target) is set`})
-			}
+		case strings.TrimSpace(action.Target) == "":
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "must not be empty"})
+		case !IsValidL2Name(action.Target):
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
+		case IsForbiddenSystemTarget(action.Target):
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"})
 		}
 		// gap-5: thread_id_ref, when set, must be a well-formed $ref dot-path (resolved at send time to
 		// the external caller's thread_id for a terminal reply).
@@ -275,9 +331,6 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 		}
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
-		}
-		if action.Meta != nil && action.Meta.Type != "" && action.Meta.Type != "system" && action.Meta.Type != "user" {
-			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
 		}
 		// gap-3: meta.context (used for response_envelope) is resolved like a payload — validate its
 		// $ref shape the same way so a bad ref is caught at publish, not silently dropped at send.
@@ -288,9 +341,6 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 	case "emit_internal_event":
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
-		}
-		if action.Meta != nil && action.Meta.Type != "" && action.Meta.Type != "system" && action.Meta.Type != "user" {
-			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
 		}
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
 	case "schedule_timer":
@@ -334,7 +384,7 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 			valueExpr, ok := action.Value.(string)
 			if !ok || strings.TrimSpace(valueExpr) == "" {
 				errs = append(errs, ValidationError{Path: path + ".value", Message: "must be a non-empty CEL expression string"})
-			} else if _, err := CompileGuard(valueExpr, clock); err != nil {
+			} else if _, err := CompileValue(valueExpr, clock); err != nil {
 				errs = append(errs, ValidationError{Path: path + ".value", Message: err.Error()})
 			}
 		}
@@ -376,18 +426,66 @@ func validateMissedPolicy(path, policy string, within *int64) ValidationErrors {
 	return nil
 }
 
+// Ref is a $ref in a payload or a meta.context: an object whose "$ref" is a dot path
+// (IsWorkflowRef), which validation requires to be rooted at input., state. or event.
+// {"$ref": path} gives the value at the path, and fails the action when the path does not resolve;
+// {"$ref": path, "default": value} gives the literal value when the path does not resolve or holds
+// null. Any other object, a JSON Schema's own "$ref" ("#/definitions/x") included, is a literal.
+type Ref struct {
+	Path       string
+	Default    any
+	HasDefault bool
+}
+
+// IsWorkflowRef reports whether object is a WF $ref: its "$ref" is a dot path, a string without the
+// "#", "/" or ":" of a JSON Schema's own reference ("#/$defs/x", a URL, "./other.json"). A path with
+// another root ("inptu.x") is a WF $ref too, so validation refuses it rather than sending it as a
+// literal.
+func IsWorkflowRef(object map[string]any) bool {
+	path, ok := object["$ref"].(string)
+	if !ok {
+		return false
+	}
+	return !strings.ContainsAny(path, "#/:")
+}
+
+// AsRef reads object as a Ref: a WF $ref holding only "$ref" and, optionally, "default" (validation
+// refuses one with any other key).
+func AsRef(object map[string]any) (Ref, bool) {
+	if !IsWorkflowRef(object) {
+		return Ref{}, false
+	}
+	defaultValue, hasDefault := object["default"]
+	switch {
+	case len(object) == 1:
+	case len(object) == 2 && hasDefault:
+	default:
+		return Ref{}, false
+	}
+	return Ref{Path: strings.TrimSpace(object["$ref"].(string)), Default: defaultValue, HasDefault: hasDefault}, true
+}
+
 func validateRefPayload(path string, value any) ValidationErrors {
 	switch typed := value.(type) {
 	case nil:
 		return nil
 	case map[string]any:
-		if refValue, ok := typed["$ref"]; ok && len(typed) == 1 {
-			refPath, ok := refValue.(string)
-			if !ok || strings.TrimSpace(refPath) == "" {
-				return ValidationErrors{{Path: path + ".$ref", Message: "must be a non-empty string"}}
+		if refPath, ok := typed["$ref"]; ok {
+			if _, isString := refPath.(string); !isString {
+				return ValidationErrors{{Path: path + ".$ref", Message: "must be a string"}}
 			}
-			if err := validateRefPath(refPath); err != nil {
+		}
+		if IsWorkflowRef(typed) {
+			ref, ok := AsRef(typed)
+			if !ok {
+				// A typo ("defualt") would otherwise send the object as a literal.
+				return ValidationErrors{{Path: path, Message: `a $ref holds only $ref and default`}}
+			}
+			if err := validateRefPath(ref.Path); err != nil {
 				return ValidationErrors{{Path: path + ".$ref", Message: err.Error()}}
+			}
+			if ref.HasDefault && holdsWorkflowRef(ref.Default) {
+				return ValidationErrors{{Path: path + ".default", Message: "a default is a literal: it holds no $ref"}}
 			}
 			return nil
 		}
@@ -405,6 +503,28 @@ func validateRefPayload(path string, value any) ValidationErrors {
 	default:
 		return nil
 	}
+}
+
+// holdsWorkflowRef reports whether value holds a WF $ref anywhere.
+func holdsWorkflowRef(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if IsWorkflowRef(typed) {
+			return true
+		}
+		for _, child := range typed {
+			if holdsWorkflowRef(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if holdsWorkflowRef(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validateRefPath(path string) error {

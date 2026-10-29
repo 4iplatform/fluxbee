@@ -1,7 +1,6 @@
 package wfcel
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/google/cel-go/cel"
@@ -10,8 +9,9 @@ import (
 	"github.com/google/cel-go/ext"
 )
 
-// maxJSONParseBytes bounds json_parse input: a guard runs on the full external inbound payload and the
-// guard timeout does not interrupt a running eval, so cap the parse work an ingress caller can drive.
+// maxJSONParseBytes bounds json_parse input: a guard runs on the full external inbound payload, and the
+// guard timeout interrupts an eval only between comprehension steps, never inside one call, so cap the
+// parse work an ingress caller can drive.
 const maxJSONParseBytes = 64 * 1024
 
 func DefaultClock() time.Time {
@@ -44,7 +44,8 @@ func NewGuardEnv(clock ClockFunc) (*cel.Env, error) {
 		ext.Strings(),
 		// json_parse(str) -> dyn: decode a JSON string (e.g. an AI structured-output reply) into a
 		// CEL value so guards can branch on real fields. Invalid JSON yields a CEL error, which makes
-		// the guard evaluate to a non-true result rather than crashing the engine.
+		// the guard evaluate to a non-true result rather than crashing the engine. Numbers follow
+		// DecodeJSON, as in event.payload: an integer is an int, any other number a double.
 		cel.Function(
 			"json_parse",
 			cel.Overload(
@@ -56,15 +57,15 @@ func NewGuardEnv(clock ClockFunc) (*cel.Env, error) {
 					if !ok {
 						return types.NewErr("json_parse expects a string argument")
 					}
-					// The GuardEvalTimeout does not actually interrupt a running eval (cel-go only
-					// interrupts via ContextEval), so bound the work explicitly: a guard reads the full
-					// external inbound payload, so refuse an oversized input rather than letting an
-					// ingress caller drive an unbounded/deep parse per message.
+					// The GuardEvalTimeout interrupts a guard between comprehension steps, never inside
+					// one call, so bound the work explicitly: a guard reads the full external inbound
+					// payload, so refuse an oversized input rather than letting an ingress caller drive
+					// an unbounded/deep parse per message.
 					if len(raw) > maxJSONParseBytes {
 						return types.NewErr("json_parse: input exceeds %d bytes", maxJSONParseBytes)
 					}
-					var parsed interface{}
-					if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+					parsed, err := DecodeJSON([]byte(raw))
+					if err != nil {
 						return types.NewErr("json_parse: invalid JSON: %v", err)
 					}
 					return types.DefaultTypeAdapter.NativeToValue(parsed)

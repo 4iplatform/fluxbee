@@ -43,7 +43,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 1
+    "seed_version": 2
   },
   {
     "layer": "design",
@@ -100,7 +100,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 1
+    "seed_version": 2
   },
   {
     "layer": "design",
@@ -120,14 +120,14 @@
             "definition": {
               "wf_schema_version": "1",
               "workflow_type": "invoice",
-              "description": "Asks IO.quickbooks for an invoice and waits for the validated data.",
+              "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
               "input_schema": {
                 "type": "object",
                 "required": ["customer_id"],
                 "properties": { "customer_id": { "type": "string" } }
               },
               "initial_state": "collecting_data",
-              "terminal_states": ["completed"],
+              "terminal_states": ["completed", "failed"],
               "states": [
                 {
                   "name": "collecting_data",
@@ -138,9 +138,10 @@
                       "target": "IO.quickbooks@motherbee",
                       "meta": { "msg": "INVOICE_CREATE_REQUEST" },
                       "payload": { "customer_id": { "$ref": "input.customer_id" } }
-                    }
+                    },
+                    { "type": "schedule_timer", "timer_key": "collection_timeout", "fire_in": "10m" }
                   ],
-                  "exit_actions": [],
+                  "exit_actions": [{ "type": "cancel_timer", "timer_key": "collection_timeout" }],
                   "transitions": [
                     {
                       "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
@@ -149,12 +150,25 @@
                       "actions": [
                         { "type": "set_variable", "name": "validated_at", "value": "now()" }
                       ]
+                    },
+                    {
+                      "event_match": { "msg": "TIMER_FIRED" },
+                      "guard": "event.timer_key == \"collection_timeout\"",
+                      "target_state": "failed",
+                      "actions": []
                     }
                   ]
                 },
                 {
                   "name": "completed",
                   "description": "Done.",
+                  "entry_actions": [],
+                  "exit_actions": [],
+                  "transitions": []
+                },
+                {
+                  "name": "failed",
+                  "description": "No validated data in time.",
                   "entry_actions": [],
                   "exit_actions": [],
                   "transitions": []
@@ -169,16 +183,23 @@
     "constraints": [
       "declare only the workflow: SY.wf-rules packages it and creates and runs its node, WF.<workflow_name>@<hive>",
       "workflow_name is lowercase letters, digits and '-' in dot-separated parts, each starting with a letter, and unique per hive",
-      "the definition is a wf_schema_version 1 state machine: workflow_type, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)"
+      "the definition is a wf_schema_version 1 state machine: workflow_type, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)",
+      "every message a WF sends is a user message: an action's meta has msg (and, to ask an agent for a structured answer, context), never type",
+      "a send_message target is a node name written in the definition; to choose among destinations, write one transition per destination with its guard",
+      "a timer's key is event.timer_key: a timeout is a TIMER_FIRED transition with the guard event.timer_key == '<timer_key>'",
+      "an agent's error answer arrives as <msg>.error, so it needs a transition of its own",
+      "a $ref to a field that may be missing gives a default: {\"$ref\": \"event.context\", \"default\": {}}; a $ref without one fails the instance"
     ],
     "do_not_repeat": [
       "do not declare the WF node in nodes, nor a runtime for it: SY.wf-rules makes both",
       "do not put the workflow definition content inside a node config — it goes in wf_deployments",
-      "do not deploy a workflow on an ingress or egress hive: it has no SY.wf-rules"
+      "do not deploy a workflow on an ingress or egress hive: it has no SY.wf-rules",
+      "do not write meta.type, target_ref or event.payload.timer_key: SY.wf-rules refuses the first two, and the third is never set",
+      "do not wait for an answer without a timer: an agent or a node that never answers leaves the instance waiting forever"
     ],
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 1
+    "seed_version": 2
   }
 ]

@@ -1,16 +1,13 @@
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
-use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
-};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    NodeConfig, NodeError, NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher,
-    RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
+    NodeConfig, NodeError, NodeSender, NodeUuidMode, OperationalRouteProfile, RouteMatch,
+    RouteTarget, RouterDispatcher,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -62,102 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target, customer_id, amount_cents, trace_id
             );
         }
-        "list" => {
-            let response = system_rpc_via_dispatcher(
-                &dispatcher,
-                target,
-                "WF_LIST_INSTANCES",
-                "WF_LIST_INSTANCES_RESPONSE",
-                json!({ "limit": 20 }),
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&response.payload)?);
-        }
-        "get" => {
-            let instance_id = args.get(3).ok_or("missing instance_id for get")?;
-            let response = system_rpc_via_dispatcher(
-                &dispatcher,
-                target,
-                "WF_GET_INSTANCE",
-                "WF_GET_INSTANCE_RESPONSE",
-                json!({ "instance_id": instance_id, "log_limit": 20 }),
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&response.payload)?);
-        }
-        "cancel" => {
-            let instance_id = args.get(3).ok_or("missing instance_id for cancel")?;
-            let response = system_rpc_via_dispatcher(
-                &dispatcher,
-                target,
-                "WF_CANCEL_INSTANCE",
-                "WF_CANCEL_INSTANCE_RESPONSE",
-                json!({ "instance_id": instance_id, "reason": "manual example cancel" }),
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&response.payload)?);
-        }
         other => {
-            return Err(format!("unsupported mode {other}; use start|list|get|cancel").into());
+            // WF_LIST_INSTANCES, WF_GET_INSTANCE and WF_CANCEL_INSTANCE answer only SY.admin@motherbee
+            // and SY.wf-rules of the WF's hive (0.1.90, FINDINGS A-119), never a client node.
+            return Err(format!("unsupported mode {other}; use start").into());
         }
     }
 
     Ok(())
-}
-
-async fn system_rpc_via_dispatcher(
-    dispatcher: &Arc<RouterDispatcher>,
-    target: &str,
-    request_msg: &str,
-    response_msg: &str,
-    payload: Value,
-) -> Result<Message, Box<dyn std::error::Error>> {
-    let message = Message {
-        routing: Routing {
-            src: String::new(),
-            src_l2_name: None,
-            dst: Destination::Broadcast,
-            ttl: 16,
-            trace_id: String::new(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(request_msg.to_string()),
-            target: Some(target.to_string()),
-            ..Meta::default()
-        },
-        payload,
-    };
-    let matcher = PendingMatcher::new(
-        vec![RouteMatch::exact(SYSTEM_KIND, response_msg)],
-        vec![
-            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
-            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
-        ],
-        vec![],
-    );
-    let labels = RpcRequestLabels::new(target, request_msg, response_msg);
-    match dispatcher
-        .send_with_matcher(message, matcher, labels, Duration::from_secs(30))
-        .await
-    {
-        Ok(msg) => Ok(msg),
-        Err(RpcError::Unreachable {
-            reason,
-            original_dst,
-        }) => Err(format!(
-            "router returned UNREACHABLE: reason={reason} original_dst={original_dst}"
-        )
-        .into()),
-        Err(RpcError::TtlExceeded {
-            original_dst,
-            last_hop,
-        }) => Err(format!(
-            "router returned TTL_EXCEEDED: original_dst={original_dst} last_hop={last_hop}"
-        )
-        .into()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn init_logging() {
@@ -217,6 +126,3 @@ fn build_targeted_message(
         payload,
     }
 }
-
-// `await_response` was removed when migrating to RouterDispatcher;
-// `system_rpc_via_dispatcher` above replaces it with `send_with_matcher`.

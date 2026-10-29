@@ -1,0 +1,58 @@
+{
+  "wf_schema_version": "1",
+  "workflow_type": "invoice",
+  "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "collecting_data",
+  "terminal_states": ["completed", "failed"],
+  "states": [
+    {
+      "name": "collecting_data",
+      "description": "Asks for the invoice and waits for its data.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.quickbooks@motherbee",
+          "meta": { "msg": "INVOICE_CREATE_REQUEST" },
+          "payload": { "customer_id": { "$ref": "input.customer_id" } }
+        },
+        { "type": "schedule_timer", "timer_key": "collection_timeout", "fire_in": "10m" }
+      ],
+      "exit_actions": [{ "type": "cancel_timer", "timer_key": "collection_timeout" }],
+      "transitions": [
+        {
+          "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
+          "guard": "event.payload.complete == true",
+          "target_state": "completed",
+          "actions": [{ "type": "set_variable", "name": "validated_at", "value": "now()" }]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == \"collection_timeout\"",
+          "target_state": "failed",
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "Done.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "failed",
+      "description": "No validated data in time.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}

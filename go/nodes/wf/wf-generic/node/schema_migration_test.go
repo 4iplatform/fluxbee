@@ -107,6 +107,11 @@ VALUES (?, ?, 'running', 'start', '{}', '{}', '', ?, ?);`,
 	if !tableExists(t, db, "wf_internal_events") {
 		t.Fatalf("migration did not create wf_internal_events")
 	}
+	for _, table := range []string{"wf_internal_events", "wf_inbound_events"} {
+		if !columnExists(t, db, table, "attempts") {
+			t.Fatalf("%s counts its replays (attempts)", table)
+		}
+	}
 	if !indexExists(t, db, "idx_wfie_instance") {
 		t.Fatalf("migration did not create idx_wfie_instance")
 	}
@@ -340,6 +345,15 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	return found == name
 }
 
+func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+	var found int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?;`, table, column).Scan(&found); err != nil {
+		t.Fatalf("inspect the columns of %s: %v", table, err)
+	}
+	return found == 1
+}
+
 func indexExists(t *testing.T, db *sql.DB, name string) bool {
 	t.Helper()
 	var found string
@@ -351,4 +365,68 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 		t.Fatalf("inspect sqlite_master for index %q: %v", name, err)
 	}
 	return found == name
+}
+
+// 0.1.90 (schema v3): a v2 store's definitions, one per workflow type, are kept by their hash, and
+// each running instance records the hash of the definition it ran on (the one the engine stored
+// last, onto which it moved every instance at each start); the inbound journal is added.
+func TestEnsureWFSchemaMigratesV2ToDefinitionsByHash(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v2.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	v2Stmts := []string{
+		`CREATE TABLE wf_definitions (workflow_type TEXT PRIMARY KEY, definition_json TEXT NOT NULL, hash TEXT NOT NULL, loaded_at_ms INTEGER NOT NULL);`,
+		`CREATE TABLE wf_instances (
+    instance_id TEXT PRIMARY KEY, workflow_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','cancelling','completed','cancelled','failed')),
+    current_state TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+    current_trace_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    terminated_at_ms INTEGER);`,
+		`CREATE TABLE wf_instance_log (log_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, logged_at_ms INTEGER NOT NULL, action_type TEXT NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL DEFAULT 1, error_detail TEXT NOT NULL DEFAULT '');`,
+		`CREATE TABLE wf_instance_timers (instance_id TEXT NOT NULL, timer_key TEXT NOT NULL, scheduled_at_ms INTEGER NOT NULL, fire_at_ms INTEGER NOT NULL, PRIMARY KEY (instance_id, timer_key));`,
+		`CREATE TABLE wf_internal_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, msg_type TEXT NOT NULL, msg_name TEXT NOT NULL, payload_json TEXT NOT NULL, trace_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL);`,
+		`INSERT INTO wf_definitions VALUES ('invoice', '{"workflow_type":"invoice"}', 'hash-invoice', 5);`,
+		`INSERT INTO wf_instances (instance_id, workflow_type, status, current_state, created_at_ms, updated_at_ms)
+VALUES ('wfi:running', 'invoice', 'running', 's', 1, 1), ('wfi:done', 'invoice', 'completed', 'd', 1, 1), ('wfi:orphan', 'gone', 'running', 's', 1, 1);`,
+		`INSERT INTO wf_internal_events (instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms)
+VALUES ('wfi:running', 'user', 'NEXT', '{}', 'trace-left', 1);`,
+		`PRAGMA user_version=2;`,
+	}
+	for _, stmt := range v2Stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v2 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	if def, ok, err := store.GetDefinition(ctx, "hash-invoice"); err != nil || !ok || def.WorkflowType != "invoice" || def.LoadedAtMS != 5 {
+		t.Fatalf("the definition is kept by its hash: %+v %v %v", def, ok, err)
+	}
+	for id, hash := range map[string]string{"wfi:running": "hash-invoice", "wfi:done": "", "wfi:orphan": ""} {
+		row, err := store.GetInstance(ctx, id)
+		if err != nil || row.DefinitionHash != hash {
+			t.Fatalf("%s: definition_hash %q, want %q (%v)", id, row.DefinitionHash, hash, err)
+		}
+	}
+	if !tableExists(t, db, "wf_inbound_events") || tableExists(t, db, "wf_definitions_by_type") || !indexExists(t, db, "idx_wfi_definition") {
+		t.Fatal("v3 tables")
+	}
+	// The queue a v2 store left keeps its event, which has run at no start yet.
+	if events, err := store.ListAllInternalEvents(ctx); err != nil || len(events) != 1 || events[0].MsgName != "NEXT" || events[0].Attempts != 0 {
+		t.Fatalf("the internal event left queued: %+v %v", events, err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
 }

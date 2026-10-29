@@ -90,7 +90,8 @@ action:
 
 **WF_LIST_INSTANCES stays direct.** Reading the instance list of a workflow it owns is a read of
 that node's domain data, not an action on the node, and it is not a protected SYSTEM action. It is
-the one recorded exception.
+the one recorded exception. Since 0.1.90 the WF node itself answers its `WF_*` verbs only to
+SY.wf-rules of its hive and SY.admin@motherbee (FINDINGS A-119).
 
 **The admin's gate for SY.wf-rules** (the analogue of IO.cloud's IO.*-only rule). It covers the six
 node actions above; the gate leaves its other actions alone (`publish_runtime_package`,
@@ -255,7 +256,9 @@ the rest, so a new orchestrator key can never stop a node.
 *Status, SDK, and what stays fatal.*
 - NODE_STATUS_GET answers the lifecycle health.
 - The SDK's msg_type checks become case-insensitive, as Rust's (audit #14).
-- Engine start failures (opening the store, recovery) stay fatal and are out of scope.
+- Engine start failures (opening the store, recovery) stay fatal and are out of scope. Since 0.1.90
+  SY.timer not answering at recovery is no longer one: the node starts DEGRADED and reconciles its
+  timers when SY.timer answers (`docs/wf-orchestration-v1.md` §5.1).
 
 The orchestrator's `_system` key-pinning test (`the_system_block_keys_are_the_ones_the_wf_node_decodes`)
 and its Go twin are replaced by a Go test: a `_system` key the node does not know is ignored, and

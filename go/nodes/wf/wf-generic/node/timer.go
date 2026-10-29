@@ -1,6 +1,11 @@
 package node
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+
+	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
+)
 
 // timerClientRef constructs the canonical client_ref for a workflow timer.
 // Format: "wf:<instance_id>::<timer_key>"
@@ -8,6 +13,20 @@ import "fmt"
 // with SY.timer v1.1, eliminating the need to track UUIDs locally.
 func timerClientRef(instanceID, timerKey string) string {
 	return fmt.Sprintf("wf:%s::%s", instanceID, timerKey)
+}
+
+// firedTimer reads whose timer a TIMER_FIRED is and its key, from the client_ref the WF schedules
+// every timer with (the payload it gives SY.timer, {instance_id, timer_key}, is not read: a fire
+// without the client_ref is no timer of the WF's).
+func firedTimer(msg sdk.Message) (instanceID, timerKey string, err error) {
+	var fired sdk.FiredEvent
+	if err := json.Unmarshal(msg.Payload, &fired); err != nil {
+		return "", "", fmt.Errorf("parse TIMER_FIRED: %w", err)
+	}
+	if fired.ClientRef == nil {
+		return "", "", fmt.Errorf("a TIMER_FIRED without the client_ref of a WF timer")
+	}
+	return parseTimerClientRef(*fired.ClientRef)
 }
 
 // parseTimerClientRef extracts instanceID and timerKey from a client_ref.

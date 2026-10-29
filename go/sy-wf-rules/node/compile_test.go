@@ -2,11 +2,14 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 func TestCompileWorkflowWritesStagedFiles(t *testing.T) {
@@ -192,5 +195,54 @@ func validWorkflowDefinition() map[string]any {
 				"transitions":   []any{},
 			},
 		},
+	}
+}
+
+// A definition's numbers are staged as written, through the command and through CONFIG_SET: decoded
+// as float64, 1.0 was staged as 1 (an integer to the engine, which keeps numbers as written since
+// 0.1.90) and an integer past 2^53 lost its last digits.
+func TestADefinitionIsStagedWithItsNumbersAsWritten(t *testing.T) {
+	const definition = `{"wf_schema_version": "1", "workflow_type": "numbers",
+  "input_schema": {"type": "object", "properties": {"limit": {"type": "integer", "maximum": 10}}},
+  "initial_state": "sending", "terminal_states": ["sent"],
+  "states": [
+    {"name": "sending",
+     "entry_actions": [{"type": "send_message", "target": "IO.out@motherbee", "meta": {"msg": "NUMBERS"},
+                        "payload": {"count": 3, "ratio": 2.5, "one": 1.0, "big": 9007199254740993}}],
+     "transitions": [{"event_match": {"msg": "NUMBERS"}, "guard": "true", "target_state": "sent"}]},
+    {"name": "sent"}
+  ]}`
+	admin := fluxbeesdk.PrimaryAdminNode
+	compile, configSet := "compile_workflow", fluxbeesdk.MSGConfigSet
+	for name, msg := range map[string]fluxbeesdk.Message{
+		"compile_workflow": {
+			Meta:    fluxbeesdk.Meta{MsgType: "command", Action: &compile},
+			Payload: json.RawMessage(`{"workflow_name": "numbers", "definition": ` + definition + `}`),
+		},
+		"CONFIG_SET": {
+			Meta: fluxbeesdk.Meta{MsgType: fluxbeesdk.SYSTEMKind, Msg: &configSet},
+			Payload: json.RawMessage(`{"node_name": "SY.wf-rules@motherbee", "schema_version": 1, "config_version": 0, "apply_mode": "replace",
+  "config": {"operation": "compile", "workflow_name": "numbers", "definition": ` + definition + `}}`),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := newTestService(t)
+			sender := &recordingSender{}
+			svc.sender = sender
+			msg.Routing = fluxbeesdk.Routing{Src: "admin-uuid", SrcL2Name: &admin, TraceID: "t-1"}
+			svc.handleMessage(msg)
+			if len(sender.sent) != 1 {
+				t.Fatalf("sent %d", len(sender.sent))
+			}
+			staged, err := svc.store.ReadDefinitionBytes("numbers", "staged")
+			if err != nil {
+				t.Fatalf("not staged (%s): %v", sender.sent[0].Payload, err)
+			}
+			for _, want := range []string{`"count": 3,`, `"ratio": 2.5`, `"one": 1.0,`, `"big": 9007199254740993,`, `"maximum": 10`} {
+				if !strings.Contains(string(staged), want) {
+					t.Fatalf("%s is not staged as written:\n%s", want, staged)
+				}
+			}
+		})
 	}
 }

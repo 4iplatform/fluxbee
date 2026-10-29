@@ -3,30 +3,36 @@ package node
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	wfSchemaVersion = 2
+	// wfSchemaVersion 3 (0.1.90): a definition is kept by its hash for as long as a running instance
+	// uses it, each instance records the hash it was born with, and an inbound event is journaled
+	// until its transition commits (wf-orchestration-v1 §5.1).
+	wfSchemaVersion = 3
 	maxLogEntries   = 100
 )
 
 // WFInstanceRow is the persistent representation of a workflow instance.
 type WFInstanceRow struct {
-	InstanceID     string
-	WorkflowType   string
+	InstanceID   string
+	WorkflowType string
+	// DefinitionHash is the hash of the definition the instance was born with, and runs on until it
+	// ends (a redeploy does not move it).
+	DefinitionHash string
 	Status         string // running, cancelling, completed, cancelled, failed
 	CurrentState   string
 	InputJSON      string // JSON-encoded input map
 	StateJSON      string // JSON-encoded state variable map
-	CurrentTraceID string // trace_id of the currently-executing event (for crash recovery)
+	CurrentTraceID string // kept empty: the inbound journal replays an event with its own trace_id
 	CreatedAtMS    int64
 	UpdatedAtMS    int64
 	TerminatedAtMS sql.NullInt64
@@ -60,10 +66,34 @@ type InternalEventRow struct {
 	PayloadJSON string
 	TraceID     string
 	CreatedAtMS int64
+	// Attempts counts the starts that ran it again (a leftover of a crash); live processing does not
+	// count. At maxReplayAttempts its instance fails (causeReplayExhausted).
+	Attempts int
+}
+
+// Inbound journal kinds: an event that creates an instance, or one an instance takes.
+const (
+	inboundCreate = "create"
+	inboundEvent  = "event"
+)
+
+// InboundEventRow is an inbound event the engine took and has not finished: saved before it is
+// processed and deleted in the commit of its transition, so a crash in between leaves it for
+// recovery to process again (at least once, wf-orchestration-v1 §5.1).
+type InboundEventRow struct {
+	EventID      int64
+	InstanceID   string // the instance it goes to, or the one it creates
+	Kind         string // inboundCreate | inboundEvent
+	MessageJSON  string // the message as received
+	ReceivedAtMS int64
+	// Attempts counts the starts that ran it again; live processing does not count. At
+	// maxReplayAttempts it is not run again (causeReplayExhausted).
+	Attempts int
 }
 
 type InstanceCommitMutation struct {
 	ConsumedInternalEventID *int64
+	ConsumedInboundEventID  *int64
 	EnqueueInternalEvents   []InternalEventRow
 	ClearInternalEvents     bool
 }
@@ -83,8 +113,9 @@ func OpenStore(path string) (*Store, error) {
 	// A pragma belongs to one connection and database/sql opens several: in the DSN,
 	// modernc.org/sqlite applies them to each connection it opens. Set once with db.Exec they
 	// reached one connection only, and the others failed at once with SQLITE_BUSY instead of
-	// waiting (as in sy-timer).
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	// waiting (as in sy-timer). synchronous stays SQLite's default, FULL, as in sy-timer: a commit is
+	// on disk when it returns, so at least once holds across a host crash too.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open wf db %q: %w", path, err)
@@ -101,23 +132,15 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func ensureWFSchema(db *sql.DB) error {
-	var userVersion int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&userVersion); err != nil {
-		return err
-	}
-	if userVersion >= wfSchemaVersion {
-		return nil
-	}
-
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS wf_definitions (
-    workflow_type  TEXT PRIMARY KEY,
+// wfSchemaStatements create every table and index at its current shape.
+var wfSchemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS wf_definitions (
+    hash            TEXT PRIMARY KEY,
+    workflow_type   TEXT NOT NULL,
     definition_json TEXT NOT NULL,
-    hash           TEXT NOT NULL,
-    loaded_at_ms   INTEGER NOT NULL
+    loaded_at_ms    INTEGER NOT NULL
 );`,
-		`CREATE TABLE IF NOT EXISTS wf_instances (
+	`CREATE TABLE IF NOT EXISTS wf_instances (
     instance_id       TEXT PRIMARY KEY,
     workflow_type     TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'running'
@@ -128,11 +151,13 @@ func ensureWFSchema(db *sql.DB) error {
     current_trace_id  TEXT NOT NULL DEFAULT '',
     created_at_ms     INTEGER NOT NULL,
     updated_at_ms     INTEGER NOT NULL,
-    terminated_at_ms  INTEGER
+    terminated_at_ms  INTEGER,
+    definition_hash   TEXT NOT NULL DEFAULT ''
 );`,
-		`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
-		`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
-		`CREATE TABLE IF NOT EXISTS wf_instance_log (
+	`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
+	`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
+	`CREATE INDEX IF NOT EXISTS idx_wfi_definition ON wf_instances(definition_hash);`,
+	`CREATE TABLE IF NOT EXISTS wf_instance_log (
     log_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id TEXT NOT NULL,
     logged_at_ms INTEGER NOT NULL,
@@ -141,126 +166,193 @@ func ensureWFSchema(db *sql.DB) error {
     ok           INTEGER NOT NULL DEFAULT 1,
     error_detail TEXT NOT NULL DEFAULT ''
 );`,
-		`CREATE INDEX IF NOT EXISTS idx_wfl_instance ON wf_instance_log(instance_id, log_id DESC);`,
-		`CREATE TABLE IF NOT EXISTS wf_instance_timers (
+	`CREATE INDEX IF NOT EXISTS idx_wfl_instance ON wf_instance_log(instance_id, log_id DESC);`,
+	`CREATE TABLE IF NOT EXISTS wf_instance_timers (
     instance_id    TEXT NOT NULL,
     timer_key      TEXT NOT NULL,
     scheduled_at_ms INTEGER NOT NULL,
     fire_at_ms     INTEGER NOT NULL,
     PRIMARY KEY (instance_id, timer_key)
 );`,
-		`CREATE TABLE IF NOT EXISTS wf_internal_events (
+	`CREATE TABLE IF NOT EXISTS wf_internal_events (
     event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id    TEXT NOT NULL,
     msg_type       TEXT NOT NULL,
     msg_name       TEXT NOT NULL,
     payload_json   TEXT NOT NULL,
     trace_id       TEXT NOT NULL,
-    created_at_ms  INTEGER NOT NULL
+    created_at_ms  INTEGER NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 0
 );`,
-		`CREATE INDEX IF NOT EXISTS idx_wfie_instance ON wf_internal_events(instance_id, event_id ASC);`,
-	}
+	`CREATE INDEX IF NOT EXISTS idx_wfie_instance ON wf_internal_events(instance_id, event_id ASC);`,
+	`CREATE TABLE IF NOT EXISTS wf_inbound_events (
+    event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id     TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK(kind IN ('create','event')),
+    message_json    TEXT NOT NULL,
+    received_at_ms  INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0
+);`,
+}
 
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
+func ensureWFSchema(db *sql.DB) error {
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&userVersion); err != nil {
+		return err
+	}
+	if userVersion >= wfSchemaVersion {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if userVersion >= 1 && userVersion < 3 {
+		if err := migrateToDefinitionsByHash(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v3: %w", err)
+		}
+	}
+	for _, stmt := range wfSchemaStatements {
+		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("create wf schema: %w", err)
 		}
 	}
-
-	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version=%d;`, wfSchemaVersion)); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version=%d;`, wfSchemaVersion)); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// migrateToDefinitionsByHash takes a v1 or v2 store to v3: its one definition per workflow type is
+// kept by its hash, and each running instance records the hash of that definition, the one it ran on
+// (the engine before v3 moved every running instance onto the definition it stored last); the
+// internal-event queue counts its replays (attempts).
+func migrateToDefinitionsByHash(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE wf_definitions RENAME TO wf_definitions_by_type;`,
+		`CREATE TABLE wf_definitions (
+    hash            TEXT PRIMARY KEY,
+    workflow_type   TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    loaded_at_ms    INTEGER NOT NULL
+);`,
+		`INSERT OR IGNORE INTO wf_definitions (hash, workflow_type, definition_json, loaded_at_ms)
+SELECT hash, workflow_type, definition_json, loaded_at_ms FROM wf_definitions_by_type;`,
+		`ALTER TABLE wf_instances ADD COLUMN definition_hash TEXT NOT NULL DEFAULT '';`,
+		`UPDATE wf_instances SET definition_hash = COALESCE(
+    (SELECT d.hash FROM wf_definitions_by_type d WHERE d.workflow_type = wf_instances.workflow_type), '')
+WHERE status IN ('running', 'cancelling');`,
+		`DROP TABLE wf_definitions_by_type;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	// A v2 store has the internal-event queue (v1 has not: it is created at its v3 shape).
+	var queues int
+	if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'wf_internal_events';`).Scan(&queues); err != nil {
+		return err
+	}
+	if queues > 0 {
+		if _, err := tx.Exec(`ALTER TABLE wf_internal_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // --- Definitions ---
 
-// UpsertDefinition inserts or replaces the stored definition for a workflow type.
-func (s *Store) UpsertDefinition(ctx context.Context, workflowType, definitionJSON, hash string, clock ClockFunc) error {
-	now := clock().UnixMilli()
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO wf_definitions (workflow_type, definition_json, hash, loaded_at_ms)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(workflow_type) DO UPDATE SET
-    definition_json = excluded.definition_json,
-    hash            = excluded.hash,
-    loaded_at_ms    = excluded.loaded_at_ms;`,
-		workflowType, definitionJSON, hash, now)
-	return err
-}
-
+// DefinitionRow is a definition kept by its hash.
 type DefinitionRow struct {
+	Hash           string
 	WorkflowType   string
 	DefinitionJSON string
-	Hash           string
 	LoadedAtMS     int64
 }
 
-// LoadAllDefinitions returns all stored workflow definitions.
-func (s *Store) LoadAllDefinitions(ctx context.Context) ([]DefinitionRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT workflow_type, definition_json, hash, loaded_at_ms FROM wf_definitions;`)
+// PutDefinition keeps a definition by its hash; loading the same one again refreshes loaded_at_ms.
+func (s *Store) PutDefinition(ctx context.Context, row DefinitionRow) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO wf_definitions (hash, workflow_type, definition_json, loaded_at_ms)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(hash) DO UPDATE SET loaded_at_ms = excluded.loaded_at_ms;`,
+		row.Hash, row.WorkflowType, row.DefinitionJSON, row.LoadedAtMS)
+	return err
+}
+
+// GetDefinition returns the definition kept under hash, if any.
+func (s *Store) GetDefinition(ctx context.Context, hash string) (DefinitionRow, bool, error) {
+	var r DefinitionRow
+	err := s.db.QueryRowContext(ctx, `
+SELECT hash, workflow_type, definition_json, loaded_at_ms FROM wf_definitions WHERE hash = ?;`, hash).Scan(
+		&r.Hash, &r.WorkflowType, &r.DefinitionJSON, &r.LoadedAtMS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, false, nil
+	}
+	return r, err == nil, err
+}
+
+// PruneDefinitions drops every kept definition but current and those a running or cancelling
+// instance still uses. It returns how many it dropped.
+func (s *Store) PruneDefinitions(ctx context.Context, current string) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM wf_definitions
+WHERE hash != ? AND hash NOT IN (
+    SELECT definition_hash FROM wf_instances WHERE status IN ('running', 'cancelling')
+);`, current)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	var out []DefinitionRow
-	for rows.Next() {
-		var r DefinitionRow
-		if err := rows.Scan(&r.WorkflowType, &r.DefinitionJSON, &r.Hash, &r.LoadedAtMS); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return result.RowsAffected()
 }
 
 // --- Instances ---
 
+// errInstanceNotFound is GetInstance's error for an instance the store does not have.
+var errInstanceNotFound = errors.New("not found")
+
+const instanceColumns = `instance_id, workflow_type, definition_hash, status, current_state, input_json, state_json,
+       current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms`
+
 // CreateInstance inserts a new workflow instance row.
 func (s *Store) CreateInstance(ctx context.Context, inst WFInstanceRow) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO wf_instances
-    (instance_id, workflow_type, status, current_state, input_json, state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
-		inst.InstanceID, inst.WorkflowType, inst.Status, inst.CurrentState,
-		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
-		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS)
+INSERT INTO wf_instances (`+instanceColumns+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
 	return err
+}
+
+func instanceValues(inst WFInstanceRow) []any {
+	return []any{
+		inst.InstanceID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
+		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
+		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS,
+	}
 }
 
 // GetInstance retrieves a single instance by ID.
 func (s *Store) GetInstance(ctx context.Context, instanceID string) (WFInstanceRow, error) {
-	var r WFInstanceRow
-	err := s.db.QueryRowContext(ctx, `
-SELECT instance_id, workflow_type, status, current_state, input_json, state_json, current_trace_id,
-       created_at_ms, updated_at_ms, terminated_at_ms
-FROM wf_instances WHERE instance_id = ?;`, instanceID).Scan(
-		&r.InstanceID, &r.WorkflowType, &r.Status, &r.CurrentState,
-		&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
-		&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS)
-	if err == sql.ErrNoRows {
-		return r, fmt.Errorf("instance %q not found", instanceID)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+instanceColumns+` FROM wf_instances WHERE instance_id = ?;`, instanceID)
+	if err != nil {
+		return WFInstanceRow{}, err
 	}
-	return r, err
+	defer rows.Close()
+	found, err := scanInstances(rows)
+	if err != nil {
+		return WFInstanceRow{}, err
+	}
+	if len(found) == 0 {
+		return WFInstanceRow{}, fmt.Errorf("instance %q %w", instanceID, errInstanceNotFound)
+	}
+	return found[0], nil
 }
 
-// UpdateInstance persists changed fields for an existing instance.
-func (s *Store) UpdateInstance(ctx context.Context, inst WFInstanceRow) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE wf_instances SET
-    status           = ?,
-    current_state    = ?,
-    state_json       = ?,
-    current_trace_id = ?,
-    updated_at_ms    = ?,
-    terminated_at_ms = ?
-WHERE instance_id = ?;`,
-		inst.Status, inst.CurrentState, inst.StateJSON, inst.CurrentTraceID,
-		inst.UpdatedAtMS, inst.TerminatedAtMS, inst.InstanceID)
-	return err
-}
-
-// CommitInstanceMutation atomically persists the instance row and internal-event queue changes.
+// CommitInstanceMutation atomically writes the instance row (an instance's first commit creates it,
+// so a creation is one commit: its row, its internal events and its inbound event) with the
+// consumption of the event its transition took and the internal-event queue changes.
 func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, mutation InstanceCommitMutation) error {
 	if mutation.ClearInternalEvents && len(mutation.EnqueueInternalEvents) > 0 {
 		return fmt.Errorf("cannot enqueue internal events while clear_internal_events is set")
@@ -273,16 +365,15 @@ func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, 
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `
-UPDATE wf_instances SET
-    status           = ?,
-    current_state    = ?,
-    state_json       = ?,
-    current_trace_id = ?,
-    updated_at_ms    = ?,
-    terminated_at_ms = ?
-WHERE instance_id = ?;`,
-		inst.Status, inst.CurrentState, inst.StateJSON, inst.CurrentTraceID,
-		inst.UpdatedAtMS, inst.TerminatedAtMS, inst.InstanceID); err != nil {
+INSERT INTO wf_instances (`+instanceColumns+`)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(instance_id) DO UPDATE SET
+    status           = excluded.status,
+    current_state    = excluded.current_state,
+    state_json       = excluded.state_json,
+    current_trace_id = excluded.current_trace_id,
+    updated_at_ms    = excluded.updated_at_ms,
+    terminated_at_ms = excluded.terminated_at_ms;`, instanceValues(inst)...); err != nil {
 		return err
 	}
 
@@ -295,6 +386,15 @@ DELETE FROM wf_internal_events WHERE instance_id = ?;`, inst.InstanceID); err !=
 		if _, err := tx.ExecContext(ctx, `
 DELETE FROM wf_internal_events WHERE instance_id = ? AND event_id = ?;`,
 			inst.InstanceID, *mutation.ConsumedInternalEventID); err != nil {
+			return err
+		}
+	}
+	if mutation.ConsumedInboundEventID != nil {
+		// Every row of the instance up to the consumed one goes: a row an earlier failed commit left
+		// came before this state, which already moved on, and must not run again at the next start.
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM wf_inbound_events WHERE instance_id = ? AND event_id <= ?;`,
+			inst.InstanceID, *mutation.ConsumedInboundEventID); err != nil {
 			return err
 		}
 	}
@@ -314,11 +414,36 @@ VALUES (?, ?, ?, ?, ?, ?);`,
 	return nil
 }
 
+// FailInstance ends an instance as failed with no transition: what the engine does when it cannot
+// run one (its definition is gone, or the transition and the failure handling both panicked). Its
+// pending internal and inbound events go with it; its timers are the caller's.
+func (s *Store) FailInstance(ctx context.Context, instanceID string, nowMS int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmts := []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE wf_instances SET status = 'failed', current_trace_id = '', updated_at_ms = ?, terminated_at_ms = ?
+WHERE instance_id = ?;`, []any{nowMS, nowMS, instanceID}},
+		{`DELETE FROM wf_internal_events WHERE instance_id = ?;`, []any{instanceID}},
+		{`DELETE FROM wf_inbound_events WHERE instance_id = ?;`, []any{instanceID}},
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt.query, stmt.args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // LoadRunningInstances returns all instances with status 'running' or 'cancelling'.
 func (s *Store) LoadRunningInstances(ctx context.Context) ([]WFInstanceRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT instance_id, workflow_type, status, current_state, input_json, state_json, current_trace_id,
-       created_at_ms, updated_at_ms, terminated_at_ms
+SELECT `+instanceColumns+`
 FROM wf_instances WHERE status IN ('running', 'cancelling');`)
 	if err != nil {
 		return nil, err
@@ -330,8 +455,7 @@ FROM wf_instances WHERE status IN ('running', 'cancelling');`)
 // ListInstances returns instances with optional filtering.
 func (s *Store) ListInstances(ctx context.Context, statusFilter string, limit int, createdAfterMS int64) ([]WFInstanceRow, error) {
 	query := `
-SELECT instance_id, workflow_type, status, current_state, input_json, state_json, current_trace_id,
-       created_at_ms, updated_at_ms, terminated_at_ms
+SELECT ` + instanceColumns + `
 FROM wf_instances WHERE 1=1`
 	args := []any{}
 	if statusFilter != "" {
@@ -360,7 +484,7 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 	for rows.Next() {
 		var r WFInstanceRow
 		if err := rows.Scan(
-			&r.InstanceID, &r.WorkflowType, &r.Status, &r.CurrentState,
+			&r.InstanceID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
 			&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
 			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS,
 		); err != nil {
@@ -369,6 +493,74 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// --- Inbound journal ---
+
+// JournalInbound saves an inbound event before the engine processes it, and returns its id. For a
+// TIMER_FIRED, firedTimerKey names the fired timer: its index row goes in the same commit, so once
+// the fire is taken a restart cannot fire it again (recovery sees no timer to recover).
+func (s *Store) JournalInbound(ctx context.Context, row InboundEventRow, firedTimerKey string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `
+INSERT INTO wf_inbound_events (instance_id, kind, message_json, received_at_ms)
+VALUES (?, ?, ?, ?);`, row.InstanceID, row.Kind, row.MessageJSON, row.ReceivedAtMS)
+	if err != nil {
+		return 0, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if firedTimerKey != "" {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM wf_instance_timers WHERE instance_id = ? AND timer_key = ?;`, row.InstanceID, firedTimerKey); err != nil {
+			return 0, err
+		}
+	}
+	return id, tx.Commit()
+}
+
+// ListInboundEvents returns the inbound events not finished, oldest first.
+func (s *Store) ListInboundEvents(ctx context.Context) ([]InboundEventRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT event_id, instance_id, kind, message_json, received_at_ms, attempts
+FROM wf_inbound_events ORDER BY event_id ASC;`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InboundEventRow
+	for rows.Next() {
+		var r InboundEventRow
+		if err := rows.Scan(&r.EventID, &r.InstanceID, &r.Kind, &r.MessageJSON, &r.ReceivedAtMS, &r.Attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CountInboundAttempt records, in its own commit, that a start runs the journaled event again.
+func (s *Store) CountInboundAttempt(ctx context.Context, eventID int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE wf_inbound_events SET attempts = attempts + 1 WHERE event_id = ?;`, eventID)
+	return err
+}
+
+// CountInternalAttempt records, in its own commit, that a start runs the queued internal event again.
+func (s *Store) CountInternalAttempt(ctx context.Context, eventID int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE wf_internal_events SET attempts = attempts + 1 WHERE event_id = ?;`, eventID)
+	return err
+}
+
+// DeleteInboundEvent drops an inbound event that no transition takes (one recovery cannot deliver).
+func (s *Store) DeleteInboundEvent(ctx context.Context, eventID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM wf_inbound_events WHERE event_id = ?;`, eventID)
+	return err
 }
 
 // --- Instance Log ---
@@ -452,7 +644,7 @@ VALUES (?, ?, ?, ?, ?, ?);`,
 // GetNextInternalEvent returns the oldest pending internal event for an instance.
 func (s *Store) GetNextInternalEvent(ctx context.Context, instanceID string) (InternalEventRow, bool, error) {
 	rows, err := s.queryInternalEvents(ctx, `
-SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms, attempts
 FROM wf_internal_events
 WHERE instance_id = ?
 ORDER BY event_id ASC
@@ -469,7 +661,7 @@ LIMIT 1;`, instanceID)
 // ListInternalEvents returns all pending internal events for an instance in FIFO order.
 func (s *Store) ListInternalEvents(ctx context.Context, instanceID string) ([]InternalEventRow, error) {
 	return s.queryInternalEvents(ctx, `
-SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms, attempts
 FROM wf_internal_events
 WHERE instance_id = ?
 ORDER BY event_id ASC;`, instanceID)
@@ -478,7 +670,7 @@ ORDER BY event_id ASC;`, instanceID)
 // ListAllInternalEvents returns all pending internal events across instances.
 func (s *Store) ListAllInternalEvents(ctx context.Context) ([]InternalEventRow, error) {
 	return s.queryInternalEvents(ctx, `
-SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms, attempts
 FROM wf_internal_events
 ORDER BY instance_id ASC, event_id ASC;`)
 }
@@ -508,6 +700,7 @@ func (s *Store) queryInternalEvents(ctx context.Context, query string, args ...a
 			&r.PayloadJSON,
 			&r.TraceID,
 			&r.CreatedAtMS,
+			&r.Attempts,
 		); err != nil {
 			return nil, err
 		}
@@ -560,10 +753,12 @@ WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
 	return rows[0], true, nil
 }
 
-// ListAllExpectedTimers returns all timer entries across all instances (used at boot recovery).
+// ListAllExpectedTimers returns all timer entries across all instances, in the order they fire (used
+// at boot recovery, which fires the missed ones in that order).
 func (s *Store) ListAllExpectedTimers(ctx context.Context) ([]TimerRow, error) {
 	return s.queryTimers(ctx, `
-SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms FROM wf_instance_timers;`)
+SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms FROM wf_instance_timers
+ORDER BY fire_at_ms, instance_id, timer_key;`)
 }
 
 func (s *Store) queryTimers(ctx context.Context, query string, args ...any) ([]TimerRow, error) {
@@ -617,6 +812,9 @@ WHERE terminated_at_ms IS NOT NULL AND terminated_at_ms < ?;`, cutoffMS)
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_internal_events WHERE instance_id = ?;`, id); err != nil {
 			return 0, err
 		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_inbound_events WHERE instance_id = ?;`, id); err != nil {
+			return 0, err
+		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_instances WHERE instance_id = ?;`, id); err != nil {
 			return 0, err
 		}
@@ -631,69 +829,29 @@ func newNullInt64(v int64) sql.NullInt64 {
 	return sql.NullInt64{Int64: v, Valid: true}
 }
 
-// marshalJSON is a convenience wrapper used by callers that need to persist maps.
+// marshalJSON writes a value the instance holds (its input, its state, a payload) as JSON that
+// unmarshalJSON reads back with the same types (wfcel.EncodeJSON: a double keeps its decimal point).
 func marshalJSON(v any) (string, error) {
 	if v == nil {
 		return "{}", nil
 	}
-	b, err := json.Marshal(v)
+	b, err := wfcel.EncodeJSON(v)
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
 }
 
-// unmarshalJSON is a convenience wrapper used by callers that need to restore maps.
-//
-// G7: it decodes with UseNumber() and then normalizes json.Number to int64 (integral) or float64,
-// matching the types cel-go/set_variable produce when a value is computed fresh. Without this,
-// json.Unmarshal decodes every JSON number as float64, so an integer state variable (e.g. a cycle
-// counter) silently degrades to float64 after a wf.engine restart — and cel-go has no modulo (%)
-// overload for double, so a guard like `state.count % 2 == 0` breaks the moment the instance is
-// restored. Restoring integers as int64 keeps int arithmetic/guards working across restarts.
+// unmarshalJSON reads a stored map back as the engine holds every value, live and after a restart
+// (wfcel.DecodeJSON): an integer is an int64 and any other number a float64. Before 0.1.90 a value
+// was a float64 live and an int64 restored, so a guard could work after a restart and fail before it
+// (FINDINGS A-118): cel-go compares and equates an int with a double, but fails arithmetic that
+// mixes them and `%` on a double.
 func unmarshalJSON(s string) (map[string]any, error) {
 	if s == "" || s == "{}" {
 		return map[string]any{}, nil
 	}
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
-	var m map[string]any
-	if err := dec.Decode(&m); err != nil {
-		return nil, err
-	}
-	normalizeJSONNumbers(m)
-	return m, nil
-}
-
-// normalizeJSONNumbers recursively rewrites json.Number values to int64 (when integral) or float64,
-// so a JSON round-trip through SQLite preserves int-ness (see unmarshalJSON / G7).
-func normalizeJSONNumbers(m map[string]any) {
-	for k, v := range m {
-		m[k] = normalizeJSONNumberValue(v)
-	}
-}
-
-func normalizeJSONNumberValue(v any) any {
-	switch x := v.(type) {
-	case json.Number:
-		if i, err := x.Int64(); err == nil {
-			return i
-		}
-		if f, err := x.Float64(); err == nil {
-			return f
-		}
-		return x.String()
-	case map[string]any:
-		normalizeJSONNumbers(x)
-		return x
-	case []any:
-		for i := range x {
-			x[i] = normalizeJSONNumberValue(x[i])
-		}
-		return x
-	default:
-		return v
-	}
+	return wfcel.DecodeJSONObject([]byte(s))
 }
 
 // nowMS returns the current time in Unix milliseconds using the given clock.

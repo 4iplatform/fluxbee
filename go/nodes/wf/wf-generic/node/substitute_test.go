@@ -102,11 +102,16 @@ func TestResolveMissingKeyReturnsError(t *testing.T) {
 	}
 }
 
-func TestResolveUnknownRootReturnsError(t *testing.T) {
-	payload := map[string]any{"$ref": "ctx.something"}
-	_, err := Resolve(payload, nil, nil, nil)
-	if err == nil {
-		t.Fatal("expected error for unknown root")
+// A JSON Schema's own "$ref" (it holds "#", "/" or ":") is a literal, not a $ref.
+func TestResolveAJSONSchemaRefIsALiteral(t *testing.T) {
+	for _, literal := range []map[string]any{
+		{"$ref": "#/definitions/item", "description": "a JSON Schema's own reference"},
+		{"$ref": "https://example.com/item.json"},
+	} {
+		got, err := Resolve(literal, nil, nil, nil)
+		if err != nil || !reflect.DeepEqual(got, literal) {
+			t.Fatalf("%v = %#v, %v", literal, got, err)
+		}
 	}
 }
 
@@ -117,5 +122,33 @@ func TestResolveNilPayload(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+// 0.1.90: {"$ref": path, "default": value} takes the literal value when the path leads to no value
+// (a key absent, or a value on the way that is not an object) or holds null, as an IO node writes an
+// absent field; {"$ref": path} alone gives the null.
+func TestResolveRefWithDefault(t *testing.T) {
+	event := map[string]any{"payload": map[string]any{"text": "hello", "empty": nil}}
+	cases := []struct {
+		ref  map[string]any
+		want any
+	}{
+		{map[string]any{"$ref": "event.context", "default": map[string]any{}}, map[string]any{}},
+		{map[string]any{"$ref": "event.payload.text.lang", "default": "en"}, "en"},
+		{map[string]any{"$ref": "event.payload.text", "default": "x"}, "hello"},
+		{map[string]any{"$ref": "event.payload.empty", "default": "x"}, "x"},
+		{map[string]any{"$ref": "event.payload.empty"}, nil},
+		{map[string]any{"$ref": "input.missing", "default": nil}, nil},
+	}
+	for _, c := range cases {
+		got, err := Resolve(c.ref, map[string]any{}, nil, event)
+		if err != nil || !reflect.DeepEqual(got, c.want) {
+			t.Fatalf("%v = %#v, %v; want %#v", c.ref, got, err, c.want)
+		}
+	}
+	// Without a default, a missing field is still an error.
+	if _, err := Resolve(map[string]any{"$ref": "event.context"}, nil, nil, event); err == nil {
+		t.Fatal("a missing field without a default is an error")
 	}
 }

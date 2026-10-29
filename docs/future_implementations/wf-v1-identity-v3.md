@@ -4,6 +4,9 @@
 **Date:** 2026-04-13
 **Audience:** AI designers (Archi), workflow authors, runtime developers, ops/SRE
 
+> **A future draft, not the engine.** The engine as built is `docs/spec-systemnode-wf-v1_1.md`; where this
+> draft differs (marked below, and in its examples), the spec holds.
+
 ---
 
 ## Table of Contents
@@ -460,10 +463,10 @@ Fields:
 |---|---|
 | `target` | L2 name of the target node. Validated syntactically at load. |
 | `meta.msg` | The `meta.msg` field of the outgoing message. |
-| `meta.type` | Defaults to `"system"`. Can be overridden to `"user"` for user-facing messages. |
+| `meta.type` | Not in the engine: since 0.1.90 every message a WF sends is a `user` message, and `meta.type` is refused (spec §10.1). |
 | `payload` | JSON object. String values in the form `"state.foo"` or `"input.foo"` or `"event.payload.foo"` are substituted at action execution time. |
 
-Substitution happens via a simple path expression: `state.customer_id` reads the `customer_id` variable from the instance state at the moment of execution. This is not CEL; it is a literal path lookup. If the path does not resolve, the field is omitted from the outgoing payload.
+Substitution happens via a simple path expression: `state.customer_id` reads the `customer_id` variable from the instance state at the moment of execution. This is not CEL; it is a literal path lookup. (In the engine, a path that does not resolve fails the action, unless its `{"$ref": ..., "default": ...}` gives a default: spec §10.1.)
 
 The action emits the message and moves on. It does not wait for a response. Responses arrive as separate incoming events, processed by normal transition evaluation.
 
@@ -578,13 +581,13 @@ When `schedule_timer` fires a timer via SY.timer, the runtime passes a payload c
 }
 ```
 
-When SY.timer fires, the `TIMER_FIRED` event arrives at the WF node with this payload inside `user_payload`. The WF runtime inspects `user_payload.instance_id`:
+When SY.timer fires, the `TIMER_FIRED` event arrives at the WF node with this payload inside `user_payload`. The WF runtime inspects `user_payload.instance_id` (in the engine: the timer's `client_ref`, for a timer the node scheduled, spec §11.2):
 
-- **If present and an instance exists** — deliver the event to that instance. The instance processes it as a normal event in its transition evaluation. Transitions can match on `meta.msg == "TIMER_FIRED"` and guard on `event.user_payload.timer_key`.
+- **If present and an instance exists** — deliver the event to that instance. The instance processes it as a normal event in its transition evaluation. Transitions can match on `meta.msg == "TIMER_FIRED"` and guard on `event.timer_key` (the engine's key for a fired timer; `event.user_payload` does not exist).
 
 - **If present but the instance is already completed/cancelled** — the timer is orphaned. Log and discard.
 
-- **If not present** — treat the event as a potential new trigger. If the payload also matches the workflow's `input_schema`, create a new instance with this event as the initial trigger. This supports the "recurring cron triggers new instance" pattern, where a timer on SY.timer has `payload = { task: ..., ...initial data }` and the WF node treats its arrival as a start.
+- **If not present** — treat the event as a potential new trigger. If the payload also matches the workflow's `input_schema`, create a new instance with this event as the initial trigger. This supports the "recurring cron triggers new instance" pattern, where a timer on SY.timer has `payload = { task: ..., ...initial data }` and the WF node treats its arrival as a start. (Not in the engine: a `TIMER_FIRED` never starts an instance, spec §11.2.)
 
 ### 11.3 Timer cleanup on instance termination
 
@@ -751,7 +754,7 @@ Handlers:
 - `WF_GET_INSTANCE` — returns instance info (state, status, variables, recent log).
 - `WF_LIST_INSTANCES` — returns instances matching filter.
 - `WF_GET_CODE` — returns the current workflow definition.
-- `TIMER_FIRED` — routes to instance by `user_payload.instance_id`, or treats as new trigger.
+- `TIMER_FIRED` — routes to instance by `user_payload.instance_id`, or treats as new trigger (in the engine: by its `client_ref`, and never a trigger, spec §14.2).
 - Any other `meta.msg` — attempts to match against an existing instance by `meta.thread_id` or similar correlation, or if it matches the `input_schema`, creates a new instance.
 
 ### 14.3 Instance creation
@@ -854,7 +857,7 @@ No admin-initiated mutations in v1. Specifically, there is **no** `wf_cancel_ins
 {
   "meta": { "type": "system", "msg": "WF_LIST_INSTANCES" },
   "payload": {
-    "status_filter": "running",
+    "status": "running",
     "limit": 100,
     "created_after_ms": 1775000000000
   }
@@ -1072,7 +1075,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'validation_timeout'",
+          "guard": "event.timer_key == 'validation_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'validator timeout'" }
@@ -1116,7 +1119,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'customer_response_timeout'",
+          "guard": "event.timer_key == 'customer_response_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'customer did not respond'" }
@@ -1169,7 +1172,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'qb_creation_timeout'",
+          "guard": "event.timer_key == 'qb_creation_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'quickbooks timeout'" }
@@ -1212,7 +1215,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'delivery_timeout'",
+          "guard": "event.timer_key == 'delivery_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'delivery timeout'" }

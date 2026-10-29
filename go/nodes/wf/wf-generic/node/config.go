@@ -183,6 +183,10 @@ func (c wfContract) materialize(operator OperatorConfig, system map[string]any) 
 		return cfg, sdk.InvalidConfig("db_path is required")
 	case cfg.SYTimerL2Name == "":
 		return cfg, sdk.InvalidConfig("sy_timer_l2_name is required (or the node's hive, to use its SY.timer)")
+	case cfg.HiveID != "" && cfg.SYTimerL2Name != "SY.timer@"+cfg.HiveID:
+		// The node takes a TIMER_FIRED only from SY.timer of its own hive (FINDINGS A-119): a timer
+		// scheduled on any other would never fire.
+		return cfg, sdk.InvalidConfig("sy_timer_l2_name must be SY.timer@%s, the SY.timer of the node's hive, not %q", cfg.HiveID, cfg.SYTimerL2Name)
 	}
 	return cfg, nil
 }

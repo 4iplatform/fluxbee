@@ -33,8 +33,8 @@ func TestEveryStoreConnectionGetsThePragmas(t *testing.T) {
 		if err := conn.QueryRowContext(ctx, "PRAGMA synchronous;").Scan(&synchronous); err != nil {
 			t.Fatalf("conn %d synchronous: %v", i, err)
 		}
-		// synchronous: 1 = NORMAL.
-		if timeout != 5000 || mode != "wal" || synchronous != 1 {
+		// synchronous: 2 = FULL, SQLite's default, as in sy-timer: a commit is on disk when it returns.
+		if timeout != 5000 || mode != "wal" || synchronous != 2 {
 			t.Fatalf("conn %d: busy_timeout=%d journal_mode=%s synchronous=%d", i, timeout, mode, synchronous)
 		}
 	}

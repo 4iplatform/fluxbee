@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -360,7 +361,7 @@ func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testin
 		t.Fatalf("CONFIG_GET = %v", reply)
 	}
 
-	if err := Dispatch(context.Background(), msgWithName(MsgWFListInstances), rt); err != nil {
+	if err := Dispatch(context.Background(), from(sdk.PrimaryAdminNode, msgWithName(MsgWFListInstances)), rt); err != nil {
 		t.Fatal(err)
 	}
 	if got := derefString(disp.sent[len(disp.sent)-1].Meta.Msg); got != MsgWFListInstancesResponse {
@@ -371,7 +372,7 @@ func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testin
 	}
 
 	sent := len(disp.sent)
-	if err := Dispatch(context.Background(), msgWithName("INVOICE_REQUEST"), rt); err != nil {
+	if err := Dispatch(context.Background(), from("AI.billing@motherbee", msgWithName("INVOICE_REQUEST")), rt); err != nil {
 		t.Fatal(err)
 	}
 	if len(disp.sent) != sent {
@@ -396,10 +397,10 @@ func TestARefusedReplyIsAnsweredWithAnError(t *testing.T) {
 		reply   string // the error reply's msg; empty when nothing replaces the failed reply
 		failed  string // the error code, as the error reply carries it
 	}{
-		{name: "WF_GET_CODE", msg: msgWithName(MsgWFGetCode), sendErr: tooLarge, reply: MsgWFGetCodeResponse, failed: `"error":"INTERNAL_ERROR"`},
+		{name: "WF_GET_CODE", msg: from(sdk.PrimaryAdminNode, msgWithName(MsgWFGetCode)), sendErr: tooLarge, reply: MsgWFGetCodeResponse, failed: `"error":"INTERNAL_ERROR"`},
 		{name: "CONFIG_GET", msg: configGet(t), sendErr: tooLarge, reply: sdk.MSGConfigResponse, failed: `"code":"` + sdk.ErrCodeInternal + `"`},
 		{name: "NODE_STATUS_GET", msg: sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusGet}}, sendErr: tooLarge},
-		{name: "queue full", msg: msgWithName(MsgWFGetCode), sendErr: queueFull},
+		{name: "queue full", msg: from(sdk.PrimaryAdminNode, msgWithName(MsgWFGetCode)), sendErr: queueFull},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -495,4 +496,70 @@ func mustLoadValidDefinition(t *testing.T) *WorkflowDefinition {
 		t.Fatalf("LoadDefinitionBytes: %v", err)
 	}
 	return def
+}
+
+// The answers of WF_LIST_INSTANCES, WF_GET_INSTANCE and WF_HELP use the snake_case keys the spec
+// shows (§15, §16.1): SY.wf-rules reads ok and count of WF_LIST_INSTANCES, Archi and an operator
+// the rest. Before 0.1.90 the instances went out with the store's Go field names.
+func TestTheWFAnswersUseTheKeysTheSpecShows(t *testing.T) {
+	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
+	instanceID := startAsking(t, rt, disp, "trace-start")
+	ask := func(name, payload string) map[string]any {
+		t.Helper()
+		request := from(sdk.PrimaryAdminNode, msgWithName(name))
+		request.Meta.MsgType = sdk.SYSTEMKind
+		request.Payload = json.RawMessage(payload)
+		if err := Dispatch(context.Background(), request, rt); err != nil {
+			t.Fatal(err)
+		}
+		return lastReply(t, disp)
+	}
+	keys := func(object any) string {
+		t.Helper()
+		fields, ok := object.(map[string]any)
+		if !ok {
+			t.Fatalf("not an object: %v", object)
+		}
+		names := make([]string, 0, len(fields))
+		for name := range fields {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return strings.Join(names, ",")
+	}
+	const summaryKeys = "created_at_ms,current_state,definition_hash,instance_id,status,terminated_at_ms,updated_at_ms,workflow_type"
+
+	list := ask(MsgWFListInstances, `{"status": "running", "limit": 0}`)
+	if keys(list) != "count,instances,ok" || list["ok"] != true || list["count"] != float64(1) {
+		t.Fatalf("WF_LIST_INSTANCES = %v", list)
+	}
+	instances, _ := list["instances"].([]any)
+	if len(instances) != 1 || keys(instances[0]) != summaryKeys {
+		t.Fatalf("an instance listed: %v", instances)
+	}
+
+	got := ask(MsgWFGetInstance, `{"instance_id": "`+instanceID+`"}`)
+	if keys(got) != "instance,ok" || got["ok"] != true {
+		t.Fatalf("WF_GET_INSTANCE = %v", got)
+	}
+	instance := got["instance"].(map[string]any)
+	if keys(instance) != "created_at_ms,current_state,definition_hash,input,instance_id,recent_log,state_variables,status,terminated_at_ms,updated_at_ms,workflow_type" ||
+		instance["instance_id"] != instanceID || instance["status"] != "running" || instance["terminated_at_ms"] != nil {
+		t.Fatalf("the instance: %v", instance)
+	}
+	if input := instance["input"].(map[string]any); input["customer_id"] != "c1" {
+		t.Fatalf("its input: %v", input)
+	}
+	recent, _ := instance["recent_log"].([]any)
+	if len(recent) == 0 || keys(recent[0]) != "action_type,error_detail,logged_at_ms,ok,summary" {
+		t.Fatalf("its log: %v", recent)
+	}
+
+	help := ask(MsgWFHelp, `{}`)
+	if keys(help) != "description,initial_state,input_schema,ok,states,terminal_states,workflow_type" || help["workflow_type"] != "asking" {
+		t.Fatalf("WF_HELP = %v", help)
+	}
+	if states, _ := help["states"].([]any); len(states) != 4 || states[0] != "asking" {
+		t.Fatalf("WF_HELP lists the states by name: %v", help["states"])
+	}
 }

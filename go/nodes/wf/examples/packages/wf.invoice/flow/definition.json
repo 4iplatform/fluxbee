@@ -8,7 +8,7 @@
     "properties": {
       "customer_id": { "type": "string" },
       "amount_cents": { "type": "integer", "minimum": 1 },
-      "currency": { "type": "string", "default": "USD" },
+      "currency": { "type": "string", "description": "ISO 4217 code; USD when absent" },
       "due_date": { "type": "string", "description": "ISO 8601 date, e.g. 2026-05-01" }
     }
   },
@@ -26,7 +26,7 @@
           "payload": {
             "customer_id": { "$ref": "input.customer_id" },
             "amount_cents": { "$ref": "input.amount_cents" },
-            "currency": { "$ref": "input.currency" }
+            "currency": { "$ref": "input.currency", "default": "USD" }
           }
         },
         {
@@ -74,7 +74,7 @@
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.payload.timer_key == 'collection_timeout'",
+          "guard": "event.timer_key == 'collection_timeout'",
           "target_state": "failed",
           "actions": [
             {
@@ -140,7 +140,7 @@
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.payload.timer_key == 'validation_timeout'",
+          "guard": "event.timer_key == 'validation_timeout'",
           "target_state": "failed",
           "actions": [
             {
@@ -164,7 +164,7 @@
             "invoice_id": { "$ref": "state.invoice_id" },
             "customer_id": { "$ref": "input.customer_id" },
             "amount_cents": { "$ref": "input.amount_cents" },
-            "currency": { "$ref": "input.currency" }
+            "currency": { "$ref": "input.currency", "default": "USD" }
           }
         },
         {
@@ -207,7 +207,7 @@
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.payload.timer_key == 'send_timeout'",
+          "guard": "event.timer_key == 'send_timeout'",
           "target_state": "failed",
           "actions": [
             {
@@ -236,7 +236,7 @@
           "meta": { "msg": "INVOICE_FAILED_NOTIFICATION" },
           "payload": {
             "customer_id": { "$ref": "input.customer_id" },
-            "failure_reason": { "$ref": "state.failure_reason" }
+            "failure_reason": { "$ref": "state.failure_reason", "default": "unknown" }
           }
         }
       ],

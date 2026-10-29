@@ -42,30 +42,31 @@ type TransitionDefinition struct {
 	Program     cel.Program        `json:"-"`
 }
 
+// EventMatch names the event a transition takes, by its meta.msg. It has no type: every message a
+// WF takes is a user message, but a TIMER_FIRED, which its msg names (event_match.type left the
+// definition language in 0.1.90, and a definition that still has it is refused).
 type EventMatch struct {
-	Msg  string  `json:"msg"`
-	Type *string `json:"type,omitempty"`
+	Msg string `json:"msg"`
 }
 
+// ActionMeta is an action's meta. It has no type: every message a WF makes is a user message
+// (meta.type left the definition language in 0.1.90, and a definition that still has it is refused).
 type ActionMeta struct {
-	Msg  string `json:"msg"`
-	Type string `json:"type,omitempty"`
+	Msg string `json:"msg"`
 	// Context is an arbitrary object placed on the outbound frame's meta.context, resolved with the
-	// same $ref/${...} rules as payload. Its primary use is requesting AI structured output via
+	// same $ref rules as payload. Its primary use is requesting AI structured output via
 	// meta.context.response_envelope (gap-3) — ai-generic reads that to shape its reply. Nil = no
-	// context is set (unchanged behavior).
+	// context is set.
 	Context any `json:"context,omitempty"`
 }
 
 type ActionDefinition struct {
 	Type string `json:"type"`
-	// Target is a STATIC destination L2 name (e.g. "AI.specialist@motherbee"). For a DYNAMIC target
-	// (routing to a node computed at runtime) set TargetRef instead — a $ref dot-path rooted at
-	// state/input/event whose resolved string value is the destination. Exactly one of Target /
-	// TargetRef must be set on a send_message action. Either way the (resolved) name is re-validated
-	// and SY.*/RT.* system nodes are refused at send time.
-	Target    string `json:"target,omitempty"`
-	TargetRef string `json:"target_ref,omitempty"`
+	// Target is the destination of a send_message: a node name written in the definition (e.g.
+	// "AI.specialist@motherbee"), never a SY.* or RT.* node. A WF that chooses among destinations
+	// does it with guards, one transition per destination (target_ref, a destination taken from
+	// data, left the definition language in 0.1.90, and a definition that still has it is refused).
+	Target string `json:"target,omitempty"`
 	// ThreadIDRef overrides the outbound thread_id with a $ref-resolved value (a dot-path rooted at
 	// state/input/event). By DEFAULT a send_message uses the WF instance_id as thread_id so replies
 	// correlate back to this instance (see correlate.go). Set ThreadIDRef ONLY for a terminal reply

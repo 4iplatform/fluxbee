@@ -1,6 +1,7 @@
 package wfcel
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,5 +125,48 @@ func TestGuardJsonParseInvalidIsNotTrue(t *testing.T) {
 	event := map[string]any{"payload": map[string]any{"body": "not json"}}
 	if EvalGuard(program, nil, nil, event) {
 		t.Fatal("invalid JSON must make the guard non-true, not crash")
+	}
+}
+
+// A guard runs on the caller's goroutine and stops at GuardEvalTimeout: one left running in its own
+// goroutine kept reading the instance's state while the next transition wrote it (a fatal concurrent
+// map access, FINDINGS A-118).
+func TestASlowGuardStopsAtItsTimeout(t *testing.T) {
+	program, err := CompileGuard(`state.items.all(a, state.items.all(b, a + b < 100000000))`, fixedClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := make([]any, 5000)
+	for i := range items {
+		items[i] = int64(i)
+	}
+	start := time.Now()
+	if EvalGuard(program, nil, map[string]any{"items": items}, nil) {
+		t.Fatal("a guard that runs out of time is false")
+	}
+	if elapsed := time.Since(start); elapsed > 20*GuardEvalTimeout {
+		t.Fatalf("the guard ran %s", elapsed)
+	}
+}
+
+// A set_variable value has a deterministic bound: past ValueCostLimit its evaluation stops with an
+// error, which fails the action under its on_error. (A search of a large text is charged by its
+// size, so the limit comes in a few steps, and the test stays quick under -race.)
+func TestASetVariableValueStopsAtItsCostLimit(t *testing.T) {
+	program, err := CompileValue(`state.items.filter(i, state.text.contains('y')).size()`, fixedClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := make([]any, 50)
+	for i := range items {
+		items[i] = int64(i)
+	}
+	large := map[string]any{"items": items, "text": strings.Repeat("x", 1<<20)}
+	if _, err := EvalValue(program, nil, large, nil); err == nil || !strings.Contains(err.Error(), "cost limit exceeded") {
+		t.Fatalf("expected the cost limit, got %v", err)
+	}
+	small, err := EvalValue(program, nil, map[string]any{"items": items, "text": "xy"}, nil)
+	if err != nil || small.Value() != int64(50) {
+		t.Fatalf("a value within the limit: %v %v", small, err)
 	}
 }

@@ -17,7 +17,7 @@ func TestExecuteActionsFailFastPolicy(t *testing.T) {
 	actx := makeActx(t, disp, &mockTimerSender{})
 	inst := &WFInstance{InstanceID: "wfi:f1", Input: map[string]any{}, StateVars: map[string]any{}}
 	actions := []ActionDefinition{
-		{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Type: "system"}, Payload: map[string]any{}},
+		{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask"}, Payload: map[string]any{}},
 	}
 	var emitted []InternalEventRow
 
@@ -61,7 +61,7 @@ func TestSendMessageRetriesTransientQueueFull(t *testing.T) {
 	s := openTestStore(t)
 	actx := ActionContext{Store: s, Dispatcher: disp, Timer: &mockTimerSender{}, Clock: fixedClock}
 	inst := &WFInstance{InstanceID: "wfi:r2", Input: map[string]any{}, StateVars: map[string]any{}}
-	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Type: "system"}, Payload: map[string]any{}}
+	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask"}, Payload: map[string]any{}}
 	if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {
 		t.Fatalf("transient queue-full should be retried, not fatal: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestSendMessageDoesNotRetryAnOversizeFrame(t *testing.T) {
 	s := openTestStore(t)
 	actx := ActionContext{Store: s, Dispatcher: disp, Timer: &mockTimerSender{}, Clock: fixedClock}
 	inst := &WFInstance{InstanceID: "wfi:r3", Input: map[string]any{}, StateVars: map[string]any{}}
-	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Type: "system"}, Payload: map[string]any{}}
+	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask"}, Payload: map[string]any{}}
 	err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx)
 	var tooLarge *sdk.MessageTooLargeError
 	if !errors.As(err, &tooLarge) {
@@ -106,7 +106,7 @@ func TestRouteToFailedTerminatesInstance(t *testing.T) {
 	if err := actx.Store.CreateInstance(context.Background(), row); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
-	if err := inst.routeToFailed(context.Background(), msgWithName("X"), actx, fmt.Errorf("boom"), nil); err != nil {
+	if err := inst.routeToFailed(context.Background(), msgWithName("X"), actx, fmt.Errorf("boom"), takenEvent{}); err != nil {
 		t.Fatalf("routeToFailed: %v", err)
 	}
 	if inst.Status != "failed" {
@@ -135,8 +135,7 @@ func TestSendMessageThreadIDRefOverrideAndContext(t *testing.T) {
 		Target:      "IO.api@motherbee",
 		ThreadIDRef: "event.payload.thread_id",
 		Meta: &ActionMeta{
-			Msg:  "answer",
-			Type: "user",
+			Msg: "answer",
 			Context: map[string]any{
 				"response_envelope": map[string]any{"schema": "invoice_result"},
 			},
@@ -177,7 +176,7 @@ func TestSendMessageDefaultThreadIDIsInstanceID(t *testing.T) {
 	action := ActionDefinition{
 		Type:    "send_message",
 		Target:  "AI.host@motherbee",
-		Meta:    &ActionMeta{Msg: "ask", Type: "system"},
+		Meta:    &ActionMeta{Msg: "ask"},
 		Payload: map[string]any{},
 	}
 	if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {

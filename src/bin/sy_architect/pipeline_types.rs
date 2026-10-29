@@ -753,8 +753,10 @@ pub fn workflow_definition_shape_error(definition: &serde_json::Value) -> Option
 
 /// The hash SY.wf-rules gives a workflow definition (`current_hash` in `list_workflows`):
 /// `sha256:` and the hex SHA-256 of the bytes it stores, which are Go's
-/// `json.MarshalIndent(definition, "", "  ")` and a newline, the definition decoded into `any`
-/// (`normalizeDefinitionBytes` and `HashDefinition` in go/sy-wf-rules/node/store.go).
+/// `json.MarshalIndent(definition, "", "  ")` and a newline, the definition decoded with its
+/// numbers as written (`decodeCompileRequest`, `normalizeDefinitionBytes` and `HashDefinition` in
+/// go/sy-wf-rules/node). A number is written as serde_json wrote it: the definition travels to
+/// SY.wf-rules as serde_json writes it, from Archi and again from SY.admin.
 pub fn wf_rules_definition_hash(definition: &serde_json::Value) -> String {
     let mut stored = String::new();
     write_go_json(definition, 0, &mut stored);
@@ -762,14 +764,15 @@ pub fn wf_rules_definition_hash(definition: &serde_json::Value) -> String {
     format!("sha256:{:x}", Sha256::digest(stored.as_bytes()))
 }
 
-/// `value` as Go's `json.MarshalIndent(value, "", "  ")` writes what it decoded into `any`: object
-/// keys sorted, every number a float64, strings with Go's escaping.
+/// `value` as Go's `json.MarshalIndent(value, "", "  ")` writes what it decoded into `any` with
+/// `UseNumber`: object keys sorted, every number as it came (serde_json's form of it, since 0.1.90;
+/// before, every number was a float64, so `1.0` was stored as `1`), strings with Go's escaping.
 fn write_go_json(value: &serde_json::Value, depth: usize, out: &mut String) {
     use serde_json::Value;
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
-        Value::Number(number) => write_go_float(number.as_f64().unwrap_or_default(), out),
+        Value::Number(number) => out.push_str(&number.to_string()),
         Value::String(text) => write_go_string(text, out),
         Value::Array(items) if items.is_empty() => out.push_str("[]"),
         Value::Array(items) => {
@@ -808,23 +811,6 @@ fn push_go_indent(depth: usize, out: &mut String) {
     out.push('\n');
     for _ in 0..depth {
         out.push_str("  ");
-    }
-}
-
-/// A float64 as Go's encoding/json writes it: the shortest digits that read back as the same
-/// number, in exponent form below 1e-6 and from 1e21 (`1e-7`, `1e+21`), so `3.0` is `3`.
-fn write_go_float(number: f64, out: &mut String) {
-    let abs = number.abs();
-    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
-        let text = format!("{number:e}");
-        match text.split_once('e') {
-            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
-                let _ = write!(out, "{mantissa}e+{exponent}");
-            }
-            _ => out.push_str(&text),
-        }
-    } else {
-        let _ = write!(out, "{number}");
     }
 }
 
@@ -1029,11 +1015,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The expected values come from Go 1.25 running what SY.wf-rules runs on these definitions
-    /// (json.Unmarshal into `any`, normalizeDefinitionBytes, HashDefinition). The numbers are ones
-    /// serde_json and Go read as the same float64 (serde_json's default parser is off by one unit in
-    /// the last place on some, e.g. -3e25); in use, Go reads what serde_json wrote, the shortest
-    /// form of the float64 Archi holds, so it hashes that same number.
+    /// The expected values come from Go 1.25 running what SY.wf-rules runs on these definitions as
+    /// serde_json writes them (decodeCompileRequest, which keeps numbers as written,
+    /// normalizeDefinitionBytes, HashDefinition): SY.wf-rules stores a number as it came, and it
+    /// comes as serde_json wrote it (`1.0` stays `1.0`, `1e21` is `1e+21`, `-0` is `-0.0`).
     #[test]
     fn the_definition_hash_is_the_one_wf_rules_reports() {
         let simple = json!({ "b": 1.0, "a": [2, { "d": "<x>", "c": null }] });
@@ -1041,21 +1026,21 @@ mod tests {
         write_go_json(&simple, 0, &mut stored);
         assert_eq!(
             stored,
-            "{\n  \"a\": [\n    2,\n    {\n      \"c\": null,\n      \"d\": \"\\u003cx\\u003e\"\n    }\n  ],\n  \"b\": 1\n}"
+            "{\n  \"a\": [\n    2,\n    {\n      \"c\": null,\n      \"d\": \"\\u003cx\\u003e\"\n    }\n  ],\n  \"b\": 1.0\n}"
         );
         assert_eq!(
             wf_rules_definition_hash(&simple),
-            "sha256:c45d0346dcc816b7f54a73b1cd7e964dae7f502b27d8d148228601cc6633ca99"
+            "sha256:ba4dca861b73e3a2cb38bcd173342c790be4f4bfed640ee36115c06e4db043d9"
         );
 
-        // Key order, Go's number forms and Go's string escapes.
+        // Key order, numbers as serde_json writes them, and Go's string escapes.
         let tricky: serde_json::Value = serde_json::from_str(
             r#"{"workflow_type":"demo","wf_schema_version":"1","initial_state":"start","states":[{"name":"start","entry_actions":[],"exit_actions":[{}],"transitions":[{"guard":"event.payload.n > 2 && a < b","target_state":"done","actions":[{"type":"set_variable","name":"x","value":"'<b>&amp;</b>'"}]}]},{"name":"done"}],"numbers":{"int":3,"float_int":1.0,"half":0.5,"neg":-7,"big":12345678901234567890,"tiny":1e-7,"small":0.000001,"huge":1e21,"just_under":1e20,"third":0.30000000000000004,"neg_zero":-0,"exp":2.5e-10,"neg_huge":-1e22},"text":{"quote":"say \"hi\"","backslash":"a\\b","newline":"l1\nl2","tab":"a\tb","cr":"a\rb","bs":"a\bb","ff":"a\fb","ctl":"a\u0001b\u001fc","del":"a\u007fb","seps":"x\u2028y\u2029z","accents":"Mendoza \u00e9 \u00f1 \u00fc","emoji":"\ud83d\udc1d","slash":"a/b"},"empty_obj":{},"empty_arr":[],"nested":[[],[{}],[1,[2,[3]]]],"flags":[true,false,null],"Zeta":1,"alpha":2,"Alpha":3,"_u":4,"10":5,"9":6}"#,
         )
         .expect("definition");
         assert_eq!(
             wf_rules_definition_hash(&tricky),
-            "sha256:419510afc7d42c75789add461314e76e661ab54ffdab2575c131378a13d98c1c"
+            "sha256:a559c5156e375fcf423e6d0b2ecb3d0338eddb18bf06e93891199ab9fa4c05a7"
         );
 
         let deployment: DesiredWfDeployment = serde_json::from_value(json!({

@@ -70,7 +70,7 @@ func TestValidateDefinitionRejectsInvalidVariableName(t *testing.T) {
 }
 
 func TestValidateDefinitionRejectsInvalidRefSyntax(t *testing.T) {
-	data := strings.Replace(validWorkflowJSON(), `"customer_id": {"$ref": "input.customer_id"}`, `"customer_id": {"$ref": "customer_id"}`, 1)
+	data := strings.Replace(validWorkflowJSON(), `"customer_id": {"$ref": "input.customer_id"}`, `"customer_id": {"$ref": "input."}`, 1)
 	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
 	assertLoadErrorContains(t, err, "states[0].entry_actions[0].payload.customer_id.$ref")
 }

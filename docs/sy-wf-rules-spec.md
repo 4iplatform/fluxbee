@@ -4,7 +4,7 @@
 **Date:** 2026-04-15
 **Audience:** Platform developers, Archi designers, operators
 **Reference implementation model:** `go/sy-opa-rules/main.go` (sy.opa-rules — sy.wf-rules follows the same API shape)
-**Related specs:** `wf-v1.md`, `sy-timer.md`, runtime-packaging-cli-spec.md
+**Related specs:** `spec-systemnode-wf-v1_1.md`, `sy-timer.md`, runtime-packaging-cli-spec.md
 
 ---
 
@@ -60,7 +60,7 @@ When a new definition is applied:
 2. The new definition becomes current.
 3. `SY.admin` restarts the WF node (its orchestrator does it).
 4. The WF node boots, loads the new definition as "current" for new instances.
-5. Existing instances in SQLite continue using the definition they were born with (frozen by hash — this is handled by wf-generic internally, not by sy.wf-rules).
+5. Existing instances in SQLite continue using the definition they were born with (frozen by hash — this is handled by wf-generic internally, not by sy.wf-rules: since 0.1.90 each instance records its definition's hash, and the WF node keeps every definition a running instance uses and drops it when the last one ends).
 
 The user perceives always-latest. The system preserves running instances transparently. This is the decision documented in the conversation of 2026-04-15.
 
@@ -178,7 +178,9 @@ Note: if a request arrives with `operation: "check"`, it is treated as a synonym
 
 ### 5.4 CONFIG_SET payload
 
-```json
+A sketch (`...` stands for the parts of the definition):
+
+```
 {
   "operation": "compile_apply",
   "workflow_name": "invoice",
@@ -202,7 +204,7 @@ Note: if a request arrives with `operation: "check"`, it is treated as a synonym
 | `operation` | string | No (default: "compile") | One of: compile, compile_apply, apply, rollback |
 | `workflow_name` | string | **Yes, always** | Name of the workflow. Determines node name `WF.<workflow_name>@<hive>`. Required for all operations including apply and rollback. |
 | `tenant_id` | string | Conditionally required | Required for the **first deploy** of a workflow when `auto_spawn=true` and the target `WF.<workflow_name>@<hive>` node does not exist yet. On rollout of an already-managed WF node, `sy.wf-rules` preserves the existing managed `tenant_id` and does not require the field again. |
-| `definition` | object | Yes for compile/compile_apply | The full workflow definition JSON per wf-v1.md §8. |
+| `definition` | object | Yes for compile/compile_apply | The full workflow definition JSON per `spec-systemnode-wf-v1_1.md` §8 (§19.2 is a complete one). Its numbers are staged as written (`3` stays `3`, `1.0` stays `1.0`). |
 | `auto_spawn` | bool | No (default: false) | If true and the WF node doesn't exist yet, ask orchestrator to spawn it after apply. |
 | `version` | uint64 | No | If provided, used for idempotency check. If 0, auto-increment. |
 
@@ -399,9 +401,9 @@ Response:
 }
 ```
 
-`running` / `status_reachable` / `health_state` are obtained from a direct `NODE_STATUS_GET` probe to `WF.<workflow_name>@<hive>` with a 2-second timeout. This is the standard node-level liveness/health signal.
+`running` / `status_reachable` / `health_state` come from SY.admin's `get_node_status` of `WF.<workflow_name>@<hive>` (the node's own `NODE_STATUS_GET`, asked through its hive's orchestrator), the standard node-level liveness/health signal. A WF node whose timers wait for SY.timer reports `DEGRADED` (`timers_not_reconciled`).
 
-**How `active_instances` is obtained:** sy.wf-rules sends a `WF_LIST_INSTANCES` query (wf-v1.md §16) to `WF.<workflow_name>@<hive>` with `status_filter: "running"` and `limit: 0`. The response includes `count`. Timeout: 2 seconds. If the WF node does not respond within the timeout (node down, overloaded, or not spawned), sy.wf-rules returns `"wf_node_timeout": true`. This does not fail the get_status query — the workflow metadata from sy.wf-rules' own state directories is always returned regardless of node availability.
+**How `active_instances` is obtained:** sy.wf-rules sends a `WF_LIST_INSTANCES` query to `WF.<workflow_name>@<hive>` with `status: "running"` and `limit: 0`; the WF node answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its own hive (`UNAUTHORIZED` to anyone else, since 0.1.90). The response includes `count`. Timeout: 2 seconds. If the WF node does not respond within the timeout (node down, overloaded, or not spawned), sy.wf-rules returns `"wf_node_timeout": true`. This does not fail the get_status query — the workflow metadata from sy.wf-rules' own state directories is always returned regardless of node availability.
 
 For `delete_workflow` with `force: false`, the same mechanism is used to check for active instances. If the node does not respond within timeout, the delete is refused with error `INSTANCES_UNKNOWN` — sy.wf-rules does not assume zero instances when it cannot confirm.
 ```
@@ -442,19 +444,20 @@ Response:
 
 ## 6. Validation (the "compile" step)
 
-When `SY.wf-rules` receives a workflow definition for compile or compile_apply, it runs the same 11 checks from wf-v1.md §8.5:
+When `SY.wf-rules` receives a workflow definition for compile or compile_apply, it validates it with the WF engine's own validator (`go/pkg/wfcel`), so it runs the checks of `spec-systemnode-wf-v1_1.md` §8.5:
 
-1. JSON structure valid per `wf_schema_version`.
+1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused.
 2. `input_schema` is valid JSON Schema.
 3. `initial_state` exists in `states`.
-4. All `terminal_states` exist in `states`.
+4. All `terminal_states` exist in `states`; a state named `failed` is one of them.
 5. Every `target_state` referenced in transitions exists in `states`.
-6. Every CEL guard expression compiles against the typed environment (`input`, `state`, `event`, `now()`).
-7. Every action has a known type (from the WF action registry).
-8. Every `send_message` target is a syntactically valid L2 name.
-9. Every `schedule_timer` duration ≥ 60 seconds.
-10. Every `set_variable` name is a valid identifier.
-11. Every `$ref` path uses a valid root (`input`, `state`, or `event`).
+6. Every transition has an `event_match.msg` and a guard, and every guard compiles against the CEL environment (`input`, `state` and `event` as maps of dynamic values; `now()`, `json_parse()` and CEL's string extensions).
+7. Every action has a known type (from the WF action registry) and valid parameters.
+8. Every `send_message` target is a syntactically valid L2 name, and no `SY.*` or `RT.*` node.
+9. No action has `meta.type` or `target_ref`, and no transition has `event_match.type`: they left the language in 0.1.90, and a definition that still has one is refused, by its path.
+10. Every `schedule_timer` and `reschedule_timer` duration ≥ 60 seconds.
+11. Every `set_variable` name is a valid identifier, and its `value` a CEL expression, as a JSON string, that compiles.
+12. Every `$ref` rooted at `input.`, `state.` or `event.` has a path with no empty segment, holds only `$ref` and `default`, and its `default` is a literal, with no `$ref` inside. An object whose `$ref` has another root (a JSON Schema's `#/definitions/x`) is a literal.
 
 For item 6 (CEL compilation), `SY.wf-rules` includes `cel-go` as a dependency and compiles guards in-process. The compiled programs are NOT persisted — they serve only to validate. The WF node (`wf-generic`) recompiles CEL from the JSON at boot. This avoids cross-binary compatibility issues.
 
@@ -602,35 +605,26 @@ This is a destructive operation. Active instances are lost if `force: true`. The
 
 ## 9. OPA rules for WF authorization
 
-`SY.wf-rules` does NOT manage OPA rules for WF authorization. Those are managed separately via `SY.opa-rules` as part of the hive's routing policy.
-
-When a new workflow is deployed, the operator must separately ensure that appropriate OPA rules exist to authorize messages to `WF.<workflow_name>@<hive>`. `SY.wf-rules` can include a suggested OPA rule snippet in the `compile` response as a convenience hint, but does not apply it.
-
-Suggested snippet in compile response (informational, not applied):
-```json
-{
-  "suggested_opa_rule": "allow {\n    input.routing.dst == \"WF.invoice@motherbee\"\n    input.meta.msg == \"INVOICE_REQUEST\"\n    startswith(input.routing.src_l2_name, \"AI.billing\")\n}"
-}
-```
+`SY.wf-rules` manages no OPA rules, and its `compile` response carries no suggested rule (an earlier draft proposed one; it was never built). OPA stays for rules of substance, never for routing between nodes (`docs/wf-orchestration-v1.md` §1, FINDINGS A-113): a WF sends to node names written in its definition.
 
 ---
 
 ## 10. Admin surface
 
-`SY.admin` exposes the following endpoints that proxy to `SY.wf-rules` via L2 unicast:
+`SY.admin` exposes the following actions, which it forwards to `SY.wf-rules@<hive>` via L2 unicast (`GET /admin/actions/<action>` gives each one's contract and example):
 
-| Admin action | Maps to | Purpose |
-|---|---|---|
-| `POST /admin/wf-rules/compile` | CONFIG_SET with operation=compile | Validate + stage |
-| `POST /admin/wf-rules/compile-apply` | CONFIG_SET with operation=compile_apply | Validate + stage + apply + restart |
-| `POST /admin/wf-rules/apply` | CONFIG_SET with operation=apply | Promote staged |
-| `POST /admin/wf-rules/rollback` | CONFIG_SET with operation=rollback | Restore backup |
-| `POST /admin/wf-rules/delete` | command delete_workflow | Remove workflow |
-| `GET /admin/wf-rules/{name}` | query get_workflow | Get current definition |
-| `GET /admin/wf-rules/{name}/status` | query get_status | Get status + WF node info |
-| `GET /admin/wf-rules` | query list_workflows | List all workflows |
+| Admin action | HTTP | Maps to | Purpose |
+|---|---|---|---|
+| `wf_rules_compile` | `POST /hives/{hive}/wf-rules/compile` | CONFIG_SET with operation=compile | Validate + stage |
+| `wf_rules_compile_apply` | `POST /hives/{hive}/wf-rules` | CONFIG_SET with operation=compile_apply | Validate + stage + apply + restart |
+| `wf_rules_apply` | `POST /hives/{hive}/wf-rules/apply` | CONFIG_SET with operation=apply | Promote staged |
+| `wf_rules_rollback` | `POST /hives/{hive}/wf-rules/rollback` | CONFIG_SET with operation=rollback | Restore backup |
+| `wf_rules_delete` | `POST /hives/{hive}/wf-rules/delete` | command delete_workflow | Remove workflow |
+| `wf_rules_get_workflow` | `GET /hives/{hive}/wf-rules?workflow_name=X` | query get_workflow | Get current definition |
+| `wf_rules_get_status` | `GET /hives/{hive}/wf-rules/status?workflow_name=X` | query get_status | Get status + WF node info |
+| `wf_rules_list_workflows` | `GET /hives/{hive}/wf-rules` | query list_workflows | List all workflows |
 
-All endpoints use the standard admin authentication. The body for POST endpoints matches the CONFIG_SET payload (§5.4). `workflow_name` is always required — in URL-based endpoints it can be taken from the path parameter `{name}`.
+The body for POST endpoints matches the CONFIG_SET payload (§5.4); `workflow_name` is always required. SY.wf-rules takes these operations only from `SY.admin@motherbee` (`UNAUTHORIZED` otherwise).
 
 ---
 
@@ -690,14 +684,18 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `WORKFLOW_NOT_FOUND` | Query or operation on a workflow_name that doesn't exist. |
 | `INSTANCES_ACTIVE` | Delete refused because WF node has active instances (and force=false). |
 | `INSTANCES_UNKNOWN` | Delete refused because WF node did not respond to instance count query within timeout (and force=false). Cannot confirm zero instances. |
-| `RUNTIME_NOT_AVAILABLE` | wf.engine runtime not installed in dist; cannot spawn. |
 | `PACKAGE_PUBLISH_FAILED` | sy.wf-rules could not materialize/install the workflow package in dist. |
 | `ORCHESTRATOR_ERROR` | A node action through SY.admin failed (the code is kept for compatibility of callers). |
-| `RESTART_FAILED` | Node rebind succeeded but `restart_node` failed twice. Deployment is incomplete. |
-| `KILL_FAILED` | kill_node failed. Unusual — typically means the orchestrator is itself in error. |
 | `INVALID_WORKFLOW_NAME` | workflow_name does not match naming regex. |
 | `INVALID_CONFIG_SET` | CONFIG_SET payload malformed. |
 | `UNSUPPORTED_OPERATION` | Unknown operation string. |
+| `UNSUPPORTED_APPLY_MODE` | A CONFIG_SET whose `apply_mode` is not `replace`. |
+| `UNAUTHORIZED` | The request did not come from `SY.admin@motherbee`. |
+| `WFRULES_ERROR` | Any other failure, with its detail: a store error, a `list_workflows` that failed, an answer too large to send. |
+
+A failed restart of the WF node is not an error code: the apply answers with its `wf_node` as `action: "restart_failed"` and the error. A failed kill (a forced delete) is `ORCHESTRATOR_ERROR`, with SY.admin's detail.
+
+`RUNTIME_NOT_AVAILABLE`, `RUNTIME_NOT_PRESENT` and `BASE_RUNTIME_NOT_AVAILABLE` are not SY.wf-rules' codes. They are SY.admin's answers to a node action (rebind, restart, spawn) while the package just published has not reached the hive; SY.wf-rules runs the action again until it does (45 s at most), and one that still fails ends the apply as `wf_node.action: "restart_failed"`, with the error.
 
 ---
 
@@ -740,7 +738,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 
 | Topic | Document |
 |---|---|
-| WF node spec | `wf-v1.md` |
+| WF node spec | `spec-systemnode-wf-v1_1.md` |
 | WF implementation tasks | `wf_v1_tasks.md` |
 | OPA rules (reference implementation model) | `go/sy-opa-rules/main.go` |
 | Identity (for OPA authorization context) | `10-identity-v2.md` |

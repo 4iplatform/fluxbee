@@ -208,16 +208,22 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   (`Config.PackageDefinitionPath`).
 - **Config** (`OperatorConfig` in `node/config.go`, unknown keys refused):
   `workflow_definition_path`, `db_path` (default `wf_instances.db` next to `config.json`),
-  `sy_timer_l2_name` (default `SY.timer@<hive>`), `tenant_id`, `gc_retention_days` (default 7),
+  `sy_timer_l2_name` (`SY.timer@<hive>`, the default and the only value it takes), `tenant_id`, `gc_retention_days` (default 7),
   `gc_interval_seconds` (default 3600). A config or definition it cannot use leaves the node up
   in `FAILED_CONFIG`, answering control messages only.
-- **Run.** It opens the SQLite instance store, recovers running instances, reconciles its
-  timers with SY.timer and starts a GC loop (`startEngine`, `node/node.go`). Timers use
-  `client_ref` `wf:<instance_id>::<timer_key>` (`node/timer.go`).
+- **Run.** It opens the SQLite instance store, keeps its definition by hash, recovers running
+  instances (each on the definition it was born with), runs again the inbound events a crash
+  left unfinished, reconciles its timers with SY.timer and starts a GC loop (`startEngine`,
+  `node/node.go`; `Recover`, `node/recover.go`). When SY.timer does not answer it starts
+  `DEGRADED` and reconciles later. Timers use `client_ref` `wf:<instance_id>::<timer_key>`
+  (`node/timer.go`).
 - **Messages** (`Dispatch`, `node/dispatch.go`): `NODE_STATUS_GET`, `CONFIG_GET`,
-  `CONFIG_SET`, `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
-  `WF_CANCEL_INSTANCE`; any other message is correlated to an existing instance or starts a new
-  one (`CorrelateAndDispatch`).
+  `CONFIG_SET`; `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
+  `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the node's hive
+  (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's hive. Any
+  other message is correlated to an existing instance or starts a new one
+  (`dispatchWorkflowEvent`, `node/correlate.go`); a reply (`*_RESPONSE`, `INVALID_INPUT`,
+  `<msg>.error`) never starts one, and a notice or a reply is never answered.
 
 ## Config
 

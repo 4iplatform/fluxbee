@@ -36,7 +36,7 @@ It is part of the family of system nodes, together with `SY.storage`, `SY.admin`
 - **A single, explicit exception.** `SY.orchestrator` can purge all the timers of an owner when it deletes a node. It is the only way a timer can be touched by someone other than its creator.
 - **Descriptive and extensible JSON.** Field names are self-explanatory, enums are readable strings, errors return human messages as well as codes. All requests accept a free `metadata` field that `SY.timer` persists without interpreting it, meant so that LLM clients can annotate extra context (reasons, correlations, human reminders) without breaking the schema.
 - **SDK as the abstraction boundary.** Client node authors never build JSON by hand nor resolve L2 names. They call typed SDK functions and get native types (`time.Time`, structs). If the wire format changes, the SDK changes, not the nodes.
-- **Determinism and replayability.** `now()` injected through `SY.timer` lets nodes like `WF` do a deterministic replay of their execution by injecting fake responses in tests. That is why it is critical that nodes do not use the language's `time.Now()` for business logic, but `SY.timer.Now()`.
+- **Determinism and replayability.** `now()` injected through `SY.timer` lets a node replay its execution deterministically, with fake responses in tests; a node that wants it asks `SY.timer.Now()` for business logic rather than the language's `time.Now()`. The WF engine does not: its CEL `now()` is the WF node's own clock (`docs/spec-systemnode-wf-v1_1.md` §8.4).
 
 ---
 
@@ -307,7 +307,7 @@ Creates a one-shot timer. If it comes with a `client_ref` and an active timer of
 |---|---|---|
 | `fire_at_utc_ms` | yes* | Absolute UTC instant in ms. Alternative to `fire_in_ms`. |
 | `fire_in_ms` | yes* | Relative duration from `now()`. Alternative to `fire_at_utc_ms`. |
-| `target_l2_name` | no | L2 name of the node to notify. Default: the requester itself, derived from `routing.src_l2_name`. |
+| `target_l2_name` | no | L2 name of the node to notify. Default: the requester itself, derived from `routing.src_l2_name`. A WF node takes a `TIMER_FIRED` only for a timer it scheduled itself (`owner_l2_name`, since 0.1.90): a timer another node schedules for it is dropped there. |
 | `client_ref` | no | Optional identifier defined by the client. If it is reused on an active timer of the same owner, `TIMER_SCHEDULE` returns the existing timer instead of creating another one. |
 | `payload` | no | Arbitrary JSON that will be included in `TIMER_FIRED.payload.user_payload`. |
 | `missed_policy` | no | `"fire"` (default), `"drop"`, or `"fire_if_within"`. |

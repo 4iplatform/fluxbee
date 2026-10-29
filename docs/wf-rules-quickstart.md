@@ -2,10 +2,19 @@
 
 A practical guide to define, deploy and operate workflows in Fluxbee.
 
-**Prerequisite:** the `wf.engine` base runtime must be published on the hive.
+**Prerequisite:** the `wf.engine` base runtime on the hive. The packaged `.deb` seeds it, at the
+package's version; check that it is there (its versions, and which is current):
 
 ```bash
-# publish wf.engine (only once per install)
+curl -sS "http://127.0.0.1:8080/hives/motherbee/runtimes/wf.engine" | jq .payload
+```
+
+Do not publish `wf.engine` by hand on a packaged install: a base runtime published by hand keeps
+`current` through every upgrade (FINDINGS A-122), so every WF node would stay on that build.
+`scripts/publish-wf-runtime.sh` is for a dev checkout without the package only:
+
+```bash
+# dev checkout only: makes this build the engine of every WF node of the hive (each restarts)
 bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
 ```
 
@@ -41,14 +50,20 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
 
 ### Full example: `WF.invoice`
 
+The workflow of the spec's case study (`docs/spec-systemnode-wf-v1_1.md` §19). It asks an agent to
+check the customer's data, for a structured answer; creates the invoice through `IO.quickbooks`;
+and asks the billing agent to deliver it. When data is missing, it tells the billing agent and ends:
+a person answers the agent of their conversation, never a WF instance, and the agent requests the
+invoice again.
+
 ```json
 {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
-  "description": "Issues an invoice, collects missing data if needed, delivers to customer.",
+  "description": "Issues an invoice: has the customer's data checked, creates the invoice and has it delivered; tells the billing agent what is missing.",
   "input_schema": {
     "type": "object",
-    "required": ["customer_id", "items", "originator_channel"],
+    "required": ["customer_id", "items"],
     "properties": {
       "customer_id": { "type": "string" },
       "items": {
@@ -63,27 +78,39 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
           }
         }
       },
-      "currency": { "type": "string" },
-      "originator_channel": { "type": "string" },
-      "originator_ilk": { "type": "string" }
+      "currency": { "type": "string" }
     }
   },
   "initial_state": "validating_data",
-  "terminal_states": ["completed", "failed", "cancelled"],
+  "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
   "states": [
     {
       "name": "validating_data",
-      "description": "Asking AI.billing-validator if the customer data is complete.",
+      "description": "Asking AI.billing-validator, for a structured answer, whether the customer's data is complete.",
       "entry_actions": [
+        {
+          "type": "set_variable",
+          "name": "validation_request",
+          "value": "'Customer %s asks for an invoice of these items: %s.'.format([input.customer_id, input.items])"
+        },
         {
           "type": "send_message",
           "target": "AI.billing-validator@motherbee",
-          "meta": { "msg": "VALIDATE_INVOICE_DATA" },
-          "payload": {
-            "customer_id": { "$ref": "input.customer_id" },
-            "items": { "$ref": "input.items" },
-            "currency": { "$ref": "input.currency" }
-          }
+          "meta": {
+            "msg": "VALIDATE_INVOICE_DATA",
+            "context": {
+              "response_envelope": {
+                "kind": "json_object_v1",
+                "strict": true,
+                "required": ["complete", "missing"],
+                "properties": {
+                  "complete": { "type": "boolean" },
+                  "missing": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          },
+          "payload": { "type": "text", "content": { "$ref": "state.validation_request" } }
         },
         {
           "type": "schedule_timer",
@@ -97,24 +124,36 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
       ],
       "transitions": [
         {
-          "event_match": { "msg": "VALIDATE_INVOICE_DATA_RESPONSE" },
-          "guard": "event.payload.complete == true",
+          "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
+          "guard": "json_parse(event.payload.content).complete == true",
           "target_state": "creating_invoice",
           "actions": [
             { "type": "set_variable", "name": "validated_at", "value": "now()" }
           ]
         },
         {
-          "event_match": { "msg": "VALIDATE_INVOICE_DATA_RESPONSE" },
-          "guard": "event.payload.complete == false",
-          "target_state": "requesting_missing_data",
+          "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
+          "guard": "json_parse(event.payload.content).complete == false",
+          "target_state": "missing_data_requested",
           "actions": [
-            { "type": "set_variable", "name": "missing_fields", "value": "event.payload.missing" }
+            {
+              "type": "set_variable",
+              "name": "missing_data_request",
+              "value": "'The invoice for customer %s needs: %s. Ask the customer, then request the invoice again.'.format([input.customer_id, json_parse(event.payload.content).missing.join(', ')])"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "VALIDATE_INVOICE_DATA.error" },
+          "guard": "true",
+          "target_state": "failed",
+          "actions": [
+            { "type": "set_variable", "name": "failure_reason", "value": "'validator error: ' + event.payload.code" }
           ]
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'validation_timeout'",
+          "guard": "event.timer_key == 'validation_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'validator timeout'" }
@@ -123,47 +162,18 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
       ]
     },
     {
-      "name": "requesting_missing_data",
-      "description": "Asking the customer for missing fields.",
+      "name": "missing_data_requested",
+      "description": "Terminal: tells the billing agent what is missing. The customer answers the agent, never this instance; the agent requests the invoice again.",
       "entry_actions": [
         {
           "type": "send_message",
-          "target": "AI.billing-responder@motherbee",
-          "meta": { "msg": "REQUEST_MISSING_INVOICE_DATA" },
-          "payload": {
-            "originator_channel": { "$ref": "input.originator_channel" },
-            "originator_ilk": { "$ref": "input.originator_ilk" },
-            "missing_fields": { "$ref": "state.missing_fields" }
-          }
-        },
-        {
-          "type": "schedule_timer",
-          "timer_key": "customer_response_timeout",
-          "fire_in": "24h",
-          "missed_policy": "fire"
+          "target": "AI.billing@motherbee",
+          "meta": { "msg": "INVOICE_DATA_MISSING" },
+          "payload": { "type": "text", "content": { "$ref": "state.missing_data_request" } }
         }
       ],
-      "exit_actions": [
-        { "type": "cancel_timer", "timer_key": "customer_response_timeout" }
-      ],
-      "transitions": [
-        {
-          "event_match": { "msg": "CUSTOMER_RESPONSE" },
-          "guard": "has(event.payload.missing_data)",
-          "target_state": "validating_data",
-          "actions": [
-            { "type": "set_variable", "name": "items", "value": "event.payload.missing_data.items" }
-          ]
-        },
-        {
-          "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'customer_response_timeout'",
-          "target_state": "failed",
-          "actions": [
-            { "type": "set_variable", "name": "failure_reason", "value": "'customer did not respond'" }
-          ]
-        }
-      ]
+      "exit_actions": [],
+      "transitions": []
     },
     {
       "name": "creating_invoice",
@@ -176,7 +186,7 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
           "payload": {
             "customer_id": { "$ref": "input.customer_id" },
             "items": { "$ref": "input.items" },
-            "currency": { "$ref": "input.currency" }
+            "currency": { "$ref": "input.currency", "default": "USD" }
           }
         },
         {
@@ -196,7 +206,11 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
           "target_state": "delivering_to_customer",
           "actions": [
             { "type": "set_variable", "name": "invoice_id", "value": "event.payload.invoice_id" },
-            { "type": "set_variable", "name": "invoice_link", "value": "event.payload.link" }
+            {
+              "type": "set_variable",
+              "name": "delivery_request",
+              "value": "'Send customer %s the invoice %s: %s'.format([input.customer_id, event.payload.invoice_id, event.payload.link])"
+            }
           ]
         },
         {
@@ -209,7 +223,7 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
         },
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'qb_creation_timeout'",
+          "guard": "event.timer_key == 'qb_creation_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'quickbooks timeout'" }
@@ -219,18 +233,23 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
     },
     {
       "name": "delivering_to_customer",
-      "description": "Asking AI.billing-responder to send the invoice to the customer.",
+      "description": "Asking the billing agent, for a structured answer, to send the invoice to the customer.",
       "entry_actions": [
         {
           "type": "send_message",
-          "target": "AI.billing-responder@motherbee",
-          "meta": { "msg": "DELIVER_INVOICE_TO_CUSTOMER" },
-          "payload": {
-            "originator_channel": { "$ref": "input.originator_channel" },
-            "originator_ilk": { "$ref": "input.originator_ilk" },
-            "invoice_id": { "$ref": "state.invoice_id" },
-            "invoice_link": { "$ref": "state.invoice_link" }
-          }
+          "target": "AI.billing@motherbee",
+          "meta": {
+            "msg": "DELIVER_INVOICE",
+            "context": {
+              "response_envelope": {
+                "kind": "json_object_v1",
+                "strict": true,
+                "required": ["delivered"],
+                "properties": { "delivered": { "type": "boolean" } }
+              }
+            }
+          },
+          "payload": { "type": "text", "content": { "$ref": "state.delivery_request" } }
         },
         {
           "type": "schedule_timer",
@@ -244,14 +263,30 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
       ],
       "transitions": [
         {
-          "event_match": { "msg": "DELIVER_INVOICE_RESPONSE" },
-          "guard": "event.payload.delivered == true",
+          "event_match": { "msg": "DELIVER_INVOICE" },
+          "guard": "json_parse(event.payload.content).delivered == true",
           "target_state": "completed",
           "actions": []
         },
         {
+          "event_match": { "msg": "DELIVER_INVOICE" },
+          "guard": "true",
+          "target_state": "failed",
+          "actions": [
+            { "type": "set_variable", "name": "failure_reason", "value": "'the agent did not deliver the invoice'" }
+          ]
+        },
+        {
+          "event_match": { "msg": "DELIVER_INVOICE.error" },
+          "guard": "true",
+          "target_state": "failed",
+          "actions": [
+            { "type": "set_variable", "name": "failure_reason", "value": "'delivery error: ' + event.payload.code" }
+          ]
+        },
+        {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "event.user_payload.timer_key == 'delivery_timeout'",
+          "guard": "event.timer_key == 'delivery_timeout'",
           "target_state": "failed",
           "actions": [
             { "type": "set_variable", "name": "failure_reason", "value": "'delivery timeout'" }
@@ -268,14 +303,14 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
     },
     {
       "name": "failed",
-      "description": "Terminal failure. Check variable 'failure_reason'.",
+      "description": "Terminal failure. The variable 'failure_reason' holds the cause.",
       "entry_actions": [],
       "exit_actions": [],
       "transitions": []
     },
     {
       "name": "cancelled",
-      "description": "Cancelled by operator via WF_CANCEL_INSTANCE.",
+      "description": "Cancelled through WF_CANCEL_INSTANCE.",
       "entry_actions": [],
       "exit_actions": [],
       "transitions": []
@@ -289,6 +324,9 @@ Save it as `invoice-workflow.json` for the examples below.
 ---
 
 ## 2. Operations
+
+SY.admin answers every call below in its envelope, `{status, action, payload, error_code,
+error_detail}`; `payload` is what SY.wf-rules answered.
 
 ### 2.1 Compile (validate without deploying)
 
@@ -304,30 +342,56 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/compile" \
 Expected response:
 ```json
 {
-  "ok": true,
-  "state": "configured",
-  "effective_config": {
-    "staged": {
-      "version": 1,
-      "hash": "sha256:...",
-      "guard_count": 8,
-      "state_count": 7
+  "status": "ok",
+  "action": "compile",
+  "payload": {
+    "ok": true,
+    "node_name": "SY.wf-rules@motherbee",
+    "state": "configured",
+    "schema_version": 1,
+    "config_version": 1,
+    "effective_config": {
+      "staged": {
+        "version": 1,
+        "hash": "sha256:...",
+        "workflow_name": "invoice",
+        "compiled_at": "2026-10-29T12:00:00Z",
+        "guard_count": 11,
+        "state_count": 7,
+        "action_count": 22
+      }
     }
-  }
+  },
+  "error_code": null,
+  "error_detail": null
 }
 ```
 
-If there are validation errors (an invalid CEL guard, a referenced state that does not exist, etc.), the system returns the error with the exact location:
+If there are validation errors (an invalid CEL guard, a referenced state that does not exist, etc.), the system returns the error with the exact location. With `evnt.payload.ok == true` as the first guard of `creating_invoice`:
 
 ```json
 {
-  "ok": false,
-  "error": {
-    "code": "COMPILE_ERROR",
-    "detail": "states[0].transitions[0].guard: undeclared reference to 'event.payload.complette'"
-  }
+  "status": "error",
+  "action": "compile",
+  "payload": {
+    "ok": false,
+    "node_name": "SY.wf-rules@motherbee",
+    "state": "error",
+    "schema_version": 1,
+    "config_version": 0,
+    "error": {
+      "code": "COMPILE_ERROR",
+      "detail": "states[2].transitions[0].guard: ERROR: <input>:1:1: undeclared reference to 'evnt' (in container '')\n | evnt.payload.ok == true\n | ^"
+    }
+  },
+  "error_code": "COMPILE_ERROR",
+  "error_detail": "states[2].transitions[0].guard: ERROR: <input>:1:1: undeclared reference to 'evnt' (in container '')\n | evnt.payload.ok == true\n | ^"
 }
 ```
+
+A guard is checked for its syntax and its roots (`input`, `state`, `event`), not for its fields: a
+misspelled field (`event.payload.complette`) compiles, and at run time it is a guard that errs, so
+false.
 
 ### 2.2 Apply (promote staged and deploy)
 
@@ -341,23 +405,35 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/apply" \
 
 `auto_spawn: true` makes the node `WF.invoice@motherbee` be created automatically if it does not exist. If it already exists, it is restarted with the new version. In the first case, `tenant_id` is required.
 
-Expected response:
+Expected response (abridged):
 ```json
 {
-  "ok": true,
-  "effective_config": {
-    "current": {
-      "version": 1,
-      "hash": "sha256:..."
+  "status": "ok",
+  "action": "apply",
+  "payload": {
+    "ok": true,
+    "state": "configured",
+    "config_version": 1,
+    "effective_config": {
+      "current": {
+        "version": 1,
+        "hash": "sha256:..."
+      }
+    },
+    "wf_node": {
+      "node_name": "WF.invoice@motherbee",
+      "action": "restarted",
+      "status": "ok"
     }
   },
-  "wf_node": {
-    "node_name": "WF.invoice@motherbee",
-    "action": "restarted",
-    "status": "ok"
-  }
+  "error_code": null,
+  "error_detail": null
 }
 ```
+
+`wf_node.action` is `restarted` for a first spawn too; `restart_failed` (with `error`) when the
+node could not be rebound, restarted or spawned, and `none` (with `reason`) when nothing ran
+(`auto_spawn` off, or a first deploy without `tenant_id`).
 
 ### 2.3 Compile + Apply in a single step
 
@@ -387,20 +463,31 @@ curl -sS "$BASE/hives/$HIVE/wf-rules?workflow_name=invoice" | jq .
 curl -sS "$BASE/hives/$HIVE/wf-rules/status?workflow_name=invoice" | jq .
 ```
 
-Response:
+Response (abridged):
 ```json
 {
   "status": "ok",
-  "workflow_name": "invoice",
-  "current_version": 2,
-  "current_hash": "sha256:...",
-  "wf_node": {
-    "node_name": "WF.invoice@motherbee",
-    "running": true,
-    "active_instances": 3
-  }
+  "action": "get_status",
+  "payload": {
+    "status": "ok",
+    "hive": "motherbee",
+    "workflow_name": "invoice",
+    "current_version": 2,
+    "current_hash": "sha256:...",
+    "wf_node": {
+      "node_name": "WF.invoice@motherbee",
+      "running": true,
+      "health_state": "HEALTHY",
+      "active_instances": 3
+    }
+  },
+  "error_code": null,
+  "error_detail": null
 }
 ```
+
+`active_instances` is the node's own count (SY.wf-rules asks it `WF_LIST_INSTANCES`); it is `null`,
+with `instances_error`, when the node does not answer.
 
 **List all the workflows of the hive:**
 
@@ -450,7 +537,22 @@ Guards are [CEL](https://github.com/google/cel-go) expressions that decide wheth
 | `state` | Workflow variables, modified by `set_variable` |
 | `event` | The message that just arrived and triggered the evaluation |
 
-Built-in function: `now()` returns a UTC timestamp in milliseconds (the process's local time).
+Built-in functions: `now()` returns the WF node's clock as Unix milliseconds (UTC), and
+`json_parse(text)` decodes a JSON string (an agent's structured answer, say); CEL's string
+extensions are there too (`format`, `join`, `split`, ...).
+
+**Numbers.** A JSON integer is an `int` and any other number a `double`, in `input`, `state` and
+`event` alike, live and after a restart, and in the definition's own literals. A comparison or an
+equality between an `int` and a `double` works when a side comes from `input`, `state`, `event` or
+`json_parse` (`state.score > 7.5` with an `int` score); arithmetic that mixes them, and `%` on a
+`double`, fails. Convert first: `double(state.n) * 1.1`, `int(state.n) % 2`.
+
+`event` holds `msg`, `type`, `thread_id`, `trace_id`, `src` (the node that sent it, as the router
+stamps it), `context` and `payload`; for a `TIMER_FIRED`, also `timer_key`, the key the timer was
+scheduled with.
+
+**Bounds.** A guard runs at most 10 ms: it is stopped there, and a guard that is stopped or errs is
+false. A `set_variable` value has a cost limit (1,000,000 CEL cost units): past it the action fails.
 
 ### Common patterns
 
@@ -464,9 +566,9 @@ event.payload.ok == true
 has(event.payload.missing_data)
 ```
 
-**Match a specific timer:**
+**Match a specific timer** (on a `TIMER_FIRED` transition):
 ```
-event.user_payload.timer_key == 'validation_timeout'
+event.timer_key == 'validation_timeout'
 ```
 
 **Compare strings:**
@@ -510,7 +612,27 @@ Actions are the effects the workflow executes. Fixed vocabulary in v1:
 }
 ```
 
-The `{"$ref": "..."}` values are resolved at execution time. The three valid roots are `input`, `state`, `event`. Everything else is literal.
+Every message a WF sends is a `user` message: `meta` takes `msg` (and `context`, see below), never
+`type`, and `target` is a node name written in the definition (never a `SY.*` or `RT.*` node). A WF
+that chooses among destinations writes one transition per destination, each with its guard and its
+`send_message`; there is no destination taken from data. A definition with `meta.type` or
+`target_ref` is refused, by its path.
+
+The `{"$ref": "..."}` values are resolved at execution time, in `send_message` and
+`emit_internal_event`, the actions that take one. A `$ref` is a dot path rooted at `input.`, `state.`
+or `event.` (another root, such as a typo `inptu.x`, is refused at load); an object whose `$ref`
+holds `#`, `/` or `:` (a JSON Schema's `"$ref": "#/definitions/item"`) is a literal, like
+everything else.
+
+A `$ref` to a field that is not there fails the action, and with it, by its default `on_error`, the
+instance; a field that holds `null` gives `null`. For a field that may be missing, give a default:
+`{"$ref": "event.context", "default": {}}` takes the literal `{}` when there is no context, or when
+it is `null`. A `$ref` holds only `$ref` and `default`, and its default is a literal: anything else
+is refused at load (a typo such as `defualt` included), by its path.
+
+`meta.context` is resolved the same way, and goes on the message's `meta.context`: to ask an agent for
+a structured answer, `"context": {"response_envelope": {...}}`. An agent answers with the request's
+`msg`, and its error as `<msg>.error`, which needs a transition of its own.
 
 ### `schedule_timer` — schedule a timer through SY.timer
 
@@ -523,7 +645,10 @@ The `{"$ref": "..."}` values are resolved at execution time. The three valid roo
 }
 ```
 
-Minimum duration: 60 seconds. `missed_policy` options: `fire` (fires on recovery), `drop` (ignores it), `fire_if_within` (fires if the delay is within a margin).
+Minimum duration: 60 seconds. `missed_policy` is SY.timer's, for a fire SY.timer itself is late
+with: `fire` (it delivers the late fire), `drop` (it does not), `fire_if_within` (it delivers it
+within `missed_within_ms`). The WF's own recovery does not apply it: a WF that restarts gives its
+instance a fire SY.timer lost, or a past-due timer's fire, whatever the policy, `drop` included.
 
 ### `cancel_timer` — cancel a pending timer
 
@@ -543,7 +668,21 @@ Minimum duration: 60 seconds. `missed_policy` options: `fire` (fires on recovery
 { "type": "set_variable", "name": "invoice_id", "value": "event.payload.invoice_id" }
 ```
 
-The `value` is a CEL expression. Examples: `"now()"`, `"'pending'"`, `"state.retry_count + 1"`, `"event.payload.result"`.
+The `value` is a CEL expression, written as a JSON string. Examples: `"now()"`, `"'pending'"`,
+`"42"`, `"state.retry_count + 1"`, `"event.payload.result"`,
+`"'Customer %s'.format([input.customer_id])"`. A JSON number or boolean (`42`, `true`) is refused
+at load: it is no CEL expression.
+The state keeps plain JSON: a list, or a map with string keys, is kept as such; a value JSON cannot
+hold (bytes, a map with other keys) fails the action.
+
+### `emit_internal_event` — queue an event for the same instance
+
+```json
+{ "type": "emit_internal_event", "meta": { "msg": "INTERNAL_DONE" }, "payload": { "result": { "$ref": "state.result" } } }
+```
+
+The event is committed with the transition and runs right after it, on the same instance, as a
+`user` event named by `meta.msg`; at most 100 of them may follow one event.
 
 ---
 
@@ -563,7 +702,7 @@ workflow
     ├── entry_actions[]   actions on ENTERING the state
     ├── exit_actions[]    actions on LEAVING the state
     └── transitions[]     transition rules
-        ├── event_match   { "msg": "MESSAGE_NAME" }
+        ├── event_match   { "msg": "MESSAGE_NAME" }   (msg only: no type)
         ├── guard         CEL expression → true/false
         ├── target_state  name of the target state
         └── actions[]     actions when taking this transition
@@ -624,23 +763,37 @@ Transitions are evaluated in declaration order. The first one whose `event_match
 
 ## 8. Operational notes
 
-**In-flight instances on update:** when a new version is applied, the instances that were already running keep using the definition they were born with. Only new instances use the updated definition. This is transparent — nothing special needs to be done.
+**In-flight instances on update:** when a new version is applied, the instances that were already running keep using the definition they were born with: each records its definition's hash, and the WF node keeps every definition a running instance uses (and drops it when the last one ends). Only new instances use the updated definition. This is transparent — nothing special needs to be done. An instance whose definition no longer loads (one written before 0.1.90 with `meta.type`, say) fails at the node's start.
 
-**Timers:** all the workflow's timers go through `SY.timer`. Minimum duration 60 seconds. If the WF node restarts, it recovers its pending timers automatically.
+**Timers:** all the workflow's timers go through `SY.timer` of the WF's hive, and the WF takes a `TIMER_FIRED` only from it, and only for a timer it scheduled itself (`owner_l2_name`): a fire of a timer another node scheduled is dropped. Minimum duration 60 seconds. If the WF node restarts, it recovers its pending timers automatically: it fires the ones it missed in the order they fire, reading each again first (a fire that cancels a later timer keeps that one from firing), and a timer that fired before the restart does not fire again. If `SY.timer` does not answer at start, the node starts anyway, reports itself `DEGRADED` (`timers_not_reconciled`), and reconciles its timers when `SY.timer` answers; a timer scheduled in the meantime that SY.timer never got is scheduled again then.
 
-**Downstream idempotency:** the nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`. In case of a WF crash and recovery, the actions can run again.
+**Messages a WF takes:** a `user` message, which starts an instance or reaches the running instance on its thread, and a `TIMER_FIRED`. Any other `system` message is control, never a workflow event: it is dropped and never answered. `event_match` matches on `msg` only (a definition with `event_match.type` is refused).
+
+**Downstream idempotency:** the WF delivers an event at least once: it saves the event before running its transition, and a crash before the transition commits runs it again at the next start, its creation included. The nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`: a repeated send keeps its `trace_id`. Each start counts the attempts of an event it runs again: one already run at 3 starts (an event that keeps taking the node down) is not run again, its instance fails (`replay_exhausted`), and the node goes on.
+
+**Replies, errors and late answers:** a reply (a `*_RESPONSE`, an `INVALID_INPUT`, an agent's `<msg>.error`) reaches only the instance whose thread it carries; it never starts an instance and is never answered. An answer on the thread of an instance of this node that ended (its timer fired first, say) is a late answer: dropped and never answered, instead of a new instance that would ask the agent again. A message that starts no instance (its payload fails `input_schema`) gets an `INVALID_INPUT` only when it is a named request.
+
+**Limits enforced:** at most 100 internal events may follow one event; past that the instance fails (`internal_event_cap`). A panic in a transition fails that instance (`transition_panic`), never the node. A guard stops at 10 ms (false), a `set_variable` at its cost limit (the action fails), and an event at 3 starts (`replay_exhausted`). The store commits with `synchronous=FULL`, so a transition whose messages went out is on disk.
 
 **Response correlation:** when the WF sends a `send_message`, it sets `meta.thread_id = instance_id`. The nodes that answer must copy that `thread_id` into their response so the WF correlates it with the right instance.
 
-**Cancel an in-flight instance:** it is done directly on the WF node, not on sy.wf-rules:
+**Cancel an in-flight instance:** the WF node's instance verbs (`WF_CANCEL_INSTANCE`,
+`WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_GET_CODE`, `WF_HELP`) answer only `SY.admin@motherbee`
+and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED`. SY.admin has no instance
+actions yet, so a cancel goes as a message from SY.admin, whose answer is not shown:
 ```bash
-# send WF_CANCEL_INSTANCE to the WF node directly via admin
-curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice@$HIVE/command" \
+curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice@$HIVE/messages" \
   -H "Content-Type: application/json" \
-  -d '{"action": "cancel_instance", "instance_id": "wfi:..."}'
+  -d '{"msg_type": "system", "msg": "WF_CANCEL_INSTANCE", "payload": {"instance_id": "wfi:...", "reason": "operator"}}'
+```
+The instance id (`wfi:...`) is the `meta.thread_id` of every message the instance sends, and the
+node's journal logs it when the instance starts:
+```bash
+journalctl -u fluxbee-node-WF.invoice-motherbee | grep 'create accepted'
+# wf: create accepted instance_id=wfi:550e8400-... workflow_type=invoice initial_state=validating_data trace_id=... src_l2="AI.billing@motherbee"
 ```
 
 **See active instances:**
 ```bash
-curl -sS "$BASE/hives/$HIVE/wf-rules/status?workflow_name=invoice" | jq .wf_node
+curl -sS "$BASE/hives/$HIVE/wf-rules/status?workflow_name=invoice" | jq .payload.wf_node
 ```

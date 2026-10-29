@@ -10,8 +10,14 @@ import (
 	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
+	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 	"github.com/google/uuid"
 )
+
+// wfMsgType is the type of every message a WF makes, sent or internal: a WF always sends user
+// messages (meta.type left the definition language in 0.1.90). An agent answers a system message
+// from its control plane, and the WF never saw that answer: the instance hung (FINDINGS A-117).
+const wfMsgType = "user"
 
 // Dispatcher abstracts sending L2 messages (testable without a real network).
 type Dispatcher interface {
@@ -75,10 +81,6 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 		return fmt.Errorf("emit_internal_event: marshal payload: %w", err)
 	}
 
-	msgType := "system"
-	if action.Meta != nil && action.Meta.Type != "" {
-		msgType = action.Meta.Type
-	}
 	msgName := ""
 	if action.Meta != nil {
 		msgName = action.Meta.Msg
@@ -90,7 +92,7 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 
 	*emitted = append(*emitted, InternalEventRow{
 		InstanceID:  inst.InstanceID,
-		MsgType:     msgType,
+		MsgType:     wfMsgType,
 		MsgName:     msgName,
 		PayloadJSON: payloadJSON,
 		TraceID:     traceID,
@@ -110,15 +112,11 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		return fmt.Errorf("send_message: resolve payload: %w", err)
 	}
 
-	raw, err := sdk.MarshalPayload(resolvedPayload)
+	raw, err := wfcel.EncodeJSON(resolvedPayload)
 	if err != nil {
 		return fmt.Errorf("send_message: marshal payload: %w", err)
 	}
 
-	msgType := "system"
-	if action.Meta != nil && action.Meta.Type != "" {
-		msgType = action.Meta.Type
-	}
 	msgName := ""
 	if action.Meta != nil {
 		msgName = action.Meta.Msg
@@ -128,7 +126,6 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 	threadID := inst.InstanceID
 	// gap-5: an explicit thread_id_ref overrides instance_id for a TERMINAL reply to an external
 	// ingress caller (answer on the caller's own thread; no reply-back to this instance is expected).
-	// Resolved the same way as target_ref.
 	if threadRef := strings.TrimSpace(action.ThreadIDRef); threadRef != "" {
 		resolved, err := lookupRef(threadRef, inst.Input, inst.StateVars, eventMap)
 		if err != nil {
@@ -153,7 +150,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		if err != nil {
 			return fmt.Errorf("send_message: resolve meta.context: %w", err)
 		}
-		ctxBytes, err := json.Marshal(resolvedCtx)
+		ctxBytes, err := wfcel.EncodeJSON(resolvedCtx)
 		if err != nil {
 			return fmt.Errorf("send_message: marshal meta.context: %w", err)
 		}
@@ -167,36 +164,9 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 	src := actx.Dispatcher.NodeUUID()
 
-	// Resolve the destination. A dynamic target (target_ref) is a $ref dot-path over state/input/event
-	// — the "AI host routes to a computed specialist" case. The (resolved) name is re-validated,
-	// SY./RT.-blocked, AND required to be user-kind again here at send time — publish-time validation
-	// is not the only line of defense (a tampered/downgraded package could otherwise slip through).
+	// The target is a node name written in the definition, validated when it loaded (a valid L2
+	// name, never a SY.* or RT.* node).
 	target := action.Target
-	if targetRef := strings.TrimSpace(action.TargetRef); targetRef != "" {
-		// F1 defense-in-depth: a runtime-computed destination must never emit a system-kind frame
-		// (that path can bypass VPN isolation). Publish forces meta.type=user; re-enforce it here.
-		if msgType != "user" {
-			return fmt.Errorf("send_message: target_ref (dynamic target) requires meta.type=user, got %q", msgType)
-		}
-		resolved, err := lookupRef(targetRef, inst.Input, inst.StateVars, eventMap)
-		if err != nil {
-			return fmt.Errorf("send_message: resolve target_ref %q: %w", targetRef, err)
-		}
-		s, ok := resolved.(string)
-		if !ok {
-			return fmt.Errorf("send_message: target_ref %q resolved to non-string %T", targetRef, resolved)
-		}
-		target = s
-	}
-	// Runtime destination guard (esp. for a runtime-computed target): the resolved name MUST be a
-	// valid L2 name and MUST NOT be a SY.*/RT.* system node — those bypass VPN isolation in the router,
-	// so a computed target could otherwise reach a system node (e.g. SY.vault) cross-VPN.
-	if !isValidL2Name(target) {
-		return fmt.Errorf("send_message: resolved target %q is not a valid L2 name", target)
-	}
-	if isForbiddenSystemTarget(target) {
-		return fmt.Errorf("send_message: resolved target %q must not be a SY.*/RT.* system node", target)
-	}
 
 	msgNameCopy := msgName
 	threadIDCopy := threadID
@@ -208,7 +178,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 			TraceID: traceID,
 		},
 		Meta: sdk.Meta{
-			MsgType:  msgType,
+			MsgType:  wfMsgType,
 			Msg:      &msgNameCopy,
 			ThreadID: &threadIDCopy,
 			Context:  contextRaw,
@@ -252,19 +222,9 @@ func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFIns
 		return fmt.Errorf("schedule_timer: no timer sender configured")
 	}
 
-	clientRef := timerClientRef(inst.InstanceID, action.TimerKey)
-	timerPayload := map[string]any{
-		"instance_id": inst.InstanceID,
-		"timer_key":   action.TimerKey,
-	}
-	opts := sdk.ScheduleOptions{
-		TargetL2Name: actx.Dispatcher.NodeL2Name(),
-		ClientRef:    clientRef,
-		Payload:      timerPayload,
-		MissedPolicy: sdk.MissedPolicy(action.MissedPolicy),
-	}
-	if action.MissedPolicy == "" {
-		opts.MissedPolicy = sdk.MissedPolicyFire
+	opts := timerScheduleOptions(actx.Dispatcher.NodeL2Name(), inst.InstanceID, action.TimerKey)
+	if action.MissedPolicy != "" {
+		opts.MissedPolicy = sdk.MissedPolicy(action.MissedPolicy)
 	}
 	if action.MissedWithinMS != nil {
 		opts.MissedWithinMS = action.MissedWithinMS
@@ -381,28 +341,48 @@ func execSetVariable(ctx context.Context, action ActionDefinition, inst *WFInsta
 		return fmt.Errorf("set_variable %q: value must be a non-empty string", action.Name)
 	}
 
-	program, err := compileGuard(valueExpr, actx.Clock)
+	// A value has a deterministic bound (wfcel.ValueCostLimit): past it the evaluation stops with an
+	// error, which fails the action under its on_error.
+	program, err := compileValue(valueExpr, actx.Clock)
 	if err != nil {
 		return fmt.Errorf("set_variable %q: compile value expression: %w", action.Name, err)
 	}
 
-	eventMap := messageToMap(event)
-	val, _, err := program.Eval(map[string]any{
-		"input": inst.Input,
-		"state": inst.StateVars,
-		"event": eventMap,
-	})
+	val, err := wfcel.EvalValue(program, inst.Input, inst.StateVars, messageToMap(event))
 	if err != nil {
 		return fmt.Errorf("set_variable %q: eval: %w", action.Name, err)
 	}
 
-	inst.StateVars[action.Name] = val.Value()
+	// The state holds plain JSON, the value the store writes and reads back: a CEL map literal is a
+	// map[ref.Val]ref.Val, which panicked the node when the state was written (FINDINGS A-118).
+	value, err := wfcel.ValueToJSON(val)
+	if err != nil {
+		return fmt.Errorf("set_variable %q: %w", action.Name, err)
+	}
+	inst.StateVars[action.Name] = value
 	return nil
 }
 
+// timerScheduleOptions is how the WF schedules an instance's timer with SY.timer: the fire comes to
+// this node, the client_ref names the instance and the key, and the payload carries both too.
+func timerScheduleOptions(nodeName, instanceID, timerKey string) sdk.ScheduleOptions {
+	return sdk.ScheduleOptions{
+		TargetL2Name: nodeName,
+		ClientRef:    timerClientRef(instanceID, timerKey),
+		Payload: map[string]any{
+			"instance_id": instanceID,
+			"timer_key":   timerKey,
+		},
+		MissedPolicy: sdk.MissedPolicyFire,
+	}
+}
+
+// instanceIDPrefix starts every instance id (and the thread of every send of an instance).
+const instanceIDPrefix = "wfi:"
+
 // newInstanceID generates a new workflow instance ID.
 func newInstanceID() string {
-	return "wfi:" + uuid.NewString()
+	return instanceIDPrefix + uuid.NewString()
 }
 
 // SDKDispatcher wraps *sdk.NodeSender to implement Dispatcher.
@@ -595,6 +575,3 @@ func validateTimerMissedPolicy(policy sdk.MissedPolicy, withinMS *int64) error {
 	}
 	return nil
 }
-
-// compileValueExpr is a thin alias used in set_variable; reuses compileGuard
-// since both compile CEL expressions in the same environment.

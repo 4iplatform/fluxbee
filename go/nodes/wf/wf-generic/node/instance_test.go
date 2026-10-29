@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -80,11 +79,13 @@ func makeActx(t *testing.T, disp *mockDispatcher, timer *mockTimerSender) Action
 	}
 }
 
+// msgWithName is a user message named name, as a workflow event comes (a WF sends user, an IO node
+// relays user, an agent answers with the request's type).
 func msgWithName(name string) sdk.Message {
 	nameCopy := name
 	return sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-1"},
-		Meta:    sdk.Meta{MsgType: "system", Msg: &nameCopy},
+		Meta:    sdk.Meta{MsgType: "user", Msg: &nameCopy},
 		Payload: json.RawMessage(`{}`),
 	}
 }
@@ -94,7 +95,7 @@ func msgWithNameAndPayload(name string, payload map[string]any) sdk.Message {
 	raw, _ := json.Marshal(payload)
 	return sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-1"},
-		Meta:    sdk.Meta{MsgType: "system", Msg: &nameCopy},
+		Meta:    sdk.Meta{MsgType: "user", Msg: &nameCopy},
 		Payload: raw,
 	}
 }
@@ -161,7 +162,7 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 	})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -179,24 +180,17 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 }
 
 func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
-	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-2"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	reg := NewInstanceRegistry()
+	rt, disp := newTestRuntime(t, "", validWorkflowJSON(), nil)
 
-	msg := msgWithNameAndPayload("INVOICE_START", map[string]any{
+	msg := from("AI.billing@motherbee", msgWithNameAndPayload("INVOICE_START", map[string]any{
 		"wrong_field": "missing required customer_id",
-	})
+	}))
 	msg.Routing.Src = "src-uuid-1"
 
-	err = CorrelateAndDispatch(context.Background(), msg, reg, def, actx.Store, actx)
-	if err != nil {
-		t.Fatalf("CorrelateAndDispatch: %v", err)
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
 	}
-	if reg.Count() != 0 {
+	if rt.Registry.Count() != 0 {
 		t.Fatalf("invalid payload should not create an instance")
 	}
 	if len(disp.sent) != 1 {
@@ -204,6 +198,9 @@ func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
 	}
 	if got := derefString(disp.sent[0].Meta.Msg); got != "INVALID_INPUT" {
 		t.Fatalf("expected INVALID_INPUT error msg, got %q", got)
+	}
+	if events, err := rt.Store.ListInboundEvents(context.Background()); err != nil || len(events) != 0 {
+		t.Fatalf("a refused creation is never journaled: %v %v", events, err)
 	}
 }
 
@@ -221,15 +218,18 @@ func TestWFGetInstanceInvalidRequestUsesResponseVerbAndUUIDSrc(t *testing.T) {
 		Store:    actx.Store,
 		ActCtx:   actx,
 		NodeUUID: "wf-uuid-3",
+		NodeName: "WF.invoice@motherbee",
 	}
 
 	msgName := MsgWFGetInstance
+	admin := sdk.PrimaryAdminNode
 	msg := sdk.Message{
 		Routing: sdk.Routing{
-			Src:     "caller-uuid-1",
-			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
-			TTL:     16,
-			TraceID: "trace-get-1",
+			Src:       "caller-uuid-1",
+			SrcL2Name: &admin,
+			Dst:       sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:       16,
+			TraceID:   "trace-get-1",
 		},
 		Meta: sdk.Meta{
 			MsgType: "system",
@@ -284,12 +284,14 @@ func TestWFCancelInstanceTransitionsImmediatelyToCancelled(t *testing.T) {
 	}
 
 	msgName := MsgWFCancelInstance
+	wfRules := "SY.wf-rules@motherbee"
 	msg := sdk.Message{
 		Routing: sdk.Routing{
-			Src:     "caller-uuid-cancel",
-			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
-			TTL:     16,
-			TraceID: "trace-cancel-now-1",
+			Src:       "caller-uuid-cancel",
+			SrcL2Name: &wfRules,
+			Dst:       sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:       16,
+			TraceID:   "trace-cancel-now-1",
 		},
 		Meta: sdk.Meta{
 			MsgType: "system",
@@ -456,7 +458,7 @@ func TestRunTransitionNoMatchLogsUnhandled(t *testing.T) {
 	event := msgWithName("UNKNOWN_EVENT")
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -498,7 +500,7 @@ func TestRunTransitionGuardFalseNoTransition(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": false})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -522,7 +524,7 @@ func TestRunTransitionCancellingGoesToCancelled(t *testing.T) {
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("ANYTHING"), actx, nil)
+	err = inst.RunTransition(context.Background(), msgWithName("ANYTHING"), actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -555,7 +557,7 @@ func TestTerminalStateCleansCancelledTimers(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -593,7 +595,7 @@ func TestActionFailureDoesNotHaltTransition(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -619,7 +621,7 @@ func TestSetVariableUpdatesStateVars(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -631,17 +633,12 @@ func TestSetVariableUpdatesStateVars(t *testing.T) {
 }
 
 func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
-	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
-
-	reg := NewInstanceRegistry()
-	inst := NewInstance(def, "wfi:timer-test", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	rt, _ := newTestRuntime(t, "", validWorkflowJSON(), nil)
+	inst := NewInstance(rt.Def, "wfi:timer-test", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst.DefinitionHash = rt.DefHash
 	row, _ := inst.ToRow(fixedClock)
-	_ = actx.Store.CreateInstance(context.Background(), row)
-	reg.Add(inst)
+	_ = rt.Store.CreateInstance(context.Background(), row)
+	rt.Registry.Add(inst)
 
 	// Build a TIMER_FIRED message for this instance
 	clientRef := timerClientRef("wfi:timer-test", "invoice_timeout")
@@ -659,54 +656,57 @@ func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
 	}
 	firedJSON, _ := json.Marshal(fired)
 	msgNameStr := sdk.MsgTimerFired
-	timerMsg := sdk.Message{
+	timerMsg := from("SY.timer@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-timer"},
 		Meta:    sdk.Meta{MsgType: "system", Msg: &msgNameStr},
 		Payload: firedJSON,
-	}
+	})
 
-	err = CorrelateAndDispatch(context.Background(), timerMsg, reg, def, actx.Store, actx)
-	if err != nil {
-		t.Fatalf("CorrelateAndDispatch: %v", err)
+	if err := Dispatch(context.Background(), timerMsg, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
 	}
 	// State should not have changed (TIMER_FIRED doesn't match DATA_VALIDATION_RESPONSE)
 	// but the dispatch should have reached the correct instance
 	if inst.CurrentState != "collecting_data" {
 		t.Errorf("unexpected state change: %s", inst.CurrentState)
 	}
+	logs, _ := rt.Store.GetRecentLog(context.Background(), inst.InstanceID, 5)
+	if len(logs) == 0 || logs[0].Summary != "unhandled event TIMER_FIRED in state collecting_data" {
+		t.Fatalf("the fire must reach the instance: %+v", logs)
+	}
 }
 
 func TestThreadIDCorrelation(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
-	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
-
-	reg := NewInstanceRegistry()
-	inst := NewInstance(def, "wfi:thread-test", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	rt, _ := newTestRuntime(t, "", validWorkflowJSON(), nil)
+	inst := NewInstance(rt.Def, "wfi:thread-test", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst.DefinitionHash = rt.DefHash
 	row, _ := inst.ToRow(fixedClock)
-	_ = actx.Store.CreateInstance(context.Background(), row)
-	reg.Add(inst)
+	_ = rt.Store.CreateInstance(context.Background(), row)
+	rt.Registry.Add(inst)
 
 	// Message with thread_id = instance_id
 	threadID := "wfi:thread-test"
-	event := sdk.Message{
+	event := from("IO.validator@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-2"},
 		Meta: sdk.Meta{
-			MsgType:  "system",
+			MsgType:  "user",
 			Msg:      strPtr("DATA_VALIDATION_RESPONSE"),
 			ThreadID: &threadID,
 		},
 		Payload: json.RawMessage(`{"complete":true}`),
-	}
+	})
 
-	err = CorrelateAndDispatch(context.Background(), event, reg, def, actx.Store, actx)
-	if err != nil {
-		t.Fatalf("CorrelateAndDispatch: %v", err)
+	if err := Dispatch(context.Background(), event, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
 	}
 	if inst.CurrentState != "completed" {
 		t.Errorf("expected completed via thread_id correlation, got %s", inst.CurrentState)
+	}
+	if rt.Registry.Count() != 0 {
+		t.Fatal("a completed instance leaves the registry")
+	}
+	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
+		t.Fatalf("the transition's commit consumes the journaled event, left %+v", events)
 	}
 }
 
@@ -729,7 +729,7 @@ func TestTraceIDPreservedAcrossTransition(t *testing.T) {
 	}
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx, nil)
+	err = inst.RunTransition(context.Background(), event, actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -753,7 +753,7 @@ func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, takenEvent{})
 	if err == nil {
 		err = inst.drainInternalEvents(context.Background(), actx)
 	}
@@ -778,27 +778,24 @@ func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
 }
 
 func TestCreateAndDispatchDrainsInitialInternalEvent(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(workflowJSONWithInitialInternalEvent()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
-	disp := &mockDispatcher{l2name: "WF.initial@motherbee", uuid: "wf-uuid-initial"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	reg := NewInstanceRegistry()
+	rt, _ := newTestRuntime(t, "", workflowJSONWithInitialInternalEvent(), nil)
 
-	msg := msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"})
-	if err := CorrelateAndDispatch(context.Background(), msg, reg, def, actx.Store, actx); err != nil {
-		t.Fatalf("CorrelateAndDispatch: %v", err)
+	msg := from("AI.billing@motherbee", msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"}))
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
 	}
-	if reg.Count() != 0 {
+	if rt.Registry.Count() != 0 {
 		t.Fatalf("completed instance should not remain in active registry")
 	}
-	rows, err := actx.Store.ListInstances(context.Background(), "completed", 10, 0)
+	rows, err := rt.Store.ListInstances(context.Background(), "completed", 10, 0)
 	if err != nil {
 		t.Fatalf("ListInstances: %v", err)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("expected one completed instance, got %d", len(rows))
+	}
+	if rows[0].DefinitionHash != rt.DefHash {
+		t.Fatalf("the instance records the definition it was born with: %q, want %q", rows[0].DefinitionHash, rt.DefHash)
 	}
 }
 
@@ -814,7 +811,7 @@ func TestInternalEventsPreserveFIFOOrder(t *testing.T) {
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, takenEvent{})
 	if err == nil {
 		err = inst.drainInternalEvents(context.Background(), actx)
 	}
@@ -846,7 +843,7 @@ func TestEmitInternalEventFromTargetEntryActionsIsDrainedAfterCommit(t *testing.
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, takenEvent{})
 	if err == nil {
 		err = inst.drainInternalEvents(context.Background(), actx)
 	}
@@ -885,7 +882,7 @@ func TestTerminalTransitionClearsQueuedInternalEvents(t *testing.T) {
 	}
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true}), actx, nil)
+	err = inst.RunTransition(context.Background(), msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true}), actx, takenEvent{})
 	inst.Unlock()
 
 	if err != nil {
@@ -1158,52 +1155,25 @@ func workflowJSONWithTargetEntryInternalEvent() string {
 }`
 }
 
-// A (dynamic target): execSendMessage resolves target_ref from state, sends to the resolved node, and
-// REFUSES a resolved SY.*/RT.* system node (VPN-bypass guard) or a non-string resolution.
-func TestExecSendMessageDynamicTargetAndSystemBlock(t *testing.T) {
+// 0.1.90: every message a WF sends is a user message, which an agent answers as a conversation turn
+// (a system message it answered from its control plane, and the instance hung: FINDINGS A-117).
+func TestAWorkflowSendIsAlwaysUser(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.router@motherbee", uuid: "wf-1"}
 	actx := makeActx(t, disp, &mockTimerSender{})
-	act := ActionDefinition{
-		Type:      "send_message",
-		TargetRef: "state.chosen_target",
-		Meta:      &ActionMeta{Type: "user", Msg: "AI_TICK"},
-		Payload:   map[string]any{"text": "hi"},
+	inst := &WFInstance{InstanceID: "i1", Input: map[string]any{}, StateVars: map[string]any{}}
+	var emitted []InternalEventRow
+	actions := []ActionDefinition{
+		{Type: "send_message", Target: "AI.specialist@motherbee", Meta: &ActionMeta{Msg: "AI_TICK"}, Payload: map[string]any{"text": "hi"}},
+		{Type: "emit_internal_event", Meta: &ActionMeta{Msg: "NEXT"}},
 	}
-	// (1) resolves to an app node -> sent.
-	inst := &WFInstance{InstanceID: "i1", Input: map[string]any{}, StateVars: map[string]any{"chosen_target": "AI.specialist@motherbee"}}
-	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err != nil {
-		t.Fatalf("dynamic send should succeed: %v", err)
+	if err := inst.executeActions(context.Background(), actions, msgWithName("KICK"), actx, &emitted); err != nil {
+		t.Fatalf("executeActions: %v", err)
 	}
-	if len(disp.sent) != 1 {
-		t.Fatalf("expected 1 sent message, got %d", len(disp.sent))
+	if len(disp.sent) != 1 || disp.sent[0].Meta.MsgType != "user" {
+		t.Fatalf("a send is a user message: %+v", disp.sent)
 	}
-	// (2) resolves to a system node -> blocked.
-	inst.StateVars["chosen_target"] = "SY.vault@motherbee"
-	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "SY.") {
-		t.Fatalf("expected system-target block, got %v", err)
-	}
-	// (3) resolves to a non-string -> error.
-	inst.StateVars["chosen_target"] = 123
-	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "non-string") {
-		t.Fatalf("expected non-string target error, got %v", err)
-	}
-	if len(disp.sent) != 1 {
-		t.Fatalf("blocked sends must not dispatch; got %d total", len(disp.sent))
-	}
-}
-
-// F1: runtime re-enforces meta.type=user for a dynamic target (defense-in-depth beyond publish).
-func TestExecSendMessageDynamicTargetRequiresUserTypeAtRuntime(t *testing.T) {
-	disp := &mockDispatcher{l2name: "WF.router@motherbee", uuid: "wf-1"}
-	actx := makeActx(t, disp, &mockTimerSender{})
-	act := ActionDefinition{Type: "send_message", TargetRef: "state.chosen_target",
-		Meta: &ActionMeta{Type: "system", Msg: "AI_TICK"}, Payload: map[string]any{}}
-	inst := &WFInstance{InstanceID: "i1", Input: map[string]any{}, StateVars: map[string]any{"chosen_target": "AI.x@motherbee"}}
-	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "meta.type=user") {
-		t.Fatalf("expected runtime type=user enforcement, got %v", err)
-	}
-	if len(disp.sent) != 0 {
-		t.Fatalf("must not dispatch, got %d", len(disp.sent))
+	if len(emitted) != 1 || emitted[0].MsgType != "user" {
+		t.Fatalf("an internal event is a user message too: %+v", emitted)
 	}
 }
 
@@ -1215,7 +1185,7 @@ func TestMessageToMapExposesContextAndSrc(t *testing.T) {
 			MsgType: "user",
 			Context: json.RawMessage(`{"io":{"reply_target":{"kind":"wapp_post","address":"573001","params":{"phone_number_id":"111"}}}}`),
 		},
-		Payload: json.RawMessage(`{"type":"text","content":"hola"}`),
+		Payload: json.RawMessage(`{"type":"text","content":"hello"}`),
 	}
 	m := messageToMap(msg)
 	if m["src"] != src {

@@ -23,3 +23,7 @@ func EvalGuard(program cel.Program, input, state, event map[string]any) bool {
 func compileGuard(expr string, clock ClockFunc) (cel.Program, error) {
 	return wfcel.CompileGuard(expr, clock)
 }
+
+func compileValue(expr string, clock ClockFunc) (cel.Program, error) {
+	return wfcel.CompileValue(expr, clock)
+}

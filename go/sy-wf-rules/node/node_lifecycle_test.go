@@ -161,7 +161,7 @@ func TestTheDeployCarriesWhoAskedForIt(t *testing.T) {
 		t.Fatalf("run calls = %d, launched_by = %q", fake.runCalls, fake.launchedBy)
 	}
 
-	compileReq, err := decodeCompileRequestFromMap(map[string]any{"workflow_name": "invoice", "launched_by": "operator"})
+	compileReq, err := decodeCompileRequest([]byte(`{"workflow_name": "invoice", "launched_by": "operator"}`))
 	if err != nil || compileReq.LaunchedBy != "operator" {
 		t.Fatalf("compile_apply keeps the admin's stamp: %+v, %v", compileReq, err)
 	}

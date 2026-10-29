@@ -1,10 +1,13 @@
 package node
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 )
 
@@ -47,16 +50,31 @@ func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) 
 	return &meta, nil
 }
 
-func decodeCompileRequestFromMap(config map[string]any) (CompileRequest, error) {
-	raw, err := json.Marshal(config)
-	if err != nil {
+// decodeCompileRequest decodes a compile request with its definition's numbers as written
+// (json.Number), so they are staged as written: decoded as float64, 1.0 was staged as 1, an integer
+// to the engine, and an integer past 2^53 lost its last digits.
+func decodeCompileRequest(raw []byte) (CompileRequest, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var req CompileRequest
+	if err := dec.Decode(&req); err != nil {
 		return CompileRequest{}, err
 	}
-	var req CompileRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return CompileRequest{}, err
+	if _, err := dec.Token(); err != io.EOF {
+		return CompileRequest{}, fmt.Errorf("invalid compile request: data after its JSON object")
 	}
 	return req, nil
+}
+
+// configCompileRequest is the compile request a CONFIG_SET's config holds (decodeCompileRequest).
+func configCompileRequest(msg fluxbeesdk.Message) (CompileRequest, error) {
+	var payload struct {
+		Config json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return CompileRequest{}, err
+	}
+	return decodeCompileRequest(payload.Config)
 }
 
 func countGuards(def *wfcel.WorkflowDefinition) int {

@@ -71,22 +71,28 @@ func TestStoreInstanceRoundtrip(t *testing.T) {
 	}
 }
 
-func TestStoreUpdateInstance(t *testing.T) {
+// An instance's first commit creates its row (a creation is one commit), and the next ones update
+// what a transition changes.
+func TestStoreCommitCreatesThenUpdatesTheInstance(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
 	inst := WFInstanceRow{
-		InstanceID:   "wfi:test-002",
-		WorkflowType: "invoice",
-		Status:       "running",
-		CurrentState: "collecting_data",
-		InputJSON:    `{}`,
-		StateJSON:    `{}`,
-		CreatedAtMS:  1776100000000,
-		UpdatedAtMS:  1776100000000,
+		InstanceID:     "wfi:test-002",
+		WorkflowType:   "invoice",
+		DefinitionHash: "hash-1",
+		Status:         "running",
+		CurrentState:   "collecting_data",
+		InputJSON:      `{}`,
+		StateJSON:      `{}`,
+		CreatedAtMS:    1776100000000,
+		UpdatedAtMS:    1776100000000,
 	}
-	if err := s.CreateInstance(ctx, inst); err != nil {
-		t.Fatalf("CreateInstance: %v", err)
+	if err := s.CommitInstanceMutation(ctx, inst, InstanceCommitMutation{}); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	if got, err := s.GetInstance(ctx, inst.InstanceID); err != nil || got.CurrentState != "collecting_data" || got.DefinitionHash != "hash-1" {
+		t.Fatalf("after the first commit: %+v %v", got, err)
 	}
 
 	inst.Status = "completed"
@@ -94,20 +100,93 @@ func TestStoreUpdateInstance(t *testing.T) {
 	inst.StateJSON = `{"validated_at":1776100001000}`
 	inst.UpdatedAtMS = 1776100001000
 	inst.TerminatedAtMS = newNullInt64(1776100001000)
-
-	if err := s.UpdateInstance(ctx, inst); err != nil {
-		t.Fatalf("UpdateInstance: %v", err)
+	if err := s.CommitInstanceMutation(ctx, inst, InstanceCommitMutation{}); err != nil {
+		t.Fatalf("second commit: %v", err)
 	}
 
 	got, err := s.GetInstance(ctx, inst.InstanceID)
 	if err != nil {
 		t.Fatalf("GetInstance: %v", err)
 	}
-	if got.Status != "completed" {
-		t.Errorf("Status: got %q, want completed", got.Status)
+	if got.Status != "completed" || got.StateJSON != inst.StateJSON || got.CreatedAtMS != 1776100000000 {
+		t.Errorf("after the second commit: %+v", got)
 	}
 	if !got.TerminatedAtMS.Valid {
 		t.Error("TerminatedAtMS should be set")
+	}
+}
+
+// A definition is kept by its hash, and goes once it is neither the current one nor the definition
+// of a running (or cancelling) instance.
+func TestStoreKeepsADefinitionWhileARunningInstanceUsesIt(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	for _, hash := range []string{"old", "older", "current"} {
+		if err := s.PutDefinition(ctx, DefinitionRow{Hash: hash, WorkflowType: "invoice", DefinitionJSON: "{}", LoadedAtMS: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id, row := range map[string]WFInstanceRow{
+		"wfi:on-old":    {DefinitionHash: "old", Status: "running"},
+		"wfi:older-end": {DefinitionHash: "older", Status: "completed"},
+	} {
+		row.InstanceID, row.WorkflowType, row.CurrentState, row.InputJSON, row.StateJSON = id, "invoice", "s", "{}", "{}"
+		if err := s.CreateInstance(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dropped, err := s.PruneDefinitions(ctx, "current")
+	if err != nil || dropped != 1 {
+		t.Fatalf("PruneDefinitions = %d, %v; want the definition no running instance uses", dropped, err)
+	}
+	for hash, kept := range map[string]bool{"old": true, "older": false, "current": true} {
+		if _, ok, err := s.GetDefinition(ctx, hash); err != nil || ok != kept {
+			t.Fatalf("definition %s kept=%v, want %v (%v)", hash, ok, kept, err)
+		}
+	}
+}
+
+// The journal keeps an inbound event until its transition's commit consumes it; a TIMER_FIRED's
+// journaling takes its timer's index row in the same commit.
+func TestStoreJournalsAnInboundEventUntilItsCommit(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.RegisterTimer(ctx, "wfi:j", "deadline", 1000, 2000); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.JournalInbound(ctx, InboundEventRow{InstanceID: "wfi:j", Kind: inboundEvent, MessageJSON: `{}`, ReceivedAtMS: 5}, "deadline")
+	if err != nil {
+		t.Fatalf("JournalInbound: %v", err)
+	}
+	if timers, _ := s.ListTimersForInstance(ctx, "wfi:j"); len(timers) != 0 {
+		t.Fatalf("the fired timer's row goes with the journaling: %+v", timers)
+	}
+	if events, _ := s.ListInboundEvents(ctx); len(events) != 1 || events[0].EventID != id || events[0].Kind != inboundEvent {
+		t.Fatalf("journal = %+v", events)
+	}
+	row := WFInstanceRow{InstanceID: "wfi:j", WorkflowType: "invoice", Status: "running", CurrentState: "s", InputJSON: "{}", StateJSON: "{}"}
+	if err := s.CommitInstanceMutation(ctx, row, InstanceCommitMutation{ConsumedInboundEventID: &id}); err != nil {
+		t.Fatal(err)
+	}
+	if events, _ := s.ListInboundEvents(ctx); len(events) != 0 {
+		t.Fatalf("the commit consumes the journaled event: %+v", events)
+	}
+
+	// FailInstance settles what is left of an instance it fails.
+	if _, err := s.JournalInbound(ctx, InboundEventRow{InstanceID: "wfi:j", Kind: inboundEvent, MessageJSON: `{}`}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueInternalEvents(ctx, []InternalEventRow{{InstanceID: "wfi:j", MsgType: "user", MsgName: "NEXT", PayloadJSON: "{}"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FailInstance(ctx, "wfi:j", 9); err != nil {
+		t.Fatal(err)
+	}
+	failed, _ := s.GetInstance(ctx, "wfi:j")
+	inbound, _ := s.ListInboundEvents(ctx)
+	internal, _ := s.ListInternalEvents(ctx, "wfi:j")
+	if failed.Status != "failed" || failed.TerminatedAtMS.Int64 != 9 || len(inbound) != 0 || len(internal) != 0 {
+		t.Fatalf("after FailInstance: %+v inbound=%v internal=%v", failed, inbound, internal)
 	}
 }
 

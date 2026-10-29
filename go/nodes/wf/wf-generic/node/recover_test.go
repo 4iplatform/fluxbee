@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,16 +23,14 @@ func (m *mockTimerLister) List(_ context.Context, filter sdk.ListFilter) ([]sdk.
 	return m.timerList, m.listErr
 }
 
-func makeRecoverActx(t *testing.T, timer TimerSender) ActionContext {
+// recoverRuntime is a node runtime on definition whose SY.timer answers TIMER_LIST with timers.
+func recoverRuntime(t *testing.T, definition string, timer *mockTimerLister) *NodeRuntime {
 	t.Helper()
-	s := openTestStore(t)
-	return ActionContext{
-		Store:      s,
-		Dispatcher: &mockDispatcher{l2name: "WF.invoice@motherbee"},
-		Timer:      timer,
-		Clock:      fixedClock,
-	}
+	rt, _ := newTestRuntime(t, "", definition, timer)
+	return rt
 }
+
+var recoverOpts = RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}
 
 func timerInfo(clientRef string, fireAtMS int64) sdk.TimerInfo {
 	ref := clientRef
@@ -46,30 +46,18 @@ func timerInfo(clientRef string, fireAtMS int64) sdk.TimerInfo {
 }
 
 func TestRecoverLoadsRunningInstances(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	timer := &mockTimerLister{}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	putRunningInstance(t, rt, "wfi:recover-1", "collecting_data")
 
-	// Insert a running instance
-	inst := WFInstanceRow{
-		InstanceID: "wfi:recover-1", WorkflowType: "invoice",
-		Status: "running", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	if err := actx.Store.CreateInstance(context.Background(), inst); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	if reg.Count() != 1 {
-		t.Errorf("expected 1 instance in registry, got %d", reg.Count())
+	if rt.Registry.Count() != 1 {
+		t.Errorf("expected 1 instance in registry, got %d", rt.Registry.Count())
 	}
-	if _, ok := reg.Get("wfi:recover-1"); !ok {
+	if _, ok := rt.Registry.Get("wfi:recover-1"); !ok {
 		t.Error("wfi:recover-1 not in registry")
 	}
 	if timer.lastFilter.Limit != sdk.MaxTimerListLimit {
@@ -78,7 +66,6 @@ func TestRecoverLoadsRunningInstances(t *testing.T) {
 }
 
 func TestRecoverCaseA_FutureTimer_NoAction(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	// fixedClock = 1776100000000 ms; future = 1776100000000 + 60000 ms
 	futureMS := int64(1776100060000)
 	ref := timerClientRef("wfi:a1", "invoice_timeout")
@@ -86,19 +73,11 @@ func TestRecoverCaseA_FutureTimer_NoAction(t *testing.T) {
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(ref, futureMS)},
 	}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	putRunningInstance(t, rt, "wfi:a1", "collecting_data")
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:a1", "invoice_timeout", 1000, futureMS)
 
-	inst := WFInstanceRow{
-		InstanceID: "wfi:a1", WorkflowType: "invoice",
-		Status: "running", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:a1", "invoice_timeout", 1000, futureMS)
-
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -108,14 +87,13 @@ func TestRecoverCaseA_FutureTimer_NoAction(t *testing.T) {
 	}
 
 	// Timer row should still exist in local store
-	timers, _ := actx.Store.ListTimersForInstance(context.Background(), "wfi:a1")
+	timers, _ := rt.Store.ListTimersForInstance(context.Background(), "wfi:a1")
 	if len(timers) != 1 {
 		t.Errorf("Case A: timer row should still exist, got %d", len(timers))
 	}
 }
 
 func TestRecoverCaseB_PastTimer_SyntheticFireAndCancel(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	// fixedClock = 1776100000000; past = 1776099000000
 	pastMS := int64(1776099000000)
 	ref := timerClientRef("wfi:b1", "invoice_timeout")
@@ -123,19 +101,11 @@ func TestRecoverCaseB_PastTimer_SyntheticFireAndCancel(t *testing.T) {
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(ref, pastMS)},
 	}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	putRunningInstance(t, rt, "wfi:b1", "collecting_data")
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:b1", "invoice_timeout", 1000, pastMS)
 
-	inst := WFInstanceRow{
-		InstanceID: "wfi:b1", WorkflowType: "invoice",
-		Status: "running", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:b1", "invoice_timeout", 1000, pastMS)
-
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -151,43 +121,31 @@ func TestRecoverCaseB_PastTimer_SyntheticFireAndCancel(t *testing.T) {
 	}
 
 	// Local timer row should be deleted after synthetic fire
-	timers, _ := actx.Store.ListTimersForInstance(context.Background(), "wfi:b1")
+	timers, _ := rt.Store.ListTimersForInstance(context.Background(), "wfi:b1")
 	if len(timers) != 0 {
 		t.Errorf("Case B: timer row should be deleted after synthetic fire, got %d", len(timers))
 	}
 }
 
 func TestRecoverCaseB_DoesNotCancelNewTimerWhenSyntheticFireReschedulesSameKey(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(workflowJSONWithTimerRefire()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
 	pastMS := int64(1776099000000)
 	ref := timerClientRef("wfi:b2", "invoice_timeout")
 
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(ref, pastMS)},
 	}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, workflowJSONWithTimerRefire(), timer)
+	putRunningInstance(t, rt, "wfi:b2", "waiting_timeout")
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:b2", "invoice_timeout", 1000, pastMS)
 
-	inst := WFInstanceRow{
-		InstanceID: "wfi:b2", WorkflowType: "invoice",
-		Status: "running", CurrentState: "waiting_timeout",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:b2", "invoice_timeout", 1000, pastMS)
-
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
 	if len(timer.cancelled) != 0 {
 		t.Fatalf("re-scheduled timer should not be cancelled during recovery, got %v", timer.cancelled)
 	}
-	rows, err := actx.Store.ListTimersForInstance(context.Background(), "wfi:b2")
+	rows, err := rt.Store.ListTimersForInstance(context.Background(), "wfi:b2")
 	if err != nil {
 		t.Fatalf("ListTimersForInstance: %v", err)
 	}
@@ -222,7 +180,7 @@ func workflowJSONWithTimerRefire() string {
       "transitions": [
         {
           "event_match": { "msg": "TIMER_FIRED" },
-          "guard": "true",
+          "guard": "event.timer_key == 'invoice_timeout'",
           "target_state": "waiting_timeout",
           "actions": [
             {
@@ -261,44 +219,33 @@ func workflowJSONWithTimerRefire() string {
 }
 
 func TestRecoverCaseC_MissingInSYTimer_DeletesLocalRow(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	timer := &mockTimerLister{timerList: []sdk.TimerInfo{}} // SY.timer has nothing
 
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	putRunningInstance(t, rt, "wfi:c1", "collecting_data")
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:c1", "invoice_timeout", 1000, 99999)
 
-	inst := WFInstanceRow{
-		InstanceID: "wfi:c1", WorkflowType: "invoice",
-		Status: "running", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:c1", "invoice_timeout", 1000, 99999)
-
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
 	// Case C: local row should be deleted
-	timers, _ := actx.Store.ListTimersForInstance(context.Background(), "wfi:c1")
+	timers, _ := rt.Store.ListTimersForInstance(context.Background(), "wfi:c1")
 	if len(timers) != 0 {
 		t.Errorf("Case C: local timer row should be deleted, got %d", len(timers))
 	}
 }
 
 func TestRecoverOrphanedSYTimerCancelled(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	// SY.timer has a timer the WF doesn't expect
 	orphanRef := timerClientRef("wfi:gone", "some_timer")
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(orphanRef, 1776100060000)},
 	}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
 	// No local timer rows registered
 
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
@@ -314,32 +261,27 @@ func TestRecoverOrphanedSYTimerCancelled(t *testing.T) {
 }
 
 func TestRecoverCancellingInstanceSkipsTimerReconcile(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	futureMS := int64(1776100060000)
 	ref := timerClientRef("wfi:cancelling", "invoice_timeout")
 
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(ref, futureMS)},
 	}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
 
 	// Instance is in cancelling status
-	inst := WFInstanceRow{
-		InstanceID: "wfi:cancelling", WorkflowType: "invoice",
-		Status: "cancelling", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
+	putRunningInstance(t, rt, "wfi:cancelling", "collecting_data")
+	if _, err := rt.Store.db.Exec(`UPDATE wf_instances SET status = 'cancelling' WHERE instance_id = 'wfi:cancelling';`); err != nil {
+		t.Fatal(err)
 	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:cancelling", "invoice_timeout", 1000, futureMS)
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:cancelling", "invoice_timeout", 1000, futureMS)
 
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
 	// Cancelling instance should still be in registry
-	if _, ok := reg.Get("wfi:cancelling"); !ok {
+	if _, ok := rt.Registry.Get("wfi:cancelling"); !ok {
 		t.Error("cancelling instance should be in registry")
 	}
 	// Timer should NOT be cancelled (we skip reconciliation for cancelling instances)
@@ -349,37 +291,29 @@ func TestRecoverCancellingInstanceSkipsTimerReconcile(t *testing.T) {
 }
 
 func TestRecoverIdempotent(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	futureMS := int64(1776100060000)
 	ref := timerClientRef("wfi:idem", "invoice_timeout")
 
 	timer := &mockTimerLister{
 		timerList: []sdk.TimerInfo{timerInfo(ref, futureMS)},
 	}
-	actx := makeRecoverActx(t, timer)
-
-	inst := WFInstanceRow{
-		InstanceID: "wfi:idem", WorkflowType: "invoice",
-		Status: "running", CurrentState: "collecting_data",
-		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
-		CreatedAtMS: 1000, UpdatedAtMS: 1000,
-	}
-	_ = actx.Store.CreateInstance(context.Background(), inst)
-	_ = actx.Store.RegisterTimer(context.Background(), "wfi:idem", "invoice_timeout", 1000, futureMS)
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	putRunningInstance(t, rt, "wfi:idem", "collecting_data")
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:idem", "invoice_timeout", 1000, futureMS)
 
 	// Run recovery twice
-	reg1 := NewInstanceRegistry()
-	if err := Recover(context.Background(), def, actx.Store, reg1, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("first Recover: %v", err)
 	}
-	reg2 := NewInstanceRegistry()
-	if err := Recover(context.Background(), def, actx.Store, reg2, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	first := rt.Registry.Count()
+	rt.Registry = NewInstanceRegistry()
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("second Recover: %v", err)
 	}
 
 	// Both runs should have loaded the same instance
-	if reg1.Count() != 1 || reg2.Count() != 1 {
-		t.Errorf("both registries should have 1 instance: reg1=%d reg2=%d", reg1.Count(), reg2.Count())
+	if first != 1 || rt.Registry.Count() != 1 {
+		t.Errorf("both registries should have 1 instance: first=%d second=%d", first, rt.Registry.Count())
 	}
 	// No timers cancelled (Case A in both runs)
 	if len(timer.cancelled) != 0 {
@@ -387,48 +321,64 @@ func TestRecoverIdempotent(t *testing.T) {
 	}
 }
 
-func TestRecoverTimerListFailureReturnsError(t *testing.T) {
-	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+// FINDINGS A-118: a WF whose SY.timer does not answer starts anyway, DEGRADED, with its instances
+// loaded; its timers are reconciled when SY.timer answers (the receive loop asks again).
+func TestRecoverStartsDegradedWhenSYTimerDoesNotAnswer(t *testing.T) {
 	timer := &mockTimerLister{listErr: errSendFailed}
-	actx := makeRecoverActx(t, timer)
-	// Override clock so retries are fast
-	actx.Clock = func() time.Time { return time.UnixMilli(1776100000000).UTC() }
+	rt := recoverRuntime(t, validWorkflowJSON(), timer)
+	rt.Plane = bootstrap(t, writeNodeConfig(t, spawnConfig(writeWorkflowPackage(t, validWorkflowJSON()))))
+	putRunningInstance(t, rt, "wfi:degraded", "collecting_data")
+	pastMS := int64(1776099000000)
+	_ = rt.Store.RegisterTimer(context.Background(), "wfi:degraded", "invoice_timeout", 1000, pastMS)
 
-	reg := NewInstanceRegistry()
-	err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{
-		OwnerL2Name: "WF.invoice@motherbee",
-		MaxRetries:  1,
-	})
-	if err == nil {
-		t.Fatal("expected error when TIMER_LIST fails")
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatalf("SY.timer not answering must not stop the node: %v", err)
+	}
+	if rt.timersPending == nil || rt.Registry.Count() != 1 {
+		t.Fatalf("expected a degraded start with the instance loaded: pending=%v instances=%d", rt.timersPending, rt.Registry.Count())
+	}
+	health := func() map[string]any {
+		t.Helper()
+		disp := rt.ActCtx.Dispatcher.(*mockDispatcher)
+		statusGet := sdk.MSGNodeStatusGet
+		probe := from("SY.orchestrator@motherbee", sdk.Message{Routing: sdk.Routing{Src: "orchestrator-uuid", TraceID: "t-status"}, Meta: sdk.Meta{MsgType: "system", Msg: &statusGet}})
+		if err := Dispatch(context.Background(), probe, rt); err != nil {
+			t.Fatal(err)
+		}
+		return lastReply(t, disp)
+	}
+	reply := health()
+	lastError, _ := reply["last_error"].(map[string]any)
+	if reply["health_state"] != "DEGRADED" || lastError["code"] != errCodeTimersNotReconciled {
+		t.Fatalf("NODE_STATUS_GET while the timers wait = %v", reply)
+	}
+	if timers, _ := rt.Store.ListTimersForInstance(context.Background(), "wfi:degraded"); len(timers) != 1 {
+		t.Fatalf("nothing is reconciled before SY.timer answers, got %v", timers)
+	}
+
+	// SY.timer answers: the past timer is fired, and the node is healthy.
+	timer.listErr = nil
+	timers, err := rt.listTimers(context.Background(), recoverOpts)
+	rt.takeTimerList(context.Background(), timerListResult{timers: timers, err: err, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+	if rt.timersPending != nil {
+		t.Fatalf("still pending: %v", rt.timersPending)
+	}
+	if reply := health(); reply["health_state"] != "HEALTHY" || reply["last_error"] != nil {
+		t.Fatalf("NODE_STATUS_GET after the reconciliation = %v", reply)
+	}
+	logs, _ := rt.Store.GetRecentLog(context.Background(), "wfi:degraded", 5)
+	if len(logs) == 0 || logs[0].Summary != "unhandled event TIMER_FIRED in state collecting_data" {
+		t.Fatalf("the missed fire reaches the instance once SY.timer answers: %+v", logs)
 	}
 }
 
 func TestRecoverDrainsPendingInternalEvents(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(workflowJSONWithInternalTransition()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
 	timer := &mockTimerLister{}
-	actx := makeRecoverActx(t, timer)
-	reg := NewInstanceRegistry()
-
-	inst := WFInstanceRow{
-		InstanceID:   "wfi:recover-internal",
-		WorkflowType: "internal-transition",
-		Status:       "running",
-		CurrentState: "waiting_internal",
-		InputJSON:    `{"customer_id":"c1"}`,
-		StateJSON:    `{}`,
-		CreatedAtMS:  1000,
-		UpdatedAtMS:  1000,
-	}
-	if err := actx.Store.CreateInstance(context.Background(), inst); err != nil {
-		t.Fatalf("CreateInstance: %v", err)
-	}
-	if err := actx.Store.EnqueueInternalEvents(context.Background(), []InternalEventRow{{
-		InstanceID:  inst.InstanceID,
-		MsgType:     "system",
+	rt := recoverRuntime(t, workflowJSONWithInternalTransition(), timer)
+	putRunningInstance(t, rt, "wfi:recover-internal", "waiting_internal")
+	if err := rt.Store.EnqueueInternalEvents(context.Background(), []InternalEventRow{{
+		InstanceID:  "wfi:recover-internal",
+		MsgType:     "user",
 		MsgName:     "INTERNAL_READY",
 		PayloadJSON: `{"value":"ready"}`,
 		TraceID:     "trace-recover-internal",
@@ -437,25 +387,202 @@ func TestRecoverDrainsPendingInternalEvents(t *testing.T) {
 		t.Fatalf("EnqueueInternalEvents: %v", err)
 	}
 
-	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	if reg.Count() != 0 {
-		t.Fatalf("expected completed instance to be removed from registry, got %d", reg.Count())
+	if rt.Registry.Count() != 0 {
+		t.Fatalf("expected completed instance to be removed from registry, got %d", rt.Registry.Count())
 	}
-	row, err := actx.Store.GetInstance(context.Background(), inst.InstanceID)
-	if err != nil {
-		t.Fatalf("GetInstance: %v", err)
-	}
+	row := mustGetInstance(t, rt, "wfi:recover-internal")
 	if row.Status != "completed" || row.CurrentState != "completed" {
 		t.Fatalf("expected completed row after recover, got status=%q state=%q", row.Status, row.CurrentState)
 	}
-	events, err := actx.Store.ListInternalEvents(context.Background(), inst.InstanceID)
+	events, err := rt.Store.ListInternalEvents(context.Background(), "wfi:recover-internal")
 	if err != nil {
 		t.Fatalf("ListInternalEvents: %v", err)
 	}
 	if len(events) != 0 {
 		t.Fatalf("expected internal queue to be drained on recover, got %d", len(events))
+	}
+}
+
+// A timer an instance schedules while the node is DEGRADED goes to SY.timer fire-and-forget, and
+// SY.timer, not answering, may never get it. When SY.timer answers again without it, the timer is
+// scheduled again, under the same client_ref (SY.timer keeps one pending timer per client_ref),
+// instead of leaving the index, which left its instance waiting forever.
+func TestATimerScheduledWhileDegradedIsScheduledAgain(t *testing.T) {
+	timer := &mockTimerLister{listErr: errSendFailed}
+	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, timer)
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatal(err)
+	}
+	if rt.timersPending == nil {
+		t.Fatal("expected a DEGRADED start")
+	}
+	instanceID := startAsking(t, rt, disp, "trace-start")
+	scheduled := len(timer.scheduled)
+
+	// A minute later SY.timer answers, without the timer.
+	rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(time.Minute) }
+	rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{}, askedAtMS: nowMS(rt.ActCtx.Clock)}, recoverOpts)
+	if rt.timersPending != nil {
+		t.Fatalf("still DEGRADED: %v", rt.timersPending)
+	}
+	if ref := timerClientRef(instanceID, "ask_timeout"); len(timer.scheduled) != scheduled+1 || timer.scheduled[scheduled] != ref {
+		t.Fatalf("the timer is scheduled again as %s: %v", ref, timer.scheduled[scheduled:])
+	}
+	row, ok, err := rt.Store.GetTimerForInstance(context.Background(), instanceID, "ask_timeout")
+	if err != nil || !ok || row.FireAtMS != fixedClock().Add(2*time.Minute).UnixMilli() {
+		t.Fatalf("the index keeps the timer, at its time: %+v %v %v", row, ok, err)
+	}
+}
+
+// raceWorkflowJSON waits for an answer under a timeout; the answer cancels the timeout, and a fire of
+// it would end the instance.
+const raceWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "race",
+  "input_schema": {"type": "object"},
+  "initial_state": "waiting",
+  "terminal_states": ["done"],
+  "states": [
+    {
+      "name": "waiting",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "timeout", "fire_in": "5m"}],
+      "transitions": [
+        {"event_match": {"msg": "ANSWER"}, "guard": "true", "target_state": "working",
+         "actions": [{"type": "cancel_timer", "timer_key": "timeout"}]}
+      ]
+    },
+    {
+      "name": "working",
+      "transitions": [
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'timeout'", "target_state": "done"},
+        {"event_match": {"msg": "FINISH"}, "guard": "true", "target_state": "done"}
+      ]
+    },
+    {"name": "done"}
+  ]
+}`
+
+// The receive loop asks SY.timer for its list off the loop and takes the answer later: a timer an
+// instance schedules in between cannot be in that list. Its row stays (and is not scheduled again),
+// so a later cancel_timer still cancels it in SY.timer.
+func TestATimerScheduledAfterTheListWasAskedKeepsItsRow(t *testing.T) {
+	timer := &mockTimerLister{listErr: errSendFailed}
+	rt, _ := newTestRuntime(t, "", raceWorkflowJSON, timer)
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatal(err)
+	}
+	// The list is asked; a second later, before its answer is taken, an instance schedules a timer.
+	askedAtMS := nowMS(rt.ActCtx.Clock)
+	rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(time.Second) }
+	instanceID := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
+	scheduled := len(timer.scheduled)
+	rt.takeTimerList(context.Background(), timerListResult{timers: []sdk.TimerInfo{}, askedAtMS: askedAtMS}, recoverOpts)
+	if _, ok, _ := rt.Store.GetTimerForInstance(context.Background(), instanceID, "timeout"); !ok || len(timer.scheduled) != scheduled {
+		t.Fatalf("the row stays as it is: kept=%v, scheduled again %d times", ok, len(timer.scheduled)-scheduled)
+	}
+
+	answer := from("AI.host@motherbee", msgWithName("ANSWER"))
+	answer.Meta.ThreadID = &instanceID
+	if err := Dispatch(context.Background(), answer, rt); err != nil {
+		t.Fatal(err)
+	}
+	ref := timerClientRef(instanceID, "timeout")
+	if len(timer.cancelled) != 1 || timer.cancelled[0] != ref {
+		t.Fatalf("cancel_timer cancels %s in SY.timer: %v", ref, timer.cancelled)
+	}
+}
+
+// remindWorkflowJSON schedules a reminder (2m), which cancels the deadline (10m), named
+// deadlineKey; the entry actions schedule them in the order they fire, or the other way round.
+func remindWorkflowJSON(deadlineKey string, deadlineFirst bool) string {
+	remind := `{"type": "schedule_timer", "timer_key": "remind", "fire_in": "2m"}`
+	deadline := fmt.Sprintf(`{"type": "schedule_timer", "timer_key": %q, "fire_in": "10m"}`, deadlineKey)
+	entry := remind + ", " + deadline
+	if deadlineFirst {
+		entry = deadline + ", " + remind
+	}
+	return fmt.Sprintf(`{
+  "wf_schema_version": "1",
+  "workflow_type": "remind",
+  "input_schema": {"type": "object"},
+  "initial_state": "waiting",
+  "terminal_states": ["timed_out", "done"],
+  "states": [
+    {
+      "name": "waiting",
+      "entry_actions": [%[1]s],
+      "transitions": [
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'remind'", "target_state": "reminded",
+         "actions": [{"type": "cancel_timer", "timer_key": %[2]q}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == '%[2]s'", "target_state": "timed_out"}
+      ]
+    },
+    {
+      "name": "reminded",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "final", "fire_in": "1h"}],
+      "transitions": [
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == '%[2]s'", "target_state": "timed_out"},
+        {"event_match": {"msg": "DONE"}, "guard": "true", "target_state": "done"}
+      ]
+    },
+    {"name": "timed_out"},
+    {"name": "done"}
+  ]
+}`, entry, deadlineKey)
+}
+
+// Two timers fired while the WF was down and SY.timer lost both fires: recovery fires them in the
+// order they fire, and reads each row again before its fire. The reminder (2m) cancels the deadline
+// (10m), so the deadline never fires: the instance ends in reminded, whatever the timers are called
+// or the order they were scheduled in.
+func TestRecoveryFiresLostTimersInTheOrderTheyFire(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		deadlineKey   string
+		deadlineFirst bool
+	}{
+		{"remind and timeout", "timeout", false},
+		{"a deadline scheduled first, whose key sorts first", "deadline", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			definition := remindWorkflowJSON(tc.deadlineKey, tc.deadlineFirst)
+			rt, _ := newTestRuntime(t, "", definition, nil)
+			instanceID := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
+			// 30 minutes later the WF starts again; SY.timer has nothing pending.
+			rt.Registry = NewInstanceRegistry()
+			rt.ActCtx.Timer = &mockTimerLister{}
+			rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(30 * time.Minute) }
+			if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+				t.Fatal(err)
+			}
+			if row := mustGetInstance(t, rt, instanceID); row.CurrentState != "reminded" || row.Status != "running" {
+				t.Fatalf("the deadline fired after the reminder cancelled it: state %s, status %s", row.CurrentState, row.Status)
+			}
+		})
+	}
+}
+
+// An instance whose current state its definition does not have (one a v1/v2 store's migration put
+// on the definition the node had then, whatever it was born with) cannot take an event: recovery
+// fails it at load (state_not_in_definition), loudly, and loads the others.
+func TestAnInstanceInAStateItsDefinitionLacksFailsAtRecovery(t *testing.T) {
+	rt := recoverRuntime(t, validWorkflowJSON(), &mockTimerLister{})
+	putRunningInstance(t, rt, "wfi:lost", "a_state_no_longer_there")
+	putRunningInstance(t, rt, "wfi:fine", "collecting_data")
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatal(err)
+	}
+	if row := mustGetInstance(t, rt, "wfi:lost"); row.Status != "failed" {
+		t.Fatalf("the instance: %+v", row)
+	}
+	if entry := lastLog(t, rt, "wfi:lost"); !strings.HasPrefix(entry.ErrorDetail, causeStateNotInDefinition) {
+		t.Fatalf("its log names the cause: %+v", entry)
+	}
+	if _, ok := rt.Registry.Get("wfi:fine"); !ok || rt.Registry.Count() != 1 {
+		t.Fatalf("the other instance is loaded: %d running", rt.Registry.Count())
 	}
 }

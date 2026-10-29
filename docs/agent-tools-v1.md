@@ -382,9 +382,8 @@ The work goes case by case.
   - So a WF never routes by ILK. Its CEL chooses among node names written in the definition, and
     nothing is computed.
   - The ILK travels intact inside the message, for the agent's memory and the IO node's delivery.
-  - Today the engine also accepts `target_ref`, a destination computed from data. By this rule it
-    does not fit, and the WF review decides whether it goes or is limited to names written in the
-    definition.
+  - Since 0.1.90 the engine refuses `target_ref`, a destination computed from data: a WF sends
+    only to node names written in the definition (wf-orchestration-v1 §5.1).
 - **Answering later a person who wrote before:** the WF keeps that message's `context.io` (its
   `reply_target`) in its state. When the timer fires, it sends the result to the IO node with it.
   The review confirms the engine allows it.

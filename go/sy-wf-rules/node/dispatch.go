@@ -38,8 +38,8 @@ func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 	action := strings.ToLower(stringValue(msg.Meta.Action))
 	switch action {
 	case "compile_workflow":
-		var req CompileRequest
-		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		req, err := decodeCompileRequest(msg.Payload)
+		if err != nil {
 			s.sendCommandResponse(msg, action, map[string]any{
 				"status":       "error",
 				"error_code":   "INVALID_CONFIG_SET",
@@ -320,7 +320,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 	}
 	switch operation {
 	case "compile":
-		compileReq, err := decodeCompileRequestFromMap(configMap)
+		compileReq, err := configCompileRequest(msg)
 		if err != nil {
 			s.sendNodeConfigResponse(msg, map[string]any{
 				"ok":        false,
@@ -411,7 +411,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		}
 		s.sendNodeConfigResponse(msg, payload)
 	case "compile_apply":
-		compileReq, err := decodeCompileRequestFromMap(configMap)
+		compileReq, err := configCompileRequest(msg)
 		if err != nil {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
 			return

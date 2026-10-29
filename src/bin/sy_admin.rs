@@ -13548,73 +13548,13 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "opa_clear" => serde_json::json!({}),
         "wf_rules_compile_apply" => serde_json::json!({
             "workflow_name": "invoice",
-            "definition": {
-                "wf_schema_version": "1",
-                "workflow_type": "invoice",
-                "description": "Issues an invoice",
-                "input_schema": {
-                    "type": "object",
-                    "required": ["customer_id"],
-                    "properties": {
-                        "customer_id": {"type": "string"}
-                    }
-                },
-                "initial_state": "collecting_data",
-                "terminal_states": ["completed"],
-                "states": [
-                    {
-                        "name": "collecting_data",
-                        "description": "Sends the invoice request and waits for validation.",
-                        "entry_actions": [
-                            {
-                                "type": "send_message",
-                                "target": "IO.quickbooks@motherbee",
-                                "meta": {"msg": "INVOICE_CREATE_REQUEST"},
-                                "payload": {
-                                    "customer_id": {"$ref": "input.customer_id"}
-                                }
-                            }
-                        ],
-                        "exit_actions": [],
-                        "transitions": [
-                            {
-                                "event_match": {"msg": "DATA_VALIDATION_RESPONSE"},
-                                "guard": "event.payload.complete == true",
-                                "target_state": "completed",
-                                "actions": [
-                                    {"type": "set_variable", "name": "validated_at", "value": "now()"}
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "name": "completed",
-                        "description": "Workflow finished.",
-                        "entry_actions": [],
-                        "exit_actions": [],
-                        "transitions": []
-                    }
-                ]
-            },
+            "definition": wf_rules_example_definition(),
             "auto_spawn": true,
             "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "wf_rules_compile" => serde_json::json!({
             "workflow_name": "invoice",
-            "definition": {
-                "wf_schema_version": "1",
-                "workflow_type": "invoice",
-                "description": "Issues an invoice",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "customer_id": {"type": "string"}
-                    }
-                },
-                "initial_state": "collecting_data",
-                "terminal_states": ["completed"],
-                "states": []
-            }
+            "definition": wf_rules_example_definition()
         }),
         "wf_rules_apply" => serde_json::json!({
             "workflow_name": "invoice",
@@ -13694,6 +13634,73 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         _ => serde_json::Value::Null,
     }
+}
+
+/// The workflow definition of the wf_rules help examples: a valid one (SY.wf-rules compiles it, and
+/// the Go test of every shipped definition validates its copy,
+/// `go/pkg/wfcel/testdata/admin_help_definition.json`), written as a WF is written since 0.1.90:
+/// sends without a type, a timeout on `event.timer_key`.
+fn wf_rules_example_definition() -> serde_json::Value {
+    serde_json::json!({
+        "wf_schema_version": "1",
+        "workflow_type": "invoice",
+        "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
+        "input_schema": {
+            "type": "object",
+            "required": ["customer_id"],
+            "properties": {
+                "customer_id": {"type": "string"}
+            }
+        },
+        "initial_state": "collecting_data",
+        "terminal_states": ["completed", "failed"],
+        "states": [
+            {
+                "name": "collecting_data",
+                "description": "Asks for the invoice and waits for its data.",
+                "entry_actions": [
+                    {
+                        "type": "send_message",
+                        "target": "IO.quickbooks@motherbee",
+                        "meta": {"msg": "INVOICE_CREATE_REQUEST"},
+                        "payload": {"customer_id": {"$ref": "input.customer_id"}}
+                    },
+                    {"type": "schedule_timer", "timer_key": "collection_timeout", "fire_in": "10m"}
+                ],
+                "exit_actions": [{"type": "cancel_timer", "timer_key": "collection_timeout"}],
+                "transitions": [
+                    {
+                        "event_match": {"msg": "DATA_VALIDATION_RESPONSE"},
+                        "guard": "event.payload.complete == true",
+                        "target_state": "completed",
+                        "actions": [
+                            {"type": "set_variable", "name": "validated_at", "value": "now()"}
+                        ]
+                    },
+                    {
+                        "event_match": {"msg": "TIMER_FIRED"},
+                        "guard": "event.timer_key == \"collection_timeout\"",
+                        "target_state": "failed",
+                        "actions": []
+                    }
+                ]
+            },
+            {
+                "name": "completed",
+                "description": "Done.",
+                "entry_actions": [],
+                "exit_actions": [],
+                "transitions": []
+            },
+            {
+                "name": "failed",
+                "description": "No validated data in time.",
+                "entry_actions": [],
+                "exit_actions": [],
+                "transitions": []
+            }
+        ]
+    })
 }
 
 fn admin_action_example_scmd(action: &str) -> Option<String> {
@@ -13885,11 +13892,16 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             "curl -X GET '/hives/motherbee/wf-rules/status?workflow_name=invoice'"
         }
         "wf_rules_list_workflows" => "curl -X GET /hives/motherbee/wf-rules",
-        "wf_rules_compile_apply" => {
-            r#"curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]},"auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
-        }
-        "wf_rules_compile" => {
-            r#"curl -X POST /hives/motherbee/wf-rules/compile -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]}}'"#
+        "wf_rules_compile_apply" | "wf_rules_compile" => {
+            let path = if action == "wf_rules_compile" {
+                "/hives/motherbee/wf-rules/compile"
+            } else {
+                "/hives/motherbee/wf-rules"
+            };
+            return Some(format!(
+                "curl -X POST {path} -d '{}'",
+                admin_action_example_payload(action)
+            ));
         }
         "wf_rules_apply" => {
             r#"curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"invoice","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
@@ -14249,12 +14261,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
+            "Every message a WF sends is a user message, to a node name written in the definition: an action with meta.type or target_ref is refused. A timer's key is event.timer_key; an agent's error answer is <msg>.error.",
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
             "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
+            "Every message a WF sends is a user message, to a node name written in the definition: an action with meta.type or target_ref is refused. A timer's key is event.timer_key; an agent's error answer is <msg>.error.",
         ],
         "wf_rules_apply" | "wf_rules_rollback" => vec![
             "workflow_name is required.",
@@ -21819,6 +21833,36 @@ mod tests {
         assert_eq!(doc["handler"], json!("wf_rules_query"));
         assert_eq!(doc["canonical_action"], json!("get_status"));
         assert_eq!(doc["read_only"], json!(true));
+    }
+
+    /// The wf_rules help examples carry one workflow definition, a valid one: the Go suite validates
+    /// its copy (`go/pkg/wfcel/testdata/admin_help_definition.json`, in
+    /// `TestEveryShippedWorkflowDefinitionValidates`), so a change on either side fails one of the
+    /// two. Before 0.1.90 the compile example had `"states": []`, which validation refuses.
+    #[test]
+    fn the_wf_rules_help_examples_carry_the_definition_the_go_suite_validates() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../go/pkg/wfcel/testdata/admin_help_definition.json"
+        ))
+        .expect("fixture json");
+        assert_eq!(wf_rules_example_definition(), fixture);
+        for (action, path) in [
+            ("wf_rules_compile_apply", "/hives/motherbee/wf-rules"),
+            ("wf_rules_compile", "/hives/motherbee/wf-rules/compile"),
+        ] {
+            let payload = admin_action_example_payload(action);
+            assert_eq!(payload["definition"], fixture, "{action}");
+            let scmd = admin_action_example_scmd(action).expect("example scmd");
+            assert_eq!(
+                scmd,
+                format!("curl -X POST {path} -d '{payload}'"),
+                "{action}"
+            );
+            assert!(
+                !payload.to_string().contains('\''),
+                "{action}: the example goes between single quotes"
+            );
+        }
     }
 
     #[test]

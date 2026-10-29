@@ -227,6 +227,22 @@ Prefer:
 A workflow runs where SY.wf-rules runs: the motherbee or a worker, never an ingress or egress hive
 (a manifest that puts one there is refused).
 
+A definition is what SY.wf-rules validates (`go/pkg/wfcel`), and since 0.1.90:
+- every message a WF sends is a `user` message: an action's `meta` has `msg` (and `context`),
+  never `type`;
+- a send's `target` is a node name written in the definition; to choose among destinations, write
+  one transition per destination with its guard (there is no `target_ref`);
+- a timeout is a `TIMER_FIRED` transition guarded by `event.timer_key == '<timer_key>'`, and every
+  wait for an answer needs one;
+- an agent answers with the request's own `msg`, never a `*_RESPONSE`, its text in
+  `payload.content`: ask it for a structured answer with `meta.context.response_envelope` and read
+  it with `json_parse(event.payload.content)`;
+- an agent's error answer arrives as `<msg>.error`, which needs a transition of its own;
+- a `$ref` to a field that may be missing gives a default (`{"$ref": "event.context", "default":
+  {}}`); without one, a missing field fails the instance.
+
+The cookbook seeds `wf_node_with_workflow` and `workflow_definition` show one.
+
 ### 4.3 IO nodes
 
 Use for external ingress/egress only:
@@ -423,16 +439,14 @@ SY.admin's API (`kill_node`, `delete_route`, `delete_vpn`).
 
 Role: materialize exactly one artifact bundle per `build_task_packet`.
 
-Artifact kinds:
-- `runtime_package`
-- `workflow_definition`
-- `opa_bundle`
-- `config_bundle`
+It builds one artifact kind, `runtime_package`; a packet of any other kind is refused. A workflow is
+not a programmer artifact: its definition is the manifest's `wf_deployments`, deployed with
+`wf_rules_compile_apply`; the user policy is the manifest's `opa`, deployed with
+`opa_compile_apply`.
 
 Important:
 - `package.json.name` is lowercase
 - `runtime_base` must exist in known context
-- `workflow_definition` is for workflow logic, not generic runtime packaging
 
 ### 6.3 PlanCompiler
 
