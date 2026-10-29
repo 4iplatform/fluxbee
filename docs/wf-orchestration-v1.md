@@ -11,9 +11,10 @@
   Everything below was read in the code; a point marked *(read, not run)* was not exercised.
 - **Case 0 (§5.1)** was decided by the operator on 2026-10-28. It was built, and validated on 8.x
   in 0.1.90 (2026-10-29; ledger 0.1.90).
-- **Next:** Case 1 (§5). The operator's decisions still open are in §4.9: the conversation model,
-  what the forward may change, and the trail's design. The operator: close the WF topic
-  completely, case by case; Archi through Cloud waits.
+- **Case 1 (§5.2)** is the operator's circuit of 2026-10-29: a sale handed to invoicing, then a
+  due-date timer and a payment check. Decided so far: one instance per conversation. Next: what the
+  forward may change. The operator: close the WF topic completely, case by case; Archi through
+  Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -262,24 +263,32 @@ This is the single place for the track. The cases are worked here one at a time.
 - **The conversation model (§4.2):**
   - one instance per conversation, keyed by the IO node's thread; or
   - one instance per message, with the conversation carried through to the agent.
-- **What "forward as received" may change:** the destination only, or named fields too.
+
+  **Decided (§5.2):** one instance per conversation, on 2026-10-29.
+- **What "forward as received" may change:** the destination only, or named fields too. Being
+  decided in §5.2.
 
 ## 5. Case by case (proposed; the operator picks)
 
 - **Case 0, before anything: what is broken today** (§3, FINDINGS A-117 to A-119). The timeouts,
   `user` by default, the examples, the seeds, the panic, the unbounded loop, the duplicate fire
   and the open verbs. **Done in 0.1.90 (§5.1).**
-- **Case 1, the operator's pass-through.** A WF timer asks an agent for an evaluation, and delivers
-  the result to a person who wrote before. It needs:
-  - a timer time taken from state;
-  - the IO node's `reply_target` kept in state;
-  - the structured answer;
-  - the relay, with the message's format kept.
-- **Case 2, a WF in front of a live conversation** (IO → WF → AI → WF → IO). It needs:
+- **Case 1, the operator's circuit (§5.2, 2026-10-29).** A conversation enters through sales and
+  is handed to invoicing, and the invoice's due date fires a payment check. It takes in two cases
+  this list first proposed:
+  - the old Case 1, the pass-through: a WF timer asks an agent for an evaluation, and the result
+    goes to a person who wrote before;
+  - the old Case 2, a WF in front of a live conversation (IO → WF → AI → WF → IO).
+
+  It needs:
   - the conversation model (§4.9);
   - a message from an IO node that advances an instance;
   - "forward as received", with `src_ilk`, `ich` and the thread;
-  - correlation of the agent's answer that does not depend on the thread.
+  - the agents' answers correlated by the conversation;
+  - the structured answer;
+  - a timer time taken from an agent's answer;
+  - the IO node's `reply_target` kept in state.
+- **Case 2:** taken into Case 1 on 2026-10-29.
 - **Case 3, escalation.** A field of the agent's evaluation routes the case to a supervisor's IO
   node (a name written in the definition), with its data.
 - **Case 4, Archi writes and operates WFs:**
@@ -361,6 +370,59 @@ This is the single place for the track. The cases are worked here one at a time.
     security topic decision 6 left open);
   - a send to an agent with `thread_id_ref` loops (A-116, Case 2's correlation);
   - SY.timer takes a timer for another node from any node (A-115).
+
+### 5.2 Case 1: the operator's circuit (being decided, 2026-10-29)
+
+**The circuit:**
+1. A registered person writes. The IO node hands every message to the WF, which sends it to
+   `AI.sales`: every conversation enters through sales.
+2. The message is about an invoice. Sales answers the WF with a field (`area`), and the WF's CEL
+   forwards the person's message to `AI.invoice`. From then on, invoice holds the conversation.
+3. `AI.invoice` issues the invoice and answers with its data, the due date included.
+4. The WF keeps the invoice in the instance's state and sets a timer at its due date. The time
+   comes from invoice's answer, not from the definition.
+5. At the due date, the WF sends the invoice to `AI.payments`, which checks the payment and
+   answers.
+6. The WF delivers that answer to the person through the IO node.
+
+Every hop is the WF's, because the agents only answer (§1). The names (`AI.sales`, `AI.invoice`,
+`AI.payments` and the IO node) are written in the definition.
+
+**The operator's rule (2026-10-29):** whenever a solution involves several agents, a WF sits at the
+IO node's exit as the router, however many agents take part.
+
+**Decided: one instance per conversation,** keyed by the IO node's thread.
+- The WF must remember that the conversation now belongs to invoice, and that lives in the instance.
+- The person's messages and the agents' answers travel on the conversation's thread. So they all
+  reach the same instance, and each agent keeps its memory. This removes A-116's choice between
+  keeping the conversation and getting the answer (§4.2).
+- With one instance per message, every message would go through sales again.
+
+**Checked in the code for this case:**
+- An agent answers whoever sent it the message (`build_reply_routing`,
+  crates/fluxbee_ai_sdk/src/message.rs). With the WF in front, every answer comes back to the WF.
+- An agent's memory is per thread and agent node (`package_for`, src/router/mod.rs). Invoice starts
+  its own memory of the conversation at the forwarded message, and never sees what was said to
+  sales.
+- An agent's model sees the payload's text and attachments and its memory package. It never sees
+  `meta.context` (the message handler in nodes/ai/ai-generic/src/bin/ai_node_runner.rs).
+- IO.api sends every message to one configured `io.dst_node`, here the WF. It only takes messages
+  in: it ignores any answer (`run_router_loop`), and this version has no outbound delivery
+  (docs/io/io-api-node-spec.md).
+
+**The test.** The operator: no extra pieces in the infrastructure for now; the integrated tests
+come later.
+- The messages are sent from inside, with Case 0's gate tool, and the answers are read in the
+  trace.
+- The due date is a few minutes away; SY.timer's floor is 60 s.
+
+**Open, one at a time:**
+1. **What the forward may change** (§4.9). In step 2 the person writes *"dale, facturámelo"*. If
+   only the destination changes, invoice receives that sentence alone, and the order (10 licenses
+   at their price) was said to sales.
+2. **When control goes back to sales,** and when the instance ends. It must outlive the due date.
+3. **Who may drive a conversation's instance** (A-123). The proposal: only the names written in the
+   definition, and SY.timer.
 
 ## 6. Docs that drift from the code
 
