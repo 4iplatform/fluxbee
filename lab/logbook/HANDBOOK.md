@@ -751,7 +751,7 @@ previous audit had found are closed; details in [`PENDING-BUGS.md`](PENDING-BUGS
 ```bash
 # 1. on the build box
 git pull && bash packaging/build-deb.sh 0.1.N
-bash scripts/apt-repo-publish.sh --serve      # publishes and KEEPS the previous ones
+bash scripts/apt-repo-publish.sh --serve      # publishes and KEEPS the previous ones (--keep N: the newest N)
 
 # 2. on motherbee
 apt-get update && apt-get install -y fluxbee  # never dpkg -i
@@ -774,7 +774,7 @@ inventory (motherbee=100, worker1=101, ingress1=102, egress1=103, build 110; cha
 ```bash
 ops() { python3 lab/ops.py --env scratchpad/pve.env --pve-host 192.168.8.207 "$@"; }
 ops build 0.1.N --wait          # git pull + build-deb.sh on the build box (log /root/build-0.1.N.log)
-ops publish 0.1.N               # apt-repo-publish.sh (log /root/publish-0.1.N.log)
+ops publish 0.1.N               # apt-repo-publish.sh --keep 10; dist/ drops the older .debs (log /root/publish-0.1.N.log)
 ops deploy 0.1.N --snapshot pre-<something>-0-1-N --drop <the-oldest>
 ops versions                    # core version and hash per hive: the installed one if there is one, otherwise dist's
 ops opa-status                  # user OPA policy per hive
@@ -1069,8 +1069,8 @@ Three paths:
    `/versions`.
 2. **Cold snapshot of the VMs** — see §1 on why cold. With the maximum of 3 per VM (§12), it
    covers only the recent past.
-3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It is the path
-   for any old version.
+3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
+   last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
 
 **Downgrading from 0.1.63 or later to an earlier version:** Syncthing keeps running as `fluxbee`
 (0.1.62 uses that user if it exists), but the 0.1.62 nodes write root-owned blobs that it cannot

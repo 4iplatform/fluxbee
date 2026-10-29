@@ -162,7 +162,9 @@ scripts/apt-repo-publish.sh --serve          # publishes the .deb in a flat repo
 `apt-repo-publish.sh` builds a flat repo (`apt-ftparchive packages` + `apt-ftparchive release`) and serves it.
 It is **unsigned** + `[trusted=yes]` (internal use). For a **public/internet** repo, sign the
 `Release` with GPG (`InRelease`) and remove `[trusted=yes]` — the `.deb` itself does not change. Run
-the script again after each new build to regenerate the index.
+the script again after each new build to regenerate the index. With `--keep N` the repo keeps only
+the newest N versions, by version order, and prints each one it removes (PROD's `ops publish`
+passes 10).
 
 > **Pin the repo box IP — OUTSIDE the DHCP pool.** The repo URL (`http://<host>:8900`) is
 > written into every client; if the build box is on DHCP and its IP drifts, every `apt update`

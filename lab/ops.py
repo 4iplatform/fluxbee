@@ -17,7 +17,8 @@ Commands
                                    the router stream lost, usage records lost or rejected (UTC);
                                    then the edge certificate (edge-cert) and the web door (web)
   build VERSION [--wait]           pull and build the .deb on the build VM (log /root/build-V.log)
-  publish VERSION                  publish the built .deb to the apt repo on the build VM
+  publish VERSION                  publish the built .deb to the apt repo on the build VM; the
+                                   repo keeps the newest 10 versions, dist/ drops the older .debs
   deploy VERSION --snapshot NAME [--drop OLD]
                                    snapshot every VM (max 3 per VM: name the one to drop, which
                                    must be the oldest), apt install on the motherbee, wait for
@@ -297,11 +298,24 @@ def cmd_build(a):
         time.sleep(15)
 
 
+# Versions the apt repo keeps: `apt install fluxbee=<v>` reaches that far back (the snapshots, 3).
+REPO_KEEP = 10
+
+
 def cmd_publish(a):
-    deb = "/opt/fluxbee/dist/fluxbee_%s_amd64.deb" % a.version
-    script = ("t0=$(date +%%s); cd /opt/fluxbee && bash scripts/apt-repo-publish.sh --deb %s "
-              "> /root/publish-%s.log 2>&1; rc=$?; tail -1 /root/publish-%s.log; "
-              "echo \"publish rc=$rc in $(( $(date +%%s) - t0 )) s\"; exit $rc" % (deb, a.version, a.version))
+    deb = "dist/fluxbee_%s_amd64.deb" % a.version
+    log = "/root/publish-%s.log" % a.version
+    # The repo keeps the newest REPO_KEEP versions, and dist/ drops every .deb older than this one,
+    # which the repo now holds: each .deb was stored twice, forever (FINDINGS B-17). Both print
+    # what they remove.
+    prune_dist = ("for f in dist/fluxbee_*_amd64.deb; do [ -e \"$f\" ] && [ \"$f\" != %s ] && "
+                  "[ \"$(printf '%%s\\n' \"$f\" %s | sort -V | head -1)\" = \"$f\" ] && "
+                  "rm -f \"$f\" && echo \"   dist: removed ${f#dist/}\"; done" % (deb, deb))
+    script = ("t0=$(date +%%s); cd /opt/fluxbee && bash scripts/apt-repo-publish.sh --deb %s --keep %d "
+              "> %s 2>&1; rc=$?; grep '^   pruned ' %s; tail -1 %s; "
+              "if [ $rc -eq 0 ]; then %s; fi; "
+              "echo \"publish rc=$rc in $(( $(date +%%s) - t0 )) s\"; exit $rc"
+              % (deb, REPO_KEEP, log, log, log, prune_dist))
     code, out, _ = vm_bash(build_vm(), script)
     print(out.strip())
     sys.exit(code or 0)

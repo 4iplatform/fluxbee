@@ -6,6 +6,7 @@
 # On the build+repo machine:
 #   scripts/make-deb.sh --branch main --version 0.1.0     # build the .deb
 #   scripts/apt-repo-publish.sh --serve                   # publish + serve on :8900
+#   scripts/apt-repo-publish.sh --keep 10                 # publish, keep only the newest 10 versions
 #
 # On a client (fresh Ubuntu):
 #   echo 'deb [trusted=yes] http://<build-host>:8900 ./' | sudo tee /etc/apt/sources.list.d/fluxbee.list
@@ -22,6 +23,8 @@ REPO="${REPO:-/var/lib/fluxbee-apt}"
 # Checksum cache for the index, outside the served directory: only new or changed .debs are hashed.
 CACHE="${CACHE:-${REPO%/}-cache/packages.db}"
 PORT="${PORT:-8900}"
+# Versions the repo keeps, the newest by version order; 0 keeps every one.
+KEEP="${KEEP:-0}"
 SERVE=0
 USE_SUDO=0
 
@@ -30,6 +33,7 @@ while [[ $# -gt 0 ]]; do
     --deb) DEB="${2:?}"; shift 2 ;;
     --repo) REPO="${2:?}"; shift 2 ;;
     --port) PORT="${2:?}"; shift 2 ;;
+    --keep) KEEP="${2:?}"; shift 2 ;;
     --serve) SERVE=1; shift ;;
     --sudo) USE_SUDO=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
@@ -38,6 +42,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 SUDO=""; [[ "$USE_SUDO" == "1" ]] && SUDO="sudo"
+[[ "$KEEP" =~ ^[0-9]+$ ]] || { echo "Error: --keep takes a number of versions (0 keeps every one)" >&2; exit 1; }
 
 command -v apt-ftparchive >/dev/null 2>&1 || {
   echo "Error: missing 'apt-ftparchive' — install with: apt-get install -y apt-utils" >&2
@@ -57,10 +62,21 @@ $SUDO mkdir -p "$REPO"
 TMP_DEB="$REPO/.$(basename "$DEB").partial"
 $SUDO cp -f "$DEB" "$TMP_DEB"
 $SUDO mv -f "$TMP_DEB" "$REPO/$(basename "$DEB")"
+# Retention: with --keep N only the newest N versions stay (by version order, not by date), and
+# the one just published always stays. Each removal is printed. Without it the repo kept every
+# version, ~250 MB each, and filled the build box's disk (FINDINGS B-17).
+if [[ "$KEEP" -gt 0 ]]; then
+  while read -r old; do
+    [[ -n "$old" && "$old" != "$(basename "$DEB")" ]] || continue
+    $SUDO rm -f "$REPO/$old"
+    echo "   pruned $old"
+  done < <(cd "$REPO" && ls fluxbee_*_amd64.deb 2>/dev/null | sort -V | head -n -"$KEEP")
+fi
 # Flat repo: rebuild the index into temp files, then swap them in with atomic renames. Writing
 # `> Packages` in place truncated the LIVE index for the whole scan, so a client running
 # `apt-get update` meanwhile saw an EMPTY repo. Release goes last, so it always describes the
-# Packages already in place. Every version stays listed (rollback is `apt install fluxbee=<v>`).
+# Packages already in place. Every version in the repo stays listed (rollback is
+# `apt install fluxbee=<v>`).
 # The checksums come from the cache: dpkg-scanpackages re-hashed every .deb on each publish
 # (8.6 min with 51 of them, ~245 MB each); with the cache only the new one is hashed.
 $SUDO mkdir -p "$(dirname "$CACHE")"
