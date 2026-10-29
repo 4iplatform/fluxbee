@@ -3677,7 +3677,7 @@ router reviews.
   describe what is available, not what is running. The fleet comparison already solves it, but
   read on its own it is confusing.
 
-### B-17 🟡 MITIGATED (2026-10-29, 94% → 71%; two deletions wait for the operator) — The PROD host's disk pool reached 94%, and the VM disks never gave space back
+### B-17 ✅ RESOLVED (2026-10-29, 94% → 50%) — The PROD host's disk pool reached 94%, and the VM disks never gave space back
 
 - **What was observed (API reads and `df` in the VMs, 2026-10-29):**
   - `local-lvm` (LVM-thin, 186.4 GiB) holds every VM disk: 175.1 GiB used (93.9%), 11.3 GiB
@@ -3713,19 +3713,19 @@ router reviews.
      egress1 1 GiB; fb-build already had 2 GiB, B-15). The guests' processes use 0.4–0.8 GiB
      each, and the rest of their RAM is page cache that the host could not take back. Now
      Proxmox reclaims it when the host goes over 80%.
-  - **The pool:** 93.9% → 87.7% (fb-build trimmed) → 81.8% (the retention) → 71.2% (the hives'
-    snapshots): 53.6 GiB free. Each reboot was checked with `ops health` and `ops versions`
-    (0.1.90 everywhere, no failed unit, the edge certificate and the web door fine).
-- **Still open:**
-  - **fb-build's `pre-lan-nic-20260925`:** Claude Code's permission classifier refused its
-    deletion, so it waits for the operator's explicit OK. It holds what fb-build wrote before
-    09-25 and has rewritten since. The API shows no per-volume usage; the estimate is tens of GiB.
-  - **VM 104 `fb-worker2`:** its destruction was refused the same way, and waits too.
-  - **The hives' remaining snapshot** holds most of what they trimmed (the guests issued
-    motherbee 49.6 GiB, worker1 25, ingress1 15.5, egress1 15.7). It comes back when the next
-    deploy replaces it.
-- **A second environment now fits:** 53.6 GiB free in the pool, and the balloon floors leave
-  room in memory without new hardware.
+  5. **With the operator's explicit OK** (Claude Code's permission classifier had refused both):
+     fb-build got a fresh snapshot, `backup-20261029`, and its `pre-lan-nic-20260925` was
+     deleted: it held 35.6 GiB. VM 104 `fb-worker2` was destroyed with its volumes; a gate that
+     needs a throwaway worker clones one from the template.
+- **The pool:** 93.9% → 87.7% (fb-build trimmed) → 81.8% (the retention) → 71.2% (the hives'
+  snapshots) → 52.1% (fb-build's old snapshot) → 50.1% (VM 104): 93.5 of 186.4 GiB used, 93.0
+  GiB free. Each reboot was checked with `ops health` and `ops versions` (0.1.90 everywhere, no
+  failed unit, the edge certificate and the web door fine).
+- **What comes back by itself:** each hive's one snapshot, `pre-wfcase0-0-1-90`, still holds
+  most of what its guest trimmed (motherbee 49.6 GiB issued, worker1 25, ingress1 15.5, egress1
+  15.7). It comes back when the next deploy replaces that snapshot.
+- **A second environment fits:** half the pool is free, and the balloon floors leave room in
+  memory without new hardware.
 
 ---
 
