@@ -1078,6 +1078,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-124 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
+
+- **What happens:** `publish_cloud_endpoint` answers with the new bearer, once
+  ([io-cloud-api](../../docs/io-cloud-api.md) §2 and §7). Through Archi, that answer goes further:
+  - SY.admin's executor runs every step of a plan through a model (`create_function_calling_model`
+    in src/bin/sy_admin.rs). The action's answer, token included, goes back to the model as the
+    tool's result, so the hive's AI provider receives it.
+  - The step's `result_preview` carries the same answer to Archi, which stores the whole response
+    in its `messages` table (`persist_chat_exchange` in src/bin/sy_architect.rs), in
+    `/var/lib/fluxbee/nodes/SY/SY.architect@motherbee/architect.lance`. Archi redacts the
+    parameters it stores (`redact_json_secret_fields`), not the answer.
+  - SY.admin's own logs keep no token: the executor's run log is redacted
+    (`redact_executor_log_value`), and the command log keeps the status, not the answer.
+- **Why it matters:** the token is the platform credential for every tenant of the hive, and the
+  contract says it lives only in the vault. Archi is the operator's interface, so rotating the
+  token there is the path an operator will take.
+- **Today:** rotate it through the motherbee's HTTP API (`POST /hives/motherbee/cloud/endpoint`),
+  which answers without a model.
+- **Options:** run `publish_cloud_endpoint` without the model and have Archi show the token once
+  without storing it; or keep the token out of what the model and Archi's history receive.
+
 ### A-123 🟡 OPEN (found 2026-10-29, 0.1.90 review) — A message on a running WF instance's thread drives it, whoever sends it
 
 - **What happens** (go/nodes/wf/wf-generic/node/correlate.go): correlation by thread does not look
