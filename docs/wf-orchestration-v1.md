@@ -13,7 +13,8 @@
   in 0.1.90 (2026-10-29; ledger 0.1.90).
 - **Case 1 (§5.2)** is the operator's circuit of 2026-10-29: a sale handed to invoicing, then a
   due-date timer and a payment check. Its decisions were taken, and it was built and reviewed, on
-  2026-10-29 (§5.2.1, §5.2.3). Next: the release 0.1.91 and the validation on 8.x (§5.2.2). The
+  2026-10-29 (§5.2.1, §5.2.3). It was released in 0.1.91 and validated on 8.x on 2026-10-30
+  (§5.2.2; ledger 0.1.91). Next: Cases 3 and 4 (§5), each decided with the operator first. The
   operator: close the WF topic completely, case by case; Archi through Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
@@ -289,6 +290,8 @@ This is the single place for the track. The cases are worked here one at a time.
   - the structured answer;
   - a timer time taken from an agent's answer;
   - the IO node's `reply_target` kept in state.
+
+  **Done in 0.1.91 (§5.2).**
 - **Case 2:** taken into Case 1 on 2026-10-29.
 - **Case 3, escalation.** A field of the agent's evaluation routes the case to a supervisor's IO
   node (a name written in the definition), with its data.
@@ -372,7 +375,7 @@ This is the single place for the track. The cases are worked here one at a time.
   - a send to an agent with `thread_id_ref` loops (A-116, Case 2's correlation);
   - SY.timer takes a timer for another node from any node (A-115).
 
-### 5.2 Case 1: the operator's circuit (decided and built, 2026-10-29)
+### 5.2 Case 1 (0.1.91): the operator's circuit. Decided and built 2026-10-29, validated 2026-10-30
 
 **The circuit:**
 1. A registered person writes. The IO node hands every message to the WF, which sends it to
@@ -444,8 +447,8 @@ Which of them a WF uses is its author's choice (*"flavor del programador"*).
 **Decided: only the nodes involved drive an instance** (A-123): those written in the definition,
 and SY.timer for the WF's own timers. *"Determinístico… no veo por qué algo adaptable."*
 
-**Built** as §5.2.1 describes, then one review round (§5.2.3). Next: the release (0.1.91) and the
-validation on 8.x (§5.2.2). The operator, 2026-10-29: *"avanzá como describís… terminá cuando esté
+**Built** as §5.2.1 describes, then one review round (§5.2.3). Released in 0.1.91 and validated on
+8.x on 2026-10-30 (§5.2.2). The operator, 2026-10-29: *"avanzá como describís… terminá cuando esté
 todo probado"*.
 
 #### 5.2.1 The build design
@@ -682,6 +685,43 @@ todo probado"*.
 - a restart of the WF in the middle keeps the conversation.
 
 Afterwards the gate's objects are removed. `pruebas`, its keys and `AI.pruebas` stay.
+
+**Run on 2026-10-30, on 0.1.91 (ledger 0.1.91). Every check held.**
+- **The setup:** the agents ran on the hive's model, Claude Sonnet 5.5, with their roles composed.
+  The WF compiled in 5 s: 8 states, 55 actions and 34 guards.
+- **The script:**
+  1. Sales answered the quote in 3 s, with the trail `[AI.gate0191sales, WF.gate0191]`.
+  2. *"Dale, facturámelo"*: sales answered `area: invoice`, and the WF forwarded the same message to
+     invoice with the order in its block. Invoice issued `F-0191-0001` for 1000, due in `2m`. The
+     person got invoice's answer 8 s after the message, and nothing from sales.
+  3. After the WF's restart, *"gracias"* went straight to invoice. Invoice remembered the invoice and
+     issued none.
+  4. SY.timer fired `payment_due` exactly 2 minutes after the invoice, across the restart.
+     Payments' notice reached the person 3 s later, as `PAYMENT_DUE` on the conversation's thread.
+  5. The instance closed 3 minutes after the notice, with nothing kept and no timer left.
+- **The checks:**
+  - **A stranger:** `IO.gate0191x` wrote on the conversation's thread. It was dropped ("the
+    definition does not involve its sender"), and nothing was delivered.
+  - **A late answer:** written under `AI.gate0191payments`'s name, once on the closed conversation's
+    thread and once on a fresh one. Both were dropped ("no running instance on its thread, and it
+    starts none").
+  - **After the close:** the person's next message on the same thread started a new instance at
+    sales.
+  - **The restart:** recovery loaded the instance, with its state and timers unchanged.
+  - **The person:** the agents saw the person's `src_ilk` on every forwarded message. Payments
+    logged `missing src_ilk` on the WF's own `PAYMENT_DUE`, as recorded (A-116).
+  - **The language:** six definitions were refused through SY.admin with `COMPILE_ERROR`, naming
+    the path:
+    - `AI.*` in `start_from`;
+    - `SY.*` in `start_from`;
+    - no `start_from`;
+    - a forward with `name`;
+    - a `keep_message` on a timer;
+    - a target with a space.
+  - **The store:** the inbound journal and the internal events were empty at every check.
+  - **Health** was clean on the four hives.
+- **Read from the WF's store, read only:** the instances' states and logs. SY.admin has no instance
+  actions yet (Case 4).
 
 #### 5.2.3 The review round (2026-10-29)
 

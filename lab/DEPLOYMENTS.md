@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ live | snap `pre-wfcase0-0-1-90` (all 4 VMs) · `apt install fluxbee=0.1.89` + core-update of the spokes |
+| **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ live | snap `pre-wfcase1-0-1-91` (all 4 VMs) · `apt install fluxbee=0.1.90` + core-update of the spokes |
+| **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ replaced by 0.1.91 | snap `pre-wfcase0-0-1-90` (deleted 2026-10-30) · `apt install fluxbee=0.1.89` + core-update of the spokes |
 | **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ replaced by 0.1.90 | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
 | **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ replaced by 0.1.89 | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
 | **0.1.87** | 2026-10-27 | `6772df4` | motherbee + spokes (core) | ✅ replaced by 0.1.88 | snap `pre-tools1-0-1-87` (all 4 VMs) · `apt install fluxbee=0.1.86` + core-update of the spokes; an AI node without `behavior.model` needs one first (see the entry) |
@@ -99,6 +100,137 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.91 — The WF track, Case 1: one instance per conversation, `start_from`, only the nodes involved drive an instance, `forward` and `keep_message`, the WF's metadata block, timer times from state, internal transitions; ai.generic reads the block and answers with `text_field` (wf-orchestration-v1 §5.2; A-123, A-116 in part)
+
+- **Date:** 2026-10-30 (ART) · **Previous version:** 0.1.90 · **Commit:** `75a6786` (the code is
+  `70b42db`).
+- **Scope:** motherbee and the three spokes (core update). PROD ran no WF before it.
+- **Design:** [wf-orchestration-v1](../docs/wf-orchestration-v1.md) §5.2, the operator's decisions
+  of 2026-10-29:
+  - one instance per conversation;
+  - a forward changes only the metadata, and the WF gives an agent deterministic context there;
+  - control goes back to sales when an agent hands the case back, or on an inactivity timer;
+  - only the nodes involved drive an instance (A-123).
+
+  The build:
+  - Two agents built it: one the WF engine and its language, the other ai.generic and its SDK.
+    I made some changes after them.
+  - One review round, with five reviewers: the engine, security, the language, the docs and the
+    agents (§5.2.3).
+  - Fixed before the release, among others:
+    - **One person's message could bounce between sales and invoice forever.** A probe made 101
+      agent requests from one message. Now a handback delivers invoice's answer and waits for the
+      person. A-125 records an engine cap for Case 4.
+    - **An agent in `start_from`** would let its late answer start an instance. `start_from` now
+      refuses it.
+    - **An agent's error or timeout ended a pending payment check.** Both now go back to sales.
+    - **A blank answer under a `text_field`** broke the person's later turns on Anthropic. The
+      history now keeps the object.
+    - **A replayed creation** could put a second instance on a thread.
+- **What changed:**
+  - **One instance per conversation.** An instance lives on the thread of the message that started
+    it, or on its own id when that message had none. Store schema v4 adds a thread column and the
+    kept messages, and refuses a second running instance on a thread.
+  - **Only the nodes involved drive an instance (A-123).** The engine takes an event in this order:
+    1. the fire of its own timer, from SY.timer;
+    2. a sender the definition does not name is dropped;
+    3. a message on a running instance's thread goes to that instance;
+    4. a non-reply from a `start_from` node starts one;
+    5. anything else is dropped.
+
+    `start_from` is required, and refuses `SY.*`, `RT.*` and `AI.*`. `event_match.src` names a
+    sender.
+  - **`forward` and `keep_message`:**
+    - `forward` sends a kept message, or the event's, with its whole meta except the memory package,
+      and its payload byte for byte;
+    - `keep_message` keeps a message under a name, committed with its transition.
+  - **The WF's block.** `meta.context.wf` carries the trail and the variables a definition names.
+    ai.generic shows it to the model after the memory block, and keeps it out of the history.
+  - **Timers and transitions.** A timer takes `fire_in` or `fire_at` from state (`$ref`), with the
+    60 s floor checked at run time. A transition may stay in its state (no `target_state`).
+  - **ai.generic answers a `text_field` contract.** The person gets the text, and the WF gets the
+    object in `meta.context.evaluation`. The history keeps the object as the agent's turn.
+  - **The language refuses more:**
+    - another action type's fields;
+    - a `keep_message`, or a forward without a message, on a timer's transition;
+    - a target with spaces;
+    - a contract the agents refuse.
+  - **The examples and the docs follow:**
+    - `wf.invoice` and `wf.router` 0.0.7 take `start_from`;
+    - the new `wf.sales.invoice` is Case 1's circuit;
+    - Archi's seeds are at `seed_version` 3;
+    - SY.admin's help, the spec, the quickstart, sy-wf-rules, the handbook and the READMEs.
+- **Deploy:**
+  - build of `75a6786` in 19 min, deploy in 236 s;
+  - publish: the repo keeps 0.1.82 to 0.1.91 (0.1.81 pruned), and `dist/` dropped 0.1.90's .deb;
+  - snapshots `pre-wfcase1-0-1-91` on the 4 VMs (`pre-wfcase0-0-1-90` was deleted);
+  - 0.1.91 on all 4 (core manifest `4d77769cf19bce32`), with health clean;
+  - `wf.engine` and `ai.generic` `current` are 0.1.91 on the motherbee and worker1, their only
+    version. `AI.pruebas` runs, HEALTHY;
+  - Archi logged "cookbook seeds upgraded" for its design and artifact cookbooks.
+- **Gate** ([wf-orchestration-v1](../docs/wf-orchestration-v1.md) §5.2.2), from inside, with no
+  extra pieces in the infrastructure:
+  - **The pieces:**
+    - three agents in `pruebas` on worker1: `AI.gate0191sales`, `AI.gate0191invoice` and
+      `AI.gate0191payments`, with immediate memory on and Spanish roles through Archi;
+    - `WF.gate0191@worker1`, through `wf_rules_compile_apply` with `auto_spawn`, holding Case 1's
+      definition on those names;
+    - a client on worker1's router socket named `IO.gate0191`, sending a registered person's
+      messages with a `meta.context.io`.
+  - **Language:** six definitions got `COMPILE_ERROR` through SY.admin, naming the path:
+    - `AI.*` in `start_from`;
+    - `SY.*` in `start_from`;
+    - no `start_from`;
+    - a forward with `name`;
+    - a `keep_message` on a timer;
+    - a target with a space.
+
+    The real one compiled in 5 s.
+  - **The conversation**, on one thread and one instance:
+    1. The quote: sales answered in 3 s.
+    2. *"Dale, facturámelo"*: sales answered `area: invoice`. The WF forwarded the same message to
+       invoice, with the order in its block, and invoice issued `F-0191-0001` for 1000, due in 2
+       minutes. The person got invoice's answer 8 s after the message.
+    3. The WF node restarted.
+    4. *"Gracias"* went straight to invoice, which remembered the invoice.
+    5. SY.timer fired `payment_due` 2 minutes after the invoice, across the restart. Payments'
+       notice reached the person 3 s later.
+    6. The instance closed after 3 minutes without messages.
+
+    Every delivery carried its trail, the conversation's thread and the person as `dst_ilk`.
+  - **The checks:**
+    - **A stranger** on the thread was dropped (A-123).
+    - **The restart:** recovery loaded the instance, with its state and timers unchanged.
+    - **A late answer** under payments' name, on the closed thread and on a fresh one, started
+      nothing.
+    - **After the close,** the person's next message started a new instance at sales.
+  - **The store:** the inbound journal and the internal events were empty at every check. The
+    instances' states and logs were read from the WF's store, read only, because SY.admin has no
+    instance actions yet (Case 4).
+  - **Health:** `failed=0`, `denials=0` on all 4, through the gate.
+- **Cleanup:**
+  - the workflow `gate0191` was deleted with `force`, node and package;
+  - the three agents were killed and purged, with their ILKs;
+  - their roles were deleted from Archi;
+  - the person's ILK was deleted and purged;
+  - the gate's folder on worker1 was removed.
+
+  `pruebas`, its keys and `AI.pruebas` stay.
+- **Noted:**
+  - A message the WF writes itself carries no `src_ilk`, so payments logged `missing src_ilk` on
+    `PAYMENT_DUE` (the rest of A-116, recorded as left out of Case 1).
+  - Compiling a valid definition through `wf-rules/compile` stages it. Here it was the current hash,
+    and the delete removed it.
+- **Upgrading another hive:** each workflow is redeployed with `start_from`.
+  - A definition written before 0.1.91 no longer loads, and its node is `FAILED_CONFIG`
+    (`invalid_definition`).
+  - Its running instances fail at the next start (`definition_unavailable`).
+  - The store moves to schema v4 by itself.
+- **Rollback:**
+  - snapshot `pre-wfcase1-0-1-91`;
+  - or `apt install fluxbee=0.1.90` plus the core update of the spokes. A WF database written by
+    0.1.91 (schema v4) is not one 0.1.90 reads; PROD has none.
 
 ## 0.1.90 — The WF track, Case 0: a WF always sends `user`, `event.timer_key`, an instance ends on its own definition, at least once, `$ref` with a default, the WF's controls answer only SY.admin and SY.wf-rules, `target_ref` goes (wf-orchestration-v1 §5.1; A-117, A-118, A-119)
 

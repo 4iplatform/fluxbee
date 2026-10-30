@@ -1116,7 +1116,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Options:** run `publish_cloud_endpoint` without the model and have Archi show the token once
   without storing it; or keep the token out of what the model and Archi's history receive.
 
-### A-123 🟡 OPEN (found 2026-10-29, 0.1.90 review) — A message on a running WF instance's thread drives it, whoever sends it
+### A-123 ✅ VALIDATED ON 8.x (0.1.91, 2026-10-30) — A message on a running WF instance's thread drives it, whoever sends it
 
 - **What happens** (go/nodes/wf/wf-generic/node/correlate.go): correlation by thread does not look
   at the sender, and an `event_match` names no sender either.
@@ -1132,6 +1132,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Decided (the operator, 2026-10-29, WF Case 1):** only the nodes involved drive an instance:
   those written in the definition, and SY.timer for the WF's own timers. Nothing adaptable. It is
   built with Case 1 ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2).
+- **Built in 0.1.91.** The engine takes an event in this order:
+  1. the fire of its own timer, from SY.timer of its hive;
+  2. a sender the definition does not name is dropped;
+  3. a message on a running instance's thread goes to that instance;
+  4. a non-reply from a `start_from` node starts one;
+  5. anything else is dropped.
+
+  `start_from` is required and refuses `SY.*`, `RT.*` and `AI.*`, and `event_match.src` names a
+  sender.
+- **Validated on 8.x (2026-10-30, the 0.1.91 gate):**
+  - a stranger on a running conversation's thread was dropped ("the definition does not involve
+    its sender");
+  - an agent's late answer, on the closed conversation's thread and on a fresh one, started
+    nothing;
+  - `AI.*` and `SY.*` in `start_from` got `COMPILE_ERROR`.
 
 ### A-122 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 
@@ -1321,7 +1336,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
     SY.admin, naming the path. They covered `meta.type`, `target_ref`, `event_match.type`, a
     `$ref` with another root, and one with an extra key.
 
-### A-116 🔴 OPEN (found 2026-10-27) — A WF in front of a conversation loses the person and the conversation for the agent
+### A-116 🟡 OPEN, IN PART (found 2026-10-27; the conversation and the forwarded person fixed in 0.1.91) — A WF in front of a conversation loses the person and the conversation for the agent
 
 - **What happens** (go/nodes/wf/wf-generic/node/):
   - **What an instance sees** of a message (`messageToMap`, instance.go): `trace_id`, `msg`,
@@ -1349,6 +1364,16 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
     `llm_usage` row has no counterpart.
 - **Next:** [wf-orchestration-v1](../../docs/wf-orchestration-v1.md), Cases 1–2: the forward, and
   the correlation by conversation.
+- **Fixed in 0.1.91 (WF Case 1, validated on 8.x on 2026-10-30):**
+  - **One instance per conversation:** an instance lives on the thread of the message that
+    started it, and every message it sends carries that thread. The agents keep one memory per
+    conversation, and the person's next message reaches the instance.
+  - **`forward`** sends a message on with its whole meta, `src_ilk` and `ich` included. The agents
+    saw the person's `src_ilk` on every forwarded message of the gate.
+  - **`thread_id_ref` left the language,** and with it the loop the 0.1.90 review found.
+- **Still open:** a message the WF writes itself (`send_message`) carries no `src_ilk`, so the agent
+  logs `missing src_ilk`. In the gate it was payments' `PAYMENT_DUE`. Recorded as left out of Case 1
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2.1).
 
 ### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
