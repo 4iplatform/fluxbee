@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -123,10 +124,11 @@ var (
 
 // fieldErrors names, by their paths, the fields an action has that are not its type's (another
 // type's field: a key no type has is the strict decoder's to report), the fields a menu, its options
-// or their params have that are not theirs, and the fields that left the definition language in
-// 0.1.90 (wf-orchestration-v1 §5.1) and 0.1.91 (thread_id_ref, §5.2.1), which the strict decoder
-// refuses too, but only as an unknown field, without saying where or why. A definition that is not
-// JSON is the decoder's to report.
+// or their params have that are not theirs, the fields that left the definition language in 0.1.90
+// (wf-orchestration-v1 §5.1) and 0.1.91 (thread_id_ref, §5.2.1), which the strict decoder refuses
+// too, but only as an unknown field, without saying where or why, and the fields written with other
+// capitals (capitalErrors), which the strict decoder takes. A definition that is not JSON is the
+// decoder's to report.
 func fieldErrors(data []byte) ValidationErrors {
 	type transition struct {
 		EventMatch map[string]any   `json:"event_match"`
@@ -211,18 +213,94 @@ func fieldErrors(data []byte) ValidationErrors {
 	for j, t := range doc.Catch {
 		checkTransition(fmt.Sprintf("catch[%d]", j), t)
 	}
+	var raw any
+	_ = json.Unmarshal(data, &raw)
+	return append(errs, capitalErrors("", raw, reflect.TypeFor[WorkflowDefinition]())...)
+}
+
+// capitalErrors names, by their paths, the keys of raw, a level of the definition as written, that
+// are a field of their level written with other capitals: encoding/json takes a key for the field
+// whose name it equals ignoring case, so the strict decoder loaded a forward's "Name" as its name
+// (and the forward sent the event instead of the kept message), and "States" as the states. It walks
+// raw along t, the Go type of its level: a struct is a level of the definition language (the
+// definition, a state, a transition, an event_match, an action, its meta, a menu, an option, a
+// param), and a field of type any (a payload, vars, meta.context, a value, a timer's time) or
+// map[string]any (the input_schema) holds user data, whose keys are never checked.
+func capitalErrors(path string, raw any, t reflect.Type) ValidationErrors {
+	var errs ValidationErrors
+	switch t.Kind() {
+	case reflect.Pointer:
+		return capitalErrors(path, raw, t.Elem())
+	case reflect.Slice:
+		items, _ := raw.([]any)
+		for i, item := range items {
+			errs = append(errs, capitalErrors(fmt.Sprintf("%s[%d]", path, i), item, t.Elem())...)
+		}
+	case reflect.Map:
+		// A menu option's params, by name.
+		object, _ := raw.(map[string]any)
+		for _, key := range sortedKeys(object) {
+			errs = append(errs, capitalErrors(path+"."+key, object[key], t.Elem())...)
+		}
+	case reflect.Struct:
+		object, _ := raw.(map[string]any)
+		fields := jsonFields(t)
+		for _, key := range sortedKeys(object) {
+			field := key
+			if _, exact := fields[key]; !exact {
+				field = ""
+				for name := range fields {
+					if strings.EqualFold(name, key) {
+						field = name
+						break
+					}
+				}
+				if field == "" {
+					// A key no field has is the strict decoder's to report.
+					continue
+				}
+				errs = append(errs, ValidationError{Path: fieldPath(path, field), Message: "is written " + key + ": the field is " + field})
+			}
+			errs = append(errs, capitalErrors(fieldPath(path, field), object[key], fields[field])...)
+		}
+	}
 	return errs
+}
+
+// jsonFields are the fields of the struct type t, by the names encoding/json decodes them from.
+func jsonFields(t reflect.Type) map[string]reflect.Type {
+	fields := map[string]reflect.Type{}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if !field.IsExported() || name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		fields[name] = field.Type
+	}
+	return fields
+}
+
+// fieldPath is the path of the field name of the level at path ("" for the definition).
+func fieldPath(path, name string) string {
+	if path == "" {
+		return name
+	}
+	return path + "." + name
 }
 
 // menuFieldErrors names, by their paths, the fields a menu, its options or their params have that are
 // not theirs (menuFields, menuOptionFields, menuParamFields). A value of the wrong JSON type is the
-// strict decoder's to report.
+// strict decoder's to report, and a field written with other capitals capitalErrors'.
 func menuFieldErrors(path string, menu map[string]any) ValidationErrors {
 	var errs ValidationErrors
 	unknown := func(path string, object map[string]any, fields []string, of string) {
-		for _, field := range sortedKeys(object) {
-			if !slices.Contains(fields, field) {
-				errs = append(errs, ValidationError{Path: path + "." + field, Message: "is not a field of " + of})
+		for _, key := range sortedKeys(object) {
+			if !slices.ContainsFunc(fields, func(field string) bool { return strings.EqualFold(field, key) }) {
+				errs = append(errs, ValidationError{Path: path + "." + key, Message: "is not a field of " + of})
 			}
 		}
 	}
@@ -412,8 +490,11 @@ func validateTransition(path string, transition *TransitionDefinition, inCatch b
 
 // eventlessErrors refuses, where an event may be no node's message, what needs one: a keep_message,
 // and a forward without message (of the event), either of which would fail the instance.
-//   - A state's transition matched on msg TIMER_FIRED takes a timer's fire. Its own actions run on
-//     it, and so do its state's exit actions and its target's entry actions.
+//   - A state's transition matched on msg TIMER_FIRED takes a timer's fire. One whose event_match
+//     names no src takes an internal event, which has no sender, when its msg is AGENT_CALL_CAP (the
+//     engine's, past the cap on agent calls, which must not fail the instance) or one an
+//     emit_internal_event of the definition emits. Its own actions run on it, and with a
+//     target_state so do its state's exit actions and its target's entry actions.
 //   - A catch transition whose event_match names no src may take a timer's fire or an internal event
 //     (wf-orchestration-v1 §5.3.6: a keep_message, or a forward of the event, needs a src). Its own
 //     actions run on it, and with a target_state so do its target's entry actions and the exit
@@ -445,17 +526,30 @@ func eventlessErrors(def *WorkflowDefinition) ValidationErrors {
 			reported[actionPath] = true
 		}
 	}
+	// The msgs of the internal events an instance may get: AGENT_CALL_CAP, and those the definition
+	// emits.
+	internal := map[string]bool{MsgAgentCallCap: true}
+	def.eachAction(func(_ string, action ActionDefinition) {
+		if action.Type == "emit_internal_event" && action.Meta != nil && action.Meta.Msg != "" {
+			internal[action.Meta.Msg] = true
+		}
+	})
 	for i, state := range def.States {
 		for j, transition := range state.Transitions {
-			if transition.EventMatch.Msg != "TIMER_FIRED" {
+			at := fmt.Sprintf("states[%d].transitions[%d]", i, j)
+			var on string
+			switch match := transition.EventMatch; {
+			case match.Msg == "TIMER_FIRED":
+				on = "the TIMER_FIRED of " + at
+			case match.Src != "" || !internal[match.Msg]:
 				continue
+			case match.Msg == MsgAgentCallCap:
+				on = "the " + MsgAgentCallCap + " of " + at
+			default:
+				on = "the internal event " + match.Msg + " of " + at
 			}
-			where := eventless{
-				on:         fmt.Sprintf("the TIMER_FIRED of states[%d].transitions[%d]", i, j),
-				why:        "which is no node's message",
-				forwardFix: ": forward a kept one",
-			}
-			check(fmt.Sprintf("states[%d].transitions[%d].actions", i, j), transition.Actions, where)
+			where := eventless{on: on, why: "which is no node's message", forwardFix: ": forward a kept one"}
+			check(at+".actions", transition.Actions, where)
 			if transition.TargetState == "" {
 				continue
 			}
@@ -917,7 +1011,9 @@ type menuNames struct {
 func (def *WorkflowDefinition) menuNames() menuNames {
 	names := menuNames{options: map[string]bool{NoneOption: true}, params: map[string]bool{ReasonParam: true}}
 	def.eachAction(func(_ string, action ActionDefinition) {
-		if action.Menu == nil {
+		// Only a send_message or a forward offers its menu to an agent: a menu on another action
+		// offers nothing, and widens no name a guard may use.
+		if action.Menu == nil || (action.Type != "send_message" && action.Type != "forward") {
 			return
 		}
 		for _, option := range action.Menu.Options {
@@ -930,40 +1026,43 @@ func (def *WorkflowDefinition) menuNames() menuNames {
 	return names
 }
 
-// Where a guard, a value or a $ref reads an agent's evaluation (its answer's meta.context.evaluation).
+// Where a guard, a value or a $ref reads an agent's evaluation (its answer's meta.context.evaluation),
+// and the fields the evaluation has: a menu's answer is {reply, option, params}.
 var (
+	evaluationPath   = []string{"event", "context", "evaluation"}
 	evaluationOption = []string{"event", "context", "evaluation", "option"}
 	evaluationParams = []string{"event", "context", "evaluation", "params"}
+	evaluationFields = []string{"reply", "option", "params"}
 )
 
 // exprErrors checks, in the checked AST of a CEL expression (a guard, a set_variable value), what it
-// reads of an agent's evaluation against the definition's menus: a comparison of
-// event.context.evaluation.option with a string literal (==, !=, in) names an option of one of them,
-// or none, and a read of event.context.evaluation.params.<p> a param of one of them, or reason. A
-// name no menu has is a typo: a guard that never matches, a value that fails the instance.
+// reads of an agent's evaluation against its fields and the definition's menus: a read, as
+// readMessage says; a comparison of event.context.evaluation.option with a string literal (==, !=,
+// in), which names an option of one of the menus, or none (the empty string names no option, and
+// option != "" is any menu's answer); and a param name looked for in the params (in), which names a
+// param of one of them, or reason. A name the evaluation or no menu has is a typo: a guard that
+// never matches, a value that fails the instance.
 func (names menuNames) exprErrors(path string, checked *cel.Ast) ValidationErrors {
 	var errs ValidationErrors
 	reported := map[string]bool{}
 	report := func(message string) {
-		if !reported[message] {
+		if message != "" && !reported[message] {
 			reported[message] = true
 			errs = append(errs, ValidationError{Path: path, Message: message})
 		}
 	}
 	option := func(e celast.Expr) {
-		if name, ok := stringLiteral(e); ok && !names.options[name] {
+		if name, ok := stringLiteral(e); ok && name != "" && !names.options[name] {
 			report(fmt.Sprintf("compares event.context.evaluation.option with %q, an option no menu of the definition offers: %s", name, nameList(names.options, NoneOption)))
 		}
 	}
-	readsOption := func(e celast.Expr) bool {
+	reads := func(e celast.Expr, want []string) bool {
 		read, ok := readPath(e)
-		return ok && slices.Equal(read, evaluationOption)
+		return ok && slices.Equal(read, want)
 	}
 	celast.PreOrderVisit(checked.NativeRep().Expr(), celast.NewExprVisitor(func(e celast.Expr) {
 		if read, ok := readPath(e); ok {
-			if param, ok := evaluationParam(read); ok && !names.params[param] {
-				report(names.paramMessage(param))
-			}
+			report(names.readMessage(read))
 		}
 		if e.Kind() != celast.CallKind || len(e.AsCall().Args()) != 2 {
 			return
@@ -971,17 +1070,20 @@ func (names menuNames) exprErrors(path string, checked *cel.Ast) ValidationError
 		args := e.AsCall().Args()
 		switch e.AsCall().FunctionName() {
 		case operators.Equals, operators.NotEquals:
-			if readsOption(args[0]) {
+			if reads(args[0], evaluationOption) {
 				option(args[1])
 			}
-			if readsOption(args[1]) {
+			if reads(args[1], evaluationOption) {
 				option(args[0])
 			}
 		case operators.In:
-			if readsOption(args[0]) && args[1].Kind() == celast.ListKind {
+			if reads(args[0], evaluationOption) && args[1].Kind() == celast.ListKind {
 				for _, element := range args[1].AsList().Elements() {
 					option(element)
 				}
+			}
+			if param, ok := stringLiteral(args[0]); ok && reads(args[1], evaluationParams) && !names.params[param] {
+				report(fmt.Sprintf("looks for %q in event.context.evaluation.params, a param no menu of the definition offers: %s", param, nameList(names.params, ReasonParam)))
 			}
 		}
 	}))
@@ -989,14 +1091,13 @@ func (names menuNames) exprErrors(path string, checked *cel.Ast) ValidationError
 }
 
 // refErrors checks the $refs of an action (in its payload, meta.context, vars and timer times) that
-// read event.context.evaluation.params.<p>: p is a param of one of the definition's menus, or
-// reason.
+// read an agent's evaluation (readMessage).
 func (names menuNames) refErrors(path string, action ActionDefinition) ValidationErrors {
 	var errs ValidationErrors
 	check := func(field string, value any) {
 		eachRef(path+"."+field, value, func(refPath string, ref Ref) {
-			if param, ok := evaluationParam(strings.Split(ref.Path, ".")); ok && !names.params[param] {
-				errs = append(errs, ValidationError{Path: refPath + ".$ref", Message: names.paramMessage(param)})
+			if message := names.readMessage(strings.Split(ref.Path, ".")); message != "" {
+				errs = append(errs, ValidationError{Path: refPath + ".$ref", Message: message})
 			}
 		})
 	}
@@ -1010,16 +1111,22 @@ func (names menuNames) refErrors(path string, action ActionDefinition) Validatio
 	return errs
 }
 
-func (names menuNames) paramMessage(param string) string {
-	return fmt.Sprintf("reads event.context.evaluation.params.%s, a param no menu of the definition offers: %s", param, nameList(names.params, ReasonParam))
-}
-
-// evaluationParam is the param a read path names under event.context.evaluation.params.
-func evaluationParam(read []string) (string, bool) {
-	if len(read) <= len(evaluationParams) || !slices.Equal(read[:len(evaluationParams)], evaluationParams) {
-		return "", false
+// readMessage says what is wrong with read, the path a guard, a value or a $ref reads, when it reads
+// a field of an agent's evaluation: event.context.evaluation.<f> names one of evaluationFields, and
+// event.context.evaluation.params.<p> a param of one of the definition's menus, or reason. "" when
+// nothing is.
+func (names menuNames) readMessage(read []string) string {
+	if len(read) <= len(evaluationPath) || !slices.Equal(read[:len(evaluationPath)], evaluationPath) {
+		return ""
 	}
-	return read[len(evaluationParams)], true
+	field := read[len(evaluationPath)]
+	switch {
+	case !slices.Contains(evaluationFields, field):
+		return fmt.Sprintf("reads event.context.evaluation.%s, a field no agent's evaluation has: reply, option or params", field)
+	case field == "params" && len(read) > len(evaluationParams) && !names.params[read[len(evaluationParams)]]:
+		return fmt.Sprintf("reads event.context.evaluation.params.%s, a param no menu of the definition offers: %s", read[len(evaluationParams)], nameList(names.params, ReasonParam))
+	}
+	return ""
 }
 
 // readPath is the path an expression reads when it is a chain of field selections, or of indexes by

@@ -96,12 +96,16 @@ func (r *InstanceRegistry) All() []*WFInstance {
 //
 // So a person who writes again after their conversation's instance ended starts a new one, on the
 // same thread, at the initial state; an agent's late answer starts nothing.
+//
+// The node's log gets a payload's first characters only for a message that reaches an instance or
+// starts one: when every message of a node comes to the WF (a Slack channel's, say), the log must
+// not keep the text of those the WF drops.
 func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Message) error {
 	name := rawMsgName(msg)
 	sender := msg.SourceL2Name()
 	threadID := derefStringPtr(msg.Meta.ThreadID)
 	log.Printf(
-		"wf: correlate inbound type=%s msg=%q src_uuid=%s src_l2=%q thread_id=%q trace_id=%s target=%q payload=%s",
+		"wf: correlate inbound type=%s msg=%q src_uuid=%s src_l2=%q thread_id=%q trace_id=%s target=%q",
 		msg.Meta.MsgType,
 		name,
 		msg.Routing.Src,
@@ -109,7 +113,6 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 		threadID,
 		msg.Routing.TraceID,
 		derefStringPtr(msg.Meta.Target),
-		payloadPreview(msg.Payload),
 	)
 
 	if name == sdk.MsgTimerFired {
@@ -127,7 +130,7 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 		return nil
 	}
 	if onThread {
-		log.Printf("wf: correlate matched thread_id=%s instance_id=%s", threadID, inst.InstanceID)
+		log.Printf("wf: correlate matched thread_id=%s instance_id=%s payload=%s", threadID, inst.InstanceID, payloadPreview(msg.Payload))
 		return rt.deliver(ctx, inst, msg, "")
 	}
 	if !rt.Def.StartsFrom(sender) || isReply(name) {
@@ -170,6 +173,7 @@ func (rt *NodeRuntime) takeTimerFired(ctx context.Context, msg sdk.Message) erro
 		log.Printf("wf: TIMER_FIRED %q for instance %q, which is not running: dropped (orphaned timer)", timerKey, instanceID)
 		return nil
 	}
+	log.Printf("wf: correlate matched timer_key=%s instance_id=%s payload=%s", timerKey, instanceID, payloadPreview(msg.Payload))
 	return rt.deliver(ctx, inst, msg, timerKey)
 }
 
@@ -224,7 +228,9 @@ func (rt *NodeRuntime) runEvent(ctx context.Context, inst *WFInstance, msg sdk.M
 func (rt *NodeRuntime) create(ctx context.Context, msg sdk.Message) error {
 	input, err := creationInput(rt.Def, msg)
 	if err != nil {
-		log.Printf("wf: create rejected trace_id=%s detail=%v input=%s", msg.Routing.TraceID, err, payloadPreview(msg.Payload))
+		// A message that starts no instance leaves no text in the log.
+		log.Printf("wf: create rejected src_l2=%q thread_id=%q trace_id=%s detail=%v",
+			msg.SourceL2Name(), derefStringPtr(msg.Meta.ThreadID), msg.Routing.TraceID, err)
 		return rt.answerInvalidInput(ctx, msg, err.Error())
 	}
 	instanceID := newInstanceID()
@@ -264,13 +270,14 @@ func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanc
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
 	log.Printf(
-		"wf: create accepted instance_id=%s thread_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q",
+		"wf: create accepted instance_id=%s thread_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q payload=%s",
 		instanceID,
 		inst.ThreadID,
 		def.WorkflowType,
 		def.InitialState,
 		msg.Routing.TraceID,
 		msg.SourceL2Name(),
+		payloadPreview(msg.Payload),
 	)
 
 	inst.Lock()

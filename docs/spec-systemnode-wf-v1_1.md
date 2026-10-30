@@ -385,7 +385,7 @@ A built-in function `now()` returns the WF node's clock as Unix milliseconds (UT
 
 When a WF node loads its workflow definition, it runs these checks:
 
-1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused.
+1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused, and so is a field written with other capitals (`"Name"` for `name`, `"States"` for `states`), by its path: `is written Name: the field is name`. Go's JSON decoder takes a key for the field it equals ignoring case, so a `forward` with a `"Name"` loaded and forwarded the event instead of the kept message. This holds at every level of the language (the definition, a state, a transition, an `event_match`, an action, its `meta`, a menu, an option, a param, a catch transition), never inside user data: a `payload`, `vars`, what `meta.context` holds and the `input_schema` keep their keys as written.
 1a. `start_from` names at least one node, each a node name with its hive, never a `SY.*`, `RT.*` or `AI.*` node: an agent only answers, and one that starts instances and that the WF asks would have its late answer start a new instance, which asks it again (a WF↔AI loop).
 2. `input_schema` is valid JSON Schema.
 3. `initial_state` exists in `states`.
@@ -397,8 +397,8 @@ When a WF node loads its workflow definition, it runs these checks:
 8a. No action has `meta.type`, `target_ref` or `thread_id_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 and 0.1.91 (every message a WF sends is a `user` message, to a node name written in the definition, on the instance's thread; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
 8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), nor `response_envelope` (a WF asks an agent with `menu`), and its `vars` is a JSON object.
 8c. A `menu` is on a `send_message` or a `forward` to an `AI.*` node only, and follows the limits the agent checks it with again (§10.10): `help` up to 600 characters; 1 to 8 options, each with a name of its own that matches `^[a-z][a-z0-9_]{0,31}$` and is never `none`, a description of 1 to 200 characters and up to 8 params; each param with a name of that pattern, a `type` (`string`, `boolean`, `integer` or `number`), a description up to 200 characters and, on a string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode code points. A menu has no field but these, at any level, and no `$ref`.
-8d. On a transition matched on `msg` `TIMER_FIRED`, no `keep_message` and no `forward` without `message`, among its actions, its state's exit actions and its target's entry actions: a `TIMER_FIRED` is no node's message. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one.
-8e. What reads an agent's evaluation is checked against the definition's menus: a guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of them, or `none`; a guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>` names a param of one of them, or `reason`. A name no menu has would be a guard that never matches, or a value that fails the instance.
+8d. Where the event may be no node's message, no `keep_message` and no `forward` without `message`, either of which would fail the instance. On a state's transition that takes a `TIMER_FIRED` (matched on that `msg`) or an internal event, which has no sender (its `event_match` names no `src`, and its `msg` is `AGENT_CALL_CAP`, §9.6, or one an `emit_internal_event` of the definition emits): among its actions and, with a `target_state`, its state's exit actions and its target's entry actions. The error names the event: `the TIMER_FIRED of states[0].transitions[2]`, `the AGENT_CALL_CAP of ...`, `the internal event TO_SALES of ...`. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one. A `forward` of a kept message goes anywhere.
+8e. What reads an agent's evaluation is checked against what it is, a menu's answer `{reply, option, params}` (§10.10), and against the definition's menus, those of its `send_message` and `forward` actions. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.<f>` names `reply`, `option` or `params` (`event.context.evaluation.optoin` and `event.context.evaluation.param.question` are refused). A guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of the menus, or `none`; the empty string names no option, so `event.context.evaluation.option != ''` (any menu's answer) is no typo. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>`, and a guard that looks for a name in them (`'question' in event.context.evaluation.params`), names a param of one of the menus, or `reason`. A name the evaluation or no menu has would be a guard that never matches, or a value that fails the instance.
 9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is ≥ 60 seconds (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. A duration in days is at most `106751d`, the most a duration holds.
 10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
@@ -481,11 +481,11 @@ A definition may have a `catch` (since Case 3, `docs/wf-orchestration-v1.md` §5
 
 An instance sends at most **8 messages to agents** (`AI.*`) between two triggers (since Case 3, `docs/wf-orchestration-v1.md` §5.3.3, FINDINGS A-125). Without it, a definition whose agents keep answering each other, or whose catch asks a failing agent again, would loop.
 
-- **A trigger** is an event from a node that is no agent (an IO node or a WF), or a `TIMER_FIRED`. An agent's answer and an internal event go on with the count of the trigger they follow.
+- **A trigger** is an event from a node that is no agent (an IO node or another WF), or a `TIMER_FIRED`. An agent's answer, an internal event and a message the WF node sends itself go on with the count of the trigger they follow: a definition that loops through a send to its own node stops at the cap too.
 - **What counts:** each `send_message` or `forward` whose `target` is an `AI.*` node.
 - **Past the cap:** the send is not made, whatever its `on_error`. The instance's log says so (`agent_call_cap: ...`), and the transition's other actions run.
-- **The error event:** after that transition, the instance gets one internal event per trigger, `AGENT_CALL_CAP`, with the payload `{"type": "error", "code": "agent_call_cap", "message": "...", "target": "<the agent>"}`. It goes through the state's transitions, the catch and the default, as any event.
-- **The instance does not fail,** so its timers stay; the next trigger starts a new count.
+- **The error event:** after that transition, the instance gets one internal event per trigger, `AGENT_CALL_CAP`, with the payload `{"type": "error", "code": "agent_call_cap", "message": "...", "target": "<the agent>"}`. It goes through the state's transitions, the catch and the default, as any event. Like any internal event it has no sender, so a transition that takes it keeps and forwards no event (§8.5, 8d).
+- **The instance does not fail,** so its timers stay; the next trigger starts a new count. A cancellation (§12) and a failure start one too: the `cancelled` or `failed` state's entry actions send to an agent whatever the last trigger spent.
 - **The count lives in memory,** per instance: a restart starts it again.
 
 ## 10. Actions (the primitive vocabulary)
@@ -711,7 +711,7 @@ When the queued internal event is processed, it is presented through the normal 
 - `event.payload`
 - `event.trace_id`
 
-From the point of view of the workflow definition, an internal event behaves like any other event. The only difference is where it comes from.
+From the point of view of the workflow definition, an internal event behaves like any other event. The only difference is where it comes from: it has no sender, so a `keep_message` cannot keep it nor a `forward` send it on, and the load refuses either where an internal event runs them (§8.5, 8d).
 
 **Trace semantics.**
 
@@ -760,7 +760,7 @@ What goes out:
 - **The meta is the message's**: every field of it but `memory_package` (its type, `msg`, `src_ilk`, `dst_ilk`, `ich`, `scope`, `priority`, `context` and any other), and the WF sets the thread and the context. The person's ILK travels intact, for the agent's memory and the IO node's delivery.
 - **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; and the WF's block, whose trail is the message's own and this node.
 
-A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` on a transition matched on `TIMER_FIRED` (§8.5).
+A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` where the event may be no node's message, a `TIMER_FIRED` or an internal event (§8.5, 8d).
 
 ### 10.8 `keep_message`
 
@@ -772,7 +772,7 @@ Keeps the event's message, whole and as received, under a name, for a later `for
 
 - A later `keep_message` under the same name replaces it.
 - Kept messages are committed with the transition (§13.1, `wf_kept_messages`), survive a restart, and go when the instance ends.
-- It fails when the event is no message a node sent (a `TIMER_FIRED`, an internal event); its `on_error` defaults to `fail`. On a transition matched on `TIMER_FIRED` it is refused at load (§8.5).
+- It fails when the event is no message a node sent (a `TIMER_FIRED`, an internal event); its `on_error` defaults to `fail`. Where the event may be one of them it is refused at load (§8.5, 8d).
 
 The pattern of a conversation: the initial state keeps the person's message (`customer`), and each state that hands the conversation to an agent forwards `customer` to it; a listening state keeps the person's next message under the same name.
 
@@ -786,7 +786,7 @@ Every message a WF sends, a `send_message` or a `forward`, carries the WF's bloc
 
 - **`trail`** lists the nodes the message went through. A `forward` takes the message's own trail (or its sender's name, when it has none) and adds the WF's name; a `send_message` starts it with the WF's name. An agent's answer never carries the request's `wf` back, so a forwarded answer's trail starts at the agent.
 - **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
-- **`menu`** is the action's menu, as written but with no empty field (§10.10); it is left out when the action has none.
+- **`menu`** is the action's menu, as written but with no empty field and with each option's params in name order (§10.10); it is left out when the action has none.
 - An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
 
 ### 10.10 `menu`: asking an agent
@@ -808,7 +808,7 @@ A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer 
 
 - **`help`** is a fixed text that gives the choice its context, in case the person's message is unclear; the instance's data travels in `vars`.
 - **`options`:** each with a `name`, a `description` and `params`, each param with a `type` (`string`, `boolean`, `integer` or `number`, an `enum` for a string) and a `description`. The limits, which the agent checks again, are in §8.5 (8c).
-- **The engine writes it** in the WF's block, `meta.context.wf.menu`, as written but with no empty field (an empty `help`, `params` or `description` is left out), which the agent would read as present and refuse.
+- **The engine writes it** in the WF's block, `meta.context.wf.menu`, as written but with no empty field (an empty `help`, `params` or `description` is left out), which the agent would read as present and refuse. An option's params go in name order, whatever their order in the definition: they are a JSON object, which the engine holds as a map (`map[string]MenuParam`) and Go encodes with its keys sorted.
 - **The agent answers `{reply, option, params}`:** `reply` is the text for the person, which goes as the answer's payload text, and which the WF forwards or not; `option` and `params` are what the guards read, in `event.context.evaluation`: `event.context.evaluation.option`, `event.context.evaluation.params.quantity`.
 - **"None of the options" is always an answer:** the agent adds `none` to every menu, with one param, `reason`; a definition cannot name an option so.
 - **An answer off the menu is an error,** with no retries: an option the menu does not have, a missing or mistyped param, or no JSON at all come back as an error payload (`invalid_structured_output`), which a state's transition or the catch takes (§9.5).
@@ -1133,6 +1133,8 @@ When an event arrives at the WF node, the runtime must decide whether it is for 
 4. **If the sender is a `start_from` node and the message is no reply** (a reply is any `*_RESPONSE`, an `INVALID_INPUT`, or an agent's error named `<msg>.error`): a new instance on its thread (§14.3), as the `input_schema` allows. If the schema refuses it, respond with `INVALID_INPUT`, unless the message has no name: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce an `INVALID_INPUT` (FINDINGS A-119).
 
 5. **Otherwise** — an answer to an instance that ended (its timer fired, it was cancelled or failed, or a first copy of the answer finished it), say: log and discard, never answered. An agent answers with the request's own `msg` and thread; as a new instance it would ask the agent again, a WF↔AI loop.
+
+The node's log names every message by its sender, `msg` and thread, and gets the first characters of its payload only when it reaches an instance or starts one: when every message of a node comes to the WF (a Slack channel's, say), the log keeps no text of those the WF discards.
 
 So a person who writes again after their conversation's instance ended starts a new one on the same thread, at the initial state. A late answer from a node outside `start_from` (an agent's) is dropped only while no instance runs on its thread: once the conversation's next instance runs there, the late answer reaches it (step 3), like any message on its thread from a node the definition names. A `system` message other than a `TIMER_FIRED` never reaches this order: it is dropped before (§14.2).
 

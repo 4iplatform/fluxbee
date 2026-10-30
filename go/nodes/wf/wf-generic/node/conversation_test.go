@@ -138,8 +138,9 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 }
 
 // A forward fails when there is no message to forward: an internal event, or a name not kept yet; a
-// keep_message, when there is no message to keep. Both fail the instance by default. (On a
-// TIMER_FIRED transition the language refuses both at load.)
+// keep_message, when there is no message to keep. Both fail the instance by default. Where the event
+// may be no node's message (a TIMER_FIRED, an internal event) the language refuses both at load, so
+// the test writes them into the definition after it loaded.
 func TestAForwardWithoutAMessageFailsTheInstance(t *testing.T) {
 	const definition = `{
   "wf_schema_version": "1",
@@ -152,8 +153,8 @@ func TestAForwardWithoutAMessageFailsTheInstance(t *testing.T) {
     {
       "name": "waiting",
       "transitions": [
-        {"event_match": {"msg": "INTERNAL"}, "guard": "true", "target_state": "done", "actions": [{"type": "keep_message", "name": "x"}]},
-        {"event_match": {"msg": "FORWARD_INTERNAL"}, "guard": "true", "target_state": "done", "actions": [{"type": "forward", "target": "AI.host@motherbee"}]},
+        {"event_match": {"msg": "INTERNAL"}, "guard": "true", "target_state": "done", "actions": []},
+        {"event_match": {"msg": "FORWARD_INTERNAL"}, "guard": "true", "target_state": "done", "actions": []},
         {"event_match": {"msg": "LATER"}, "guard": "true", "target_state": "done", "actions": [{"type": "forward", "target": "AI.host@motherbee", "message": "later"}]},
         {"event_match": {"msg": "EMIT"}, "guard": "true", "actions": [{"type": "emit_internal_event", "meta": {"msg": "INTERNAL"}}]},
         {"event_match": {"msg": "EMIT_FORWARD"}, "guard": "true", "actions": [{"type": "emit_internal_event", "meta": {"msg": "FORWARD_INTERNAL"}}]},
@@ -165,6 +166,9 @@ func TestAForwardWithoutAMessageFailsTheInstance(t *testing.T) {
   ]
 }`
 	rt, disp := newTestRuntime(t, "", definition, nil)
+	waiting := rt.Def.States[0].Transitions
+	waiting[0].Actions = []ActionDefinition{{Type: "keep_message", Name: "x"}}
+	waiting[1].Actions = []ActionDefinition{{Type: "forward", Target: "AI.host@motherbee"}}
 	send := func(instanceID string, msg sdk.Message) {
 		t.Helper()
 		msg.Meta.ThreadID = &instanceID
@@ -306,6 +310,57 @@ func TestTheCorrelationOrderOfAConversation(t *testing.T) {
 	third := startInstance(t, rt, message("IO.in@motherbee", "", "", map[string]any{"text": "new"}))
 	if row := mustGetInstance(t, rt, third); row.ThreadID != third {
 		t.Fatalf("an instance started without a thread: %+v", row)
+	}
+}
+
+// The node's log gets a payload's first characters only for a message that reaches an instance or
+// starts one: when every message of a node comes to the WF, as the supervisors' Slack channel's
+// does, the log must not keep the text of those the WF drops. A dropped message's lines keep its
+// sender, msg and thread.
+func TestTheNodesLogKeepsNoTextOfADroppedMessage(t *testing.T) {
+	rt, _ := newTestRuntime(t, "", conversationWorkflowJSON, nil)
+	message := func(sender, name, thread, payload string) sdk.Message {
+		msg := from(sender, sdk.Message{
+			Routing: sdk.Routing{Src: sender + "-uuid", TraceID: "trace-" + thread},
+			Meta:    sdk.Meta{MsgType: "user", ThreadID: &thread},
+			Payload: json.RawMessage(payload),
+		})
+		if name != "" {
+			msg.Meta.Msg = &name
+		}
+		return msg
+	}
+	logOf := func(msg sdk.Message) string {
+		t.Helper()
+		return nodeLog(t, func() {
+			if err := Dispatch(context.Background(), msg, rt); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	const secret = `{"type":"text","content":"a 20% discount for Acme"}`
+	for label, c := range map[string]struct{ sender, name string }{
+		"a node the definition does not involve":     {"IO.stranger@motherbee", ""},
+		"a node of an event_match.src, on no thread": {"IO.watch@motherbee", "NOTE"},
+		"an agent's late answer":                     {"AI.host@motherbee", ""},
+		"a reply from a start_from node":             {"IO.in@motherbee", "X_RESPONSE"},
+		"a message the input_schema refuses":         {"IO.in@motherbee", "START"},
+	} {
+		logged := logOf(message(c.sender, c.name, "conv-dropped", secret))
+		if strings.Contains(logged, "discount") || !strings.Contains(logged, `src_l2="`+c.sender+`"`) || !strings.Contains(logged, `thread_id="conv-dropped"`) ||
+			!strings.Contains(logged, fmt.Sprintf("msg=%q", c.name)) {
+			t.Fatalf("%s: %s", label, logged)
+		}
+	}
+
+	// The message that starts an instance, and one that reaches it.
+	logged := logOf(message("IO.in@motherbee", "", "conv-1", `{"text":"a 20% discount for Acme"}`))
+	if !strings.Contains(logged, "wf: create accepted") || !strings.Contains(logged, `payload={"text":"a 20% discount for Acme"}`) {
+		t.Fatalf("the message that starts an instance: %s", logged)
+	}
+	logged = logOf(message("IO.watch@motherbee", "NOTE", "conv-1", `{"note":"Acme pays late"}`))
+	if !strings.Contains(logged, "wf: correlate matched thread_id=conv-1") || !strings.Contains(logged, `payload={"note":"Acme pays late"}`) {
+		t.Fatalf("a message that reaches an instance: %s", logged)
 	}
 }
 

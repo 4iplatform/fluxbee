@@ -25,16 +25,16 @@ const maxReplayAttempts = 3
 
 // maxAgentCallsPerTrigger bounds the messages an instance sends to agents (AI.*) between two
 // triggers (wf-orchestration-v1 §5.3.3): a trigger is a message from a node that is no agent (an IO
-// node, a WF) or a timer's fire. Past it a send to an agent is not made, the transition goes on,
-// and the instance gets one AGENT_CALL_CAP internal event per trigger, an error it may take. So a
-// definition whose agents keep answering each other, or whose catch asks a failing agent again,
+// node, another WF) or a timer's fire. Past it a send to an agent is not made, the transition goes
+// on, and the instance gets one AGENT_CALL_CAP internal event per trigger, an error it may take. So
+// a definition whose agents keep answering each other, or whose catch asks a failing agent again,
 // stops there (FINDINGS A-125), and the instance never fails for it.
 const maxAgentCallsPerTrigger = 8
 
 // msgAgentCallCap names the internal event of a trigger that reached the cap, and codeAgentCallCap
 // is the code of its error payload.
 const (
-	msgAgentCallCap  = "AGENT_CALL_CAP"
+	msgAgentCallCap  = wfcel.MsgAgentCallCap
 	codeAgentCallCap = "agent_call_cap"
 )
 
@@ -228,7 +228,7 @@ func (inst *WFInstance) Unlock() { inst.mu.Unlock() }
 // event. A crash before the commit leaves the event for recovery, which runs it again: its sends
 // go again, with the same trace_id.
 func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, actx ActionContext, taken takenEvent) error {
-	if startsATrigger(event) {
+	if startsATrigger(event, actx.Dispatcher.NodeL2Name()) {
 		inst.calls = agentCalls{}
 	}
 
@@ -397,6 +397,9 @@ func (inst *WFInstance) keep(name string, msg sdk.Message, actx ActionContext) e
 }
 
 func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Message, actx ActionContext, taken takenEvent) error {
+	// The cancellation starts a new count of agent calls: the last trigger's must not drop a send of
+	// the cancelled state's entry actions.
+	inst.calls = agentCalls{}
 	mutation := taken.mutation()
 	mutation.ClearInternalEvents = true
 	cancelledState := inst.findState("cancelled")
@@ -493,6 +496,9 @@ func (inst *WFInstance) runActions(ctx context.Context, actions []ActionDefiniti
 // cancelled, pending internal events are cleared, the taken event is consumed, and the cause is
 // logged loudly.
 func (inst *WFInstance) routeToFailed(ctx context.Context, event sdk.Message, actx ActionContext, cause error, taken takenEvent) error {
+	// The failure starts a new count of agent calls: the last trigger's must not drop a send of the
+	// failed state's entry actions.
+	inst.calls = agentCalls{}
 	prevState := inst.CurrentState
 	now := nowMS(actx.Clock)
 	log.Printf("instance %s: fatal failure in state %q — routing to failed: %v", inst.InstanceID, prevState, cause)
@@ -673,13 +679,15 @@ func catchMatches(match EventMatch, msg sdk.Message) bool {
 
 // startsATrigger reports whether event starts a new count of the instance's agent calls
 // (maxAgentCallsPerTrigger): a timer's fire, or a message from a node that is no agent (an IO node,
-// a WF). An agent's answer and an internal event go on with the count of the trigger they follow.
-func startsATrigger(event sdk.Message) bool {
+// another WF). An agent's answer, an internal event and a message the WF node sent itself (self, its
+// name) go on with the count of the trigger they follow: a definition that loops through a send to
+// its own node would otherwise never reach the cap.
+func startsATrigger(event sdk.Message, self string) bool {
 	if sdk.IsSystemKind(event.Meta.MsgType) {
 		return rawMsgName(event) == sdk.MsgTimerFired
 	}
 	sender := event.SourceL2Name()
-	return sender != "" && !wfcel.IsAgent(sender)
+	return sender != "" && sender != self && !wfcel.IsAgent(sender)
 }
 
 // callAgent counts a send to target against the cap of the instance's trigger when target is an

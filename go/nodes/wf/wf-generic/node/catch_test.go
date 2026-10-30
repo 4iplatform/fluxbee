@@ -89,7 +89,8 @@ const menuWireWorkflowJSON = `{
 
 // Case 3 (§5.3.6): the engine writes an action's menu in the WF's block (meta.context.wf.menu) as it
 // is written, but with no empty field, which the agent would read as present and refuse: an empty
-// help, an empty params and an empty description are left out. A send without a menu has none.
+// help, an empty params and an empty description are left out. An option's params go in name order
+// (a map, which Go encodes sorted). A send without a menu has none.
 func TestTheMenuGoesInTheWFBlockAsWritten(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", menuWireWorkflowJSON, nil)
 	startInstance(t, rt, ioMessage("conv-menu", "", `{"type":"text","content":"hi"}`))
@@ -430,7 +431,7 @@ func TestTheCapCountsFromTheMessageThatStartsAnInstance(t *testing.T) {
 
 // What starts a new count of agent calls: a timer's fire (SY.timer's, or recovery's synthetic one)
 // and a message from a node that is no agent; never an agent's answer, an internal event (even one
-// named TIMER_FIRED) or a control message.
+// named TIMER_FIRED), a control message or a message the WF node sent itself.
 func TestWhatStartsATrigger(t *testing.T) {
 	named := func(sender, msgType, msgName string) sdk.Message {
 		msg := sdk.Message{Meta: sdk.Meta{MsgType: msgType, Msg: strPtr(msgName)}}
@@ -455,9 +456,147 @@ func TestWhatStartsATrigger(t *testing.T) {
 		"an agent's answer, lowercase": {named("ai.sales@worker1", "user", "ASK"), false},
 		"an internal event":            {internal, false},
 		"a control message":            {named(sdk.PrimaryAdminNode, sdk.SYSTEMKind, MsgWFCancelInstance), false},
+		"the WF's message to itself":   {named(testNodeName, "user", "AGAIN"), false},
 	} {
-		if got := startsATrigger(c.msg); got != c.want {
+		if got := startsATrigger(c.msg, testNodeName); got != c.want {
 			t.Fatalf("%s: starts a trigger = %v, want %v", name, got, c.want)
 		}
+	}
+}
+
+// selfLoopingWorkflowJSON asks AI.host, sends each of its answers to the WF's own node, and asks
+// AI.host again when that message comes back: a loop through the WF's own node, which the cap on
+// agent calls stops.
+const selfLoopingWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "self_looping",
+  "start_from": ["IO.in@motherbee"],
+  "input_schema": {"type": "object"},
+  "initial_state": "asking",
+  "terminal_states": ["done", "failed"],
+  "states": [
+    {
+      "name": "asking",
+      "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "go"}}],
+      "transitions": [
+        {"event_match": {"src": "AI.host@motherbee"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "` + testNodeName + `", "meta": {"msg": "AGAIN"}, "payload": {}}]},
+        {"event_match": {"src": "` + testNodeName + `"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "again"}}]},
+        {"event_match": {"msg": "AGENT_CALL_CAP"}, "guard": "true", "actions": [{"type": "set_variable", "name": "capped", "value": "event.payload.target"}]}
+      ]
+    },
+    {"name": "done"},
+    {"name": "failed"}
+  ]
+}`
+
+// A message the WF node sends itself is no trigger: it goes on with the count of agent calls of the
+// trigger it follows, so a definition that loops through its own node stops at the cap too.
+func TestALoopThroughTheWFsOwnNodeStopsAtTheCap(t *testing.T) {
+	rt, disp := newTestRuntime(t, "", selfLoopingWorkflowJSON, nil)
+	instanceID := startInstance(t, rt, ioMessage("conv-self", "", `{"type":"text","content":"go"}`))
+	asks := func() int {
+		n := 0
+		for _, msg := range disp.sent {
+			if msg.Routing.Dst.Value() == "AI.host@motherbee" {
+				n++
+			}
+		}
+		return n
+	}
+	// The router brings the WF's message to itself back, stamped with the WF's name; the agent answers
+	// each ask. Two rounds make an ask, so the cap is spent at round 16; the rounds after it bring the
+	// WF's message back again, and none asks.
+	for round := 0; round < 3*maxAgentCallsPerTrigger; round++ {
+		last := disp.sent[len(disp.sent)-1]
+		var next sdk.Message
+		switch last.Routing.Dst.Value() {
+		case "AI.host@motherbee":
+			next = agentAnswer(t, "AI.host@motherbee", last, `{"type":"text","content":"ok"}`, nil)
+		case testNodeName:
+			next = from(testNodeName, last)
+		default:
+			t.Fatalf("round %d: sent to %s", round, last.Routing.Dst.Value())
+		}
+		if err := Dispatch(context.Background(), next, rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if state := mustState(t, rt, instanceID); asks() != maxAgentCallsPerTrigger || state["capped"] != "AI.host@motherbee" {
+		t.Fatalf("%d asks, state %v", asks(), state)
+	}
+	if row := mustGetInstance(t, rt, instanceID); row.Status != "running" {
+		t.Fatalf("the instance never fails for the cap: %+v", row)
+	}
+}
+
+// terminatingWorkflowJSON asks AI.host again at each of its answers, past the cap on agent calls; an
+// answer "break" fails a set_variable, which fails the instance. The cancelled and failed states'
+// entry actions write to AI.host.
+const terminatingWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "terminating",
+  "start_from": ["IO.in@motherbee"],
+  "input_schema": {"type": "object"},
+  "initial_state": "asking",
+  "terminal_states": ["done", "cancelled", "failed"],
+  "states": [
+    {
+      "name": "asking",
+      "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "go"}}],
+      "transitions": [
+        {"event_match": {"src": "AI.host@motherbee"}, "guard": "event.payload.content == 'break'",
+         "actions": [{"type": "set_variable", "name": "broken", "value": "state.missing + 1"}]},
+        {"event_match": {"src": "AI.host@motherbee"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "again"}}]}
+      ]
+    },
+    {"name": "done"},
+    {"name": "cancelled", "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "CANCELLED"}, "payload": {}}]},
+    {"name": "failed", "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "FAILED"}, "payload": {}}]}
+  ]
+}`
+
+// spendTheCap starts an instance of terminatingWorkflowJSON on thread and answers its asks until the
+// cap on agent calls drops one: maxAgentCallsPerTrigger asks went, and the last answer's did not.
+func spendTheCap(t *testing.T, rt *NodeRuntime, disp *mockDispatcher, thread string) (string, sdk.Message) {
+	t.Helper()
+	instanceID := startInstance(t, rt, ioMessage(thread, "", `{"type":"text","content":"go"}`))
+	for i := 0; i < maxAgentCallsPerTrigger; i++ {
+		if err := Dispatch(context.Background(), agentAnswer(t, "AI.host@motherbee", sentTo(t, disp, "AI.host@motherbee"), `{"type":"text","content":"ok"}`, nil), rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := sentTo(t, disp, "AI.host@motherbee")
+	if row := mustGetInstance(t, rt, instanceID); len(disp.sent) != maxAgentCallsPerTrigger || row.Status != "running" {
+		t.Fatalf("past the cap: %d sent, %+v", len(disp.sent), row)
+	}
+	return instanceID, last
+}
+
+// An instance that ends cancelled or failed starts a new count of agent calls: the cancelled or
+// failed state's entry actions send to an agent even when the trigger before spent the cap.
+func TestATerminatingInstanceSendsPastTheCap(t *testing.T) {
+	rt, disp := newTestRuntime(t, "", terminatingWorkflowJSON, nil)
+	cancelled, _ := spendTheCap(t, rt, disp, "conv-cancel")
+	cancel := from(sdk.PrimaryAdminNode, msgWithNameAndPayload(MsgWFCancelInstance, map[string]any{"instance_id": cancelled, "reason": "operator"}))
+	cancel.Routing.Src = "admin-uuid"
+	cancel.Meta.MsgType = sdk.SYSTEMKind
+	if err := Dispatch(context.Background(), cancel, rt); err != nil {
+		t.Fatal(err)
+	}
+	if row := mustGetInstance(t, rt, cancelled); row.Status != "cancelled" || derefString(sentTo(t, disp, "AI.host@motherbee").Meta.Msg) != "CANCELLED" {
+		t.Fatalf("the cancelled state's send: %+v, sent %d", row, len(disp.sent))
+	}
+
+	// An agent's answer is no trigger: the failure it leads to starts the count.
+	disp.sent = nil
+	failed, last := spendTheCap(t, rt, disp, "conv-fail")
+	if err := Dispatch(context.Background(), agentAnswer(t, "AI.host@motherbee", last, `{"type":"text","content":"break"}`, nil), rt); err != nil {
+		t.Fatal(err)
+	}
+	if row := mustGetInstance(t, rt, failed); row.Status != "failed" || derefString(sentTo(t, disp, "AI.host@motherbee").Meta.Msg) != "FAILED" {
+		t.Fatalf("the failed state's send: %+v, sent %d", row, len(disp.sent))
 	}
 }

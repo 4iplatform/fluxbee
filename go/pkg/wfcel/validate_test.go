@@ -545,7 +545,7 @@ func TestValidateDefinitionTimerTimesFromState(t *testing.T) {
 	}
 	for _, valid := range []string{
 		`"fire_in": {"$ref": "state.invoice.due_in"},`,
-		`"fire_in": {"$ref": "event.context.evaluation.due_in", "default": "30d"},`,
+		`"fire_in": {"$ref": "event.payload.due_in", "default": "30d"},`,
 		`"fire_at": {"$ref": "state.due_at"},`,
 		`"fire_at": "2026-11-01T12:00:00Z",`,
 	} {
@@ -667,6 +667,189 @@ func TestATimerFiredTransitionKeepsAndForwardsNoEvent(t *testing.T) {
 		{``, ``, keep, "states[2].entry_actions[0]: a keep_message runs on the TIMER_FIRED of states[0].transitions[0]"},
 	} {
 		assertErrorContains(t, timeout(c.actions, c.exit, c.entry, `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`), c.want)
+	}
+}
+
+// A state's transition that takes an internal event, which has no sender, keeps and forwards no event
+// either: one whose event_match names no src and whose msg is AGENT_CALL_CAP (the engine's, past the
+// cap on agent calls) or one an emit_internal_event of the definition emits. Such a definition
+// loaded, and the forward failed the instance, though the cap must never fail it.
+func TestAnInternalEventTransitionKeepsAndForwardsNoEvent(t *testing.T) {
+	// internal adds to the first state a transition matched on match to failed, with actions, the
+	// state's exit actions and failed's entry actions. Completed's entry actions emit NEXT, and the
+	// first state's other transition keeps the node's message it takes as late.
+	internal := func(match, actions, exitActions, entryActions string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },`, `"exit_actions": [`+exitActions+`],
+      "transitions": [
+        {"event_match": `+match+`, "guard": "true", "target_state": "failed", "actions": [`+actions+`]},
+        {
+          "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },`, 1)
+		data = strings.Replace(data, `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`, `{"type": "keep_message", "name": "late"}`, 1)
+		data = strings.Replace(data, `"name": "completed",
+      "description": "done",
+      "entry_actions": [],`, `"name": "completed",
+      "description": "done",
+      "entry_actions": [{"type": "emit_internal_event", "meta": {"msg": "NEXT"}}],`, 1)
+		data = strings.Replace(data, `"name": "failed",
+      "description": "failed",
+      "entry_actions": [],`, `"name": "failed",
+      "description": "failed",
+      "entry_actions": [`+entryActions+`],`, 1)
+		if !strings.Contains(data, `"event_match": `+match) || !strings.Contains(data, `"name": "late"`) || !strings.Contains(data, `"emit_internal_event"`) {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	const keep, forward = `{"type": "keep_message", "name": "kept"}`, `{"type": "forward", "target": "AI.x@worker1"}`
+	// A node's message: a msg nothing emits, or a src (an internal event has none).
+	for _, match := range []string{`{"msg": "OTHER"}`, `{"msg": "AGENT_CALL_CAP", "src": "AI.x@worker1"}`, `{"msg": "NEXT", "src": "IO.x@worker1"}`} {
+		if err := internal(match, keep+", "+forward, forward, keep); err != nil {
+			t.Fatalf("%s: %v", match, err)
+		}
+	}
+	// A kept message is no event's: a forward of one goes, on an internal event too.
+	for _, match := range []string{`{"msg": "AGENT_CALL_CAP"}`, `{"msg": "NEXT"}`} {
+		if err := internal(match, `{"type": "forward", "target": "AI.x@worker1", "message": "late"}`, ``, ``); err != nil {
+			t.Fatalf("%s, a forward of a kept message: %v", match, err)
+		}
+	}
+	for _, c := range []struct{ match, actions, exit, entry, want string }{
+		{`{"msg": "AGENT_CALL_CAP"}`, keep, ``, ``, "states[0].transitions[0].actions[0]: a keep_message runs on the AGENT_CALL_CAP of states[0].transitions[0], which is no node's message to keep"},
+		{`{"msg": "AGENT_CALL_CAP"}`, forward, ``, ``, "states[0].transitions[0].actions[0]: a forward without message runs on the AGENT_CALL_CAP of states[0].transitions[0], which is no node's message to forward: forward a kept one"},
+		{`{"msg": "AGENT_CALL_CAP"}`, ``, forward, ``, "states[0].exit_actions[0]: a forward without message runs on the AGENT_CALL_CAP of states[0].transitions[0]"},
+		{`{"msg": "AGENT_CALL_CAP"}`, ``, ``, keep, "states[2].entry_actions[0]: a keep_message runs on the AGENT_CALL_CAP of states[0].transitions[0]"},
+		{`{"msg": "NEXT"}`, keep, ``, ``, "states[0].transitions[0].actions[0]: a keep_message runs on the internal event NEXT of states[0].transitions[0], which is no node's message to keep"},
+		{`{"msg": "NEXT"}`, forward, ``, ``, "states[0].transitions[0].actions[0]: a forward without message runs on the internal event NEXT of states[0].transitions[0], which is no node's message to forward: forward a kept one"},
+		{`{"msg": "NEXT"}`, ``, forward, ``, "states[0].exit_actions[0]: a forward without message runs on the internal event NEXT of states[0].transitions[0]"},
+		{`{"msg": "NEXT"}`, ``, ``, keep, "states[2].entry_actions[0]: a keep_message runs on the internal event NEXT of states[0].transitions[0]"},
+	} {
+		assertErrorContains(t, internal(c.match, c.actions, c.exit, c.entry), c.want)
+	}
+}
+
+// An agent's evaluation is a menu's answer, {reply, option, params}: a guard, a set_variable value
+// or a $ref that reads another field of it is refused (event.context.evaluation.optoin never
+// matched, and event.context.evaluation.param.question failed the instance). A param name looked for
+// in its params (in) is checked as a read of the param is, and the option compared with the empty
+// string, any menu's answer, is no typo.
+func TestTheEvaluationIsReplyOptionAndParams(t *testing.T) {
+	guard := func(expr string) error {
+		t.Helper()
+		quoted, _ := json.Marshal(expr)
+		_, err := loadChanged(t, `"guard": "event.context.evaluation.option == 'invoice'"`, `"guard": `+string(quoted))
+		return err
+	}
+	for _, valid := range []string{
+		"event.context.evaluation.reply != ''",
+		"has(event.context.evaluation.reply) && size(event.context.evaluation.params) > 0",
+		"has(event.context.evaluation)",
+		"event.context.evaluation.option != ''",
+		"'' != event.context.evaluation.option",
+		"event.context.evaluation.option in ['', 'answer']",
+		"'question' in event.context.evaluation.params",
+		"'reason' in event['context']['evaluation']['params']",
+		"!('plan' in event.context.evaluation.params)",
+		"'qty' in state.params",
+	} {
+		if err := guard(valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+	const at = "states[0].transitions[0].guard: "
+	field := func(name string) string {
+		return at + "reads event.context.evaluation." + name + ", a field no agent's evaluation has: reply, option or params"
+	}
+	for expr, want := range map[string]string{
+		"event.context.evaluation.optoin == 'invoice'":           field("optoin"),
+		"event.context.evaluation.param.question != ''":          field("param"),
+		"has(event.context.evaluation.options)":                  field("options"),
+		"event['context']['evaluation']['Option'] == 'invoice'":  field("Option"),
+		"'qustion' in event.context.evaluation.params":           at + `looks for "qustion" in event.context.evaluation.params, a param no menu of the definition offers: plan, quantity, question or reason`,
+		"'Question' in event['context']['evaluation']['params']": at + `looks for "Question" in event.context.evaluation.params`,
+		"event.context.evaluation.option in ['', 'invoce']":      at + `compares event.context.evaluation.option with "invoce"`,
+	} {
+		assertErrorContains(t, guard(expr), want)
+	}
+
+	// A set_variable value, and a $ref in a payload or a timer's time.
+	_, err := loadChanged(t, `"value": "{'quantity': event.context.evaluation.params.quantity}"`, `"value": "event.context.evaluation.reason"`)
+	assertErrorContains(t, err, "states[0].transitions[0].actions[0].value: reads event.context.evaluation.reason, a field no agent's evaluation has")
+	for to, want := range map[string]string{
+		`{"$ref": "event.context.evaluation.question"}`:                      "states[0].transitions[1].actions[0].payload.content.$ref: reads event.context.evaluation.question, a field no agent's evaluation has: reply, option or params",
+		`{"$ref": "event.context.evaluation.param.question", "default": ""}`: "states[0].transitions[1].actions[0].payload.content.$ref: reads event.context.evaluation.param, a field",
+	} {
+		_, err := loadChanged(t, `{"$ref": "event.context.evaluation.params.question"}`, to)
+		assertErrorContains(t, err, want)
+	}
+	_, err = loadChanged(t, `{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer"}, {"type": "schedule_timer", "timer_key": "t", "fire_in": {"$ref": "event.context.evaluation.due_in", "default": "30d"}}`)
+	assertErrorContains(t, err, "states[0].entry_actions[1].fire_in.$ref: reads event.context.evaluation.due_in, a field no agent's evaluation has")
+	if _, err := loadChanged(t, `{"$ref": "event.context.evaluation.params.question"}`, `{"$ref": "event.context.evaluation.reply"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only a send_message or a forward offers its menu: one on another action (which a definition read
+	// as JSON cannot have, it is no field of that action) widens no name a guard may use.
+	data := strings.Replace(menuWorkflowJSON(), `{"type": "keep_message", "name": "customer"}`,
+		`{"type": "keep_message", "name": "customer", "menu": {"options": [{"name": "stray", "description": "d", "params": {"hint": {"type": "string"}}}]}}`, 1)
+	data = strings.Replace(data, `"guard": "event.context.evaluation.option == 'invoice'"`, `"guard": "event.context.evaluation.option == 'stray' && event.context.evaluation.params.hint != ''"`, 1)
+	var def WorkflowDefinition
+	if err := json.Unmarshal([]byte(data), &def); err != nil {
+		t.Fatal(err)
+	}
+	errs := ValidateDefinition(&def, fixedClock)
+	assertErrorContains(t, errs, `states[0].transitions[0].guard: compares event.context.evaluation.option with "stray"`)
+	assertErrorContains(t, errs, "states[0].transitions[0].guard: reads event.context.evaluation.params.hint")
+}
+
+// encoding/json takes a key for the field it equals ignoring case, so the strict decoder loaded a
+// forward's "Name" as its name (and the forward sent the event instead of the kept message), and
+// "States" as the states. At every level of the language a key that is a field written with other
+// capitals is refused, by the field's path. The user data (a payload, vars, meta.context's contents,
+// the input_schema) is never checked.
+func TestAFieldWrittenWithOtherCapitalsIsRefused(t *testing.T) {
+	const menuAt = "states[0].entry_actions[1].menu"
+	for _, c := range []struct{ from, to, want string }{
+		{`"states": [`, `"States": [`, "states: is written States: the field is states"},
+		{`"states": [`, "\"ſtates\": [", "states: is written ſtates: the field is states"},
+		{`"start_from":`, `"Start_From":`, "start_from: is written Start_From: the field is start_from"},
+		{`"name": "asking"`, `"Name": "asking"`, "states[0].name: is written Name: the field is name"},
+		{`"guard": "event.context.evaluation.option == 'invoice'"`, `"GUARD": "event.context.evaluation.option == 'invoice'"`, "states[0].transitions[0].guard: is written GUARD: the field is guard"},
+		{`"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'consult'"`, `"event_match": {"Src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'consult'"`, "states[0].transitions[1].event_match.src: is written Src: the field is src"},
+		{`{"type": "keep_message", "name": "customer"}`, `{"Type": "keep_message", "name": "customer"}`, "states[0].entry_actions[0].type: is written Type: the field is type"},
+		{`{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer", "On_Error": "continue"}`, "states[0].entry_actions[0].on_error: is written On_Error: the field is on_error"},
+		{`{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer", "Menu": {"options": []}}`, "states[0].entry_actions[0].menu: is written Menu: the field is menu"},
+		{`"target": "AI.sales@worker1", "message": "customer"`, `"target": "AI.sales@worker1", "Name": "customer"`, "states[0].entry_actions[1].name: is written Name: the field is name"},
+		{`"meta": {"msg": "CONSULT"}`, `"Meta": {"msg": "CONSULT"}`, "states[0].transitions[1].actions[0].meta: is written Meta: the field is meta"},
+		{`"meta": {"msg": "CONSULT"}`, `"meta": {"Msg": "CONSULT"}`, "states[0].transitions[1].actions[0].meta.msg: is written Msg: the field is msg"},
+		{`"help": "The person is buying licenses."`, `"Help": "The person is buying licenses."`, menuAt + ".help: is written Help: the field is help"},
+		{`"options": [`, `"Options": [`, menuAt + ".options: is written Options: the field is options"},
+		{`{"name": "answer", "description"`, `{"name": "answer", "Description"`, menuAt + ".options[0].description: is written Description: the field is description"},
+		{`"quantity": {"type": "integer"}`, `"quantity": {"Type": "integer"}`, menuAt + ".options[1].params.quantity.type: is written Type: the field is type"},
+	} {
+		_, err := loadChanged(t, c.from, c.to)
+		assertErrorContains(t, err, c.want)
+		// The menu's own check leaves a field written with other capitals to this one.
+		if strings.Contains(err.Error(), "is not a field of a menu") {
+			t.Fatalf("%s: %v", c.to, err)
+		}
+	}
+	_, err := loadCatch(t, `{"Event_Match": {}, "guard": "true"}`)
+	assertErrorContains(t, err, "catch[0].event_match: is written Event_Match: the field is event_match")
+
+	// User data keeps its keys as written.
+	for from, to := range map[string]string{
+		`"payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}}`: `"payload": {"Type": "text", "Content": {"$ref": "event.context.evaluation.params.question"}}`,
+		`"meta": {"msg": "CONSULT"}`:         `"meta": {"msg": "CONSULT", "context": {"IO": {"Reply_Target": "C1"}}}, "vars": {"Order": 1}`,
+		`"input_schema": {"type": "object"}`: `"input_schema": {"type": "object", "properties": {"Name": {"type": "string"}}}`,
+	} {
+		if _, err := loadChanged(t, from, to); err != nil {
+			t.Fatalf("%s: %v", to, err)
+		}
 	}
 }
 

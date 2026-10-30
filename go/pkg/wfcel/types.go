@@ -115,6 +115,11 @@ const (
 	ReasonParam = "reason"
 )
 
+// MsgAgentCallCap is the msg of the internal event the engine queues for an instance whose send to an
+// agent the cap on agent calls did not make (wf-orchestration-v1 §5.3.6). Like any internal event, it
+// has no sender.
+const MsgAgentCallCap = "AGENT_CALL_CAP"
+
 type ActionDefinition struct {
 	Type string `json:"type"`
 	// Target is the destination of a send_message or a forward: a node name written in the
