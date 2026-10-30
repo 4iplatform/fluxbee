@@ -1133,3 +1133,16 @@ With an agent in the test tenant `pruebas`:
 - **The reads:** the operator's queries and paging, Archi's chat answer from
   `/hives/motherbee/usage`, and Cloud's `get_usage`, which sees only its tenant.
 - **The streams:** no usage record lost. Details in `lab/DEPLOYMENTS.md`.
+
+## 8. Later: node logs on the stream (the operator, 2026-10-30)
+
+- **The direction:** *"este tema de log es transversal a la plataforma y para mí la solución es
+  ponerle al que quiera logear un stream como tienen los mensajes para que todo vaya a
+  SY.storage"*.
+  - Any node that logs gets a subject on its router's stream, as the turns have (§2.3).
+  - SY.storage is the sink. A node's log is then read where the turns and the usage records are,
+    not on each host.
+- **Today:** a node's process log is local. It goes to its host's journald. A WF instance's own
+  log lives in the WF's store (wf-orchestration-v1 §4.8).
+- **When:** a later stage, as its own topic. Until then logs stay local (WF Case 3's default log,
+  wf-orchestration-v1 §5.3.2, included).

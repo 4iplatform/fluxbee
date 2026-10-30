@@ -853,6 +853,10 @@ docs, and the agents. Everything below was fixed before the release.
   - The instance's log gets an `unhandled event` entry, and the instance stays where it was
     (go/nodes/wf/wf-generic/node/instance.go, where no transition is chosen).
   - The engine also writes a line to the node's log. Today it does not.
+  - **The log stays local** (the operator, 2026-10-30): *"el tema de log por ahora déjalo
+    local… este tema de log es transversal a la plataforma"*. A stream for any node that logs,
+    with SY.storage as its sink, comes in a later stage ([router-stream-v1](router-stream-v1.md)
+    §8).
 - **Where the failures come from.** The operator asked whether only a badly built CEL leads here.
   It does not:
   - the model does not follow the menu. This is the likeliest;
@@ -908,7 +912,8 @@ docs, and the agents. Everything below was fixed before the release.
 
 - *"A Archi vamos a tener que ponerle info para que sepa programar esto… de hecho Fluxbee necesita
   un handbook único, sería el de Archi, y que lo use el que quiera, sea humano o quien sea que
-  necesite, como un super-Archi."*
+  necesite, como un super-Archi."* And, on its shape: *"yo iría por capítulos… un doc completo
+  es imposible, sí algo conceptualmente conectado"*.
 - **Today,** verified:
   - **What Archi reads:** its handbook, appended whole to its prompt (`build_archi_prompt`,
     src/bin/sy_architect.rs; 39 KB), and its cookbook seeds.
@@ -919,36 +924,160 @@ docs, and the agents. Everything below was fixed before the release.
   - **For people:** the reference is [wf-rules-quickstart](wf-rules-quickstart.md): CEL guards in
     §3 and every action in §4.
 - **In this case:**
-  - the handbook's WF section becomes the one reference for writing a WF. It covers what a guard
-    reads and calls, the actions, the menu, the catch, `none` and the cap;
+  - the handbook's WF section becomes one self-contained chapter, the one reference for writing a
+    WF. It covers what a guard reads and calls, the actions, the menu, the catch, `none` and the
+    cap;
   - Archi gets a seed with an agent and a menu;
   - the quickstart's §3 and §4 point to the handbook instead of repeating it.
-- **Proposed: the handbook for all of Fluxbee as its own topic, after this track.** The handbook
-  goes whole into Archi's prompt, so gathering all of Fluxbee there means Archi reads it by
-  sections.
+- **The handbook for all of Fluxbee is its own topic, after this track:** chapters, conceptually
+  connected. The handbook goes whole into Archi's prompt today, so Archi will read it a chapter at
+  a time.
 
-#### 5.3.6 The build and the gate
+#### 5.3.6 The build design and the gate
 
-- **wfcel:**
-  - the menu: its shape, names and limits, with `none` reserved;
-  - the catch;
-  - guards checked against the menus' option names;
-  - `response_envelope` refused in a WF's action.
-- **The engine:**
-  - the menu goes into the WF's block;
-  - the catch, tried after the state's transitions;
-  - the default also logged to the node's log;
-  - the cap.
-- **ai.generic and its SDK:**
-  - the menu and the answer's contract are rendered in the WF's block of the message, so the
-    system prompt stays the role;
-  - `none` is added;
-  - the answer is checked against the menu;
-  - `reply` becomes the payload's text, and the object goes in `meta.context.evaluation`, as
-    `text_field` does.
-- **io.slack:** the thread records, in and out.
-- **Archi:** the handbook's WF section and a seed.
-- **The gate:**
+Read in the code on 2026-10-30, at `32353f18`. Four pieces; the contracts between them are exact.
+
+**1. The definition language (go/pkg/wfcel):**
+- **`menu`** is a field of `send_message` and `forward` (`actionFields`), allowed only when the
+  action's `target` is an `AI.*` node:
+
+  ```json
+  "menu": {
+    "help": "optional, 1 to 600 characters",
+    "options": [
+      {"name": "invoice",
+       "description": "1 to 200 characters",
+       "params": {"quantity": {"type": "integer", "description": "optional, up to 200 characters"},
+                  "plan": {"type": "string", "enum": ["basic", "pro"]}}}
+    ]
+  }
+  ```
+
+  - 1 to 8 options. A name matches `^[a-z][a-z0-9_]{0,31}$`, is unique in its menu, and is never
+    `none`.
+  - `params` is optional, with up to 8 per option. A param's name follows the same pattern, and
+    its `type` is `string`, `boolean`, `integer` or `number`. `enum` is for strings only, with 1 to
+    20 values.
+  - Characters are counted as Unicode code points. The menu is literal: no `$ref` inside it.
+- **`meta.context.response_envelope` is refused in a WF's action:** "a WF asks an agent with
+  `menu`".
+- **`catch`** is a top-level list of transitions (`WorkflowDefinition.Catch`).
+  - It has a state transition's shape, except that its `event_match` may be empty, which matches
+    every event. `guard` is required, and `target_state` is optional: without it, the transition
+    is internal and stays in the current state.
+  - Its actions are `send_message`, `forward`, `keep_message`, `set_variable` and
+    `emit_internal_event`. Timer actions belong to states: the catch goes to a state whose entry
+    actions set them.
+  - A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names
+    a `src`, so the event is a node's message and never a timer's.
+  - The catch's actions and targets count as the definition's own: `eachAction` and `Involves`
+    include them.
+- **Checked against the menus:**
+  - a guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`,
+    `in`) must name an option of one of the definition's menus, or `none`;
+  - a guard or a `$ref` that reads `event.context.evaluation.params.<p>` must name a param of one
+    of them, or `reason`.
+
+  An error names the path, as any other does.
+
+**2. The engine (go/nodes/wf/wf-generic/node):**
+- **The menu:** `withWFBlock` writes the action's menu, as written, into `meta.context.wf.menu`,
+  next to `trail` and `vars`.
+- **The catch:** when no transition of the current state takes an event, the engine tries the
+  catch's transitions in order. A chosen one runs like a state's: exit and entry actions with a
+  `target_state`, or internal without one.
+- **The default:** when neither takes the event, the instance's log gets today's `unhandled
+  event` entry, and the node's local log gets a line naming the instance, the state and the event.
+  Both are local (§5.3.2).
+- **The cap:** `maxAgentCallsPerTrigger = 8`.
+  - **A trigger** is an inbound event whose sender is not an `AI.*` node (a message from an IO node
+    or a WF), or a `TIMER_FIRED`. An agent's answer or an internal event starts no new count.
+  - **What counts:** each `send_message` or `forward` whose target is `AI.*` counts one.
+  - **Past the cap:** the send is not made. The instance's log says so, and the transition's other
+    actions run.
+  - **The error event:** after the transition, the instance gets one internal event per trigger,
+    `msg` `AGENT_CALL_CAP`, with the payload `{"type": "error", "code": "agent_call_cap",
+    "message": "...", "target": "<the agent>"}`. It goes through the state's transitions, then the
+    catch, then the default. The instance does not fail.
+  - **The count** lives in memory, per instance. A restart starts it again.
+- **The example** (go/nodes/wf/examples/packages/wf.sales.invoice):
+  - it moves to the menu, with sales' options `answer`, `invoice` and `consult`;
+  - `consult` goes to `IO.slack.supervisores@motherbee` and waits with a timer;
+  - the definition gets a catch.
+
+  Every definition in the docs and the seeds stays valid: `shipped_definitions_test.go` reads
+  them.
+
+**3. ai.generic and its SDK (nodes/ai/ai-generic, crates/fluxbee_ai_sdk):**
+- **The menu** is read from `meta.context.wf.menu`.
+  - ai.generic checks it again, with wfcel's limits. An invalid menu gets the error answer
+    `invalid_menu`, with no model call.
+  - A message with both a menu and a `response_envelope` gets `conflicting_contracts`, also with
+    no model call.
+- **Rendered in the WF's block** (`render_wf_prompt_block`), after the path and the variables:
+
+  ```text
+  Help: The person is buying licenses. ...
+  Options (choose exactly one):
+  - answer: You answer the person yourself.
+  - invoice: They accepted the quote and ask for the invoice.
+    params: product (string), quantity (integer), unit_price (number)
+  - consult: A supervisor must approve something before you answer.
+    params: question (string): What you ask, with the data to decide.
+  - none: None of the options fits.
+    params: reason (string): Why none of the options fits.
+  Answer with only one JSON object: {"reply": "<text for the person, may be empty>", "option": "<one name above>", "params": {<that option's params>}}
+  ```
+
+  - The system prompt stays the role: no fallback instruction is appended for a menu.
+  - The block stays out of the history, as the WF's block does.
+  - The agent may still use its tools; its final text is the object.
+- **The answer** is parsed as `parse_structured_output` parses: a fenced object, or an object
+  followed by text. Then it is checked:
+  - `option` is one of the menu's, or `none`;
+  - each param of that option is present with its type. An `integer` is a JSON integer, a
+    `number` any number, and an `enum` one of its values. `none` needs `reason`, a string;
+  - `reply` is a string, and may be empty;
+  - a param the option does not declare is dropped, with a log line.
+
+  Anything else is `invalid_structured_output`, with a detail: `not_json`, `unknown_option:<x>`,
+  `missing_param:<p>` or `type_mismatch:<p>:<type>`. The model's first 200 characters are logged,
+  as for any contract.
+- **The answer message:**
+  - its payload's text is `reply`;
+  - `meta.context.evaluation` is the checked object, `{"reply", "option", "params"}`;
+  - the history keeps the whole object, as with a `text_field`.
+- **The SDK** gets a menu contract next to `ResponseContract`, with the same `answer` shape
+  (`ContractAnswer`). The request log says which contract a message had.
+
+**4. io.slack (nodes/io/io-slack, nodes/io/common): the thread records.**
+- **Storage:** a SQLite file in the node's own directory, next to its `config.json`. One row per
+  Slack place: `thread_id`, `channel_id`, `thread_ts` (empty for a channel's top level),
+  `created_at` and `last_used_at`. A Slack place is one channel and one thread, and has one
+  thread id.
+- **In:**
+  - a reply in a Slack thread whose root `ts` is recorded takes the recorded thread id, in
+    `meta.thread_id` and in the IO context, instead of the native thread's id;
+  - any other message takes today's id, and its place is recorded under it.
+- **Out:**
+  - a message on a recorded thread id goes to that thread's place, and `reply_target` is not read;
+  - an unrecorded thread id with a `reply_target` of the node's own channel is posted as today,
+    and recorded;
+  - otherwise the message is posted at the top level of the channel, and the post's `ts` is
+    recorded for that thread id.
+- **Expiry:** a record unused for 30 days is deleted, at start and daily.
+- **Failure:** if the records fail, the node logs it and works as today.
+
+**5. Archi (Case 3's part of §5.3.5, after pieces 1 to 3):**
+- the handbook's WF section is rewritten as one self-contained chapter, kept compact because it
+  rides in Archi's prompt;
+- the two WF seeds hold the menu example;
+- the quickstart's §3 and §4 point to the chapter.
+
+**Checks before the review round:** Rust fmt, clippy (`-D warnings`) and the workspace's tests; Go
+gofmt, vet and race tests in each module; the doc links. Then one review round, as in Case 1.
+
+**The gate:**
   1. Case 1 again, on the menu, with roles that keep only their trade.
   2. The consultation, with the supervisors' side on a real io.slack in a test channel. To check
      first: whether two io.slack nodes can share one Slack app over Socket Mode.
