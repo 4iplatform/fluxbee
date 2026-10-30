@@ -1154,8 +1154,8 @@ impl SlackClients {
         Ok(Url::parse(&url)?)
     }
 
-    /// Posts a message and returns its `ts`, which Slack's answer carries: the thread records keep a
-    /// new top-level post's (see thread_records).
+    /// Posts a message, its text escaped (`post_message_body`), and returns its `ts`, which Slack's
+    /// answer carries: the thread records keep a new top-level post's (see thread_records).
     async fn post_message(
         &self,
         channel: &str,
@@ -1163,16 +1163,7 @@ impl SlackClients {
         thread_ts: Option<&str>,
         blocks: Option<serde_json::Value>,
     ) -> Result<Option<String>> {
-        let mut body = serde_json::json!({
-            "channel": channel,
-            "text": text,
-        });
-        if let Some(ts) = thread_ts {
-            body["thread_ts"] = serde_json::Value::String(ts.to_string());
-        }
-        if let Some(b) = blocks {
-            body["blocks"] = b;
-        }
+        let body = post_message_body(channel, text, thread_ts, blocks);
 
         #[derive(Deserialize)]
         struct PostResp {
@@ -1292,6 +1283,9 @@ impl SlackClients {
             ));
         }
 
+        // No `initial_comment`: the share carries no message text. A file's title is the file's
+        // metadata, not message text, and Slack parses it for no mention or link, so the file's
+        // name goes as it is (a message's text is escaped, `post_message_body`).
         let mut complete_payload = serde_json::json!({
             "files": [{
                 "id": file_id,
@@ -1327,6 +1321,45 @@ impl SlackClients {
 
         Ok(())
     }
+}
+
+/// The body of a `chat.postMessage` in `channel`, in the Slack thread `thread_ts` or at the top
+/// level: `text` escaped (`escape_slack_text`), and `blocks` as they are.
+fn post_message_body(
+    channel: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+    blocks: Option<Value>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "channel": channel,
+        "text": escape_slack_text(text),
+    });
+    if let Some(ts) = thread_ts {
+        body["thread_ts"] = Value::String(ts.to_string());
+    }
+    if let Some(blocks) = blocks {
+        body["blocks"] = blocks;
+    }
+    body
+}
+
+/// `text` as Slack shows it, as written: `&`, `<` and `>` become `&amp;`, `&lt;` and `&gt;`, as
+/// Slack's formatting rules ask of text that is not markup. The text the node posts is a payload's,
+/// which a person or an agent wrote: unescaped, a `<!channel>`, `<!here>`, `<@U…>` or
+/// `<!subteam^…>` in it pings, and a `<https://evil.example|https://sso.acme.com>` shows a false
+/// link label. A bare URL still links.
+fn escape_slack_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Parse a Slack `Retry-After` header (integer seconds) into a bounded backoff, clamped to
@@ -3130,8 +3163,9 @@ mod tests {
     use super::{
         build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
         extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
-        is_control_plane_msg_type, parse_retry_after, slack_relay_policy_from_config,
-        slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
+        is_control_plane_msg_type, parse_retry_after, post_message_body,
+        slack_relay_policy_from_config, slack_vault_key, vault_change_is_slack, SlackClients,
+        SlackRelayConfig, SlackRuntimeState,
     };
     use std::time::Duration;
 
@@ -3497,5 +3531,42 @@ mod tests {
 
         let otro = serde_json::json!({"type":"reaction_added"});
         assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
+    }
+
+    /// A payload's text is posted as Slack shows plain text: its `&`, `<` and `>` escaped. What a
+    /// person wrote, and an agent passed on (a WF's question to the supervisors' channel), never
+    /// pings the channel, a person or a group, and never shows a false link label. A bare URL is
+    /// left to link, and `blocks` go as they are.
+    #[test]
+    fn a_payloads_text_is_posted_escaped_and_its_blocks_as_they_are() {
+        let blocks = json!([
+            {"type": "section", "text": {"type": "mrkdwn", "text": "<!here> *Aprobado*"}}
+        ]);
+        let body = post_message_body(
+            "C0SUPERVISORS",
+            "<!channel> <!here> <@U0BOSS> <!subteam^S0SALES|@ventas> ¿20% para 10 Pro? Entrá a \
+             <https://evil.example|https://sso.acme.com> o https://fluxbee.example/public/k3y \
+             (Q&A: 1 < 2 > 0)",
+            Some("1793000000.000100"),
+            Some(blocks.clone()),
+        );
+        assert_eq!(
+            body,
+            json!({
+                "channel": "C0SUPERVISORS",
+                "text": "&lt;!channel&gt; &lt;!here&gt; &lt;@U0BOSS&gt; \
+                         &lt;!subteam^S0SALES|@ventas&gt; ¿20% para 10 Pro? Entrá a \
+                         &lt;https://evil.example|https://sso.acme.com&gt; o \
+                         https://fluxbee.example/public/k3y (Q&amp;A: 1 &lt; 2 &gt; 0)",
+                "thread_ts": "1793000000.000100",
+                "blocks": blocks,
+            })
+        );
+
+        // At the top level, without blocks; a text with nothing to escape goes as it is.
+        assert_eq!(
+            post_message_body("C0SUPERVISORS", "Aprobado: 15%.", None, None),
+            json!({"channel": "C0SUPERVISORS", "text": "Aprobado: 15%."})
+        );
     }
 }

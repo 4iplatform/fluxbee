@@ -480,7 +480,8 @@ struct BehaviorContext {
 
 /// One message's answer: its reply and, under a response contract with a `text_field` or a WF's
 /// menu, the object the model answered with, which the reply carries in `meta.context.evaluation`
-/// (`MessageContract::answer`).
+/// (`MessageContract::answer`). A menu's `reply` there is the reply's own text
+/// (`tool_loop_answer`).
 #[derive(Debug, PartialEq)]
 struct AiChatAnswer {
     output: AiBehaviorOutput,
@@ -3184,9 +3185,12 @@ fn tool_loop_system_prompt(
 /// The answer of one message's tool loop: its reply (`tool_loop_output`) and, under a response
 /// contract with a `text_field` or a WF's menu, its evaluation. There the model's `text` is the
 /// contract's object: it gives the reply's text, blank or not, and the evaluation
-/// (`MessageContract::answer`). A loop that wrote nothing, made no file and published no page has
-/// no answer, as without the contract; one that made a file or published a page but wrote no
-/// object fails, as an object that is not the contract's does.
+/// (`MessageContract::answer`). Under a menu, the evaluation's `reply` is the reply's text as the
+/// person gets it, with the fixed line that names the files or the links the loop adds to it: a
+/// WF that forwards only a reply that is not blank still delivers them (FINDINGS A-98, A-99). A
+/// loop that wrote nothing, made no file and published no page has no answer, as without the
+/// contract; one that made a file or published a page but wrote no object fails, as an object
+/// that is not the contract's does.
 fn tool_loop_answer(
     text: Option<String>,
     files: Vec<AiUserArtifact>,
@@ -3202,10 +3206,21 @@ fn tool_loop_answer(
     let answer = contract.answer(text.unwrap_or_default())?;
     let output = tool_loop_output(Some(answer.text.clone()), files, links)
         .unwrap_or_else(|| AiBehaviorOutput::text(answer.text));
-    Ok(Some(AiChatAnswer {
-        output,
-        evaluation: answer.evaluation,
-    }))
+    let mut evaluation = answer.evaluation;
+    if contract.menu().is_some() {
+        if let Some(Value::Object(evaluation)) = evaluation.as_mut() {
+            evaluation.insert("reply".to_string(), json!(reply_text(&output)));
+        }
+    }
+    Ok(Some(AiChatAnswer { output, evaluation }))
+}
+
+/// The text a reply delivers: its own, or its final output's; blank when it has none.
+fn reply_text(output: &AiBehaviorOutput) -> &str {
+    match output {
+        AiBehaviorOutput::Text(text) => text,
+        AiBehaviorOutput::Final(final_output) => final_output.text.as_deref().unwrap_or_default(),
+    }
 }
 
 /// The reply of one message's tool loop (FINDINGS A-98, A-99): the model's `text`
@@ -3331,9 +3346,10 @@ fn files_fallback_line(files: &[AiUserArtifact]) -> String {
 }
 
 /// The assistant's turn an answer leaves in the immediate memory: under a `text_field` or a menu,
-/// the object the model answered with (a menu's as checked), as compact JSON, which is what the
-/// contract asks it to write and never blank (a blank turn fails every later one: Anthropic refuses
-/// an empty text block); otherwise its reply (`summarize_behavior_output`).
+/// the object the model answered with (a menu's as checked, with the reply the person got), as
+/// compact JSON, which is what the contract asks it to write and never blank (a blank turn fails
+/// every later one: Anthropic refuses an empty text block); otherwise its reply
+/// (`summarize_behavior_output`).
 fn assistant_turn_text(answer: &AiChatAnswer) -> String {
     match &answer.evaluation {
         Some(evaluation) => evaluation.to_string(),
@@ -10225,6 +10241,138 @@ mod tests {
                 })),
             })
         );
+    }
+
+    /// Under a WF's menu, the evaluation's `reply` is the text the person gets: with the fixed line
+    /// that names the files for a blank reply, and with the links of the published pages that the
+    /// reply leaves out (FINDINGS A-98, A-99). So a WF that forwards only a reply that is not blank
+    /// still delivers them. A reply the loop leaves as it is stays the model's.
+    #[test]
+    fn under_a_menu_the_evaluations_reply_is_the_text_the_person_gets() {
+        const LINK: &str = "https://fluxbee.example/public/k3y";
+        let contract = sample_menu_contract();
+        let file = || {
+            vec![AiUserArtifact::new(
+                b"x".to_vec(),
+                "text/plain",
+                "pedido.csv",
+            )]
+        };
+        let link = [LINK.to_string()];
+        let files_line = "Aca esta el archivo solicitado: pedido.csv";
+        for (reply, files, links, delivered) in [
+            ("", file(), &[][..], files_line.to_string()),
+            ("", Vec::new(), &link[..], LINK.to_string()),
+            (
+                "Te paso la página.",
+                Vec::new(),
+                &link[..],
+                format!("Te paso la página.\n{LINK}"),
+            ),
+            ("", file(), &link[..], format!("{files_line}\n{LINK}")),
+            // Left as the model wrote it.
+            (
+                "Tu página: https://fluxbee.example/public/k3y",
+                Vec::new(),
+                &link[..],
+                format!("Tu página: {LINK}"),
+            ),
+            ("Listo.", file(), &[][..], "Listo.".to_string()),
+            ("", Vec::new(), &[][..], String::new()),
+        ] {
+            let model_text = json!({"reply": reply, "option": "answer"}).to_string();
+            let answer = tool_loop_answer(Some(model_text), files, links, Some(&contract))
+                .expect("an answer")
+                .expect("a reply");
+            let text = match &answer.output {
+                AiBehaviorOutput::Text(text) => text.clone(),
+                AiBehaviorOutput::Final(output) => output.text.clone().unwrap_or_default(),
+            };
+            assert_eq!(text, delivered, "{reply:?}");
+            assert_eq!(
+                answer.evaluation,
+                Some(json!({"reply": delivered, "option": "answer", "params": {}})),
+                "{reply:?}"
+            );
+        }
+    }
+
+    /// Under a WF's menu, the history keeps the checked object with the reply the person got: the
+    /// fixed line that names the files, when the model's reply is blank.
+    #[tokio::test]
+    async fn under_a_menu_the_history_keeps_the_reply_the_person_got() {
+        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
+        let node = GenericAiNode {
+            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
+            ..test_node()
+        };
+        let ai = AiChatRuntime {
+            immediate_memory: ImmediateMemorySection {
+                enabled: true,
+                ..ImmediateMemorySection::default()
+            },
+            ..chat_runtime(None, None)
+        };
+        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
+        let ctx = BehaviorContext {
+            src_ilk: Some(src_ilk.to_string()),
+            thread_id: Some("thread:sim-wf-1".to_string()),
+            ..BehaviorContext::default()
+        };
+        let model = ScriptedModel::new(
+            vec![(
+                "generate_csv_artifact",
+                json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
+            )],
+            Some(r#"{"reply": "", "option": "answer"}"#),
+        );
+        let files = Arc::new(ReplyFiles::default());
+        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
+        let text = "mandame el pedido";
+        let answer = node
+            .run_tool_loop(
+                &model,
+                &tools,
+                &files,
+                &ai,
+                &ctx,
+                text.to_string(),
+                None,
+                text,
+                Some(&sample_menu_contract()),
+            )
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
+        let AiBehaviorOutput::Final(reply) = &answer.output else {
+            panic!("a reply with its file: {answer:?}");
+        };
+        assert_eq!(
+            reply.text.as_deref(),
+            Some("Aca esta el archivo solicitado: pedido.csv")
+        );
+
+        let record = node
+            .immediate_memory_store
+            .as_ref()
+            .expect("the store")
+            .get(src_ilk)
+            .await
+            .expect("the record")
+            .expect("a record");
+        let kept = record
+            .recent_interactions
+            .iter()
+            .map(|interaction| interaction.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                text,
+                r#"{"option":"answer","params":{},"reply":"Aca esta el archivo solicitado: pedido.csv"}"#
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// The call without tools answers under a menu as the tool loop does.

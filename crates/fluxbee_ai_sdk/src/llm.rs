@@ -604,19 +604,23 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
         });
     }
 
-    if let Some(stripped) = trimmed.strip_prefix("```") {
-        let stripped = stripped.trim_start_matches(|c| c != '\n');
-        let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
-        // The object ends where its JSON ends: the closing fence, and any text or fenced block
-        // after it, is the model's (FINDINGS A-131). Without a whole value, it ends at the last
-        // closing fence.
-        if let Some(value) = leading_json_value(stripped.trim_start()) {
-            return Ok(value.to_string());
+    if let Some(fenced) = trimmed.strip_prefix("```") {
+        let (opening_line, body) = fenced.split_once('\n').unwrap_or((fenced, ""));
+        // The object starts after the opening fence's language tag, on that line
+        // (```json {"reply": ...}```) or the next one, and ends where its JSON ends: the closing
+        // fence, and any text or fenced block after it, is the model's (FINDINGS A-131). Without a
+        // whole object, it ends at the last closing fence.
+        let tag_len = opening_line
+            .find(|c: char| c.is_whitespace() || c == '{')
+            .unwrap_or(opening_line.len());
+        if let Some(object) = [&fenced[tag_len..], body]
+            .into_iter()
+            .find_map(|start| leading_json_object(start.trim_start()))
+        {
+            return Ok(object.to_string());
         }
-        let stripped = stripped
-            .rfind("```")
-            .map_or(stripped, |end| &stripped[..end]);
-        let inner = stripped.trim();
+        let body = body.rfind("```").map_or(body, |end| &body[..end]);
+        let inner = body.trim();
         if inner.is_empty() {
             return Err(AiSdkError::InvalidStructuredOutput {
                 detail: "empty_json_fence".to_string(),
@@ -625,12 +629,13 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
         return Ok(inner.to_string());
     }
 
-    // Among other text, the object is the first whole one, whatever text follows it.
-    if let Some(value) = trimmed
-        .find('{')
-        .and_then(|start| leading_json_value(&trimmed[start..]))
+    // Among other text, the object is the first whole one, whatever text is around it: a `{` that
+    // starts none (`Elijo {consult}: {...}`) is the text's.
+    if let Some(object) = trimmed
+        .match_indices('{')
+        .find_map(|(start, _)| leading_json_object(&trimmed[start..]))
     {
-        return Ok(value.to_string());
+        return Ok(object.to_string());
     }
 
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
@@ -645,11 +650,12 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
     }
 }
 
-/// The JSON value `text` starts with, without what follows it, when it starts with a whole one.
-fn leading_json_value(text: &str) -> Option<&str> {
+/// The JSON object `text` starts with, without what follows it, when it starts with a whole one:
+/// an object, never another value.
+fn leading_json_object(text: &str) -> Option<&str> {
     let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
     match values.next() {
-        Some(Ok(_)) => Some(&text[..values.byte_offset()]),
+        Some(Ok(Value::Object(_))) => Some(&text[..values.byte_offset()]),
         _ => None,
     }
 }
@@ -2362,6 +2368,45 @@ mod tests {
             extract_json_value(raw).expect(raw),
             json!({"reply": "Mirá:\n```\nplan pro\n```"})
         );
+    }
+
+    /// Among other text, the object is the first whole one, from whichever `{` it starts at: a `{`
+    /// that starts none is the text's. Text with no object is still an error.
+    #[test]
+    fn a_brace_that_starts_no_object_is_the_texts() {
+        let object =
+            json!({"reply": "Lo consulto.", "option": "consult", "params": {"question": "20%?"}});
+        for raw in [
+            format!("Elijo {{consult}}: {object}"),
+            format!("{{nada}} y {{\"a\": }} antes de {object} y {{después}}"),
+            format!("Elijo {{consult}}:\n```json\n{object}\n```"),
+        ] {
+            assert_eq!(extract_json_value(&raw).expect(&raw), object, "{raw}");
+        }
+        assert!(matches!(
+            extract_json_value("Elijo {consult} y {nada}"),
+            Err(AiSdkError::InvalidStructuredOutput { .. })
+        ));
+    }
+
+    /// The opening fence's line may hold the object after its language tag, or with none, and the
+    /// object may go on over the next lines. A tag with more words leaves the object to the next
+    /// line, as before.
+    #[test]
+    fn an_object_on_the_opening_fences_line_is_that_object() {
+        for raw in [
+            "```json {\"ok\":true}```",
+            "```json {\"ok\":true}\n```\n¿Algo más?",
+            "```{\"ok\":true}```",
+            "```JSON{\"ok\":\ntrue}\n```",
+            "```json title=\"answer\"\n{\"ok\":true}\n```",
+        ] {
+            assert_eq!(
+                extract_json_value(raw).expect(raw),
+                json!({"ok": true}),
+                "{raw}"
+            );
+        }
     }
 
     /// A blank assistant turn never reaches Anthropic, which refuses an empty text block: a history

@@ -107,6 +107,8 @@ records are `slack_threads.db`, next to the node's `config.json`: one row per pl
 - If the records cannot open or a query fails, the node logs it and works without them: messages
   in keep the computed id, and messages out go to the `reply_target` of the node's own channel, or
   else to the top level.
+- Marking a record used is best effort: when only that fails (a full disk, a locked or read-only
+  file), the node logs it and uses the record it found.
 
 So a WF's question, which carries the instance's thread id, is answered on that thread id when a
 supervisor replies in the Slack thread of its post.
@@ -372,6 +374,11 @@ What is still to settle per type:
 - Slack Web API: `chat.postMessage`
 - Required token: **Bot Token** (`xoxb-...`)
 - Minimal scope: `chat:write`
+- **The text is escaped:** `&`, `<` and `>` are posted as `&amp;`, `&lt;` and `&gt;`, as Slack's
+  formatting rules ask of text that is not markup. A payload's text is what a person or an agent
+  wrote, so a `<!channel>`, `<!here>`, `<@U…>`, `<!subteam^…>` or `<https://evil.example|label>` in
+  it shows as written: it pings no one and shows no false link label. A bare URL still links.
+  `blocks` go as they are.
 
 ### 8.2 Destination resolution
 
@@ -472,6 +479,13 @@ Spawn/orchestrator mode (compliance path):
   - today the runtime treats missing config/secrets as a fatal startup error (`exit 1`), which causes a restart loop in systemd.
   - `IO.slack` responsibility: this case must move to a degraded/not-ready mode, without ending the process.
   - expected state (pending): bring up the runtime, publish a config error state and stay controllable by the orchestrator/admin.
+
+- Inbound text keeps Slack's escaping:
+  - a person's `&`, `<` and `>` reach the mesh as `&amp;`, `&lt;` and `&gt;`, and a mention or a
+    link as Slack's markup (`<@U…>`, `<https://…|label>`);
+  - the outbound text is escaped (§8.1), so an agent that quotes such text back shows the entity,
+    for example `Q&amp;A`;
+  - pending: decoding the three entities on the way in.
 
 
 

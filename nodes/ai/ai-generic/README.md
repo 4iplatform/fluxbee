@@ -189,10 +189,12 @@ On every request the node reads the key of its provider from SY.vault:
   retryable.
   - **`text_field`** names one of the contract's required `string` properties, for example
     `"text_field": "reply"`. The reply's text is then that field's value, and the whole object goes
-    in the reply's `meta.context.evaluation`: a WF delivers the text and branches on
-    `event.context.evaluation`. The object is checked on both paths, with tools and without them. A
-    `text_field` that is not a required `string` property makes the contract invalid. The history
-    keeps the whole object as the agent's turn, so a blank text never leaves a blank turn.
+    in the reply's `meta.context.evaluation`. The object is checked on both paths, with tools and
+    without them. A `text_field` that is not a required `string` property makes the contract
+    invalid. The history keeps the whole object as the agent's turn, so a blank text never leaves a
+    blank turn.
+  - **Who uses it:** a caller that is not a WF. A WF asks an agent with a menu (below): wfcel
+    refuses `meta.context.response_envelope` in a WF's actions.
 - **A WF's menu:** a WF asks an agent to choose with `meta.context.wf.menu`
   ([docs/wf-orchestration-v1.md §5.3](../../../docs/wf-orchestration-v1.md#53-case-3-the-internal-consultation-decided-with-the-operator-2026-10-30)):
   an optional `help`, and 1 to 8 `options`, each with a `name`, a `description` and its `params`
@@ -205,8 +207,9 @@ On every request the node reads the key of its provider from SY.vault:
     `reason`), which the node adds to every menu, and the one line that gives the answer's shape,
     `{"reply", "option", "params"}`. The system prompt stays the agent's role, with tools and
     without them, and the agent may use its tools before it answers.
-  - **The answer** is found as a structured answer's is, in a fence or among other text. Its
-    `option` is one of the menu's or `none`, each param of that option is there with its type
+  - **The answer** is found as a structured answer's is: the first whole JSON object, in a fence
+    (also on the fence's opening line) or among other text, where a `{` that starts none is text.
+    Its `option` is one of the menu's or `none`, each param of that option is there with its type
     (an integer a JSON integer, a number any number, an `enum`'s value one of its values; `none`
     needs `reason`), and `reply` is a string, maybe empty. A param the option does not declare, or
     a field besides the three, is dropped with a line in the journal. Anything else is an
@@ -215,6 +218,11 @@ On every request the node reads the key of its provider from SY.vault:
   - **The reply's** text is `reply`, and its `meta.context.evaluation` the checked object, which a
     WF reads as `event.context.evaluation.option` and `event.context.evaluation.params.<p>`. The
     history keeps that object as the agent's turn, as under a `text_field`.
+  - **`reply` is the text the person gets.** When the tool loop adds to the model's reply (the
+    fixed line that names the files, for a blank reply, or a published page's link on a line of its
+    own; see [Tools](#tools)), the evaluation's `reply` and the history's object carry it too. So a
+    WF that forwards only a reply that is not blank still delivers the files and the links
+    (FINDINGS A-98, A-99).
   - **The journal:** the "AI chat request prepared" line names the message's contract, `none`,
     `envelope` or `menu`.
 - **Attachments** (`text/v1` `attachments[]` and `content_ref`):

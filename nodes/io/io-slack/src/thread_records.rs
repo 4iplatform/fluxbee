@@ -19,7 +19,7 @@
 //! hours later, after a restart. A record unused for 30 days is deleted, at start and daily. When the
 //! records fail, the node logs it and works without them: a message keeps the thread id io-common
 //! computes, and an outbound one goes to the `reply_target` of the node's own channel, or else to the
-//! top level.
+//! top level. Marking a record used is best effort: a record found is used even when that fails.
 
 use anyhow::Result;
 use io_common::io_context::{IoContext, SlackPostTarget};
@@ -75,7 +75,7 @@ impl SlackThreadRecords {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The thread id recorded for a place, which marks it used.
+    /// The thread id recorded for a place, which marks it used (`touch`).
     fn thread_of_place(
         &self,
         channel_id: &str,
@@ -91,16 +91,13 @@ impl SlackThreadRecords {
             )
             .optional()?;
         if thread_id.is_some() {
-            conn.execute(
-                "UPDATE slack_threads SET last_used_at = ?3 WHERE channel_id = ?1 AND thread_ts = ?2",
-                params![channel_id, thread_ts, now_ms],
-            )?;
+            Self::touch(&conn, channel_id, thread_ts, now_ms);
         }
         Ok(thread_id)
     }
 
     /// The place of a thread id in a channel, as its `thread_ts` (empty for the top level), which
-    /// marks it used. A thread id that came to have two places goes to the one used last.
+    /// marks it used (`touch`). A thread id that came to have two places goes to the one used last.
     fn place_of_thread(
         &self,
         thread_id: &str,
@@ -117,12 +114,26 @@ impl SlackThreadRecords {
             )
             .optional()?;
         if let Some(thread_ts) = thread_ts.as_deref() {
-            conn.execute(
-                "UPDATE slack_threads SET last_used_at = ?3 WHERE channel_id = ?1 AND thread_ts = ?2",
-                params![channel_id, thread_ts, now_ms],
-            )?;
+            Self::touch(&conn, channel_id, thread_ts, now_ms);
         }
         Ok(thread_ts)
+    }
+
+    /// Marks a place used, which keeps it from the expiry. Best effort: when it fails (a full disk,
+    /// a locked or read-only file) it logs, and the lookup still answers with the record it found,
+    /// which is never lost to its mark.
+    fn touch(conn: &Connection, channel_id: &str, thread_ts: &str, now_ms: u64) {
+        if let Err(err) = conn.execute(
+            "UPDATE slack_threads SET last_used_at = ?3 WHERE channel_id = ?1 AND thread_ts = ?2",
+            params![channel_id, thread_ts, now_ms],
+        ) {
+            tracing::warn!(
+                channel_id = %channel_id,
+                thread_ts = %thread_ts,
+                error = %err,
+                "slack thread records: marking a record used failed; it is used all the same"
+            );
+        }
     }
 
     /// Records a place under a thread id. A place has one thread id, the last one recorded; when it
@@ -930,5 +941,46 @@ mod tests {
         new_post.posted(Some("1793000000.000903"), NOW);
         assert_eq!(new_post.thread_ts(), None);
         assert!(records.expire(NOW).is_err());
+    }
+
+    /// Marking a record used is best effort: when that fails (a full disk, a locked or read-only
+    /// file), the record found still decides. A supervisor's reply still reaches the WF's
+    /// instance, and a message on the recorded thread still goes to its place, not to a new post at
+    /// the top level.
+    #[test]
+    fn a_record_found_is_used_even_when_marking_it_used_fails() {
+        let records = records();
+        records
+            .record(WF_THREAD, CHANNEL, "1793000000.001000", NOW - DAY_MS)
+            .expect("record");
+        records
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER touch_fails BEFORE UPDATE ON slack_threads \
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .expect("trigger");
+
+        let mut reply = inbound(Some("1793000000.001000"));
+        map_inbound_thread(Some(&records), &mut reply, Some("1793000000.001000"), NOW);
+        assert_eq!(reply.conversation.thread_id.as_deref(), Some(WF_THREAD));
+
+        let thread = resolve(Some(&records), Some(WF_THREAD), None);
+        assert_eq!(
+            thread.place,
+            OutboundPlace::Recorded(Some("1793000000.001000".to_string()))
+        );
+        assert_eq!(thread.thread_ts(), Some("1793000000.001000"));
+
+        // Neither use was marked.
+        assert_eq!(
+            rows(&records),
+            vec![row(
+                WF_THREAD,
+                "1793000000.001000",
+                NOW - DAY_MS,
+                NOW - DAY_MS
+            )]
+        );
     }
 }

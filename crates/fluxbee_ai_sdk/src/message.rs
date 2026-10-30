@@ -1814,12 +1814,15 @@ mod tests {
                 evaluation: Some(invoice.clone()),
             }
         );
-        // In a fence, or followed by text, as a structured call takes it.
+        // In a fence, also on the opening fence's line, or among text, also after a `{` that
+        // starts no object, as a structured call takes it.
         for raw in [
             format!("```json\n{invoice}\n```"),
             format!("```json\n{invoice}\n```\n¿Algo más?"),
+            format!("```json {invoice}```"),
             format!("{invoice}\nListo."),
             format!("Elijo invoice: {invoice}"),
+            format!("Elijo {{invoice}}: {invoice}"),
         ] {
             assert_eq!(menu.answer(raw.clone()).expect(&raw), answer, "{raw}");
         }
