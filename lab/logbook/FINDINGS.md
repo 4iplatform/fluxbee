@@ -1078,6 +1078,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
+
+- **What happens:**
+  - **Slack:** in Socket Mode, "when multiple connections are active, each payload may be sent to
+    any of the connections" (docs.slack.dev, *Using Socket Mode*). Each event reaches one
+    connection, not all of them.
+  - **io.slack:** a node keeps one Socket Mode connection and is bound to one conversation. It drops
+    an event of another channel, with only a `debug` line ("dropping inbound Slack event outside
+    configured binding", nodes/io/io-slack/src/main.rs, the inbound loop).
+  - **The result:** two io.slack nodes on the same Slack app split its events between them. Each
+    drops the other's share, and nothing above `debug` says so.
+- **Why it matters:** WF Case 3 puts a second io.slack (the supervisors') next to the person's. A
+  multi-channel deployment is the normal shape.
+- **Not documented:**
+  - docs/io/io-slack.md does not say that each node needs its own Slack app;
+  - it still says that inbound comes "only through mentions of the bot (`app_mention`)". The code
+    also relays the plain messages of the bound channel.
+- **Today:** each io.slack node needs its own Slack app, with its own `xapp-` and `xoxb-` tokens. WF
+  Case 3's gate does that.
+- **Options, for the IO family's track:**
+  - one connection per app that hands each event to the node bound to its channel, as io.wapp's
+    fan-out does for one Meta webhook (docs/io-wapp-design.md);
+  - or one node that serves several bindings.
+
+  Either way, the doc says it, and a dropped event is logged above `debug`.
+
 ### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 5) — A wf-rules `check` stages the definition it checks
 
 - **What happens** (go/sy-wf-rules/node/dispatch.go): `check` is `compile` under another name, and
