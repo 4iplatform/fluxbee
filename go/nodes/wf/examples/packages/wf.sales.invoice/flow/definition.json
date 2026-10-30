@@ -1,7 +1,7 @@
 {
   "wf_schema_version": "1",
   "workflow_type": "sales.invoice",
-  "description": "Cases 1 and 3 of wf-orchestration-v1 (§5.2, §5.3): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales, which the WF asks with a menu: answer, invoice or consult. Invoice hands the conversation to AI.invoice, which holds it until it hands it back (its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. Consult tells the person that sales will check, and writes sales' question to the supervisors' IO.slack.supervisores@motherbee; their answer, in the thread of that post, goes to sales, which tells the person, and when none comes in 30 minutes the WF tells sales so. A person's message costs two agent calls at most, and no agent is asked twice with the same message. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error, or an answer that does not come in 120 s, is noted in last_error and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. The catch takes none from the agent the WF waits for (waiting_for): its reply goes to the person, its reason goes to last_error, and sales holds the conversation; it notes in last_error an error no state takes, such as the cap on agent calls. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
+  "description": "Cases 1 and 3 of wf-orchestration-v1 (§5.2, §5.3): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales, which the WF asks with a menu: answer, invoice or consult. Invoice hands the conversation to AI.invoice, which holds it until it hands it back (its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. Consult tells the person that sales will check (when sales' reply is not empty), and writes sales' question to the supervisors' IO.slack.supervisores@motherbee. Each supervisor's message in the thread of that post goes to sales, which says whether it decides the question (decided, which goes to the person) or not yet (wait, and the WF waits on); when no decision comes in 30 minutes the WF tells sales so. A supervisor's message while sales answers the person, or while invoicing or payments hold the conversation, is logged and dropped (the default). A person's message costs two agent calls at most, and no agent is asked twice with the same message. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error, or an answer that does not come in 120 s, is noted in last_error and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. The catch takes none from the agent the WF waits for (waiting_for): its reply goes to the person, its reason goes to last_error, and sales holds the conversation; it notes in last_error an error no state takes, such as the cap on agent calls. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
   "start_from": ["IO.api.sales@worker1"],
   "input_schema": {
     "type": "object",
@@ -109,10 +109,24 @@
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
-          "guard": "event.context.evaluation.option == 'consult'",
+          "guard": "event.context.evaluation.option == 'consult' && event.context.evaluation.reply != ''",
           "target_state": "consulting",
           "actions": [
             { "type": "forward", "target": "IO.api.sales@worker1" },
+            { "type": "set_variable", "name": "question", "value": "event.context.evaluation.params.question" },
+            {
+              "type": "send_message",
+              "target": "IO.slack.supervisores@motherbee",
+              "meta": { "msg": "SUPERVISOR_QUESTION" },
+              "payload": { "type": "text", "content": { "$ref": "event.context.evaluation.params.question" } }
+            }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'consult'",
+          "target_state": "consulting",
+          "actions": [
             { "type": "set_variable", "name": "question", "value": "event.context.evaluation.params.question" },
             {
               "type": "send_message",
@@ -165,7 +179,7 @@
     },
     {
       "name": "consulting",
-      "description": "Sales' question is with the supervisors, at IO.slack.supervisores@motherbee, and the person was told that sales will check. A supervisor's answer, in the thread of that post, goes to sales with vars.question, and sales tells the person. When none comes in 30 minutes, the WF tells sales so, and sales tells the person. A message from the person meanwhile goes to sales with the same menu, and sales' answer goes to the person; a payment_due meanwhile is noted.",
+      "description": "Sales' question is with the supervisors, at IO.slack.supervisores@motherbee, and the person was told that sales will check. A supervisor's message in the thread of that post goes to sales with vars.question, and sales says whether it decides the question. When none comes in 30 minutes, the WF tells sales so, and sales tells the person. A message from the person meanwhile goes to sales with the same menu, and sales' answer goes to the person; a payment_due meanwhile is noted.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "'IO.slack.supervisores@motherbee'" },
         { "type": "schedule_timer", "timer_key": "consult_timeout", "fire_in": "30m" }
@@ -182,8 +196,11 @@
               "target": "AI.sales@worker1",
               "vars": { "question": { "$ref": "state.question" } },
               "menu": {
-                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
-                "options": [ { "name": "answer", "description": "You tell the person." } ]
+                "help": "A supervisor wrote in the thread of the question in vars.question, which you asked about this conversation. Tell the person only what a supervisor decided.",
+                "options": [
+                  { "name": "decided", "description": "The message decides the question: you tell the person the decision." },
+                  { "name": "wait", "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty." }
+                ]
               }
             }
           ]
@@ -240,7 +257,7 @@
     },
     {
       "name": "sales_relaying",
-      "description": "Sales has the supervisors' answer, or the news that none came, and tells the person: its answer goes to the person, with the person's context.io, and sales holds the conversation. A message from the person meanwhile goes to sales with the same menu; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
+      "description": "Sales has a supervisor's message, or the news that no decision came, and tells the person: its answer or its decided goes to the person, with the person's context.io, and sales holds the conversation; its wait goes back to consulting, and the WF waits for the decision. A message from the person meanwhile goes to sales, to answer it; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
         { "type": "schedule_timer", "timer_key": "relay_timeout", "fire_in": "120s" }
@@ -255,9 +272,15 @@
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
-          "guard": "event.context.evaluation.option == 'answer'",
+          "guard": "event.context.evaluation.option in ['answer', 'decided']",
           "target_state": "sales_listening",
           "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'wait'",
+          "target_state": "consulting",
+          "actions": []
         },
         {
           "event_match": { "src": "IO.api.sales@worker1" },
@@ -291,7 +314,7 @@
     },
     {
       "name": "sales_listening",
-      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person, and a supervisor's answer that came after its wait goes to sales, which tells the person. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
+      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person, but not a wait, and a supervisor's message that came after its wait goes to sales, which says whether it decides the question. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "''" },
         { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
@@ -309,7 +332,7 @@
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
-          "guard": "event.payload.type != 'error'",
+          "guard": "event.payload.type != 'error' && event.context.evaluation.option != 'wait'",
           "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
         },
         {
@@ -332,8 +355,11 @@
               "target": "AI.sales@worker1",
               "vars": { "question": { "$ref": "state.question", "default": "" } },
               "menu": {
-                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
-                "options": [ { "name": "answer", "description": "You tell the person." } ]
+                "help": "A supervisor wrote in the thread of the question in vars.question, which you asked about this conversation. Tell the person only what a supervisor decided.",
+                "options": [
+                  { "name": "decided", "description": "The message decides the question: you tell the person the decision." },
+                  { "name": "wait", "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty." }
+                ]
               }
             }
           ]

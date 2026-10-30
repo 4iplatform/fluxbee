@@ -752,12 +752,23 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.delivered("Todavía no, apenas sepa te aviso.", salesAgent)
 	c.inState("consulting")
 
-	// 3. A supervisor answers in the thread: the answer goes to sales as it came, with the question
+	// 3. A supervisor asks another in the thread: the message goes to sales, which says it decides
+	// nothing yet (wait). The person gets nothing, and the WF waits for the decision again.
+	sent := c.count(salesIO)
+	c.supervisor("@ana, ¿este cliente pagó tarde?")
+	c.inState("sales_relaying")
+	c.choose(salesAgent, c.sentTo(salesAgent), "", "wait", nil)
+	c.inState("consulting")
+	if c.count(salesIO) != sent {
+		t.Fatalf("a message that decides nothing does not reach the person: %d", c.count(salesIO))
+	}
+
+	// 4. A supervisor decides in the thread: the message goes to sales as it came, with the question
 	// and the menu, and the wait's timer goes.
 	answer := c.supervisor("Aprobado hasta 15%.")
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
-	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "answer" ||
+	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait" ||
 		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" {
 		t.Fatalf("sales gets the supervisor's answer: %s %s", toSales.Payload, toSales.Meta.Context)
 	}
@@ -765,18 +776,23 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 		t.Fatalf("the wait's timer goes: %v", c.timer.pending)
 	}
 
-	// 4. Sales tells the person: its answer, to a message from the supervisors' channel, goes to the
+	// 5. Sales tells the person: its decided, to a message from the supervisors' channel, goes to the
 	// person with the person's context.io, and sales holds the conversation.
-	c.choose(salesAgent, toSales, "Te puedo hacer 15% de descuento.", "answer", nil)
+	c.choose(salesAgent, toSales, "Te puedo hacer 15% de descuento.", "decided", nil)
 	c.delivered("Te puedo hacer 15% de descuento.", salesAgent)
 	c.inState("sales_listening")
 
-	// 5. Another consult, which no supervisor answers in time: the WF tells sales so, with the
+	// 6. Another consult, with an empty reply, which no supervisor answers in time: the person gets
+	// nothing at the consult, the supervisors get the question; then the WF tells sales so, with the
 	// question, its menu and the person's context.io, and sales' answer goes to the person.
 	const another = "¿25% en 20 licencias?"
 	c.person("¿Y 25% si llevo 20?")
-	c.choose(salesAgent, c.sentTo(salesAgent), "Lo consulto.", "consult", map[string]any{"question": another})
+	sent = c.count(salesIO)
+	c.choose(salesAgent, c.sentTo(salesAgent), "", "consult", map[string]any{"question": another})
 	c.inState("consulting")
+	if c.count(salesIO) != sent || !strings.Contains(string(c.sentTo(supervisorsIO).Payload), "25%") {
+		t.Fatalf("an empty reply does not reach the person, and the question goes out: %d", c.count(salesIO))
+	}
 	c.fire("consult_timeout")
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
@@ -788,13 +804,13 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.delivered("Todavía no me confirmaron, preguntame más tarde.", salesAgent)
 	c.inState("sales_listening")
 
-	// 6. The supervisor answers later: the answer still goes to sales, which tells the person.
+	// 7. The supervisor answers later: the answer still goes to sales, which tells the person.
 	c.supervisor("Sí, 25% en 20 está bien.")
 	c.inState("sales_relaying")
 	if vars := fmt.Sprint(wfBlock(t, c.sentTo(salesAgent))["vars"]); vars != "map[question:"+another+"]" {
 		t.Fatalf("a late answer goes to sales with its question: %s", vars)
 	}
-	c.choose(salesAgent, c.sentTo(salesAgent), "¡Me aprobaron 25% en 20 licencias!", "answer", nil)
+	c.choose(salesAgent, c.sentTo(salesAgent), "¡Me aprobaron 25% en 20 licencias!", "decided", nil)
 	c.delivered("¡Me aprobaron 25% en 20 licencias!", salesAgent)
 	c.inState("sales_listening")
 	if questions := c.count(supervisorsIO); questions != 2 {

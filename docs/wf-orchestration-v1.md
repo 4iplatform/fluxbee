@@ -907,6 +907,19 @@ docs, and the agents. Everything below was fixed before the release.
 - **Scope:** io.slack, the normalized IO node. The other IO nodes follow in the IO family's track.
 - The operator expects thread ids to be *"otro debug grande cuando empecemos a hacer pruebas
   reales"*.
+- **Decided after the review (the operator, 2026-10-30): each message a WF sends to a channel opens
+  a new post there.**
+  - **What the review found:** a thread id is the conversation's, so it outlives one question. A
+    second consultation of the same customer, days later, went as a reply into the first
+    question's Slack thread, out of the channel's view. And a late reply there, meant for the
+    first question, decided the second.
+  - **The rule:** a place io.slack opened with its own post serves one message. The next message on
+    that thread id opens a new post, and io.slack forgets the older post it opened, so a late
+    reply to an old question is no longer taken. A place a person opened keeps today's behavior.
+  - **For Case 4:** when a WF must keep writing in one thread (handing a conversation to a person
+    of the team), the WF will ask for it.
+  - **The operator's note:** cognition already has two axes for this, the thread (physical) and the
+    context (contextual, [12-cognition-v2](history/12-cognition-v2.md)). For now, the rule above.
 
 #### 5.3.5 Decided: Archi learns to write this, from one handbook
 
@@ -981,8 +994,8 @@ Read in the code on 2026-10-30, at `32353f18`. Four pieces; the contracts betwee
   An error names the path, as any other does.
 
 **2. The engine (go/nodes/wf/wf-generic/node):**
-- **The menu:** `withWFBlock` writes the action's menu, as written, into `meta.context.wf.menu`,
-  next to `trail` and `vars`.
+- **The menu:** `withWFBlock` writes the action's menu into `meta.context.wf.menu`, next to
+  `trail` and `vars`: as written, but with each option's params in name order and no empty field.
 - **The catch:** when no transition of the current state takes an event, the engine tries the
   catch's transitions in order. A chosen one runs like a state's: exit and entry actions with a
   `target_state`, or internal without one.
@@ -1088,8 +1101,8 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
   `event.context.evaluation.reply != ''`.
 - **The agent checks the menu with exactly wfcel's limits,** blank texts and empty or repeated
   `enum` values included.
-- **A menu's answer is the first whole JSON value,** fenced or among other text (FINDINGS A-131,
-  resolved).
+- **A menu's answer is the first whole JSON object,** fenced (on the opening fence's line too) or
+  among other text (FINDINGS A-131, resolved).
 - **A blank `thread_ts` panicked io-common's thread id** (FINDINGS A-130): it is now the channel's
   top level.
 - **Not checked at load:** a `meta.context` written whole by a `$ref` may carry a

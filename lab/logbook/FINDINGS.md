@@ -1078,6 +1078,28 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-133 🟡 OPEN (found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
+
+- **What happens:** `runtime.immediate_memory` (off by default) keeps an agent's recent turns per
+  sender `src_ilk` (`load_immediate_memory_for_input`, `persist_immediate_turn` in
+  nodes/ai/ai-generic/src/bin/ai_node_runner.rs; docs/immediate-conversation-memory-spec.md §4
+  says so on purpose).
+  - In a WF consultation, the supervisor's message reaches the agent with the supervisor's ILK. The
+    turn in which the agent tells the person the decision is kept under the supervisor, so the
+    person's next message finds no decision.
+  - When the same supervisor answers another customer's consultation, the agent reads the first
+    customer's turns.
+- **Why it matters:** it contradicts the cognition model, where memory belongs to the communication
+  `(thread_id, agent ILK)` ([cognition](../../docs/reference/cognition.md) §1).
+- **The operator (2026-10-30):** *"la memoria apagada, cognitive debería resolver eso... no
+  quisiera usar la memoria propia del SDK de IA"*. The agents run with it off, and cognition is
+  their memory. Checked that day: SY.cognition is `ready_semantic_ai` on the motherbee and worker1,
+  and the Case 1 gate's threads have memories with their content.
+- **To watch in the gate:** the package holds contexts, reasons, memories and episodes; the
+  summarizer never sees a message's text, and the region is rewritten after two model calls.
+  Whether sales knows a supervisor's decision on the person's next message is checked there.
+- **Next:** remove the immediate memory, or key it by thread, when the agents' memory is revisited.
+
 ### A-132 🟡 OPEN (found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
 
 - **What happens:** go/nodes/wf/wf-generic/node: an instance's status may be `cancelling` in the
@@ -1106,7 +1128,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`leading_json_value`), so a fence or braces after it are the model's, and a fence in the
   object's own text stays in it. Without a whole value, the old cuts apply.
 
-### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: a "send to channel" reply is dropped, a mention may arrive twice, and an empty message posts a fallback
+### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: "send to channel" and file replies are dropped, a mention may arrive twice, an empty message posts a fallback, and a files-only post is not recorded
 
 - **A reply with "Also send to #channel" never reaches the mesh.**
   - Slack gives it the subtype `thread_broadcast`, and the echo guard drops every message with a
@@ -1127,6 +1149,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     in io-common;
   - docs/io/io-slack.md said that inbound is `app_mention` only, and its IO context example had the
     old `slack_workspace` entrypoint and a `thread_ts` as the thread id.
+- **A reply with a file never reaches the mesh** (found in Case 3's review). Slack gives a message
+  that shares a file the subtype `file_share`, which the same echo guard drops. A supervisor who
+  answers a consultation with a screenshot never answers it, and the consultation times out. Only
+  an `app_mention` reaches `collect_slack_blob_attachments`.
+- **A post with only files is never recorded** (found in Case 3's review). A message on a thread id
+  with no recorded place, and with files and no text, is uploaded file by file at the top level,
+  and an upload answers no `ts` (thread_records.rs, `OutboundThread::posted`). A reply under any of
+  those posts keeps its own thread id, and the thread's next message opens another top-level post.
 - **A message with no text posts a fallback in Spanish.** An outbound message whose text is empty
   (an agent's empty `reply` that a WF forwards, say) posts "No pude entregar el mensaje en Slack (sin
   contenido util)." to the person (nodes/io/io-slack/src/main.rs). The handbook (§4.2.4) and the
@@ -1134,7 +1164,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Next, in the IO family's track:**
   - relay a `thread_broadcast` as the plain message it is;
   - deduplicate by the message (channel and `ts`), not by the event;
-  - drop a message with no text and no blocks, with a log line, instead of the fallback.
+  - drop a message with no text and no blocks, with a log line, instead of the fallback;
+  - relay a `file_share` with the checks a plain message gets, and its files;
+  - post a new place's files under a first text post (their names), whose `ts` is recorded.
 
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 

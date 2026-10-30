@@ -9,7 +9,9 @@ Sources of the `WF.*` nodes: the workflow engine and its example workflows.
   node's exit, each asked with a menu, with a consultation of the supervisors' IO node and a
   catch); their definitions validate in CI and run on the engine in its tests.
 
-The definition language and its validator are `go/pkg/wfcel`, shared with SY.wf-rules. The spec is
+The definition language and its validator are `go/pkg/wfcel`, shared with SY.wf-rules. Writing a
+definition is the handbook's §4.2
+([docs/archi/handbook_fluxbee.md](../../../docs/archi/handbook_fluxbee.md)). The spec is
 [docs/spec-systemnode-wf-v1_1.md](../../../docs/spec-systemnode-wf-v1_1.md), the deploy guide
 [docs/wf-rules-quickstart.md](../../../docs/wf-rules-quickstart.md), and the track
 [docs/wf-orchestration-v1.md](../../../docs/wf-orchestration-v1.md).

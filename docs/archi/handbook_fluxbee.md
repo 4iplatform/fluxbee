@@ -227,10 +227,15 @@ operating one.
 - **Declaring it:** in `wf_deployments`, deployed with `wf_rules_compile_apply`. SY.wf-rules
   packages it, then creates and runs its `WF.<workflow_name>@<hive>` node. Never declare that node
   in `nodes`, and never `run_node` it: a manifest that declares a `WF.*` node is refused.
+- **Wiring it:** each IO node whose messages the WF takes sends them to the WF: its config's
+  `io.dst_node` is `WF.<workflow_name>@<hive>`. That covers the nodes of `start_from`, and the
+  supervisors' io.slack of a consultation. Without it, the IO node keeps sending where it did, and
+  the WF never hears from it.
 - **Where it runs:** where SY.wf-rules runs, on the motherbee or a worker. Never on an ingress or
   an egress hive.
 - **A complete example:** the seeds `wf_node_with_workflow` and `workflow_definition`. An agent
-  answers through a menu, consults a supervisor, and the catch takes what no state handles.
+  answers through a menu or consults the supervisors, and the catch acts on its answers wherever
+  they arrive.
 
 #### 4.2.1 The definition
 
@@ -364,8 +369,8 @@ what the agent may answer, and the role keeps only the agent's trade.
   - `help` is optional, up to 600 characters. Use it to give the choice context.
   - 1 to 8 options. A name matches `^[a-z][a-z0-9_]{0,31}$`, is unique, and is never `none`. A
     description holds 1 to 200 characters.
-  - Up to 8 params per option. A param's type is `string`, `boolean`, `integer` or `number`, and its
-    optional description holds up to 200 characters.
+  - Up to 8 params per option. A param's name matches the same pattern. Its type is `string`,
+    `boolean`, `integer` or `number`, and its optional description holds up to 200 characters.
   - `enum` is for strings only: 1 to 20 values, each non-empty and unique.
   - The menu is literal (no `$ref`), and a field it does not define is refused.
 - **`none`:** the agent node adds it to every menu, with the param `reason`.
@@ -374,9 +379,15 @@ what the agent may answer, and the role keeps only the agent's trade.
     `event_match.src`;
   - the text for the person is in `event.payload.content`;
   - `event.context.evaluation` is `{reply, option, params}`. Read
-    `event.context.evaluation.option` and `event.context.evaluation.params.question`;
+    `event.context.evaluation.option` and `event.context.evaluation.params.question`. Its `reply`
+    is the text the person gets: the model's, or the line that names the agent's files and the
+    links of its pages;
   - a guard, a `set_variable` or a `$ref` that names an option or a param that no menu of the
-    definition has is refused.
+    definition has is refused, and so is a field of the evaluation other than those three. A WF
+    reads only the answers to its own menus: to pass a choice on to another WF, send it in a
+    payload built from `$ref`s.
+- **Params are the person's words passed on by a model.** Guard them before acting on them, such as
+  a price below the list price.
 - **Errors:** an answer off the menu comes back as a payload of type `error`, code
   `invalid_structured_output`, with no retry. Off the menu means an unknown option, a missing or
   mistyped param, or no JSON. A timeout and a provider failure are errors too. An error's `msg` is
@@ -405,7 +416,7 @@ what the agent may answer, and the role keeps only the agent's trade.
 - **The default:** without a catch, or when the catch takes nothing, the event is logged locally,
   in the instance's log and the node's log, as `unhandled event`. The instance stays where it was.
 - **The cap:** at most 8 messages go to agents between two triggers. A trigger is a message from an
-  IO node or a WF, or a timer fire.
+  IO node or another WF, or a timer fire.
   - Past the cap, the send is not made.
   - The instance gets one `AGENT_CALL_CAP` event (a payload of type `error`, code `agent_call_cap`),
     for its transitions or its catch.
@@ -419,11 +430,14 @@ what the agent may answer, and the role keeps only the agent's trade.
   (an option), or an inactivity timer fires.
 - **A consultation:**
   1. The agent answers `consult`.
-  2. The WF forwards the agent's reply to the person.
-  3. It writes the question (a `$ref` to the param) to the supervisors' IO node, and waits with a
-     timer.
-  4. The supervisor's answer, in the thread of that post, reaches the instance. The WF forwards it
-     to the agent with a menu.
+  2. The WF forwards the agent's reply to the person, when it is not empty.
+  3. It writes the question (a `$ref` to the param) to the supervisors' io.slack, and waits with a
+     timer. Only io.slack maps a reply in the thread of its post back to the instance's thread.
+  4. Each supervisor's message in that thread reaches the instance. The WF forwards it to the agent
+     with a menu of two options: the message decides the question (`decided`), or decides nothing
+     yet (`wait`). Only a decision reaches the person.
+- **Answers in any state:** a person who writes twice gets two answers, and a decision may cross an
+  answer to the person. The catch acts on an agent's answers wherever they arrive.
 - **Late events:** handle a message where it can arrive. Use an internal transition when it must not
   leave the state, and guard the catch with a state variable when it must not move the instance.
 

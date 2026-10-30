@@ -27377,12 +27377,12 @@ mod tests {
             (
                 cookbook_paths::DESIGN,
                 4,
-                "7644772c2509e7b3b995639ff879096f6bb4b10c5a039e88c34e5de87898767f",
+                "63856a9386016b06c49269e49eac0dccaa900a76de3a9829b56097dd9ad33cb4",
             ),
             (
                 cookbook_paths::ARTIFACT,
                 4,
-                "0ab38ff93efd5354bec7aec05ff893fec5055eb97151281f0eac7e0f60e2d582",
+                "69012e9098674a8e17a2f17377bdeb43541b76b1b897f635fea327f6058fc139",
             ),
             (
                 cookbook_paths::PLAN_COMPILE,
