@@ -1606,10 +1606,13 @@ async fn run_inbound_socket_mode(
                 Some(v) => v.to_string(),
                 None => continue,
             };
+            // A blank thread_ts is the channel's top level, like a missing one.
             let thread_ts = event
                 .get("thread_ts")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let content = mention_re.replace(raw_text, "").to_string();
 

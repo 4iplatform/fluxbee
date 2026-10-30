@@ -1078,6 +1078,43 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-131 🟡 OPEN (found 2026-10-30, building WF Case 3) — A fenced answer followed by another fenced block does not parse
+
+- **What happens:** crates/fluxbee_ai_sdk/src/llm.rs, `extract_json_candidate`, cuts a fenced answer
+  at the LAST closing fence.
+  - An object in a fence, followed by text that holds another fenced block (an example, say), is
+    read from the first fence to the last one. That is not JSON.
+  - The answer is then `json_parse_error`; under a WF's menu, `invalid_structured_output` with
+    `not_json`.
+- **Why it matters:** since 0.1.91, a fenced object followed by text is that object. This case
+  escaped it, and a menu's answer goes through the same parse.
+- **Fix:** cut at the first closing fence after the object.
+
+### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: a "send to channel" reply is dropped, and a mention may arrive twice
+
+- **A reply with "Also send to #channel" never reaches the mesh.**
+  - Slack gives it the subtype `thread_broadcast`, and the echo guard drops every message with a
+    subtype (`classify_slack_inbound`, nodes/io/io-slack/src/main.rs). The code's comment says so;
+    the docs did not.
+  - In WF Case 3, a supervisor who ticks it never answers the consultation. The gate's supervisor
+    does not tick it.
+- **A mention may arrive twice.** A Slack app subscribed to both `app_mention` and
+  `message.channels` (or `message.groups`) may deliver a message that mentions the bot as two
+  events, with different `event_id`s.
+  - The node deduplicates by `event_id` (its inbound loop's `message_id`), so it would relay that
+    message twice.
+  - Slack's `app_mention` page does not say whether both events arrive, so this is not verified.
+  - WF Case 3's gate app subscribes to the messages only, which include the mentions.
+- **Fixed in Case 3, by the way:**
+  - a blank `thread_ts` panicked io-common's thread id (`expect` in `slack_inbound_io_context`) and
+    killed the inbound task silently. A blank one is now the channel's top level, in io-slack and
+    in io-common;
+  - docs/io/io-slack.md said that inbound is `app_mention` only, and its IO context example had the
+    old `slack_workspace` entrypoint and a `thread_ts` as the thread id.
+- **Next, in the IO family's track:**
+  - relay a `thread_broadcast` as the plain message it is;
+  - deduplicate by the message (channel and `ts`), not by the event.
+
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 
 - **What happens:**
@@ -1091,10 +1128,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     drops the other's share, and nothing above `debug` says so.
 - **Why it matters:** WF Case 3 puts a second io.slack (the supervisors') next to the person's. A
   multi-channel deployment is the normal shape.
-- **Not documented:**
-  - docs/io/io-slack.md does not say that each node needs its own Slack app;
-  - it still says that inbound comes "only through mentions of the bot (`app_mention`)". The code
-    also relays the plain messages of the bound channel.
+- **Not documented:** docs/io/io-slack.md does not say that each node needs its own Slack app. Its
+  stale inbound line was fixed in Case 3 (A-130).
 - **Today:** each io.slack node needs its own Slack app, with its own `xapp-` and `xoxb-` tokens. WF
   Case 3's gate does that.
 - **Options, for the IO family's track:**

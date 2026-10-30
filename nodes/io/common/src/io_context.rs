@@ -517,6 +517,8 @@ pub fn slack_inbound_io_context(
     message_id: &str,
 ) -> IoContext {
     let binding_id = slack_binding_id(workspace_id, conversation_id);
+    // A blank thread_ts is the channel's top level: as a native thread id it would panic below.
+    let thread_ts = thread_ts.map(str::trim).filter(|ts| !ts.is_empty());
     let thread_id = match thread_ts {
         Some(native_thread_id) => Some(
             compute_thread_id(ThreadIdInput::NativeThread {
@@ -752,6 +754,22 @@ mod tests {
                 .and_then(|v| v.as_str()),
             None
         );
+    }
+
+    #[test]
+    fn slack_blank_thread_ts_is_the_channel_top_level() {
+        let io = slack_inbound_io_context("T123", "U456", "C789", Some("  "), "EvABC");
+        let expected = compute_thread_id(ThreadIdInput::PersistentChannel {
+            channel_type: "slack",
+            entrypoint_id: Some("T123"),
+            conversation_id: "C789",
+        })
+        .expect("thread id");
+        assert_eq!(
+            io.conversation.thread_id.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(io.reply_target.params.get("thread_ts").is_none());
     }
 
     #[test]

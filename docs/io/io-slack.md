@@ -8,7 +8,8 @@
 The **Slack IO Node** is the adapter between Slack and the internal system (router + nodes).
 For the MVP, its goal is:
 
-- **Inbound:** receive messages only through **mentions of the bot** (`app_mention`).
+- **Inbound:** receive the bot's mentions (`app_mention`) and the plain messages of the bound
+  channel (`message`).
 - **Outbound:** send messages to Slack using the **Slack Web API** (`chat.postMessage`).
 
 This document **extends** the base IO Nodes specification and defines only
@@ -132,20 +133,30 @@ The choice of mode does **NOT affect** the IO's internal contract.
 
 ---
 
-### 3.2 Supported event: `app_mention`
+### 3.2 Supported events: `app_mention` and `message`
 
-The Slack IO Node **ONLY** processes events:
-- `type = "app_mention"`
+The Slack IO Node relays, in the bound channel only:
+- `type = "app_mention"`;
+- `type = "message"` when it is a plain message from a person:
+  - it has no `subtype`, so no edits, deletions, joins, bot posts or thread broadcasts;
+  - it has no `bot_id`;
+  - it is not the node's own post. The node knows its bot user id from `auth.test`; while that id
+    is unknown, it relays no `message` (it fails closed).
 
 Relevant fields of the Slack event:
-- `user`: ID of the user who mentions the bot.
-- `channel`: ID of the channel where the mention happened.
+- `user`: ID of the user who wrote.
+- `channel`: ID of the channel.
 - `text`: message content.
 - `ts`: message timestamp.
-- `thread_ts`: thread timestamp (if it applies).
+- `thread_ts`: thread timestamp, when the message is in a Slack thread.
 - `event_id` / `event_ts`: event identifiers.
 
-Other events **MUST** be ignored.
+Other events are ignored.
+
+- **A mention may arrive twice.** A Slack app subscribed to `message.channels` (or
+  `message.groups`) already receives the mentions, as messages. Subscribed to `app_mention` too, a
+  mention may arrive as two events with different `event_id`s, and the node deduplicates by
+  `event_id` (FINDINGS A-130). Subscribe to the messages only.
 
 ---
 
@@ -254,9 +265,9 @@ Operational interpretation:
 {
   "io": {
     "channel": "slack",
-    "entrypoint": { "kind": "slack_workspace", "id": "<team_id>" },
+    "entrypoint": { "kind": "slack_binding", "id": "<team_id>:<channel>" },
     "sender": { "kind": "slack_user", "id": "<user>" },
-    "conversation": { "kind": "slack_channel", "id": "<channel>", "thread_id": "<thread_ts if present>" },
+    "conversation": { "kind": "slack_channel", "id": "<channel>", "thread_id": "<computed from the channel and the Slack thread, or the recorded one (§2.4)>" },
     "message": { "id": "<event_id|ts>" },
     "reply_target": {
       "kind": "slack_post",
