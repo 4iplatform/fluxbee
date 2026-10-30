@@ -93,16 +93,25 @@ The node owns its conversations' thread ids, because it created the communicatio
 ([wf-orchestration-v1](../wf-orchestration-v1.md) §5.3.4). It records the thread id of each Slack
 place it handles, a place being one channel and one thread in it, or the channel's top level. The
 records are `slack_threads.db`, next to the node's `config.json`: one row per place, with
-`thread_id`, `channel_id`, `thread_ts` (empty for the top level), `created_at` and `last_used_at`
-(`nodes/io/io-slack/src/thread_records.rs`).
+`thread_id`, `channel_id`, `thread_ts` (empty for the top level), `created_at`, `last_used_at` and
+`opened_by_node` (`nodes/io/io-slack/src/thread_records.rs`).
 
+- **Who opened a place:** the node, with its own post at the top level, or a person: a place
+  recorded on the way in, or the `reply_target` of the node's own channel.
 - **In:** a reply in a Slack thread whose root is recorded takes the recorded thread id, in
-  `meta.thread_id` and in `meta.context.io.conversation.thread_id`. Any other message takes the
-  computed id (§2.2), and its place is recorded under it.
-- **Out:** a message on a recorded thread id goes to that thread's place, and its `reply_target` is
-  not read. An unrecorded one whose `reply_target` is the node's own channel is posted there, and
-  recorded. Any other is posted at the top level: the post's `ts` is recorded for its thread id,
-  and the rest of the message (its files) goes into that post's thread.
+  `meta.thread_id` and in `meta.context.io.conversation.thread_id`, and the place keeps its opener.
+  Any other message takes the computed id (§2.2), and its place is recorded under it.
+- **Out, to a place a person opened:** a message on its thread id goes there, and its
+  `reply_target` is not read.
+- **Out, a post the node opened serves one message** (the operator, 2026-10-30): the next message
+  on its thread id opens a new post at the top level, whatever its `reply_target`. Once that post
+  goes out, its `ts` is recorded, and the node forgets its older posts on the thread id. So a
+  second question on a conversation, days later, shows in the channel, and a late reply under the
+  first question's post gets its own thread id: it never decides the second.
+- **Out, an unrecorded thread id:** with a `reply_target` of the node's own channel, it is posted
+  there, and recorded. Any other is posted at the top level, and the post's `ts` is recorded.
+- A message's first post decides its place; the rest of the message (its files) goes there, after
+  a new post into that post's thread.
 - A record unused for 30 days is deleted, at start and daily.
 - If the records cannot open or a query fails, the node logs it and works without them: messages
   in keep the computed id, and messages out go to the `reply_target` of the node's own channel, or
@@ -297,6 +306,13 @@ Operational interpretation:
 }
 ```
 
+- `content` is the person's words as written. Slack sends a person's `&`, `<` and `>` as `&amp;`,
+  `&lt;` and `&gt;`, and the node decodes those three, `&amp;` last, so `&amp;lt;` stays `&lt;`.
+- Slack's own markup stays as it is: a `<…>` with raw angle brackets, such as a mention `<@U…>` or
+  a link `<https://…|label>`.
+- On the way out the text is escaped again (§8.1), so a person's `Q&A <x>` goes back as Slack
+  sent it.
+
 ### 7.1 Size-based offload rule (delegated to the SDK `send`)
 - `IO.slack` builds the base `text/v1` payload (`content` + `attachments` when applicable).
 - The decision to keep it inline or convert it to `content_ref` because of the size limit **is made by `fluxbee_sdk::NodeSender::send`**.
@@ -378,14 +394,16 @@ What is still to settle per type:
   formatting rules ask of text that is not markup. A payload's text is what a person or an agent
   wrote, so a `<!channel>`, `<!here>`, `<@U…>`, `<!subteam^…>` or `<https://evil.example|label>` in
   it shows as written: it pings no one and shows no false link label. A bare URL still links.
-  `blocks` go as they are.
+  `blocks` go as they are. A person's text, decoded on the way in (§7), goes back escaped once.
 
 ### 8.2 Destination resolution
 
 The node posts only in its bound channel (`config.io.conversation_id`). Where in it is the thread
 records' call (§2.4):
 
-- the recorded place of the message's `meta.thread_id`;
+- the place of the message's `meta.thread_id`, when a person opened it;
+- a new post at the top level, recorded, when the node opened its places: each of its posts serves
+  one message;
 - else its `reply_target`, when that is the node's own channel: its `thread_ts`, or the top level;
 - else a new post at the top level, recorded.
 
@@ -479,13 +497,6 @@ Spawn/orchestrator mode (compliance path):
   - today the runtime treats missing config/secrets as a fatal startup error (`exit 1`), which causes a restart loop in systemd.
   - `IO.slack` responsibility: this case must move to a degraded/not-ready mode, without ending the process.
   - expected state (pending): bring up the runtime, publish a config error state and stay controllable by the orchestrator/admin.
-
-- Inbound text keeps Slack's escaping:
-  - a person's `&`, `<` and `>` reach the mesh as `&amp;`, `&lt;` and `&gt;`, and a mention or a
-    link as Slack's markup (`<@U…>`, `<https://…|label>`);
-  - the outbound text is escaped (§8.1), so an agent that quotes such text back shows the entity,
-    for example `Q&amp;A`;
-  - pending: decoding the three entities on the way in.
 
 
 

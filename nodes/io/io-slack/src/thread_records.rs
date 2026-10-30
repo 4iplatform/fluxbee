@@ -2,16 +2,24 @@
 //!
 //! The IO node owns a conversation's thread ids, because it created the communication event. It
 //! records the thread id of each Slack place it handles: a place is one channel and one thread in
-//! it, or the channel's top level, and has one thread id.
-//! - **In:** a reply in a Slack thread whose root is recorded takes the recorded thread id. Any other
-//!   message keeps the id io-common computes for its place, and its place is recorded under it.
-//! - **Out:** a message on a recorded thread id goes to that thread's place, and its `reply_target`
-//!   is not read. An unrecorded one whose `reply_target` is the node's own channel is posted there,
-//!   as before, and recorded. Any other is posted at the top level of the channel, and the post's
-//!   `ts` is recorded for its thread id.
+//! it, or the channel's top level, and has one thread id. A record says who opened its place: a
+//! person (a place recorded on the way in, or the `reply_target` of the node's own channel), or the
+//! node, with its own post at the top level.
+//! - **In:** a reply in a Slack thread whose root is recorded takes the recorded thread id, and the
+//!   place keeps its opener. Any other message keeps the id io-common computes for its place, and
+//!   its place is recorded under it.
+//! - **Out:** a message on a thread id with a place a person opened goes there, and its
+//!   `reply_target` is not read. A post the node opened serves one message (the operator,
+//!   2026-10-30): the next message on its thread id opens a new post at the top level, whatever its
+//!   `reply_target`, and once that post goes out the node forgets its older posts on the thread id.
+//!   An unrecorded thread id whose `reply_target` is the node's own channel is posted there, as
+//!   before, and recorded. Any other is posted at the top level of the channel, and the post's `ts`
+//!   is recorded for its thread id.
 //!
 //! So a WF's question, which carries the instance's thread id, is answered on that thread id when a
-//! supervisor replies in the Slack thread of its post. And an agent's answer, which carries the
+//! supervisor replies in the Slack thread of its post. A second question on the thread id, days
+//! later, is a new post in the channel's view, and a late reply to the first one gets its own
+//! thread id, so it never decides the second. And an agent's answer, which carries the
 //! `reply_target` of the message it answers (possibly another node's channel), lands where its
 //! conversation is on this side.
 //!
@@ -35,15 +43,17 @@ const RECORD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often the unused records are deleted, besides at start.
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// One row per Slack place: `thread_ts` is empty for the channel's top level, and the times are Unix
-/// milliseconds. The index serves the outbound lookup, by thread id.
+/// One row per Slack place: `thread_ts` is empty for the channel's top level, the times are Unix
+/// milliseconds, and `opened_by_node` is 1 for a place the node opened with its own post at the top
+/// level, 0 for one a person opened. The index serves the outbound lookup, by thread id.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS slack_threads (
-    thread_id    TEXT NOT NULL,
-    channel_id   TEXT NOT NULL,
-    thread_ts    TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    last_used_at INTEGER NOT NULL,
+    thread_id      TEXT NOT NULL,
+    channel_id     TEXT NOT NULL,
+    thread_ts      TEXT NOT NULL,
+    created_at     INTEGER NOT NULL,
+    last_used_at   INTEGER NOT NULL,
+    opened_by_node INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (channel_id, thread_ts)
 );
 CREATE INDEX IF NOT EXISTS slack_threads_by_thread_id ON slack_threads (thread_id, channel_id);
@@ -53,6 +63,17 @@ CREATE INDEX IF NOT EXISTS slack_threads_by_thread_id ON slack_threads (thread_i
 /// is a short query on a local file and never holds the lock across an `.await`.
 pub(crate) struct SlackThreadRecords {
     conn: Mutex<Connection>,
+}
+
+/// What the records hold for a thread id in a channel (`SlackThreadRecords::place_of_thread`).
+#[derive(Debug, PartialEq, Eq)]
+enum ThreadPlaces {
+    /// No place.
+    Unrecorded,
+    /// A place a person opened: its `thread_ts`, empty for the top level.
+    PersonOpened(String),
+    /// Only posts the node opened, each of which served its one message.
+    NodePosts,
 }
 
 impl SlackThreadRecords {
@@ -96,27 +117,33 @@ impl SlackThreadRecords {
         Ok(thread_id)
     }
 
-    /// The place of a thread id in a channel, as its `thread_ts` (empty for the top level), which
-    /// marks it used (`touch`). A thread id that came to have two places goes to the one used last.
+    /// What the records hold for a thread id in a channel (`ThreadPlaces`). A place a person opened
+    /// is marked used (`touch`), and of two, the thread id goes to the one used last. The node's
+    /// own posts are not: the message opens a new one, and they are forgotten once it goes out.
     fn place_of_thread(
         &self,
         thread_id: &str,
         channel_id: &str,
         now_ms: u64,
-    ) -> Result<Option<String>> {
+    ) -> Result<ThreadPlaces> {
         let conn = self.conn();
-        let thread_ts: Option<String> = conn
+        let found: Option<(String, bool)> = conn
             .query_row(
-                "SELECT thread_ts FROM slack_threads WHERE thread_id = ?1 AND channel_id = ?2 \
-                 ORDER BY last_used_at DESC LIMIT 1",
+                "SELECT thread_ts, opened_by_node FROM slack_threads \
+                 WHERE thread_id = ?1 AND channel_id = ?2 \
+                 ORDER BY opened_by_node, last_used_at DESC LIMIT 1",
                 params![thread_id, channel_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some(thread_ts) = thread_ts.as_deref() {
-            Self::touch(&conn, channel_id, thread_ts, now_ms);
-        }
-        Ok(thread_ts)
+        Ok(match found {
+            None => ThreadPlaces::Unrecorded,
+            Some((_, true)) => ThreadPlaces::NodePosts,
+            Some((thread_ts, false)) => {
+                Self::touch(&conn, channel_id, &thread_ts, now_ms);
+                ThreadPlaces::PersonOpened(thread_ts)
+            }
+        })
     }
 
     /// Marks a place used, which keeps it from the expiry. Best effort: when it fails (a full disk,
@@ -136,8 +163,8 @@ impl SlackThreadRecords {
         }
     }
 
-    /// Records a place under a thread id. A place has one thread id, the last one recorded; when it
-    /// changes, the record starts again, so `created_at` says since when the place has this one.
+    /// Records a place a person opened under a thread id: one recorded on the way in, or the reply
+    /// target of the node's own channel (`upsert`).
     fn record(
         &self,
         thread_id: &str,
@@ -145,15 +172,62 @@ impl SlackThreadRecords {
         thread_ts: &str,
         now_ms: u64,
     ) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO slack_threads (thread_id, channel_id, thread_ts, created_at, last_used_at) \
-             VALUES (?1, ?2, ?3, ?4, ?4) \
+        Self::upsert(
+            &self.conn(),
+            thread_id,
+            channel_id,
+            thread_ts,
+            false,
+            now_ms,
+        )
+    }
+
+    /// Records the node's own post at the top level, `ts`, as the place it opened for a thread id,
+    /// and forgets the older posts it opened for that thread id in the channel, each of which
+    /// served its one message: a late reply under one of them gets its own thread id. Both or
+    /// neither, and says how many it forgot.
+    fn record_node_post(
+        &self,
+        thread_id: &str,
+        channel_id: &str,
+        ts: &str,
+        now_ms: u64,
+    ) -> Result<usize> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let forgotten = transaction.execute(
+            "DELETE FROM slack_threads \
+             WHERE thread_id = ?1 AND channel_id = ?2 AND opened_by_node = 1 AND thread_ts <> ?3",
+            params![thread_id, channel_id, ts],
+        )?;
+        Self::upsert(&transaction, thread_id, channel_id, ts, true, now_ms)?;
+        transaction.commit()?;
+        Ok(forgotten)
+    }
+
+    /// Records a place under a thread id, opened by the node or by a person. A place has one thread
+    /// id, the last one recorded; when it changes, the record starts again, so `created_at` says
+    /// since when the place has this one, and `opened_by_node` who opened it for it.
+    fn upsert(
+        conn: &Connection,
+        thread_id: &str,
+        channel_id: &str,
+        thread_ts: &str,
+        opened_by_node: bool,
+        now_ms: u64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO slack_threads \
+                 (thread_id, channel_id, thread_ts, created_at, last_used_at, opened_by_node) \
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
              ON CONFLICT (channel_id, thread_ts) DO UPDATE SET \
                  thread_id = excluded.thread_id, \
                  created_at = CASE WHEN thread_id = excluded.thread_id \
                      THEN created_at ELSE excluded.created_at END, \
+                 opened_by_node = CASE WHEN thread_id = excluded.thread_id \
+                     THEN opened_by_node ELSE excluded.opened_by_node END, \
                  last_used_at = excluded.last_used_at",
-            params![thread_id, channel_id, thread_ts, now_ms],
+            params![thread_id, channel_id, thread_ts, now_ms, opened_by_node],
         )?;
         Ok(())
     }
@@ -285,12 +359,14 @@ pub(crate) fn map_inbound_thread(
 /// Where an outbound message's posts go in the node's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutboundPlace {
-    /// Its thread id is recorded: the record's thread, `None` for the top level.
+    /// Its thread id is recorded at a place a person opened, or the message's first post opened
+    /// its place: that thread, `None` for the top level.
     Recorded(Option<String>),
     /// Unrecorded, with a `reply_target` of the node's own channel: that thread, `None` for the top
     /// level, as before the records.
     ReplyTarget(Option<String>),
-    /// Anything else: a new post at the top level.
+    /// A new post at the top level, which the node opens: for a thread id it has only its own
+    /// posts for, or for anything else.
     NewPost,
 }
 
@@ -307,7 +383,7 @@ pub(crate) struct OutboundThread<'a> {
 impl<'a> OutboundThread<'a> {
     /// Out: `workspace_id` and `channel_id` are the node's binding, `thread_id` the message's
     /// `meta.thread_id` and `reply_target` its `meta.context.io.reply_target`. A `reply_target` of
-    /// another channel, or another workspace, is never read.
+    /// another channel, or another workspace, is never read, and on a recorded thread id none is.
     pub(crate) fn resolve(
         records: Option<&'a SlackThreadRecords>,
         workspace_id: &str,
@@ -320,13 +396,13 @@ impl<'a> OutboundThread<'a> {
         let mut record_as = thread_id;
         if let (Some(records), Some(thread_id)) = (records, thread_id) {
             match records.place_of_thread(thread_id, channel_id, now_ms) {
-                Ok(Some(thread_ts)) => {
+                Ok(ThreadPlaces::PersonOpened(thread_ts)) => {
                     let place = OutboundPlace::Recorded(non_empty(thread_ts));
                     tracing::debug!(
                         channel_id = %channel_id,
                         thread_id = %thread_id,
                         place = ?place,
-                        "outbound message on a recorded Slack thread"
+                        "outbound message on a Slack thread a person opened"
                     );
                     return Self {
                         records: Some(records),
@@ -335,7 +411,22 @@ impl<'a> OutboundThread<'a> {
                         place,
                     };
                 }
-                Ok(None) => {}
+                Ok(ThreadPlaces::NodePosts) => {
+                    // Each of the node's posts served its one message: this one opens a new post,
+                    // whatever reply target it carries, and `posted` forgets the older ones.
+                    tracing::debug!(
+                        channel_id = %channel_id,
+                        thread_id = %thread_id,
+                        "outbound message on a thread id the node opened its posts for: a new post"
+                    );
+                    return Self {
+                        records: Some(records),
+                        channel_id,
+                        record_as: Some(thread_id),
+                        place: OutboundPlace::NewPost,
+                    };
+                }
+                Ok(ThreadPlaces::Unrecorded) => {}
                 Err(err) => {
                     // As with the records closed: the reply_target of this channel or the top
                     // level, and nothing recorded.
@@ -390,33 +481,48 @@ impl<'a> OutboundThread<'a> {
 
     /// A post of the message went out; `ts` is the new Slack message's, when Slack answers one (a
     /// file upload does not). The first post that can records the place for the thread id, and the
-    /// message's other posts go there: after a new post, into its thread.
+    /// message's other posts go there: after a new post, into its thread. A new post is recorded
+    /// as the node's, and the node's older posts on the thread id are forgotten
+    /// (`SlackThreadRecords::record_node_post`).
     pub(crate) fn posted(&mut self, ts: Option<&str>, now_ms: u64) {
         let (Some(records), Some(thread_id)) = (self.records, self.record_as) else {
             return;
         };
-        let thread_ts = match &self.place {
+        let (thread_ts, opened_by_node) = match &self.place {
             OutboundPlace::Recorded(_) => return,
-            OutboundPlace::ReplyTarget(thread_ts) => thread_ts.clone(),
+            OutboundPlace::ReplyTarget(thread_ts) => (thread_ts.clone(), false),
             OutboundPlace::NewPost => match ts {
-                Some(ts) => Some(ts.to_string()),
+                Some(ts) => (Some(ts.to_string()), true),
                 None => return,
             },
         };
         self.record_as = None;
-        match records.record(
-            thread_id,
-            self.channel_id,
-            thread_ts.as_deref().unwrap_or(""),
-            now_ms,
-        ) {
-            Ok(()) => {
+        let place = thread_ts.as_deref().unwrap_or("");
+        let recorded = if opened_by_node {
+            records.record_node_post(thread_id, self.channel_id, place, now_ms)
+        } else {
+            records
+                .record(thread_id, self.channel_id, place, now_ms)
+                .map(|()| 0)
+        };
+        match recorded {
+            Ok(forgotten) => {
                 tracing::debug!(
                     channel_id = %self.channel_id,
-                    thread_ts = thread_ts.as_deref().unwrap_or(""),
+                    thread_ts = %place,
                     thread_id = %thread_id,
+                    opened_by_node,
                     "slack thread recorded for an outbound message"
                 );
+                if forgotten > 0 {
+                    tracing::info!(
+                        channel_id = %self.channel_id,
+                        thread_id = %thread_id,
+                        forgotten,
+                        "the node's older posts on this thread id are forgotten: a late reply \
+                         under one of them gets its own thread id"
+                    );
+                }
                 self.place = OutboundPlace::Recorded(thread_ts);
             }
             Err(err) => {
@@ -449,6 +555,8 @@ mod tests {
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
     /// The thread id a WF instance puts on every message it sends.
     const WF_THREAD: &str = "thread:sha256:wf-instance";
+    /// The thread id of a conversation a person started in a Slack thread.
+    const PERSON_THREAD: &str = "thread:sha256:person-thread";
 
     fn records() -> SlackThreadRecords {
         SlackThreadRecords::with_connection(Connection::open_in_memory().expect("in-memory db"))
@@ -477,12 +585,15 @@ mod tests {
         OutboundThread::resolve(records, WORKSPACE, CHANNEL, thread_id, reply_target, NOW)
     }
 
-    /// Every record as (thread_id, channel_id, thread_ts, created_at, last_used_at).
-    fn rows(records: &SlackThreadRecords) -> Vec<(String, String, String, u64, u64)> {
+    /// A record as (thread_id, channel_id, thread_ts, created_at, last_used_at, opened_by_node).
+    type Row = (String, String, String, u64, u64, bool);
+
+    /// Every record.
+    fn rows(records: &SlackThreadRecords) -> Vec<Row> {
         let conn = records.conn();
         let mut statement = conn
             .prepare(
-                "SELECT thread_id, channel_id, thread_ts, created_at, last_used_at \
+                "SELECT thread_id, channel_id, thread_ts, created_at, last_used_at, opened_by_node \
                  FROM slack_threads ORDER BY channel_id, thread_ts",
             )
             .expect("prepare");
@@ -494,25 +605,45 @@ mod tests {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             })
             .expect("query");
         mapped.collect::<rusqlite::Result<Vec<_>>>().expect("rows")
     }
 
-    fn row(
-        thread_id: &str,
-        thread_ts: &str,
-        created_at: u64,
-        last_used_at: u64,
-    ) -> (String, String, String, u64, u64) {
+    /// A record of a place a person opened, in the bound channel.
+    fn row(thread_id: &str, thread_ts: &str, created_at: u64, last_used_at: u64) -> Row {
         (
             thread_id.to_string(),
             CHANNEL.to_string(),
             thread_ts.to_string(),
             created_at,
             last_used_at,
+            false,
         )
+    }
+
+    /// A record of a post the node opened in the bound channel.
+    fn node_row(thread_id: &str, ts: &str, created_at: u64, last_used_at: u64) -> Row {
+        let mut record = row(thread_id, ts, created_at, last_used_at);
+        record.5 = true;
+        record
+    }
+
+    /// The WF's message `thread_id` posted at the top level, as the outbound loop posts it: Slack
+    /// answers the post's `ts`.
+    fn post_at_top_level(records: &SlackThreadRecords, thread_id: &str, ts: &str, now_ms: u64) {
+        let mut thread = OutboundThread::resolve(
+            Some(records),
+            WORKSPACE,
+            CHANNEL,
+            Some(thread_id),
+            None,
+            now_ms,
+        );
+        assert_eq!(thread.place, OutboundPlace::NewPost, "{thread_id}");
+        thread.posted(Some(ts), now_ms);
     }
 
     fn temp_node_dir(label: &str) -> PathBuf {
@@ -529,9 +660,7 @@ mod tests {
     #[test]
     fn a_reply_under_a_recorded_post_takes_its_thread_id() {
         let records = records();
-        records
-            .record(WF_THREAD, CHANNEL, "1793000000.000100", NOW - DAY_MS)
-            .expect("record");
+        post_at_top_level(&records, WF_THREAD, "1793000000.000100", NOW - DAY_MS);
 
         let mut io = inbound(Some("1793000000.000100"));
         let native_thread = io.conversation.thread_id.clone().expect("computed id");
@@ -550,14 +679,15 @@ mod tests {
             json!({"type": "text", "content": "approved"}),
         );
         assert_eq!(msg.meta.thread_id.as_deref(), Some(WF_THREAD));
-        // The reply target still names the Slack thread, and the reply was a use of the record.
+        // The reply target still names the Slack thread, and the reply was a use of the record,
+        // which stays the node's post.
         assert_eq!(
             io.reply_target.params["thread_ts"].as_str(),
             Some("1793000000.000100")
         );
         assert_eq!(
             rows(&records),
-            vec![row(WF_THREAD, "1793000000.000100", NOW - DAY_MS, NOW)]
+            vec![node_row(WF_THREAD, "1793000000.000100", NOW - DAY_MS, NOW)]
         );
     }
 
@@ -607,17 +737,17 @@ mod tests {
         );
     }
 
-    /// A message on a recorded thread id goes to the record's place; its reply target is not read,
-    /// even one of this channel, and its posts record nothing more.
+    /// A message on a thread id recorded at a place a person opened goes to that place; its reply
+    /// target is not read, even one of this channel, and its posts record nothing more.
     #[test]
     fn a_recorded_thread_goes_to_its_place_and_its_reply_target_is_not_read() {
         let records = records();
         records
-            .record(WF_THREAD, CHANNEL, "1793000000.000300", NOW - DAY_MS)
+            .record(PERSON_THREAD, CHANNEL, "1793000000.000300", NOW - DAY_MS)
             .expect("record");
         let elsewhere_here = target(CHANNEL, Some("1793000000.000999"));
 
-        let mut thread = resolve(Some(&records), Some(WF_THREAD), Some(&elsewhere_here));
+        let mut thread = resolve(Some(&records), Some(PERSON_THREAD), Some(&elsewhere_here));
         assert_eq!(
             thread.place,
             OutboundPlace::Recorded(Some("1793000000.000300".to_string()))
@@ -627,7 +757,7 @@ mod tests {
         assert_eq!(thread.thread_ts(), Some("1793000000.000300"));
         assert_eq!(
             rows(&records),
-            vec![row(WF_THREAD, "1793000000.000300", NOW - DAY_MS, NOW)]
+            vec![row(PERSON_THREAD, "1793000000.000300", NOW - DAY_MS, NOW)]
         );
 
         // A record of the top level posts there.
@@ -694,8 +824,9 @@ mod tests {
     }
 
     /// The WF's question: its thread id is the instance's, unknown here, and it brings no reply
-    /// target. It is posted at the top level, the post's `ts` is recorded, the rest of the message
-    /// follows into the post's Slack thread, and so does the next message on the thread id.
+    /// target. It is posted at the top level, the post's `ts` is recorded as a place the node
+    /// opened, and the rest of the message follows into the post's Slack thread. A reply there
+    /// reaches the thread id.
     #[test]
     fn an_unrecorded_thread_with_no_target_is_posted_at_the_top_level_then_recorded() {
         let records = records();
@@ -712,11 +843,7 @@ mod tests {
         assert_eq!(thread.thread_ts(), Some("1793000000.000500"));
         assert_eq!(
             rows(&records),
-            vec![row(WF_THREAD, "1793000000.000500", NOW, NOW)]
-        );
-        assert_eq!(
-            resolve(Some(&records), Some(WF_THREAD), None).place,
-            OutboundPlace::Recorded(Some("1793000000.000500".to_string()))
+            vec![node_row(WF_THREAD, "1793000000.000500", NOW, NOW)]
         );
         let mut reply = inbound(Some("1793000000.000500"));
         map_inbound_thread(Some(&records), &mut reply, Some("1793000000.000500"), NOW);
@@ -791,18 +918,23 @@ mod tests {
         );
     }
 
-    /// A thread id that came to have two places goes to the one used last.
+    /// A thread id that came to have two places a person opened goes to the one used last.
     #[test]
     fn a_thread_id_with_two_places_goes_to_the_one_used_last() {
         let records = records();
         records
-            .record(WF_THREAD, CHANNEL, "1793000000.000700", NOW - 2 * DAY_MS)
+            .record(
+                PERSON_THREAD,
+                CHANNEL,
+                "1793000000.000700",
+                NOW - 2 * DAY_MS,
+            )
             .expect("record");
         records
-            .record(WF_THREAD, CHANNEL, "1793000000.000701", NOW - DAY_MS)
+            .record(PERSON_THREAD, CHANNEL, "1793000000.000701", NOW - DAY_MS)
             .expect("record");
         assert_eq!(
-            resolve(Some(&records), Some(WF_THREAD), None).thread_ts(),
+            resolve(Some(&records), Some(PERSON_THREAD), None).thread_ts(),
             Some("1793000000.000701")
         );
 
@@ -814,7 +946,7 @@ mod tests {
             NOW + 1,
         );
         assert_eq!(
-            resolve(Some(&records), Some(WF_THREAD), None).thread_ts(),
+            resolve(Some(&records), Some(PERSON_THREAD), None).thread_ts(),
             Some("1793000000.000700")
         );
     }
@@ -842,10 +974,15 @@ mod tests {
                     NOW - 29 * DAY_MS,
                 )
                 .expect("record");
-            assert!(records
-                .place_of_thread("thread:sha256:used", CHANNEL, NOW - 2 * DAY_MS)
-                .expect("lookup")
-                .is_some());
+            let used = OutboundThread::resolve(
+                Some(&records),
+                WORKSPACE,
+                CHANNEL,
+                Some("thread:sha256:used"),
+                None,
+                NOW - 2 * DAY_MS,
+            );
+            assert_eq!(used.thread_ts(), Some("1793000000.000802"));
         }
 
         // At start.
@@ -943,15 +1080,45 @@ mod tests {
         assert!(records.expire(NOW).is_err());
     }
 
+    /// Recording the node's new post fails, and its transaction is undone: the post went out, the
+    /// rest of the message stays at the top level, as when the records fail, and the records keep
+    /// what they had.
+    #[test]
+    fn when_recording_the_nodes_post_fails_the_records_keep_what_they_had() {
+        let records = records();
+        post_at_top_level(&records, WF_THREAD, "1793000000.000904", NOW - DAY_MS);
+        records
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER record_fails BEFORE INSERT ON slack_threads \
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .expect("trigger");
+        let mut second = resolve(Some(&records), Some(WF_THREAD), None);
+        assert_eq!(second.place, OutboundPlace::NewPost);
+        second.posted(Some("1793000000.000905"), NOW);
+        assert_eq!(second.thread_ts(), None);
+        assert_eq!(
+            rows(&records),
+            vec![node_row(
+                WF_THREAD,
+                "1793000000.000904",
+                NOW - DAY_MS,
+                NOW - DAY_MS
+            )]
+        );
+    }
+
     /// Marking a record used is best effort: when that fails (a full disk, a locked or read-only
-    /// file), the record found still decides. A supervisor's reply still reaches the WF's
-    /// instance, and a message on the recorded thread still goes to its place, not to a new post at
-    /// the top level.
+    /// file), the record found still decides. A supervisor's reply under the WF's post still
+    /// reaches the WF's instance, and a message on a thread a person opened still goes to its
+    /// place, not to a new post at the top level.
     #[test]
     fn a_record_found_is_used_even_when_marking_it_used_fails() {
         let records = records();
+        post_at_top_level(&records, WF_THREAD, "1793000000.001000", NOW - DAY_MS);
         records
-            .record(WF_THREAD, CHANNEL, "1793000000.001000", NOW - DAY_MS)
+            .record(PERSON_THREAD, CHANNEL, "1793000000.001001", NOW - DAY_MS)
             .expect("record");
         records
             .conn()
@@ -965,22 +1132,148 @@ mod tests {
         map_inbound_thread(Some(&records), &mut reply, Some("1793000000.001000"), NOW);
         assert_eq!(reply.conversation.thread_id.as_deref(), Some(WF_THREAD));
 
-        let thread = resolve(Some(&records), Some(WF_THREAD), None);
+        let thread = resolve(Some(&records), Some(PERSON_THREAD), None);
         assert_eq!(
             thread.place,
-            OutboundPlace::Recorded(Some("1793000000.001000".to_string()))
+            OutboundPlace::Recorded(Some("1793000000.001001".to_string()))
         );
-        assert_eq!(thread.thread_ts(), Some("1793000000.001000"));
+        assert_eq!(thread.thread_ts(), Some("1793000000.001001"));
 
         // Neither use was marked.
         assert_eq!(
             rows(&records),
+            vec![
+                node_row(WF_THREAD, "1793000000.001000", NOW - DAY_MS, NOW - DAY_MS),
+                row(
+                    PERSON_THREAD,
+                    "1793000000.001001",
+                    NOW - DAY_MS,
+                    NOW - DAY_MS
+                ),
+            ]
+        );
+    }
+
+    /// The node's own post serves one message (docs/wf-orchestration-v1.md §5.3.4, decided after
+    /// the review). The next message on its thread id, a second consultation days later, opens a
+    /// new post at the top level, in the channel's view, whatever reply target it carries, and the
+    /// node forgets its first post. A late reply under the first post, meant for the first
+    /// question, keeps its own thread id and never decides the second; a reply under the new post
+    /// reaches the thread id, and leaves the post the node's.
+    #[test]
+    fn a_second_message_on_a_thread_opens_a_new_post_and_forgets_the_first() {
+        let records = records();
+        post_at_top_level(&records, WF_THREAD, "1793000000.001100", NOW - 3 * DAY_MS);
+        let mut answer = inbound(Some("1793000000.001100"));
+        map_inbound_thread(
+            Some(&records),
+            &mut answer,
+            Some("1793000000.001100"),
+            NOW - 2 * DAY_MS,
+        );
+        assert_eq!(answer.conversation.thread_id.as_deref(), Some(WF_THREAD));
+
+        // The second message carries the reply target of the supervisor's answer under the first
+        // post, as an agent's answer to it would.
+        let under_first = target(CHANNEL, Some("1793000000.001100"));
+        let mut second = resolve(Some(&records), Some(WF_THREAD), Some(&under_first));
+        assert_eq!(second.place, OutboundPlace::NewPost);
+        assert_eq!(second.thread_ts(), None);
+        // A file upload answers no ts: nothing changes yet.
+        second.posted(None, NOW);
+        assert_eq!(second.thread_ts(), None);
+        assert_eq!(rows(&records).len(), 1);
+        // The post: recorded as the node's, and the rest of the message goes into its thread.
+        second.posted(Some("1793000000.001200"), NOW);
+        assert_eq!(second.thread_ts(), Some("1793000000.001200"));
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.001200", NOW, NOW)]
+        );
+
+        // A late reply under the first post keeps its computed id, and its place is a person's.
+        let mut late = inbound(Some("1793000000.001100"));
+        let late_thread = late.conversation.thread_id.clone().expect("computed id");
+        map_inbound_thread(
+            Some(&records),
+            &mut late,
+            Some("1793000000.001100"),
+            NOW + 1,
+        );
+        assert_ne!(late_thread, WF_THREAD);
+        assert_eq!(
+            late.conversation.thread_id.as_deref(),
+            Some(late_thread.as_str())
+        );
+
+        // A reply under the new post reaches the thread id; the post stays the node's, so the next
+        // message on the thread id opens a post of its own again.
+        let mut reply = inbound(Some("1793000000.001200"));
+        map_inbound_thread(
+            Some(&records),
+            &mut reply,
+            Some("1793000000.001200"),
+            NOW + 2,
+        );
+        assert_eq!(reply.conversation.thread_id.as_deref(), Some(WF_THREAD));
+        assert_eq!(
+            rows(&records),
+            vec![
+                row(&late_thread, "1793000000.001100", NOW + 1, NOW + 1),
+                node_row(WF_THREAD, "1793000000.001200", NOW, NOW + 2),
+            ]
+        );
+        assert_eq!(
+            resolve(Some(&records), Some(WF_THREAD), None).place,
+            OutboundPlace::NewPost
+        );
+    }
+
+    /// A place a person opened keeps today's behavior: each message on its thread id goes there,
+    /// and nothing more is recorded. It wins over a post of the node's on the same thread id.
+    #[test]
+    fn a_place_a_person_opened_keeps_its_messages() {
+        let records = records();
+        let mut person = inbound(Some("1793000000.001300"));
+        let person_thread = person.conversation.thread_id.clone().expect("computed id");
+        map_inbound_thread(
+            Some(&records),
+            &mut person,
+            Some("1793000000.001300"),
+            NOW - DAY_MS,
+        );
+        for at in [NOW, NOW + 1] {
+            let mut answer = OutboundThread::resolve(
+                Some(&records),
+                WORKSPACE,
+                CHANNEL,
+                Some(person_thread.as_str()),
+                None,
+                at,
+            );
+            assert_eq!(
+                answer.place,
+                OutboundPlace::Recorded(Some("1793000000.001300".to_string()))
+            );
+            answer.posted(Some("1793000000.001399"), at);
+            assert_eq!(answer.thread_ts(), Some("1793000000.001300"));
+        }
+        assert_eq!(
+            rows(&records),
             vec![row(
-                WF_THREAD,
-                "1793000000.001000",
+                &person_thread,
+                "1793000000.001300",
                 NOW - DAY_MS,
-                NOW - DAY_MS
+                NOW + 1
             )]
+        );
+
+        records
+            .record_node_post(&person_thread, CHANNEL, "1793000000.001301", NOW + 2)
+            .expect("record");
+        assert_eq!(
+            resolve(Some(&records), Some(person_thread.as_str()), None).place,
+            OutboundPlace::Recorded(Some("1793000000.001300".to_string()))
         );
     }
 }

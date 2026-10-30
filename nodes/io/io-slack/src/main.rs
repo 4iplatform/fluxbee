@@ -1348,7 +1348,8 @@ fn post_message_body(
 /// Slack's formatting rules ask of text that is not markup. The text the node posts is a payload's,
 /// which a person or an agent wrote: unescaped, a `<!channel>`, `<!here>`, `<@U…>` or
 /// `<!subteam^…>` in it pings, and a `<https://evil.example|https://sso.acme.com>` shows a false
-/// link label. A bare URL still links.
+/// link label. A bare URL still links. A person's text, decoded on the way in
+/// (`decode_slack_text`), goes back escaped once.
 fn escape_slack_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -1360,6 +1361,33 @@ fn escape_slack_text(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// A person's words as they wrote them, from a message's `text`. Slack sends a person's `&`, `<`
+/// and `>` as `&amp;`, `&lt;` and `&gt;`, and those three are decoded, `&amp;` last, so `&amp;lt;`
+/// is `&lt;`. Slack's own markup, a `<…>` with raw angle brackets such as a mention `<@U…>` or a
+/// link `<https://…|label>`, stays as it is: a person's `<` is never raw. On the way out the text
+/// is escaped again (`escape_slack_text`).
+fn decode_slack_text(text: &str) -> String {
+    let decode = |words: &str| {
+        words
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    };
+    let mut decoded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        let Some(len) = rest[start..].find('>') else {
+            break;
+        };
+        let end = start + len + 1;
+        decoded.push_str(&decode(&rest[..start]));
+        decoded.push_str(&rest[start..end]);
+        rest = &rest[end..];
+    }
+    decoded.push_str(&decode(rest));
+    decoded
 }
 
 /// Parse a Slack `Retry-After` header (integer seconds) into a bounded backoff, clamped to
@@ -1647,7 +1675,8 @@ async fn run_inbound_socket_mode(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let content = mention_re.replace(raw_text, "").to_string();
+            // The person's words as written: what Slack escapes in them is decoded.
+            let content = decode_slack_text(&mention_re.replace(raw_text, ""));
 
             tracing::debug!(
                 team_id = %team_id,
@@ -2483,9 +2512,11 @@ async fn run_outbound_loop(
             }
         };
         // Where in the bound channel the message goes is the thread records' call: its thread id's
-        // recorded place, else its reply_target when that is this channel, else a new post at the
-        // top level, recorded. Another channel's reply_target is never read: an agent's answer
-        // carries the one of the message it answers, which can be another node's.
+        // place when a person opened it; a new post at the top level when the node opened its
+        // places, since each of its posts serves one message; else its reply_target when that is
+        // this channel; else a new post at the top level, recorded. Another channel's
+        // reply_target is never read: an agent's answer carries the one of the message it
+        // answers, which can be another node's.
         let reply_target = msg
             .meta
             .context
@@ -3161,11 +3192,11 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
-        extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
-        is_control_plane_msg_type, parse_retry_after, post_message_body,
-        slack_relay_policy_from_config, slack_vault_key, vault_change_is_slack, SlackClients,
-        SlackRelayConfig, SlackRuntimeState,
+        build_slack_inbound_payload_from_parts, build_system_reply, classify_slack_inbound,
+        decode_slack_text, default_slack_allowed_mimes, extract_runtime_relay_config,
+        extract_slack_tokens_from_vault_value, is_control_plane_msg_type, parse_retry_after,
+        post_message_body, slack_relay_policy_from_config, slack_vault_key, vault_change_is_slack,
+        SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
     use std::time::Duration;
 
@@ -3568,5 +3599,48 @@ mod tests {
             post_message_body("C0SUPERVISORS", "Aprobado: 15%.", None, None),
             json!({"channel": "C0SUPERVISORS", "text": "Aprobado: 15%."})
         );
+    }
+
+    /// What Slack escapes in a person's text is decoded on the way in, and escaped once on the way
+    /// out: a person's `Q&A <x>`, which Slack sends as `Q&amp;A &lt;x&gt;`, reaches the mesh as
+    /// written and goes back as Slack sent it. Slack's own markup, a mention or a link, stays as it
+    /// is, and `&amp;` is decoded last, so `&amp;lt;` is `&lt;`.
+    #[test]
+    fn a_persons_text_reaches_the_mesh_as_written_and_goes_back_escaped_once() {
+        let content = decode_slack_text("Q&amp;A &lt;x&gt;");
+        assert_eq!(content, "Q&A <x>");
+        let payload = build_slack_inbound_payload_from_parts(
+            "T0WORKSPACE",
+            "U0PERSON",
+            "C0SALES",
+            None,
+            "Ev0001",
+            &content,
+            &[],
+        )
+        .expect("a payload");
+        assert_eq!(payload["content"], "Q&A <x>");
+        assert_eq!(
+            post_message_body("C0SALES", &content, None, None)["text"],
+            "Q&amp;A &lt;x&gt;"
+        );
+
+        for (sent, written) in [
+            ("&amp;lt;b&amp;gt;", "&lt;b&gt;"),
+            ("R&amp;D &amp;amp; P&amp;L", "R&D &amp; P&L"),
+            ("<@U0BOSS> 1 &lt; 2", "<@U0BOSS> 1 < 2"),
+            (
+                "<!here> mirá <https://acme.example/?a=1&amp;b=2|Q&amp;A> y R&amp;D",
+                "<!here> mirá <https://acme.example/?a=1&amp;b=2|Q&amp;A> y R&D",
+            ),
+            (
+                "¿Qué tal? Nada que decodificar.",
+                "¿Qué tal? Nada que decodificar.",
+            ),
+            // A raw `<` with no `>` after it is no markup.
+            ("1 < 2 &gt; 0", "1 < 2 > 0"),
+        ] {
+            assert_eq!(decode_slack_text(sent), written, "{sent}");
+        }
     }
 }
