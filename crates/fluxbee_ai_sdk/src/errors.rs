@@ -20,6 +20,10 @@ pub enum AiSdkError {
     InvalidResponseContract { detail: String },
     #[error("invalid structured output: {detail}")]
     InvalidStructuredOutput { detail: String },
+    #[error("invalid menu: {detail}")]
+    InvalidMenu { detail: String },
+    #[error("conflicting contracts: the message carries a WF's menu (meta.context.wf.menu) and a response_envelope")]
+    ConflictingContracts,
     #[error("artifact MIME not allowed: {mime}")]
     ArtifactMimeNotAllowed { mime: String },
     #[error("artifact filename invalid: {detail}")]
@@ -65,6 +69,8 @@ impl AiSdkError {
             AiSdkError::Protocol(_) => false,
             AiSdkError::InvalidResponseContract { .. } => false,
             AiSdkError::InvalidStructuredOutput { .. } => false,
+            AiSdkError::InvalidMenu { .. } => false,
+            AiSdkError::ConflictingContracts => false,
             AiSdkError::ArtifactMimeNotAllowed { .. } => false,
             AiSdkError::ArtifactFilenameInvalid { .. } => false,
         }

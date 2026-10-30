@@ -463,6 +463,22 @@ registered case ends saved as `completed` and is never deleted by the model.
   output as it is; with it, that field's value as the text and the whole object, checked against
   the schema, as the evaluation, which `set_reply_evaluation` puts in the reply's
   `meta.context.evaluation`. An output that is not that object is `InvalidStructuredOutput`.
+- **A WF's menu** (`meta.context.wf.menu`,
+  [docs/wf-orchestration-v1.md §5.3.6](../../docs/wf-orchestration-v1.md#536-the-build-design-and-the-gate)):
+  `resolve_message_contract` reads the contract a message asks its answer under, a
+  `MessageContract`: its menu, or its response contract. A message with both is
+  `ConflictingContracts`.
+  - `MenuContract::from_value` checks a menu again with wfcel's limits (`InvalidMenu`, naming the
+    field) and adds `none`, with its param `reason`, last.
+  - `MenuContract::prompt` is the menu as the model reads it, at the end of the WF's block: the
+    help, the options with their params, and the line that gives the answer's shape. A menu has no
+    `output_schema`, so the system prompt stays the role.
+  - `MenuContract::answer` takes the object in the model's output, as a structured call does, and
+    checks it: an option of the menu or `none`, each of its params with its type, a string
+    `reply`. The answer's text is the `reply`, and its evaluation the checked
+    `{reply, option, params}`, without the params the option does not declare. Anything else is
+    `InvalidStructuredOutput`: `not_json`, `unknown_option:<x>`, `missing_param:<p>` or
+    `type_mismatch:<p>:<type>`.
 - **Input and output helpers:**
   - `resolve_model_input_from_payload_with_options` reads a `text/v1` payload, its `content_ref` and
     its attachments;

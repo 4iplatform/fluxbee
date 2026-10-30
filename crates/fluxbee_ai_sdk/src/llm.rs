@@ -565,26 +565,35 @@ pub(crate) fn parse_structured_output(
     raw: &str,
     output_schema: &OutputSchemaSpec,
 ) -> Result<Value> {
-    let parsed = extract_json_candidate(raw).and_then(|candidate| {
-        let parsed: Value = serde_json::from_str(&candidate).map_err(|err| {
-            AiSdkError::InvalidStructuredOutput {
-                detail: format!("json_parse_error: {err}"),
-            }
-        })?;
+    let parsed = extract_json_value(raw).and_then(|parsed| {
         validate_value_against_schema(&parsed, output_schema.json_schema())?;
         Ok(parsed)
     });
     if let Err(err) = &parsed {
-        // What the model wrote, to tune the prompt that led to it: the error says only why.
-        tracing::warn!(
-            schema = %output_schema.name(),
-            error = %err,
-            output_len = raw.len(),
-            output_preview = %raw.chars().take(200).collect::<String>(),
-            "a model's answer is not the object its schema asks for"
-        );
+        warn_unstructured_answer(output_schema.name(), err, raw);
     }
     parsed
+}
+
+/// The JSON value a model's `raw` answer holds, also inside a fence or among other text
+/// (`extract_json_candidate`); an answer without one is `InvalidStructuredOutput`.
+pub(crate) fn extract_json_value(raw: &str) -> Result<Value> {
+    let candidate = extract_json_candidate(raw)?;
+    serde_json::from_str(&candidate).map_err(|err| AiSdkError::InvalidStructuredOutput {
+        detail: format!("json_parse_error: {err}"),
+    })
+}
+
+/// The log of an answer that is not the object its contract, `schema`, asks for: what the model
+/// wrote, to tune the prompt that led to it, since the error says only why.
+pub(crate) fn warn_unstructured_answer(schema: &str, err: &AiSdkError, raw: &str) {
+    tracing::warn!(
+        schema = %schema,
+        error = %err,
+        output_len = raw.len(),
+        output_preview = %raw.chars().take(200).collect::<String>(),
+        "a model's answer is not the object its schema asks for"
+    );
 }
 
 fn extract_json_candidate(raw: &str) -> Result<String> {

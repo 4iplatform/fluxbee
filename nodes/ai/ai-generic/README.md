@@ -168,10 +168,11 @@ On every request the node reads the key of its provider from SY.vault:
   front of the user input as a text block.
 - **A WF's block:** a WF puts `meta.context.wf`, `{"trail": [node names], "vars": {...}}`, on every
   message it sends
-  ([docs/wf-orchestration-v1.md §5.2.1](../../../docs/wf-orchestration-v1.md#521-the-build-design)).
-  The node shows it to the model as a text block after the memory block and before the message:
-  the trail as a path (`IO.api@motherbee -> WF.sales.invoice@worker1`), and `vars` as JSON, cut at
-  8 KiB with a line that says so.
+  ([docs/wf-orchestration-v1.md §5.2.1](../../../docs/wf-orchestration-v1.md#521-the-build-design)),
+  with a `menu` when it asks the agent to choose (below). The node shows it to the model as a text
+  block after the memory block and before the message: the trail as a path
+  (`IO.api@motherbee -> WF.sales.invoice@worker1`), `vars` as JSON, cut at 8 KiB with a line that
+  says so, and the menu.
   - Text and multimodal input alike: as parts, each block is a text part of its own, first.
   - The conversation's history (`runtime.immediate_memory`) keeps what the person wrote, without
     either block.
@@ -192,6 +193,30 @@ On every request the node reads the key of its provider from SY.vault:
     `event.context.evaluation`. The object is checked on both paths, with tools and without them. A
     `text_field` that is not a required `string` property makes the contract invalid. The history
     keeps the whole object as the agent's turn, so a blank text never leaves a blank turn.
+- **A WF's menu:** a WF asks an agent to choose with `meta.context.wf.menu`
+  ([docs/wf-orchestration-v1.md §5.3](../../../docs/wf-orchestration-v1.md#53-case-3-the-internal-consultation-decided-with-the-operator-2026-10-30)):
+  an optional `help`, and 1 to 8 `options`, each with a `name`, a `description` and its `params`
+  (`string`, `boolean`, `integer` or `number`, with an optional description and, for a string, an
+  optional `enum`).
+  - **Checked first:** the node checks the menu again with wfcel's limits. An invalid menu is
+    answered `invalid_menu`, and a message with a menu and a `response_envelope`
+    `conflicting_contracts`, neither retryable, and the model is not called.
+  - **What the model reads:** the menu at the end of the WF's block, with `none` (its param
+    `reason`), which the node adds to every menu, and the one line that gives the answer's shape,
+    `{"reply", "option", "params"}`. The system prompt stays the agent's role, with tools and
+    without them, and the agent may use its tools before it answers.
+  - **The answer** is found as a structured answer's is, in a fence or among other text. Its
+    `option` is one of the menu's or `none`, each param of that option is there with its type
+    (an integer a JSON integer, a number any number, an `enum`'s value one of its values; `none`
+    needs `reason`), and `reply` is a string, maybe empty. A param the option does not declare, or
+    a field besides the three, is dropped with a line in the journal. Anything else is an
+    `invalid_structured_output`, not retryable, whose message ends with `not_json`,
+    `unknown_option:<x>`, `missing_param:<p>` or `type_mismatch:<p>:<type>`.
+  - **The reply's** text is `reply`, and its `meta.context.evaluation` the checked object, which a
+    WF reads as `event.context.evaluation.option` and `event.context.evaluation.params.<p>`. The
+    history keeps that object as the agent's turn, as under a `text_field`.
+  - **The journal:** the "AI chat request prepared" line names the message's contract, `none`,
+    `envelope` or `menu`.
 - **Attachments** (`text/v1` `attachments[]` and `content_ref`):
   - text (`text/plain`, `text/markdown`, `application/json`, `text/csv`, `text/html`) goes in as
     text, decoded with U+FFFD for bytes that are not UTF-8, and cut at 100,000 characters with a

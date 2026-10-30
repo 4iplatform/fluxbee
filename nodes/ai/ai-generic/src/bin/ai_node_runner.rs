@@ -12,16 +12,17 @@ use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
     create_function_calling_model, create_llm_client, extract_text, is_infrastructure_message,
-    note_infrastructure_message, resolve_model_input_from_payload_with_options,
-    resolve_response_envelope_contract, set_reply_evaluation, AgentTool, AiAccount,
+    note_infrastructure_message, resolve_message_contract,
+    resolve_model_input_from_payload_with_options, set_reply_evaluation, AgentTool, AiAccount,
     AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, ContractAnswer,
     ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
     FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
     FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
-    LlmClient, LlmRequest, Message, ModelInputOptions, ModelSettings, NodeRuntime,
-    ResolvedModelInput, ResponseContract, RuntimeConfig, TenantSource, ThreadStateDeleteTool,
-    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard,
-    ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
+    LlmClient, LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
+    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
+    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
+    MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -31,7 +32,7 @@ use fluxbee_sdk::managed_control_plane::{
     DEFAULT_MANAGED_NODES_ROOT,
 };
 use fluxbee_sdk::protocol::{
-    MemoryPackage, Meta, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP,
+    MemoryPackage, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP,
     MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
 };
 use fluxbee_sdk::{
@@ -477,9 +478,9 @@ struct BehaviorContext {
     tool_ran: AtomicBool,
 }
 
-/// One message's answer: its reply and, under a response contract with a `text_field`, the whole
-/// object the model answered with, which the reply carries in `meta.context.evaluation`
-/// (`ResponseContract::answer`).
+/// One message's answer: its reply and, under a response contract with a `text_field` or a WF's
+/// menu, the object the model answered with, which the reply carries in `meta.context.evaluation`
+/// (`MessageContract::answer`).
 #[derive(Debug, PartialEq)]
 struct AiChatAnswer {
     output: AiBehaviorOutput,
@@ -894,6 +895,23 @@ impl AiNode for GenericAiNode {
             let payload = node_runtime_not_ready_payload();
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
+        // The contract its answer is asked under: a message with an invalid one, or with a WF's
+        // menu and a response_envelope, is answered with the error and never reaches the model.
+        let contract = match resolve_message_contract(&msg.meta) {
+            Ok(contract) => contract,
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    error = %err,
+                    "the message's contract is not valid; replying with its error payload"
+                );
+                return Ok(Some(build_reply_message_runtime_src(
+                    &msg,
+                    ai_runtime_error_payload(&err),
+                )));
+            }
+        };
 
         let (input, resolved_user_input): (String, Option<ResolvedModelInput>) =
             if msg.meta.msg_type.eq_ignore_ascii_case("user") {
@@ -914,7 +932,10 @@ impl AiNode for GenericAiNode {
                 (extract_text(&msg.payload).unwrap_or_default(), None)
             };
         let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
-        let wf_block = render_wf_prompt_block(msg.meta.context.as_ref());
+        let wf_block = render_wf_prompt_block(
+            msg.meta.context.as_ref(),
+            contract.as_ref().and_then(MessageContract::menu),
+        );
         // What the model reads before the message: the memory block, then the WF's.
         let prompt_blocks = [cognition_block.as_deref(), wf_block.as_deref()]
             .into_iter()
@@ -991,7 +1012,7 @@ impl AiNode for GenericAiNode {
                         input_parts,
                         &user_text,
                         &behavior_ctx,
-                        &msg.meta,
+                        contract.as_ref(),
                     )
                     .await
                 {
@@ -1087,7 +1108,7 @@ impl GenericAiNode {
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         user_text: &str,
         ctx: &BehaviorContext,
-        meta: &Meta,
+        contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
         let credential = self
             .resolve_ai_credential(engine.provider)
@@ -1100,37 +1121,36 @@ impl GenericAiNode {
             ai.base_url.clone(),
             account.clone(),
         );
-        let contract = resolve_response_envelope_contract(meta)?;
-        let output_schema = contract.as_ref().map(|contract| &contract.output_schema);
+        let output_schema = contract.and_then(MessageContract::output_schema);
         let files = Arc::new(ReplyFiles::default());
         let tool_registry = self.build_tool_registry(ctx, &files)?;
         let tool_count = tool_registry.definitions().len();
-        let output_contract_mode = match (output_schema, tool_count > 0) {
-            (Some(_), true) => "fallback_instruction",
-            (Some(_), false) => "structured_output",
+        let output_contract_mode = match (contract, tool_count > 0) {
+            (Some(MessageContract::Envelope(_)), true) => "fallback_instruction",
+            (Some(MessageContract::Envelope(_)), false) => "structured_output",
+            // The menu and its answer's shape ride in the WF's block, on either path.
+            (Some(MessageContract::Menu(_)), _) => "wf_block_instruction",
             (None, _) => "free_text",
+        };
+        let text_field = match contract {
+            Some(MessageContract::Envelope(envelope)) => envelope.text_field.as_deref(),
+            _ => None,
         };
         tracing::info!(
             node_name = %self.node_name,
             thread_id = ?ctx.thread_id,
             src_ilk = ?ctx.src_ilk,
             tool_count,
+            contract = contract.map_or("none", MessageContract::kind),
             output_contract_mode,
             output_schema_name = ?output_schema.map(|schema| schema.name()),
-            text_field = ?contract.as_ref().and_then(|contract| contract.text_field.as_deref()),
+            text_field = ?text_field,
             provider = %credential.provider,
             model = %engine.model,
             "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
-            let prompt = self.agent_prompt().await;
-            let system = match output_schema {
-                Some(schema) => format!(
-                    "{prompt}\n\n{}",
-                    build_output_schema_fallback_instruction(schema)?
-                ),
-                None => prompt,
-            };
+            let system = tool_loop_system_prompt(self.agent_prompt().await, contract)?;
             let model = create_function_calling_model(
                 credential.provider,
                 credential.api_key.clone(),
@@ -1151,7 +1171,7 @@ impl GenericAiNode {
                     input.clone(),
                     input_parts.clone(),
                     user_text,
-                    contract.as_ref(),
+                    contract,
                 )
                 .await?
             {
@@ -1168,15 +1188,15 @@ impl GenericAiNode {
             max_output_tokens: None,
             model_settings: Some(ai.model_settings.clone()),
         };
-        self.run_plain_call(client.as_ref(), req, ai, ctx, user_text, contract.as_ref())
+        self.run_plain_call(client.as_ref(), req, ai, ctx, user_text, contract)
             .await
     }
 
     /// One message's tool loop, and its answer (`tool_loop_answer`): the model's own text with
     /// every file its tools made and the link of every page it published (`tool_loop_output`,
-    /// FINDINGS A-98, A-99), or, under a `text_field`, that field of its object. `None` when the
-    /// model ended without text, made no file and published no page: the caller then asks it once
-    /// more, without tools.
+    /// FINDINGS A-98, A-99), or, under a `text_field` or a menu, the text its object gives. `None`
+    /// when the model ended without text, made no file and published no page: the caller then asks
+    /// it once more, without tools.
     async fn run_tool_loop(
         &self,
         model: &dyn FunctionCallingModel,
@@ -1187,7 +1207,7 @@ impl GenericAiNode {
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         user_text: &str,
-        contract: Option<&ResponseContract>,
+        contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
@@ -1211,8 +1231,9 @@ impl GenericAiNode {
         Ok(Some(answer))
     }
 
-    /// One message's call without tools, which asks the model for the contract's object when the
-    /// message names a contract, and its answer under that contract (`ResponseContract::answer`).
+    /// One message's call without tools, which asks the provider for a response contract's object
+    /// when the message names one, and its answer under the message's contract
+    /// (`MessageContract::answer`).
     async fn run_plain_call(
         &self,
         client: &dyn LlmClient,
@@ -1220,7 +1241,7 @@ impl GenericAiNode {
         ai: &AiChatRuntime,
         ctx: &BehaviorContext,
         user_text: &str,
-        contract: Option<&ResponseContract>,
+        contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
         let response = client.generate(request).await?;
         let answer = match contract {
@@ -3143,19 +3164,36 @@ fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
     value.truncate(end);
 }
 
+/// The tool loop's system prompt: the agent's `prompt`, then a response contract's instruction,
+/// which the provider enforces only on a call without tools. Under a WF's menu it stays the role:
+/// the WF's block shows the model the menu and its answer's shape (docs/wf-orchestration-v1.md
+/// §5.3.6).
+fn tool_loop_system_prompt(
+    prompt: String,
+    contract: Option<&MessageContract>,
+) -> fluxbee_ai_sdk::Result<String> {
+    match contract.and_then(MessageContract::output_schema) {
+        Some(schema) => Ok(format!(
+            "{prompt}\n\n{}",
+            build_output_schema_fallback_instruction(schema)?
+        )),
+        None => Ok(prompt),
+    }
+}
+
 /// The answer of one message's tool loop: its reply (`tool_loop_output`) and, under a response
-/// contract with a `text_field`, its evaluation. There the model's `text` is the contract's object:
-/// that field is the reply's text, blank or not, and the object its evaluation
-/// (`ResponseContract::answer`). A loop that wrote nothing, made no file and published no page has
+/// contract with a `text_field` or a WF's menu, its evaluation. There the model's `text` is the
+/// contract's object: it gives the reply's text, blank or not, and the evaluation
+/// (`MessageContract::answer`). A loop that wrote nothing, made no file and published no page has
 /// no answer, as without the contract; one that made a file or published a page but wrote no
-/// object fails, as an object without the field does.
+/// object fails, as an object that is not the contract's does.
 fn tool_loop_answer(
     text: Option<String>,
     files: Vec<AiUserArtifact>,
     links: &[String],
-    contract: Option<&ResponseContract>,
+    contract: Option<&MessageContract>,
 ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
-    let Some(contract) = contract.filter(|contract| contract.text_field.is_some()) else {
+    let Some(contract) = contract.filter(|contract| contract.has_evaluation()) else {
         return Ok(tool_loop_output(text, files, links).map(AiChatAnswer::from));
     };
     if text.is_none() && files.is_empty() && links.is_empty() {
@@ -3292,10 +3330,10 @@ fn files_fallback_line(files: &[AiUserArtifact]) -> String {
     }
 }
 
-/// The assistant's turn an answer leaves in the immediate memory: under a `text_field`, the whole
-/// object the model answered with, as compact JSON, which is what the contract asks it to write and
-/// never blank (a blank turn fails every later one: Anthropic refuses an empty text block);
-/// otherwise its reply (`summarize_behavior_output`).
+/// The assistant's turn an answer leaves in the immediate memory: under a `text_field` or a menu,
+/// the object the model answered with (a menu's as checked), as compact JSON, which is what the
+/// contract asks it to write and never blank (a blank turn fails every later one: Anthropic refuses
+/// an empty text block); otherwise its reply (`summarize_behavior_output`).
 fn assistant_turn_text(answer: &AiChatAnswer) -> String {
     match &answer.evaluation {
         Some(evaluation) => evaluation.to_string(),
@@ -6725,14 +6763,35 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
                 "retryable": false
             })
         }
-        // The model answered, but not with the object the message's response contract asks for.
+        // The model answered, but not with the object the message's contract asks for: its
+        // response contract, or its WF's menu.
         fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput { detail } => json!({
             "type": "error",
             "code": "invalid_structured_output",
             "message": format!(
-                "The AI's answer is not the object its response contract asks for: {}",
+                "The AI's answer is not the object its contract asks for: {}",
                 trim_chars(detail, 220)
             ),
+            "retryable": false
+        }),
+        // The WF's menu is outside wfcel's limits: its definition is the one to fix. The model
+        // was not called.
+        fluxbee_ai_sdk::errors::AiSdkError::InvalidMenu { detail } => json!({
+            "type": "error",
+            "code": "invalid_menu",
+            "message": format!(
+                "The WF's menu (meta.context.wf.menu) is not valid: {}",
+                trim_chars(detail, 220)
+            ),
+            "retryable": false
+        }),
+        // A WF asks an agent with its menu, never with a response_envelope too. The model was not
+        // called.
+        fluxbee_ai_sdk::errors::AiSdkError::ConflictingContracts => json!({
+            "type": "error",
+            "code": "conflicting_contracts",
+            "message": "The message carries both a WF's menu (meta.context.wf.menu) and a \
+                response_envelope: a WF asks an agent with its menu alone.",
             "retryable": false
         }),
         other => json!({
@@ -7167,10 +7226,10 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
 }
 
 /// The WF's block, `meta.context.wf` (docs/wf-orchestration-v1.md §5.2.1), as the model reads it:
-/// the path the message took, from its `trail`, and the WF's `vars` as JSON, cut at
-/// `WF_VARS_PROMPT_MAX_BYTES` with a line that says so. `None` without a block, or with neither a
-/// trail nor vars in it.
-fn render_wf_prompt_block(context: Option<&Value>) -> Option<String> {
+/// the path the message took, from its `trail`, the WF's `vars` as JSON, cut at
+/// `WF_VARS_PROMPT_MAX_BYTES` with a line that says so, and the WF's `menu`, checked
+/// (`MenuContract::prompt`, §5.3.6). `None` without a block, or with no trail, vars or menu in it.
+fn render_wf_prompt_block(context: Option<&Value>, menu: Option<&MenuContract>) -> Option<String> {
     let wf = context?.get("wf")?;
     let mut lines = vec!["Workflow context:".to_string()];
     let trail = wf
@@ -7198,6 +7257,9 @@ fn render_wf_prompt_block(context: Option<&Value>) -> Option<String> {
             ));
         }
         lines.push(format!("Variables: {json}"));
+    }
+    if let Some(menu) = menu {
+        lines.push(menu.prompt());
     }
     (lines.len() > 1).then(|| lines.join("\n"))
 }
@@ -7240,7 +7302,7 @@ fn inject_prompt_blocks_into_input_parts(
 mod tests {
     use super::*;
     use base64::Engine as _;
-    use fluxbee_ai_sdk::{Destination, Meta, Routing};
+    use fluxbee_ai_sdk::{Destination, Meta, ResponseContract, Routing};
     use fluxbee_sdk::protocol::{
         MemoryContextSummary, MemoryPackage, MemoryReasonSummary, MemorySummary,
     };
@@ -8494,7 +8556,8 @@ mod tests {
 
     #[test]
     fn the_wf_block_shows_the_trail_as_a_path_and_the_vars_as_json() {
-        let block = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        let block =
+            render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         assert_eq!(
             block,
             "Workflow context:\n\
@@ -8505,17 +8568,17 @@ mod tests {
         // Either part alone.
         let trail_only = json!({"wf": {"trail": ["WF.sales.invoice@worker1"], "vars": {}}});
         assert_eq!(
-            render_wf_prompt_block(Some(&trail_only)).as_deref(),
+            render_wf_prompt_block(Some(&trail_only), None).as_deref(),
             Some("Workflow context:\nPath: WF.sales.invoice@worker1")
         );
         let vars_only = json!({"wf": {"vars": {"invoice": {"number": "A-1"}}}});
         assert_eq!(
-            render_wf_prompt_block(Some(&vars_only)).as_deref(),
+            render_wf_prompt_block(Some(&vars_only), None).as_deref(),
             Some("Workflow context:\nVariables: {\"invoice\":{\"number\":\"A-1\"}}")
         );
 
         // No block, or nothing in it.
-        assert_eq!(render_wf_prompt_block(None), None);
+        assert_eq!(render_wf_prompt_block(None, None), None);
         for context in [
             json!({"io": {"channel": "api"}}),
             json!({"wf": {}}),
@@ -8523,7 +8586,11 @@ mod tests {
             json!({"wf": {"trail": [" ", 7], "vars": null}}),
             json!({"wf": "WF.sales.invoice@worker1"}),
         ] {
-            assert_eq!(render_wf_prompt_block(Some(&context)), None, "{context}");
+            assert_eq!(
+                render_wf_prompt_block(Some(&context), None),
+                None,
+                "{context}"
+            );
         }
     }
 
@@ -8533,7 +8600,7 @@ mod tests {
         let context = json!({"wf": {"vars": {"note": note}}});
         let whole = json!({"note": note}).to_string();
 
-        let block = render_wf_prompt_block(Some(&context)).expect("the WF's block");
+        let block = render_wf_prompt_block(Some(&context), None).expect("the WF's block");
         let (json, mark) = block
             .strip_prefix("Workflow context:\nVariables: ")
             .and_then(|vars| vars.rsplit_once('\n'))
@@ -8546,11 +8613,67 @@ mod tests {
 
         // At 8 KiB or less, whole and unmarked.
         let fits = json!({"wf": {"vars": {"note": "x".repeat(WF_VARS_PROMPT_MAX_BYTES - 11)}}});
-        let block = render_wf_prompt_block(Some(&fits)).expect("the WF's block");
+        let block = render_wf_prompt_block(Some(&fits), None).expect("the WF's block");
         assert!(!block.contains("[cut at"));
         assert_eq!(
             block.len(),
             "Workflow context:\nVariables: ".len() + WF_VARS_PROMPT_MAX_BYTES
+        );
+    }
+
+    /// Case 1's block with a menu for sales, as Case 3's WF sends it (docs/wf-orchestration-v1.md
+    /// §5.3.6).
+    fn sample_wf_menu_context() -> Value {
+        let mut context = sample_wf_context();
+        context["wf"]["menu"] = json!({
+            "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+            "options": [
+                {"name": "answer", "description": "You answer the person yourself."},
+                {"name": "consult", "description": "A supervisor must approve something before you answer.",
+                 "params": {"question": {"type": "string", "description": "What you ask, with the data to decide."}}}
+            ]
+        });
+        context
+    }
+
+    /// The contract of `sample_wf_menu_context`'s message.
+    fn sample_menu_contract() -> MessageContract {
+        let meta = Meta {
+            context: Some(sample_wf_menu_context()),
+            ..Meta::default()
+        };
+        resolve_message_contract(&meta)
+            .expect("a valid menu")
+            .expect("a contract")
+    }
+
+    /// The WF's block shows its menu after the path and the variables: its help, its options and
+    /// `none`, and the answer's shape. A block with only a menu is still shown.
+    #[test]
+    fn the_wf_block_shows_the_menu_after_the_path_and_the_variables() {
+        let contract = sample_menu_contract();
+        let menu = contract.menu().expect("the menu");
+        let block = render_wf_prompt_block(Some(&sample_wf_menu_context()), Some(menu))
+            .expect("the WF's block");
+        assert_eq!(
+            block,
+            "Workflow context:\n\
+             Path: IO.api@motherbee -> WF.sales.invoice@worker1\n\
+             Variables: {\"order\":{\"product\":\"Pro\",\"quantity\":10,\"unit_price\":49}}\n\
+             Help: The person is buying licenses. A discount above 10% needs a supervisor's approval.\n\
+             Options (choose exactly one):\n\
+             - answer: You answer the person yourself.\n\
+             - consult: A supervisor must approve something before you answer.\n\
+             \x20 params: question (string): What you ask, with the data to decide.\n\
+             - none: None of the options fits.\n\
+             \x20 params: reason (string): Why none of the options fits.\n\
+             Answer with only one JSON object: {\"reply\": \"<text for the person, may be empty>\", \"option\": \"<one name above>\", \"params\": {<that option's params>}}"
+        );
+
+        let only_menu = json!({"wf": {"menu": sample_wf_menu_context()["wf"]["menu"]}});
+        assert_eq!(
+            render_wf_prompt_block(Some(&only_menu), Some(menu)),
+            Some(format!("Workflow context:\n{}", menu.prompt()))
         );
     }
 
@@ -8560,7 +8683,7 @@ mod tests {
     fn the_memory_block_comes_first_then_the_wf_block_then_the_message() {
         let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
-        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
 
         let text = inject_prompt_blocks_into_text_input("dale, facturámelo", &[&memory, &wf]);
         assert_eq!(
@@ -9524,7 +9647,7 @@ mod tests {
 
     /// A contract as Case 1's WF gives sales (docs/wf-orchestration-v1.md §5.2.1): the answer's
     /// text is its `reply`.
-    fn sales_contract() -> ResponseContract {
+    fn sales_envelope() -> ResponseContract {
         ResponseContract::from_value(&json!({
             "kind": "json_object_v1",
             "required": ["reply", "area"],
@@ -9538,11 +9661,23 @@ mod tests {
         .expect("a valid contract")
     }
 
+    fn sales_contract() -> MessageContract {
+        MessageContract::Envelope(sales_envelope())
+    }
+
+    /// `sales_envelope` without its `text_field`.
+    fn plain_sales_contract() -> MessageContract {
+        MessageContract::Envelope(ResponseContract {
+            text_field: None,
+            ..sales_envelope()
+        })
+    }
+
     /// One message's tool loop with `model`, through the tools every message gets, under
     /// `contract`.
     async fn tool_loop_answer_under(
         model: &ScriptedModel,
-        contract: &ResponseContract,
+        contract: &MessageContract,
     ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
         let ctx = BehaviorContext::default();
         let files = Arc::new(ReplyFiles::default());
@@ -9617,14 +9752,10 @@ mod tests {
         );
 
         // Without a text_field, nothing changes.
-        let plain = ResponseContract {
-            text_field: None,
-            ..sales_contract()
-        };
         let model = ScriptedModel::new(Vec::new(), None)
             .with_call_text(r#"{"reply": "Hola", "area": "sales"}"#);
         assert_eq!(
-            tool_loop_answer_under(&model, &plain)
+            tool_loop_answer_under(&model, &plain_sales_contract())
                 .await
                 .expect("the tool loop"),
             Some(AiChatAnswer::from(AiBehaviorOutput::text(
@@ -9689,44 +9820,18 @@ mod tests {
     /// error, and, without a `text_field`, the model's text as it is.
     #[tokio::test]
     async fn under_a_text_field_the_call_without_tools_answers_that_field_and_the_object() {
-        let call = |content: &str, contract: ResponseContract| {
-            let client =
-                fluxbee_ai_sdk::MockLlmClient::with_responses(vec![fluxbee_ai_sdk::LlmResponse {
-                    content: content.to_string(),
-                }]);
-            async move {
-                let request = LlmRequest {
-                    model: "gpt-5.5".to_string(),
-                    system: None,
-                    input: "dale, facturámelo".to_string(),
-                    input_parts: None,
-                    output_schema: Some(contract.output_schema.clone()),
-                    max_output_tokens: None,
-                    model_settings: None,
-                };
-                test_node()
-                    .run_plain_call(
-                        &client,
-                        request,
-                        &chat_runtime(None, None),
-                        &BehaviorContext::default(),
-                        "dale, facturámelo",
-                        Some(&contract),
-                    )
-                    .await
-            }
-        };
-
         let object = r#"{"reply": "Te paso con facturación.", "area": "invoice"}"#;
         assert_eq!(
-            call(object, sales_contract()).await.expect("an answer"),
+            plain_call_under(object, sales_contract())
+                .await
+                .expect("an answer"),
             AiChatAnswer {
                 output: AiBehaviorOutput::text("Te paso con facturación."),
                 evaluation: Some(json!({"reply": "Te paso con facturación.", "area": "invoice"})),
             }
         );
 
-        let err = call(r#"{"area": "invoice"}"#, sales_contract())
+        let err = plain_call_under(r#"{"area": "invoice"}"#, sales_contract())
             .await
             .expect_err("not the contract's object");
         assert_eq!(
@@ -9734,14 +9839,43 @@ mod tests {
             "invalid_structured_output"
         );
 
-        let plain = ResponseContract {
-            text_field: None,
-            ..sales_contract()
-        };
         assert_eq!(
-            call(object, plain).await.expect("an answer"),
+            plain_call_under(object, plain_sales_contract())
+                .await
+                .expect("an answer"),
             AiChatAnswer::from(AiBehaviorOutput::text(object))
         );
+    }
+
+    /// One message's call without tools, whose model answers `content`, under `contract`, as
+    /// `run_ai_chat` makes it: with the schema the contract asks the provider for, if any.
+    async fn plain_call_under(
+        content: &str,
+        contract: MessageContract,
+    ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
+        let client =
+            fluxbee_ai_sdk::MockLlmClient::with_responses(vec![fluxbee_ai_sdk::LlmResponse {
+                content: content.to_string(),
+            }]);
+        let request = LlmRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            input: "dale, facturámelo".to_string(),
+            input_parts: None,
+            output_schema: contract.output_schema().cloned(),
+            max_output_tokens: None,
+            model_settings: None,
+        };
+        test_node()
+            .run_plain_call(
+                &client,
+                request,
+                &chat_runtime(None, None),
+                &BehaviorContext::default(),
+                "dale, facturámelo",
+                Some(&contract),
+            )
+            .await
     }
 
     /// One message `text` that a WF sent with its block `wf`, as `on_message` hands it to the tool
@@ -9805,7 +9939,7 @@ mod tests {
             thread_id: Some("thread:sim-wf-1".to_string()),
             ..BehaviorContext::default()
         };
-        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
 
         assert_eq!(
             history_turn(
@@ -9931,12 +10065,332 @@ mod tests {
 
         let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
-        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         assert_eq!(
             reply.payload["content"],
             format!("Echo: {memory}\n\n{wf}\n\nCurrent user message:\nhola")
         );
         assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+    }
+
+    /// A user message on a conversation's thread that a WF sent with `context`.
+    fn wf_user_message(context: Value) -> Message {
+        let mut msg = sample_user_request_with_context(
+            context,
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.meta.thread_id = Some("thread:sim-wf-1".to_string());
+        msg
+    }
+
+    /// Through `on_message`, a WF's message with a menu reaches the model with the menu at the end
+    /// of the WF's block (an echo node answers what its model would read), and the reply carries
+    /// no `wf` back.
+    #[tokio::test]
+    async fn a_message_with_a_menu_reaches_the_model_with_the_menu_in_the_wf_block() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+
+        let reply = node
+            .on_message(wf_user_message(sample_wf_menu_context()))
+            .await
+            .expect("on_message")
+            .expect("a reply");
+
+        let contract = sample_menu_contract();
+        let wf = render_wf_prompt_block(Some(&sample_wf_menu_context()), contract.menu())
+            .expect("the WF's block");
+        assert!(wf.contains("\n- none: None of the options fits.\n"));
+        assert_eq!(
+            reply.payload["content"],
+            format!("Echo: {wf}\n\nCurrent user message:\nhola")
+        );
+        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+    }
+
+    /// A message with an invalid menu, or with a menu and a response_envelope, is answered with
+    /// the error before the node looks for its key: the model is never called.
+    #[tokio::test]
+    async fn a_message_with_an_invalid_menu_or_two_contracts_never_reaches_the_model() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        // Its own provider and model, and no SY.vault client: a message that passed the check
+        // would be answered `missing_ai_api_key`.
+        *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), Some("gpt-5.5")));
+
+        let mut invalid = sample_wf_menu_context();
+        invalid["wf"]["menu"]["options"][0]["name"] = json!("none");
+        let mut both = sample_wf_menu_context();
+        both["response_envelope"] = json!({
+            "kind": "json_object_v1",
+            "required": ["reply"],
+            "properties": {"reply": {"type": "string"}},
+            "text_field": "reply"
+        });
+        for (context, code, message) in [
+            (
+                invalid,
+                "invalid_menu",
+                "The WF's menu (meta.context.wf.menu) is not valid: menu.options[0].name: must \
+                 not be none: every menu has it, for an answer that none of the options fits",
+            ),
+            (
+                both,
+                "conflicting_contracts",
+                "The message carries both a WF's menu (meta.context.wf.menu) and a \
+                 response_envelope: a WF asks an agent with its menu alone.",
+            ),
+        ] {
+            let reply = node
+                .on_message(wf_user_message(context))
+                .await
+                .expect("on_message")
+                .expect("a reply");
+            assert_eq!(
+                reply.payload,
+                json!({"type": "error", "code": code, "message": message, "retryable": false})
+            );
+        }
+
+        // An invalid response contract is refused as before, also before the key.
+        let reply = node
+            .on_message(wf_user_message(
+                json!({"response_envelope": {"kind": "array_v1"}}),
+            ))
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(reply.payload["code"], "ai_runtime_error");
+        assert_eq!(reply.payload["retryable"], json!(false));
+
+        // A valid menu goes on, to the key.
+        let reply = node
+            .on_message(wf_user_message(sample_wf_menu_context()))
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(reply.payload["code"], "missing_ai_api_key");
+    }
+
+    /// Under a WF's menu, the tool loop's reply is the answer's `reply`, with the files its tools
+    /// made, and its evaluation the checked `{reply, option, params}`: a param the option does not
+    /// declare is dropped.
+    #[tokio::test]
+    async fn under_a_menu_the_tool_loop_answers_the_reply_and_the_checked_object() {
+        let model = ScriptedModel::new(
+            vec![(
+                "generate_csv_artifact",
+                json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
+            )],
+            Some(
+                r#"{"reply": "Lo consulto con un supervisor.", "option": "consult", "params": {"question": "¿20% en 10 Pro?", "discount": 20}}"#,
+            ),
+        );
+        let answer = tool_loop_answer_under(&model, &sample_menu_contract())
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
+        let AiBehaviorOutput::Final(reply) = &answer.output else {
+            panic!("a reply with its file: {answer:?}");
+        };
+        assert_eq!(
+            reply.text.as_deref(),
+            Some("Lo consulto con un supervisor.")
+        );
+        assert_eq!(reply.artifacts[0].filename, "pedido.csv");
+        assert_eq!(
+            answer.evaluation,
+            Some(json!({
+                "reply": "Lo consulto con un supervisor.",
+                "option": "consult",
+                "params": {"question": "¿20% en 10 Pro?"}
+            }))
+        );
+
+        // Without a call, in a fence: none, with a blank reply.
+        let model = ScriptedModel::new(Vec::new(), None).with_call_text(
+            "```json\n{\"reply\": \"\", \"option\": \"none\", \"params\": {\"reason\": \"They ask for a refund.\"}}\n```",
+        );
+        assert_eq!(
+            tool_loop_answer_under(&model, &sample_menu_contract())
+                .await
+                .expect("the tool loop"),
+            Some(AiChatAnswer {
+                output: AiBehaviorOutput::text(""),
+                evaluation: Some(json!({
+                    "reply": "",
+                    "option": "none",
+                    "params": {"reason": "They ask for a refund."}
+                })),
+            })
+        );
+    }
+
+    /// The call without tools answers under a menu as the tool loop does.
+    #[tokio::test]
+    async fn under_a_menu_the_call_without_tools_answers_the_reply_and_the_checked_object() {
+        assert_eq!(
+            plain_call_under(
+                r#"Elijo: {"reply": "Hola, ¿qué plan?", "option": "answer"}"#,
+                sample_menu_contract()
+            )
+            .await
+            .expect("an answer"),
+            AiChatAnswer {
+                output: AiBehaviorOutput::text("Hola, ¿qué plan?"),
+                evaluation: Some(
+                    json!({"reply": "Hola, ¿qué plan?", "option": "answer", "params": {}})
+                ),
+            }
+        );
+    }
+
+    /// Under a WF's menu, an answer off it fails on both paths, and the sender gets
+    /// `invalid_structured_output` with its detail.
+    #[tokio::test]
+    async fn under_a_menu_an_answer_off_it_is_invalid_structured_output() {
+        for (text, detail) in [
+            ("Te paso con un supervisor.", "not_json"),
+            (
+                r#"{"reply": "Listo.", "option": "invoice"}"#,
+                "unknown_option:invoice",
+            ),
+            (
+                r#"{"reply": "Listo.", "option": "consult"}"#,
+                "missing_param:question",
+            ),
+            (
+                r#"{"reply": "Listo.", "option": "consult", "params": {"question": 20}}"#,
+                "type_mismatch:question:string",
+            ),
+        ] {
+            let model = ScriptedModel::new(Vec::new(), None).with_call_text(text);
+            let looped = tool_loop_answer_under(&model, &sample_menu_contract())
+                .await
+                .expect_err("off the menu");
+            let plain = plain_call_under(text, sample_menu_contract())
+                .await
+                .expect_err("off the menu");
+            for err in [looped, plain] {
+                assert_eq!(
+                    ai_chat_failure_payload(&err, false),
+                    json!({
+                        "type": "error",
+                        "code": "invalid_structured_output",
+                        "message": format!(
+                            "The AI's answer is not the object its contract asks for: {detail}"
+                        ),
+                        "retryable": false
+                    }),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// The tool loop's system prompt is the role, with a response contract's instruction after it;
+    /// under a WF's menu it stays the role, since the WF's block carries the menu. The call without
+    /// tools gets no schema under a menu either (`MessageContract::output_schema`).
+    #[test]
+    fn under_a_menu_the_system_prompt_stays_the_role() {
+        let role = "You sell Fluxbee licenses.".to_string();
+        assert_eq!(
+            tool_loop_system_prompt(role.clone(), None).expect("prompt"),
+            role
+        );
+        assert_eq!(
+            tool_loop_system_prompt(role.clone(), Some(&sample_menu_contract())).expect("prompt"),
+            role
+        );
+        assert_eq!(sample_menu_contract().output_schema(), None);
+        assert_eq!(
+            tool_loop_system_prompt(role.clone(), Some(&sales_contract())).expect("prompt"),
+            format!(
+                "{role}\n\n{}",
+                build_output_schema_fallback_instruction(&sales_envelope().output_schema)
+                    .expect("the instruction")
+            )
+        );
+    }
+
+    /// Under a WF's menu, the model reads the menu in the WF's block, and the history keeps what
+    /// the person wrote, without the block, and the checked object as the assistant's turn.
+    #[tokio::test]
+    async fn under_a_menu_the_history_keeps_what_the_person_wrote_and_the_checked_object() {
+        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
+        let node = GenericAiNode {
+            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
+            ..test_node()
+        };
+        let ai = AiChatRuntime {
+            immediate_memory: ImmediateMemorySection {
+                enabled: true,
+                ..ImmediateMemorySection::default()
+            },
+            ..chat_runtime(None, None)
+        };
+        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
+        let ctx = BehaviorContext {
+            src_ilk: Some(src_ilk.to_string()),
+            thread_id: Some("thread:sim-wf-1".to_string()),
+            ..BehaviorContext::default()
+        };
+        let contract = sample_menu_contract();
+        let wf = render_wf_prompt_block(Some(&sample_wf_menu_context()), contract.menu())
+            .expect("the WF's block");
+        let text = "quiero 20% de descuento";
+        let model = ScriptedModel::new(Vec::new(), None).with_call_text(
+            r#"{"reply": "Lo consulto.", "option": "consult", "params": {"question": "¿20%?", "discount": 20}}"#,
+        );
+        let files = Arc::new(ReplyFiles::default());
+        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
+        let answer = node
+            .run_tool_loop(
+                &model,
+                &tools,
+                &files,
+                &ai,
+                &ctx,
+                inject_prompt_blocks_into_text_input(text, &[&wf]),
+                None,
+                text,
+                Some(&contract),
+            )
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
+        assert_eq!(answer.output, AiBehaviorOutput::text("Lo consulto."));
+        {
+            let seen = model.seen.lock().expect("seen");
+            assert!(seen[0].items.iter().any(|item| matches!(
+                item,
+                FunctionLoopItem::UserText { content }
+                    if *content == format!("{wf}\n\nCurrent user message:\n{text}")
+            )));
+        }
+
+        let record = node
+            .immediate_memory_store
+            .as_ref()
+            .expect("the store")
+            .get(src_ilk)
+            .await
+            .expect("the record")
+            .expect("a record");
+        let kept = record
+            .recent_interactions
+            .iter()
+            .map(|interaction| interaction.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                text,
+                r#"{"option":"consult","params":{"question":"¿20%?"},"reply":"Lo consulto."}"#
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A file named as an earlier one of the same reply takes its place, in the earlier one's
