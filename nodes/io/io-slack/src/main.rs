@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod thread_records;
+
 use anyhow::Result;
 use fluxbee_sdk::protocol::{
     Destination, Message as WireMessage, Meta, Routing, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
@@ -18,7 +20,7 @@ use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
 use io_common::io_context::{
-    extract_slack_post_target, slack_binding_id, slack_inbound_io_context,
+    extract_slack_post_target, slack_binding_id, slack_inbound_io_context, IoContext,
 };
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
@@ -50,6 +52,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use thread_records::{
+    map_inbound_thread, open_node_thread_records, run_thread_records_expiry_loop, OutboundThread,
+    SlackThreadRecords,
+};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
@@ -211,6 +217,13 @@ async fn main() -> Result<()> {
     ));
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
 
+    // The thread id of each Slack place this node handles, next to its config.json (see
+    // thread_records). Without them the node works as it did before they existed.
+    let thread_records = open_node_thread_records(&config.node_name).map(Arc::new);
+    if let Some(records) = thread_records.clone() {
+        tokio::spawn(run_thread_records_expiry_loop(records));
+    }
+
     // Woken by the SY.vault `VAULT_SECRET_CHANGED` broadcast (handled in run_outbound_loop) so a
     // Cloud-side token update (put/rotate/delete) reloads credentials IMMEDIATELY instead of waiting
     // for the next poll tick — this is the primary path now that Slack token rotation is disabled and
@@ -283,6 +296,7 @@ async fn main() -> Result<()> {
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
         vault_change_notify.clone(),
+        thread_records.clone(),
     ));
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
@@ -303,6 +317,7 @@ async fn main() -> Result<()> {
         ensured_bindings.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
+        thread_records,
     ));
 
     let relay_flush_task = tokio::spawn(run_relay_flush_loop(
@@ -1139,13 +1154,15 @@ impl SlackClients {
         Ok(Url::parse(&url)?)
     }
 
+    /// Posts a message and returns its `ts`, which Slack's answer carries: the thread records keep a
+    /// new top-level post's (see thread_records).
     async fn post_message(
         &self,
         channel: &str,
         text: &str,
         thread_ts: Option<&str>,
         blocks: Option<serde_json::Value>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let mut body = serde_json::json!({
             "channel": channel,
             "text": text,
@@ -1160,6 +1177,7 @@ impl SlackClients {
         #[derive(Deserialize)]
         struct PostResp {
             ok: bool,
+            ts: Option<String>,
             error: Option<String>,
         }
         let slack_bot_token = self.slack_bot_token().await?;
@@ -1181,7 +1199,7 @@ impl SlackClients {
                 resp.error.unwrap_or_else(|| "unknown".to_string())
             ));
         }
-        Ok(())
+        Ok(resp.ts)
     }
 
     async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
@@ -1355,6 +1373,7 @@ async fn run_inbound_socket_mode(
     ensured_bindings: Arc<Mutex<HashSet<String>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
+    thread_records: Option<Arc<SlackThreadRecords>>,
 ) -> Result<()> {
     let sender = dispatcher.sender_snapshot();
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
@@ -1606,12 +1625,21 @@ async fn run_inbound_socket_mode(
                 "inbound Slack message"
             );
 
-            let io_ctx = slack_inbound_io_context(
+            let mut io_ctx = slack_inbound_io_context(
                 &binding.workspace_id,
                 &user,
                 &binding.conversation_id,
                 thread_ts.as_deref(),
                 &message_id,
+            );
+            // A reply in the Slack thread of a recorded post takes that post's thread id (a WF's
+            // question gets its answer back on the instance's thread); any other message keeps
+            // the computed one and records its place. Before dispatch, so an answer finds it.
+            map_inbound_thread(
+                thread_records.as_deref(),
+                &mut io_ctx,
+                thread_ts.as_deref(),
+                now_epoch_ms(),
             );
             let attachments = collect_slack_blob_attachments(
                 slack.as_ref(),
@@ -1652,6 +1680,7 @@ async fn run_inbound_socket_mode(
                 &content,
                 attachments,
                 payload.clone(),
+                io_ctx.clone(),
             );
 
             let relay_decision = relay.lock().await.handle_fragment(relay_fragment);
@@ -1784,6 +1813,7 @@ fn build_slack_relay_fragment(
     content: &str,
     attachments: Vec<InboundAttachmentInput>,
     raw_payload: Value,
+    io_context: IoContext,
 ) -> RelayFragment {
     RelayFragment {
         relay_key: slack_relay_key(workspace_id, user, conversation_id, thread_ts),
@@ -1795,13 +1825,7 @@ fn build_slack_relay_fragment(
             .filter_map(|attachment| serde_json::to_value(attachment.blob_ref).ok())
             .collect(),
         raw_payload: Some(raw_payload),
-        io_context: slack_inbound_io_context(
-            workspace_id,
-            user,
-            conversation_id,
-            thread_ts,
-            message_id,
-        ),
+        io_context,
         identity_input: ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: slack_external_id(node_name, user),
@@ -2293,6 +2317,7 @@ async fn run_outbound_loop(
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
     vault_change_notify: Arc<Notify>,
+    thread_records: Option<Arc<SlackThreadRecords>>,
 ) -> Result<()> {
     let mut incoming_rx = dispatcher
         .take_command_receiver(RPC_CH_INCOMING)
@@ -2421,34 +2446,23 @@ async fn run_outbound_loop(
                 continue;
             }
         };
-        let target = msg
+        // Where in the bound channel the message goes is the thread records' call: its thread id's
+        // recorded place, else its reply_target when that is this channel, else a new post at the
+        // top level, recorded. Another channel's reply_target is never read: an agent's answer
+        // carries the one of the message it answers, which can be another node's.
+        let reply_target = msg
             .meta
             .context
             .as_ref()
-            .and_then(extract_slack_post_target)
-            .unwrap_or_else(|| {
-                tracing::debug!(
-                    trace_id = %msg.routing.trace_id,
-                    msg_type = %msg.meta.msg_type,
-                    msg = %meta_msg,
-                    payload_type = %payload_type,
-                    configured_conversation_id = %binding.conversation_id,
-                    "outbound missing io.reply_target; falling back to configured Slack binding"
-                );
-                io_common::io_context::SlackPostTarget {
-                    channel_id: binding.conversation_id.clone(),
-                    thread_ts: None,
-                    workspace_id: Some(binding.workspace_id.clone()),
-                }
-            });
-        if target.channel_id != binding.conversation_id {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                configured_conversation_id = %binding.conversation_id,
-                requested_conversation_id = %target.channel_id,
-                "outbound reply_target channel does not match configured binding; forcing configured conversation_id"
-            );
-        }
+            .and_then(extract_slack_post_target);
+        let mut thread = OutboundThread::resolve(
+            thread_records.as_deref(),
+            &binding.workspace_id,
+            &binding.conversation_id,
+            msg.meta.thread_id.as_deref(),
+            reply_target.as_ref(),
+            now_epoch_ms(),
+        );
 
         let mut sent_any = false;
         match resolve_text_v1_for_outbound(
@@ -2473,25 +2487,27 @@ async fn run_outbound_loop(
                 if has_text || has_blocks {
                     tracing::debug!(
                         slack_channel = binding.conversation_id,
-                        slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
+                        slack_thread_ts = thread.thread_ts().unwrap_or(""),
                         text_len = resolved.text.len(),
                         has_blocks,
                         text_preview = %truncate(&resolved.text, 120),
                         "sending slack message"
                     );
-                    if let Err(e) = slack
+                    let posted = slack
                         .post_message(
                             &binding.conversation_id,
                             &resolved.text,
-                            target.thread_ts.as_deref(),
+                            thread.thread_ts(),
                             blocks,
                         )
-                        .await
-                    {
-                        tracing::warn!(error=?e, "failed to send slack message");
-                    } else {
-                        sent_any = true;
-                        tracing::debug!("slack message sent");
+                        .await;
+                    match posted {
+                        Ok(ts) => {
+                            sent_any = true;
+                            thread.posted(ts.as_deref(), now_epoch_ms());
+                            tracing::debug!("slack message sent");
+                        }
+                        Err(e) => tracing::warn!(error=?e, "failed to send slack message"),
                     }
                 }
 
@@ -2503,28 +2519,30 @@ async fn run_outbound_loop(
                     };
                     match blob_toolkit.read_blob_async(&attachment.blob_ref).await {
                         Ok(bytes) => {
-                            if let Err(error) = slack
+                            let uploaded = slack
                                 .upload_file(
                                     &binding.conversation_id,
-                                    target.thread_ts.as_deref(),
+                                    thread.thread_ts(),
                                     filename,
                                     &attachment.blob_ref.mime,
                                     bytes,
                                 )
-                                .await
-                            {
-                                tracing::warn!(
+                                .await;
+                            match uploaded {
+                                Ok(()) => {
+                                    sent_any = true;
+                                    thread.posted(None, now_epoch_ms());
+                                    tracing::debug!(
+                                        blob_name = %attachment.blob_ref.blob_name,
+                                        filename = %filename,
+                                        "slack attachment uploaded"
+                                    );
+                                }
+                                Err(error) => tracing::warn!(
                                     error = ?error,
                                     blob_name = %attachment.blob_ref.blob_name,
                                     "failed to upload attachment to Slack"
-                                );
-                            } else {
-                                sent_any = true;
-                                tracing::debug!(
-                                    blob_name = %attachment.blob_ref.blob_name,
-                                    filename = %filename,
-                                    "slack attachment uploaded"
-                                );
+                                ),
                             }
                         }
                         Err(error) => {
@@ -2548,34 +2566,36 @@ async fn run_outbound_loop(
                     "Error ({}) al procesar contenido/adjuntos.",
                     err.canonical_code()
                 );
-                if let Err(error) = slack
+                let posted = slack
                     .post_message(
                         &binding.conversation_id,
                         &fallback,
-                        target.thread_ts.as_deref(),
+                        thread.thread_ts(),
                         None,
                     )
-                    .await
-                {
-                    tracing::warn!(error=?error, "failed to send outbound fallback message");
-                } else {
-                    sent_any = true;
+                    .await;
+                match posted {
+                    Ok(ts) => {
+                        sent_any = true;
+                        thread.posted(ts.as_deref(), now_epoch_ms());
+                    }
+                    Err(error) => {
+                        tracing::warn!(error=?error, "failed to send outbound fallback message")
+                    }
                 }
             }
         }
 
         if !sent_any {
             let fallback = "No pude entregar el mensaje en Slack (sin contenido util).";
-            if let Err(error) = slack
-                .post_message(
-                    &binding.conversation_id,
-                    fallback,
-                    target.thread_ts.as_deref(),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(error=?error, "failed to send final outbound fallback");
+            let posted = slack
+                .post_message(&binding.conversation_id, fallback, thread.thread_ts(), None)
+                .await;
+            match posted {
+                Ok(ts) => thread.posted(ts.as_deref(), now_epoch_ms()),
+                Err(error) => {
+                    tracing::warn!(error=?error, "failed to send final outbound fallback")
+                }
             }
         }
     }

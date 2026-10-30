@@ -24,6 +24,8 @@ the **Slack-specific** decisions and needs.
   - deduplication and sessionization are **in memory** (*best-effort*),
   - outbound retries/outbox are **in memory** (*best-effort*),
   - the technical state is lost after a restart.
+- The one exception is `IO.slack`'s thread records (§2.4): a local SQLite file in its node directory,
+  because a reply can come hours later, after a restart.
 
 > Note: to avoid inconsistencies with future durability needs, the IO's internal logic should use a **persistence interface** (MVP: InMemory), as defined in `io-common.md`.
 
@@ -46,7 +48,8 @@ Reading adjusted to the real current state of the repo:
 - `IoContext.entrypoint` no longer represents the workspace in the abstract, but the local `workspace_id + conversation_id` binding;
 - the current `thread_id` calculation already uses local channel material:
   - `NativeThread(channel_type=\"slack\", entrypoint_id=workspace_id, native_thread_id=thread_ts)` when there is a native thread;
-  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=workspace_id, conversation_id=conversation_id)` when there is no `thread_ts`.
+  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=workspace_id, conversation_id=conversation_id)` when there is no `thread_ts`;
+  - a reply in the Slack thread of a recorded post takes the recorded thread id instead (§2.4).
 
 Practical conclusion:
 
@@ -82,6 +85,30 @@ Residual gap:
 
 - the local validation of `SY.identity` depends on the available build environment;
 - the homogeneous resolution for other IO nodes is still pending.
+
+### 2.4 Thread records
+
+The node owns its conversations' thread ids, because it created the communication event
+([wf-orchestration-v1](../wf-orchestration-v1.md) §5.3.4). It records the thread id of each Slack
+place it handles, a place being one channel and one thread in it, or the channel's top level. The
+records are `slack_threads.db`, next to the node's `config.json`: one row per place, with
+`thread_id`, `channel_id`, `thread_ts` (empty for the top level), `created_at` and `last_used_at`
+(`nodes/io/io-slack/src/thread_records.rs`).
+
+- **In:** a reply in a Slack thread whose root is recorded takes the recorded thread id, in
+  `meta.thread_id` and in `meta.context.io.conversation.thread_id`. Any other message takes the
+  computed id (§2.2), and its place is recorded under it.
+- **Out:** a message on a recorded thread id goes to that thread's place, and its `reply_target` is
+  not read. An unrecorded one whose `reply_target` is the node's own channel is posted there, and
+  recorded. Any other is posted at the top level: the post's `ts` is recorded for its thread id,
+  and the rest of the message (its files) goes into that post's thread.
+- A record unused for 30 days is deleted, at start and daily.
+- If the records cannot open or a query fails, the node logs it and works without them: messages
+  in keep the computed id, and messages out go to the `reply_target` of the node's own channel, or
+  else to the top level.
+
+So a WF's question, which carries the instance's thread id, is answered on that thread id when a
+supervisor replies in the Slack thread of its post.
 
 ---
 
@@ -337,10 +364,15 @@ What is still to settle per type:
 
 ### 8.2 Destination resolution
 
-The Slack IO Node **MUST**:
-- Send the message to the indicated `channel`.
-- If `thread_ts` is present, reply in the same thread.
-- Otherwise, post in the channel.
+The node posts only in its bound channel (`config.io.conversation_id`). Where in it is the thread
+records' call (§2.4):
+
+- the recorded place of the message's `meta.thread_id`;
+- else its `reply_target`, when that is the node's own channel: its `thread_ts`, or the top level;
+- else a new post at the top level, recorded.
+
+A `reply_target` of another channel is never read: an agent's answer carries the one of the message
+it answers, which can be another node's.
 
 ### 8.3 Long content policy (current state)
 
@@ -449,7 +481,7 @@ This definition replaces any legacy mode or ad-hoc identity logic in the Slack n
 
 ### Clarification - meta.thread_id vs meta.context
 
-- `meta.thread_id` carries the communication: `NativeThread` inside a Slack thread, `PersistentChannel` outside one (§2.2)
+- `meta.thread_id` carries the communication: `NativeThread` inside a Slack thread, `PersistentChannel` outside one (§2.2), or the recorded thread id for a reply in the Slack thread of a recorded post (§2.4)
 - `meta.context` is free JSON for the receiver and the OPA policy; the Slack facts go in `meta.context.io`
 - There is no `meta.ctx`: the router drops every key that is not a field of `Meta` ([protocol](../reference/protocol.md) §3.1)
 

@@ -111,6 +111,8 @@ Managed runtime note:
 - The vault secret behind that key is `{"app_token":"xapp-...","bot_token":"xoxb-..."}` with
   `metadata.resource_type: slack`. The node reads it at start, on a `VAULT_SECRET_CHANGED` and
   every 60 s, and runs degraded until it has it.
+- Its thread records, the thread id of each Slack place it handles, are `slack_threads.db` next to
+  its `config.json` (`docs/io/io-slack.md` §2.4).
 - Launch, secret and config: `docs/io/io-slack-deploy-runbook.md` §3 (steps 4 and 5) and §5.
 
 Optional env vars (they override the managed config):

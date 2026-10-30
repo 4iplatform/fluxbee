@@ -39,6 +39,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 nix = { version = "0.28", features = ["fs"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# io.slack's thread records (docs/wf-orchestration-v1.md §5.3.4): the version and features the root
+# workspace declares.
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -505,6 +505,10 @@ pub fn slack_binding_id(workspace_id: &str, conversation_id: &str) -> String {
     format!("{workspace_id}:{conversation_id}")
 }
 
+/// The IO context of a Slack message in the bound channel. Its thread id is the one computed for the
+/// message's place: `NativeThread` inside a Slack thread, `PersistentChannel` at the channel's top
+/// level. io.slack replaces it with the recorded one for a reply in the Slack thread of a post it
+/// recorded (its thread records, docs/wf-orchestration-v1.md §5.3.4).
 pub fn slack_inbound_io_context(
     workspace_id: &str,
     user_id: &str,
