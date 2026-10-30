@@ -1078,6 +1078,73 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 4) — A wf-rules `check` stages the definition it checks
+
+- **What happens** (go/sy-wf-rules/node/dispatch.go): `check` is `compile` under another name, and
+  a compile writes the definition to `staged` ([sy-wf-rules](../../docs/nodes/sy-wf-rules.md),
+  "Compile").
+  - SY.admin describes `wf_rules_compile` as "Compile a workflow definition without applying it".
+    It does not say that the definition is staged.
+  - In the 0.1.91 gate, the run of refused definitions also compiled a valid one. It stayed staged
+    until the workflow's delete.
+- **Why it matters:** an `apply` without a `version` deploys whatever is staged. A check that Archi
+  runs before asking the operator leaves its definition one `apply` away from going live.
+- **Next:** WF Case 4, the check before deploy
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §4.7). It should be a read-only check,
+  as OPA's `opa_check` is.
+
+### A-127 🔴 OPEN (found 2026-10-30, the 0.1.91 gate) — SY.admin's node control and message routes send a bare node name as is
+
+- **What happens** (src/bin/sy_admin.rs):
+  - **Control:** `POST /hives/{hive}/nodes/{name}/control/config-get` and `/control/config-set`
+    (`handle_node_control_command`) send to the name as given.
+    - A name with `@hive` must match the path's hive.
+    - A bare name goes out without a hive.
+  - **Messages:** `POST /hives/{hive}/nodes/{name}/messages` (`handle_send_node_message`) does the
+    same, and does not even compare a qualified name with the path's hive. The path's hive only
+    shows in the answer.
+  - **The router does not know a bare name.** The answer is `TRANSPORT_ERROR transport
+    unreachable: reason=NODE_NOT_FOUND`. In the gate, `config-get` on `AI.gate0191sales` failed that
+    way, and on `AI.gate0191sales@worker1` it answered.
+  - **The routes that go through the orchestrator take a bare name** on the same path: `status`,
+    `help`, `restart` and the node's `DELETE`. The gate used them all that way.
+- **Why it matters:**
+  - On the same path, one route takes a bare name and the next does not.
+  - The error reads as a transport failure, not as a wrong name.
+  - Archi calls these routes for the operator.
+- **Fix:** both handlers qualify a bare name with the path's hive. `messages` also refuses a
+  qualified name of another hive, as the control handler does.
+
+### A-126 🔴 OPEN (found 2026-10-30, the 0.1.91 gate) — Archi deletes an agent asset that an agent's definition still names
+
+- **What happens:**
+  - **The delete checks nothing.** `DELETE /api/agent-assets?hash=` and Archi's `delete_agent_asset`
+    tool (`delete_agent_asset_from_disk`, src/bin/sy_architect.rs) remove
+    `blob://agent-assets/<hash>.json`. They do not look for the ILK definitions that name it.
+    - The answer carries a `definition_warning`.
+    - The tool's description and Archi's handbook (docs/archi/handbook_fluxbee.md) ask Archi to
+      take the hash out of active definitions first. Nothing enforces it.
+  - **Syncthing carries the delete to the workers** (`agent-assets/` is shared, A-72).
+  - **A running agent does not notice.** While its definition's hashes stay the same, it reuses
+    what it composed and never reads the folder again (`should_reuse_cognitive_state`,
+    nodes/ai/ai-generic/src/bin/ai_node_runner.rs).
+  - **At its next start it loses the asset.** Before its first definition, a missing asset is
+    composed as it is (`compose_cognitive_state`):
+    - when the role was its only asset, the agent answers with the unconfigured prompt
+      (`definition_state` `error`);
+    - with other assets, it runs without that one (`partial`).
+- **Why it matters:** the delete looks harmless, and the damage shows at the next restart (an
+  upgrade, a reboot), far from the delete. People then talk to an agent without its role.
+- **Seen in the 0.1.91 gate:** the cleanup had to purge the three agents before it deleted their
+  roles.
+- **The docs drift:** docs/identity-v2.1-agent-definition-addendum.md says that the agent "can
+  become `partial`" at once. In the code, the change comes only at the agent's next start.
+- **Options:**
+  - refuse the delete while an ILK definition names the hash, list those ILKs, and give the
+    operator a `force`;
+  - or show who uses each asset in `list_agent_assets`, so that the operator sees it before
+    deleting.
+
 ### A-125 🟡 OPEN (found 2026-10-29, 0.1.91 review) — A WF whose agents keep answering each other runs without end
 
 - **What happens** (go/nodes/wf/wf-generic/node/): nothing bounds how many messages an instance

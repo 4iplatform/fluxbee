@@ -297,7 +297,8 @@ This is the single place for the track. The cases are worked here one at a time.
   node (a name written in the definition), with its data.
 - **Case 4, Archi writes and operates WFs:**
   - the guide and seeds;
-  - a check before deploy, with `COMPILE_ERROR` back to the designer;
+  - a check before deploy, with `COMPILE_ERROR` back to the designer. Today's `check` is a
+    compile, and it stages the definition (FINDINGS A-128);
   - instances visible through SY.admin.
 - **Later, in the IO family:** writing first to a person who never wrote (FINDINGS A-114).
 
