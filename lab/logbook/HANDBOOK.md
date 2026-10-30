@@ -798,9 +798,9 @@ ops run 100 script.sh [args]    # a local script (bash or .py) on a VM
    count as updated.
 7. `health` since the start of the deploy.
 
-The 3-snapshot rule is respected this way: if a VM already has 3, `deploy` does not start until
-you name the oldest with `--drop`, and it deletes that one and no other. The ledger record is
-still made by hand.
+The one-snapshot rule (below) is kept this way: if a VM already has its one, `deploy` does not
+start until you name it with `--drop`. It takes the new one first, then deletes that one and no
+other. The ledger record is still made by hand.
 
 ### Record the deploy — ALWAYS (audit) · operator's rule (2026-08-20)
 

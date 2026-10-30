@@ -1078,6 +1078,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-125 🟡 OPEN (found 2026-10-29, 0.1.91 review) — A WF whose agents keep answering each other runs without end
+
+- **What happens** (go/nodes/wf/wf-generic/node/): nothing bounds how many messages an instance
+  sends between two triggers (a person's message, a timer fire). `maxInternalEventsPerEvent` bounds
+  internal events within one event, not a cycle across agents' answers.
+  - A definition where an agent's answer leads to asking another agent, whose answer leads back,
+    runs as long as the agents keep answering. Each turn is a model call.
+  - Case 1's first `wf.sales.invoice` did that: a handback asked sales again with the same message,
+    and a person's text could steer both agents into bouncing it. The review's probe made 101 agent
+    requests from one message.
+- **Fixed in the example (0.1.91):** a handback delivers the answer and waits for the person, so
+  one message costs at most two agent calls.
+- **Why it stays open:** Archi will write such definitions once its guide teaches handbacks
+  (Case 4), and a cycle is a definition bug the engine cannot tell from a bounded negotiation.
+- **Option, to decide with the operator in Case 4:** a cap in the engine on the messages an
+  instance sends between two triggers. Past it, the send fails and the instance fails with a cause.
+
 ### A-124 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
 
 - **What happens:** `publish_cloud_endpoint` answers with the new bearer, once

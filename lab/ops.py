@@ -298,7 +298,8 @@ def cmd_build(a):
         time.sleep(15)
 
 
-# Versions the apt repo keeps: `apt install fluxbee=<v>` reaches that far back (the snapshots, 3).
+# Versions the apt repo keeps: `apt install fluxbee=<v>` reaches that far back (a VM's one
+# snapshot undoes only the last release).
 REPO_KEEP = 10
 
 
@@ -441,7 +442,7 @@ def main():
     s = sub.add_parser("publish"); s.add_argument("version"); s.set_defaults(fn=cmd_publish)
     s = sub.add_parser("deploy"); s.add_argument("version")
     s.add_argument("--snapshot", required=True, help="name of the snapshot taken on every VM first")
-    s.add_argument("--drop", help="the oldest snapshot to delete where a VM already has 3")
+    s.add_argument("--drop", help="the snapshot to delete where a VM already has its one")
     s.set_defaults(fn=cmd_deploy)
     a = p.parse_args()
     # Progress shows as it happens even when the output goes to a pipe or a file.

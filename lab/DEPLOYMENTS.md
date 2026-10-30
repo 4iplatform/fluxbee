@@ -7,10 +7,10 @@
 > **Rule (HANDBOOK §12): no `apt install` in prod — and no core-update to a spoke — without an
 > entry here.** Without an entry, the deploy is not done.
 >
-> **Snapshots: never more than 3 per VM (HANDBOOK §12, since 2026-09-25).** The "by snapshot" rollback
-> of the old entries may no longer exist: on 2026-09-25 the ones from 0.1.19 to 0.1.29 were deleted.
-> The path that always remains is `apt install fluxbee=<previous>`, because the repo keeps every
-> version.
+> **Snapshots: one per VM (HANDBOOK §12; three from 2026-09-25, one since 2026-10-29).** The "by
+> snapshot" rollback of an older entry no longer exists: only the last release's snapshot is kept.
+> The path that remains is `apt install fluxbee=<previous>`, as far back as the repo goes: it keeps
+> the newest 10 versions (since 2026-10-29).
 >
 > Siblings: [`logbook/HANDBOOK.md`](logbook/HANDBOOK.md) (deploy recipes), [`logbook/METHOD.md`](logbook/METHOD.md)
 > (how the infra is operated), `logbook/YYYY-MM-DD.md` (narrative logbook), [`logbook/FINDINGS.md`](logbook/FINDINGS.md)
