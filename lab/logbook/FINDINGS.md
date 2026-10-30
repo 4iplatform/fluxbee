@@ -1138,7 +1138,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Seen in the 0.1.91 gate:** the cleanup had to purge the three agents before it deleted their
   roles.
 - **The docs drift:** docs/identity-v2.1-agent-definition-addendum.md says that the agent "can
-  become `partial`" at once. In the code, the change comes only at the agent's next start.
+  become `partial` until the definition is updated", which reads as right away. In the code, the
+  change comes only at the agent's next start.
 - **Options:**
   - refuse the delete while an ILK definition names the hash, list those ILKs, and give the
     operator a `force`;
