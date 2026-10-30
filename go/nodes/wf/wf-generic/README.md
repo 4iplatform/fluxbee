@@ -26,8 +26,8 @@ How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md Â
   `target_state` is internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a
   `$ref`, checked when the action runs. The Go SDK writes frames without HTML escaping.
 - **Asking an agent.** A `send_message` or a `forward` to an `AI.*` node may offer it a `menu`, the
-  options it may choose from; the engine writes it in the WF's block as written, with no empty
-  field. The agent answers `{reply, option, params}` in `meta.context.evaluation`, `none` with a
+  options it may choose from; the engine writes it in the WF's block as written, with each option's
+  params in name order and no empty field. The agent answers `{reply, option, params}` in `meta.context.evaluation`, `none` with a
   `reason` when no option fits, and an error payload for an answer off the menu. A definition with
   `meta.context.response_envelope` is refused: a WF asks an agent with `menu`. What a guard, a
   value or a `$ref` reads of the evaluation is checked against the definition's menus at load.
@@ -37,7 +37,8 @@ How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md Â
   the instance's log gets `unhandled event ... in state ...`, the node's log a line naming the
   instance, the state and the event, and the instance stays where it was.
 - **The cap on agent calls.** At most 8 messages go to agents (`AI.*`) between two triggers, a
-  trigger being a message from a node that is no agent or a timer's fire. Past it the send is not
+  trigger being a message from a node that is neither an agent nor the WF itself, or a timer's
+  fire. Past it the send is not
   made, the instance's log says so and the transition goes on; the instance then gets one
   `AGENT_CALL_CAP` internal event per trigger (an error payload, `agent_call_cap`, with the agent as
   `target`), which its states, its catch or the default take. The instance never fails for it, and

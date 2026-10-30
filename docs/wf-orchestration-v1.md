@@ -1133,6 +1133,42 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
 - a catch that every definition must have, first proposed on 2026-10-30. The operator chose
   .NET's model: an optional catch, with the log as the default.
 
+#### 5.3.8 The review round (2026-10-30)
+
+Six reviewers, each blind to the others' lens: the engine, the language, the agents, io.slack,
+security and the docs. Fixed before the release:
+- **A second consultation of a customer went into the first one's Slack thread** (io.slack,
+  security, docs), out of the channel's view, and a late reply there decided it. The operator
+  decided that a post io.slack opens serves one message (§5.3.4).
+- **A person's text reached the supervisors' channel as Slack markup** (security): `<!channel>`,
+  mentions, and links with a label of the person's choosing. io.slack escapes the text it posts,
+  and decodes what Slack escapes on the way in.
+- **The first message in the question's thread was the decision** (security), so an internal
+  remark could reach the customer, and the decision after it was dropped. A supervisor's message
+  goes to the agent with a menu that lets it say the message decides nothing yet (`wait`).
+- **The seeds' example dropped answers it asked for** (docs): a person who writes twice, or a
+  decision that crosses an answer. Its catch acts on the agent's answers wherever they arrive, and
+  a test walks the example on the engine (`seed_test.go`).
+- **A file or a link never reached the person under the recommended guard** (agents, docs): the
+  evaluation's `reply` is now the text the person gets.
+- **The agent's memory in a consultation** (agents): ai.generic's immediate memory is the
+  sender's, so a supervisor's turn was kept under the supervisor. The operator: it stays off, and
+  cognition is the agents' memory (FINDINGS A-133).
+- **The language:**
+  - a state's transition on `AGENT_CALL_CAP`, or on an internal event, that forwards or keeps the
+    event loaded, then failed the instance;
+  - a misspelled evaluation field, a param looked up with `in`, and a field name written with other
+    capitals loaded;
+  - `option != ''` was refused.
+- **The engine:** a cancelled or failed instance's send to an agent could be dropped by a spent cap;
+  a WF's message to itself restarted the count; the node's log kept the text of messages it
+  dropped.
+- **Smaller:** a brace before the object, an object on the opening fence's line, a failed touch that
+  lost a thread record; the docs: an IO node's `io.dst_node`, the supervisors' io.slack, params as
+  the person's words, the param name rule, one reference per topic.
+- **Recorded for later:** io.slack drops a reply with a file and does not record a post with only
+  files (A-130, the IO family's track); the engine's unused `cancelling` status (A-132).
+
 ## 6. Docs that drift from the code
 
 **Fixed in 0.1.90,** every item below and more that the review found. A test now validates every
