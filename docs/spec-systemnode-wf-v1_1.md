@@ -68,7 +68,7 @@ This is not a feature. It is the mechanism that makes the whole premise of Fluxb
 - A router with history. Routing single messages is what OPA does. WF coordinates processes that span many messages in time.
 - A middleware that intercepts messages between other nodes. WF is a destination like any other node. The router routes a message to a WF node if OPA decides that message should go there; WF never sits between other nodes.
 - A lenguaje general de programación. WF is a state machine with a small, fixed vocabulary of actions. If you find yourself wanting to write imperative code inside a WF, you are probably using the wrong tool.
-- An AI with deterministic wrapping. WF does not reason. It evaluates. If reasoning is required, reasoning lives in an AI node that receives a question from the WF and returns a structured answer that the WF evaluates deterministically.
+- An AI with deterministic wrapping. WF does not reason. It evaluates. If reasoning is required, reasoning lives in an AI node that receives a question from the WF, with the options it may choose from (a menu, §10.10), and returns its choice, which the WF evaluates deterministically.
 - A place where ambiguity is resolved. If data is ambiguous, the WF delegates the ambiguity to an AI node, which returns something structured that the WF can evaluate. The WF itself never handles ambiguity directly.
 
 ### 2.1 WF vs OPA vs AI — the clean separation
@@ -134,14 +134,15 @@ If a WF step encounters ambiguous data ("are these customer details sufficient t
 ```
 WF state: awaiting_data_review
   ↓ send_message to AI.billing-validator: a text with the customer data, and a
-    meta.context.response_envelope naming the fields of the answer
+    menu (§10.10) with the options complete, and missing with the param missing
   ↓ (wait for the answer: the request's own msg, on the instance's thread)
-  ↓ receive event: a text holding {complete: true} or {complete: false, missing: [...]}
-  ↓ evaluate guard: json_parse(event.payload.content).complete == true
-  ↓ transition to next state based on structured response
+  ↓ receive event: the agent's reply, and its choice in meta.context.evaluation:
+    {option: complete} or {option: missing, params: {missing: ...}}, or none
+  ↓ evaluate guard: event.context.evaluation.option == 'complete'
+  ↓ transition to next state based on the option chosen
 ```
 
-The ambiguity lived for a moment inside the AI node and came back resolved into a structured form. The WF never touched the ambiguity directly. This pattern is how WF and AI cooperate cleanly: WF asks, AI answers in a form evaluable by a deterministic guard.
+The ambiguity lived for a moment inside the AI node and came back resolved into one of the options the WF offered. The WF never touched the ambiguity directly. This pattern is how WF and AI cooperate cleanly: WF asks, with what the agent may choose, and the AI answers in a form evaluable by a deterministic guard.
 
 ## 5. How a WF is triggered
 
@@ -316,6 +317,7 @@ Fields:
 | `initial_state` | Name of the state where new instances begin. |
 | `terminal_states` | List of state names that end the instance when reached. |
 | `states` | Array of state definitions. |
+| `catch` | Optional. Transitions the engine tries, in order, when no transition of the current state takes an event, in any state (§9.5). |
 
 ### 8.2 State definition
 
@@ -367,7 +369,7 @@ Fields:
 | `target_state` | Name of the state to transition to. Without it the transition is **internal**: it runs its actions and stays in its state, with no exit or entry actions (§9.1). |
 | `actions` | Array of actions executed as part of this transition, before entering the target state. |
 
-Within a single state, transitions are evaluated in the order they are declared. The first one whose `event_match` matches and whose `guard` evaluates to `true` is taken. If none match, the event is logged and ignored.
+Within a single state, transitions are evaluated in the order they are declared. The first one whose `event_match` matches and whose `guard` evaluates to `true` is taken. If none match, the definition's `catch` is tried (§9.5); when it takes nothing either, the event is logged and ignored.
 
 ### 8.4 Input schema compilation to CEL
 
@@ -388,14 +390,15 @@ When a WF node loads its workflow definition, it runs these checks:
 2. `input_schema` is valid JSON Schema.
 3. `initial_state` exists in `states`.
 4. All `terminal_states` exist in `states`; a state named `failed` is one of them.
-5. Every `target_state` in every transition exists in `states`; a transition without one is internal.
-6. Every transition has a guard, and an `event_match` with a `msg`, a `src` or both, a `src` being a node name with its hive, never a `SY.*` or `RT.*` node; and every guard CEL expression compiles.
-7. Every action has a known `type` and valid parameters, and only the fields of its type: a field of another type is refused, by its path (a `forward` with a `name` instead of a `message` would forward the event).
+5. Every `target_state` in every transition, the catch's included, exists in `states`; a transition without one is internal.
+6. Every transition has a guard, and an `event_match` with a `msg`, a `src` or both, a `src` being a node name with its hive, never a `SY.*` or `RT.*` node; and every guard CEL expression compiles. A catch transition's `event_match` may be empty (it matches every event).
+7. Every action has a known `type` and valid parameters, and only the fields of its type: a field of another type is refused, by its path (a `forward` with a `name` instead of a `message` would forward the event). A catch transition's actions are `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event`: timers belong to states.
 8. For `send_message` and `forward` actions, the `target` is syntactically a valid L2 name, without spaces around it, and not a `SY.*` or `RT.*` node. A `forward` has no `meta.msg` and no `payload` (it keeps the message's own), and the `message` it names is one a `keep_message` of the definition keeps.
 8a. No action has `meta.type`, `target_ref` or `thread_id_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 and 0.1.91 (every message a WF sends is a `user` message, to a node name written in the definition, on the instance's thread; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
-8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), and its `vars` is a JSON object.
-8c. A `meta.context.response_envelope` written in the definition (not a `$ref`) follows the rules the agent reads it with (`response_contract_to_output_schema_spec` in the AI SDK): `kind` `json_object_v1`; `required`, a non-empty list of names among the `properties`; `properties`, a non-empty object of properties each of `type` `string`, `boolean`, `integer` or `number`; an `enum`, a list of strings, only on a string; a `text_field`, when there is one, a string listed in `required` whose property is a string. An agent refuses a contract that breaks one, and the instance would wait for an answer that never comes.
-8d. On a transition matched on `msg` `TIMER_FIRED`, no `keep_message` and no `forward` without `message`, among its actions, its state's exit actions and its target's entry actions: a `TIMER_FIRED` is no node's message.
+8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), nor `response_envelope` (a WF asks an agent with `menu`), and its `vars` is a JSON object.
+8c. A `menu` is on a `send_message` or a `forward` to an `AI.*` node only, and follows the limits the agent checks it with again (§10.10): `help` up to 600 characters; 1 to 8 options, each with a name of its own that matches `^[a-z][a-z0-9_]{0,31}$` and is never `none`, a description of 1 to 200 characters and up to 8 params; each param with a name of that pattern, a `type` (`string`, `boolean`, `integer` or `number`), a description up to 200 characters and, on a string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode code points. A menu has no field but these, at any level, and no `$ref`.
+8d. On a transition matched on `msg` `TIMER_FIRED`, no `keep_message` and no `forward` without `message`, among its actions, its state's exit actions and its target's entry actions: a `TIMER_FIRED` is no node's message. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one.
+8e. What reads an agent's evaluation is checked against the definition's menus: a guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of them, or `none`; a guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>` names a param of one of them, or `reason`. A name no menu has would be a guard that never matches, or a value that fails the instance.
 9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is ≥ 60 seconds (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. A duration in days is at most `106751d`, the most a duration holds.
 10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
@@ -430,7 +433,8 @@ When an event arrives at an instance (resolved by its `meta.thread_id`, the inst
 4. For each, evaluates `event_match` against the event: its `meta.msg` and its router-stamped sender.
 5. If matched, evaluates `guard` in the CEL environment.
 6. If guard evaluates to `true`, this transition is taken. Stop evaluation.
-7. If no transition matches, logs the event as "unhandled" and ignores it.
+7. If no transition matches, tries the definition's `catch` transitions the same way, in order (§9.5).
+8. If none of them matches either, the default: logs the event as "unhandled", in the instance's log and the node's, and ignores it.
 
 Evaluation is strictly synchronous per instance. Concurrent events for the same instance are serialized by the mutex.
 
@@ -447,6 +451,42 @@ Variables in `state` are set by `set_variable` actions. They persist for the lif
 Variables have no declared types. They are whatever was last assigned. Guards referencing untyped or missing variables cause the guard to fail silently (returns false), which is the same as the transition not applying.
 
 Variables are not globally visible across instances. Each instance has its own `state`.
+
+### 9.5 The catch and the default
+
+A definition may have a `catch` (since Case 3, `docs/wf-orchestration-v1.md` §5.3.2), as in .NET's `try`/`catch`: a list of transitions the engine tries, in order, when no transition of the current state takes an event, in any state. A state can take an event first with its own transitions, as a local `try` does.
+
+```json
+{
+  "catch": [
+    {
+      "event_match": {},
+      "guard": "event.context.evaluation.option == 'none'",
+      "target_state": "failed",
+      "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'no option fits: ' + event.context.evaluation.params.reason" } ]
+    }
+  ]
+}
+```
+
+- **Its shape is a state transition's,** but its `event_match` may be empty, which matches every event (a message, a timer's fire, an internal event). Its `guard` is required, and its `target_state` optional: a chosen catch transition runs as a state's, with the current state's exit actions, its own actions and the target's entry actions, or internally, staying where it was, without a `target_state`.
+- **What reaches it:** an agent's `none` (§10.10); an agent's error, which is a payload of type `error` (an answer off its menu, a provider failure); and any event no transition took. Its guards tell them apart: `event.context.evaluation.option == 'none'`, `event.payload.type == 'error'`.
+- **Its actions** are `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event`. Timers belong to states: a catch that needs one goes to a state whose entry actions set it. A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names a `src`, so the event is a node's message and never a timer's (§8.5, 8d).
+- **Its actions and targets are the definition's own:** its `event_match.src` and its targets are nodes the definition involves (§14.5), and its `keep_message` keeps a message a `forward` may send.
+- **What it does is the designer's choice:** for example, hand the conversation to a person, ask another agent, or fail the instance, as in §19.2.
+
+**The default.** Without a catch, or when none of its transitions takes the event, the instance's log gets `unhandled event <msg> from <sender> in state <state>` (`no matching transition`), the node's own log a line naming the instance, the state and the event, and the instance stays where it was. Both logs are local.
+
+### 9.6 The cap on agent calls
+
+An instance sends at most **8 messages to agents** (`AI.*`) between two triggers (since Case 3, `docs/wf-orchestration-v1.md` §5.3.3, FINDINGS A-125). Without it, a definition whose agents keep answering each other, or whose catch asks a failing agent again, would loop.
+
+- **A trigger** is an event from a node that is no agent (an IO node or a WF), or a `TIMER_FIRED`. An agent's answer and an internal event go on with the count of the trigger they follow.
+- **What counts:** each `send_message` or `forward` whose `target` is an `AI.*` node.
+- **Past the cap:** the send is not made, whatever its `on_error`. The instance's log says so (`agent_call_cap: ...`), and the transition's other actions run.
+- **The error event:** after that transition, the instance gets one internal event per trigger, `AGENT_CALL_CAP`, with the payload `{"type": "error", "code": "agent_call_cap", "message": "...", "target": "<the agent>"}`. It goes through the state's transitions, the catch and the default, as any event.
+- **The instance does not fail,** so its timers stay; the next trigger starts a new count.
+- **The count lives in memory,** per instance: a restart starts it again.
 
 ## 10. Actions (the primitive vocabulary)
 
@@ -478,8 +518,9 @@ Fields:
 |---|---|
 | `target` | L2 name of the target node, written in the definition. Validated at load: a valid L2 name, never a `SY.*` or `RT.*` node. |
 | `meta.msg` | The `meta.msg` field of the outgoing message. |
-| `meta.context` | Optional. A JSON object, resolved like the payload, and sent as the message's `meta.context` (to ask an agent for a structured answer: `{"response_envelope": {...}}`, which, written in the definition, is checked at load by the agent's rules, §8.5). It never writes `wf`, the WF's own block (§10.9). |
+| `meta.context` | Optional. A JSON object, resolved like the payload, and sent as the message's `meta.context` (the person's `context.io`, say). It never writes `wf`, the WF's own block (§10.9), nor `response_envelope`: a WF asks an agent with `menu`. |
 | `vars` | Optional. A JSON object, resolved like the payload, sent in the WF's block as `meta.context.wf.vars`: the deterministic context the WF gives the receiver (§10.9). |
+| `menu` | Optional, to an `AI.*` target only. The options the agent may choose from, sent in the WF's block as `meta.context.wf.menu` (§10.10). |
 | `payload` | JSON object. See payload substitution rules below. |
 
 Every message a WF sends is a `user` message: there is no `meta.type` (before 0.1.90 it defaulted to `system`, and an agent answered a system message from its control plane, so the instance waited forever). A WF that chooses among destinations writes one transition per destination, each with its guard and its `send_message` to a name written there; no destination is taken from data (`target_ref` left the language in 0.1.90).
@@ -693,12 +734,13 @@ Sends a message on **as it was received** (since 0.1.91): the event's message, o
   "type": "forward",
   "target": "AI.invoice@worker1",
   "message": "customer",
-  "meta": {
-    "context": {
-      "response_envelope": { "kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply"], "properties": { "reply": { "type": "string" } } }
-    }
-  },
-  "vars": { "order": { "$ref": "state.order" } }
+  "vars": { "order": { "$ref": "state.order" } },
+  "menu": {
+    "options": [
+      { "name": "issued", "description": "You issued the invoice.", "params": { "invoice_number": { "type": "string" }, "due_in": { "type": "string" } } },
+      { "name": "handback", "description": "Sales takes the conversation back." }
+    ]
+  }
 }
 ```
 
@@ -708,8 +750,9 @@ Fields:
 |---|---|
 | `target` | L2 name of the target node, written in the definition, as for `send_message`. |
 | `message` | Optional. The name a `keep_message` kept a message under; without it, the event's message. |
-| `meta.context` | Optional. The keys the action writes over the message's own `meta.context`, resolved like a payload (`response_envelope`, say). It never writes `wf`. |
+| `meta.context` | Optional. The keys the action writes over the message's own `meta.context`, resolved like a payload (the person's `context.io`, say). It never writes `wf` nor `response_envelope`. |
 | `vars` | Optional. As for `send_message`: `meta.context.wf.vars` (§10.9). |
+| `menu` | Optional, to an `AI.*` target only. As for `send_message`: `meta.context.wf.menu` (§10.10). |
 
 What goes out:
 
@@ -738,14 +781,40 @@ The pattern of a conversation: the initial state keeps the person's message (`cu
 Every message a WF sends, a `send_message` or a `forward`, carries the WF's block in `meta.context.wf` (since 0.1.91): deterministic context for the receiver, which an agent shows its model before the person's text.
 
 ```json
-{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } } } }
+{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
 ```
 
 - **`trail`** lists the nodes the message went through. A `forward` takes the message's own trail (or its sender's name, when it has none) and adds the WF's name; a `send_message` starts it with the WF's name. An agent's answer never carries the request's `wf` back, so a forwarded answer's trail starts at the agent.
 - **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
+- **`menu`** is the action's menu, as written but with no empty field (§10.10); it is left out when the action has none.
 - An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
 
-### 10.10 What is NOT in v1
+### 10.10 `menu`: asking an agent
+
+A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer it a menu (since Case 3, `docs/wf-orchestration-v1.md` §5.3.1): what the agent may do there, fixed in the definition and never in its role, so a role keeps only the agent's trade. It is the one way to ask an agent within a WF: `meta.context.response_envelope`, which IO nodes keep for their own callers, is refused in a WF's action.
+
+```json
+{
+  "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+  "options": [
+    { "name": "answer", "description": "You answer the person yourself." },
+    { "name": "invoice", "description": "They accepted the quote and ask for the invoice.",
+      "params": { "quantity": { "type": "integer" }, "plan": { "type": "string", "enum": ["basic", "pro"] } } },
+    { "name": "consult", "description": "A supervisor must approve something before you answer.",
+      "params": { "question": { "type": "string", "description": "What you ask, with the data to decide." } } }
+  ]
+}
+```
+
+- **`help`** is a fixed text that gives the choice its context, in case the person's message is unclear; the instance's data travels in `vars`.
+- **`options`:** each with a `name`, a `description` and `params`, each param with a `type` (`string`, `boolean`, `integer` or `number`, an `enum` for a string) and a `description`. The limits, which the agent checks again, are in §8.5 (8c).
+- **The engine writes it** in the WF's block, `meta.context.wf.menu`, as written but with no empty field (an empty `help`, `params` or `description` is left out), which the agent would read as present and refuse.
+- **The agent answers `{reply, option, params}`:** `reply` is the text for the person, which goes as the answer's payload text, and which the WF forwards or not; `option` and `params` are what the guards read, in `event.context.evaluation`: `event.context.evaluation.option`, `event.context.evaluation.params.quantity`.
+- **"None of the options" is always an answer:** the agent adds `none` to every menu, with one param, `reason`; a definition cannot name an option so.
+- **An answer off the menu is an error,** with no retries: an option the menu does not have, a missing or mistyped param, or no JSON at all come back as an error payload (`invalid_structured_output`), which a state's transition or the catch takes (§9.5).
+- **What reads the answer is checked** against the definition's menus at load (§8.5, 8e).
+
+### 10.11 What is NOT in v1
 
 The following action types are intentionally excluded from v1 and reserved for future versions:
 
@@ -901,7 +970,7 @@ CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 
 `state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance.
 
-**`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
+**`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A transition of the catch starts its summary with `catch[<i>]:`, and a send past the cap on agent calls is an action entry that is not ok, its `error_detail` starting with `agent_call_cap` (§9.6). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
 
 Cap per instance: 100 entries, FIFO. Older entries are pruned when adding new ones. When the instance terminates, its log is preserved until the instance itself is GC'd (retention default 7 days, configurable).
 
@@ -1053,13 +1122,13 @@ The alternative — guaranteeing exactly-once through write-ahead logging of pen
 
 ### 14.5 Event correlation: which instance does this event belong to?
 
-When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or neither. An instance is a conversation: it lives on the thread of the message that started it (§14.3). Only the nodes written in the definition drive an instance (FINDINGS A-123): those of its `start_from`, of an `event_match.src`, and the targets of its `send_message` and `forward` actions, plus SY.timer for the WF's own timers. The resolution order is strict (since 0.1.91):
+When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or neither. An instance is a conversation: it lives on the thread of the message that started it (§14.3). Only the nodes written in the definition drive an instance (FINDINGS A-123): those of its `start_from`, of an `event_match.src`, and the targets of its `send_message` and `forward` actions, the catch's included, plus SY.timer for the WF's own timers. The resolution order is strict (since 0.1.91):
 
 1. **If `meta.msg == "TIMER_FIRED"`**: taken only from SY.timer of the WF's own hive, and only for a timer this node scheduled (`owner_l2_name`). The event is for the instance its `client_ref` names. If the instance does not run (terminated, expired, never existed), log "orphaned timer" and discard.
 
 2. **If the sender is no node the definition involves**: log and discard, never answered. On the thread of a running instance, that instance's own definition decides (it may be older than the current one, §13.1); otherwise the current definition.
 
-3. **If `meta.thread_id` is the thread of a running instance**: the event is for that instance. This is how a person's next message reaches their conversation's instance, and how the answer of an AI / IO node the WF contacted comes back: the WF sets `meta.thread_id` to the instance's thread on every message it sends, and target nodes are expected to copy this value to the `meta.thread_id` of their response. An event the instance's current state has no transition for is logged and dropped (§8.3): it is never queued for a later state.
+3. **If `meta.thread_id` is the thread of a running instance**: the event is for that instance. This is how a person's next message reaches their conversation's instance, and how the answer of an AI / IO node the WF contacted comes back: the WF sets `meta.thread_id` to the instance's thread on every message it sends, and target nodes are expected to copy this value to the `meta.thread_id` of their response. An event that neither the instance's current state nor the catch takes is logged and dropped (§9.5): it is never queued for a later state.
 
 4. **If the sender is a `start_from` node and the message is no reply** (a reply is any `*_RESPONSE`, an `INVALID_INPUT`, or an agent's error named `<msg>.error`): a new instance on its thread (§14.3), as the `input_schema` allows. If the schema refuses it, respond with `INVALID_INPUT`, unless the message has no name: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce an `INVALID_INPUT` (FINDINGS A-119).
 
@@ -1313,11 +1382,11 @@ This is the reference example used throughout the document. It demonstrates all 
 
 The task: when the billing system asks for an invoice for a customer, through its IO node (`IO.api.billing@motherbee`), the workflow must:
 
-1. Have an AI node check that the customer data is complete enough to invoice, for a structured answer.
+1. Have an AI node check that the customer data is complete enough to invoice: it chooses from a menu.
 2. If incomplete, tell the billing agent (the AI node in the conversation with the customer) what is missing, and end. The agent asks the customer, who answers it through the IO node of their channel, never this instance; the billing system asks for the invoice again once it has the data.
 3. Once complete, invoke an external invoicing system (IO.quickbooks) to create the invoice.
 4. Wait for confirmation of invoice creation.
-5. Have the billing agent deliver the invoice to the customer, for a structured answer.
+5. Have the billing agent deliver the invoice to the customer, and say, from a menu, whether it did.
 6. Complete.
 
 Duration: minutes to hours. Deterministic in every decision. Side effects are real and visible externally (invoice exists in QuickBooks, message delivered). Must survive node restarts.
@@ -1352,10 +1421,20 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
   },
   "initial_state": "validating_data",
   "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
+  "catch": [
+    {
+      "event_match": {},
+      "guard": "event.context.evaluation.option == 'none'",
+      "target_state": "failed",
+      "actions": [
+        { "type": "set_variable", "name": "failure_reason", "value": "'no option fits: ' + event.context.evaluation.params.reason" }
+      ]
+    }
+  ],
   "states": [
     {
       "name": "validating_data",
-      "description": "Asking AI.billing-validator, for a structured answer, whether the customer's data is complete.",
+      "description": "Asking AI.billing-validator, with a menu, whether the customer's data is complete.",
       "entry_actions": [
         {
           "type": "set_variable",
@@ -1365,19 +1444,17 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         {
           "type": "send_message",
           "target": "AI.billing-validator@motherbee",
-          "meta": {
-            "msg": "VALIDATE_INVOICE_DATA",
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "required": ["complete", "missing"],
-                "properties": {
-                  "complete": { "type": "boolean" },
-                  "missing": { "type": "string" }
-                }
+          "meta": { "msg": "VALIDATE_INVOICE_DATA" },
+          "menu": {
+            "help": "The billing system asks for an invoice, which is issued only when the customer's data is complete.",
+            "options": [
+              { "name": "complete", "description": "The customer's data is complete." },
+              {
+                "name": "missing",
+                "description": "The invoice needs data the customer has not given.",
+                "params": { "missing": { "type": "string", "description": "What is missing." } }
               }
-            }
+            ]
           },
           "payload": { "type": "text", "content": { "$ref": "state.validation_request" } }
         },
@@ -1394,7 +1471,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
       "transitions": [
         {
           "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
-          "guard": "json_parse(event.payload.content).complete == true",
+          "guard": "event.context.evaluation.option == 'complete'",
           "target_state": "creating_invoice",
           "actions": [
             { "type": "set_variable", "name": "validated_at", "value": "now()" }
@@ -1402,13 +1479,13 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
         },
         {
           "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
-          "guard": "json_parse(event.payload.content).complete == false",
+          "guard": "event.context.evaluation.option == 'missing'",
           "target_state": "missing_data_requested",
           "actions": [
             {
               "type": "set_variable",
               "name": "missing_data_request",
-              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, json_parse(event.payload.content).missing])"
+              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, event.context.evaluation.params.missing])"
             }
           ]
         },
@@ -1502,21 +1579,21 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
     },
     {
       "name": "delivering_to_customer",
-      "description": "Asking the billing agent, for a structured answer, to send the invoice to the customer.",
+      "description": "Asking the billing agent, with a menu, to send the invoice to the customer.",
       "entry_actions": [
         {
           "type": "send_message",
           "target": "AI.billing@motherbee",
-          "meta": {
-            "msg": "DELIVER_INVOICE",
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "required": ["delivered"],
-                "properties": { "delivered": { "type": "boolean" } }
+          "meta": { "msg": "DELIVER_INVOICE" },
+          "menu": {
+            "options": [
+              { "name": "delivered", "description": "You sent the customer the invoice." },
+              {
+                "name": "undelivered",
+                "description": "You could not send it.",
+                "params": { "why": { "type": "string" } }
               }
-            }
+            ]
           },
           "payload": { "type": "text", "content": { "$ref": "state.delivery_request" } }
         },
@@ -1533,16 +1610,16 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
       "transitions": [
         {
           "event_match": { "msg": "DELIVER_INVOICE" },
-          "guard": "json_parse(event.payload.content).delivered == true",
+          "guard": "event.context.evaluation.option == 'delivered'",
           "target_state": "completed",
           "actions": []
         },
         {
           "event_match": { "msg": "DELIVER_INVOICE" },
-          "guard": "true",
+          "guard": "event.context.evaluation.option == 'undelivered'",
           "target_state": "failed",
           "actions": [
-            { "type": "set_variable", "name": "failure_reason", "value": "'the agent did not deliver the invoice'" }
+            { "type": "set_variable", "name": "failure_reason", "value": "'not delivered: ' + event.context.evaluation.params.why" }
           ]
         },
         {
@@ -1592,7 +1669,8 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
 
 - **All four WF properties present:** multi-step (validation → creation → delivery), memory between steps (state variables accumulating), deterministic (every transition is a guard-based decision, no ambiguity), lives in time (timers of minutes to 24 hours).
 - **Clean separation AI/WF/IO:** the WF delegates ambiguous work (validating data sufficiency, delivering the invoice to a person) to AI nodes, and the structured work (creating the invoice) to an IO node. The WF itself does no reasoning.
-- **Asking an agent:** the WF writes the agent a text (`set_variable` builds it with CEL's `format`, and `$ref` carries it), asks for a structured answer (`meta.context.response_envelope`, whose fields are scalars: the agent takes a string, boolean, integer or number), and branches on its fields with `json_parse(event.payload.content)`. The agent answers with the request's own `msg` (`VALIDATE_INVOICE_DATA`), never a `*_RESPONSE`; its error answer is a payload of type `error`, named `<msg>.error` because the request has a `msg`, and has a transition of its own.
+- **Asking an agent:** the WF writes the agent a text (`set_variable` builds it with CEL's `format`, and `$ref` carries it), offers it a menu (§10.10: `complete`, or `missing` with the param `missing`), and branches on the option it chose, `event.context.evaluation.option`, reading its params in `event.context.evaluation.params`. The agent answers with the request's own `msg` (`VALIDATE_INVOICE_DATA`), never a `*_RESPONSE`; its error answer, an answer off its menu included, is a payload of type `error`, named `<msg>.error` because the request has a `msg`, and has a transition of its own.
+- **The catch:** an agent that finds that no option fits answers `none`, which no state takes; the catch (§9.5), with an empty `event_match` that matches it in any state, fails the instance with the agent's `reason`.
 - **Who starts it:** `IO.api.billing@motherbee`, the billing system's IO node, the only node in `start_from`. The instance lives on the thread of its request, and every message the instance sends carries that thread. The agents are targets: they answer, and start nothing.
 - **No wait for a person:** a person answers the agent of their conversation, never a WF instance, so `missing_data_requested` tells the agent and ends. The agent's acknowledgement then comes from a node outside `start_from`, on a thread no instance holds: it is dropped (§14.5), instead of starting a new instance.
 - **A field that may be missing:** `currency` is optional, so its `$ref` gives a default (`USD`); a `$ref` without one fails the action when the field is not there.
@@ -1646,6 +1724,9 @@ This is the Archi-first loop: definitions as data, simple OPA rules using identi
 | CEL for guards | Deterministic, typed, sandboxed, 10ms ceiling |
 | `cel-go` as implementation | Canonical, production-grade, well-maintained |
 | Fixed action vocabulary (`send_message`, timers, `set_variable`) | Simplicity and safety |
+| A WF asks an agent with a menu, written in the action | What an agent may do is fixed and clear, and never in its role: a role keeps only the agent's trade, so it stays reusable (Case 3) |
+| An optional `catch`, with the log as the default | .NET's model: the designer programs what to do with what no state takes, or leaves it to the log (Case 3) |
+| A cap on agent calls between two triggers | The catch makes a loop easy to write; past the cap the send is not made, and the instance hears it, without failing (Case 3, A-125) |
 | Workflow timers via SY.timer | No duplicated timer infrastructure; minimum 60s enforced |
 | Runtime timers via Go native | Sub-60s plumbing stays invisible to workflow authors |
 | SQLite per node, monolithic | Same pattern as SY.timer, consistent with Fluxbee |
@@ -1688,6 +1769,8 @@ Workflow authors should be aware of these limits.
 - **100 log entries per instance**, FIFO.
 - **Retention: 7 days for terminated instances** (default, configurable).
 - **At most 100 internal events after one event** (`internal_event_cap`).
+- **At most 8 messages to agents between two triggers** (`AGENT_CALL_CAP`, §9.6): past it a send to an agent is not made, and the instance does not fail.
+- **A menu's limits:** `help` up to 600 characters, 1 to 8 options, 8 params an option, descriptions up to 200 characters, an `enum` of 1 to 20 values (§8.5, 8c).
 - **At most 3 starts for an event a crash left unfinished** (`replay_exhausted`, §14.4).
 - **At most 1000 timers read back from SY.timer** at a reconciliation.
 

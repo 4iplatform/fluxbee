@@ -1,7 +1,7 @@
 {
   "wf_schema_version": "1",
   "workflow_type": "sales.invoice",
-  "description": "Case 1 of wf-orchestration-v1 (§5.2): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales; when sales answers area invoice, the conversation goes to AI.invoice, which holds it until it hands it back (area sales: its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. A person's message costs two agent calls at most. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error or an answer that does not come in 120 s is noted in last_error, and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
+  "description": "Cases 1 and 3 of wf-orchestration-v1 (§5.2, §5.3): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales, which the WF asks with a menu: answer, invoice or consult. Invoice hands the conversation to AI.invoice, which holds it until it hands it back (its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. Consult tells the person that sales will check, and writes sales' question to the supervisors' IO.slack.supervisores@motherbee; their answer, in the thread of that post, goes to sales, which tells the person, and when none comes in 30 minutes the WF tells sales so. A person's message costs two agent calls at most, and no agent is asked twice with the same message. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error, or an answer that does not come in 120 s, is noted in last_error and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. The catch takes none from the agent the WF waits for (waiting_for): its reply goes to the person, its reason goes to last_error, and sales holds the conversation; it notes in last_error an error no state takes, such as the cap on agent calls. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
   "start_from": ["IO.api.sales@worker1"],
   "input_schema": {
     "type": "object",
@@ -12,6 +12,31 @@
   },
   "initial_state": "start",
   "terminal_states": ["closed", "failed"],
+  "catch": [
+    {
+      "event_match": { "src": "AI.sales@worker1" },
+      "guard": "state.waiting_for == 'AI.sales@worker1' && event.context.evaluation.option == 'none'",
+      "target_state": "sales_listening",
+      "actions": [
+        { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } },
+        { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: none: ' + event.context.evaluation.params.reason" }
+      ]
+    },
+    {
+      "event_match": { "src": "AI.invoice@worker1" },
+      "guard": "state.waiting_for == 'AI.invoice@worker1' && event.context.evaluation.option == 'none'",
+      "target_state": "sales_listening",
+      "actions": [
+        { "type": "forward", "target": "IO.api.sales@worker1" },
+        { "type": "set_variable", "name": "last_error", "value": "'AI.invoice@worker1: none: ' + event.context.evaluation.params.reason" }
+      ]
+    },
+    {
+      "event_match": {},
+      "guard": "event.payload.type == 'error'",
+      "actions": [ { "type": "set_variable", "name": "last_error", "value": "'unhandled error: ' + event.payload.code" } ]
+    }
+  ],
   "states": [
     {
       "name": "start",
@@ -30,28 +55,28 @@
     },
     {
       "name": "sales_thinking",
-      "description": "Sales holds the conversation: the person's message (customer) goes to AI.sales with its contract (reply, area, product, quantity, unit_price). Area invoice hands the conversation to invoice, with the order kept in state; any other answer goes to the person. Entered only from a person's message. A message from the person meanwhile goes to sales too; a payment_due meanwhile is noted, and acted on in the next listening state. An error or no answer in 120 s goes back to listening, noted in last_error.",
+      "description": "Sales holds the conversation: the person's message (customer) goes to AI.sales with its menu. Answer goes to the person; invoice hands the conversation to invoice, with the order kept in state; consult tells the person that sales will check, and writes sales' question to the supervisors. Entered only from a person's message. A message from the person meanwhile goes to sales too; a payment_due meanwhile is noted, and acted on in the next listening state. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
       "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
         {
           "type": "forward",
           "target": "AI.sales@worker1",
           "message": "customer",
-          "meta": {
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "text_field": "reply",
-                "required": ["reply", "area", "product", "quantity", "unit_price"],
-                "properties": {
-                  "reply": { "type": "string" },
-                  "area": { "type": "string", "enum": ["sales", "invoice"] },
-                  "product": { "type": "string" },
-                  "quantity": { "type": "integer" },
-                  "unit_price": { "type": "number" }
-                }
+          "menu": {
+            "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval.",
+            "options": [
+              { "name": "answer", "description": "You answer the person yourself." },
+              {
+                "name": "invoice",
+                "description": "They accepted the quote and ask for the invoice.",
+                "params": { "product": { "type": "string" }, "quantity": { "type": "integer" }, "unit_price": { "type": "number" } }
+              },
+              {
+                "name": "consult",
+                "description": "A supervisor must approve something before you answer. Your reply tells the person you will check.",
+                "params": { "question": { "type": "string", "description": "What you ask the supervisor, with the data to decide." } }
               }
-            }
+            ]
           }
         },
         { "type": "schedule_timer", "timer_key": "sales_timeout", "fire_in": "120s" }
@@ -66,21 +91,36 @@
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
-          "guard": "event.context.evaluation.area == 'invoice'",
+          "guard": "event.context.evaluation.option == 'answer'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'invoice'",
           "target_state": "invoice_thinking",
           "actions": [
             {
               "type": "set_variable",
               "name": "order",
-              "value": "{'product': event.context.evaluation.product, 'quantity': event.context.evaluation.quantity, 'unit_price': event.context.evaluation.unit_price}"
+              "value": "{'product': event.context.evaluation.params.product, 'quantity': event.context.evaluation.params.quantity, 'unit_price': event.context.evaluation.params.unit_price}"
             }
           ]
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
-          "guard": "true",
-          "target_state": "sales_listening",
-          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+          "guard": "event.context.evaluation.option == 'consult'",
+          "target_state": "consulting",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1" },
+            { "type": "set_variable", "name": "question", "value": "event.context.evaluation.params.question" },
+            {
+              "type": "send_message",
+              "target": "IO.slack.supervisores@motherbee",
+              "meta": { "msg": "SUPERVISOR_QUESTION" },
+              "payload": { "type": "text", "content": { "$ref": "event.context.evaluation.params.question" } }
+            }
+          ]
         },
         {
           "event_match": { "src": "IO.api.sales@worker1" },
@@ -91,22 +131,21 @@
               "type": "forward",
               "target": "AI.sales@worker1",
               "message": "customer",
-              "meta": {
-                "context": {
-                  "response_envelope": {
-                    "kind": "json_object_v1",
-                    "strict": true,
-                    "text_field": "reply",
-                    "required": ["reply", "area", "product", "quantity", "unit_price"],
-                    "properties": {
-                      "reply": { "type": "string" },
-                      "area": { "type": "string", "enum": ["sales", "invoice"] },
-                      "product": { "type": "string" },
-                      "quantity": { "type": "integer" },
-                      "unit_price": { "type": "number" }
-                    }
+              "menu": {
+                "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval.",
+                "options": [
+                  { "name": "answer", "description": "You answer the person yourself." },
+                  {
+                    "name": "invoice",
+                    "description": "They accepted the quote and ask for the invoice.",
+                    "params": { "product": { "type": "string" }, "quantity": { "type": "integer" }, "unit_price": { "type": "number" } }
+                  },
+                  {
+                    "name": "consult",
+                    "description": "A supervisor must approve something before you answer. Your reply tells the person you will check.",
+                    "params": { "question": { "type": "string", "description": "What you ask the supervisor, with the data to decide." } }
                   }
-                }
+                ]
               }
             }
           ]
@@ -125,9 +164,136 @@
       ]
     },
     {
-      "name": "sales_listening",
-      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
+      "name": "consulting",
+      "description": "Sales' question is with the supervisors, at IO.slack.supervisores@motherbee, and the person was told that sales will check. A supervisor's answer, in the thread of that post, goes to sales with vars.question, and sales tells the person. When none comes in 30 minutes, the WF tells sales so, and sales tells the person. A message from the person meanwhile goes to sales with the same menu, and sales' answer goes to the person; a payment_due meanwhile is noted.",
       "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'IO.slack.supervisores@motherbee'" },
+        { "type": "schedule_timer", "timer_key": "consult_timeout", "fire_in": "30m" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "consult_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "IO.slack.supervisores@motherbee" },
+          "guard": "true",
+          "target_state": "sales_relaying",
+          "actions": [
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "vars": { "question": { "$ref": "state.question" } },
+              "menu": {
+                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
+                "options": [ { "name": "answer", "description": "You tell the person." } ]
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'consult_timeout'",
+          "target_state": "sales_relaying",
+          "actions": [
+            {
+              "type": "send_message",
+              "target": "AI.sales@worker1",
+              "meta": { "msg": "CONSULT_UNANSWERED", "context": { "io": { "$ref": "state.io" } } },
+              "vars": { "question": { "$ref": "state.question" } },
+              "menu": {
+                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
+                "options": [ { "name": "answer", "description": "You tell the person." } ]
+              },
+              "payload": {
+                "type": "text",
+                "content": "No supervisor answered your question in 30 minutes. Tell the customer you could not confirm it yet, and that they can ask again."
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "message": "customer",
+              "vars": { "question": { "$ref": "state.question" } },
+              "menu": {
+                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
+                "options": [ { "name": "answer", "description": "You tell the person." } ]
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.payload.type != 'error'",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
+        }
+      ]
+    },
+    {
+      "name": "sales_relaying",
+      "description": "Sales has the supervisors' answer, or the news that none came, and tells the person: its answer goes to the person, with the person's context.io, and sales holds the conversation. A message from the person meanwhile goes to sales with the same menu; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
+        { "type": "schedule_timer", "timer_key": "relay_timeout", "fire_in": "120s" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "relay_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: error'" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'answer'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "message": "customer",
+              "vars": { "question": { "$ref": "state.question" } },
+              "menu": {
+                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
+                "options": [ { "name": "answer", "description": "You tell the person." } ]
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'relay_timeout'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: timeout'" } ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
+        }
+      ]
+    },
+    {
+      "name": "sales_listening",
+      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person, and a supervisor's answer that came after its wait goes to sales, which tells the person. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "''" },
         { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
         { "type": "emit_internal_event", "meta": { "msg": "CHECK_PAYMENT" } }
       ],
@@ -144,7 +310,7 @@
         {
           "event_match": { "src": "AI.sales@worker1" },
           "guard": "event.payload.type != 'error'",
-          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
         },
         {
           "event_match": { "src": "AI.invoice@worker1" },
@@ -156,6 +322,22 @@
           "guard": "event.payload.type != 'error'",
           "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
         },
+        {
+          "event_match": { "src": "IO.slack.supervisores@motherbee" },
+          "guard": "true",
+          "target_state": "sales_relaying",
+          "actions": [
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "vars": { "question": { "$ref": "state.question", "default": "" } },
+              "menu": {
+                "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
+                "options": [ { "name": "answer", "description": "You tell the person." } ]
+              }
+            }
+          ]
+        },
         { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'payment_due'", "target_state": "payments_thinking", "actions": [] },
         { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'idle' && !state.invoice_pending", "target_state": "closed", "actions": [] },
         { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'idle'", "actions": [] }
@@ -163,30 +345,30 @@
     },
     {
       "name": "invoice_thinking",
-      "description": "Invoice holds the conversation: the person's message (customer) goes to AI.invoice with vars.order and its contract (reply, area, invoice_number, amount, due_in: a duration in minutes, hours or days, such as 2m, 1h or 30d). An invoice issued goes to the person and, with a due_in of that form, sets the timer payment_due at it; without one, last_error says so and no payment check follows. Area sales hands the conversation back: its reply goes to the person, and sales takes the person's next message. Any other answer goes to the person. A message from the person meanwhile goes to invoice too; a payment_due meanwhile is noted. An error or no answer in 120 s gives control back to sales, noted in last_error.",
+      "description": "Invoice holds the conversation: the person's message (customer) goes to AI.invoice with vars.order and its menu. An invoice issued goes to the person and, with a due_in in minutes, hours or days (such as 2m, 1h or 30d), sets the timer payment_due at it; without one, last_error says so and no payment check follows. Handback gives the conversation back: its reply goes to the person, and sales takes the person's next message. Any other answer goes to the person. A message from the person meanwhile goes to invoice too; a payment_due meanwhile is noted. An error or no answer in 120 s gives control back to sales, noted in last_error; none goes to the catch.",
       "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'AI.invoice@worker1'" },
         {
           "type": "forward",
           "target": "AI.invoice@worker1",
           "message": "customer",
-          "meta": {
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "text_field": "reply",
-                "required": ["reply", "area", "invoice_number", "amount", "due_in"],
-                "properties": {
-                  "reply": { "type": "string" },
-                  "area": { "type": "string", "enum": ["invoice", "sales"] },
+          "vars": { "order": { "$ref": "state.order" } },
+          "menu": {
+            "help": "You hold the person's conversation about the order in vars.order: issue the invoice they ask for, answer their questions about it, or hand them back to sales when their business with invoicing is done.",
+            "options": [
+              {
+                "name": "issued",
+                "description": "You issued the invoice.",
+                "params": {
                   "invoice_number": { "type": "string" },
                   "amount": { "type": "number" },
-                  "due_in": { "type": "string" }
+                  "due_in": { "type": "string", "description": "When it falls due, in minutes, hours or days, such as 2m, 1h or 30d." }
                 }
-              }
-            }
-          },
-          "vars": { "order": { "$ref": "state.order" } }
+              },
+              { "name": "answer", "description": "You answer the person, and keep the conversation." },
+              { "name": "handback", "description": "The person's business with invoicing is done: sales takes the conversation back." }
+            ]
+          }
         },
         { "type": "schedule_timer", "timer_key": "invoice_timeout", "fire_in": "120s" }
       ],
@@ -200,20 +382,20 @@
         },
         {
           "event_match": { "src": "AI.invoice@worker1" },
-          "guard": "event.context.evaluation.area == 'sales'",
+          "guard": "event.context.evaluation.option == 'handback'",
           "target_state": "sales_listening",
           "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
         },
         {
           "event_match": { "src": "AI.invoice@worker1" },
-          "guard": "event.context.evaluation.invoice_number != '' && !state.invoice_pending && event.context.evaluation.due_in.matches('^[1-9][0-9]*[mhd]$')",
+          "guard": "event.context.evaluation.option == 'issued' && !state.invoice_pending && event.context.evaluation.params.due_in.matches('^[1-9][0-9]*[mhd]$')",
           "target_state": "invoice_listening",
           "actions": [
             { "type": "forward", "target": "IO.api.sales@worker1" },
             {
               "type": "set_variable",
               "name": "invoice",
-              "value": "{'invoice_number': event.context.evaluation.invoice_number, 'amount': event.context.evaluation.amount, 'due_in': event.context.evaluation.due_in}"
+              "value": "{'invoice_number': event.context.evaluation.params.invoice_number, 'amount': event.context.evaluation.params.amount, 'due_in': event.context.evaluation.params.due_in}"
             },
             { "type": "set_variable", "name": "invoice_pending", "value": "true" },
             { "type": "schedule_timer", "timer_key": "payment_due", "fire_in": { "$ref": "state.invoice.due_in" }, "on_error": "fail" }
@@ -221,7 +403,7 @@
         },
         {
           "event_match": { "src": "AI.invoice@worker1" },
-          "guard": "event.context.evaluation.invoice_number != '' && !state.invoice_pending",
+          "guard": "event.context.evaluation.option == 'issued' && !state.invoice_pending",
           "target_state": "invoice_listening",
           "actions": [
             { "type": "forward", "target": "IO.api.sales@worker1" },
@@ -230,7 +412,7 @@
         },
         {
           "event_match": { "src": "AI.invoice@worker1" },
-          "guard": "true",
+          "guard": "event.context.evaluation.option in ['answer', 'issued']",
           "target_state": "invoice_listening",
           "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
         },
@@ -243,24 +425,23 @@
               "type": "forward",
               "target": "AI.invoice@worker1",
               "message": "customer",
-              "meta": {
-                "context": {
-                  "response_envelope": {
-                    "kind": "json_object_v1",
-                    "strict": true,
-                    "text_field": "reply",
-                    "required": ["reply", "area", "invoice_number", "amount", "due_in"],
-                    "properties": {
-                      "reply": { "type": "string" },
-                      "area": { "type": "string", "enum": ["invoice", "sales"] },
+              "vars": { "order": { "$ref": "state.order" } },
+              "menu": {
+                "help": "You hold the person's conversation about the order in vars.order: issue the invoice they ask for, answer their questions about it, or hand them back to sales when their business with invoicing is done.",
+                "options": [
+                  {
+                    "name": "issued",
+                    "description": "You issued the invoice.",
+                    "params": {
                       "invoice_number": { "type": "string" },
                       "amount": { "type": "number" },
-                      "due_in": { "type": "string" }
+                      "due_in": { "type": "string", "description": "When it falls due, in minutes, hours or days, such as 2m, 1h or 30d." }
                     }
-                  }
-                }
-              },
-              "vars": { "order": { "$ref": "state.order" } }
+                  },
+                  { "name": "answer", "description": "You answer the person, and keep the conversation." },
+                  { "name": "handback", "description": "The person's business with invoicing is done: sales takes the conversation back." }
+                ]
+              }
             }
           ]
         },
@@ -281,6 +462,7 @@
       "name": "invoice_listening",
       "description": "Waits for the person, with invoice in control: their next message is kept and goes to invoice. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of invoice goes to the person. After 3 minutes without messages, invoice gives control back to sales.",
       "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "''" },
         { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
         { "type": "emit_internal_event", "meta": { "msg": "CHECK_PAYMENT" } }
       ],
@@ -305,14 +487,19 @@
     },
     {
       "name": "payments_thinking",
-      "description": "The invoice fell due: the WF writes to AI.payments, with vars.invoice and the person's context.io, and the agent decides what to tell the customer. Its answer goes to the person, and control goes back to sales with nothing pending. A message from the person meanwhile goes to payments too. An error or no answer in 120 s also ends the payment check, noted in last_error.",
+      "description": "The invoice fell due: the WF writes to AI.payments, with vars.invoice, the person's context.io and its menu, and the agent decides what to tell the customer. Its answer, whatever its option, goes to the person, and control goes back to sales with nothing pending. A message from the person meanwhile goes to payments too. An error or no answer in 120 s also ends the payment check, noted in last_error.",
       "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'AI.payments@worker1'" },
         { "type": "set_variable", "name": "payment_overdue", "value": "false" },
         {
           "type": "send_message",
           "target": "AI.payments@worker1",
           "meta": { "msg": "PAYMENT_DUE", "context": { "io": { "$ref": "state.io" } } },
           "vars": { "invoice": { "$ref": "state.invoice" } },
+          "menu": {
+            "help": "An invoice of this customer, in vars.invoice, fell due and was not paid.",
+            "options": [ { "name": "notify", "description": "You write the customer about the overdue invoice." } ]
+          },
           "payload": {
             "type": "text",
             "content": "The payment period of this invoice has ended, and it was not paid. Tell the customer that the invoice was not paid."
@@ -345,7 +532,16 @@
           "guard": "true",
           "actions": [
             { "type": "keep_message", "name": "customer" },
-            { "type": "forward", "target": "AI.payments@worker1", "message": "customer" }
+            {
+              "type": "forward",
+              "target": "AI.payments@worker1",
+              "message": "customer",
+              "vars": { "invoice": { "$ref": "state.invoice" } },
+              "menu": {
+                "help": "An invoice of this customer, in vars.invoice, fell due and was not paid.",
+                "options": [ { "name": "notify", "description": "You write the customer about the overdue invoice." } ]
+              }
+            }
           ]
         },
         {

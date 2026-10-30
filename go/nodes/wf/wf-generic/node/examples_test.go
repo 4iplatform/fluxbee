@@ -37,8 +37,8 @@ func lastSent(t *testing.T, disp *mockDispatcher) (sdk.Message, map[string]any) 
 
 // agentAnswer is an agent's answer to request, as ai-generic builds it: the request's msg (with
 // ".error" for an error, when the request had one) and thread, and the request's context without
-// its thread_id, src_ilk, response_envelope and wf; an answer to a response contract that names a
-// text_field carries the whole evaluation in meta.context.evaluation.
+// its thread_id, src_ilk, response_envelope, wf and evaluation (sanitize_reply_context); an answer
+// to a menu carries its evaluation, {reply, option, params}, in meta.context.evaluation.
 func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string, evaluation map[string]any) sdk.Message {
 	t.Helper()
 	answerContext := map[string]any{}
@@ -47,7 +47,7 @@ func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string
 			t.Fatal(err)
 		}
 	}
-	for _, key := range []string{"thread_id", "src_ilk", "response_envelope", "wf"} {
+	for _, key := range []string{"thread_id", "src_ilk", "response_envelope", "wf", "evaluation"} {
 		delete(answerContext, key)
 	}
 	if evaluation != nil {
@@ -285,6 +285,10 @@ const (
 	salesIOContext = `{"io":{"reply_target":{"address":"conv-7","kind":"api"}}}`
 	personILK      = "ilk:00000000-0000-4000-8000-0000000000aa"
 	personICH      = "ich:api:conv-7"
+	// supervisorsIO is the supervisors' Slack channel, and supervisorsIOContext the context.io of a
+	// supervisor's answer there.
+	supervisorsIO        = "IO.slack.supervisores@motherbee"
+	supervisorsIOContext = `{"io":{"reply_target":{"address":"C0SUPERVISORS","kind":"slack_post","params":{"thread_ts":"1730289000.000100"}}}}`
 )
 
 func newSalesConversation(t *testing.T) *salesConversation {
@@ -329,9 +333,14 @@ func (c *salesConversation) person(text string) sdk.Message {
 	return msg
 }
 
-// answer is agent's answer to request, with reply as its text and evaluation as its contract's object.
-func (c *salesConversation) answer(agent string, request sdk.Message, reply string, evaluation map[string]any) {
+// choose is agent's answer to request's menu: reply as its text, and its evaluation, {reply, option,
+// params}, in meta.context.evaluation.
+func (c *salesConversation) choose(agent string, request sdk.Message, reply, option string, params map[string]any) {
 	c.t.Helper()
+	if params == nil {
+		params = map[string]any{}
+	}
+	evaluation := map[string]any{"reply": reply, "option": option, "params": params}
 	c.dispatch(agentAnswer(c.t, agent, request, fmt.Sprintf(`{"type":"text","content":%q}`, reply), evaluation))
 }
 
@@ -339,6 +348,22 @@ func (c *salesConversation) answer(agent string, request sdk.Message, reply stri
 func (c *salesConversation) fail(agent string, request sdk.Message) {
 	c.t.Helper()
 	c.dispatch(agentAnswer(c.t, agent, request, `{"type":"error","code":"invalid_output","message":"the answer broke the contract"}`, nil))
+}
+
+// supervisor answers in Slack, in the thread of the WF's post: IO.slack.supervisores gives the answer
+// the thread it recorded for that post, the conversation's (wf-orchestration-v1 §5.3.4), and the
+// context.io of its own channel.
+func (c *salesConversation) supervisor(text string) sdk.Message {
+	c.t.Helper()
+	c.turn++
+	thread := salesThread
+	msg := from(supervisorsIO, sdk.Message{
+		Routing: sdk.Routing{Src: "slack-uuid", TraceID: fmt.Sprintf("trace-supervisor-%d", c.turn)},
+		Meta:    sdk.Meta{MsgType: "user", ThreadID: &thread, Context: json.RawMessage(supervisorsIOContext)},
+		Payload: json.RawMessage(fmt.Sprintf(`{"type":"text","content":%q}`, text)),
+	})
+	c.dispatch(msg)
+	return msg
 }
 
 // fire fires the instance's pending timer key, as SY.timer does.
@@ -385,6 +410,21 @@ func (c *salesConversation) state() map[string]any {
 	return state
 }
 
+// logged reports whether the running instance's log has an entry with summary.
+func (c *salesConversation) logged(summary string) bool {
+	c.t.Helper()
+	logs, err := c.rt.Store.GetRecentLog(context.Background(), c.running().InstanceID, 200)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	for _, entry := range logs {
+		if entry.Summary == summary {
+			return true
+		}
+	}
+	return false
+}
+
 // sentTo is the last message the WF sent to node since it started.
 func (c *salesConversation) sentTo(node string) sdk.Message {
 	c.t.Helper()
@@ -407,6 +447,18 @@ func (c *salesConversation) trail(msg sdk.Message) string {
 	return fmt.Sprint(wfBlock(c.t, msg)["trail"])
 }
 
+// options names the options of the menu a message offers, in its WF's block.
+func (c *salesConversation) options(msg sdk.Message) string {
+	c.t.Helper()
+	menu, _ := wfBlock(c.t, msg)["menu"].(map[string]any)
+	options, _ := menu["options"].([]any)
+	var names []string
+	for _, option := range options {
+		names = append(names, fmt.Sprint(option.(map[string]any)["name"]))
+	}
+	return strings.Join(names, " ")
+}
+
 // delivered checks the last message the person got: reply, from agent through the WF, with the
 // person's context.io.
 func (c *salesConversation) delivered(reply, agent string) {
@@ -420,26 +472,29 @@ func (c *salesConversation) delivered(reply, agent string) {
 	}
 }
 
-func salesEvaluation(reply, area string) map[string]any {
-	return map[string]any{"reply": reply, "area": area, "product": "Pro", "quantity": 10, "unit_price": 100}
+// salesOrder is the params of sales' option invoice, and issuedInvoice those of invoice's option
+// issued.
+func salesOrder() map[string]any {
+	return map[string]any{"product": "Pro", "quantity": 10, "unit_price": 100}
 }
 
-func invoiceEvaluation(reply, area, number, dueIn string) map[string]any {
-	return map[string]any{"reply": reply, "area": area, "invoice_number": number, "amount": 1000, "due_in": dueIn}
+func issuedInvoice(number, dueIn string) map[string]any {
+	return map[string]any{"invoice_number": number, "amount": 1000, "due_in": dueIn}
 }
 
-// Case 1 (wf-orchestration-v1 §5.2), the whole circuit of the wf.sales.invoice example on the engine,
-// with the agents and SY.timer played by the test: a conversation enters through sales and is handed
-// to invoice, which issues an invoice and hands the conversation back without sales being asked
-// again; the due date fires while sales answers and is acted on when sales is done, through
-// payments; the instance closes after its idle time. A stranger on the conversation's thread is
-// refused, an answer after the close is dropped, and the person's next message starts a new instance
-// at sales. A restart in the middle keeps the conversation, the message it kept included.
+// Case 1 (wf-orchestration-v1 §5.2), on Case 3's menus (§5.3): the whole circuit of the
+// wf.sales.invoice example on the engine, with the agents and SY.timer played by the test. A
+// conversation enters through sales, which chooses invoice, and is handed to invoice, which issues an
+// invoice and hands the conversation back without sales being asked again; the due date fires while
+// sales answers and is acted on when sales is done, through payments; the instance closes after its
+// idle time. A stranger on the conversation's thread is refused, an answer after the close is
+// dropped, and the person's next message starts a new instance at sales. A restart in the middle
+// keeps the conversation, the message it kept included.
 func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c := newSalesConversation(t)
 
 	// 1. The person writes: a new instance on the conversation's thread, at sales, which gets the
-	// message as it came (the payload, the person's ILK, the channel), with its contract and the trail.
+	// message as it came (the payload, the person's ILK, the channel), with its menu and the trail.
 	first := c.person("Hola, quiero cotizar 10 licencias del plan Pro")
 	if row := c.inState("sales_thinking"); row.ThreadID != salesThread {
 		t.Fatalf("the instance's thread: %+v", row)
@@ -447,12 +502,12 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	toSales := c.sentTo(salesAgent)
 	if string(toSales.Payload) != string(first.Payload) || derefString(toSales.Meta.SrcIlk) != personILK || derefString(toSales.Meta.Ich) != personICH ||
 		toSales.Meta.Msg != nil || derefString(toSales.Meta.ThreadID) != salesThread || c.trail(toSales) != "["+salesIO+" "+salesWFNode+"]" ||
-		!strings.Contains(string(toSales.Meta.Context), `"text_field":"reply"`) || !strings.Contains(string(toSales.Meta.Context), `"io":{"reply_target"`) {
+		c.options(toSales) != "answer invoice consult" || !strings.Contains(string(toSales.Meta.Context), `"io":{"reply_target"`) {
 		t.Fatalf("sales gets the person's message: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
 
 	// 2. Sales answers: the answer goes to the person, and the WF listens.
-	c.answer(salesAgent, toSales, "El plan Pro cuesta 100 por licencia.", salesEvaluation("El plan Pro cuesta 100 por licencia.", "sales"))
+	c.choose(salesAgent, toSales, "El plan Pro cuesta 100 por licencia.", "answer", nil)
 	c.delivered("El plan Pro cuesta 100 por licencia.", salesAgent)
 	c.inState("sales_listening")
 
@@ -473,13 +528,13 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.start()
 	c.inState("sales_thinking")
 
-	// 5. The handoff: sales hands the conversation to invoice, which gets the person's message (the
-	// one the instance kept before the restart) with the order in vars.
-	c.answer(salesAgent, toSales, "Te paso con facturación.", salesEvaluation("Te paso con facturación.", "invoice"))
+	// 5. The handoff: sales chooses invoice; invoice gets the person's message (the one the instance
+	// kept before the restart) with the order in vars, and its own menu.
+	c.choose(salesAgent, toSales, "Te paso con facturación.", "invoice", salesOrder())
 	c.inState("invoice_thinking")
 	toInvoice := c.sentTo(invoiceAgent)
 	if string(toInvoice.Payload) != string(ask.Payload) || c.trail(toInvoice) != "["+salesIO+" "+salesWFNode+"]" ||
-		fmt.Sprint(wfBlock(t, toInvoice)["vars"]) != "map[order:map[product:Pro quantity:10 unit_price:100]]" {
+		fmt.Sprint(wfBlock(t, toInvoice)["vars"]) != "map[order:map[product:Pro quantity:10 unit_price:100]]" || c.options(toInvoice) != "issued answer handback" {
 		t.Fatalf("invoice gets the person's message and the order: %s %s", toInvoice.Payload, toInvoice.Meta.Context)
 	}
 
@@ -493,13 +548,13 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 
 	// 7. The invoice is issued: it goes to the person, and payment_due is set at its due_in.
 	// Invoice's answer to the second message goes to the person too.
-	c.answer(invoiceAgent, toInvoice, "Factura F-0001 por 1000, vence en 2 minutos.", invoiceEvaluation("Factura F-0001 por 1000, vence en 2 minutos.", "invoice", "F-0001", "2m"))
+	c.choose(invoiceAgent, toInvoice, "Factura F-0001 por 1000, vence en 2 minutos.", "issued", issuedInvoice("F-0001", "2m"))
 	c.delivered("Factura F-0001 por 1000, vence en 2 minutos.", invoiceAgent)
 	c.inState("invoice_listening")
 	if due, ok := c.pending("payment_due"); !ok || !due.Equal(fixedClock().Add(2*time.Minute)) {
 		t.Fatalf("payment_due fires at the invoice's due_in: %v", c.timer.pending)
 	}
-	c.answer(invoiceAgent, alsoToInvoice, "Sí, te la mando por mail.", invoiceEvaluation("Sí, te la mando por mail.", "invoice", "F-0001", "2m"))
+	c.choose(invoiceAgent, alsoToInvoice, "Sí, te la mando por mail.", "answer", nil)
 	c.delivered("Sí, te la mando por mail.", invoiceAgent)
 	c.inState("invoice_listening")
 
@@ -508,7 +563,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.person("Gracias")
 	toInvoice = c.sentTo(invoiceAgent)
 	askedSales := c.count(salesAgent)
-	c.answer(invoiceAgent, toInvoice, "¡A vos! Te dejo con ventas.", invoiceEvaluation("¡A vos! Te dejo con ventas.", "sales", "", ""))
+	c.choose(invoiceAgent, toInvoice, "¡A vos! Te dejo con ventas.", "handback", nil)
 	c.delivered("¡A vos! Te dejo con ventas.", invoiceAgent)
 	c.inState("sales_listening")
 	if asked := c.count(salesAgent); asked != askedSales {
@@ -525,20 +580,20 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	}
 
 	// 10. Sales answers: its answer goes to the person, and the noted due date goes to payments, which
-	// gets the WF's text, the invoice in vars and the person's context.io.
-	c.answer(salesAgent, toSales, "Decime.", salesEvaluation("Decime.", "sales"))
+	// gets the WF's text, the invoice in vars, its menu and the person's context.io.
+	c.choose(salesAgent, toSales, "Decime.", "answer", nil)
 	c.delivered("Decime.", salesAgent)
 	c.inState("payments_thinking")
 	toPayments := c.sentTo(paymentsAgent)
 	if derefString(toPayments.Meta.Msg) != "PAYMENT_DUE" || !strings.Contains(string(toPayments.Payload), "was not paid") || c.trail(toPayments) != "["+salesWFNode+"]" ||
-		fmt.Sprint(wfBlock(t, toPayments)["vars"]) != "map[invoice:map[amount:1000 due_in:2m invoice_number:F-0001]]" ||
+		fmt.Sprint(wfBlock(t, toPayments)["vars"]) != "map[invoice:map[amount:1000 due_in:2m invoice_number:F-0001]]" || c.options(toPayments) != "notify" ||
 		!strings.Contains(string(toPayments.Meta.Context), `"io":{"reply_target":{"address":"conv-7","kind":"api"}}`) {
 		t.Fatalf("payments gets the due date: %+v %s %s", toPayments.Meta, toPayments.Payload, toPayments.Meta.Context)
 	}
 
 	// 11. Payments answers: the answer goes to the person, and sales holds the conversation again,
 	// with nothing pending.
-	c.answer(paymentsAgent, toPayments, "Tu factura F-0001 venció y no figura pagada.", nil)
+	c.choose(paymentsAgent, toPayments, "Tu factura F-0001 venció y no figura pagada.", "notify", nil)
 	c.delivered("Tu factura F-0001 venció y no figura pagada.", paymentsAgent)
 	c.inState("sales_listening")
 	if c.state()["invoice_pending"] != false {
@@ -559,7 +614,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 
 	// 13. An agent's late answer on the conversation's thread starts nothing.
 	sent = len(c.disp.sent)
-	c.answer(salesAgent, toSales, "¿Algo más?", salesEvaluation("¿Algo más?", "sales"))
+	c.choose(salesAgent, toSales, "¿Algo más?", "answer", nil)
 	if rows, _ := c.rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 1 || len(c.disp.sent) != sent {
 		t.Fatalf("a late answer: %d instances, %d sends", len(rows), len(c.disp.sent)-sent)
 	}
@@ -578,7 +633,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 // noted in last_error, sales holds the conversation again, the person gets no answer to that
 // message, and a pending payment_due stays (before, a person could make an agent break its contract
 // and kill the payment check). An invoice without a valid due_in goes to the person with no payment
-// check, and a stale timeout of another state is nobody's.
+// check, and a stale timeout of another state is nobody's: not the catch's either.
 func TestTheSalesInvoiceExampleSurvivesItsAgents(t *testing.T) {
 	c := newSalesConversation(t)
 	lastError := func(want string) {
@@ -605,9 +660,9 @@ func TestTheSalesInvoiceExampleSurvivesItsAgents(t *testing.T) {
 	// An invoice without a valid due_in goes to the person, with no payment check.
 	c.person("Quiero 10 licencias, facturámelas")
 	toSales = c.sentTo(salesAgent)
-	c.answer(salesAgent, toSales, "Te paso con facturación.", salesEvaluation("Te paso con facturación.", "invoice"))
+	c.choose(salesAgent, toSales, "Te paso con facturación.", "invoice", salesOrder())
 	toInvoice := c.sentTo(invoiceAgent)
-	c.answer(invoiceAgent, toInvoice, "Factura F-0002, vence en dos minutos.", invoiceEvaluation("Factura F-0002, vence en dos minutos.", "invoice", "F-0002", "dos minutos"))
+	c.choose(invoiceAgent, toInvoice, "Factura F-0002, vence en dos minutos.", "issued", issuedInvoice("F-0002", "dos minutos"))
 	c.delivered("Factura F-0002, vence en dos minutos.", invoiceAgent)
 	c.inState("invoice_listening")
 	lastError("AI.invoice@worker1: the invoice has no valid due_in, so no payment check")
@@ -618,7 +673,7 @@ func TestTheSalesInvoiceExampleSurvivesItsAgents(t *testing.T) {
 	// Invoice issues it again, with a due_in: the payment check is set.
 	c.person("¿Me la emitís con fecha?")
 	toInvoice = c.sentTo(invoiceAgent)
-	c.answer(invoiceAgent, toInvoice, "Factura F-0003, vence en 5 minutos.", invoiceEvaluation("Factura F-0003, vence en 5 minutos.", "invoice", "F-0003", "5m"))
+	c.choose(invoiceAgent, toInvoice, "Factura F-0003, vence en 5 minutos.", "issued", issuedInvoice("F-0003", "5m"))
 	c.inState("invoice_listening")
 	if due, ok := c.pending("payment_due"); !ok || !due.Equal(fixedClock().Add(5*time.Minute)) {
 		t.Fatalf("payment_due at the due_in: %v", c.timer.pending)
@@ -656,5 +711,143 @@ func TestTheSalesInvoiceExampleSurvivesItsAgents(t *testing.T) {
 	c.fire("idle")
 	if row := mustGetInstance(t, c.rt, instanceID); row.CurrentState != "closed" {
 		t.Fatalf("it closes when idle: %+v", row)
+	}
+}
+
+// Case 3 (wf-orchestration-v1 §5.3), the internal consultation: sales chooses consult; its reply goes
+// to the person, and its question to the supervisors' IO node, IO.slack.supervisores, which the WF
+// waits for with a timer. A supervisor's answer, in the thread of the WF's post, reaches the
+// conversation's instance and goes to sales as it came, with the question in vars and a menu; sales'
+// answer goes to the person with the person's context.io. A person's message while the supervisors
+// decide goes to sales, which answers it. When no supervisor answers in time the WF tells sales so,
+// and an answer that comes later still goes to sales.
+func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
+	c := newSalesConversation(t)
+	const question = "¿Aprobamos 20% de descuento en 10 licencias Pro a 100 cada una?"
+
+	// 1. The person asks for a discount, and sales consults: its reply goes to the person, and its
+	// question to the supervisors, on the conversation's thread, with no menu and no context but the
+	// WF's block.
+	c.person("Quiero 10 licencias Pro con 20% de descuento")
+	c.choose(salesAgent, c.sentTo(salesAgent), "Lo consulto con un supervisor y te aviso.", "consult", map[string]any{"question": question})
+	c.delivered("Lo consulto con un supervisor y te aviso.", salesAgent)
+	c.inState("consulting")
+	toSupervisors := c.sentTo(supervisorsIO)
+	if derefString(toSupervisors.Meta.Msg) != "SUPERVISOR_QUESTION" || string(toSupervisors.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, question) ||
+		derefString(toSupervisors.Meta.ThreadID) != salesThread || string(toSupervisors.Meta.Context) != `{"wf":{"trail":["`+salesWFNode+`"]}}` {
+		t.Fatalf("the supervisors get the question: %+v %s %s", toSupervisors.Meta, toSupervisors.Payload, toSupervisors.Meta.Context)
+	}
+	if due, ok := c.pending("consult_timeout"); !ok || !due.Equal(fixedClock().Add(30*time.Minute)) || c.state()["question"] != question || c.state()["waiting_for"] != supervisorsIO {
+		t.Fatalf("the WF waits for the supervisors: %v %v", c.timer.pending, c.state())
+	}
+
+	// 2. The person writes meanwhile: sales gets it, with the question and its menu, and its answer
+	// goes to the person; the WF waits on.
+	c.person("¿Novedades?")
+	toSales := c.sentTo(salesAgent)
+	if !strings.Contains(string(toSales.Payload), "Novedades") || c.options(toSales) != "answer" || fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" {
+		t.Fatalf("sales gets the person's message: %s %s", toSales.Payload, toSales.Meta.Context)
+	}
+	c.choose(salesAgent, toSales, "Todavía no, apenas sepa te aviso.", "answer", nil)
+	c.delivered("Todavía no, apenas sepa te aviso.", salesAgent)
+	c.inState("consulting")
+
+	// 3. A supervisor answers in the thread: the answer goes to sales as it came, with the question
+	// and the menu, and the wait's timer goes.
+	answer := c.supervisor("Aprobado hasta 15%.")
+	c.inState("sales_relaying")
+	toSales = c.sentTo(salesAgent)
+	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "answer" ||
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" {
+		t.Fatalf("sales gets the supervisor's answer: %s %s", toSales.Payload, toSales.Meta.Context)
+	}
+	if _, ok := c.pending("consult_timeout"); ok {
+		t.Fatalf("the wait's timer goes: %v", c.timer.pending)
+	}
+
+	// 4. Sales tells the person: its answer, to a message from the supervisors' channel, goes to the
+	// person with the person's context.io, and sales holds the conversation.
+	c.choose(salesAgent, toSales, "Te puedo hacer 15% de descuento.", "answer", nil)
+	c.delivered("Te puedo hacer 15% de descuento.", salesAgent)
+	c.inState("sales_listening")
+
+	// 5. Another consult, which no supervisor answers in time: the WF tells sales so, with the
+	// question, its menu and the person's context.io, and sales' answer goes to the person.
+	const another = "¿25% en 20 licencias?"
+	c.person("¿Y 25% si llevo 20?")
+	c.choose(salesAgent, c.sentTo(salesAgent), "Lo consulto.", "consult", map[string]any{"question": another})
+	c.inState("consulting")
+	c.fire("consult_timeout")
+	c.inState("sales_relaying")
+	toSales = c.sentTo(salesAgent)
+	if derefString(toSales.Meta.Msg) != "CONSULT_UNANSWERED" || !strings.Contains(string(toSales.Payload), "No supervisor answered") || c.options(toSales) != "answer" ||
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+another+"]" || !strings.Contains(string(toSales.Meta.Context), `"io":{"reply_target":{"address":"conv-7","kind":"api"}}`) {
+		t.Fatalf("sales hears that no supervisor answered: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
+	}
+	c.choose(salesAgent, toSales, "Todavía no me confirmaron, preguntame más tarde.", "answer", nil)
+	c.delivered("Todavía no me confirmaron, preguntame más tarde.", salesAgent)
+	c.inState("sales_listening")
+
+	// 6. The supervisor answers later: the answer still goes to sales, which tells the person.
+	c.supervisor("Sí, 25% en 20 está bien.")
+	c.inState("sales_relaying")
+	if vars := fmt.Sprint(wfBlock(t, c.sentTo(salesAgent))["vars"]); vars != "map[question:"+another+"]" {
+		t.Fatalf("a late answer goes to sales with its question: %s", vars)
+	}
+	c.choose(salesAgent, c.sentTo(salesAgent), "¡Me aprobaron 25% en 20 licencias!", "answer", nil)
+	c.delivered("¡Me aprobaron 25% en 20 licencias!", salesAgent)
+	c.inState("sales_listening")
+	if questions := c.count(supervisorsIO); questions != 2 {
+		t.Fatalf("one question per consult: %d", questions)
+	}
+}
+
+// Case 3 (wf-orchestration-v1 §5.3.2): none, from the agent the WF waits for, goes to the example's
+// catch: its reply goes to the person, its reason to last_error, and sales holds the conversation. A
+// none that comes late, from an agent the WF no longer waits for, is the default's; an error no state
+// takes is noted in last_error, and the instance stays where it was.
+func TestTheSalesInvoiceExampleCatchesWhatItsStatesDoNot(t *testing.T) {
+	c := newSalesConversation(t)
+
+	// Sales chooses none.
+	c.person("¿Me recomendás un restaurante?")
+	c.choose(salesAgent, c.sentTo(salesAgent), "De eso no sé, ¿te ayudo con licencias?", "none", map[string]any{"reason": "not about licenses"})
+	c.delivered("De eso no sé, ¿te ayudo con licencias?", salesAgent)
+	c.inState("sales_listening")
+	if c.state()["last_error"] != "AI.sales@worker1: none: not about licenses" || !c.logged("catch[0]: transition sales_thinking → sales_listening") {
+		t.Fatalf("the catch takes sales' none: %v", c.state())
+	}
+
+	// Invoice chooses none: the same, and sales holds the conversation.
+	c.person("Facturame 10 licencias Pro")
+	c.choose(salesAgent, c.sentTo(salesAgent), "Te paso con facturación.", "invoice", salesOrder())
+	c.choose(invoiceAgent, c.sentTo(invoiceAgent), "No puedo emitirla todavía.", "none", map[string]any{"reason": "no tax id"})
+	c.delivered("No puedo emitirla todavía.", invoiceAgent)
+	c.inState("sales_listening")
+	if c.state()["last_error"] != "AI.invoice@worker1: none: no tax id" || !c.logged("catch[1]: transition invoice_thinking → sales_listening") {
+		t.Fatalf("the catch takes invoice's none: %v", c.state())
+	}
+
+	// A late none: the person writes twice while sales answers; sales hands the first message to
+	// invoice, and its none to the second comes while the WF waits for invoice. The default logs it,
+	// and invoice keeps the conversation.
+	c.person("Quiero 5 licencias más")
+	first := c.sentTo(salesAgent)
+	c.person("Facturámelas")
+	second := c.sentTo(salesAgent)
+	c.choose(salesAgent, first, "Te paso con facturación.", "invoice", salesOrder())
+	c.inState("invoice_thinking")
+	sent := len(c.disp.sent)
+	c.choose(salesAgent, second, "", "none", map[string]any{"reason": "already handed over"})
+	c.inState("invoice_thinking")
+	if len(c.disp.sent) != sent || !c.logged("unhandled event (no msg) from AI.sales@worker1 in state invoice_thinking") {
+		t.Fatalf("a late none is the default's: %+v", c.disp.sent[sent:])
+	}
+
+	// A late error, which no state takes: the catch notes it, and the instance stays.
+	c.fail(salesAgent, second)
+	c.inState("invoice_thinking")
+	if c.state()["last_error"] != "unhandled error: invalid_output" || len(c.disp.sent) != sent {
+		t.Fatalf("the catch notes the error: %v", c.state())
 	}
 }

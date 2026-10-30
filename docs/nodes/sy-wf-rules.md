@@ -55,7 +55,7 @@ request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
   anything else is `INVALID_WORKFLOW_NAME`.
 - `metadata.json` (`WfRulesMetadata`): `version` (a counter), `hash` (`sha256:` of the
   definition), `workflow_name`, `workflow_type`, `wf_schema_version`, `compiled_at`,
-  `guard_count`, `state_count`, `action_count`.
+  `guard_count`, `state_count`, `action_count` (the catch's guards and actions count too).
 - When a compile does not give a version, the next one is the highest of the three slots plus 1
   (`NextVersion`).
 - Apply moves `current` to `backup` and `staged` to `current` (`RotateToApply`). Rollback moves
@@ -66,8 +66,9 @@ request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
 ### Compile
 
 `CompileWorkflow` (`node/compile.go`) checks the name, loads and validates the definition with
-`wfcel.LoadDefinitionBytes` (`COMPILE_ERROR` on failure), and writes it to `staged`. Nothing
-is published or deployed.
+`wfcel.LoadDefinitionBytes` (`COMPILE_ERROR` on failure, naming the path: the checks of the spec's
+§8.5, a menu's limits and its catch included), and writes it to `staged`. Nothing is published or
+deployed.
 
 ### Apply and rollback (the deploy)
 

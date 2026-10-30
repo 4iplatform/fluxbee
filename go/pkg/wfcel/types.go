@@ -27,6 +27,11 @@ type WorkflowDefinition struct {
 	InitialState   string            `json:"initial_state"`
 	TerminalStates []string          `json:"terminal_states"`
 	States         []StateDefinition `json:"states"`
+	// Catch is the definition's catch (wf-orchestration-v1 §5.3.2): transitions the engine tries, in
+	// order, when no transition of the current state takes an event, in any state. A catch transition
+	// has a state transition's shape, but its event_match may be empty, which matches every event, and
+	// it sets no timers. When the catch takes nothing either, the event is logged, as without one.
+	Catch          []TransitionDefinition `json:"catch,omitempty"`
 	inputValidator *jsonschema.Schema
 }
 
@@ -66,15 +71,49 @@ type ActionMeta struct {
 	Msg string `json:"msg,omitempty"`
 	// Context is an object written on the outbound message's meta.context, resolved with the same
 	// $ref rules as payload: a send_message's whole context, the keys a forward writes over the
-	// message's own. Its primary use is requesting AI structured output via
-	// meta.context.response_envelope (gap-3) — ai-generic reads that to shape its reply. It never
-	// writes wf, the engine's own block (ContextWF). Nil = no context is set.
+	// message's own (an IO node's context.io, say). It never writes wf, the engine's own block
+	// (ContextWF), nor response_envelope: a WF asks an agent with the action's menu. Nil = no context
+	// is set.
 	Context any `json:"context,omitempty"`
 }
 
 // ContextWF is the key of the WF's block in the meta.context of every message a WF sends:
-// {"trail": [the nodes the message went through], "vars": {what the action's vars writes}}.
+// {"trail": [the nodes the message went through], "vars": {what the action's vars writes},
+// "menu": the action's menu, as written}.
 const ContextWF = "wf"
+
+// Menu is what a WF offers an agent to choose from, on a send_message or a forward to an AI.* node
+// (wf-orchestration-v1 §5.3.1): help, a fixed text that gives the choice its context, and the
+// options. The agent answers {reply, option, params}: reply is the text for the person, option the
+// name of one of the options or none (which the agent adds to every menu, with the param reason),
+// and params that option's. The answer's meta.context.evaluation holds it, where a guard reads it.
+type Menu struct {
+	Help    string       `json:"help,omitempty"`
+	Options []MenuOption `json:"options"`
+}
+
+// MenuOption is one option of a menu: its name, what it means, and the params the agent fills when
+// it chooses it.
+type MenuOption struct {
+	Name        string               `json:"name"`
+	Description string               `json:"description"`
+	Params      map[string]MenuParam `json:"params,omitempty"`
+}
+
+// MenuParam is a param of a menu option: its type (string, boolean, integer or number), what it
+// holds, and, for a string, the values it may take.
+type MenuParam struct {
+	Type        string   `json:"type"`
+	Description string   `json:"description,omitempty"`
+	Enum        []string `json:"enum,omitempty"`
+}
+
+// The option an agent adds to every menu, and its param: none of the options fits, and why. A
+// definition never names an option so.
+const (
+	NoneOption  = "none"
+	ReasonParam = "reason"
+)
 
 type ActionDefinition struct {
 	Type string `json:"type"`
@@ -91,7 +130,10 @@ type ActionDefinition struct {
 	Message string `json:"message,omitempty"`
 	// Vars is an object, $ref-resolved, that a send_message or a forward writes in the WF's block
 	// (meta.context.wf.vars): the deterministic context the WF gives the receiver.
-	Vars     any    `json:"vars,omitempty"`
+	Vars any `json:"vars,omitempty"`
+	// Menu is what a send_message or a forward to an agent (AI.*) offers it to choose from, written
+	// in the WF's block (meta.context.wf.menu) as it is written here: literal, with no $ref.
+	Menu     *Menu  `json:"menu,omitempty"`
 	Payload  any    `json:"payload,omitempty"`
 	TimerKey string `json:"timer_key,omitempty"`
 	// FireIn (a duration) and FireAt (an RFC3339 UTC time) are a literal string or a $ref, resolved

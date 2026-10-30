@@ -49,8 +49,16 @@ type ActionContext struct {
 func executeAction(ctx context.Context, path string, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
 	switch action.Type {
 	case "send_message":
+		// A send to an agent counts against the cap of the instance's trigger, past which it is not
+		// made (maxAgentCallsPerTrigger).
+		if err := inst.callAgent(action.Target); err != nil {
+			return err
+		}
 		return execSendMessage(ctx, action, inst, event, actx)
 	case "forward":
+		if err := inst.callAgent(action.Target); err != nil {
+			return err
+		}
 		return execForward(ctx, action, inst, event, actx)
 	case "keep_message":
 		return execKeepMessage(action, inst, event, actx)
@@ -129,9 +137,8 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		msgName = action.Meta.Msg
 	}
 
-	// gap-3: an optional meta.context (e.g. {response_envelope: {...}} to request AI structured
-	// output), resolved with the same $ref rules as the payload, and the WF's block over it, a trail
-	// that starts at this node.
+	// gap-3: an optional meta.context (an IO node's context.io, say), resolved with the same $ref
+	// rules as the payload, and the WF's block over it, a trail that starts at this node.
 	metaContext := map[string]any{}
 	if err := writeActionContext(metaContext, action, inst, eventMap); err != nil {
 		return fmt.Errorf("send_message: %w", err)
@@ -287,8 +294,10 @@ func writeActionContext(metaContext map[string]any, action ActionDefinition, ins
 }
 
 // withWFBlock is metaContext with the WF's block (meta.context.wf, wf-orchestration-v1 §5.2.1,
-// item 7), as the message goes: trail, the nodes the message went through, and vars, what the
-// action's vars writes, $ref-resolved: the deterministic context the WF gives the receiver.
+// item 7), as the message goes: trail, the nodes the message went through; vars, what the action's
+// vars writes, $ref-resolved: the deterministic context the WF gives the receiver; and menu, the
+// action's menu as written, what an agent may choose from (§5.3.6). vars and menu are there only
+// when the action has them.
 func withWFBlock(metaContext map[string]any, trail []string, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
 	hops := make([]any, len(trail))
 	for i, name := range trail {
@@ -301,6 +310,9 @@ func withWFBlock(metaContext map[string]any, trail []string, action ActionDefini
 			return nil, fmt.Errorf("resolve vars: %w", err)
 		}
 		block["vars"] = vars
+	}
+	if action.Menu != nil {
+		block["menu"] = action.Menu
 	}
 	metaContext[wfcel.ContextWF] = block
 	raw, err := wfcel.EncodeJSON(metaContext)

@@ -30,7 +30,8 @@ const forwardingWorkflowJSON = `{
       "name": "asking",
       "entry_actions": [
         {"type": "keep_message", "name": "original"},
-        {"type": "forward", "target": "AI.host@motherbee", "meta": {"context": {"response_envelope": {"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}}}, "vars": {"seen": {"$ref": "event.src"}}}
+        {"type": "forward", "target": "AI.host@motherbee", "meta": {"context": {"channel": "sales"}}, "vars": {"seen": {"$ref": "event.src"}},
+         "menu": {"options": [{"name": "ok", "description": "It is fine & done."}]}}
       ],
       "transitions": [
         {"event_match": {"src": "AI.host@motherbee"}, "guard": "true", "target_state": "done",
@@ -91,7 +92,7 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 	if forwarded.Routing.Dst.Value() != "AI.host@motherbee" || forwarded.Routing.SrcL2Name != nil || forwarded.Routing.Src != "wf-uuid" || forwarded.Routing.TraceID != "trace-raw" {
 		t.Fatalf("the routing is the WF's: %+v", forwarded.Routing)
 	}
-	if got := string(meta.Context); got != `{"io":{"reply_target":{"address":"a&b","kind":"api"}},"response_envelope":{"kind":"json_object_v1","properties":{"ok":{"type":"boolean"}},"required":["ok"]},"wf":{"trail":["IO.in@motherbee","WF.invoice@motherbee"],"vars":{"seen":"IO.in@motherbee"}}}` {
+	if got := string(meta.Context); got != `{"channel":"sales","io":{"reply_target":{"address":"a&b","kind":"api"}},"wf":{"menu":{"options":[{"name":"ok","description":"It is fine & done."}]},"trail":["IO.in@motherbee","WF.invoice@motherbee"],"vars":{"seen":"IO.in@motherbee"}}}` {
 		t.Fatalf("the context: the message's, the keys the action writes and the WF's block: %s", got)
 	}
 

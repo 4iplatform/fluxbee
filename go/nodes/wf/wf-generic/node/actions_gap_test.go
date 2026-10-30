@@ -116,10 +116,10 @@ func TestRouteToFailedTerminatesInstance(t *testing.T) {
 	}
 }
 
-// 0.1.91 (wf-orchestration-v1 §5.2.1, items 1 and 7) + gap-3: a send carries the instance's
-// thread, the conversation's (thread_id_ref left the language), and its meta.context (e.g.
-// response_envelope for AI structured output) with the WF's block: a trail that starts at this
-// node, and what the action's vars writes, $ref-resolved.
+// 0.1.91 (wf-orchestration-v1 §5.2.1, items 1 and 7) + gap-3 + Case 3 (§5.3.6): a send carries the
+// instance's thread, the conversation's (thread_id_ref left the language), and its meta.context
+// (e.g. the person's context.io) with the WF's block: a trail that starts at this node, what the
+// action's vars writes, $ref-resolved, and the action's menu, as written.
 func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap"}
 	actx := makeActx(t, disp, &mockTimerSender{})
@@ -135,10 +135,14 @@ func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 		Meta: &ActionMeta{
 			Msg: "answer",
 			Context: map[string]any{
-				"response_envelope": map[string]any{"schema": "invoice_result"},
+				"io": map[string]any{"reply_target": map[string]any{"kind": "api", "address": "conv-9"}},
 			},
 		},
-		Vars:    map[string]any{"order": map[string]any{"$ref": "state.order"}, "note": "<a & b>"},
+		Vars: map[string]any{"order": map[string]any{"$ref": "state.order"}, "note": "<a & b>"},
+		Menu: &Menu{Help: "Invoice the <order> & answer.", Options: []MenuOption{
+			{Name: "issued", Description: "You issued it.", Params: map[string]MenuParam{"due_in": {Type: "string", Enum: []string{"1h", "30d"}}}},
+			{Name: "answer", Description: "You answer."},
+		}},
 		Payload: map[string]any{"text": "done"},
 	}
 	if err := execSendMessage(context.Background(), action, inst, msgWithName("REPLY"), actx); err != nil {
@@ -151,7 +155,7 @@ func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	if got := derefStringPtr(sent.Meta.ThreadID); got != "conv-9" {
 		t.Fatalf("a send carries the instance's thread, got %q", got)
 	}
-	want := `{"response_envelope":{"schema":"invoice_result"},"wf":{"trail":["WF.invoice@motherbee"],"vars":{"note":"<a & b>","order":{"quantity":10,"unit_price":1.5}}}}`
+	want := `{"io":{"reply_target":{"address":"conv-9","kind":"api"}},"wf":{"menu":{"help":"Invoice the <order> & answer.","options":[{"name":"issued","description":"You issued it.","params":{"due_in":{"type":"string","enum":["1h","30d"]}}},{"name":"answer","description":"You answer."}]},"trail":["WF.invoice@motherbee"],"vars":{"note":"<a & b>","order":{"quantity":10,"unit_price":1.5}}}}`
 	if got := string(sent.Meta.Context); got != want {
 		t.Fatalf("meta.context:\n got %s\nwant %s", got, want)
 	}

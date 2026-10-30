@@ -5,7 +5,8 @@ Base runtime for instanceable `WF.*` nodes.
 This module holds the workflow engine in Go: it loads one workflow definition (validated by
 `go/pkg/wfcel`), runs its instances, and keeps them in SQLite (`wf_instances.db`).
 
-How it runs a workflow (0.1.90 and 0.1.91, docs/wf-orchestration-v1.md §5.1 and §5.2.1):
+How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md §5.1, §5.2.1 and
+§5.3.6):
 
 - **One instance per conversation.** An instance lives on the thread of the message that started it
   (its own id when that message had none), and every message it sends carries that thread: the
@@ -20,10 +21,27 @@ How it runs a workflow (0.1.90 and 0.1.91, docs/wf-orchestration-v1.md §5.1 and
 - **Forwarding.** `forward` sends a message on as it was received, the event's or one `keep_message`
   kept: the payload byte for byte, every meta field but `memory_package`; the WF changes the
   destination, the thread, the `meta.context` keys it writes and its block, `meta.context.wf` (the
-  trail of the nodes the message went through, and the action's `vars`), which every message a WF
-  sends carries. A transition matches by `msg`, by `src` or both; one without a `target_state` is
-  internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a `$ref`, checked when
-  the action runs. The Go SDK writes frames without HTML escaping.
+  trail of the nodes the message went through, the action's `vars`, and its `menu`), which every
+  message a WF sends carries. A transition matches by `msg`, by `src` or both; one without a
+  `target_state` is internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a
+  `$ref`, checked when the action runs. The Go SDK writes frames without HTML escaping.
+- **Asking an agent.** A `send_message` or a `forward` to an `AI.*` node may offer it a `menu`, the
+  options it may choose from; the engine writes it in the WF's block as written, with no empty
+  field. The agent answers `{reply, option, params}` in `meta.context.evaluation`, `none` with a
+  `reason` when no option fits, and an error payload for an answer off the menu. A definition with
+  `meta.context.response_envelope` is refused: a WF asks an agent with `menu`. What a guard, a
+  value or a `$ref` reads of the evaluation is checked against the definition's menus at load.
+- **The catch and the default.** When no transition of the current state takes an event, the
+  definition's `catch` transitions are tried in order, in any state (an empty `event_match` matches
+  every event); a chosen one runs as a state's. When the catch takes nothing either, the default:
+  the instance's log gets `unhandled event ... in state ...`, the node's log a line naming the
+  instance, the state and the event, and the instance stays where it was.
+- **The cap on agent calls.** At most 8 messages go to agents (`AI.*`) between two triggers, a
+  trigger being a message from a node that is no agent or a timer's fire. Past it the send is not
+  made, the instance's log says so and the transition goes on; the instance then gets one
+  `AGENT_CALL_CAP` internal event per trigger (an error payload, `agent_call_cap`, with the agent as
+  `target`), which its states, its catch or the default take. The instance never fails for it, and
+  the count, in memory, starts again at a restart.
 - **Every message a WF sends is a `user` message**, to a node name written in the definition, and
   every message it takes is a `user` message, but a `TIMER_FIRED`: any other `system` message is
   dropped, never answered. A definition with `meta.type`, `target_ref` or `event_match.type` is
@@ -50,8 +68,8 @@ How it runs a workflow (0.1.90 and 0.1.91, docs/wf-orchestration-v1.md §5.1 and
   snake_case keys. A router notice, a reply (`*_RESPONSE`, `INVALID_INPUT`, `<msg>.error`) and a
   message without a name are never answered, and a reply never starts an instance. Nor does an
   agent's late answer, which comes from no `start_from` node: it is dropped while no instance runs
-  on its thread, and reaches the conversation's next instance once one runs there. A message the
-  current state has no transition for is logged and dropped, never queued.
+  on its thread, and reaches the conversation's next instance once one runs there. A message that
+  neither the current state nor the catch takes is logged and dropped, never queued.
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default
   (`{"$ref": "event.context", "default": {}}`, taken for a missing or `null` field); a `$ref` holds
   only `$ref` and `default`, and its default is a literal. The state holds plain JSON, and a JSON

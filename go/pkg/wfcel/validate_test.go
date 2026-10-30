@@ -2,6 +2,7 @@ package wfcel
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -498,7 +499,7 @@ func TestValidateDefinitionForwardKeepMessageAndTheWFBlock(t *testing.T) {
 	}
 	for _, valid := range []string{
 		`{"type": "forward", "target": "AI.sales@worker1"}`,
-		`{"type": "keep_message", "name": "customer"}, {"type": "forward", "target": "AI.sales@worker1", "message": "customer", "meta": {"context": {"response_envelope": {"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}}}, "vars": {"order": {"$ref": "state.order"}, "note": "literal"}}`,
+		`{"type": "keep_message", "name": "customer"}, {"type": "forward", "target": "AI.sales@worker1", "message": "customer", "meta": {"context": {"io": {"$ref": "state.io"}}}, "vars": {"order": {"$ref": "state.order"}, "note": "literal"}}`,
 		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"$ref": "state.ctx", "default": {}}}}`,
 		`{"type": "send_message", "target": "AI.payments@worker1", "meta": {"msg": "DUE", "context": {"io": {"$ref": "state.io"}}}, "vars": {"invoice": {"$ref": "state.invoice"}}, "payload": {"type": "text", "content": "due"}}`,
 	} {
@@ -690,52 +691,403 @@ func TestADurationOfTooManyDaysIsRefused(t *testing.T) {
 	}
 }
 
-// A response contract written in the definition is checked at load by the rules an agent reads it
-// with (response_contract_to_output_schema_spec in crates/fluxbee_ai_sdk/src/message.rs), on a
-// send_message and on a forward; a $ref is not.
-func TestAResponseContractIsCheckedAsTheAgentReadsIt(t *testing.T) {
-	envelope := func(contract string) error {
+// salesMenuJSON is the menu menuWorkflowJSON offers AI.sales@worker1.
+const salesMenuJSON = `{"help": "The person is buying licenses.", "options": [
+  {"name": "answer", "description": "You answer the person yourself."},
+  {"name": "invoice", "description": "They accepted the quote.", "params": {"quantity": {"type": "integer"}, "plan": {"type": "string", "enum": ["basic", "pro"]}}},
+  {"name": "consult", "description": "A supervisor must approve it.", "params": {"question": {"type": "string", "description": "What you ask."}}}
+]}`
+
+// menuWorkflowJSON asks AI.sales@worker1 with a menu, and branches on its evaluation: an invoice
+// keeps the order, a consult writes the question to the supervisors.
+func menuWorkflowJSON() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "sales",
+  "start_from": ["IO.api.sales@worker1"],
+  "input_schema": {"type": "object"},
+  "initial_state": "asking",
+  "terminal_states": ["done", "failed"],
+  "states": [
+    {
+      "name": "asking",
+      "entry_actions": [
+        {"type": "keep_message", "name": "customer"},
+        {"type": "forward", "target": "AI.sales@worker1", "message": "customer", "menu": ` + salesMenuJSON + `}
+      ],
+      "transitions": [
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'invoice'", "target_state": "done",
+         "actions": [{"type": "set_variable", "name": "order", "value": "{'quantity': event.context.evaluation.params.quantity}"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'consult'", "target_state": "done",
+         "actions": [{"type": "send_message", "target": "IO.slack.supervisores@motherbee", "meta": {"msg": "CONSULT"}, "payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}}}]}
+      ]
+    },
+    {"name": "done"},
+    {"name": "failed"}
+  ]
+}`
+}
+
+// loadChanged loads menuWorkflowJSON with from replaced by to.
+func loadChanged(t *testing.T, from, to string) (*WorkflowDefinition, error) {
+	t.Helper()
+	data := strings.Replace(menuWorkflowJSON(), from, to, 1)
+	if data == menuWorkflowJSON() {
+		t.Fatalf("the fixture did not change: %s", from)
+	}
+	return LoadDefinitionBytes([]byte(data), "", fixedClock)
+}
+
+// Case 3 (wf-orchestration-v1 §5.3.6): a send_message or a forward to an agent offers it a menu,
+// literal and within the limits the agent checks again; each error names its path.
+func TestAMenuIsCheckedAsTheAgentReadsIt(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(menuWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if menu := def.States[0].EntryActions[1].Menu; menu == nil || menu.Help != "The person is buying licenses." || len(menu.Options) != 3 ||
+		menu.Options[1].Params["plan"].Enum[1] != "pro" || menu.Options[2].Params["question"].Description != "What you ask." {
+		t.Fatalf("the menu as written: %+v", menu)
+	}
+	invoice := `{"name": "invoice", "description": "d", "params": {"quantity": {"type": "integer"}, "plan": {"type": "string"}}}`
+	consult := `{"name": "consult", "description": "d", "params": {"question": {"type": "string"}}}`
+	// menuOf is a menu with options, and the invoice and consult the fixture's guards read.
+	menuOf := func(options ...string) string {
+		return `{"options": [` + strings.Join(append(options, invoice, consult), ", ") + `]}`
+	}
+	option := func(name string) string { return fmt.Sprintf(`{"name": %q, "description": "d"}`, name) }
+	params := func(n int) string {
+		var listed []string
+		for i := 0; i < n; i++ {
+			listed = append(listed, fmt.Sprintf(`"p%d": {"type": "boolean"}`, i))
+		}
+		return `{"name": "many", "description": "d", "params": {` + strings.Join(listed, ", ") + `}}`
+	}
+	values := func(n int) string {
+		var listed []string
+		for i := 0; i < n; i++ {
+			listed = append(listed, fmt.Sprintf(`"v%d"`, i))
+		}
+		return `[` + strings.Join(listed, ", ") + `]`
+	}
+	withMenu := func(menu string) error {
 		t.Helper()
-		data := strings.Replace(validWorkflowJSON(), `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`,
-			`{"type": "forward", "target": "AI.x@worker1", "meta": {"context": {"response_envelope": `+contract+`}}}`, 1)
-		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		_, err := loadChanged(t, salesMenuJSON, menu)
 		return err
 	}
 	for _, valid := range []string{
-		`{"kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply", "area"], "properties": {"reply": {"type": "string"}, "area": {"type": "string", "enum": ["a", "b"]}, "n": {"type": "integer", "description": "not read"}}}`,
-		`{"kind": "json_object_v1", "strict": "yes", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`,
-		`{"$ref": "state.contract"}`,
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"$ref": "state.properties"}}`,
+		menuOf(),
+		menuOf(option("a1"), option("a2"), option("a3"), option("a4"), option("a5"), option("a6")),
+		`{"help": "` + strings.Repeat("ñ", 600) + `", "options": [` + invoice + `, ` + consult + `]}`,
+		menuOf(`{"name": "answer", "description": "` + strings.Repeat("é", 200) + `"}`),
+		menuOf(params(8)),
+		menuOf(`{"name": "typed", "description": "d", "params": {"s": {"type": "string", "enum": ` + values(20) + `}, "b": {"type": "boolean"}, "i": {"type": "integer"}, "n": {"type": "number", "description": "` + strings.Repeat("x", 200) + `"}}}`),
+		menuOf(option("a_" + strings.Repeat("b", 30))),
 	} {
-		if err := envelope(valid); err != nil {
+		if err := withMenu(valid); err != nil {
 			t.Fatalf("%s: %v", valid, err)
 		}
 	}
-	const at = "states[0].transitions[0].actions[0].meta.context.response_envelope"
-	for contract, want := range map[string]string{
-		`"json"`: at + ": must be a JSON object",
-		`{"required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                                                              at + `.kind: must be "json_object_v1"`,
-		`{"kind": "json_schema", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                                       at + `.kind: must be "json_object_v1"`,
-		`{"kind": "json_object_v1", "properties": {"ok": {"type": "boolean"}}}`:                                                                        at + ".required: must be a non-empty list of property names",
-		`{"kind": "json_object_v1", "required": [], "properties": {"ok": {"type": "boolean"}}}`:                                                        at + ".required: must be a non-empty list of property names",
-		`{"kind": "json_object_v1", "required": ["ok"]}`:                                                                                               at + ".properties: must be a non-empty object",
-		`{"kind": "json_object_v1", "required": ["ok", 3], "properties": {"ok": {"type": "boolean"}}}`:                                                 at + ".required[1]: must be a string",
-		`{"kind": "json_object_v1", "required": [" "], "properties": {"ok": {"type": "boolean"}}}`:                                                     at + ".required[0]: must not be empty",
-		`{"kind": "json_object_v1", "required": ["ko"], "properties": {"ok": {"type": "boolean"}}}`:                                                    at + `.required[0]: must be one of the properties ("ko" is not)`,
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": "boolean"}}`:                                                              at + ".properties.ok: must be an object",
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {}}}`:                                                                     at + ".properties.ok.type: is required",
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "array"}}}`:                                                      at + ".properties.ok.type: must be string, boolean, integer or number",
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "string", "enum": "a"}}}`:                                        at + ".properties.ok.enum: must be a list",
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "integer", "enum": [1]}}}`:                                       at + ".properties.ok.enum: is only for a property of type string",
-		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "string", "enum": ["a", 1]}}}`:                                   at + ".properties.ok.enum: must hold strings only",
-		`{"kind": "json_object_v1", "text_field": 1, "required": ["ok"], "properties": {"ok": {"type": "string"}}}`:                                    at + ".text_field: must be a string",
-		`{"kind": "json_object_v1", "text_field": "reply", "required": ["ok"], "properties": {"ok": {"type": "string"}, "reply": {"type": "string"}}}`: at + ".text_field: must be listed in required",
-		`{"kind": "json_object_v1", "text_field": "ok", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                at + ".text_field: must be a property of type string",
+	const at = "states[0].entry_actions[1].menu"
+	for menu, want := range map[string]string{
+		`{"options": []}`: at + ".options: must hold 1 to 8 options (the agent adds none)",
+		menuOf(option("a1"), option("a2"), option("a3"), option("a4"), option("a5"), option("a6"), option("a7")): at + ".options: must hold 1 to 8 options",
+		menuOf(option("none")):                            at + `.options[0].name: must not be "none": the agent adds none to every menu`,
+		menuOf(option("Answer")):                          at + ".options[0].name: must be a lowercase name of 32 characters at most",
+		menuOf(option("1st")):                             at + ".options[0].name: must be a lowercase name",
+		menuOf(option("")):                                at + ".options[0].name: must be a lowercase name",
+		menuOf(option("a" + strings.Repeat("b", 32))):     at + ".options[0].name: must be a lowercase name",
+		menuOf(option("answer"), option("answer")):        at + `.options[1].name: must be unique in its menu ("answer" is taken)`,
+		menuOf(`{"name": "answer"}`):                      at + ".options[0].description: must not be empty",
+		menuOf(`{"name": "answer", "description": "  "}`): at + ".options[0].description: must not be empty",
+		menuOf(`{"name": "answer", "description": "` + strings.Repeat("é", 201) + `"}`): at + ".options[0].description: must be 200 characters at most",
+		`{"help": "` + strings.Repeat("a", 601) + `", "options": [` + invoice + `]}`:    at + ".help: must be 600 characters at most",
+		`{"help": "  ", "options": [` + invoice + `]}`:                                  at + ".help: must not be blank",
+		menuOf(params(9)): at + ".options[0].params: must hold 8 params at most",
+		menuOf(`{"name": "answer", "description": "d", "params": {"Qty": {"type": "integer"}}}`):                                                 at + ".options[0].params.Qty: must be named with a lowercase name",
+		menuOf(`{"name": "answer", "description": "d", "params": {"items": {"type": "array"}}}`):                                                 at + ".options[0].params.items.type: must be string, boolean, integer or number",
+		menuOf(`{"name": "answer", "description": "d", "params": {"items": {}}}`):                                                                at + ".options[0].params.items.type: is required",
+		menuOf(`{"name": "answer", "description": "d", "params": {"n": {"type": "integer", "enum": ["1"]}}}`):                                    at + ".options[0].params.n.enum: is only for a param of type string",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "enum": []}}}`):                                        at + ".options[0].params.s.enum: must hold 1 to 20 values",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "enum": ` + values(21) + `}}}`):                        at + ".options[0].params.s.enum: must hold 1 to 20 values",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "description": " "}}}`):                                at + ".options[0].params.s.description: must not be blank",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "description": "` + strings.Repeat("x", 201) + `"}}}`): at + ".options[0].params.s.description: must be 200 characters at most",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "enum": ["a", ""]}}}`):                                 at + ".options[0].params.s.enum[1]: must not be empty",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "enum": [" "]}}}`):                                     at + ".options[0].params.s.enum[0]: must not be empty",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "enum": ["a", "a"]}}}`):                                at + `.options[0].params.s.enum[1]: must be unique in its enum ("a" is taken)`,
+		// The menu has only its own fields, at every level, as the agent reads it; and it is literal:
+		// the strict decoder refuses a $ref where a string goes.
+		`{"options": [` + invoice + `], "contract": {}}`:                                                      at + ".contract: is not a field of a menu",
+		menuOf(`{"name": "answer", "descripton": "d"}`):                                                       at + ".options[0].descripton: is not a field of a menu option",
+		menuOf(`{"name": "answer", "description": "d", "params": {"s": {"type": "string", "default": "x"}}}`): at + ".options[0].params.s.default: is not a field of a menu param",
+		`{"help": {"$ref": "state.help"}, "options": [` + invoice + `]}`:                                      "menu.help",
 	} {
-		assertErrorContains(t, envelope(contract), want)
+		assertErrorContains(t, withMenu(menu), want)
 	}
-	// On a send_message too.
-	data := strings.Replace(validWorkflowJSON(), `"meta": { "msg": "INVOICE_CREATE_REQUEST" },`, `"meta": { "msg": "INVOICE_CREATE_REQUEST", "context": {"response_envelope": {"kind": "json_object_v1"}} },`, 1)
-	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
-	assertErrorContains(t, err, "states[0].entry_actions[0].meta.context.response_envelope.required: must be a non-empty list of property names")
+
+	// A menu is for an agent, whatever the case of its name, on a send_message or a forward, and on
+	// no other action.
+	if _, err := loadChanged(t, `{"type": "forward", "target": "AI.sales@worker1"`, `{"type": "forward", "target": "ai.sales@worker1"`); err != nil {
+		t.Fatalf("an agent's name in lowercase: %v", err)
+	}
+	if _, err := loadChanged(t, `"target": "IO.slack.supervisores@motherbee", "meta": {"msg": "CONSULT"},`, `"target": "AI.supervisor@motherbee", "meta": {"msg": "CONSULT"}, "menu": {"options": [{"name": "approve", "description": "You approve it."}]},`); err != nil {
+		t.Fatalf("a send_message with a menu: %v", err)
+	}
+	_, err = loadChanged(t, `{"type": "forward", "target": "AI.sales@worker1"`, `{"type": "forward", "target": "IO.api.sales@worker1"`)
+	assertErrorContains(t, err, at+": is only for an agent (AI.*) target")
+	_, err = loadChanged(t, `"target": "IO.slack.supervisores@motherbee", "meta": {"msg": "CONSULT"},`, `"target": "IO.slack.supervisores@motherbee", "meta": {"msg": "CONSULT"}, "menu": {"options": [{"name": "approve", "description": "d"}]},`)
+	assertErrorContains(t, err, "states[0].transitions[1].actions[0].menu: is only for an agent (AI.*) target")
+	for action, want := range map[string]string{
+		`{"type": "keep_message", "name": "customer", "menu": {"options": []}}`:                                            "states[0].entry_actions[0].menu: is not a field of keep_message",
+		`{"type": "keep_message", "name": "customer"}, {"type": "emit_internal_event", "meta": {"msg": "GO"}, "menu": {}}`: "states[0].entry_actions[1].menu: is not a field of emit_internal_event",
+	} {
+		_, err := loadChanged(t, `{"type": "keep_message", "name": "customer"}`, action)
+		assertErrorContains(t, err, want)
+	}
+}
+
+// Case 3: a WF asks an agent with menu. response_envelope, which IO nodes keep for their own callers,
+// is refused in a WF's action, written or as a $ref, on a forward and on a send_message; a context
+// that is a $ref is resolved when the action runs.
+func TestAResponseEnvelopeIsRefusedInAWFsAction(t *testing.T) {
+	const why = ": is not part of the definition language: a WF asks an agent with menu"
+	for _, c := range []struct{ from, to, path string }{
+		{`"message": "customer", "menu"`, `"message": "customer", "meta": {"context": {"response_envelope": {"kind": "json_object_v1", "text_field": "reply", "required": ["reply"], "properties": {"reply": {"type": "string"}}}}}, "menu"`, "states[0].entry_actions[1].meta.context.response_envelope"},
+		{`"message": "customer", "menu"`, `"message": "customer", "meta": {"context": {"response_envelope": {"$ref": "state.contract"}}}, "menu"`, "states[0].entry_actions[1].meta.context.response_envelope"},
+		{`"meta": {"msg": "CONSULT"}`, `"meta": {"msg": "CONSULT", "context": {"response_envelope": {}}}`, "states[0].transitions[1].actions[0].meta.context.response_envelope"},
+	} {
+		_, err := loadChanged(t, c.from, c.to)
+		assertErrorContains(t, err, c.path+why)
+	}
+	if _, err := loadChanged(t, `"message": "customer", "menu"`, `"message": "customer", "meta": {"context": {"$ref": "state.context", "default": {}}}, "menu"`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// catchWorkflowJSON is menuWorkflowJSON with a catch.
+func catchWorkflowJSON(catch string) string {
+	return strings.Replace(menuWorkflowJSON(), `"states": [`, `"catch": [`+catch+`],
+  "states": [`, 1)
+}
+
+func loadCatch(t *testing.T, catch string) (*WorkflowDefinition, error) {
+	t.Helper()
+	return LoadDefinitionBytes([]byte(catchWorkflowJSON(catch)), "", fixedClock)
+}
+
+// Case 3 (wf-orchestration-v1 §5.3.6): the catch is a list of transitions with a state transition's
+// shape, but its event_match may be empty (it matches every event), its target_state is optional
+// and it sets no timers. A keep_message, or a forward of the event, needs a src. Each error names
+// its path.
+func TestTheCatchIsCheckedAsAStatesTransitions(t *testing.T) {
+	def, err := loadCatch(t, `
+    {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'none'", "target_state": "done",
+     "actions": [
+       {"type": "keep_message", "name": "declined"},
+       {"type": "forward", "target": "IO.api.sales@worker1"},
+       {"type": "set_variable", "name": "last_error", "value": "event.context.evaluation.params.reason"},
+       {"type": "emit_internal_event", "meta": {"msg": "DECLINED"}},
+       {"type": "send_message", "target": "IO.slack.supervisores@motherbee", "meta": {"msg": "DECLINED"}, "payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.reason"}}}
+     ]},
+    {"event_match": {"msg": "AGENT_CALL_CAP"}, "guard": "true", "actions": [{"type": "set_variable", "name": "capped", "value": "event.payload.target"}]},
+    {"event_match": {}, "guard": "event.payload.type == 'error'", "actions": [{"type": "forward", "target": "IO.api.sales@worker1", "message": "declined"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(def.Catch) != 3 || def.Catch[0].TargetState != "done" || def.Catch[1].TargetState != "" || def.Catch[2].EventMatch != (EventMatch{}) {
+		t.Fatalf("the catch: %+v", def.Catch)
+	}
+	for i, transition := range def.Catch {
+		if transition.Program == nil {
+			t.Fatalf("catch[%d] has no compiled guard", i)
+		}
+	}
+	for catch, want := range map[string]string{
+		`{"event_match": {}, "guard": "", "actions": []}`:                                                                                                      "catch[0].guard: must not be empty",
+		`{"event_match": {}, "guard": "event.payload.type ==", "actions": []}`:                                                                                 "catch[0].guard: ",
+		`{"event_match": {}, "guard": "true", "target_state": "nowhere"}`:                                                                                      "catch[0].target_state: must reference an existing state",
+		`{"event_match": {"msg": " "}, "guard": "true"}`:                                                                                                       "catch[0].event_match.msg: must not be blank",
+		`{"event_match": {"src": "IO.slack"}, "guard": "true"}`:                                                                                                "catch[0].event_match.src: must be a node name with its hive",
+		`{"event_match": {"src": "SY.timer@worker1"}, "guard": "true"}`:                                                                                        "catch[0].event_match.src: must not be a SY.* / RT.* system node",
+		`{"event_match": {"type": "user"}, "guard": "true"}`:                                                                                                   "catch[0].event_match.type: is not part of the definition language",
+		`{"event_match": {}, "guard": "true", "actions": [{"type": "nope"}]}`:                                                                                  "catch[0].actions[0].type: unknown action type",
+		`{"event_match": {}, "guard": "true", "actions": [{"type": "set_variable", "name": "1x", "value": "1"}]}`:                                              "catch[0].actions[0].name: must be a valid identifier",
+		`{"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "IO.api.sales@worker1", "name": "x"}]}`:       "catch[0].actions[0].name: is not a field of forward",
+		`{"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "IO.api.sales@worker1", "message": "kept"}]}`: "catch[0].actions[0].message: must name a message a keep_message keeps",
+		`{"event_match": {}, "guard": "true", "actions": [{"type": "keep_message", "name": "late"}]}`:                                                          "catch[0].actions[0]: a keep_message runs on catch[0], whose event_match names no src, so its event may be a timer's fire or an internal event, no node's message to keep: name a src",
+		`{"event_match": {"msg": "TIMER_FIRED"}, "guard": "true", "actions": [{"type": "forward", "target": "IO.api.sales@worker1"}]}`:                         "catch[0].actions[0]: a forward without message runs on catch[0], whose event_match names no src, so its event may be a timer's fire or an internal event, no node's message to forward: forward a kept one, or name a src",
+		`{"event_match": {}, "guard": "true"}, {"event_match": {"msg": "X"}, "guard": "true", "actions": [{"type": "keep_message", "name": "late"}]}`:          "catch[1].actions[0]: a keep_message runs on catch[1]",
+	} {
+		_, err := loadCatch(t, catch)
+		assertErrorContains(t, err, want)
+	}
+	// Timers belong to states: the catch goes to a state whose entry actions set them.
+	for _, timer := range []string{
+		`{"type": "schedule_timer", "timer_key": "t", "fire_in": "5m"}`,
+		`{"type": "cancel_timer", "timer_key": "t"}`,
+		`{"type": "reschedule_timer", "timer_key": "t", "fire_in": "5m"}`,
+	} {
+		_, err := loadCatch(t, `{"event_match": {}, "guard": "true", "actions": [`+timer+`]}`)
+		assertErrorContains(t, err, "catch[0].actions[0].type: is a timer action, and the catch sets no timers: it goes to a state whose entry actions set them")
+	}
+
+	// A catch transition that names no src and goes to a state runs, on an event that may be no
+	// node's message, the exit actions of the state it leaves, any state but a terminal one, and the
+	// entry actions of its target: neither may keep or forward the event. With a src, or internal, it
+	// may.
+	exitForwards := func(catch string) error {
+		t.Helper()
+		data := strings.Replace(catchWorkflowJSON(catch), `"transitions": [
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'invoice'"`, `"exit_actions": [{"type": "forward", "target": "IO.api.sales@worker1"}],
+      "transitions": [
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'invoice'"`, 1)
+		data = strings.Replace(data, `{"name": "done"}`, `{"name": "done", "entry_actions": [{"type": "keep_message", "name": "last"}], "exit_actions": [{"type": "keep_message", "name": "gone"}]}`, 1)
+		if !strings.Contains(data, `"name": "gone"`) {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	err = exitForwards(`{"event_match": {"msg": "STOP"}, "guard": "true", "target_state": "done"}`)
+	assertErrorContains(t, err, "states[0].exit_actions[0]: a forward without message runs on catch[0], whose event_match names no src")
+	assertErrorContains(t, err, "states[1].entry_actions[0]: a keep_message runs on catch[0], whose event_match names no src")
+	if strings.Contains(err.Error(), "states[1].exit_actions") {
+		t.Fatalf("a terminal state's exit actions never run: %v", err)
+	}
+	for _, catch := range []string{
+		`{"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "target_state": "done"}`,
+		`{"event_match": {}, "guard": "true"}`,
+	} {
+		if err := exitForwards(catch); err != nil {
+			t.Fatalf("%s: %v", catch, err)
+		}
+	}
+}
+
+// Case 3: the catch's actions and targets count as the definition's own: a keep_message there keeps
+// a message a forward may send, its event_match.src and its targets are involved, and its numbers
+// keep their type.
+func TestTheCatchCountsAsTheDefinitionsOwn(t *testing.T) {
+	def, err := loadCatch(t, `
+    {"event_match": {"src": "IO.slack.ops@motherbee"}, "guard": "true",
+     "actions": [{"type": "keep_message", "name": "ops"}, {"type": "forward", "target": "AI.helper@motherbee"}]},
+    {"event_match": {}, "guard": "true", "actions": [
+      {"type": "forward", "target": "IO.api.sales@worker1", "message": "ops"},
+      {"type": "send_message", "target": "IO.audit@motherbee", "meta": {"msg": "UNHANDLED"}, "payload": {"count": 3, "ratio": 1.5}}
+    ]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{
+		"IO.slack.ops@motherbee":          true,
+		"AI.helper@motherbee":             true,
+		"IO.audit@motherbee":              true,
+		"IO.slack.supervisores@motherbee": true,
+		"AI.stranger@motherbee":           false,
+	} {
+		if got := def.Involves(name); got != want {
+			t.Fatalf("%s: involves = %v, want %v", name, got, want)
+		}
+	}
+	if payload := def.Catch[1].Actions[1].Payload.(map[string]any); payload["count"] != int64(3) || payload["ratio"] != 1.5 {
+		t.Fatalf("the catch's numbers: %#v", payload)
+	}
+	var paths []string
+	def.eachAction(func(path string, _ ActionDefinition) { paths = append(paths, path) })
+	if got := strings.Join(paths[len(paths)-4:], " "); got != "catch[0].actions[0] catch[0].actions[1] catch[1].actions[0] catch[1].actions[1]" {
+		t.Fatalf("eachAction ends with the catch's actions: %v", paths)
+	}
+}
+
+// Case 3 (wf-orchestration-v1 §5.3.6): what a guard, a set_variable value or a $ref reads of an
+// agent's evaluation is checked against the definition's menus. A comparison of the option with a
+// string literal (==, !=, in) names an option of one of them, or none; a read of a param names a
+// param of one of them, or reason.
+func TestTheEvaluationReadsAreCheckedAgainstTheMenus(t *testing.T) {
+	guard := func(expr string) error {
+		t.Helper()
+		quoted, _ := json.Marshal(expr)
+		_, err := loadChanged(t, `"guard": "event.context.evaluation.option == 'invoice'"`, `"guard": `+string(quoted))
+		return err
+	}
+	for _, valid := range []string{
+		"event.context.evaluation.option == 'none'",
+		"event.context.evaluation.option != 'answer'",
+		"'invoice' == event.context.evaluation.option",
+		"event.context.evaluation.option in ['answer', 'none']",
+		"event['context']['evaluation']['option'] == 'consult'",
+		"event.context.evaluation.params.reason != ''",
+		"has(event.context.evaluation.params.plan) && event.context.evaluation.params['quantity'] > 1",
+		"event.context.evaluation.option == state.expected",
+		"event.context.evaluation.option.startsWith('inv')",
+		"event.payload.option == 'anything' && state.params.x == 1",
+	} {
+		if err := guard(valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+	const at = "states[0].transitions[0].guard: "
+	const option = `compares event.context.evaluation.option with "invoce", an option no menu of the definition offers: answer, consult, invoice or none`
+	const param = "reads event.context.evaluation.params.qty, a param no menu of the definition offers: plan, quantity, question or reason"
+	for expr, want := range map[string]string{
+		"event.context.evaluation.option == 'invoce'":                      at + option,
+		"event.context.evaluation.option != 'invoce'":                      at + option,
+		"'invoce' == event.context.evaluation.option":                      at + option,
+		"event.context.evaluation.option in ['answer', 'invoce']":          at + option,
+		"event['context']['evaluation']['option'] == 'invoce'":             at + option,
+		"true && (state.x || event.context.evaluation.option == 'invoce')": at + option,
+		"event.context.evaluation.params.qty > 1":                          at + param,
+		"has(event.context.evaluation.params.qty)":                         at + param,
+		"event.context.evaluation.params['qty'] == 1":                      at + param,
+		"event.context.evaluation.params.qty.size() > 0":                   at + param,
+		"[1].exists(x, x == event.context.evaluation.params.qty)":          at + param,
+		"event.context.evaluation.option == 'Invoice'":                     at + `compares event.context.evaluation.option with "Invoice"`,
+	} {
+		assertErrorContains(t, guard(expr), want)
+	}
+	// A typo read twice is one error.
+	if err := guard("event.context.evaluation.option == 'invoce' || event.context.evaluation.option == 'invoce'"); err == nil || strings.Count(err.Error(), `"invoce"`) != 1 {
+		t.Fatalf("one error per typo: %v", err)
+	}
+
+	// A set_variable value, and a $ref in a payload, a meta.context, vars or a timer's time.
+	_, err := loadChanged(t, `"value": "{'quantity': event.context.evaluation.params.quantity}"`, `"value": "{'quantity': event.context.evaluation.params.qty}"`)
+	assertErrorContains(t, err, "states[0].transitions[0].actions[0].value: "+param)
+	const ref = "reads event.context.evaluation.params.qustion, a param no menu of the definition offers: plan, quantity, question or reason"
+	for to, want := range map[string]string{
+		`{"$ref": "event.context.evaluation.params.qustion"}`:                 "states[0].transitions[1].actions[0].payload.content.$ref: " + ref,
+		`{"$ref": "event.context.evaluation.params.qustion", "default": "?"}`: "states[0].transitions[1].actions[0].payload.content.$ref: " + ref,
+		`[{"$ref": "event.context.evaluation.params.qustion.text"}]`:          "states[0].transitions[1].actions[0].payload.content[0].$ref: " + ref,
+	} {
+		_, err := loadChanged(t, `{"$ref": "event.context.evaluation.params.question"}`, to)
+		assertErrorContains(t, err, want)
+	}
+	for to, want := range map[string]string{
+		`"meta": {"msg": "CONSULT", "context": {"q": {"$ref": "event.context.evaluation.params.qustion"}}}`: "states[0].transitions[1].actions[0].meta.context.q.$ref: " + ref,
+		`"meta": {"msg": "CONSULT"}, "vars": {"q": {"$ref": "event.context.evaluation.params.qustion"}}`:    "states[0].transitions[1].actions[0].vars.q.$ref: " + ref,
+	} {
+		_, err := loadChanged(t, `"meta": {"msg": "CONSULT"}`, to)
+		assertErrorContains(t, err, want)
+	}
+	_, err = loadChanged(t, `{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer"}, {"type": "schedule_timer", "timer_key": "t", "fire_in": {"$ref": "event.context.evaluation.params.due_in"}}`)
+	assertErrorContains(t, err, "states[0].entry_actions[1].fire_in.$ref: reads event.context.evaluation.params.due_in")
+	for _, valid := range []string{`{"$ref": "event.context.evaluation.params.reason"}`, `{"$ref": "event.context.evaluation.option"}`, `{"$ref": "event.context.evaluation"}`} {
+		if _, err := loadChanged(t, `{"$ref": "event.context.evaluation.params.question"}`, valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+
+	// The catch's guards are checked too, and a menu in the catch counts.
+	_, err = loadCatch(t, `{"event_match": {}, "guard": "event.context.evaluation.option == 'nada'"}`)
+	assertErrorContains(t, err, `catch[0].guard: compares event.context.evaluation.option with "nada"`)
+	if _, err := LoadDefinitionBytes([]byte(strings.Replace(catchWorkflowJSON(`{"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.helper@motherbee", "menu": {"options": [{"name": "retry", "description": "Try again.", "params": {"hint": {"type": "string"}}}]}}]}`),
+		`"guard": "event.context.evaluation.option == 'invoice'"`, `"guard": "event.context.evaluation.option == 'retry' && event.context.evaluation.params.hint != ''"`, 1)), "", fixedClock); err != nil {
+		t.Fatalf("a menu in the catch: %v", err)
+	}
+
+	// Without a menu, only none and reason are an agent's.
+	data := strings.Replace(validWorkflowJSON(), `"guard": "event.payload.complete == true"`, `"guard": "event.context.evaluation.option == 'ok' && event.context.evaluation.params.why != ''"`, 1)
+	_, err = LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, `states[0].transitions[0].guard: compares event.context.evaluation.option with "ok", an option no menu of the definition offers: none`)
+	assertErrorContains(t, err, "states[0].transitions[0].guard: reads event.context.evaluation.params.why, a param no menu of the definition offers: reason")
 }

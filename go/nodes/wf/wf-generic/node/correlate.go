@@ -284,6 +284,11 @@ func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanc
 			// than a half-initialized running state.
 			return inst.routeToFailed(ctx, msg, rt.ActCtx, err, taken)
 		}
+		// The message that starts an instance is its first trigger: a send the cap on agent calls
+		// did not make tells the instance, as after any transition.
+		if capped, ok := inst.agentCallCapEvent(msg, rt.ActCtx); ok {
+			emitted = append(emitted, capped)
+		}
 		if inst.isTerminalState(initialState.Name) {
 			now := nowMS(rt.ActCtx.Clock)
 			inst.Status = terminalStatus(initialState.Name, inst.def.TerminalStates)

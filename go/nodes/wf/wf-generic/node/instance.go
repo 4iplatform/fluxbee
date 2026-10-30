@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -21,6 +22,21 @@ const maxInternalEventsPerEvent = 100
 // queued internal event): a row run that many times without finishing is a poison event that takes
 // the node down, and the next start fails its instance instead (causeReplayExhausted).
 const maxReplayAttempts = 3
+
+// maxAgentCallsPerTrigger bounds the messages an instance sends to agents (AI.*) between two
+// triggers (wf-orchestration-v1 §5.3.3): a trigger is a message from a node that is no agent (an IO
+// node, a WF) or a timer's fire. Past it a send to an agent is not made, the transition goes on,
+// and the instance gets one AGENT_CALL_CAP internal event per trigger, an error it may take. So a
+// definition whose agents keep answering each other, or whose catch asks a failing agent again,
+// stops there (FINDINGS A-125), and the instance never fails for it.
+const maxAgentCallsPerTrigger = 8
+
+// msgAgentCallCap names the internal event of a trigger that reached the cap, and codeAgentCallCap
+// is the code of its error payload.
+const (
+	msgAgentCallCap  = "AGENT_CALL_CAP"
+	codeAgentCallCap = "agent_call_cap"
+)
 
 // Why the engine fails an instance on its own. The "FAILED in <state>" entry of the instance's log
 // (and the journal's line) starts its detail with the cause's name.
@@ -69,6 +85,19 @@ type WFInstance struct {
 	// writes: kept since the last commit that went through.
 	kept      map[string]keptMessage
 	keptSince map[string]bool
+	// calls counts the messages sent to agents since the instance's last trigger. It lives in memory:
+	// a restart starts the count again.
+	calls agentCalls
+}
+
+// agentCalls is an instance's count of the messages it sent to agents (AI.*) since its last trigger
+// (maxAgentCallsPerTrigger).
+type agentCalls struct {
+	sent int
+	// skipped is the agent of the trigger's first send past the cap, and reported says its
+	// AGENT_CALL_CAP event went.
+	skipped  string
+	reported bool
 }
 
 // keptMessage is a message keep_message kept: as received, and as the store keeps it.
@@ -188,12 +217,21 @@ func (inst *WFInstance) Unlock() { inst.mu.Unlock() }
 // RunTransition processes an incoming event against the current state.
 // It must be called with mu held by the caller.
 //
+// The first transition of the current state whose event_match and guard take the event runs; when
+// none does, the first of the definition's catch (wf-orchestration-v1 §5.3.2); when the catch takes
+// nothing either, the default logs the event, in the instance's log and in the node's, and the
+// instance stays where it was.
+//
 // Execution model (act-then-commit, at least once): the event is durable before this runs (in the
 // inbound journal or the internal-event queue, taken), the actions run (exit → transition →
 // entry), and one commit writes the new state, enqueues the internal events and deletes the taken
 // event. A crash before the commit leaves the event for recovery, which runs it again: its sends
 // go again, with the same trace_id.
 func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, actx ActionContext, taken takenEvent) error {
+	if startsATrigger(event) {
+		inst.calls = agentCalls{}
+	}
+
 	// Fast-path: cancelling → immediate transition to 'cancelled'
 	if inst.Status == "cancelling" {
 		return inst.runCancelTransition(ctx, event, actx, taken)
@@ -208,25 +246,18 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	// Build the event map for CEL + $ref resolution
 	eventMap := messageToMap(event)
 
-	// Find the first matching + passing transition
-	var chosen *TransitionDefinition
-	for i := range stateDef.Transitions {
-		t := &stateDef.Transitions[i]
-		if !matchesEvent(t.EventMatch, event) {
-			continue
-		}
-		if t.Program == nil {
-			log.Printf("instance %s: transition %d has no compiled program, skipping", inst.InstanceID, i)
-			continue
-		}
-		if EvalGuard(t.Program, inst.Input, inst.StateVars, eventMap) {
-			chosen = t
-			break
-		}
+	// The first transition that takes the event: the state's, then the catch's.
+	chosen, _ := inst.chooseTransition(stateDef.Transitions, event, eventMap, matchesEvent)
+	caughtBy := -1
+	if chosen == nil {
+		chosen, caughtBy = inst.chooseTransition(inst.def.Catch, event, eventMap, catchMatches)
 	}
 
 	if chosen == nil {
-		// Log unhandled event and return without state change
+		// The default: the event is logged, in the instance's log and in the node's (both local,
+		// wf-orchestration-v1 §5.3.2), and the instance stays where it was.
+		log.Printf("instance %s: unhandled event %s in state %s (trace_id=%s): no transition of the state nor of the catch takes it",
+			inst.InstanceID, eventName(event), inst.CurrentState, event.Routing.TraceID)
 		now := nowMS(actx.Clock)
 		_ = actx.Store.AppendLog(ctx, WFLogEntry{
 			InstanceID:  inst.InstanceID,
@@ -280,6 +311,10 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 			return inst.routeToFailed(ctx, event, actx, err, taken)
 		}
 	}
+	// A send the cap on agent calls did not make tells the instance, after the transition.
+	if capped, ok := inst.agentCallCapEvent(event, actx); ok {
+		emitted = append(emitted, capped)
+	}
 
 	// Commit the new state
 	inst.CurrentTraceID = ""
@@ -305,6 +340,9 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	summary := fmt.Sprintf("transition %s → %s", prevState, inst.CurrentState)
 	if internal {
 		summary = fmt.Sprintf("internal transition in %s on %s", inst.CurrentState, eventName(event))
+	}
+	if caughtBy >= 0 {
+		summary = fmt.Sprintf("catch[%d]: %s", caughtBy, summary)
 	}
 	_ = actx.Store.AppendLog(ctx, WFLogEntry{
 		InstanceID: inst.InstanceID,
@@ -415,7 +453,15 @@ func (inst *WFInstance) runActions(ctx context.Context, actions []ActionDefiniti
 		ok := err == nil
 		detail := ""
 		fatal := false
-		if err != nil {
+		var capped agentCallCapError
+		switch {
+		case err == nil:
+		case errors.As(err, &capped):
+			// Past the cap on agent calls the send is not made, whatever its on_error, and the
+			// transition's other actions run.
+			detail = err.Error()
+			log.Printf("instance %s: %s (%s) not sent: %v", inst.InstanceID, path, action.Type, err)
+		default:
 			detail = err.Error()
 			fatal = !bestEffort && action.EffectiveOnError() == OnErrorFail
 			if fatal {
@@ -584,9 +630,28 @@ func terminalStatus(stateName string, terminalStates []string) string {
 	}
 }
 
+// chooseTransition is the first of transitions whose event_match matches event (by matches) and
+// whose guard passes, and its index; nil and -1 when none does.
+func (inst *WFInstance) chooseTransition(transitions []TransitionDefinition, event sdk.Message, eventMap map[string]any, matches func(EventMatch, sdk.Message) bool) (*TransitionDefinition, int) {
+	for i := range transitions {
+		t := &transitions[i]
+		if !matches(t.EventMatch, event) {
+			continue
+		}
+		if t.Program == nil {
+			log.Printf("instance %s: transition %d has no compiled program, skipping", inst.InstanceID, i)
+			continue
+		}
+		if EvalGuard(t.Program, inst.Input, inst.StateVars, eventMap) {
+			return t, i
+		}
+	}
+	return nil, -1
+}
+
 // matchesEvent checks whether a transition's event_match matches the incoming message: by its msg,
 // by its sender (src, the name the router stamps), or by both, and then both must match. An
-// event_match with neither (validation refuses it) matches nothing.
+// event_match with neither (validation refuses it in a state) matches nothing.
 func matchesEvent(match EventMatch, msg sdk.Message) bool {
 	if strings.TrimSpace(match.Msg) == "" && match.Src == "" {
 		return false
@@ -595,6 +660,87 @@ func matchesEvent(match EventMatch, msg sdk.Message) bool {
 		return false
 	}
 	return match.Src == "" || msg.SourceL2Name() == match.Src
+}
+
+// catchMatches is matchesEvent for a transition of the catch, whose empty event_match matches every
+// event.
+func catchMatches(match EventMatch, msg sdk.Message) bool {
+	if strings.TrimSpace(match.Msg) == "" && match.Src == "" {
+		return true
+	}
+	return matchesEvent(match, msg)
+}
+
+// startsATrigger reports whether event starts a new count of the instance's agent calls
+// (maxAgentCallsPerTrigger): a timer's fire, or a message from a node that is no agent (an IO node,
+// a WF). An agent's answer and an internal event go on with the count of the trigger they follow.
+func startsATrigger(event sdk.Message) bool {
+	if sdk.IsSystemKind(event.Meta.MsgType) {
+		return rawMsgName(event) == sdk.MsgTimerFired
+	}
+	sender := event.SourceL2Name()
+	return sender != "" && !wfcel.IsAgent(sender)
+}
+
+// callAgent counts a send to target against the cap of the instance's trigger when target is an
+// agent: one past maxAgentCallsPerTrigger is refused (agentCallCapError), and is not made.
+func (inst *WFInstance) callAgent(target string) error {
+	if !wfcel.IsAgent(target) {
+		return nil
+	}
+	if inst.calls.sent >= maxAgentCallsPerTrigger {
+		if inst.calls.skipped == "" {
+			inst.calls.skipped = target
+		}
+		return agentCallCapError{target: target}
+	}
+	inst.calls.sent++
+	return nil
+}
+
+// agentCallCapError is a send to an agent past the cap of its trigger: it is not made, whatever its
+// on_error.
+type agentCallCapError struct {
+	target string
+}
+
+func (e agentCallCapError) Error() string {
+	return codeAgentCallCap + ": " + agentCallCapMessage(e.target)
+}
+
+// agentCallCapMessage says why the send to target was not made.
+func agentCallCapMessage(target string) string {
+	return fmt.Sprintf("%d messages went to agents since the last trigger (a message from an IO node or a WF, or a timer's fire), the most there may be: the one to %s was not sent",
+		maxAgentCallsPerTrigger, target)
+}
+
+// agentCallCapEvent is the internal event an instance gets after a transition whose send to an agent
+// the cap did not make, once per trigger: AGENT_CALL_CAP, with the error payload {type: error, code:
+// agent_call_cap, message, target: the agent}. It goes through the state's transitions, the catch
+// and the default, as any event.
+func (inst *WFInstance) agentCallCapEvent(event sdk.Message, actx ActionContext) (InternalEventRow, bool) {
+	if inst.calls.skipped == "" || inst.calls.reported {
+		return InternalEventRow{}, false
+	}
+	inst.calls.reported = true
+	payload, err := marshalJSON(map[string]any{
+		"type":    "error",
+		"code":    codeAgentCallCap,
+		"message": agentCallCapMessage(inst.calls.skipped),
+		"target":  inst.calls.skipped,
+	})
+	if err != nil {
+		log.Printf("instance %s: %s not queued: %v", inst.InstanceID, msgAgentCallCap, err)
+		return InternalEventRow{}, false
+	}
+	return InternalEventRow{
+		InstanceID:  inst.InstanceID,
+		MsgType:     wfMsgType,
+		MsgName:     msgAgentCallCap,
+		PayloadJSON: payload,
+		TraceID:     transitionTraceID(inst, event),
+		CreatedAtMS: nowMS(actx.Clock),
+	}, true
 }
 
 // messageToMap converts an sdk.Message to a plain map for use in CEL evaluation

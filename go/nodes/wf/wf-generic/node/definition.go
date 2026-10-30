@@ -18,6 +18,9 @@ type TransitionDefinition = wfcel.TransitionDefinition
 type EventMatch = wfcel.EventMatch
 type ActionMeta = wfcel.ActionMeta
 type ActionDefinition = wfcel.ActionDefinition
+type Menu = wfcel.Menu
+type MenuOption = wfcel.MenuOption
+type MenuParam = wfcel.MenuParam
 type LoadError = wfcel.ValidationError
 
 func LoadDefinitionFile(path string, clock ClockFunc) (*WorkflowDefinition, error) {

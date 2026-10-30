@@ -35,6 +35,29 @@ func TestCompileWorkflowWritesStagedFiles(t *testing.T) {
 	}
 }
 
+// The catch's guards and actions count as the definition's own (wf-orchestration-v1 §5.3.6).
+func TestCompileWorkflowCountsTheCatch(t *testing.T) {
+	svc := newTestService(t)
+	definition := validWorkflowDefinition()
+	definition["catch"] = []any{
+		map[string]any{
+			"event_match": map[string]any{},
+			"guard":       "event.payload.type == 'error'",
+			"actions": []any{
+				map[string]any{"type": "set_variable", "name": "last_error", "value": "event.payload.code"},
+				map[string]any{"type": "emit_internal_event", "meta": map[string]any{"msg": "ERRED"}},
+			},
+		},
+	}
+	meta, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: definition})
+	if err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	if meta.GuardCount != 2 || meta.StateCount != 2 || meta.ActionCount != 5 {
+		t.Fatalf("unexpected counts %#v", meta)
+	}
+}
+
 func TestCompileWorkflowAutoIncrementsVersion(t *testing.T) {
 	svc := newTestService(t)
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {

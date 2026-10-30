@@ -16,24 +16,40 @@ const ValueCostLimit = 1_000_000
 // CompileGuard compiles a guard. Its program checks for an interrupt at every comprehension step, so
 // EvalGuard stops it at GuardEvalTimeout.
 func CompileGuard(expr string, clock ClockFunc) (cel.Program, error) {
-	return compileProgram(expr, clock, cel.InterruptCheckFrequency(1))
+	program, _, err := compileGuard(expr, clock)
+	return program, err
 }
 
 // CompileValue compiles a set_variable value, with ValueCostLimit.
 func CompileValue(expr string, clock ClockFunc) (cel.Program, error) {
+	program, _, err := compileValue(expr, clock)
+	return program, err
+}
+
+// compileGuard and compileValue are CompileGuard and CompileValue with the checked AST, which
+// validation reads (menuNames.exprErrors).
+func compileGuard(expr string, clock ClockFunc) (cel.Program, *cel.Ast, error) {
+	return compileProgram(expr, clock, cel.InterruptCheckFrequency(1))
+}
+
+func compileValue(expr string, clock ClockFunc) (cel.Program, *cel.Ast, error) {
 	return compileProgram(expr, clock, cel.CostLimit(ValueCostLimit))
 }
 
-func compileProgram(expr string, clock ClockFunc, opts ...cel.ProgramOption) (cel.Program, error) {
+func compileProgram(expr string, clock ClockFunc, opts ...cel.ProgramOption) (cel.Program, *cel.Ast, error) {
 	env, err := NewGuardEnv(clock)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	ast, issues := env.Compile(expr)
+	checked, issues := env.Compile(expr)
 	if issues != nil && issues.Err() != nil {
-		return nil, issues.Err()
+		return nil, nil, issues.Err()
 	}
-	return env.Program(ast, opts...)
+	program, err := env.Program(checked, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return program, checked, nil
 }
 
 // EvalGuard evaluates a guard on the caller's goroutine, stopped at GuardEvalTimeout. A guard that

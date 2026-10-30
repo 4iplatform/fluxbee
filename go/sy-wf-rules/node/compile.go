@@ -77,26 +77,36 @@ func configCompileRequest(msg fluxbeesdk.Message) (CompileRequest, error) {
 	return decodeCompileRequest(payload.Config)
 }
 
+// countGuards and countActions count the guards and actions of the states' transitions and of the
+// catch's, which are the definition's own as well.
 func countGuards(def *wfcel.WorkflowDefinition) int {
 	total := 0
-	for _, state := range def.States {
-		for _, transition := range state.Transitions {
+	count := func(transitions []wfcel.TransitionDefinition) {
+		for _, transition := range transitions {
 			if strings.TrimSpace(transition.Guard) != "" {
 				total++
 			}
 		}
 	}
+	for _, state := range def.States {
+		count(state.Transitions)
+	}
+	count(def.Catch)
 	return total
 }
 
 func countActions(def *wfcel.WorkflowDefinition) int {
 	total := 0
-	for _, state := range def.States {
-		total += len(state.EntryActions)
-		total += len(state.ExitActions)
-		for _, transition := range state.Transitions {
+	count := func(transitions []wfcel.TransitionDefinition) {
+		for _, transition := range transitions {
 			total += len(transition.Actions)
 		}
 	}
+	for _, state := range def.States {
+		total += len(state.EntryActions)
+		total += len(state.ExitActions)
+		count(state.Transitions)
+	}
+	count(def.Catch)
 	return total
 }

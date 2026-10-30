@@ -285,7 +285,7 @@ A sketch (`...` stands for the parts of the definition):
 
 Note that `ok: true` in this case reflects that sy.wf-rules successfully persisted the new definition. The node-level failure is reported in `wf_node.action`, not in the top-level error. This distinguishes "sy.wf-rules did its job but the downstream restart failed" from "sy.wf-rules itself failed". The operator typically reacts to `wf_node.action != "restarted"` with a retry or rollback.
 
-**Error** (with `evnt.payload.ok == true` as the first guard of the third state; a guard is checked for its syntax and its roots, not for its fields):
+**Error** (with `evnt.payload.ok == true` as the first guard of the third state; a guard is checked for its syntax and its roots, not for its fields, but for what it reads of an agent's evaluation, which must be an option or a param of one of the definition's menus):
 ```json
 {
   "ok": false,

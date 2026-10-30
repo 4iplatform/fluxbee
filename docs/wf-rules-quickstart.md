@@ -52,15 +52,17 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
 
 The workflow of the spec's case study (`docs/spec-systemnode-wf-v1_1.md` §19). The billing
 system asks for an invoice through its IO node, `IO.api.billing@motherbee`, the only node in its
-`start_from`. It asks an agent to check the customer's data, for a structured answer; creates the
-invoice through `IO.quickbooks`; and asks the billing agent to deliver it. When data is missing, it
-tells the billing agent and ends: the agent asks the customer, who answers it, never a WF instance,
-and the billing system asks for the invoice again once it has the data.
+`start_from`. It asks an agent, with a menu, whether the customer's data is complete; creates the
+invoice through `IO.quickbooks`; and asks the billing agent, with a menu, to deliver it. When data
+is missing, it tells the billing agent and ends: the agent asks the customer, who answers it, never
+a WF instance, and the billing system asks for the invoice again once it has the data. Its catch
+fails the request when an agent finds that no option fits (`none`).
 
 A WF that sits at an IO node's exit and hands a conversation among agents is the example package
-`go/nodes/wf/examples/packages/wf.sales.invoice` (`docs/wf-orchestration-v1.md` §5.2): it uses
-`forward`, `keep_message`, the WF's block and a timer time from an agent's answer (§4), and
-internal transitions (§5).
+`go/nodes/wf/examples/packages/wf.sales.invoice` (`docs/wf-orchestration-v1.md` §5.2 and §5.3): it
+uses `forward`, `keep_message`, the WF's block, menus and a timer time from an agent's answer (§4),
+internal transitions and a catch (§5), and asks the supervisors through their IO node,
+`IO.slack.supervisores`, when sales chooses `consult`.
 
 ```json
 {
@@ -90,10 +92,20 @@ internal transitions (§5).
   },
   "initial_state": "validating_data",
   "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
+  "catch": [
+    {
+      "event_match": {},
+      "guard": "event.context.evaluation.option == 'none'",
+      "target_state": "failed",
+      "actions": [
+        { "type": "set_variable", "name": "failure_reason", "value": "'no option fits: ' + event.context.evaluation.params.reason" }
+      ]
+    }
+  ],
   "states": [
     {
       "name": "validating_data",
-      "description": "Asking AI.billing-validator, for a structured answer, whether the customer's data is complete.",
+      "description": "Asking AI.billing-validator, with a menu, whether the customer's data is complete.",
       "entry_actions": [
         {
           "type": "set_variable",
@@ -103,19 +115,17 @@ internal transitions (§5).
         {
           "type": "send_message",
           "target": "AI.billing-validator@motherbee",
-          "meta": {
-            "msg": "VALIDATE_INVOICE_DATA",
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "required": ["complete", "missing"],
-                "properties": {
-                  "complete": { "type": "boolean" },
-                  "missing": { "type": "string" }
-                }
+          "meta": { "msg": "VALIDATE_INVOICE_DATA" },
+          "menu": {
+            "help": "The billing system asks for an invoice, which is issued only when the customer's data is complete.",
+            "options": [
+              { "name": "complete", "description": "The customer's data is complete." },
+              {
+                "name": "missing",
+                "description": "The invoice needs data the customer has not given.",
+                "params": { "missing": { "type": "string", "description": "What is missing." } }
               }
-            }
+            ]
           },
           "payload": { "type": "text", "content": { "$ref": "state.validation_request" } }
         },
@@ -132,7 +142,7 @@ internal transitions (§5).
       "transitions": [
         {
           "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
-          "guard": "json_parse(event.payload.content).complete == true",
+          "guard": "event.context.evaluation.option == 'complete'",
           "target_state": "creating_invoice",
           "actions": [
             { "type": "set_variable", "name": "validated_at", "value": "now()" }
@@ -140,13 +150,13 @@ internal transitions (§5).
         },
         {
           "event_match": { "msg": "VALIDATE_INVOICE_DATA" },
-          "guard": "json_parse(event.payload.content).complete == false",
+          "guard": "event.context.evaluation.option == 'missing'",
           "target_state": "missing_data_requested",
           "actions": [
             {
               "type": "set_variable",
               "name": "missing_data_request",
-              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, json_parse(event.payload.content).missing])"
+              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, event.context.evaluation.params.missing])"
             }
           ]
         },
@@ -240,21 +250,21 @@ internal transitions (§5).
     },
     {
       "name": "delivering_to_customer",
-      "description": "Asking the billing agent, for a structured answer, to send the invoice to the customer.",
+      "description": "Asking the billing agent, with a menu, to send the invoice to the customer.",
       "entry_actions": [
         {
           "type": "send_message",
           "target": "AI.billing@motherbee",
-          "meta": {
-            "msg": "DELIVER_INVOICE",
-            "context": {
-              "response_envelope": {
-                "kind": "json_object_v1",
-                "strict": true,
-                "required": ["delivered"],
-                "properties": { "delivered": { "type": "boolean" } }
+          "meta": { "msg": "DELIVER_INVOICE" },
+          "menu": {
+            "options": [
+              { "name": "delivered", "description": "You sent the customer the invoice." },
+              {
+                "name": "undelivered",
+                "description": "You could not send it.",
+                "params": { "why": { "type": "string" } }
               }
-            }
+            ]
           },
           "payload": { "type": "text", "content": { "$ref": "state.delivery_request" } }
         },
@@ -271,16 +281,16 @@ internal transitions (§5).
       "transitions": [
         {
           "event_match": { "msg": "DELIVER_INVOICE" },
-          "guard": "json_parse(event.payload.content).delivered == true",
+          "guard": "event.context.evaluation.option == 'delivered'",
           "target_state": "completed",
           "actions": []
         },
         {
           "event_match": { "msg": "DELIVER_INVOICE" },
-          "guard": "true",
+          "guard": "event.context.evaluation.option == 'undelivered'",
           "target_state": "failed",
           "actions": [
-            { "type": "set_variable", "name": "failure_reason", "value": "'the agent did not deliver the invoice'" }
+            { "type": "set_variable", "name": "failure_reason", "value": "'not delivered: ' + event.context.evaluation.params.why" }
           ]
         },
         {
@@ -363,9 +373,9 @@ Expected response:
         "hash": "sha256:...",
         "workflow_name": "invoice",
         "compiled_at": "2026-10-29T12:00:00Z",
-        "guard_count": 11,
+        "guard_count": 12,
         "state_count": 7,
-        "action_count": 22
+        "action_count": 23
       }
     }
   },
@@ -398,7 +408,9 @@ If there are validation errors (an invalid CEL guard, a referenced state that do
 
 A guard is checked for its syntax and its roots (`input`, `state`, `event`), not for its fields: a
 misspelled field (`event.payload.complette`) compiles, and at run time it is a guard that errs, so
-false.
+false. What it reads of an agent's evaluation is the exception (§4, `menu`): an option or a param
+that no menu of the definition offers (`event.context.evaluation.option == 'complet'`) is refused,
+by its path.
 
 ### 2.2 Apply (promote staged and deploy)
 
@@ -545,8 +557,8 @@ Guards are [CEL](https://github.com/google/cel-go) expressions that decide wheth
 | `event` | The message that just arrived and triggered the evaluation |
 
 Built-in functions: `now()` returns the WF node's clock as Unix milliseconds (UTC), and
-`json_parse(text)` decodes a JSON string (an agent's structured answer, say); CEL's string
-extensions are there too (`format`, `join`, `split`, ...).
+`json_parse(text)` decodes a JSON string; CEL's string extensions are there too (`format`, `join`,
+`split`, ...).
 
 **Numbers.** A JSON integer is an `int` and any other number a `double`, in `input`, `state` and
 `event` alike, live and after a restart, and in the definition's own literals. A comparison or an
@@ -556,8 +568,8 @@ equality between an `int` and a `double` works when a side comes from `input`, `
 
 `event` holds `msg`, `type`, `thread_id`, `trace_id`, `src` (the node that sent it, as the router
 stamps it), `context` and `payload`; for a `TIMER_FIRED`, also `timer_key`, the key the timer was
-scheduled with. An agent's answer to a response contract that names a `text_field` carries its
-whole evaluation in `event.context.evaluation`, and the text in `event.payload.content`.
+scheduled with. An agent's answer to a menu (§4) carries its choice in `event.context.evaluation`,
+`{reply, option, params}`, and its `reply` in `event.payload.content`.
 
 **Bounds.** A guard runs at most 10 ms: it is stopped there, and a guard that is stopped or errs is
 false. A `set_variable` value has a cost limit (1,000,000 CEL cost units): past it the action fails.
@@ -579,12 +591,19 @@ has(event.payload.missing_data)
 event.timer_key == 'validation_timeout'
 ```
 
-**Branch on an agent's evaluation** (a response contract with a `text_field`):
+**Branch on the option an agent chose** (its menu's, §4), **and read its params:**
 ```
-event.context.evaluation.area == 'invoice'
+event.context.evaluation.option == 'invoice'
+event.context.evaluation.params.quantity > 5
 ```
 
-**An agent's error answer** (to a forwarded message, which has no `msg`):
+**The agent found that no option fits** (`none`, with the param `reason`):
+```
+event.context.evaluation.option == 'none'
+```
+
+**An agent's error answer** (to a forwarded message, which has no `msg`), an answer off its menu
+included:
 ```
 event.payload.type == 'error'
 ```
@@ -649,27 +668,68 @@ instance; a field that holds `null` gives `null`. For a field that may be missin
 it is `null`. A `$ref` holds only `$ref` and `default`, and its default is a literal: anything else
 is refused at load (a typo such as `defualt` included), by its path.
 
-`meta.context` is resolved the same way, and goes on the message's `meta.context`: to ask an agent for
-a structured answer, `"context": {"response_envelope": {...}}`, checked at load by the rules the
-agent reads it with: `kind` `json_object_v1`, `required` names among the `properties`, each of type
-string, boolean, integer or number, `enum` on a string only. An agent answers with the request's
-`msg`. Its error answer is a payload of type `error`, which needs a transition of its own; its
-`msg` is `<msg>.error` only when the request had a `msg` (a forwarded person's message has none, so
-the guard `event.payload.type == 'error'` takes it). A contract that names a `text_field` (a
-required string property) gets the answer's text in that field, and the whole object in
-`event.context.evaluation`.
+`meta.context` is resolved the same way, and goes on the message's `meta.context` (the person's
+`context.io` an IO node gave, say). It never writes `wf`, the WF's block below, nor
+`response_envelope`: a WF asks an agent with a `menu`, and a definition with
+`meta.context.response_envelope` is refused, by its path.
 
 `vars`, an object resolved the same way, goes in the WF's block, below.
+
+### `menu` — ask an agent to choose
+
+A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer it a menu: what it
+may do, fixed in the definition and never in its role.
+
+```json
+{
+  "type": "forward",
+  "target": "AI.sales@worker1",
+  "message": "customer",
+  "menu": {
+    "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+    "options": [
+      { "name": "answer", "description": "You answer the person yourself." },
+      { "name": "invoice", "description": "They accepted the quote and ask for the invoice.",
+        "params": { "quantity": { "type": "integer" }, "plan": { "type": "string", "enum": ["basic", "pro"] } } },
+      { "name": "consult", "description": "A supervisor must approve something before you answer.",
+        "params": { "question": { "type": "string", "description": "What you ask, with the data to decide." } } }
+    ]
+  }
+}
+```
+
+- **The menu, checked at load:** `help` is optional, up to 600 characters; 1 to 8 options, each
+  with a `name` (`^[a-z][a-z0-9_]{0,31}$`, unique in its menu, never `none`), a `description` of 1 to
+  200 characters and up to 8 `params`. A param has a name of the same pattern, a `type` (`string`,
+  `boolean`, `integer` or `number`), an optional `description` up to 200 characters and, for a
+  string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode
+  code points. The menu is literal (no `$ref`), and a field it does not have is refused at every
+  level, by its path, as the agent refuses it.
+- **On the wire** it goes in the WF's block, `meta.context.wf.menu`, as written, with no empty field.
+- **The answer** is `{reply, option, params}`, in `event.context.evaluation`, and `reply`, the text
+  for the person, is its payload's text, which the WF forwards or not. The agent adds `none` to
+  every menu, with the param `reason`: none of the options fits.
+- **An answer off the menu is an error,** with no retries: an option the menu does not have, a
+  missing or mistyped param, or no JSON at all come back as a payload of type `error`
+  (`invalid_structured_output`).
+- **What reads the answer is checked against the menus:** a guard that compares
+  `event.context.evaluation.option` with a string (`==`, `!=`, `in`) names an option of one of the
+  definition's menus, or `none`; a guard, a `set_variable` value or a `$ref` that reads
+  `event.context.evaluation.params.<p>` names a param of one of them, or `reason`.
+
+An agent answers with the request's `msg`. Its error answer is a payload of type `error`, which needs
+a transition of its own, or the catch's (§5); its `msg` is `<msg>.error` only when the request had a
+`msg` (a forwarded person's message has none, so the guard `event.payload.type == 'error'` takes it).
 
 ### The WF's block, `meta.context.wf`
 
 Every message a WF sends, a `send_message` or a `forward`, carries it: `trail`, the nodes the
-message went through, and `vars`, what the action's `vars` writes (left out without one). An agent
-shows it to its model before the person's text, and never sends it back. An action's
-`meta.context` never writes `wf`.
+message went through; `vars`, what the action's `vars` writes; and `menu`, the action's menu (each
+left out when the action has none). An agent shows it to its model before the person's text, and
+never sends it back. An action's `meta.context` never writes `wf`.
 
 ```json
-{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "quantity": 10 } } } }
+{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "quantity": 10 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
 ```
 
 ### `forward` — send a message on as it was received
@@ -679,8 +739,9 @@ shows it to its model before the person's text, and never sends it back. An acti
   "type": "forward",
   "target": "AI.invoice@worker1",
   "message": "customer",
-  "meta": { "context": { "response_envelope": { "kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply"], "properties": { "reply": { "type": "string" } } } } },
-  "vars": { "order": { "$ref": "state.order" } }
+  "meta": { "context": { "io": { "$ref": "state.io" } } },
+  "vars": { "order": { "$ref": "state.order" } },
+  "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." }, { "name": "handback", "description": "Sales takes the conversation back." } ] }
 }
 ```
 
@@ -771,6 +832,11 @@ workflow
 ├── input_schema          JSON Schema of the event that creates instances
 ├── initial_state         name of the state where instances start
 ├── terminal_states       list of states that end the instance
+├── catch[]               optional: transitions tried when no transition of the current state takes an event
+│   ├── event_match       as a state's, or {} (every event)
+│   ├── guard             CEL expression → true/false
+│   ├── target_state      optional, as a state's
+│   └── actions[]         send_message, forward, keep_message, set_variable, emit_internal_event
 └── states[]
     ├── name              unique state name
     ├── description       free text
@@ -797,6 +863,24 @@ by both, and then both must match: a person's message and an agent's answer to i
 A transition without a `target_state` is **internal**: it runs its actions and stays in its state,
 with no exit or entry actions (its timers keep running), as when a due date that fires while an
 agent answers is noted for the next state.
+
+**The catch**, as in .NET's `try`/`catch`: when no transition of the current state takes an event,
+in any state, the definition's `catch` transitions are tried in order, and a chosen one runs as a
+state's (with a `target_state`, the current state's exit actions, its own and the target's entry
+actions; without one, it stays). A state can take `none` or an error itself first, as a local
+`try` does. What reaches the catch: an agent's `none`, an agent's error (an answer off the menu, a
+timeout it reports, a provider failure), and any event no transition took; its guards tell them
+apart (`event.context.evaluation.option == 'none'`, `event.payload.type == 'error'`).
+- An empty `event_match` matches every event, a timer's fire and an internal event included.
+- It sets no timers: it goes to a state whose entry actions set them.
+- A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names a
+  `src`, so the event is a node's message: refused at load otherwise, and so are such actions among
+  the exit actions of the states it may leave and the entry actions of its target, when it has one.
+- Its `event_match.src` and its targets are nodes the definition involves (§8).
+
+**The default:** without a catch, or when none of its transitions takes the event, the instance's log
+gets `unhandled event <event> in state <state>`, the node's own log a line naming the instance, the
+state and the event, and the instance stays where it was. Both logs are local.
 
 ---
 
@@ -850,13 +934,15 @@ agent answers is noted for the next state.
 
 **Messages a WF takes:** a `user` message, which starts an instance or reaches the running instance on its thread, and a `TIMER_FIRED`. Any other `system` message is control, never a workflow event: it is dropped and never answered. `event_match` matches on `msg`, `src` or both (a definition with `event_match.type` is refused).
 
-**One instance per conversation, and only the nodes involved:** an instance lives on the thread of the message that started it, and a message on that thread reaches it, but only from a node the definition names: one in `start_from`, in an `event_match.src`, or a target of a `send_message` or a `forward` (and SY.timer for its own timers). Anyone else is dropped, never answered. A message from a `start_from` node on a thread no instance holds starts a new instance there, as `input_schema` allows: a person who writes again after their instance ended starts a new one on the same conversation. `start_from` names IO nodes and WFs, never an agent (which only answers) nor a `SY.*` or `RT.*` node.
+**One instance per conversation, and only the nodes involved:** an instance lives on the thread of the message that started it, and a message on that thread reaches it, but only from a node the definition names: one in `start_from`, in an `event_match.src`, or a target of a `send_message` or a `forward`, the catch's included (and SY.timer for its own timers). Anyone else is dropped, never answered. A message from a `start_from` node on a thread no instance holds starts a new instance there, as `input_schema` allows: a person who writes again after their instance ended starts a new one on the same conversation. `start_from` names IO nodes and WFs, never an agent (which only answers) nor a `SY.*` or `RT.*` node.
 
-**A message the state has no transition for** is logged (`unhandled event ... in state ...`) and dropped: it is never queued for a later state. A definition that may get a message early handles it where it can arrive, with an internal transition (one without `target_state`) when it must not leave the state.
+**A message the state has no transition for** goes to the catch (§5), and when the catch takes nothing either it is logged (`unhandled event ... in state ...`, in the instance's log and the node's) and dropped: it is never queued for a later state. A definition that may get a message early handles it where it can arrive, with an internal transition (one without `target_state`) when it must not leave the state.
 
 **Downstream idempotency:** the WF delivers an event at least once: it saves the event before running its transition, and a crash before the transition commits runs it again at the next start, its creation included. The nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`: a repeated send keeps its `trace_id`. Each start counts the attempts of an event it runs again: one already run at 3 starts (an event that keeps taking the node down) is not run again, its instance fails (`replay_exhausted`), and the node goes on.
 
 **Replies, errors and late answers:** a reply (a `*_RESPONSE`, an `INVALID_INPUT`, an agent's `<msg>.error`) reaches only the instance whose thread it carries; it never starts an instance and is never answered. A late answer from a node outside `start_from` (an agent's, after its instance ended: its timer fired first, say) is dropped, never answered, only while no instance runs on its thread, instead of a new instance that would ask the agent again; once the conversation's next instance runs there, the late answer reaches it, as any message on its thread from a node the definition names. A message that starts no instance (its payload fails `input_schema`) gets an `INVALID_INPUT` only when it is a named request.
+
+**The cap on agent calls:** at most 8 messages go to agents (`AI.*`, a `send_message` or a `forward` each) between two triggers, a trigger being a message from an IO node or a WF, or a timer's fire; an agent's answer and an internal event start no new count. Past the cap the send is not made, the instance's log says so, and the transition's other actions run; after the transition the instance gets one internal event per trigger, `AGENT_CALL_CAP`, with the payload `{"type": "error", "code": "agent_call_cap", "message": ..., "target": <the agent>}`, which goes through the state's transitions, the catch and the default. The instance never fails for it. The count lives in memory: a restart starts it again. So a definition whose agents keep answering each other, or whose catch asks a failing agent again, stops there.
 
 **Limits enforced:** at most 100 internal events may follow one event; past that the instance fails (`internal_event_cap`). A panic in a transition fails that instance (`transition_panic`), never the node. A guard stops at 10 ms (false), a `set_variable` at its cost limit (the action fails), and an event at 3 starts (`replay_exhausted`). The store commits with `synchronous=FULL`, so a transition whose messages went out is on disk.
 
