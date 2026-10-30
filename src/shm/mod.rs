@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{self, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::protocol::MemoryPackage;
@@ -825,6 +826,8 @@ pub struct MemoryRegionWriter {
 pub struct MemoryRegionReader {
     mmap: Mmap,
     layout: RegionLayout,
+    /// The last snapshot read, with the seqlock sequence it was read at (`read_snapshot_cached`).
+    cached: Option<(u64, Arc<MemoryShmSnapshot>)>,
 }
 
 trait SeqHeader {
@@ -2129,7 +2132,7 @@ impl MemoryRegionWriter {
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
-        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)
+        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout).map(|(_, snapshot)| snapshot)
     }
 
     pub fn update_heartbeat(&mut self) {
@@ -2175,12 +2178,33 @@ impl MemoryRegionReader {
         validate_name(name)?;
         let layout = layout_memory();
         let mmap = open_read_only_region(name, layout.total_len)?;
-        Ok(Self { mmap, layout })
+        Ok(Self {
+            mmap,
+            layout,
+            cached: None,
+        })
     }
 
     pub fn read_snapshot(&self) -> Result<MemoryShmSnapshot, ShmError> {
         let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
-        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)
+        read_memory_snapshot(header, self.mmap.as_ref(), &self.layout).map(|(_, snapshot)| snapshot)
+    }
+
+    /// The snapshot, parsed again only when the region changed since the last read. Keyed by the
+    /// seqlock's sequence, which every write moves, a heartbeat's too: a time such as `updated_at`
+    /// can repeat for two writes in the same millisecond, and serve the older one.
+    pub fn read_snapshot_cached(&mut self) -> Result<Arc<MemoryShmSnapshot>, ShmError> {
+        let header = self.header_ref().ok_or(ShmError::InvalidHeader)?;
+        let seq = header.seq.load(Ordering::Acquire);
+        if let Some((cached_seq, snapshot)) = &self.cached {
+            if *cached_seq == seq {
+                return Ok(Arc::clone(snapshot));
+            }
+        }
+        let (seq, snapshot) = read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)?;
+        let snapshot = Arc::new(snapshot);
+        self.cached = Some((seq, Arc::clone(&snapshot)));
+        Ok(snapshot)
     }
 
     pub fn read_header(&self) -> Option<MemoryHeaderSnapshot> {
@@ -2606,13 +2630,17 @@ fn open_read_only_opa_region(name: &str) -> Result<Mmap, ShmError> {
     Ok(mmap)
 }
 
+/// The region's snapshot, and the seqlock sequence it was read at. The payload is copied out
+/// between two reads of the sequence, and copied again when a write moved it, then parsed: a
+/// parse of the region itself could run into a rewrite, fail, and leave a delivery without its
+/// package.
 fn read_memory_snapshot(
     header: &MemoryHeader,
     mmap: &[u8],
     layout: &RegionLayout,
-) -> Result<MemoryShmSnapshot, ShmError> {
+) -> Result<(u64, MemoryShmSnapshot), ShmError> {
     let start = Instant::now();
-    loop {
+    let (seq, payload) = loop {
         if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
             return Err(ShmError::SeqLockTimeout);
         }
@@ -2624,24 +2652,28 @@ fn read_memory_snapshot(
         atomic::fence(Ordering::Acquire);
         let data_size = header.data_size as usize;
         if data_size > MEMORY_MAX_DATA_SIZE {
+            // A size torn by a rewrite is read again; a steady one is a broken region.
+            if header.seq.load(Ordering::Acquire) != s1 {
+                continue;
+            }
             return Err(ShmError::InvalidHeader);
         }
         let data_offset = layout.node_offset;
         let payload = mmap
             .get(data_offset..data_offset + data_size)
-            .ok_or(ShmError::InvalidHeader)?;
-        let snapshot = if payload.is_empty() {
-            MemoryShmSnapshot::default()
-        } else {
-            serde_json::from_slice::<MemoryShmSnapshot>(payload)
-                .map_err(|_| ShmError::InvalidHeader)?
-        };
+            .ok_or(ShmError::InvalidHeader)?
+            .to_vec();
         atomic::fence(Ordering::Acquire);
-        let s2 = header.seq.load(Ordering::Acquire);
-        if s1 == s2 {
-            return Ok(snapshot);
+        if header.seq.load(Ordering::Acquire) == s1 {
+            break (s1, payload);
         }
+    };
+    if payload.is_empty() {
+        return Ok((seq, MemoryShmSnapshot::default()));
     }
+    let snapshot = serde_json::from_slice::<MemoryShmSnapshot>(&payload)
+        .map_err(|_| ShmError::InvalidHeader)?;
+    Ok((seq, snapshot))
 }
 
 fn is_region_valid(mmap: &[u8]) -> bool {
@@ -4118,6 +4150,126 @@ mod tests {
         assert_eq!(roundtrip.threads[0].package.memories.len(), 1);
         assert_eq!(roundtrip.threads[0].package.episodes.len(), 1);
 
+        cleanup_shm(&name);
+    }
+
+    /// A snapshot whose one package carries `fill` bytes of memory summary.
+    fn snapshot_of(fill: usize, updated_at: u64) -> MemoryShmSnapshot {
+        MemoryShmSnapshot {
+            schema_version: 2,
+            updated_at,
+            threads: vec![MemoryShmThreadEntry {
+                thread_id: "thread:t".to_string(),
+                agent_ilk: "ilk:agent".to_string(),
+                agent_node: "AI.test@sandbox".to_string(),
+                package: MemoryPackage {
+                    package_version: 3,
+                    thread_id: "thread:t".to_string(),
+                    dominant_context: None,
+                    dominant_reason: None,
+                    contexts: Vec::new(),
+                    reasons: Vec::new(),
+                    memories: vec![MemorySummary {
+                        memory_id: "memory:t".to_string(),
+                        summary: "x".repeat(fill),
+                        weight: 1.0,
+                        dominant_context_id: None,
+                        dominant_reason_id: None,
+                    }],
+                    episodes: Vec::new(),
+                    turns: Vec::new(),
+                    truncated: None,
+                },
+            }],
+        }
+    }
+
+    /// A read that overlaps a rewrite reads again instead of failing: the payload is copied out
+    /// between two reads of the sequence, and parsed after. Parsed in place, a read could run into
+    /// a rewrite, fail to parse, and leave a delivery without its package. A read may still give up
+    /// on a region that is never still (a timeout), never on a torn payload.
+    #[test]
+    fn a_read_that_overlaps_a_rewrite_reads_again() {
+        let id = Uuid::new_v4().simple().to_string();
+        let name = format!("/jsmem-t-{}", &id[..8]);
+        cleanup_shm(&name);
+        let mut writer =
+            MemoryRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox").expect("writer");
+        writer
+            .write_snapshot(&snapshot_of(2_000_000, 1))
+            .expect("first snapshot");
+        let reader = MemoryRegionReader::open_read_only(&name).expect("reader");
+
+        // Reads run while the writer rewrites the region a dozen times, however long that takes.
+        let written = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rewrites = {
+            let (written, stop) = (Arc::clone(&written), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let snapshots = [snapshot_of(1_500_000, 2), snapshot_of(2_000_000, 3)];
+                while !stop.load(Ordering::Relaxed) {
+                    let next = written.load(Ordering::Relaxed) as usize % 2;
+                    writer.write_snapshot(&snapshots[next]).expect("rewrite");
+                    written.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            })
+        };
+        let (mut read, mut torn) = (0usize, 0usize);
+        let started = Instant::now();
+        while written.load(Ordering::Relaxed) < 12 && started.elapsed() < Duration::from_secs(30) {
+            match reader.read_snapshot() {
+                Ok(snapshot) => {
+                    assert_eq!(snapshot.threads.len(), 1);
+                    read += 1;
+                }
+                Err(ShmError::SeqLockTimeout) => {}
+                Err(_) => torn += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        rewrites.join().expect("the writer");
+        cleanup_shm(&name);
+        assert!(
+            written.load(Ordering::Relaxed) >= 12,
+            "the region was rewritten while read"
+        );
+        assert_eq!(torn, 0, "{read} reads whole");
+        assert!(read > 0);
+    }
+
+    /// The router's cached read parses the region again only after it changes: the same snapshot
+    /// while nothing was written, the new one right after a write, even in the same millisecond.
+    #[test]
+    fn a_cached_read_holds_only_until_the_region_changes() {
+        let id = Uuid::new_v4().simple().to_string();
+        let name = format!("/jsmem-c-{}", &id[..8]);
+        cleanup_shm(&name);
+        let mut writer =
+            MemoryRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox").expect("writer");
+        writer
+            .write_snapshot(&snapshot_of(10, 1))
+            .expect("snapshot");
+        let mut reader = MemoryRegionReader::open_read_only(&name).expect("reader");
+        let first = reader.read_snapshot_cached().expect("read");
+        let again = reader.read_snapshot_cached().expect("read");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "nothing changed: not parsed again"
+        );
+
+        writer
+            .write_snapshot(&snapshot_of(20, 1))
+            .expect("snapshot");
+        let changed = reader.read_snapshot_cached().expect("read");
+        assert_eq!(changed.threads[0].package.memories[0].summary.len(), 20);
+
+        writer.update_heartbeat();
+        let after_heartbeat = reader.read_snapshot_cached().expect("read");
+        assert_eq!(
+            after_heartbeat.threads[0].package.memories[0].summary.len(),
+            20
+        );
         cleanup_shm(&name);
     }
 

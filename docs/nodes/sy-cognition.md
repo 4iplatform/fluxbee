@@ -49,12 +49,15 @@ Two paths take each turn:
 
 - **The intake,** in the `STREAM_BATCH` handler, adds the turn to its communication's last turns:
   who spoke (`in` or `out`), the sender's ILK, the node it came through (the IO node at the head
-  of a WF's trail), its text cut at 2,000 characters, its files and its time. It rewrites the
-  memory region and appends the thread row at once, so the agent's next message carries the turn
-  before it, whatever the worker's backlog. 20 turns at most, and 48 KiB.
+  of a WF's trail), its text cut at 2,000 characters, its files, the option an answer chose from a
+  WF's menu, and its time. It rewrites the memory region at once, so the agent's next message
+  carries the turn before it, whatever the worker's backlog, and appends the thread row of a
+  communication the worker has loaded. 20 turns at most, and 48 KiB.
 - **The worker** takes the turns one at a time, with up to two model calls each (about 5 s a
-  turn), and derives the labels, memories and episodes. It works on a copy, so the intake never
-  waits for it, and writes the copy back keeping the turns the intake took meanwhile.
+  turn), and derives the labels, memories and episodes. It loads a communication from SY.storage
+  first, merges the intake's turns and writes the thread row right away; then it works on a copy,
+  so the intake never waits for it, and writes the copy back merging the turns the intake took
+  meanwhile. No intake batch drops its communication from the region while it works.
 
 Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 
@@ -62,9 +65,9 @@ Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 
 | Message | Who may send / where it goes | What it does |
 | --- | --- | --- |
-| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, rewrites the memory region and appends the thread rows; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
+| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, rewrites the memory region and appends the thread rows of the loaded ones; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
 | `COGNITION_STATE_GET` (sent) | to `SY.storage@motherbee` | loads a communication's durable state, page by page, its last turns included |
-| `STREAM_APPEND storage.cognition.batch` (sent) | to its router's stream | the durable envelopes of each turn, in packs of at most 64 KiB (`COGNITION_APPEND_MAX_BYTES`); the thread row, with the last turns, at every batch and after every turn |
+| `STREAM_APPEND storage.cognition.batch` (sent) | to its router's stream | the durable envelopes of each turn, in packs of at most 64 KiB (`COGNITION_APPEND_MAX_BYTES`); the thread row, with the last turns, at every batch of a loaded communication, after each load and after each turn |
 | `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`, `NODE_STATUS_GET` | `CONFIG_*` only from `SY.admin@motherbee` (router system policy) | control and status |
 | `VAULT_SECRET_CHANGED` | broadcast | re-probes the AI key and updates its state; it does not exit |

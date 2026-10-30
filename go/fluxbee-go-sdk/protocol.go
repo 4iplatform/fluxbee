@@ -130,14 +130,22 @@ type MemoryPackage struct {
 }
 
 // MemoryTurn is one turn of a communication, as its memory package carries it: a message its agent
-// received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through.
+// received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through;
+// Choice, on "out" only, the option the agent chose from a WF's menu.
 type MemoryTurn struct {
-	Direction   string  `json:"direction"`
-	SrcIlk      *string `json:"src_ilk,omitempty"`
-	Via         *string `json:"via,omitempty"`
-	Text        string  `json:"text,omitempty"`
-	Attachments uint32  `json:"attachments,omitempty"`
-	Ts          string  `json:"ts"`
+	Direction   string            `json:"direction"`
+	SrcIlk      *string           `json:"src_ilk,omitempty"`
+	Via         *string           `json:"via,omitempty"`
+	Text        string            `json:"text,omitempty"`
+	Attachments uint32            `json:"attachments,omitempty"`
+	Choice      *MemoryTurnChoice `json:"choice,omitempty"`
+	Ts          string            `json:"ts"`
+}
+
+// MemoryTurnChoice is an option an agent chose from a WF's menu, its params as compact JSON.
+type MemoryTurnChoice struct {
+	Option string `json:"option"`
+	Params string `json:"params,omitempty"`
 }
 
 type MemoryContextSummary struct {

@@ -78,8 +78,8 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
 - It skips any record at or below the last seq it took from that stream and epoch
   (`stream_seen`, `stream_repeats_skipped_total`).
 - It takes each new `cognition.turns` record into its communication's last turns, rewrites the
-  memory region once for the batch, and appends the thread rows of the communications it touched
-  (the intake, §3.4).
+  memory region once for the batch, and appends the thread rows of the loaded communications it
+  touched (the intake, §3.4).
 - Then it hands each record to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full queue drops
   the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its communication's
   last turns.
@@ -107,8 +107,10 @@ stays in the last turns.
    - An agent node without an ILK in the SHM gets no memory (`no_agent_ilk_total`).
 3. **State:** a communication this cognition has not loaded is loaded from SY.storage first
    (§6), even when the intake already holds its last turns (`adopt_stored_state` merges them).
-   If the load fails, the turn is skipped (`state_fetch_failures_total`). One held but idle for
-   5 minutes is checked against SY.storage again.
+   The region is rewritten and the thread row goes out right after the load, so the merged turns
+   are durable whatever the model calls below do. If the load fails, the turn is skipped
+   (`state_fetch_failures_total`). One held but idle for 5 minutes is checked against SY.storage
+   again.
 4. **Text:** the message's text content (`TextV1Payload`, `extract_turn_text`). A message
    without text gets an empty tag set, and no tagger call.
 5. **AI key:** resolved from SY.vault on every turn (§8). Without it the turn is skipped and
@@ -120,13 +122,16 @@ stays in the last turns.
    end, and it guards the durable rows (§5). A skipped turn gets no number.
 8. **Derivations:** the thread's first and last seen, contexts, reasons, co-occurrences, scope
    (§4); the thread row goes out in step 10. Steps 7 to 9 run on a copy of the communication's
-   state, without the lock the intake takes, so the intake never waits for a model call.
+   state, without the lock the intake takes, so the intake never waits for a model call. A
+   communication no longer loaded when the copy is taken skips the turn: a blank state would
+   number it from 1 again. Until the turn is done, every region write keeps the communication
+   (`worker_turn`), so no intake batch drops it from a full region meanwhile.
 9. **Summarizer:** one model call when the communication has an active scope (§3.2). A failure
    skips only the memory and episode updates of this turn.
 10. **Outputs:** the turn's envelopes go to SY.storage through the stream (§5). The copy goes back
-    into what is held (`write_back_turn`): its derivations replace the held ones, and the last
-    turns stay as the intake left them, with those it took meanwhile. Then the memory region is
-    rewritten (§7) and the thread row goes out, built from what is held (`sync_held_state`).
+    into what is held (`write_back_turn`): its derivations replace the held ones, and its turns
+    are merged with those the intake took meanwhile. Then the memory region is rewritten (§7) and
+    the thread row goes out, built from what is held (`sync_held_state`).
 
 ### 3.1 The tagger
 
@@ -177,14 +182,14 @@ The policy is published in `STATUS` and `CONFIG_GET` (`degraded_semantics_policy
 turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_turns`).
 
 - **When:** as the batch arrives, ahead of the worker and its model calls (about 5 s a turn). The
-  region is rewritten and the thread rows go to SY.storage before the batch is acked, so the next
-  message the router delivers to the agent, a second later, carries the turn before it, whatever
-  the worker's backlog: the stream sends a record to its sinks as soon as it takes it. The message
-  being delivered is not among its own turns in practice: the router reads its package right after
-  it appends its copy (`deliver_locally`), long before the copy reaches SY.cognition.
+  region is rewritten, and the thread rows of the loaded communications go to SY.storage, before
+  the batch is acked, so the next message the router delivers to the agent, a second later,
+  carries the turn before it, whatever the worker's backlog: the stream sends a record to its
+  sinks as soon as it takes it. The message being delivered is never among its own turns: the
+  router reads its package before it appends its copy (`deliver_locally`, §7).
 - **Which turns:** those with a thread id and an agent ILK, found as the worker finds them
-  (`agent_identity_of`, cached); the worker counts the others. A turn with neither text nor files
-  is left out: the package would show it empty.
+  (`agent_identity_of`, cached); the worker counts the others. A turn with neither text, files
+  nor a menu choice is left out: the package would show it empty.
 - **What a turn keeps** (`MemoryTurn` in `crates/fluxbee_sdk/src/protocol.rs`):
   - `direction`: `out` when its router names the agent node as the sender, `in` otherwise;
   - `src_ilk`: the sender's ILK, when the message had one;
@@ -195,9 +200,15 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     answer to it keeps its question;
   - `attachments`: how many files it carried; a text that came as a file (`content_ref`) counts as
     one;
+  - `choice`, on `out` only: what the agent chose from a WF's menu with this answer, from its
+    `meta.context.evaluation` (`menu_choice`): the option, and its params as compact JSON, cut at
+    2,000 characters. The turn is kept for it even when the reply is blank: the WF may not have
+    forwarded the reply, and the choice says what the answer did;
   - `ts`: when its router took it (the stream record's time), RFC 3339 in UTC.
 
-  `src_ilk` and `via` come from the message's meta and are cut at 256 characters.
+  `src_ilk`, `via` and the option come from the message and are cut at 256 characters. U+0000
+  leaves every field (`turn_field`): PostgreSQL's `jsonb` refuses it, and every thread row that
+  carried the turn would fail until the turn left the window.
 - **How many:** the last 20, oldest first (`COGNITION_RECENT_TURNS`); the 21st pushes out the
   oldest. They also stay under 48 KiB serialized (`COGNITION_RECENT_TURNS_MAX_BYTES`), the oldest
   going first, never the newest: 20 turns of 2,000 characters of Latin text fit; a script of more
@@ -206,12 +217,15 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
   stream's record limit. A turn the communication holds already (a batch sent again) is not added.
 - **A communication not loaded yet** (new, after a restart, or after its agent moved here): the
   intake starts it from the turns the region had for it, if any, and the region keeps the package
-  it had, with the new turns, until the worker loads it (§7). The worker's load merges SY.storage's
-  turns with the intake's: each once, in the order they were taken (`merge_recent_turns`).
+  it had, with the new turns, until the worker loads it (§7). It writes no thread row: its turn
+  count is unknown, and a row of turn 0 could replace a stored one of turn 0 (a communication whose
+  turns never got a number) with fewer turns. The worker's load merges SY.storage's turns with the
+  intake's, each once, in the order they were taken (`merge_recent_turns`), and writes the row at
+  once (step 3). Until then its new turns live in the region alone.
 - **Who writes what:** the intake owns the last turns and the last turn's ILKs and channel; the
   worker owns the rest. Both change the held state and publish it in `sync_held_state`, under the
   region's lock and then the state's, so neither loses the other's writes. The worker derives on a
-  copy and writes it back keeping the intake's turns (step 10 above).
+  copy and writes it back merging the intake's turns (step 10 above).
 
 ---
 
@@ -309,13 +323,14 @@ The op is `upsert` or `close`. SY.cognition never sends `delete`.
 - Each pack is a `STREAM_APPEND` to SY.cognition's own router (`fluxbee_sdk::stream::append`).
 - The router takes `storage.cognition.*` only from `SY.cognition@<its hive>` (`subject_allowed`),
   and sends it to `SY.storage@motherbee`.
-- **The thread row** has two writers: the intake, at every batch, for each communication it took
-  a turn of, and the worker, after each turn (`thread_rows`). Both build it from what is held
-  when it goes out, numbered with the worker's turn count, and append it before they let go of the
-  held state's lock (`sync_held_state`). Rows of an equal turn reach SY.storage in the order they
-  were built, and the guard below takes an equal turn, so the stored row never ends on fewer turns
-  than the last one sent. A communication the worker has not loaded yet writes turn 0, which the
-  guard refuses over a stored row; the worker's load merges those turns back (§6).
+- **The thread row** has two writers: the intake, at every batch, for each loaded communication it
+  took a turn of, and the worker, after each load and each turn (`thread_rows`). Both build it from
+  what is held when it goes out, numbered with the worker's turn count and stamped with the time
+  it was built, and append it before they let go of the held state's lock (`sync_held_state`). A
+  communication the worker has not loaded writes none (§3.4).
+- **Rows of an equal turn** are ordered by the time they were built: SY.storage takes one only
+  when it is later than the stored one (the guard below), so a row its inbox applies late, behind
+  a full process queue or in its retry, never rolls the turns back.
 - The last turns live only in the thread row's `payload`; `cognition_threads` has no column for
   them. 48 KiB at most (§3.4), so the row fits a pack.
 
@@ -330,7 +345,8 @@ The op is `upsert` or `close`. SY.cognition never sends `delete`.
   keyed by its communication (`communication_id`). A scope row keeps `source_turn` only.
 - **The guard:** an upsert replaces a row only when its turn is equal or later
   (`WHERE ... source_turn <= EXCLUDED.source_turn`). A late retry, or a cognition that restarted
-  empty, never rolls a row back.
+  empty, never rolls a row back. A thread row of an equal turn must also be built at the same time
+  or later (`(source_turn, source_ts::timestamptz)`, `COGNITION_THREAD_UPSERT_SQL`).
 - A `close` is stored with status `closed` (`normalized_status`).
 - The envelope's schema version must be 2, or the row fails (`parse_cognition_envelope`).
 
@@ -438,9 +454,22 @@ intake batch, after every worker turn and after the reload (`sync_held_state`):
 - The lookup is by `thread_id` and the destination node's name (`agent_node`), one per
   destination.
 - A package the sender set is removed for every destination (`prepare_local_delivery`).
+- It reads the package before it appends the turn's copy for cognition, so the message being
+  delivered is never among its own recent turns.
 - It reads the region at delivery, and reopens it when its heartbeat is older than 30 s
   (`HEARTBEAT_STALE_MS`) or a read fails. When it still cannot read it, the message goes without
-  a package.
+  a package, and the router says so in its journal, at most every 30 s.
+- **A read** (`read_memory_snapshot` in `src/shm/mod.rs`) copies the payload out between two reads
+  of the region's sequence, again when a write moved it, and parses the copy: a read that
+  overlaps a rewrite reads again instead of failing.
+- **The parsed snapshot is kept** (`MemoryRegionReader::read_snapshot_cached`) until the region's
+  sequence moves: SY.cognition rewrites it about twice a turn, and a full one takes milliseconds to
+  parse, behind the router's one reader. The sequence moves on every write, heartbeats too (every
+  5 s); `updated_at` is not used, since two writes in one millisecond would share it.
+- **A package never costs the message** (`serialize_with_package`): when the message with its
+  package is over a frame (`MAX_FRAME_SIZE`, 128 KiB), the package loses its oldest turns, as many
+  as the excess takes, and then goes whole; the router says so in its journal, at most every 30 s.
+  The link skips a frame over the size, so the agent would never get the message.
 - If SY.cognition stops, the region keeps its last snapshot, and the router keeps serving it.
 
 **ai.generic** renders the package into a "Conversation memory" block ahead of the user's text,
@@ -451,6 +480,10 @@ before a WF's block when the message carries one (`render_memory_package_prompt_
   (UTC, to the minute) and who spoke. The agent's own turns read "you"; another's read its
   sender's ILK and the node it came through, so a person and a supervisor in one thread read
   apart (`render_memory_turn`).
+- Each turn's text is a JSON string, so no text can pass for a turn's line of its own; files are
+  counted, and an answer that chose from a WF's menu reads `chose <option> <params>`.
+- After the blocks, the message being answered is named the same way: `Current user message,
+  from <ILK> via <node>:` (`current_message_label`), a line of the text or a text part of its own.
 - The AI SDK cuts nothing of what the model reads ahead of the message: it cuts only the
   immediate memory's history (FINDINGS A-71), which the agents run without. With 20 turns of
   2,000 characters the block passes 40,000 characters (some 10,000 tokens a call, and again on
@@ -558,12 +591,11 @@ sync status.
 - **Acked but not processed:** SY.cognition acks a batch before the worker processes its turns.
   Turns queued when it stops lose their labels, memories and episodes; the stream does not resend
   them. Their text is in the last turns already.
-- **A frame over 128 KiB:** the router skips a delivery whose message, with its package, is over
-  a frame (`MAX_FRAME_SIZE`), and the agent never gets it. The last turns are bounded (48 KiB) so
-  that a package and an inline text message (at most 64 KiB) fit, but a message at that size with
-  long memory summaries and a full window of turns can still pass it.
-- **The region is read whole:** the router parses the whole snapshot at every delivery to an
-  agent (`read_memory_snapshot_for_delivery`), and SY.cognition rewrites it whole at every batch
-  and every worker turn. The last turns make it fuller, so each read and write takes longer.
+- **Turns before the load live in the region alone:** a communication's turns that the intake
+  took before the worker loaded it reach SY.storage only with that load; a host reset meanwhile
+  loses them. The load waits behind the worker's backlog.
+- **The region is written whole:** SY.cognition rewrites it at every batch and every worker turn,
+  and the router parses it again after each write. The last turns make it fuller, so each write and
+  parse takes longer.
 - **`memory.lance`:** `STATUS` and `CONFIG_GET` report a `memory_lance` path
   (`ensure_runtime_paths`), but nothing in SY.cognition uses it.

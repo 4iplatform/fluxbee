@@ -6758,14 +6758,11 @@ async fn deliver_locally(
     let turn = is_communication_turn(&prepared);
     let sender_name = prepared.routing.src_l2_name.clone().unwrap_or_default();
     let mut plain: Option<Vec<u8>> = None;
-    let mut memory: Option<Option<MemoryShmSnapshot>> = None;
+    let mut memory: Option<Option<Arc<MemoryShmSnapshot>>> = None;
     for delivery in deliveries {
         let agent = is_agent_node(&delivery.node);
-        if agent && turn {
-            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
-                log_stream.append_cognition_turn(&delivery.node, copy);
-            }
-        }
+        // The package is read before the turn's copy goes to cognition, so the message is never
+        // among its own recent turns.
         let package = if agent
             && should_enrich_with_memory_package(&prepared)
             && canonical_thread_id_from_meta(&prepared.meta).is_some()
@@ -6777,19 +6774,20 @@ async fn deliver_locally(
                 );
             }
             package_for(
-                memory.as_ref().and_then(Option::as_ref),
+                memory.as_ref().and_then(|memory| memory.as_deref()),
                 &prepared,
                 &delivery.node,
             )
         } else {
             None
         };
-        let data = match package {
-            Some(package) => {
-                let mut enriched = prepared.clone();
-                enriched.meta.memory_package = Some(package);
-                serde_json::to_vec(&enriched)?
+        if agent && turn {
+            if let Some(copy) = cognition_copy(&prepared, &sender_name) {
+                log_stream.append_cognition_turn(&delivery.node, copy);
             }
+        }
+        let data = match package {
+            Some(package) => serialize_with_package(&prepared, package, &delivery.node)?,
             None => match &plain {
                 Some(data) => data.clone(),
                 None => {
@@ -6813,7 +6811,7 @@ async fn serialize_for_local_delivery(
     src_via_hub: bool,
     dst_node: &str,
 ) -> Result<Option<Vec<u8>>, RouterError> {
-    let Some(mut prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
+    let Some(prepared) = prepare_local_delivery(hive_id, msg, src_via_hub) else {
         return Ok(None);
     };
     if is_agent_node(dst_node)
@@ -6822,9 +6820,91 @@ async fn serialize_for_local_delivery(
     {
         let memory =
             read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await;
-        prepared.meta.memory_package = package_for(memory.as_ref(), &prepared, dst_node);
+        if let Some(package) = package_for(memory.as_deref(), &prepared, dst_node) {
+            return Ok(Some(serialize_with_package(&prepared, package, dst_node)?));
+        }
     }
     Ok(Some(serde_json::to_vec(&prepared)?))
+}
+
+/// How often the router says that agents get their messages without their memory package, or
+/// with part of it: these repeat with every delivery while the cause lasts.
+const PACKAGE_LOSS_LOG_INTERVAL_MS: u64 = 30_000;
+static PACKAGES_UNREAD: AtomicU64 = AtomicU64::new(0);
+static PACKAGES_UNREAD_LOGGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+static PACKAGES_CUT: AtomicU64 = AtomicU64::new(0);
+static PACKAGES_CUT_LOGGED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one more loss in `total`, and says whether its line may go out now: at most once every
+/// `PACKAGE_LOSS_LOG_INTERVAL_MS`.
+fn package_loss_due(total: &AtomicU64, logged_at_ms: &AtomicU64) -> Option<u64> {
+    let total = total.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = now_epoch_ms();
+    let last = logged_at_ms.load(Ordering::Relaxed);
+    (now.saturating_sub(last) >= PACKAGE_LOSS_LOG_INTERVAL_MS
+        && logged_at_ms
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok())
+    .then_some(total)
+}
+
+/// A message with its memory package, serialized within a frame (`MAX_FRAME_SIZE`): the router
+/// skips a bigger one, and the agent would never get the message. The package loses its oldest
+/// turns first, as many as the excess takes, then goes whole: it never costs the message.
+fn serialize_with_package(
+    prepared: &Message,
+    package: MemoryPackage,
+    agent_node: &str,
+) -> Result<Vec<u8>, RouterError> {
+    let turns_held = package.turns.len();
+    let mut enriched = prepared.clone();
+    enriched.meta.memory_package = Some(package);
+    loop {
+        let data = serde_json::to_vec(&enriched)?;
+        let excess = data.len().saturating_sub(MAX_FRAME_SIZE);
+        let Some(package) = enriched.meta.memory_package.as_mut() else {
+            // Over a frame without any package: the link skips it, as any other.
+            return Ok(data);
+        };
+        if excess == 0 {
+            let dropped = turns_held - package.turns.len();
+            if dropped > 0 {
+                if let Some(total) = package_loss_due(&PACKAGES_CUT, &PACKAGES_CUT_LOGGED_AT_MS) {
+                    tracing::warn!(
+                        agent_node,
+                        thread_id = %package.thread_id,
+                        dropped_turns = dropped,
+                        total,
+                        "router delivered a memory package without its oldest turns: with them the message is over a frame"
+                    );
+                }
+            }
+            return Ok(data);
+        }
+        if package.turns.is_empty() {
+            if let Some(total) = package_loss_due(&PACKAGES_CUT, &PACKAGES_CUT_LOGGED_AT_MS) {
+                tracing::warn!(
+                    agent_node,
+                    thread_id = %package.thread_id,
+                    total,
+                    "router delivered a message without its memory package: with it the message is over a frame"
+                );
+            }
+            enriched.meta.memory_package = None;
+            continue;
+        }
+        let mut freed = 0usize;
+        let oldest = package
+            .turns
+            .iter()
+            .take_while(|turn| {
+                let enough = freed >= excess;
+                freed += serde_json::to_vec(turn).map_or(0, |turn| turn.len() + 1);
+                !enough
+            })
+            .count();
+        package.turns.drain(..oldest.max(1));
+    }
 }
 
 /// The authority gate for a system message, and the delivery's own stamps: the action class, and
@@ -6890,11 +6970,14 @@ fn package_for(
         .map(|entry| entry.package.clone())
 }
 
+/// The memory region's snapshot, for a delivery to an agent. The reader keeps the last one parsed
+/// until the region changes (`read_snapshot_cached`). `None`, said in the journal, when the region
+/// cannot be read even once reopened: the agents then get their messages without a package.
 async fn read_memory_snapshot_for_delivery(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     stale_after_ms: u64,
-) -> Option<MemoryShmSnapshot> {
+) -> Option<Arc<MemoryShmSnapshot>> {
     let shm_name = memory_shm_name_for_hive(hive_id).ok()?;
     let now = now_epoch_ms();
     let mut guard = memory_reader.lock().await;
@@ -6911,16 +6994,26 @@ async fn read_memory_snapshot_for_delivery(
     }
 
     if let Some(snapshot) = guard
-        .as_ref()
-        .and_then(|reader| reader.read_snapshot().ok())
+        .as_mut()
+        .and_then(|reader| reader.read_snapshot_cached().ok())
     {
         return Some(snapshot);
     }
 
     *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
-    guard
-        .as_ref()
-        .and_then(|reader| reader.read_snapshot().ok())
+    let snapshot = guard
+        .as_mut()
+        .and_then(|reader| reader.read_snapshot_cached().ok());
+    if snapshot.is_none() {
+        if let Some(total) = package_loss_due(&PACKAGES_UNREAD, &PACKAGES_UNREAD_LOGGED_AT_MS) {
+            tracing::warn!(
+                shm = %shm_name,
+                total,
+                "router could not read the memory region: agents get their messages without their memory package"
+            );
+        }
+    }
+    snapshot
 }
 
 #[cfg(test)]
@@ -9660,6 +9753,170 @@ mod tests {
         assert!(cognition[0].2.meta.memory_package.is_none());
         assert_eq!(cognition[1].1, "AI.bot@motherbee");
         assert_eq!(cognition[1].2.payload["n"], 4);
+    }
+
+    /// A message to an agent on `thread:t1`, from IO.api, whose text is `content`.
+    fn agent_turn(content: &str) -> Message {
+        let mut msg: Message = serde_json::from_slice(&test_frame(
+            Uuid::new_v4(),
+            "user",
+            None,
+            Destination::Unicast("AI.sales@motherbee".to_string()),
+            serde_json::json!({ "type": "text", "content": content }),
+        ))
+        .unwrap();
+        msg.routing.src_l2_name = Some("IO.api@motherbee".to_string());
+        msg.meta.thread_id = Some("thread:t1".to_string());
+        msg
+    }
+
+    /// An agent's package is read before its router hands the turn's copy to cognition, so the
+    /// message can never be among its own recent turns. Here the test holds the region's reader:
+    /// the delivery waits for it, and no copy has gone out meanwhile.
+    #[tokio::test]
+    async fn an_agents_package_is_read_before_its_copy_goes_to_cognition() {
+        let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
+        let held = Arc::clone(&memory_reader).lock_owned().await;
+        let (log_stream, observed) = stream::StreamHandle::observed();
+        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let msg = agent_turn("hola");
+        let delivery = tokio::spawn({
+            let memory_reader = Arc::clone(&memory_reader);
+            async move {
+                deliver_locally(
+                    vec![LocalDelivery::to("AI.sales@motherbee", agent_tx)],
+                    &msg,
+                    &memory_reader,
+                    "rtorder",
+                    false,
+                    &log_stream,
+                )
+                .await
+            }
+        });
+        time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            observed.drain().is_empty(),
+            "no copy goes to cognition before the package is read"
+        );
+        drop(held);
+        delivery.await.expect("joined").expect("delivered");
+        let copies = observed.drain();
+        assert_eq!(copies.len(), 1, "the copy, after the read");
+        assert_eq!(copies[0].0, fluxbee_sdk::stream::SUBJECT_COGNITION_TURNS);
+        assert!(agent_rx.recv().await.is_some(), "the message");
+    }
+
+    /// A package that would push a message past a frame loses its oldest turns, and then goes
+    /// whole, so the message always reaches the agent: the router skips a frame over
+    /// `MAX_FRAME_SIZE`, and the agent would never get it.
+    #[tokio::test]
+    async fn a_package_never_costs_its_message_a_frame() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+        let hive_id = format!("memfit-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = memory_shm_name_for_hive(&hive_id).expect("memory shm name");
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+        let turns = (0..20u32)
+            .map(|n| fluxbee_sdk::protocol::MemoryTurn {
+                direction: fluxbee_sdk::protocol::MemoryTurnDirection::In,
+                src_ilk: Some("ilk:person".to_string()),
+                via: Some("IO.api@motherbee".to_string()),
+                text: format!("{n:02} {}", "x".repeat(1_997)),
+                attachments: 0,
+                choice: None,
+                ts: format!("2026-10-30T12:{n:02}:00.000Z"),
+            })
+            .collect::<Vec<_>>();
+        let package = fluxbee_sdk::protocol::MemoryPackage {
+            package_version: 3,
+            thread_id: "thread:t1".to_string(),
+            dominant_context: None,
+            dominant_reason: None,
+            contexts: Vec::new(),
+            reasons: Vec::new(),
+            memories: vec![fluxbee_sdk::protocol::MemorySummary {
+                memory_id: "memory:1".to_string(),
+                summary: "y".repeat(4_000),
+                weight: 1.0,
+                dominant_context_id: None,
+                dominant_reason_id: None,
+            }],
+            episodes: Vec::new(),
+            turns,
+            truncated: None,
+        };
+        let mut writer =
+            crate::shm::MemoryRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("writer");
+        writer
+            .write_snapshot(&MemoryShmSnapshot {
+                schema_version: 2,
+                updated_at: now_epoch_ms(),
+                threads: vec![crate::shm::MemoryShmThreadEntry {
+                    thread_id: "thread:t1".to_string(),
+                    agent_ilk: "ilk:sales".to_string(),
+                    agent_node: "AI.sales@motherbee".to_string(),
+                    package: package.clone(),
+                }],
+            })
+            .expect("snapshot");
+
+        // 100 KB of text and the whole package are over a frame: the oldest turns go.
+        let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
+        let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        deliver_locally(
+            vec![LocalDelivery::to("AI.sales@motherbee", agent_tx)],
+            &agent_turn(&"z".repeat(100_000)),
+            &memory_reader,
+            &hive_id,
+            false,
+            &stream::StreamHandle::detached(),
+        )
+        .await
+        .expect("delivered");
+        let frame = agent_rx.recv().await.expect("the message");
+        cleanup(&shm_name);
+        assert!(frame.len() <= MAX_FRAME_SIZE, "{} bytes", frame.len());
+        let delivered: Message = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            delivered.payload["content"].as_str().map(str::len),
+            Some(100_000)
+        );
+        let kept = delivered.meta.memory_package.expect("the package").turns;
+        assert!(!kept.is_empty() && kept.len() < 20, "{} turns", kept.len());
+        assert_eq!(kept.last(), package.turns.last(), "the newest stay");
+
+        // A message near a frame has no room even for the package without turns: it goes alone.
+        let mut near = agent_turn("");
+        let bare = serde_json::to_vec(&near).unwrap().len();
+        near.payload["content"] = serde_json::json!("z".repeat(MAX_FRAME_SIZE - bare - 1_000));
+        let frame = serialize_with_package(&near, package.clone(), "AI.sales@motherbee")
+            .expect("serialized");
+        assert!(frame.len() <= MAX_FRAME_SIZE);
+        let delivered: Message = serde_json::from_slice(&frame).unwrap();
+        assert!(delivered.meta.memory_package.is_none());
+        assert_eq!(delivered.payload, near.payload);
+
+        // A small message keeps the whole package.
+        let frame =
+            serialize_with_package(&agent_turn("hola"), package.clone(), "AI.sales@motherbee")
+                .expect("serialized");
+        let delivered: Message = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            delivered
+                .meta
+                .memory_package
+                .expect("the package")
+                .turns
+                .len(),
+            20
+        );
     }
 
     #[test]

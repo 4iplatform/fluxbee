@@ -346,6 +346,37 @@ CREATE INDEX IF NOT EXISTS idx_cognition_memories_communication ON cognition_mem
 CREATE INDEX IF NOT EXISTS idx_cognition_episodes_communication ON cognition_episodes(thread_id, agent_ilk);
 "#;
 
+/// A communication's thread row. Its cognition writes it many times with one turn number (at every
+/// batch, after each load and after each turn, docs/reference/cognition.md §5), each with the
+/// communication's last turns as it built it. So a row of the same turn replaces the stored one
+/// only when it was built later (`source_ts`): a row the inbox applies late, behind a full process
+/// queue or in its retry, never rolls the turns back.
+const COGNITION_THREAD_UPSERT_SQL: &str = r#"
+INSERT INTO cognition_threads (
+    communication_id, thread_id, agent_ilk, source_turn, entity_version, writer, source_ts,
+    src_ilk, dst_ilk, ich, status, first_seen_at, last_seen_at, turn_count, payload
+)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+ON CONFLICT (communication_id) DO UPDATE SET
+    thread_id = EXCLUDED.thread_id,
+    agent_ilk = EXCLUDED.agent_ilk,
+    source_turn = EXCLUDED.source_turn,
+    entity_version = EXCLUDED.entity_version,
+    writer = EXCLUDED.writer,
+    source_ts = EXCLUDED.source_ts,
+    src_ilk = EXCLUDED.src_ilk,
+    dst_ilk = EXCLUDED.dst_ilk,
+    ich = EXCLUDED.ich,
+    status = EXCLUDED.status,
+    first_seen_at = EXCLUDED.first_seen_at,
+    last_seen_at = EXCLUDED.last_seen_at,
+    turn_count = EXCLUDED.turn_count,
+    payload = EXCLUDED.payload,
+    updated_at = now()
+WHERE (cognition_threads.source_turn, cognition_threads.source_ts::timestamptz)
+   <= (EXCLUDED.source_turn, EXCLUDED.source_ts::timestamptz)
+"#;
+
 /// LLM usage records (A-70 stage 3, docs/router-stream-v1.md §7.5), one row per model call:
 /// `claimed_tenant_id` is the tenant the record named, `tenant_id` the one SY.storage charged, and
 /// `verified` is false when identity never answered. A response lands once (`record_id`, and the
@@ -1321,30 +1352,7 @@ ON CONFLICT (dedupe_key) DO NOTHING
         let (agent_ilk, source_turn) = envelope_communication(envelope)?;
         let payload = json_value(&envelope.data)?;
         db.execute(
-            r#"
-INSERT INTO cognition_threads (
-    communication_id, thread_id, agent_ilk, source_turn, entity_version, writer, source_ts,
-    src_ilk, dst_ilk, ich, status, first_seen_at, last_seen_at, turn_count, payload
-)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-ON CONFLICT (communication_id) DO UPDATE SET
-    thread_id = EXCLUDED.thread_id,
-    agent_ilk = EXCLUDED.agent_ilk,
-    source_turn = EXCLUDED.source_turn,
-    entity_version = EXCLUDED.entity_version,
-    writer = EXCLUDED.writer,
-    source_ts = EXCLUDED.source_ts,
-    src_ilk = EXCLUDED.src_ilk,
-    dst_ilk = EXCLUDED.dst_ilk,
-    ich = EXCLUDED.ich,
-    status = EXCLUDED.status,
-    first_seen_at = EXCLUDED.first_seen_at,
-    last_seen_at = EXCLUDED.last_seen_at,
-    turn_count = EXCLUDED.turn_count,
-    payload = EXCLUDED.payload,
-    updated_at = now()
-WHERE cognition_threads.source_turn <= EXCLUDED.source_turn
-"#,
+            COGNITION_THREAD_UPSERT_SQL,
             &[
                 &envelope.entity_id,
                 envelope
@@ -4259,6 +4267,33 @@ mod tests {
         }
         assert!(COGNITION_SCHEMA_SQL.contains("communication_id TEXT PRIMARY KEY"));
         assert!(!COGNITION_SCHEMA_SQL.contains("thread_seq"));
+    }
+
+    /// A thread row of the same turn replaces the stored one only when it was built later: its
+    /// cognition writes the row at every batch and after every turn, with the same turn number,
+    /// and the inbox can apply one late (a full process queue, the retry). Ordered by the turn
+    /// alone, the later one applied would win, with fewer turns.
+    #[test]
+    fn a_thread_row_of_the_same_turn_replaces_only_an_older_one() {
+        let guard = COGNITION_THREAD_UPSERT_SQL
+            .split("WHERE")
+            .nth(1)
+            .expect("the guard")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            guard,
+            "(cognition_threads.source_turn, cognition_threads.source_ts::timestamptz) \
+             <= (EXCLUDED.source_turn, EXCLUDED.source_ts::timestamptz)"
+        );
+        let ddl_start = COGNITION_SCHEMA_SQL
+            .find("CREATE TABLE IF NOT EXISTS cognition_threads (")
+            .expect("the table");
+        assert!(
+            COGNITION_SCHEMA_SQL[ddl_start..].contains("source_ts        TEXT NOT NULL"),
+            "the cast reads the text SY.cognition writes, RFC 3339"
+        );
     }
 
     const TENANT: &str = "tnt:22222222-2222-4222-8222-222222222222";

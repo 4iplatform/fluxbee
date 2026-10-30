@@ -138,8 +138,21 @@ pub struct MemoryTurn {
     /// How many files it carried; a text sent as a file (`content_ref`) counts as one.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub attachments: u32,
+    /// Only on `out`: what the agent chose from a WF's menu with this answer. The turn is kept for
+    /// it even when the answer's text is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<MemoryTurnChoice>,
     /// When its agent's router took it (RFC 3339, UTC).
     pub ts: String,
+}
+
+/// An option an agent chose from a WF's menu, as its answer's `meta.context.evaluation` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTurnChoice {
+    pub option: String,
+    /// Its params as compact JSON, cut at 2,000 characters; empty when it has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub params: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

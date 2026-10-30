@@ -340,6 +340,11 @@ One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`
 - **The guard:** an upsert replaces a row only if its turn is equal or later
   (`WHERE ... source_turn <= EXCLUDED.source_turn`). A late retry, or a cognition that booted
   empty, never moves it back.
+  - A thread row (`COGNITION_THREAD_UPSERT_SQL`) of an equal turn replaces the stored one only when
+    it was built later (`(source_turn, source_ts::timestamptz)`): SY.cognition writes it at every
+    batch, after each load and after each turn, many times with one turn number and each time with
+    the communication's last turns, and a row the inbox applies late (a full process queue, the
+    retry) would roll them back.
 - A `close` is stored with status `closed` (`normalized_status`). An envelope with a
   `schema_version` other than 2 fails and stays in the inbox (`parse_cognition_envelope`).
 - **Indexes:** `(thread_id, agent_ilk)` on each per-communication table, and `scope_id`,
@@ -530,7 +535,7 @@ its sink for the window at most (120 s).
 | 32 MB cap, or a full queue (16 MB waiting for the disk) | New records are dropped and counted; routing goes on |
 | Identity does not answer when a usage is charged | The row is retried; on attempt 10 it is stored unverified |
 | SY.cognition goes down | It loses its queue (what was acked and not processed); when it comes back, it reloads its communications from SY.storage |
-| `jsr-memory` cannot be read | The message is delivered without `memory_package` |
+| `jsr-memory` cannot be read | The message is delivered without `memory_package`, and the router says so in its journal (at most every 30 s) |
 
 ### 9.3 Idempotency
 

@@ -171,14 +171,20 @@ On every request the node reads the key of its provider from SY.vault:
   - its labels and memories: the thread, the dominant context and reason, up to 4 contexts and 4
     reasons, up to 3 memories, and what the package left out;
   - then the recent conversation, the communication's last turns (up to 20), oldest first, one
-    line each: `- [2026-10-30 12:05] <who>: <text>`, the time in UTC. `<who>` is `you` for the
+    line each: `- [2026-10-30 12:05] <who>: "<text>"`, the time in UTC. `<who>` is `you` for the
     agent's own turns, and `<sender ILK> via <node>` for the others, the node being the one the
     message came through (the IO node, for a message a WF forwarded), so the person and a
-    supervisor in one thread read apart. A text of several lines stays indented under its turn,
-    and files are counted (`[2 attachments]`). The message being answered is not among them.
+    supervisor in one thread read apart. The text is a JSON string, so no text can pass for a
+    turn's line of its own; files are counted (`[2 attachments]`), and an answer that chose from
+    a WF's menu says so, even with a blank text (`chose invoice {"quantity":10}`). The message
+    being answered is not among them.
   - This is the agents' recent conversation: SY.cognition takes each turn as it arrives, so the
     next message carries the one before it. Run agents with `runtime.immediate_memory` off; it is
     kept per sender, not per conversation (FINDINGS A-133).
+  - **The message being answered names its sender the same way,** once a block comes before it:
+    `Current user message, from <sender ILK> via <node>:`, the node being the first of a WF's
+    trail or else the sender. As text, a line ahead of the message; as parts, a text part of its
+    own after the blocks.
   - Nothing ahead of the message is cut, and the message itself never is (FINDINGS A-71): with 20
     turns of 2,000 characters the block passes 40,000 characters (some 10,000 tokens a call), and
     the WF's block and the message still reach the model whole.
