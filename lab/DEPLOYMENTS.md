@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ live | snap `pre-wfcase1-0-1-91` (all 4 VMs) · `apt install fluxbee=0.1.90` + core-update of the spokes |
+| **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ live | snap `pre-wfcase3-0-1-92` (all 4 VMs) · `apt install fluxbee=0.1.91` + core-update of the spokes |
+| **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
 | **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ replaced by 0.1.91 | snap `pre-wfcase0-0-1-90` (deleted 2026-10-30) · `apt install fluxbee=0.1.89` + core-update of the spokes |
 | **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ replaced by 0.1.90 | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
 | **0.1.88** | 2026-10-27 | `d01ba1d` | motherbee + spokes (core) + ai.generic `0.1.88-gate1` published as `current` (gate) | ✅ replaced by 0.1.89 | snap `pre-reconcile-0-1-88` (all 4 VMs) · `apt install fluxbee=0.1.87` + core-update of the spokes |
@@ -100,6 +101,83 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.92 — The WF track, Case 3: the WF asks an agent with a menu, the catch and the default log, the cap on agent calls, io.slack's thread records, and Archi's WF chapter (wf-orchestration-v1 §5.3; A-125, A-131)
+
+- **Date:** 2026-10-30 (ART) · **Previous version:** 0.1.91 · **Commit:** `4e20b88`.
+- **Scope:** motherbee and the three spokes (core update). PROD ran no WF before it.
+- **Design:** [wf-orchestration-v1](../docs/wf-orchestration-v1.md) §5.3, decided with the operator on
+  2026-10-30: the menu, the catch as in .NET with the log as the default, the cap of 8 agent calls
+  per trigger (A-125), the way back belongs to the IO node, and one handbook.
+  - **The build:** three agents, from §5.3.6's contracts: the Go side, ai.generic and the AI SDK,
+    and io.slack. Then Archi's part: the handbook's §4.2 and the seeds' `sales.consult`.
+  - **The review round** (§5.3.8): six reviewers, 23 findings, fixed before the release. Two
+    decisions of the operator came out of it:
+    - a post io.slack opens serves one message;
+    - the agents' memory is cognition's, and ai.generic's immediate memory stays off (A-133).
+- **What changed:**
+  - **The menu.** A send or a forward to an `AI.*` node may carry a menu. The agent adds `none`,
+    answers `{reply, option, params}` in `meta.context.evaluation`, and an answer off the menu is an
+    error, with no retry. wfcel checks the menu and every read of the evaluation against it.
+    `meta.context.response_envelope` is refused in a WF.
+  - **The catch** is tried when no transition of the state takes an event. Without one, or when it
+    takes nothing, the event is logged locally as `unhandled event`.
+  - **The cap:** 8 agent calls per trigger, then one `AGENT_CALL_CAP` event. The instance never
+    fails for it.
+  - **io.slack's thread records** (`slack_threads.db` in the node's directory):
+    - a reply in the thread of a post the node made takes that post's thread id;
+    - an outbound message goes to its thread id's recorded place;
+    - a post the node opened serves one message;
+    - the text it posts is escaped, and the text it relays decodes what Slack escapes.
+  - **ai.generic:** the menu contract; the evaluation's `reply` is the text the person gets; a
+    model's answer is the first whole JSON object (A-131).
+  - **Archi:** the handbook's §4.2 is the one reference for writing a WF. The seeds hold
+    `sales.consult` at `seed_version` 4, and the quickstart points to the chapter.
+- **Deploy:**
+  - build of `4e20b88` in 22 min, deploy in 233 s;
+  - publish: the repo keeps 0.1.83 to 0.1.92 (0.1.82 pruned), and `dist/` dropped 0.1.91's .deb;
+  - snapshots `pre-wfcase3-0-1-92` on the 4 VMs (`pre-wfcase1-0-1-91` was deleted);
+  - 0.1.92 on all 4 (core manifest `5b5d0061ccb9b190`), with health clean;
+  - `wf.engine`, `ai.generic` and `io.slack` `current` are 0.1.92 on the motherbee and worker1.
+    `AI.pruebas` runs, HEALTHY;
+  - Archi logged "cookbook seeds upgraded" for its design and artifact cookbooks.
+  - **Before it:** the operator reset the Proxmox host by mistake (2026-10-30, about 19:46 UTC). The
+    5 VMs came back on their own (`onboot=1`), and health was clean on all 4 hives.
+- **Gate** (§5.3.6), first run. The deployment stays up until the track's case is complete:
+  - **The pieces:**
+    - a person registered in `pruebas` through io.cloud;
+    - three agents on worker1, `AI.gate0192sales/invoice/payments`, with Spanish roles that keep only
+      their trade, and immediate memory off;
+    - `WF.gate0192@worker1`, the repo's `wf.sales.invoice` on those names: 10 states, 51 guards, 89
+      actions, compiled in 5 s;
+    - a client on worker1's router socket as `IO.gate0192`;
+    - a real io.slack, `IO.slack.gate0192@motherbee`, in the operator's test Slack workspace. Its
+      tokens went to SY.vault through stdin, and its `io.dst_node` is the WF.
+  - **The menu:** every answer came back as an option of its menu with its evaluation, and the WF
+    branched on it. The person got sales' quote 2.6 s after writing.
+  - **The consultation**, with the operator as the supervisor in Slack:
+    1. Sales chose `consult` with a precise question; the person got "I will check", and the
+       question was posted at the channel's top level.
+    2. An answer the operator wrote in the channel, outside the thread, reached the WF on the
+       channel's thread id, and was dropped: no instance holds it.
+    3. The answer in the thread reached the instance. Sales chose `decided`, and the person got the
+       decision: 15% approved, 1,700 USD a month.
+    4. Sales' second question opened a new post. A late reply in the first post's thread was
+       dropped, since io.slack had forgotten that post.
+    5. Three messages in the new thread that decided nothing got `wait`, and the person got none of
+       them. The next decision reached the person.
+    6. The WF node's log kept no text of the messages it dropped.
+  - **What failed: the agents' memory.** With immediate memory off, sales forgot its own quote
+    ("which plan do you want?") and did not invoice. Two turns after the approval, it forgot that
+    too and consulted again. SY.cognition was active and took every turn, but its package holds
+    labels and summaries that come several turns late, never the turns (FINDINGS A-134). The
+    operator decided that cognition carries the last 20 turns of each communication; that is
+    being built.
+  - **Health:** `failed=0`, `denials=0` on all 4.
+- **Rollback:**
+  - snapshot `pre-wfcase3-0-1-92`;
+  - or `apt install fluxbee=0.1.91` plus the core update of the spokes. A WF definition with a menu
+    or a catch does not load on 0.1.91, and io.slack's records file is new.
 
 ## 0.1.91 — The WF track, Case 1: one instance per conversation, `start_from`, only the nodes involved drive an instance, `forward` and `keep_message`, the WF's metadata block, timer times from state, internal transitions; ai.generic reads the block and answers with `text_field` (wf-orchestration-v1 §5.2; A-123, A-116 in part)
 

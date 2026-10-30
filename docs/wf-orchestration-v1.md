@@ -1121,6 +1121,11 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
 - How the team member hands the conversation back: a word, a reaction, or an inactivity timer.
 - What the agent knows, when it takes the conversation back, of what was said meanwhile.
 - What the first message to the team's channel carries, so that a person can take over.
+- **What the gate showed (2026-10-30):**
+  - **A supervisor who answers in the channel,** not in the thread of the question, is not heard:
+    the reply has the channel's thread id, and the WF drops it. Natural for a person to do.
+  - **A supervisor who asks the agent something** ("between 20% and 15%, which would you give?")
+    gets no answer: the agent may only decide or wait.
 - **Which posts io.slack records.** It records the place of each message that reaches it, and of
   each post it makes on a thread it does not know. Its answer at a channel's top level is not
   recorded, so a person who replies in that answer's Slack thread starts a new thread id, and a

@@ -1078,6 +1078,32 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-134 🟡 OPEN, BEING BUILT (found 2026-10-30, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
+
+- **What happened in the gate:** with ai.generic's immediate memory off (A-133), the sales agent
+  forgot its own quote and answered "which plan do you want?" to "dale, facturámelo", so it never
+  invoiced. Two turns after a supervisor's approval, it forgot that too, and consulted again.
+- **Why** (verified in the code and the history):
+  - The package (`build_memory_package_for_thread`, src/bin/sy_cognition.rs) holds contexts,
+    reasons, memories and episodes. ai.generic shows four labels of each, and three summaries.
+  - The summaries come late. SY.cognition processes turns one by one, each with two model calls
+    (about 5 s per turn in the gate, queued), and the summarizer starts with an active scope: the
+    gate's first summary came at the sixth turn, after the conversation.
+  - The router's stream is not the delay: it wakes its sender on every record, and SY.cognition
+    acks a batch at once (`take_stream_batch`).
+  - **The history:** the context model of February 2026 (docs/history/11-context.md) gave every
+    message the last 20 turns of its conversation (`ctx_window`). The router never filled it: no
+    commit of the router touched it. In March, cognition v2 handed the recent conversation to the AI
+    SDK's immediate memory (12-cognition-v2 §1, §14), built first for SY.architect, which cognition
+    does not serve. The 0.1.79 cleanup removed the unused field.
+- **Decided with the operator (2026-10-30):** cognition carries the last 20 turns of each
+  communication `(thread_id, agent ILK)` in the package, with who spoke and the node each turn came
+  through. They are written at intake, before the slow worker, so the next message already has
+  them. They go in the durable state too, so they survive a restart. SY.architect keeps the AI
+  SDK's immediate memory.
+- **Next:** build it, then run the gate again: Case 1 to the invoice, and sales recalling a
+  supervisor's decision.
+
 ### A-133 🟡 OPEN (found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
 
 - **What happens:** `runtime.immediate_memory` (off by default) keeps an agent's recent turns per
@@ -1098,7 +1124,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To watch in the gate:** the package holds contexts, reasons, memories and episodes; the
   summarizer never sees a message's text, and the region is rewritten after two model calls.
   Whether sales knows a supervisor's decision on the person's next message is checked there.
-- **Next:** remove the immediate memory, or key it by thread, when the agents' memory is revisited.
+- **Next:** cognition becomes the agents' recent conversation too (A-134). The immediate memory
+  stays for SY.architect; for AI agents, remove it or key it by thread when that is in place.
 
 ### A-132 🟡 OPEN (found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
 
