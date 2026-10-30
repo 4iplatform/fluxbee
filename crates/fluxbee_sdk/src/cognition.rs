@@ -181,6 +181,9 @@ pub struct CognitionThreadData {
     pub last_seen_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_count: Option<u64>,
+    /// The communication's last turns, oldest first, as its memory package carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<crate::protocol::MemoryTurn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

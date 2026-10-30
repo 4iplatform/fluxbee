@@ -4077,6 +4077,7 @@ mod tests {
                         title: "Urgent billing dispute".to_string(),
                         intensity: 7,
                     }],
+                    turns: Vec::new(),
                     truncated: Some(MemoryPackageTruncated {
                         applied: false,
                         dropped_contexts: 0,

@@ -39,6 +39,7 @@ fn sample_message() -> Message {
                 reasons: vec![],
                 memories: vec![],
                 episodes: vec![],
+                turns: Vec::new(),
                 truncated: None,
             }),
             action: None,

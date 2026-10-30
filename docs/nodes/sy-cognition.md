@@ -1,10 +1,12 @@
 # SY.cognition
 
 SY.cognition keeps the conversational memory of a hive's AI agents. Its router copies the turns
-its `AI.*` agents send and receive; SY.cognition tags them with the hive's LLM and keeps state
-per communication (contexts, reasons, co-occurrences, scopes, memories, episodes). It publishes
-memory packages in a shared-memory region that the router attaches to deliveries to agents, and
-sends its durable state to SY.storage.
+its `AI.*` agents send and receive; SY.cognition keeps each communication's last 20 turns, taken
+as they arrive, and tags the turns with the hive's LLM to keep the rest of its state (contexts,
+reasons, co-occurrences, scopes, memories, episodes). It publishes memory packages in a
+shared-memory region that the router attaches to deliveries to agents, and sends its durable
+state to SY.storage. The agents' recent conversation comes from here: ai.generic's immediate
+memory stays off for them.
 
 Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls). The model
 (communications, packages, retention): [docs/reference/cognition.md](../reference/cognition.md).
@@ -41,15 +43,28 @@ node name; a turn without a thread id, or from an agent without an ILK, is skipp
 The feed: the agent's own router copies both directions as `cognition.turns` records of its
 stream (what the agent sends, at entry; what it receives, at delivery) and the stream delivers
 them to `SY.cognition@<same hive>` (`sinks_for` in `src/router/stream.rs`). On the first turn of
-a communication it does not hold, SY.cognition loads its state from SY.storage.
+a communication it has not loaded, SY.cognition loads its state from SY.storage.
+
+Two paths take each turn:
+
+- **The intake,** in the `STREAM_BATCH` handler, adds the turn to its communication's last turns:
+  who spoke (`in` or `out`), the sender's ILK, the node it came through (the IO node at the head
+  of a WF's trail), its text cut at 2,000 characters, its files and its time. It rewrites the
+  memory region and appends the thread row at once, so the agent's next message carries the turn
+  before it, whatever the worker's backlog. 20 turns at most, and 48 KiB.
+- **The worker** takes the turns one at a time, with up to two model calls each (about 5 s a
+  turn), and derives the labels, memories and episodes. It works on a copy, so the intake never
+  waits for it, and writes the copy back keeping the turns the intake took meanwhile.
+
+Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 
 ## Messages
 
 | Message | Who may send / where it goes | What it does |
 | --- | --- | --- |
-| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records, skips repeats by stream and epoch, acks at once; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
-| `COGNITION_STATE_GET` (sent) | to `SY.storage@motherbee` | loads a communication's durable state, page by page |
-| `STREAM_APPEND storage.cognition.batch` (sent) | to its router's stream | the durable envelopes of each turn, in packs of at most 64 KiB (`COGNITION_APPEND_MAX_BYTES`) |
+| `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, rewrites the memory region and appends the thread rows; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
+| `COGNITION_STATE_GET` (sent) | to `SY.storage@motherbee` | loads a communication's durable state, page by page, its last turns included |
+| `STREAM_APPEND storage.cognition.batch` (sent) | to its router's stream | the durable envelopes of each turn, in packs of at most 64 KiB (`COGNITION_APPEND_MAX_BYTES`); the thread row, with the last turns, at every batch and after every turn |
 | `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`, `NODE_STATUS_GET` | `CONFIG_*` only from `SY.admin@motherbee` (router system policy) | control and status |
 | `VAULT_SECRET_CHANGED` | broadcast | re-probes the AI key and updates its state; it does not exit |
@@ -63,15 +78,18 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 
 - In memory: the communications it holds.
 - `/jsr-memory-<hive>`: the memory packages, at most 4 MiB of data (`MEMORY_MAX_DATA_SIZE` in
-  `src/shm/mod.rs`); the router reads it when it delivers a message to an agent.
-- The durable state lives in SY.storage's `cognition_*` tables; SY.cognition has no database of
-  its own. `fluxbee-factory-reset` removes its node directory entries and the region
-  (`cognition_paths`).
+  `src/shm/mod.rs`); the router reads it when it delivers a message to an agent. Each package
+  carries its communication's last turns (`package_version` 3), so the region holds fewer
+  communications than it did: some 90 when every turn is 2,000 characters long.
+- The durable state lives in SY.storage's `cognition_*` tables; the last turns are in the payload
+  of `cognition_threads`. SY.cognition has no database of its own, and the region does not survive
+  a host reset: after one, the last turns come back from SY.storage. `fluxbee-factory-reset`
+  removes its node directory entries and the region (`cognition_paths`).
 
 ## Failure behavior
 
-- Fail-open: without an AI key, or when the tagger fails, a turn is skipped (no envelopes, the
-  region unchanged).
+- Fail-open: without an AI key, or when the tagger fails, the worker skips a turn (no labels,
+  memories or episodes). Its text is in the last turns all the same: the intake needs no model.
 - A communication that cannot be loaded from SY.storage is skipped and counted.
 - The orchestrator's boot waits up to 60 s for it to appear on the router and only warns if it
   does not.

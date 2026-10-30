@@ -1133,6 +1133,12 @@ Cognitive enriches AI nodes. OPA reads identity only.
 
 ## 14. Relationship to Immediate Memory (AI SDK)
 
+> **Note (2026-10-30):** this section and §1's "does NOT handle immediate conversation memory" no
+> longer hold for AI agents. Their recent conversation now comes from cognition: the memory
+> package carries each communication's last 20 turns, taken as they arrive
+> (`docs/reference/cognition.md` §3.4 and §7), and ai.generic's immediate memory stays off for
+> them (FINDINGS A-133). SY.architect keeps the AI SDK's immediate memory.
+
 | Aspect | Immediate Memory (SDK) | Cognitive Memory (SY.cognition) |
 |--------|------------------------|--------------------------------|
 | Scope | Single session | Cross-session, cross-thread |

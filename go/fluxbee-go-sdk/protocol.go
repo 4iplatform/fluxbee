@@ -125,7 +125,19 @@ type MemoryPackage struct {
 	Reasons         []MemoryReasonSummary   `json:"reasons,omitempty"`
 	Memories        []MemorySummary         `json:"memories,omitempty"`
 	Episodes        []EpisodeSummary        `json:"episodes,omitempty"`
+	Turns           []MemoryTurn            `json:"turns,omitempty"`
 	Truncated       *MemoryPackageTruncated `json:"truncated,omitempty"`
+}
+
+// MemoryTurn is one turn of a communication, as its memory package carries it: a message its agent
+// received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through.
+type MemoryTurn struct {
+	Direction   string  `json:"direction"`
+	SrcIlk      *string `json:"src_ilk,omitempty"`
+	Via         *string `json:"via,omitempty"`
+	Text        string  `json:"text,omitempty"`
+	Attachments uint32  `json:"attachments,omitempty"`
+	Ts          string  `json:"ts"`
 }
 
 type MemoryContextSummary struct {

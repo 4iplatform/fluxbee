@@ -9563,6 +9563,7 @@ mod tests {
                 reasons: Vec::new(),
                 memories: Vec::new(),
                 episodes: Vec::new(),
+                turns: Vec::new(),
                 truncated: None,
             });
             serde_json::to_vec(&msg).unwrap()
@@ -9676,6 +9677,7 @@ mod tests {
             reasons: Vec::new(),
             memories: Vec::new(),
             episodes: Vec::new(),
+            turns: Vec::new(),
             truncated: None,
         };
         let entry = |thread: &str, node: &str, label: &str| crate::shm::MemoryShmThreadEntry {
@@ -10603,6 +10605,7 @@ mod tests {
             reasons: Vec::new(),
             memories: Vec::new(),
             episodes: Vec::new(),
+            turns: Vec::new(),
             truncated: None,
         };
         let fresh_package = fluxbee_sdk::protocol::MemoryPackage {
@@ -10618,6 +10621,7 @@ mod tests {
             reasons: Vec::new(),
             memories: Vec::new(),
             episodes: Vec::new(),
+            turns: Vec::new(),
             truncated: None,
         };
 

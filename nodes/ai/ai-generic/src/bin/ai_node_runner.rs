@@ -32,8 +32,9 @@ use fluxbee_sdk::managed_control_plane::{
     DEFAULT_MANAGED_NODES_ROOT,
 };
 use fluxbee_sdk::protocol::{
-    MemoryPackage, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP,
-    MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
+    MemoryPackage, MemoryTurn, MemoryTurnDirection, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE,
+    MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET,
+    MSG_NODE_STATUS_GET_RESPONSE,
 };
 use fluxbee_sdk::{
     managed_node_config_path_with_root, managed_node_instance_dir, managed_node_name,
@@ -7177,6 +7178,8 @@ fn blob_name_end(bytes: &[u8], underscore: usize) -> Option<usize> {
     (extension > 0).then_some(dot + 1 + extension)
 }
 
+/// The communication's memory package as the model reads it, ahead of the message: its labels,
+/// memories and what was left out, then its last turns, oldest first (`render_memory_turn`).
 fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) -> Option<String> {
     let package = memory_package?;
     let mut lines = Vec::new();
@@ -7238,7 +7241,47 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
         }
     }
 
+    if !package.turns.is_empty() {
+        lines.push(
+            "Recent conversation, oldest first, times in UTC (the current message comes after it):"
+                .to_string(),
+        );
+        lines.extend(package.turns.iter().map(render_memory_turn));
+    }
+
     Some(lines.join("\n"))
+}
+
+/// One turn of the recent conversation: when, who spoke, and what. The agent's own turns are
+/// "you"; another's names its sender's ILK and the node it came through, so a person and a
+/// supervisor in one thread read apart. A text of several lines keeps them, indented under the
+/// turn.
+fn render_memory_turn(turn: &MemoryTurn) -> String {
+    let speaker = match turn.direction {
+        MemoryTurnDirection::Out => "you".to_string(),
+        MemoryTurnDirection::In => match (turn.src_ilk.as_deref(), turn.via.as_deref()) {
+            (Some(ilk), Some(via)) => format!("{ilk} via {via}"),
+            (Some(ilk), None) => ilk.to_string(),
+            (None, Some(via)) => format!("via {via}"),
+            (None, None) => "unknown sender".to_string(),
+        },
+    };
+    let mut text = turn.text.replace('\n', "\n  ");
+    if turn.attachments > 0 {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&match turn.attachments {
+            1 => "[1 attachment]".to_string(),
+            files => format!("[{files} attachments]"),
+        });
+    }
+    // `2026-10-30T10:41:05.123Z` reads `2026-10-30 10:41`.
+    let time = match (turn.ts.get(..10), turn.ts.get(11..16)) {
+        (Some(date), Some(clock)) => format!("{date} {clock}"),
+        _ => turn.ts.clone(),
+    };
+    format!("- [{time}] {speaker}: {text}")
 }
 
 /// The WF's block, `meta.context.wf` (docs/wf-orchestration-v1.md §5.2.1), as the model reads it:
@@ -8518,6 +8561,7 @@ mod tests {
                 dominant_reason_id: Some("reason:1".to_string()),
             }],
             episodes: vec![],
+            turns: Vec::new(),
             truncated: None,
         }
     }
@@ -8536,6 +8580,75 @@ mod tests {
         assert!(enriched.contains("Conversation memory:"));
         assert!(enriched.contains("Dominant context: refund dispute"));
         assert!(enriched.contains("Current user message:\nplease help with this refund"));
+    }
+
+    /// The memory block keeps its lines and ends with the communication's last turns, oldest
+    /// first, each with who spoke: the agent itself as "you", and anyone else by sender and the
+    /// node the message came through, so the person and a supervisor in one thread read apart. A
+    /// text of several lines stays under its turn; a turn of files alone says how many.
+    #[test]
+    fn the_memory_block_shows_the_recent_conversation_oldest_first_with_who_spoke() {
+        let turn = |direction, src_ilk: &str, via: Option<&str>, text: &str, ts: &str| MemoryTurn {
+            direction,
+            src_ilk: Some(src_ilk.to_string()),
+            via: via.map(str::to_string),
+            text: text.to_string(),
+            attachments: 0,
+            ts: ts.to_string(),
+        };
+        let mut package = sample_memory_package();
+        package.turns = vec![
+            turn(
+                MemoryTurnDirection::In,
+                "ilk:person",
+                Some("IO.slack.T01@motherbee"),
+                "I want 10 Pro licenses at 20% off",
+                "2026-10-30T12:00:05.000Z",
+            ),
+            turn(
+                MemoryTurnDirection::Out,
+                "ilk:sales",
+                None,
+                "I will check with my supervisor.\nBack to you shortly.",
+                "2026-10-30T12:00:09.000Z",
+            ),
+            turn(
+                MemoryTurnDirection::In,
+                "ilk:supervisor",
+                Some("IO.slack.supervisores@motherbee"),
+                "20% approved",
+                "2026-10-30T12:05:41.000Z",
+            ),
+            MemoryTurn {
+                attachments: 2,
+                ..turn(
+                    MemoryTurnDirection::In,
+                    "ilk:person",
+                    Some("IO.slack.T01@motherbee"),
+                    "",
+                    "2026-10-30T12:06:00.000Z",
+                )
+            },
+        ];
+        let block = render_memory_package_prompt_block(Some(&package)).expect("memory block");
+        assert_eq!(
+            block,
+            [
+                "Conversation memory:",
+                "Thread: thread:canonical-1",
+                "Dominant context: refund dispute",
+                "Dominant reason: confrontational pushback",
+                "Contexts: refund dispute",
+                "Reasons: confrontational pushback",
+                "Memories: charged twice previously",
+                "Recent conversation, oldest first, times in UTC (the current message comes after it):",
+                "- [2026-10-30 12:00] ilk:person via IO.slack.T01@motherbee: I want 10 Pro licenses at 20% off",
+                "- [2026-10-30 12:00] you: I will check with my supervisor.\n  Back to you shortly.",
+                "- [2026-10-30 12:05] ilk:supervisor via IO.slack.supervisores@motherbee: 20% approved",
+                "- [2026-10-30 12:06] ilk:person via IO.slack.T01@motherbee: [2 attachments]",
+            ]
+            .join("\n")
+        );
     }
 
     #[test]
@@ -10087,6 +10200,82 @@ mod tests {
             format!("Echo: {memory}\n\n{wf}\n\nCurrent user message:\nhola")
         );
         assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+    }
+
+    /// Twenty turns of 2,000 characters, the most cognition keeps, push nothing out: the model reads
+    /// the memory block, the WF's block and the message whole, the message last, both through
+    /// `on_message` and on the tool loop, where the AI SDK cuts only the history around the
+    /// message (FINDINGS A-71). The agents run without that history.
+    #[tokio::test]
+    async fn twenty_long_turns_leave_the_wf_block_and_the_message_whole() {
+        let mut package = sample_memory_package();
+        package.turns = (0..20u32)
+            .map(|n| MemoryTurn {
+                direction: if n % 2 == 0 {
+                    MemoryTurnDirection::In
+                } else {
+                    MemoryTurnDirection::Out
+                },
+                src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+                via: (n % 2 == 0).then(|| "IO.api@motherbee".to_string()),
+                text: format!("{n:02} {}", "x".repeat(1_997)),
+                attachments: 0,
+                ts: format!("2026-10-30T12:{n:02}:00.000Z"),
+            })
+            .collect();
+        let memory = render_memory_package_prompt_block(Some(&package)).expect("memory block");
+        assert!(memory.chars().count() > 20 * 2_000, "every turn whole");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
+
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = sample_user_request_with_context(
+            sample_wf_context(),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.meta.thread_id = Some("thread:sim-wf-1".to_string());
+        msg.meta.memory_package = Some(package);
+        let reply = node
+            .on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(
+            reply.payload["content"],
+            format!("Echo: {memory}\n\n{wf}\n\nCurrent user message:\nhola")
+        );
+
+        let input = inject_prompt_blocks_into_text_input("hola", &[&memory, &wf]);
+        let model = ScriptedModel::new(Vec::new(), None).with_call_text("Hi, what do you need?");
+        let files = Arc::new(ReplyFiles::default());
+        let ctx = BehaviorContext::default();
+        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
+        node.run_tool_loop(
+            &model,
+            &tools,
+            &files,
+            &chat_runtime(None, None),
+            &ctx,
+            input.clone(),
+            None,
+            "hola",
+            None,
+        )
+        .await
+        .expect("the tool loop")
+        .expect("an answer");
+        let seen = model.seen.lock().expect("seen");
+        let read = seen[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionLoopItem::UserText { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(read, [input.as_str()]);
+        assert!(input.ends_with(&format!("{wf}\n\nCurrent user message:\nhola")));
     }
 
     /// A user message on a conversation's thread that a WF sent with `context`.

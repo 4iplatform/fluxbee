@@ -1,3 +1,6 @@
+// STATUS's `turns_consumer` is one `json!` object past the macro's default depth.
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
@@ -17,8 +20,9 @@ use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRec
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
-    MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, Message, Meta, Routing,
-    VaultSecretChangedPayload, VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, MemoryTurn, MemoryTurnDirection,
+    Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MEMORY_PACKAGE_VERSION,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::SystemRpcRequest;
 use fluxbee_sdk::stream::{
@@ -75,6 +79,18 @@ const COGNITION_AGENT_ILK_TTL: Duration = Duration::from_secs(60);
 /// A communication held but idle this long is checked against SY.storage before its next turn:
 /// its agent may have moved to another hive and back meanwhile (§6.2).
 const COGNITION_HELD_STALE_AFTER: Duration = Duration::from_secs(300);
+/// How many of its last turns a communication keeps, oldest first: the 21st pushes out the oldest.
+const COGNITION_RECENT_TURNS: usize = 20;
+/// The most of a turn's text kept, in characters.
+const COGNITION_TURN_TEXT_MAX_CHARS: usize = 2_000;
+/// The most characters a turn keeps of its sender's ILK and of the node it came through: the
+/// message names both, so they are bounded like its text.
+const COGNITION_TURN_NAME_MAX_CHARS: usize = 256;
+/// The most bytes a communication's turns take, serialized; past it the oldest go first. Twenty
+/// turns of 2,000 characters of Latin text fit; text that takes more bytes a character keeps fewer.
+/// It keeps a package and the message it rides on under a frame (128 KiB, of which an inline text
+/// message takes at most 64 KiB) and a thread row under the stream's record limit (96 KB).
+const COGNITION_RECENT_TURNS_MAX_BYTES: usize = 48 * 1024;
 const COGNITION_DEFAULT_CONTEXT_CLOSE_THRESHOLD: f64 = 0.25;
 const COGNITION_DEFAULT_REASON_CLOSE_THRESHOLD: f64 = 0.25;
 const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
@@ -267,6 +283,8 @@ struct CognitionRuntimeState {
     last_rebuild_at: Option<String>,
     /// Turns whose agent node has no ILK in the identity shared memory: no memory for them.
     no_agent_ilk_total: u64,
+    /// Turns the intake added to their communication's last turns, ahead of the worker.
+    intake_turns_total: u64,
     /// Records of a stream batch at or below the last seq taken for that stream and epoch.
     stream_repeats_skipped_total: u64,
     /// `COGNITION_STATE_GET` exchanges with SY.storage (one per communication loaded), and the
@@ -297,6 +315,8 @@ struct CognitionAppState {
     control_state: Arc<Mutex<CognitionControlState>>,
     runtime_state: Arc<Mutex<CognitionRuntimeState>>,
     /// The communications this cognition holds, each owned by one of its hive's agents (§6.1).
+    /// The intake and the worker both write it, and the region is built from it: whoever writes
+    /// the region takes `memory_region` first, then this (`sync_held_state`).
     thread_states: Arc<Mutex<HashMap<CommunicationKey, ThreadCognitionState>>>,
     memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
     vault: VaultClient,
@@ -326,19 +346,30 @@ struct CognitionTurn {
     agent_node: String,
 }
 
+/// A communication as this cognition holds it. The intake owns its last turns and the last turn's
+/// ILKs and channel; the worker owns the rest, and its turn count numbers the thread row both write.
 #[derive(Debug, Clone, Default)]
 struct ThreadCognitionState {
+    /// Whether its state came from SY.storage, or SY.storage had none. Until then the intake holds
+    /// only its turns, and the worker loads it before its next turn (`adopt_stored_state`).
+    loaded: bool,
     /// The agent node its router delivers to, where the memory package is read (mechanism only).
     agent_node: String,
     first_seen_at: Option<String>,
     last_seen_at: Option<String>,
     turn_count: u64,
+    /// The last turn's sender and receiver ILKs and channel, as its thread row keeps them.
+    src_ilk: Option<String>,
+    dst_ilk: Option<String>,
+    ich: Option<String>,
     contexts: HashMap<String, ContextState>,
     reasons: HashMap<String, ReasonState>,
     cooccurrences: HashMap<String, CooccurrenceState>,
     active_scope: Option<ScopeBindingState>,
     memories: HashMap<String, MemoryState>,
     episodes: HashMap<String, EpisodeState>,
+    /// Its last turns, oldest first (`push_recent_turn`): what its agent received and sent.
+    turns: Vec<MemoryTurn>,
 }
 
 #[derive(Debug, Clone)]
@@ -475,7 +506,7 @@ struct MemoryHotThreadCandidate {
     key: CommunicationKey,
     entry: MemoryShmThreadEntry,
     serialized_bytes: usize,
-    updated_by_this_turn: bool,
+    just_updated: bool,
     has_active_scope: bool,
     live_entities_total: usize,
     last_seen_epoch_ms: i64,
@@ -609,8 +640,9 @@ async fn main() -> Result<(), CognitionError> {
     }
 
     // The worker's task first resolves the AI key and brings back the communications the shared
-    // memory holds, then takes turns. Meanwhile the main loop keeps acking its routers' batches and
-    // the turns wait in the queue, inside the streams' window (§6.2).
+    // memory holds, then takes turns. Meanwhile the main loop keeps taking its routers' batches,
+    // their last turns go to the region at once, and the turns wait in the queue, inside the
+    // streams' window (§6.2).
     let (turn_tx, turn_rx) = mpsc::channel::<CognitionTurn>(COGNITION_TURN_QUEUE);
     let worker_state = Arc::clone(&app_state);
     std::mem::drop(tokio::spawn(async move {
@@ -696,9 +728,11 @@ async fn run_turn_worker(mut rx: mpsc::Receiver<CognitionTurn>, app_state: Arc<C
     }
 }
 
-/// A `STREAM_BATCH` from one of its hive's routers: each new record goes to the turn queue, and the
-/// batch is acked at once (best effort, §2.7). A record at or below the last one taken from that
-/// stream and epoch is a repeat; a full queue drops a turn and counts it.
+/// A `STREAM_BATCH` from one of its hive's routers. Its new turns go first to their communications'
+/// last turns, which the memory region and SY.storage get at once (`take_recent_turns`), then each
+/// to the worker's queue; the batch is acked without waiting for the worker (best effort, §2.7). A
+/// record at or below the last one taken from that stream and epoch is a repeat; a full queue drops
+/// a turn and counts it.
 async fn take_stream_batch(
     app_state: &CognitionAppState,
     turn_tx: &mpsc::Sender<CognitionTurn>,
@@ -731,6 +765,8 @@ async fn take_stream_batch(
         .copied()
         .unwrap_or(0);
     let (mut repeats, mut dropped) = (0u64, 0u64);
+    let mut turns = Vec::new();
+    let mut recent = Vec::new();
     for record in batch.records {
         if record.seq <= seen {
             repeats += 1;
@@ -747,10 +783,16 @@ async fn take_stream_batch(
                 continue;
             }
         };
-        let turn = CognitionTurn {
+        recent.extend(intake_turn(app_state, &message, &record.producer, record.ts_ms).await);
+        turns.push(CognitionTurn {
             message,
             agent_node: record.producer,
-        };
+        });
+    }
+    // The next message its router delivers to the agent carries these turns, whatever the
+    // worker's backlog.
+    take_recent_turns(app_state, recent).await;
+    for turn in turns {
         match turn_tx.try_send(turn) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
@@ -776,6 +818,278 @@ async fn take_stream_batch(
     if let Err(err) = sender.send(ack).await {
         tracing::warn!(error = %err, "sy.cognition could not ack a stream batch");
     }
+}
+
+/// A turn as the intake takes it (docs/reference/cognition.md §3.4): the communication it belongs
+/// to, the last turn's ILKs and channel its thread row keeps, and the turn as the agent's package
+/// shows it.
+#[derive(Debug, Clone)]
+struct RecentTurn {
+    key: CommunicationKey,
+    agent_node: String,
+    src_ilk: Option<String>,
+    dst_ilk: Option<String>,
+    ich: Option<String>,
+    turn: MemoryTurn,
+}
+
+/// What the intake keeps of a copy of a turn: `None` without a thread id or without an ILK for its
+/// agent node in the identity shared memory, as the worker finds it (`agent_identity_of`, the
+/// worker counts both), and without text or files.
+async fn intake_turn(
+    app_state: &CognitionAppState,
+    message: &Message,
+    agent_node: &str,
+    ts_ms: u64,
+) -> Option<RecentTurn> {
+    message
+        .meta
+        .thread_id
+        .as_deref()
+        .filter(|thread_id| !thread_id.trim().is_empty())?;
+    let agent = agent_identity_of(app_state, agent_node).await?;
+    recent_turn_of(message, agent_node, &agent.ilk, ts_ms)
+}
+
+/// A copy of a turn as its communication keeps it. The agent sent it (`out`) when its router names
+/// the agent node as the sender; otherwise the agent received it (`in`), through `turn_via`. A turn
+/// with neither text nor files is left out: the package would show it empty.
+fn recent_turn_of(
+    message: &Message,
+    agent_node: &str,
+    agent_ilk: &str,
+    ts_ms: u64,
+) -> Option<RecentTurn> {
+    let thread_id = message
+        .meta
+        .thread_id
+        .clone()
+        .filter(|thread_id| !thread_id.trim().is_empty())?;
+    let text = extract_turn_text(&message.payload)
+        .map(|text| cut_chars(&text, COGNITION_TURN_TEXT_MAX_CHARS))
+        .unwrap_or_default();
+    let attachments = turn_attachments(&message.payload);
+    if text.is_empty() && attachments == 0 {
+        return None;
+    }
+    let direction = if message.routing.src_l2_name.as_deref() == Some(agent_node) {
+        MemoryTurnDirection::Out
+    } else {
+        MemoryTurnDirection::In
+    };
+    let turn = MemoryTurn {
+        direction,
+        src_ilk: message
+            .meta
+            .src_ilk
+            .as_deref()
+            .map(str::trim)
+            .filter(|ilk| !ilk.is_empty())
+            .map(|ilk| cut_chars(ilk, COGNITION_TURN_NAME_MAX_CHARS)),
+        via: match direction {
+            MemoryTurnDirection::In => turn_via(message),
+            MemoryTurnDirection::Out => None,
+        },
+        text,
+        attachments,
+        ts: turn_ts(ts_ms),
+    };
+    Some(RecentTurn {
+        key: CommunicationKey {
+            thread_id,
+            agent_ilk: agent_ilk.to_string(),
+        },
+        agent_node: agent_node.to_string(),
+        src_ilk: message.meta.src_ilk.clone(),
+        dst_ilk: message.meta.dst_ilk.clone(),
+        ich: message.meta.ich.clone(),
+        turn,
+    })
+}
+
+/// The node a turn came in through: for a message a WF forwards, the first node of its trail
+/// (`meta.context.wf.trail`, the IO node it came from); otherwise its sender, as its router names
+/// it.
+fn turn_via(message: &Message) -> Option<String> {
+    let named = |node: Option<&str>| {
+        node.map(str::trim)
+            .filter(|node| !node.is_empty())
+            .map(|node| cut_chars(node, COGNITION_TURN_NAME_MAX_CHARS))
+    };
+    named(
+        message
+            .meta
+            .context
+            .as_ref()
+            .and_then(|context| context.pointer("/wf/trail/0"))
+            .and_then(Value::as_str),
+    )
+    .or_else(|| named(message.routing.src_l2_name.as_deref()))
+}
+
+/// How many files a turn carried: its attachments, and its text when it came as a file.
+fn turn_attachments(payload: &Value) -> u32 {
+    TextV1Payload::from_value(payload).map_or(0, |payload| {
+        u32::try_from(payload.attachments.len() + usize::from(payload.content_ref.is_some()))
+            .unwrap_or(u32::MAX)
+    })
+}
+
+/// When its router took a turn (the stream record's time), in UTC to the millisecond.
+fn turn_ts(ts_ms: u64) -> String {
+    i64::try_from(ts_ms)
+        .ok()
+        .filter(|ms| *ms > 0)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// `value` cut at `max_chars` characters, the last of them an ellipsis when it was cut.
+fn cut_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().nth(max_chars).is_none() {
+        return value.to_string();
+    }
+    let mut cut: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The intake's turns into what is held (docs/reference/cognition.md §3.4): the region is
+/// rewritten with them, and their thread rows go to SY.storage, before the turns reach the worker's
+/// queue.
+async fn take_recent_turns(app_state: &CognitionAppState, recent: Vec<RecentTurn>) {
+    if recent.is_empty() {
+        return;
+    }
+    let taken = recent.len() as u64;
+    let mut kept: Vec<CommunicationKey> = Vec::new();
+    for turn in &recent {
+        if !kept.contains(&turn.key) {
+            kept.push(turn.key.clone());
+        }
+    }
+    if let Err(err) = sync_held_state(app_state, &kept, "", |threads, carried| {
+        hold_recent_turns(threads, carried, recent)
+    })
+    .await
+    {
+        tracing::warn!(error = %err, "sy.cognition failed to sync jsr-memory at intake");
+    }
+    let mut state = app_state.runtime_state.lock().await;
+    state.intake_turns_total = state.intake_turns_total.saturating_add(taken);
+}
+
+/// Adds each turn to its communication's last turns, and returns the communications it touched. A
+/// communication not held yet starts from the turns the region had for it (after a restart), and
+/// is loaded by the worker before its next turn.
+fn hold_recent_turns(
+    threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
+    carried: &[MemoryShmThreadEntry],
+    recent: Vec<RecentTurn>,
+) -> Vec<CommunicationKey> {
+    let mut touched: Vec<CommunicationKey> = Vec::new();
+    for recent in recent {
+        let held = threads.entry(recent.key.clone()).or_insert_with(|| {
+            let turns = carried
+                .iter()
+                .find(|entry| {
+                    entry.thread_id == recent.key.thread_id
+                        && entry.agent_ilk == recent.key.agent_ilk
+                })
+                .map(|entry| entry.package.turns.clone())
+                .unwrap_or_default();
+            ThreadCognitionState {
+                turns,
+                ..ThreadCognitionState::default()
+            }
+        });
+        held.agent_node = recent.agent_node;
+        held.src_ilk = recent.src_ilk;
+        held.dst_ilk = recent.dst_ilk;
+        held.ich = recent.ich;
+        push_recent_turn(&mut held.turns, recent.turn);
+        if !touched.contains(&recent.key) {
+            touched.push(recent.key);
+        }
+    }
+    touched
+}
+
+/// Adds a turn to a communication's last turns, unless they hold it already (a batch sent again).
+fn push_recent_turn(turns: &mut Vec<MemoryTurn>, turn: MemoryTurn) {
+    if turns.contains(&turn) {
+        return;
+    }
+    turns.push(turn);
+    bound_recent_turns(turns);
+}
+
+/// The oldest turns go past `COGNITION_RECENT_TURNS`, and past `COGNITION_RECENT_TURNS_MAX_BYTES`;
+/// the newest always stays.
+fn bound_recent_turns(turns: &mut Vec<MemoryTurn>) {
+    let excess = turns.len().saturating_sub(COGNITION_RECENT_TURNS);
+    turns.drain(..excess);
+    let size = |turn: &MemoryTurn| serde_json::to_vec(turn).map_or(0, |bytes| bytes.len() + 1);
+    let mut bytes: usize = turns.iter().map(size).sum();
+    let mut oldest = 0;
+    while turns.len() - oldest > 1 && bytes > COGNITION_RECENT_TURNS_MAX_BYTES {
+        bytes -= size(&turns[oldest]);
+        oldest += 1;
+    }
+    turns.drain(..oldest);
+}
+
+/// One communication's last turns from two copies of them, SY.storage's and what is held (or the
+/// region's): each turn of either once, in the order they were taken, bounded as at intake.
+fn merge_recent_turns(stored: &[MemoryTurn], held: &[MemoryTurn]) -> Vec<MemoryTurn> {
+    let mut merged = stored.to_vec();
+    for turn in held {
+        if !merged.contains(turn) {
+            merged.push(turn.clone());
+        }
+    }
+    merged.sort_by_key(|turn| parse_rfc3339_epoch_ms(&turn.ts).unwrap_or_default());
+    bound_recent_turns(&mut merged);
+    merged
+}
+
+/// A communication's state from SY.storage becomes what is held, loaded: the stored derivations,
+/// and the stored turns with those the intake took meanwhile. When the intake holds turns the
+/// store lacks, its last turn's ILKs and channel stay.
+fn adopt_stored_state(
+    threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
+    key: &CommunicationKey,
+    mut stored: ThreadCognitionState,
+    agent_node: &str,
+) {
+    stored.loaded = true;
+    stored.agent_node = agent_node.to_string();
+    if let Some(held) = threads.get(key) {
+        if held.turns.iter().any(|turn| !stored.turns.contains(turn)) {
+            stored.src_ilk = held.src_ilk.clone();
+            stored.dst_ilk = held.dst_ilk.clone();
+            stored.ich = held.ich.clone();
+        }
+        stored.turns = merge_recent_turns(&stored.turns, &held.turns);
+    }
+    threads.insert(key.clone(), stored);
+}
+
+/// The worker's turn back into what is held: its derivations replace the held ones, and what the
+/// intake owns stays as the intake left it, with the turns it took while the model answered.
+fn write_back_turn(
+    threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
+    key: &CommunicationKey,
+    mut updated: ThreadCognitionState,
+) {
+    if let Some(held) = threads.get_mut(key) {
+        updated.turns = std::mem::take(&mut held.turns);
+        updated.src_ilk = held.src_ilk.take();
+        updated.dst_ilk = held.dst_ilk.take();
+        updated.ich = held.ich.take();
+    }
+    threads.insert(key.clone(), updated);
 }
 
 /// One turn of a communication (§6.2): the ILK of the agent that owns it, its state (loaded from
@@ -817,20 +1131,19 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         .lock()
         .await
         .get(&key)
+        .filter(|state| state.loaded)
         .map(|state| (state.turn_count, thread_last_seen_epoch_ms(state)));
     match held_turn {
         None => {
-            // Its state may be in SY.storage: after a restart, or when its agent moved here.
+            // Its state may be in SY.storage: after a restart, or when its agent moved here. The
+            // intake may hold its last turns already.
             match fetch_communication_state(&app_state, &key).await {
-                Ok(state) => {
-                    let mut state = state.unwrap_or_default();
-                    state.agent_node = turn.agent_node.clone();
-                    app_state
-                        .thread_states
-                        .lock()
-                        .await
-                        .insert(key.clone(), state);
-                }
+                Ok(state) => adopt_stored_state(
+                    &mut *app_state.thread_states.lock().await,
+                    &key,
+                    state.unwrap_or_default(),
+                    &turn.agent_node,
+                ),
                 Err(err) => {
                     tracing::warn!(
                         thread_id = %thread_id,
@@ -848,14 +1161,14 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         {
             // Held but idle: its agent may have moved away and back meanwhile, and another
             // hive's cognition carried it on. The stored state wins when it is further along.
-            if let Ok(Some(mut stored)) = fetch_communication_state(&app_state, &key).await {
+            if let Ok(Some(stored)) = fetch_communication_state(&app_state, &key).await {
                 if stored.turn_count > held_turns {
-                    stored.agent_node = turn.agent_node.clone();
-                    app_state
-                        .thread_states
-                        .lock()
-                        .await
-                        .insert(key.clone(), stored);
+                    adopt_stored_state(
+                        &mut *app_state.thread_states.lock().await,
+                        &key,
+                        stored,
+                        &turn.agent_node,
+                    );
                 }
             }
         }
@@ -957,33 +1270,48 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         }
     };
 
-    let update_result = {
-        let mut threads = app_state.thread_states.lock().await;
-        let thread_state = threads.entry(key.clone()).or_default();
-        thread_state.agent_node = turn.agent_node.clone();
-        update_thread_state_and_build_envelopes(
-            &app_state.hive_id,
-            &app_state.node_name,
-            &thread_id,
-            &agent_ilk,
-            src_ilk.as_deref(),
-            dst_ilk.as_deref(),
-            ich.as_deref(),
-            &tagger,
-            &thresholds,
-            &api_key,
-            &account,
-            &semantic_tagger_config,
-            &ts,
-            thread_state,
-            &AiNarrativeSummarizer,
-        )
+    // The derivations run on a copy, without the lock: the intake goes on taking turns while the
+    // summarizer answers, and they stay (`write_back_turn`).
+    let mut thread_state = app_state
+        .thread_states
+        .lock()
         .await
-    };
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    thread_state.agent_node = turn.agent_node.clone();
+    let update_result = update_thread_state_and_build_envelopes(
+        &app_state.hive_id,
+        &app_state.node_name,
+        &thread_id,
+        &agent_ilk,
+        src_ilk.as_deref(),
+        dst_ilk.as_deref(),
+        &tagger,
+        &thresholds,
+        &api_key,
+        &account,
+        &semantic_tagger_config,
+        &ts,
+        &mut thread_state,
+        &AiNarrativeSummarizer,
+    )
+    .await;
     let (published, publish_errors) =
         append_envelopes(&app_state, update_result.envelopes, &msg.routing.trace_id).await;
 
-    if let Err(err) = sync_memory_shm(&app_state, Some(&key)).await {
+    // The thread row goes with the region's rewrite, built from what is held then.
+    if let Err(err) = sync_held_state(
+        &app_state,
+        std::slice::from_ref(&key),
+        &msg.routing.trace_id,
+        |threads, _| {
+            write_back_turn(threads, &key, thread_state);
+            vec![key.clone()]
+        },
+    )
+    .await
+    {
         tracing::warn!(
             error = %err,
             trace_id = %msg.routing.trace_id,
@@ -1195,55 +1523,103 @@ async fn agent_identity_of(
     Some(found)
 }
 
-/// Writes the memory region: the packages of the communications this cognition holds, ranked, and
-/// after them the entries the region had for communications it has not loaded (a restart before
-/// their reload, or a reload that failed), so a restart never blanks what the agents read (§6.2).
-/// `turn`: the communication the current turn updated, which always stays.
-async fn sync_memory_shm(
+/// Changes what this cognition holds and publishes it, under the region's lock and then the held
+/// state's, the one order every writer takes them in, so the intake and the worker never lose each
+/// other's writes. `change` updates the held communications and names those whose thread rows go
+/// out; the rows are built from what is then held, the region is rewritten from it (`kept`, the
+/// communications just updated, always stay), and the rows are appended before the locks go. So
+/// they reach the stream in the order they were built, and SY.storage, which takes a row of an
+/// equal turn, never ends on fewer turns (docs/reference/cognition.md §5).
+///
+/// The region holds the packages of the communications this cognition holds, ranked, and after
+/// them the entries it had for communications not loaded (a restart before their reload, or a
+/// reload that failed), so a restart never blanks what the agents read (§6.2).
+async fn sync_held_state<F>(
     app_state: &CognitionAppState,
-    turn: Option<&CommunicationKey>,
-) -> Result<(), json_router::shm::ShmError> {
+    kept: &[CommunicationKey],
+    trace_id: &str,
+    change: F,
+) -> Result<(), json_router::shm::ShmError>
+where
+    F: FnOnce(
+        &mut HashMap<CommunicationKey, ThreadCognitionState>,
+        &[MemoryShmThreadEntry],
+    ) -> Vec<CommunicationKey>,
+{
     let mut memory_region = app_state.memory_region.lock().await;
-    let Some(region) = memory_region.as_mut() else {
-        let mut state = app_state.runtime_state.lock().await;
-        state.last_shm_sync_status = Some("skipped_missing_region".to_string());
-        state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
-        return Ok(());
-    };
-    let carried: Vec<MemoryShmThreadEntry> = region
-        .read_snapshot()
+    let carried: Vec<MemoryShmThreadEntry> = memory_region
+        .as_ref()
+        .and_then(|region| region.read_snapshot().ok())
         .map(|snapshot| snapshot.threads)
         .unwrap_or_default();
-    let hot_set = {
-        let mut threads = app_state.thread_states.lock().await;
-        retain_memory_hot_set(&mut threads, turn, carried)?
+    let mut threads = app_state.thread_states.lock().await;
+    let persist = change(&mut threads, &carried);
+    let rows = thread_rows(&app_state.hive_id, &app_state.node_name, &threads, &persist);
+    let synced = match memory_region.as_mut() {
+        Some(region) => retain_memory_hot_set(&mut threads, kept, carried).and_then(|hot_set| {
+            region.write_snapshot(&hot_set.snapshot)?;
+            Ok(Some(hot_set.stats))
+        }),
+        None => Ok(None),
     };
-    region.write_snapshot(&hot_set.snapshot)?;
+    let (published, publish_errors) = append_envelopes(app_state, rows, trace_id).await;
+    drop(threads);
     drop(memory_region);
 
-    let sync_status = if hot_set.stats.pruned_threads_total > 0 {
-        "ok_pruned"
-    } else {
-        "ok"
-    };
     let mut state = app_state.runtime_state.lock().await;
-    state.shm_hot_threads_total = hot_set.stats.selected_threads_total;
-    state.shm_pruned_threads_total = hot_set.stats.pruned_threads_total;
-    state.shm_payload_bytes = hot_set.stats.payload_bytes;
+    state.published_entities_total = state.published_entities_total.saturating_add(published);
+    state.publish_errors_total = state.publish_errors_total.saturating_add(publish_errors);
+    let stats = synced?;
+    let sync_status = match &stats {
+        None => "skipped_missing_region",
+        Some(stats) if stats.pruned_threads_total > 0 => "ok_pruned",
+        Some(_) => "ok",
+    };
+    if let Some(stats) = stats {
+        state.shm_hot_threads_total = stats.selected_threads_total;
+        state.shm_pruned_threads_total = stats.pruned_threads_total;
+        state.shm_payload_bytes = stats.payload_bytes;
+    }
     state.last_shm_sync_status = Some(sync_status.to_string());
     state.last_shm_sync_at = Some(chrono::Utc::now().to_rfc3339());
     Ok(())
 }
 
+/// The thread rows of `keys` as held now (docs/reference/cognition.md §5): numbered with the
+/// worker's turn count, and with the last turns the intake took. A communication no longer held
+/// has none.
+fn thread_rows(
+    hive_id: &str,
+    writer: &str,
+    threads: &HashMap<CommunicationKey, ThreadCognitionState>,
+    keys: &[CommunicationKey],
+) -> Vec<(&'static str, Vec<u8>)> {
+    let ts = chrono::Utc::now().to_rfc3339();
+    keys.iter()
+        .filter_map(|key| {
+            let thread_state = threads.get(key)?;
+            let comm = CognitionCommunicationRef {
+                thread_id: key.thread_id.clone(),
+                agent_ilk: key.agent_ilk.clone(),
+                turn: thread_state.turn_count,
+            };
+            build_thread_envelope_body(hive_id, writer, &comm, &ts, thread_state)
+                .map(|body| (SUBJECT_STORAGE_COGNITION_THREADS, body))
+        })
+        .collect()
+}
+
 /// Ranks the communications this cognition holds and keeps, in rank order, each one whose entry
 /// still fits the region; then, in the region's previous order, the carried entries of the ones
-/// it does not hold. The communication the current turn updated goes first, so it is never the
-/// one dropped. Then recency (`last_seen_at`), an active scope, live entities, `turn_count` and
-/// the key. Ranked by live entities ahead of recency, a new thread in a full region was dropped
-/// right after its own turn and started over, with a new scope written to storage, on every turn.
+/// it does not hold. The communications just updated (`kept`) go first, so they are never the
+/// ones dropped. Then recency (the last turn, or `last_seen_at`), an active scope, live entities,
+/// `turn_count` and the key. Ranked by live entities ahead of recency, a new thread in a full
+/// region was dropped right after its own turn and started over, with a new scope written to
+/// storage, on every turn. A communication not loaded yet shows the package the region had for
+/// it, with the turns the intake took since.
 fn build_memory_hot_set_snapshot(
     threads: &HashMap<CommunicationKey, ThreadCognitionState>,
-    turn: Option<&CommunicationKey>,
+    kept: &[CommunicationKey],
     carried: Vec<MemoryShmThreadEntry>,
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
     let updated_at = json_router::shm::now_epoch_ms();
@@ -1255,29 +1631,44 @@ fn build_memory_hot_set_snapshot(
     let base_size = serde_json::to_vec(&base_snapshot)?.len();
     let mut candidates = Vec::with_capacity(threads.len());
     for (key, thread_state) in threads {
+        let region_had = (!thread_state.loaded)
+            .then(|| {
+                carried.iter().find(|entry| {
+                    entry.thread_id == key.thread_id && entry.agent_ilk == key.agent_ilk
+                })
+            })
+            .flatten();
+        let package = match region_had {
+            Some(entry) => MemoryPackage {
+                package_version: MEMORY_PACKAGE_VERSION,
+                turns: thread_state.turns.clone(),
+                ..entry.package.clone()
+            },
+            None => build_memory_package_for_thread(&key.thread_id, thread_state),
+        };
         let entry = MemoryShmThreadEntry {
             thread_id: key.thread_id.clone(),
             agent_ilk: key.agent_ilk.clone(),
             agent_node: thread_state.agent_node.clone(),
-            package: build_memory_package_for_thread(&key.thread_id, thread_state),
+            package,
         };
         let serialized_bytes = serde_json::to_vec(&entry)?.len();
         candidates.push(MemoryHotThreadCandidate {
             key: key.clone(),
             entry,
             serialized_bytes,
-            updated_by_this_turn: turn == Some(key),
+            just_updated: kept.contains(key),
             has_active_scope: thread_state.active_scope.is_some(),
             live_entities_total: thread_live_entities_total(thread_state),
-            last_seen_epoch_ms: thread_last_seen_epoch_ms(thread_state),
+            last_seen_epoch_ms: thread_recency_epoch_ms(thread_state),
             turn_count: thread_state.turn_count,
         });
     }
 
     candidates.sort_by(|left, right| {
         right
-            .updated_by_this_turn
-            .cmp(&left.updated_by_this_turn)
+            .just_updated
+            .cmp(&left.just_updated)
             .then_with(|| right.last_seen_epoch_ms.cmp(&left.last_seen_epoch_ms))
             .then_with(|| right.has_active_scope.cmp(&left.has_active_scope))
             .then_with(|| right.live_entities_total.cmp(&left.live_entities_total))
@@ -1332,15 +1723,15 @@ fn build_memory_hot_set_snapshot(
 }
 
 /// The one retention rule for local cognition state: build the jsr-memory hot set and drop every
-/// communication that did not make it. Applied after every live turn (with the turn's
-/// communication, which always stays) and after a reload, so memory stays bounded by the SHM
-/// capacity. A dropped communication reloads from SY.storage if it comes back.
+/// communication that did not make it. Applied at every intake and live turn (with the
+/// communications they updated, which always stay) and after a reload, so memory stays bounded
+/// by the SHM capacity. A dropped communication reloads from SY.storage if it comes back.
 fn retain_memory_hot_set(
     threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
-    turn: Option<&CommunicationKey>,
+    kept: &[CommunicationKey],
     carried: Vec<MemoryShmThreadEntry>,
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
-    let hot_set = build_memory_hot_set_snapshot(threads, turn, carried)?;
+    let hot_set = build_memory_hot_set_snapshot(threads, kept, carried)?;
     threads.retain(|key, _| hot_set.selected_thread_ids.contains(key));
     Ok(hot_set)
 }
@@ -1383,6 +1774,17 @@ fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
         .unwrap_or_default()
 }
 
+/// When a communication last had a turn, for the region's ranking: the worker's last, or a later
+/// one the intake took. The idle check (`COGNITION_HELD_STALE_AFTER`) reads the worker's alone.
+fn thread_recency_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
+    let last_turn = thread_state
+        .turns
+        .last()
+        .and_then(|turn| parse_rfc3339_epoch_ms(&turn.ts))
+        .unwrap_or_default();
+    thread_last_seen_epoch_ms(thread_state).max(last_turn)
+}
+
 fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -1392,7 +1794,9 @@ fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
 /// At start, before the first turn: the communications the memory region holds come back from
 /// SY.storage over the mesh, at most `COGNITION_RELOAD_CONCURRENCY` at once (§6.2). One that could
 /// not load, or that SY.storage has no state for yet (its last envelopes may still be on their way),
-/// stays in the region as it was and loads on its next turn.
+/// stays in the region as it was and loads on its next turn. The region's turns may be ahead of
+/// SY.storage's (the intake writes the region first): a loaded communication keeps them, and its
+/// thread row goes out again when it does.
 async fn reload_communications_from_shared_memory(app_state: &Arc<CognitionAppState>) {
     use futures::stream::{self, StreamExt};
     let entries: Vec<MemoryShmThreadEntry> = {
@@ -1410,27 +1814,36 @@ async fn reload_communications_from_shared_memory(app_state: &Arc<CognitionAppSt
                 agent_ilk: entry.agent_ilk,
             };
             let state = fetch_communication_state(app_state, &key).await;
-            (entry.agent_node, key, state)
+            (entry.agent_node, key, entry.package.turns, state)
         })
         .buffer_unordered(COGNITION_RELOAD_CONCURRENCY)
         .collect()
         .await;
     let (mut loaded, mut without_state, mut failed) = (0u64, 0u64, 0u64);
-    {
-        let mut threads = app_state.thread_states.lock().await;
-        for (agent_node, key, state) in results {
+    let reloaded = sync_held_state(app_state, &[], "", |threads, _| {
+        let mut persist = Vec::new();
+        for (agent_node, key, region_turns, state) in results {
             match state {
-                Ok(Some(mut state)) => {
-                    state.agent_node = agent_node;
-                    threads.insert(key, state);
+                Ok(Some(mut stored)) => {
+                    let stored_turns = stored.turns.clone();
+                    stored.turns = merge_recent_turns(&stored.turns, &region_turns);
+                    adopt_stored_state(threads, &key, stored, &agent_node);
+                    if threads
+                        .get(&key)
+                        .is_some_and(|held| held.turns != stored_turns)
+                    {
+                        persist.push(key);
+                    }
                     loaded += 1;
                 }
                 Ok(None) => without_state += 1,
                 Err(_) => failed += 1,
             }
         }
-    }
-    if let Err(err) = sync_memory_shm(app_state, None).await {
+        persist
+    })
+    .await;
+    if let Err(err) = reloaded {
         tracing::warn!(error = %err, "sy.cognition could not write jsr-memory after its reload");
     }
     let status = format!("ok loaded {loaded}, without state {without_state}, failed {failed}");
@@ -1570,13 +1983,18 @@ fn rebuild_rows_from_envelopes(envelopes: Vec<Value>) -> RebuildRows {
 /// contexts and reasons by label, co-occurrences by `"<context label>|<reason label>"`, memories by
 /// scope id, episodes by `"<scope instance id>|<affect id>"`. Keyed by entity id instead, every
 /// lookup of the next live turn missed and it re-created each entity, under the same id, next to
-/// the rebuilt one. The active scope is the open instance with the latest start turn.
+/// the rebuilt one. The active scope is the open instance with the latest start turn. The last
+/// turns come back from the thread row.
 fn build_communication_state(key: &CommunicationKey, rows: RebuildRows) -> ThreadCognitionState {
     let mut state = ThreadCognitionState::default();
     if let Some(thread) = rows.thread {
         state.first_seen_at = thread.first_seen_at;
         state.last_seen_at = thread.last_seen_at;
         state.turn_count = thread.turn_count.unwrap_or(0);
+        state.src_ilk = thread.src_ilk;
+        state.dst_ilk = thread.dst_ilk;
+        state.ich = thread.ich;
+        state.turns = thread.turns;
     }
     for (context_id, payload) in rows.contexts {
         let context = context_state_from_payload(context_id, payload);
@@ -1891,6 +2309,8 @@ async fn resolve_cognition_resource(
     }
 }
 
+/// A communication's memory package (docs/reference/cognition.md §7): its labels, memories and
+/// episodes from the worker, and its last turns from the intake.
 fn build_memory_package_for_thread(
     thread_id: &str,
     thread_state: &ThreadCognitionState,
@@ -1937,7 +2357,7 @@ fn build_memory_package_for_thread(
     let dropped_episodes = episodes.len().saturating_sub(MAX_EPISODES) as u32;
 
     MemoryPackage {
-        package_version: 2,
+        package_version: MEMORY_PACKAGE_VERSION,
         thread_id: thread_id.to_string(),
         dominant_context,
         dominant_reason,
@@ -1979,6 +2399,8 @@ fn build_memory_package_for_thread(
                 intensity: episode.intensity.round().clamp(0.0, u8::MAX as f64) as u8,
             })
             .collect(),
+        // Bounded at intake (`bound_recent_turns`): they all go.
+        turns: thread_state.turns.clone(),
         truncated: if dropped_contexts == 0
             && dropped_reasons == 0
             && dropped_memories == 0
@@ -2230,6 +2652,7 @@ fn build_status_payload(
         "dropped_turns_queue_full_total": runtime_state.dropped_turns_queue_full_total,
         "stream_repeats_skipped_total": runtime_state.stream_repeats_skipped_total,
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
+        "intake_turns_total": runtime_state.intake_turns_total,
         "state_fetches_total": runtime_state.state_fetches_total,
         "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "published_entities_total": runtime_state.published_entities_total,
@@ -2338,6 +2761,10 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
+            "Each communication keeps its last 20 turns (what its agent received and sent, 2,000 characters of text each, 48 KiB in all). They are taken when the stream batch arrives, ahead of the model calls: the memory region and the thread row get them at once, so the agent's next message carries the turn before it."
+                .to_string(),
+        ),
+        Value::String(
             "config.thresholds.context_close / reason_close (0 to 1, default 0.25) are the weights under which an open context / reason closes once turns stop reinforcing it; a co-occurrence closes under their average. Nothing gates opening: every tag the tagger returns opens a context, every canonical signal a reason. They replace context_open / reason_open, which only ever set this, at half their value."
                 .to_string(),
         ),
@@ -2395,6 +2822,7 @@ fn build_cognition_config_get_payload(
         "published_entities_total": runtime_state.published_entities_total,
         "publish_errors_total": runtime_state.publish_errors_total,
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
+        "intake_turns_total": runtime_state.intake_turns_total,
         "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "last_thread_id": runtime_state.last_thread_id,
         "last_tags": runtime_state.last_tags,
@@ -2870,7 +3298,9 @@ fn extract_turn_text(payload: &Value) -> Option<String> {
 
 /// One turn of a communication (`thread_id`, the agent `agent_ilk` that owns it, §6.2): its state
 /// moves on, and the envelopes of what changed come back. The turn is numbered here; the number
-/// orders the communication and guards its rows in SY.storage.
+/// orders the communication and guards its rows in SY.storage. The thread row is not among them:
+/// it carries the intake's turns too, so it is built from what is held when it goes out
+/// (`thread_rows`).
 async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
@@ -2878,7 +3308,6 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     agent_ilk: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
-    ich: Option<&str>,
     tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
     api_key: &str,
@@ -2903,19 +3332,6 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     let reason_candidates = build_reason_candidates(tagger);
 
     let mut out = Vec::new();
-    if let Some(body) = build_thread_envelope_body(
-        hive_id,
-        writer,
-        comm,
-        ts,
-        thread_state,
-        src_ilk,
-        dst_ilk,
-        ich,
-    ) {
-        out.push((SUBJECT_STORAGE_COGNITION_THREADS, body));
-    }
-
     out.extend(update_contexts_for_thread(
         hive_id,
         writer,
@@ -3061,24 +3477,24 @@ fn build_reason_candidates(tagger: &SemanticTaggerOutput) -> Vec<ReasonCandidate
     out
 }
 
+/// A communication's thread row (docs/reference/cognition.md §4): first and last seen, the turn
+/// count, the last turn's ILKs and channel, and its last turns.
 fn build_thread_envelope_body(
     hive_id: &str,
     writer: &str,
     comm: &CognitionCommunicationRef,
     ts: &str,
     thread_state: &ThreadCognitionState,
-    src_ilk: Option<&str>,
-    dst_ilk: Option<&str>,
-    ich: Option<&str>,
 ) -> Option<Vec<u8>> {
     let data = CognitionThreadData {
-        src_ilk: src_ilk.map(ToString::to_string),
-        dst_ilk: dst_ilk.map(ToString::to_string),
-        ich: ich.map(ToString::to_string),
+        src_ilk: thread_state.src_ilk.clone(),
+        dst_ilk: thread_state.dst_ilk.clone(),
+        ich: thread_state.ich.clone(),
         status: Some("open".to_string()),
         first_seen_at: thread_state.first_seen_at.clone(),
         last_seen_at: thread_state.last_seen_at.clone(),
         turn_count: Some(thread_state.turn_count),
+        turns: thread_state.turns.clone(),
     };
     let envelope = CognitionDurableEnvelope::new(
         CognitionDurableEntity::Thread,
@@ -4364,12 +4780,68 @@ mod tests {
 
     const TEST_THREAD: &str = "thread:sha256:test";
     const TEST_AGENT: &str = "ilk:agent";
+    const TEST_AGENT_NODE: &str = "AI.sales@motherbee";
+    /// 2026-10-30T12:00:00Z, in milliseconds: when a router took a test turn.
+    const TEST_TS: u64 = 1_793_361_600_000;
 
     fn key(thread_id: &str) -> CommunicationKey {
         CommunicationKey {
             thread_id: thread_id.to_string(),
             agent_ilk: TEST_AGENT.to_string(),
         }
+    }
+
+    fn text(content: &str) -> Value {
+        json!({ "type": "text", "content": content })
+    }
+
+    /// A copy of a turn of `TEST_THREAD` as the agent's router hands it to cognition: `src` is
+    /// the sender as the router names it.
+    fn turn_copy(src: &str, src_ilk: Option<&str>, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(src.to_string()),
+                dst: Destination::Unicast(TEST_AGENT_NODE.to_string()),
+                ttl: 8,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                src_ilk: src_ilk.map(str::to_string),
+                thread_id: Some(TEST_THREAD.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// What the person writes to the agent through IO.api.
+    fn person_says(content: &str) -> Message {
+        turn_copy("IO.api@motherbee", Some("ilk:person"), text(content))
+    }
+
+    /// What a supervisor writes through the supervisors' io.slack, and a WF forwards to the agent.
+    fn supervisor_says(content: &str) -> Message {
+        let mut message = turn_copy("WF.sales@motherbee", Some("ilk:supervisor"), text(content));
+        message.meta.context = Some(json!({
+            "wf": {"trail": ["IO.slack.supervisores@motherbee", "WF.sales@motherbee"]}
+        }));
+        message
+    }
+
+    /// What the agent answers.
+    fn agent_says(content: &str) -> Message {
+        turn_copy(TEST_AGENT_NODE, Some(TEST_AGENT), text(content))
+    }
+
+    /// The turn the intake keeps of `message`, which its router took at `ts_ms`.
+    fn taken(message: &Message, ts_ms: u64) -> RecentTurn {
+        recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, ts_ms).expect("a turn")
+    }
+
+    fn texts(turns: &[MemoryTurn]) -> Vec<&str> {
+        turns.iter().map(|turn| turn.text.as_str()).collect()
     }
 
     /// Answers like the AI does, from the input: memory text always, episode text exactly when
@@ -4436,14 +4908,13 @@ mod tests {
             reason_signals_extra: strings(extra),
         };
         let ts = format!("2026-01-01T{:02}:{:02}:00Z", seq / 60, seq % 60);
-        update_thread_state_and_build_envelopes(
+        let mut out = update_thread_state_and_build_envelopes(
             "motherbee",
             "SY.cognition@motherbee",
             TEST_THREAD,
             TEST_AGENT,
             Some("ilk:juan"),
             Some("ilk:agent"),
-            Some("ich:test"),
             &tagger,
             thresholds,
             "test-key",
@@ -4454,7 +4925,17 @@ mod tests {
             &CannedNarrative,
         )
         .await
-        .envelopes
+        .envelopes;
+        // The thread row, as the worker sends it once the turn is back in what is held.
+        let key = key(TEST_THREAD);
+        let threads = HashMap::from([(key.clone(), thread.clone())]);
+        out.extend(thread_rows(
+            "motherbee",
+            "SY.cognition@motherbee",
+            &threads,
+            &[key],
+        ));
+        out
     }
 
     fn envelopes_of(
@@ -4647,25 +5128,41 @@ mod tests {
     }
 
     /// After a restart the region keeps the entries of communications not loaded yet, after the
-    /// ones in memory; an entry of a communication in memory is replaced, never doubled.
+    /// ones in memory, with their last turns; an entry of a communication in memory is replaced,
+    /// never doubled. One the intake took a turn of before its load keeps the region's labels, with
+    /// its turns.
     #[tokio::test]
     async fn the_region_keeps_what_it_has_not_loaded() {
         let mut threads = HashMap::new();
         let mut loaded = ThreadCognitionState::default();
         live_turn(&mut loaded, 1, &["billing"], &["inform"], &[]).await;
-        loaded.agent_node = "AI.sales@motherbee".to_string();
+        loaded.loaded = true;
+        loaded.agent_node = TEST_AGENT_NODE.to_string();
+        loaded.turns = vec![taken(&person_says("hello"), TEST_TS).turn];
         threads.insert(key("thread:loaded"), loaded.clone());
         let entry = |thread: &str, agent: &str| MemoryShmThreadEntry {
             thread_id: thread.to_string(),
             agent_ilk: agent.to_string(),
-            agent_node: "AI.sales@motherbee".to_string(),
+            agent_node: TEST_AGENT_NODE.to_string(),
             package: build_memory_package_for_thread(thread, &loaded),
         };
         let carried = vec![
             entry("thread:loaded", TEST_AGENT),
             entry("thread:not-loaded", TEST_AGENT),
+            entry("thread:taken", TEST_AGENT),
         ];
-        let hot_set = build_memory_hot_set_snapshot(&threads, None, carried).expect("hot set");
+        // The intake took a turn of `thread:taken` before the worker loaded it.
+        let mut person = person_says("and the price?");
+        person.meta.thread_id = Some("thread:taken".to_string());
+        hold_recent_turns(
+            &mut threads,
+            &carried,
+            vec![taken(&person, TEST_TS + 1_000)],
+        );
+
+        let hot_set =
+            build_memory_hot_set_snapshot(&threads, &[key("thread:taken")], carried.clone())
+                .expect("hot set");
         let kept: Vec<(&str, &str)> = hot_set
             .snapshot
             .threads
@@ -4675,10 +5172,36 @@ mod tests {
         assert_eq!(
             kept,
             vec![
-                ("thread:loaded", "AI.sales@motherbee"),
-                ("thread:not-loaded", "AI.sales@motherbee"),
+                ("thread:taken", TEST_AGENT_NODE),
+                ("thread:loaded", TEST_AGENT_NODE),
+                ("thread:not-loaded", TEST_AGENT_NODE),
             ]
         );
+        let package = |thread: &str| {
+            &hot_set
+                .snapshot
+                .threads
+                .iter()
+                .find(|entry| entry.thread_id == thread)
+                .expect("an entry")
+                .package
+        };
+        assert_eq!(package("thread:not-loaded").turns, loaded.turns);
+        let taken_package = package("thread:taken");
+        assert_eq!(
+            texts(&taken_package.turns),
+            ["hello", "and the price?"],
+            "the region's turns, then the intake's"
+        );
+        assert_eq!(
+            taken_package
+                .dominant_context
+                .as_ref()
+                .map(|c| c.label.as_str()),
+            Some("billing"),
+            "the region's labels stay until the load"
+        );
+        assert_eq!(taken_package.package_version, MEMORY_PACKAGE_VERSION);
     }
 
     /// Live state follows the rebuild's retention rule: a thread outside the jsr-memory hot
@@ -4712,7 +5235,7 @@ mod tests {
             threads.insert(key(&format!("thread:{index}")), thread);
         }
 
-        let hot_set = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, &[], Vec::new()).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert_eq!(threads.len() as u64, hot_set.stats.selected_threads_total);
         // The oldest thread goes.
@@ -4736,7 +5259,7 @@ mod tests {
                 thread_of_a_fifth_of_the_region(seq, &topics).await,
             );
         }
-        let full = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        let full = retain_memory_hot_set(&mut threads, &[], Vec::new()).expect("hot set");
         assert_eq!(full.stats.pruned_threads_total, 0);
 
         threads.insert(
@@ -4748,7 +5271,7 @@ mod tests {
                 < thread_live_entities_total(&threads[&key("thread:old:1")])
         );
         // No turn thread: the ranking alone keeps it, as after a reload.
-        let hot_set = retain_memory_hot_set(&mut threads, None, Vec::new()).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, &[], Vec::new()).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert!(threads.contains_key(&key("thread:new")));
         assert!(!threads.contains_key(&key("thread:old:1")));
@@ -4770,7 +5293,7 @@ mod tests {
             key("thread:turn"),
             thread_of_a_fifth_of_the_region(1, &["shipping"]).await,
         );
-        let hot_set = retain_memory_hot_set(&mut threads, Some(&key("thread:turn")), Vec::new())
+        let hot_set = retain_memory_hot_set(&mut threads, &[key("thread:turn")], Vec::new())
             .expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert!(threads.contains_key(&key("thread:turn")));
@@ -5068,5 +5591,424 @@ mod tests {
                 ("ilk:juan".to_string(), 1.0)
             ])
         );
+    }
+
+    // --- A communication's last turns, taken at intake (docs/reference/cognition.md §3.4) ---
+
+    /// A cognition on a test router, with `region` as its memory region, that knows the ILK of
+    /// `TEST_AGENT_NODE` as the identity shared memory would answer it.
+    fn test_app_state(
+        hive_id: &str,
+        region: Option<MemoryRegionWriter>,
+    ) -> (
+        Arc<CognitionAppState>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+    ) {
+        let node_name = format!("SY.cognition@{hive_id}");
+        let (dispatcher, router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            &node_name,
+            build_cognition_rpc_profile().expect("profile"),
+        );
+        let agent = AgentIdentity {
+            ilk: TEST_AGENT.to_string(),
+            tenant: None,
+            seq: 0,
+            read_at: std::time::Instant::now(),
+        };
+        let app_state = Arc::new(CognitionAppState {
+            hive_id: hive_id.to_string(),
+            node_name: node_name.clone(),
+            self_ilk_id: "ilk:cognition".to_string(),
+            runtime_paths: test_runtime_paths(),
+            control_state: Arc::new(Mutex::new(test_control_state())),
+            runtime_state: Arc::new(Mutex::new(CognitionRuntimeState::default())),
+            thread_states: Arc::new(Mutex::new(HashMap::new())),
+            memory_region: Arc::new(Mutex::new(region)),
+            vault: VaultClient::for_primary(
+                Arc::clone(&dispatcher),
+                VaultCallerOwned::new("ilk:cognition".to_string(), node_name),
+            ),
+            dispatcher,
+            agent_ilks: Mutex::new(HashMap::from([(TEST_AGENT_NODE.to_string(), agent)])),
+            usage: UsageRecorder::disabled(),
+            stream_seen: Mutex::new(HashMap::new()),
+        });
+        (app_state, router)
+    }
+
+    /// A `STREAM_BATCH` from its hive's router stream, with a `cognition.turns` record of
+    /// `TEST_AGENT_NODE` for each `(seq, ts_ms, message)`.
+    fn turns_batch(hive_id: &str, records: &[(u64, u64, &Message)]) -> Message {
+        let stream = format!("RT.gateway.stream@{hive_id}");
+        let records = records
+            .iter()
+            .map(|(seq, ts_ms, message)| fluxbee_sdk::stream::StreamRecord {
+                seq: *seq,
+                ts_ms: *ts_ms,
+                subject: SUBJECT_COGNITION_TURNS.to_string(),
+                producer: TEST_AGENT_NODE.to_string(),
+                payload: serde_json::to_value(message).expect("message"),
+            })
+            .collect();
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(stream.clone()),
+                dst: Destination::Unicast(format!("SY.cognition@{hive_id}")),
+                ttl: 1,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_STREAM_BATCH.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::to_value(StreamBatch {
+                stream,
+                epoch: 7,
+                records,
+            })
+            .expect("batch"),
+        }
+    }
+
+    /// The package the region holds for `TEST_THREAD` and `TEST_AGENT_NODE`, as its router reads
+    /// it at delivery.
+    async fn region_package(app_state: &CognitionAppState) -> Option<MemoryPackage> {
+        let region = app_state.memory_region.lock().await;
+        region
+            .as_ref()?
+            .read_snapshot()
+            .ok()?
+            .threads
+            .into_iter()
+            .find(|entry| entry.thread_id == TEST_THREAD && entry.agent_node == TEST_AGENT_NODE)
+            .map(|entry| entry.package)
+    }
+
+    /// The intake, with the worker held back (nothing takes its queue): the region carries a turn
+    /// as soon as its batch is taken, and the agent's answer right after it, so the next message
+    /// delivered to the agent has both. Each thread row goes to the stream with the turns, each
+    /// turn then waits in the worker's queue, and each batch is acked.
+    #[tokio::test]
+    async fn the_intake_puts_a_turn_in_the_region_before_the_worker_takes_it() {
+        let hive_id = format!("cogtest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = memory_shm_name_for_hive(&hive_id).expect("memory shm name");
+        let unlink = || {
+            let name = std::ffi::CString::new(shm_name.as_str()).expect("shm name");
+            let _ = nix::sys::mman::shm_unlink(name.as_c_str());
+        };
+        unlink();
+        let region = MemoryRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+            .expect("memory region");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region));
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+
+        let question = person_says("How much is the Pro plan?");
+        let answer = agent_says("USD 49 a license. How many do you want?");
+        for (seq, ts_ms, message) in [(1, TEST_TS, &question), (2, TEST_TS + 3_000, &answer)] {
+            let batch = turns_batch(&hive_id, &[(seq, ts_ms, message)]);
+            take_stream_batch(&app_state, &turn_tx, &batch).await;
+
+            let appended = router
+                .next_outgoing_within(Duration::from_secs(1))
+                .await
+                .expect("the thread row");
+            assert_eq!(
+                appended.meta.msg.as_deref(),
+                Some(fluxbee_sdk::stream::MSG_STREAM_APPEND)
+            );
+            let append: fluxbee_sdk::stream::StreamAppend =
+                serde_json::from_value(appended.payload).expect("an append");
+            assert_eq!(append.subject, SUBJECT_STORAGE_COGNITION_BATCH);
+            let row: CognitionDurableEnvelope<CognitionThreadData> =
+                serde_json::from_value(append.payload["envelopes"][0].clone()).expect("a row");
+            assert_eq!(row.entity, CognitionDurableEntity::Thread);
+            assert_eq!(
+                row.data.turns.last().map(|turn| turn.text.clone()),
+                extract_turn_text(&message.payload)
+            );
+
+            let ack = router
+                .next_outgoing_within(Duration::from_secs(1))
+                .await
+                .expect("the ack");
+            assert_eq!(ack.meta.msg.as_deref(), Some(MSG_STREAM_ACK));
+            assert_eq!(ack.payload["up_to_seq"], json!(seq));
+            let queued = turn_rx.try_recv().expect("the turn waits for the worker");
+            assert_eq!(queued.message.routing.trace_id, message.routing.trace_id);
+        }
+
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!(package.package_version, MEMORY_PACKAGE_VERSION);
+        assert_eq!(
+            package.turns,
+            vec![
+                MemoryTurn {
+                    direction: MemoryTurnDirection::In,
+                    src_ilk: Some("ilk:person".to_string()),
+                    via: Some("IO.api@motherbee".to_string()),
+                    text: "How much is the Pro plan?".to_string(),
+                    attachments: 0,
+                    ts: "2026-10-30T12:00:00.000Z".to_string(),
+                },
+                MemoryTurn {
+                    direction: MemoryTurnDirection::Out,
+                    src_ilk: Some(TEST_AGENT.to_string()),
+                    via: None,
+                    text: "USD 49 a license. How many do you want?".to_string(),
+                    attachments: 0,
+                    ts: "2026-10-30T12:00:03.000Z".to_string(),
+                },
+            ]
+        );
+        // Only the intake ran: the worker neither loaded the communication nor numbered a turn.
+        let held = app_state.thread_states.lock().await[&key(TEST_THREAD)].clone();
+        assert!(!held.loaded);
+        assert_eq!(held.turn_count, 0);
+        assert_eq!(app_state.runtime_state.lock().await.intake_turns_total, 2);
+        unlink();
+    }
+
+    /// A communication keeps its last 20 turns in the order its router took them, each with who
+    /// spoke: what the agent received, with its sender and the node it came through (the IO node
+    /// at the head of a WF's trail, else the sender), and what it sent. The 21st pushes out the
+    /// oldest.
+    #[test]
+    fn a_communication_keeps_its_last_twenty_turns_with_who_spoke() {
+        let mut threads = HashMap::new();
+        for n in 0..21u64 {
+            let content = format!("turn {n}");
+            let message = match n % 3 {
+                0 => person_says(&content),
+                1 => agent_says(&content),
+                _ => supervisor_says(&content),
+            };
+            let turn = taken(&message, TEST_TS + n * 1_000);
+            hold_recent_turns(&mut threads, &[], vec![turn]);
+        }
+        let turns = &threads[&key(TEST_THREAD)].turns;
+        let expected: Vec<String> = (1..=20).map(|n| format!("turn {n}")).collect();
+        assert_eq!(texts(turns), expected);
+        let who = |turn: &MemoryTurn| {
+            (
+                turn.direction,
+                turn.src_ilk.clone(),
+                turn.via.clone(),
+                turn.ts.clone(),
+            )
+        };
+        assert_eq!(
+            who(&turns[0]),
+            (
+                MemoryTurnDirection::Out,
+                Some(TEST_AGENT.to_string()),
+                None,
+                "2026-10-30T12:00:01.000Z".to_string()
+            )
+        );
+        assert_eq!(
+            who(&turns[1]),
+            (
+                MemoryTurnDirection::In,
+                Some("ilk:supervisor".to_string()),
+                Some("IO.slack.supervisores@motherbee".to_string()),
+                "2026-10-30T12:00:02.000Z".to_string()
+            )
+        );
+        assert_eq!(
+            who(&turns[2]),
+            (
+                MemoryTurnDirection::In,
+                Some("ilk:person".to_string()),
+                Some("IO.api@motherbee".to_string()),
+                "2026-10-30T12:00:03.000Z".to_string()
+            )
+        );
+        // A batch sent again adds nothing.
+        let again = taken(&person_says("turn 18"), TEST_TS + 18_000);
+        hold_recent_turns(&mut threads, &[], vec![again]);
+        assert_eq!(
+            threads[&key(TEST_THREAD)].turns.len(),
+            COGNITION_RECENT_TURNS
+        );
+    }
+
+    /// A turn's text is cut at 2,000 characters. A turn with only files is kept, with no text and
+    /// its files counted, so the agent's answer to it keeps its question; one with neither text nor
+    /// files is left out.
+    #[test]
+    fn a_turn_keeps_its_text_cut_and_counts_its_files() {
+        let long = taken(&person_says(&"á".repeat(2_500)), TEST_TS).turn;
+        assert_eq!(long.text.chars().count(), COGNITION_TURN_TEXT_MAX_CHARS);
+        assert!(long.text.ends_with('…'));
+
+        let photo = json!({
+            "type": "blob_ref",
+            "blob_name": "photo_0123456789abcdef.png",
+            "size": 10,
+            "mime": "image/png",
+            "filename_original": "photo.png",
+            "spool_day": "2026-10-30"
+        });
+        let only_files = turn_copy(
+            "IO.api@motherbee",
+            Some("ilk:person"),
+            json!({"type": "text", "content": "", "attachments": [photo]}),
+        );
+        let files = taken(&only_files, TEST_TS).turn;
+        assert_eq!((files.text.as_str(), files.attachments), ("", 1));
+
+        let no_text = turn_copy(
+            "IO.api@motherbee",
+            Some("ilk:person"),
+            json!({"type": "event", "name": "typing"}),
+        );
+        assert!(recent_turn_of(&no_text, TEST_AGENT_NODE, TEST_AGENT, TEST_TS).is_none());
+    }
+
+    /// Text of more bytes a character keeps fewer turns: they stay under the bytes a package and a
+    /// thread row may take, and the newest always stays. Twenty turns of 2,000 characters of Latin
+    /// text all fit.
+    #[test]
+    fn the_last_turns_stay_under_their_byte_bound() {
+        let size = |turns: &[MemoryTurn]| {
+            turns
+                .iter()
+                .map(|turn| serde_json::to_vec(turn).expect("turn").len() + 1)
+                .sum::<usize>()
+        };
+        let mut wide = Vec::new();
+        for n in 0..20u64 {
+            let said = person_says(&format!("{n} {}", "字".repeat(1_990)));
+            push_recent_turn(&mut wide, taken(&said, TEST_TS + n * 1_000).turn);
+        }
+        assert!(wide.len() < COGNITION_RECENT_TURNS);
+        assert!(size(&wide) <= COGNITION_RECENT_TURNS_MAX_BYTES);
+        assert!(wide.last().expect("a turn").text.starts_with("19 "));
+
+        let mut latin = Vec::new();
+        for n in 0..20u64 {
+            let said = person_says(&"x".repeat(COGNITION_TURN_TEXT_MAX_CHARS));
+            push_recent_turn(&mut latin, taken(&said, TEST_TS + n * 1_000).turn);
+        }
+        assert_eq!(latin.len(), COGNITION_RECENT_TURNS);
+        assert!(size(&latin) <= COGNITION_RECENT_TURNS_MAX_BYTES);
+    }
+
+    /// Two agents on one thread are two communications: each keeps the turns its own router took,
+    /// and the region carries each under its agent node.
+    #[test]
+    fn two_agents_on_one_thread_keep_their_own_turns() {
+        let to_sales = person_says("I want 10 Pro licenses");
+        let to_invoice = turn_copy(
+            "WF.sales@motherbee",
+            Some("ilk:person"),
+            text("Invoice 10 Pro licenses"),
+        );
+        let mut threads = HashMap::new();
+        hold_recent_turns(
+            &mut threads,
+            &[],
+            vec![
+                recent_turn_of(&to_sales, TEST_AGENT_NODE, "ilk:sales", TEST_TS).expect("a turn"),
+                recent_turn_of(&to_invoice, "AI.invoice@motherbee", "ilk:invoice", TEST_TS)
+                    .expect("a turn"),
+            ],
+        );
+        let hot_set = build_memory_hot_set_snapshot(&threads, &[], Vec::new()).expect("hot set");
+        assert_eq!(hot_set.snapshot.threads.len(), 2);
+        for (node, agent_ilk, said) in [
+            (TEST_AGENT_NODE, "ilk:sales", "I want 10 Pro licenses"),
+            (
+                "AI.invoice@motherbee",
+                "ilk:invoice",
+                "Invoice 10 Pro licenses",
+            ),
+        ] {
+            let entry = hot_set
+                .snapshot
+                .threads
+                .iter()
+                .find(|entry| entry.agent_node == node)
+                .expect("its entry");
+            assert_eq!(entry.thread_id, TEST_THREAD);
+            assert_eq!(entry.agent_ilk, agent_ilk);
+            assert_eq!(texts(&entry.package.turns), [said]);
+        }
+    }
+
+    /// The turns are in the thread row: SY.storage keeps the row's data as its payload and gives
+    /// it back, and a load has them again (docs/reference/cognition.md §6). The turns the intake
+    /// took of a communication not loaded yet go after the stored ones when it loads, and the
+    /// worker's turn, written back after its model calls, keeps the turns the intake took
+    /// meanwhile.
+    #[test]
+    fn the_turns_survive_a_load_and_the_workers_write_back() {
+        let mut threads = HashMap::new();
+        let said = [
+            person_says("How much is Pro?"),
+            agent_says("USD 49 a license."),
+            supervisor_says("20% approved"),
+        ];
+        for (n, message) in (0u64..).zip(&said) {
+            hold_recent_turns(&mut threads, &[], vec![taken(message, TEST_TS + n * 1_000)]);
+        }
+        let held = threads[&key(TEST_THREAD)].clone();
+
+        // As SY.storage stores a thread row (`persist_cognition_thread`: its typed data is the
+        // payload) and answers it (`cognition_state`: the payload is the data).
+        let stored: Vec<Value> = thread_rows(
+            "motherbee",
+            "SY.cognition@motherbee",
+            &threads,
+            &[key(TEST_THREAD)],
+        )
+        .into_iter()
+        .map(|(_, body)| {
+            let row: CognitionDurableEnvelope<CognitionThreadData> =
+                serde_json::from_slice(&body).expect("a thread row");
+            serde_json::to_value(&row).expect("row")
+        })
+        .collect();
+        let loaded =
+            build_communication_state(&key(TEST_THREAD), rebuild_rows_from_envelopes(stored));
+        assert_eq!(loaded.turns, held.turns);
+        assert_eq!(loaded.src_ilk.as_deref(), Some("ilk:supervisor"));
+
+        // After a restart the intake takes a turn before the worker loads the communication.
+        let mut restarted = HashMap::new();
+        let next = taken(&person_says("Go ahead, invoice me"), TEST_TS + 10_000);
+        hold_recent_turns(&mut restarted, &[], vec![next]);
+        adopt_stored_state(&mut restarted, &key(TEST_THREAD), loaded, TEST_AGENT_NODE);
+        let adopted = restarted[&key(TEST_THREAD)].clone();
+        assert!(adopted.loaded);
+        assert_eq!(
+            texts(&adopted.turns),
+            [
+                "How much is Pro?",
+                "USD 49 a license.",
+                "20% approved",
+                "Go ahead, invoice me"
+            ]
+        );
+        assert_eq!(adopted.src_ilk.as_deref(), Some("ilk:person"));
+
+        // The worker's turn runs on a copy; the intake takes the agent's answer meanwhile.
+        let mut updated = adopted.clone();
+        updated.turn_count += 1;
+        let answer = taken(&agent_says("Done, invoicing you."), TEST_TS + 12_000);
+        hold_recent_turns(&mut restarted, &[], vec![answer]);
+        write_back_turn(&mut restarted, &key(TEST_THREAD), updated);
+        let written = &restarted[&key(TEST_THREAD)];
+        assert_eq!(written.turn_count, adopted.turn_count + 1);
+        assert_eq!(written.turns.len(), 5);
+        assert_eq!(
+            written.turns.last().map(|turn| turn.text.as_str()),
+            Some("Done, invoicing you.")
+        );
+        assert_eq!(written.src_ilk.as_deref(), Some(TEST_AGENT));
     }
 }

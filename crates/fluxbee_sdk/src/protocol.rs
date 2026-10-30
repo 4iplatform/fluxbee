@@ -90,6 +90,13 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// The `MemoryPackage` SY.cognition writes: 3 added `turns` (2026-10-30).
+pub const MEMORY_PACKAGE_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPackage {
     pub package_version: u32,
@@ -106,8 +113,42 @@ pub struct MemoryPackage {
     pub memories: Vec<MemorySummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub episodes: Vec<EpisodeSummary>,
+    /// The communication's last turns, oldest first, as SY.cognition took them when they arrived.
+    /// The message the package rides on is not among them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<MemoryTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<MemoryPackageTruncated>,
+}
+
+/// One turn of a communication: a message its agent received (`in`) or sent (`out`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTurn {
+    pub direction: MemoryTurnDirection,
+    /// The sender's ILK, when the message carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_ilk: Option<String>,
+    /// Only on `in`: the node it came in through. For a message a WF forwards, the first node of
+    /// its trail (`meta.context.wf.trail`); otherwise its sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Its text, cut at 2,000 characters. Empty when it carried only files.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// How many files it carried; a text sent as a file (`content_ref`) counts as one.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attachments: u32,
+    /// When its agent's router took it (RFC 3339, UTC).
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryTurnDirection {
+    /// The agent received it.
+    In,
+    /// The agent sent it.
+    Out,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
