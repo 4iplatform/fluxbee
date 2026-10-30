@@ -80,7 +80,7 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 | `provider` | `openai` or `anthropic`: the API the node speaks and the key it reads ([The key](#the-key)). Without it, the hive's, read on each request |
 | `model_settings` | `max_output_tokens`; an answer cut at it is a `provider_output_truncated` error. `temperature` and `top_p` are accepted too, but current models reject `temperature` (gpt-5.5, Claude 5): leave it out |
 | `base_url` | optional, and rarely needed: the full URL the request is posted to. It needs `provider`, and it must be `https` on that provider's host (`api.openai.com` or `api.anthropic.com`); the node's environment can lift the host rule with `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
-| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory block included, and whole: the tool loop cuts only the history before it, 1,200 characters an interaction |
+| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory and WF blocks included, and whole: the tool loop cuts only the history before it, 1,200 characters an interaction |
 
 `behavior.vault_key`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`,
 `config.secrets` and `config.assets` are refused, as is any other unknown field under `behavior`,
@@ -166,7 +166,32 @@ On every request the node reads the key of its provider from SY.vault:
 
 - **Memory:** the router attaches the communication's `meta.memory_package`, and the node puts it in
   front of the user input as a text block.
-- **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`.
+- **A WF's block:** a WF puts `meta.context.wf`, `{"trail": [node names], "vars": {...}}`, on every
+  message it sends
+  ([docs/wf-orchestration-v1.md §5.2.1](../../../docs/wf-orchestration-v1.md#521-the-build-design)).
+  The node shows it to the model as a text block after the memory block and before the message:
+  the trail as a path (`IO.api@motherbee -> WF.sales.invoice@worker1`), and `vars` as JSON, cut at
+  8 KiB with a line that says so.
+  - Text and multimodal input alike: as parts, each block is a text part of its own, first.
+  - The conversation's history (`runtime.immediate_memory`) keeps what the person wrote, without
+    either block.
+- **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`. Its
+  `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`,
+  `final_response_contract`, `wf` and `evaluation`: an answer never carries the request's WF block
+  back, and its evaluation is only ever its own.
+- **A structured answer:** a message whose `meta.context.response_envelope` holds a contract
+  (`json_object_v1`: `required`, `properties` of type `string`, `boolean`, `integer` or `number`, an
+  optional `enum` for strings, `strict`) is answered with the contract's object, as JSON in the
+  reply's text. The tool loop has the contract in its system prompt; the call without tools, after
+  a loop that wrote nothing, asks the provider for it and checks the object. An invalid contract is
+  an `ai_runtime_error`, and an object that fails its check an `invalid_structured_output`, neither
+  retryable.
+  - **`text_field`** names one of the contract's required `string` properties, for example
+    `"text_field": "reply"`. The reply's text is then that field's value, and the whole object goes
+    in the reply's `meta.context.evaluation`: a WF delivers the text and branches on
+    `event.context.evaluation`. The object is checked on both paths, with tools and without them. A
+    `text_field` that is not a required `string` property makes the contract invalid. The history
+    keeps the whole object as the agent's turn, so a blank text never leaves a blank turn.
 - **Attachments** (`text/v1` `attachments[]` and `content_ref`):
   - text (`text/plain`, `text/markdown`, `application/json`, `text/csv`, `text/html`) goes in as
     text, decoded with U+FFFD for bytes that are not UTF-8, and cut at 100,000 characters with a

@@ -137,6 +137,7 @@ func validWorkflowJSON() string {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
   "description": "issues invoice",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],
@@ -379,12 +380,12 @@ func TestForbiddenSystemTargetAndRefPathHelpers(t *testing.T) {
 		}
 	}
 	for _, p := range []string{"state.x", "input.a.b", "event.payload.node"} {
-		if !isValidRefPath(p) {
-			t.Fatalf("%q should be a valid ref path", p)
+		if err := validateRefPath(p); err != nil {
+			t.Fatalf("%q should be a valid ref path: %v", p, err)
 		}
 	}
 	for _, p := range []string{"foo.bar", "state", "state.", ".x", ""} {
-		if isValidRefPath(p) {
+		if validateRefPath(p) == nil {
 			t.Fatalf("%q should be an invalid ref path", p)
 		}
 	}
@@ -406,4 +407,335 @@ func TestValidateDefinitionRejectsNonTerminalFailedState(t *testing.T) {
 	if !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("expected a reservation error, got: %v", err)
 	}
+}
+
+// 0.1.91 (wf-orchestration-v1 §5.2.1, item 2): start_from is required, and names the nodes whose
+// messages start an instance, each with its hive, never a SY.* or RT.* node.
+func TestValidateDefinitionStartFrom(t *testing.T) {
+	load := func(startFrom string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"start_from": ["IO.api.billing@motherbee"]`, startFrom, 1)
+		if data == validWorkflowJSON() {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	if err := load(`"start_from": ["IO.api.sales@worker1", "WF.upstream@motherbee"]`); err != nil {
+		t.Fatalf("two starters: %v", err)
+	}
+	for startFrom, want := range map[string]string{
+		`"start_from": []`:                                                   "start_from: must name the nodes whose messages start an instance",
+		`"description": "x"`:                                                 "start_from: must name the nodes whose messages start an instance",
+		`"start_from": ["IO.api.sales"]`:                                     "start_from[0]: must be a node name with its hive",
+		`"start_from": ["IO.api.billing@motherbee", " IO.x@w "]`:             "start_from[1]: must be a node name with its hive",
+		`"start_from": ["SY.admin@motherbee"]`:                               "start_from[0]: must not be a SY.* / RT.* system node",
+		`"start_from": ["IO.api.billing@motherbee", "rt.gw@motherbee"]`:      "start_from[1]: must not be a SY.* / RT.* system node",
+		`"start_from": ["IO.api.billing@motherbee", "AI.billing@motherbee"]`: "start_from[1]: must not be an AI.* node: an agent only answers",
+		`"start_from": ["ai.sales@worker1"]`:                                 "start_from[0]: must not be an AI.* node",
+	} {
+		assertErrorContains(t, load(startFrom), want)
+	}
+}
+
+// 0.1.91 (item 1): thread_id_ref left the language. Every message an instance sends carries the
+// instance's thread, and a definition that still has it is refused, by its path, saying why.
+func TestValidateDefinitionRefusesThreadIDRef(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"target": "IO.quickbooks@motherbee",`, `"target": "IO.quickbooks@motherbee", "thread_id_ref": "event.thread_id",`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "states[0].entry_actions[0].thread_id_ref: is not part of the definition language")
+	assertErrorContains(t, err, "the instance's thread")
+}
+
+// 0.1.91 (items 4 and 9): a transition matches the sender (event_match.src), the msg, or both; one
+// without a target_state is internal, and stays in its state.
+func TestValidateDefinitionEventMatchSrcAndInternalTransitions(t *testing.T) {
+	transition := func(match, target string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
+          "guard": "event.payload.complete == true",
+          "target_state": "completed",`, `"event_match": `+match+`, "guard": "true", `+target, 1)
+		if data == validWorkflowJSON() {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	for _, match := range []string{`{"src": "IO.quickbooks@motherbee"}`, `{"msg": "X", "src": "AI.other@worker1"}`, `{"msg": "X"}`} {
+		if err := transition(match, `"target_state": "completed",`); err != nil {
+			t.Fatalf("%s: %v", match, err)
+		}
+		if err := transition(match, ``); err != nil {
+			t.Fatalf("%s, internal: %v", match, err)
+		}
+	}
+	assertErrorContains(t, transition(`{}`, `"target_state": "completed",`), "states[0].transitions[0].event_match: must name a msg, a src or both")
+	assertErrorContains(t, transition(`{"msg": "  ", "src": "IO.quickbooks@motherbee"}`, ``), "states[0].transitions[0].event_match.msg: must not be blank")
+	assertErrorContains(t, transition(`{"src": "IO.quickbooks"}`, ``), "states[0].transitions[0].event_match.src: must be a node name with its hive")
+	assertErrorContains(t, transition(`{"src": "SY.timer@motherbee"}`, ``), "states[0].transitions[0].event_match.src: must not be a SY.* / RT.* system node")
+	assertErrorContains(t, transition(`{"msg": "X"}`, `"target_state": "nowhere",`), "states[0].transitions[0].target_state: must reference an existing state")
+
+	def, err := LoadDefinitionBytes([]byte(strings.Replace(validWorkflowJSON(), `"event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
+          "guard": "event.payload.complete == true",
+          "target_state": "completed",`, `"event_match": {"msg": "X"}, "guard": "true",`, 1)), "", fixedClock)
+	if err != nil || def.States[0].Transitions[0].TargetState != "" || def.States[0].Transitions[0].Program == nil {
+		t.Fatalf("an internal transition: %+v %v", def, err)
+	}
+}
+
+// 0.1.91 (items 5 to 7): forward sends a message as it was received, the event's or one a
+// keep_message kept; a send_message and a forward write the WF's block (meta.context.wf), which
+// their own context never writes, and its vars.
+func TestValidateDefinitionForwardKeepMessageAndTheWFBlock(t *testing.T) {
+	action := func(actions string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`, actions, 1)
+		if data == validWorkflowJSON() {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	for _, valid := range []string{
+		`{"type": "forward", "target": "AI.sales@worker1"}`,
+		`{"type": "keep_message", "name": "customer"}, {"type": "forward", "target": "AI.sales@worker1", "message": "customer", "meta": {"context": {"response_envelope": {"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}}}, "vars": {"order": {"$ref": "state.order"}, "note": "literal"}}`,
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"$ref": "state.ctx", "default": {}}}}`,
+		`{"type": "send_message", "target": "AI.payments@worker1", "meta": {"msg": "DUE", "context": {"io": {"$ref": "state.io"}}}, "vars": {"invoice": {"$ref": "state.invoice"}}, "payload": {"type": "text", "content": "due"}}`,
+	} {
+		if err := action(valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+	const at = "states[0].transitions[0].actions[0]"
+	for actions, want := range map[string]string{
+		`{"type": "forward"}`: at + ".target: must not be empty",
+		`{"type": "forward", "target": "SY.admin@motherbee"}`:                                                        at + ".target: must not target a SY.* / RT.* system node",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"msg": "TURN"}}`:                                 at + ".meta.msg: is not a field of forward: a forward keeps the message's own msg",
+		`{"type": "forward", "target": "AI.sales@worker1", "payload": {"text": "x"}}`:                                at + ".payload: is not a field of forward: a forward sends the message's payload as it was received",
+		`{"type": "forward", "target": "AI.sales@worker1", "message": "customer"}`:                                   at + ".message: must name a message a keep_message keeps",
+		`{"type": "forward", "target": "AI.sales@worker1", "message": "a-b"}`:                                        at + ".message: must be a valid identifier",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": "x"}}`:                                at + ".meta.context: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"wf": 1}}}`:                          at + ".meta.context.wf: is the WF's own block",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": [1]}`:                                             at + ".vars: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"$ref": "state.x"}}`:                             at + ".vars: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"x": {"$ref": "nope.x"}}}`:                       at + ".vars.x.$ref: root must be input, state, or event",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": {"wf": {"trail": []}}}}`: at + ".meta.context.wf: is the WF's own block",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": [1]}}`:                   at + ".meta.context: must be a JSON object",
+		`{"type": "keep_message"}`: at + ".name: must be a valid identifier",
+		`{"type": "keep_message", "name": "customer", "message": "customer"}`:      at + ".message: is not a field of keep_message",
+		`{"type": "set_variable", "name": "x", "value": "1", "vars": {"a": 1}}`:    at + ".vars: is not a field of set_variable",
+		`{"type": "emit_internal_event", "meta": {"msg": "GO"}, "vars": {"a": 1}}`: at + ".vars: is not a field of emit_internal_event",
+	} {
+		assertErrorContains(t, action(actions), want)
+	}
+}
+
+// 0.1.91 (item 8): fire_in and fire_at take a literal or a $ref, resolved when the action runs (and
+// the 60 s floor checked then); a $ref's default is a literal, checked as one.
+func TestValidateDefinitionTimerTimesFromState(t *testing.T) {
+	timer := func(spec string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"fire_in": "5m",`, spec, 1)
+		if data == validWorkflowJSON() {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	for _, valid := range []string{
+		`"fire_in": {"$ref": "state.invoice.due_in"},`,
+		`"fire_in": {"$ref": "event.context.evaluation.due_in", "default": "30d"},`,
+		`"fire_at": {"$ref": "state.due_at"},`,
+		`"fire_at": "2026-11-01T12:00:00Z",`,
+	} {
+		if err := timer(valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+	const at = "states[0].entry_actions[1]"
+	for spec, want := range map[string]string{
+		`"fire_in": "30s",`:                                 at + ".fire_in: must be at least 60s",
+		`"fire_in": 300,`:                                   at + `.fire_in: must be a duration (e.g. "5m") or a $ref`,
+		`"fire_in": {"$ref": "state."},`:                    at + ".fire_in.$ref: path segments must not be empty",
+		`"fire_in": {"$ref": "state.x", "defualt": "5m"},`:  at + ".fire_in: a $ref holds only $ref and default",
+		`"fire_in": {"$ref": "state.x", "default": "10s"},`: at + ".fire_in.default: must be at least 60s",
+		`"fire_in": {"$ref": "state.x", "default": 600},`:   at + `.fire_in.default: must be a duration (e.g. "5m")`,
+		`"fire_at": "tomorrow",`:                            at + ".fire_at: must be RFC3339 UTC timestamp",
+		`"fire_in": "5m", "fire_at": {"$ref": "state.x"},`:  at + ": fire_in and fire_at are mutually exclusive",
+		`"fire_in": "",`:                                    at + ": exactly one of fire_in or fire_at is required",
+	} {
+		assertErrorContains(t, timer(spec), want)
+	}
+}
+
+// 0.1.91 (item 3, FINDINGS A-123): only the nodes written in a definition drive its instances:
+// those of its start_from, of an event_match.src, and its send_message and forward targets.
+func TestTheNodesADefinitionInvolves(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`,
+		`{"type": "forward", "target": "AI.sales@worker1"}`, 1)
+	data = strings.Replace(data, `"event_match": { "msg": "DATA_VALIDATION_RESPONSE" },`, `"event_match": { "msg": "DATA_VALIDATION_RESPONSE", "src": "IO.validator@motherbee" },`, 1)
+	def, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string][2]bool{
+		"IO.api.billing@motherbee": {true, true},
+		"IO.quickbooks@motherbee":  {false, true},
+		"IO.validator@motherbee":   {false, true},
+		"AI.sales@worker1":         {false, true},
+		"AI.stranger@motherbee":    {false, false},
+		"SY.timer@motherbee":       {false, false},
+		"":                         {false, false},
+	} {
+		if got := [2]bool{def.StartsFrom(name), def.Involves(name)}; got != want {
+			t.Fatalf("%q: starts from, involves = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// Every action takes the fields of its type only: a field of another type is refused, by its path
+// (a forward with a name instead of a message loaded, and forwarded the event).
+func TestAnActionRefusesTheFieldsOfOtherTypes(t *testing.T) {
+	action := func(actions string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`, actions, 1)
+		if data == validWorkflowJSON() {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	const at = "states[0].transitions[0].actions[0]"
+	for actions, want := range map[string]string{
+		`{"type": "keep_message", "name": "customer"}, {"type": "forward", "target": "AI.sales@worker1", "name": "customer"}`: "states[0].transitions[0].actions[1].name: is not a field of forward: a forward names the kept message it sends with message",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M"}, "message": "m"}`:                            at + ".message: is not a field of send_message",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M"}, "timer_key": "t"}`:                          at + ".timer_key: is not a field of send_message",
+		`{"type": "emit_internal_event", "meta": {"msg": "GO", "context": {}}}`:                                               at + ".meta.context: is not a field of emit_internal_event",
+		`{"type": "keep_message", "name": "x", "meta": {"msg": "M"}}`:                                                         at + ".meta: is not a field of keep_message",
+		`{"type": "cancel_timer", "timer_key": "t", "fire_in": "5m"}`:                                                         at + ".fire_in: is not a field of cancel_timer",
+		`{"type": "reschedule_timer", "timer_key": "t", "fire_in": "5m", "missed_policy": "fire"}`:                            at + ".missed_policy: is not a field of reschedule_timer",
+		`{"type": "schedule_timer", "timer_key": "t", "fire_in": "5m", "target": "AI.x@worker1"}`:                             at + ".target: is not a field of schedule_timer",
+		`{"type": "set_variable", "name": "x", "value": "1", "payload": {}}`:                                                  at + ".payload: is not a field of set_variable",
+	} {
+		assertErrorContains(t, action(actions), want)
+	}
+	// on_error is every type's.
+	if err := action(`{"type": "keep_message", "name": "x", "on_error": "continue"}`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// On a transition matched on TIMER_FIRED there is no node's message: a keep_message, and a forward
+// without message, are refused, among its own actions, its state's exit actions and its target's
+// entry actions, all of which run on the TIMER_FIRED.
+func TestATimerFiredTransitionKeepsAndForwardsNoEvent(t *testing.T) {
+	// timeout adds to the first state a TIMER_FIRED transition to failed, with actions, the state's
+	// exit actions and failed's entry actions; elsewhere replaces the actions of its other
+	// transition.
+	timeout := func(actions, exitActions, entryActions, elsewhere string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },`, `"exit_actions": [`+exitActions+`],
+      "transitions": [
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "true", "target_state": "failed", "actions": [`+actions+`]},
+        {
+          "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },`, 1)
+		data = strings.Replace(data, `"name": "failed",
+      "description": "failed",
+      "entry_actions": [],`, `"name": "failed",
+      "description": "failed",
+      "entry_actions": [`+entryActions+`],`, 1)
+		data = strings.Replace(data, `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`, elsewhere, 1)
+		if !strings.Contains(data, `"msg": "TIMER_FIRED"`) {
+			t.Fatal("the fixture did not change")
+		}
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	const keep, forward = `{"type": "keep_message", "name": "late"}`, `{"type": "forward", "target": "AI.x@worker1"}`
+	// A kept message is no event's: a forward of one goes, on a TIMER_FIRED too.
+	if err := timeout(`{"type": "forward", "target": "AI.x@worker1", "message": "late"}`, ``, ``, keep); err != nil {
+		t.Fatalf("a forward of a kept message: %v", err)
+	}
+	for _, c := range []struct{ actions, exit, entry, want string }{
+		{keep, ``, ``, "states[0].transitions[0].actions[0]: a keep_message runs on the TIMER_FIRED of states[0].transitions[0], which is no node's message to keep"},
+		{forward, ``, ``, "states[0].transitions[0].actions[0]: a forward without message runs on the TIMER_FIRED of states[0].transitions[0]"},
+		{``, forward, ``, "states[0].exit_actions[0]: a forward without message runs on the TIMER_FIRED of states[0].transitions[0]"},
+		{``, ``, keep, "states[2].entry_actions[0]: a keep_message runs on the TIMER_FIRED of states[0].transitions[0]"},
+	} {
+		assertErrorContains(t, timeout(c.actions, c.exit, c.entry, `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`), c.want)
+	}
+}
+
+// A target is a node name written as the router stamps it: one with spaces around it is refused,
+// as start_from and event_match.src are.
+func TestATargetWithSpacesIsRefused(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"target": "IO.quickbooks@motherbee"`, `"target": " IO.quickbooks@motherbee "`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "states[0].entry_actions[0].target: must be a node name without spaces around it")
+}
+
+// A day count past what a duration holds is refused: "213504d" wrapped to 25m26s, and an agent's
+// answer reaches it through a $ref.
+func TestADurationOfTooManyDaysIsRefused(t *testing.T) {
+	if got, err := ParseWorkflowDuration("106751d"); err != nil || got != 106751*24*time.Hour {
+		t.Fatalf("the most days: %v %v", got, err)
+	}
+	for _, value := range []string{"106752d", "213504d", "99999999999999999999d"} {
+		if got, err := ParseWorkflowDuration(value); err == nil || !strings.Contains(err.Error(), "at most 106751d") {
+			t.Fatalf("%s: %v %v", value, got, err)
+		}
+	}
+}
+
+// A response contract written in the definition is checked at load by the rules an agent reads it
+// with (response_contract_to_output_schema_spec in crates/fluxbee_ai_sdk/src/message.rs), on a
+// send_message and on a forward; a $ref is not.
+func TestAResponseContractIsCheckedAsTheAgentReadsIt(t *testing.T) {
+	envelope := func(contract string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `{ "type": "set_variable", "name": "validated_at", "value": "now()" }`,
+			`{"type": "forward", "target": "AI.x@worker1", "meta": {"context": {"response_envelope": `+contract+`}}}`, 1)
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	for _, valid := range []string{
+		`{"kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply", "area"], "properties": {"reply": {"type": "string"}, "area": {"type": "string", "enum": ["a", "b"]}, "n": {"type": "integer", "description": "not read"}}}`,
+		`{"kind": "json_object_v1", "strict": "yes", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`,
+		`{"$ref": "state.contract"}`,
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"$ref": "state.properties"}}`,
+	} {
+		if err := envelope(valid); err != nil {
+			t.Fatalf("%s: %v", valid, err)
+		}
+	}
+	const at = "states[0].transitions[0].actions[0].meta.context.response_envelope"
+	for contract, want := range map[string]string{
+		`"json"`: at + ": must be a JSON object",
+		`{"required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                                                              at + `.kind: must be "json_object_v1"`,
+		`{"kind": "json_schema", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                                       at + `.kind: must be "json_object_v1"`,
+		`{"kind": "json_object_v1", "properties": {"ok": {"type": "boolean"}}}`:                                                                        at + ".required: must be a non-empty list of property names",
+		`{"kind": "json_object_v1", "required": [], "properties": {"ok": {"type": "boolean"}}}`:                                                        at + ".required: must be a non-empty list of property names",
+		`{"kind": "json_object_v1", "required": ["ok"]}`:                                                                                               at + ".properties: must be a non-empty object",
+		`{"kind": "json_object_v1", "required": ["ok", 3], "properties": {"ok": {"type": "boolean"}}}`:                                                 at + ".required[1]: must be a string",
+		`{"kind": "json_object_v1", "required": [" "], "properties": {"ok": {"type": "boolean"}}}`:                                                     at + ".required[0]: must not be empty",
+		`{"kind": "json_object_v1", "required": ["ko"], "properties": {"ok": {"type": "boolean"}}}`:                                                    at + `.required[0]: must be one of the properties ("ko" is not)`,
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": "boolean"}}`:                                                              at + ".properties.ok: must be an object",
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {}}}`:                                                                     at + ".properties.ok.type: is required",
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "array"}}}`:                                                      at + ".properties.ok.type: must be string, boolean, integer or number",
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "string", "enum": "a"}}}`:                                        at + ".properties.ok.enum: must be a list",
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "integer", "enum": [1]}}}`:                                       at + ".properties.ok.enum: is only for a property of type string",
+		`{"kind": "json_object_v1", "required": ["ok"], "properties": {"ok": {"type": "string", "enum": ["a", 1]}}}`:                                   at + ".properties.ok.enum: must hold strings only",
+		`{"kind": "json_object_v1", "text_field": 1, "required": ["ok"], "properties": {"ok": {"type": "string"}}}`:                                    at + ".text_field: must be a string",
+		`{"kind": "json_object_v1", "text_field": "reply", "required": ["ok"], "properties": {"ok": {"type": "string"}, "reply": {"type": "string"}}}`: at + ".text_field: must be listed in required",
+		`{"kind": "json_object_v1", "text_field": "ok", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}`:                                at + ".text_field: must be a property of type string",
+	} {
+		assertErrorContains(t, envelope(contract), want)
+	}
+	// On a send_message too.
+	data := strings.Replace(validWorkflowJSON(), `"meta": { "msg": "INVOICE_CREATE_REQUEST" },`, `"meta": { "msg": "INVOICE_CREATE_REQUEST", "context": {"response_envelope": {"kind": "json_object_v1"}} },`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "states[0].entry_actions[0].meta.context.response_envelope.required: must be a non-empty list of property names")
 }

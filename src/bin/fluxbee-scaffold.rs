@@ -344,14 +344,16 @@ fn scaffold_config_only(
     Ok(created)
 }
 
-/// The smallest definition `wf.engine` accepts: it waits for one message and finishes.
+/// The smallest definition `wf.engine` accepts: a message from the node its `start_from` names
+/// starts an instance, which waits for one message and finishes.
 fn workflow_definition_template(name: &str) -> String {
     let workflow_type = name.strip_prefix("wf.").unwrap_or(name);
     format!(
         r#"{{
   "wf_schema_version": "1",
   "workflow_type": "{workflow_type}",
-  "description": "Replace with what this workflow does.",
+  "description": "Replace with what this workflow does, and start_from with the nodes whose messages start it.",
+  "start_from": ["IO.api@motherbee"],
   "input_schema": {{ "type": "object", "properties": {{}} }},
   "initial_state": "waiting",
   "terminal_states": ["done"],

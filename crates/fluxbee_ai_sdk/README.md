@@ -452,7 +452,17 @@ registered case ends saved as `completed` and is never deleted by the model.
   - its `dst_ilk` is the incoming `src_ilk`;
   - its `src_ilk` is the agent's own ILK (`RuntimeConfig::self_ilk_id`, read from
     `FLUXBEE_NODE_ILK_ID` by default), never the human's;
-  - it keeps `thread_id` and drops `memory_package`.
+  - it keeps `thread_id` and drops `memory_package`;
+  - its `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`, a WF's
+    block (`wf`) and an `evaluation`, and without `final_response_contract` unless
+    `ReplyContextOptions` keeps it.
+- **A response contract** (`meta.context.response_envelope`, `json_object_v1`):
+  `resolve_response_envelope_contract` reads it as a `ResponseContract`, its `output_schema` for the
+  model and, when the contract names one, its `text_field`, a required `string` property.
+  `ResponseContract::answer` turns the model's output into the answer: without `text_field`, the
+  output as it is; with it, that field's value as the text and the whole object, checked against
+  the schema, as the evaluation, which `set_reply_evaluation` puts in the reply's
+  `meta.context.evaluation`. An output that is not that object is `InvalidStructuredOutput`.
 - **Input and output helpers:**
   - `resolve_model_input_from_payload_with_options` reads a `text/v1` payload, its `content_ref` and
     its attachments;

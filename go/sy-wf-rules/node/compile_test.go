@@ -141,6 +141,7 @@ func validWorkflowDefinition() map[string]any {
 		"wf_schema_version": "1",
 		"workflow_type":     "invoice",
 		"description":       "issues invoice",
+		"start_from":        []any{"IO.api.billing@motherbee"},
 		"input_schema": map[string]any{
 			"type":     "object",
 			"required": []any{"customer_id"},
@@ -202,7 +203,7 @@ func validWorkflowDefinition() map[string]any {
 // as float64, 1.0 was staged as 1 (an integer to the engine, which keeps numbers as written since
 // 0.1.90) and an integer past 2^53 lost its last digits.
 func TestADefinitionIsStagedWithItsNumbersAsWritten(t *testing.T) {
-	const definition = `{"wf_schema_version": "1", "workflow_type": "numbers",
+	const definition = `{"wf_schema_version": "1", "workflow_type": "numbers", "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object", "properties": {"limit": {"type": "integer", "maximum": 10}}},
   "initial_state": "sending", "terminal_states": ["sent"],
   "states": [

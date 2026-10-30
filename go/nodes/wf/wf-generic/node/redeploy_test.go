@@ -15,6 +15,7 @@ func deployWorkflowJSON(version string) string {
   "wf_schema_version": "1",
   "workflow_type": "deploy",
   "description": "VERSION",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "waiting",
   "terminal_states": ["done_VERSION"],
@@ -46,7 +47,7 @@ func TestARedeployKeepsARunningInstanceOnItsDefinition(t *testing.T) {
 	}
 
 	for _, instanceID := range []string{old, fresh} {
-		goMsg := from("AI.host@motherbee", msgWithName("GO"))
+		goMsg := from("IO.in@motherbee", msgWithName("GO"))
 		goMsg.Meta.ThreadID = &instanceID
 		if err := Dispatch(context.Background(), goMsg, v2); err != nil {
 			t.Fatal(err)
@@ -104,6 +105,7 @@ func TestARefWithADefaultForwardsAMessageWithoutContext(t *testing.T) {
 	const forwarding = `{
   "wf_schema_version": "1",
   "workflow_type": "forwarding",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "forwarding",
   "terminal_states": ["forwarded", "failed"],
@@ -130,10 +132,11 @@ func TestARefWithADefaultForwardsAMessageWithoutContext(t *testing.T) {
 	if len(disp.sent) != 3 {
 		t.Fatalf("sent %d", len(disp.sent))
 	}
-	if got := string(disp.sent[0].Meta.Context); got != `{"io":{"channel":"wapp"}}` {
+	// Each carries the WF's block too (wf-orchestration-v1 §5.2.1, item 7).
+	if got := string(disp.sent[0].Meta.Context); got != `{"io":{"channel":"wapp"},"wf":{"trail":["WF.invoice@motherbee"]}}` {
 		t.Fatalf("a present field is taken: %s", got)
 	}
-	if got := string(disp.sent[1].Meta.Context); got != `{}` {
+	if got := string(disp.sent[1].Meta.Context); got != `{"wf":{"trail":["WF.invoice@motherbee"]}}` {
 		t.Fatalf("a missing field takes its default: %s", got)
 	}
 	if got := string(disp.sent[0].Payload); got != `{"lang":"en","text":"hello"}` {

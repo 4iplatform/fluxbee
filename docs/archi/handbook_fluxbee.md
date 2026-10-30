@@ -228,6 +228,9 @@ A workflow runs where SY.wf-rules runs: the motherbee or a worker, never an ingr
 (a manifest that puts one there is refused).
 
 A definition is what SY.wf-rules validates (`go/pkg/wfcel`), and since 0.1.90:
+- `start_from` names the nodes whose messages start an instance (since 0.1.91): IO nodes or WFs,
+  each a node name with its hive, never an `AI.*` node (an agent only answers) nor a `SY.*` or
+  `RT.*` node; only the nodes the definition names drive an instance;
 - every message a WF sends is a `user` message: an action's `meta` has `msg` (and `context`),
   never `type`;
 - a send's `target` is a node name written in the definition; to choose among destinations, write
@@ -237,7 +240,9 @@ A definition is what SY.wf-rules validates (`go/pkg/wfcel`), and since 0.1.90:
 - an agent answers with the request's own `msg`, never a `*_RESPONSE`, its text in
   `payload.content`: ask it for a structured answer with `meta.context.response_envelope` and read
   it with `json_parse(event.payload.content)`;
-- an agent's error answer arrives as `<msg>.error`, which needs a transition of its own;
+- an agent's error answer is a payload of type `error`, which needs a transition of its own; its
+  `msg` is `<msg>.error` only when the request had a `msg` (a forwarded person's message has none:
+  match the agent by `event_match.src`, with the guard `event.payload.type == 'error'`);
 - a `$ref` to a field that may be missing gives a default (`{"$ref": "event.context", "default":
   {}}`); without one, a missing field fails the instance.
 

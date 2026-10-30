@@ -36,6 +36,9 @@ const (
 	causeStateNotInDefinition = "state_not_in_definition"
 	// causeReplayExhausted: an event of the instance ran at maxReplayAttempts starts without finishing.
 	causeReplayExhausted = "replay_exhausted"
+	// causeThreadTaken: another running instance holds the instance's thread, and a message on it
+	// reaches that one only.
+	causeThreadTaken = "thread_taken"
 )
 
 // WFInstance is the in-memory representation of a running workflow instance.
@@ -43,7 +46,12 @@ const (
 type WFInstance struct {
 	mu sync.Mutex
 
-	InstanceID   string
+	InstanceID string
+	// ThreadID is the instance's thread, the conversation's: the thread_id of the message that
+	// started it, or InstanceID when that message had none. Every message the instance sends carries
+	// it, so the agents keep one memory per conversation and their answers come back here
+	// (wf-orchestration-v1 §5.2.1, item 1).
+	ThreadID     string
 	WorkflowType string
 	// DefinitionHash and def are the definition the instance was born with: it runs on it until it
 	// ends, whatever is deployed meanwhile.
@@ -57,6 +65,16 @@ type WFInstance struct {
 	CreatedAtMS    int64
 	UpdatedAtMS    int64
 	TerminatedAtMS *int64
+	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit
+	// writes: kept since the last commit that went through.
+	kept      map[string]keptMessage
+	keptSince map[string]bool
+}
+
+// keptMessage is a message keep_message kept: as received, and as the store keeps it.
+type keptMessage struct {
+	msg sdk.Message
+	row KeptMessageRow
 }
 
 // takenEvent is the durable copy of the event a transition takes: its row in the inbound journal or
@@ -72,11 +90,13 @@ func (t takenEvent) mutation() InstanceCommitMutation {
 	return InstanceCommitMutation{ConsumedInboundEventID: t.inboundID, ConsumedInternalEventID: t.internalID}
 }
 
-// NewInstance creates a new WFInstance for the given definition and input.
+// NewInstance creates a new WFInstance for the given definition and input, on its own id as its
+// thread (the creation sets the thread of the message that starts it, when it has one).
 func NewInstance(def *WorkflowDefinition, instanceID, workflowType string, input map[string]any, clock ClockFunc) *WFInstance {
 	now := nowMS(clock)
 	return &WFInstance{
 		InstanceID:   instanceID,
+		ThreadID:     instanceID,
 		WorkflowType: workflowType,
 		def:          def,
 		Status:       "running",
@@ -88,8 +108,8 @@ func NewInstance(def *WorkflowDefinition, instanceID, workflowType string, input
 	}
 }
 
-// FromRow restores an instance from its persistent row.
-func FromRow(row WFInstanceRow, def *WorkflowDefinition) (*WFInstance, error) {
+// FromRow restores an instance from its persistent row and the messages it kept.
+func FromRow(row WFInstanceRow, def *WorkflowDefinition, kept []KeptMessageRow) (*WFInstance, error) {
 	input, err := unmarshalJSON(row.InputJSON)
 	if err != nil {
 		return nil, fmt.Errorf("instance %s: bad input_json: %w", row.InstanceID, err)
@@ -100,6 +120,7 @@ func FromRow(row WFInstanceRow, def *WorkflowDefinition) (*WFInstance, error) {
 	}
 	inst := &WFInstance{
 		InstanceID:     row.InstanceID,
+		ThreadID:       row.ThreadID,
 		WorkflowType:   row.WorkflowType,
 		DefinitionHash: row.DefinitionHash,
 		def:            def,
@@ -114,6 +135,16 @@ func FromRow(row WFInstanceRow, def *WorkflowDefinition) (*WFInstance, error) {
 	if row.TerminatedAtMS.Valid {
 		v := row.TerminatedAtMS.Int64
 		inst.TerminatedAtMS = &v
+	}
+	for _, keptRow := range kept {
+		var msg sdk.Message
+		if err := json.Unmarshal([]byte(keptRow.MessageJSON), &msg); err != nil {
+			return nil, fmt.Errorf("instance %s: bad kept message %q: %w", row.InstanceID, keptRow.Name, err)
+		}
+		if inst.kept == nil {
+			inst.kept = map[string]keptMessage{}
+		}
+		inst.kept[keptRow.Name] = keptMessage{msg: msg, row: keptRow}
 	}
 	return inst, nil
 }
@@ -131,6 +162,7 @@ func (inst *WFInstance) ToRow(clock ClockFunc) (WFInstanceRow, error) {
 	}
 	row := WFInstanceRow{
 		InstanceID:     inst.InstanceID,
+		ThreadID:       inst.ThreadID,
 		WorkflowType:   inst.WorkflowType,
 		DefinitionHash: inst.DefinitionHash,
 		Status:         inst.Status,
@@ -200,7 +232,7 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 			InstanceID:  inst.InstanceID,
 			LoggedAtMS:  now,
 			ActionType:  "event",
-			Summary:     fmt.Sprintf("unhandled event %s in state %s", msgName(event), inst.CurrentState),
+			Summary:     fmt.Sprintf("unhandled event %s in state %s", eventName(event), inst.CurrentState),
 			OK:          false,
 			ErrorDetail: "no matching transition",
 		})
@@ -213,9 +245,14 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		return nil
 	}
 
-	targetStateDef := inst.findState(chosen.TargetState)
-	if targetStateDef == nil {
-		return inst.routeToFailed(ctx, event, actx, fmt.Errorf("%s: target state %q is not in the instance's definition", causeStateNotInDefinition, chosen.TargetState), taken)
+	// A transition without a target_state is internal: it runs its own actions and stays, with no
+	// exit or entry actions (an event that arrives early is noted without leaving the state).
+	internal := chosen.TargetState == ""
+	var targetStateDef *StateDefinition
+	if !internal {
+		if targetStateDef = inst.findState(chosen.TargetState); targetStateDef == nil {
+			return inst.routeToFailed(ctx, event, actx, fmt.Errorf("%s: target state %q is not in the instance's definition", causeStateNotInDefinition, chosen.TargetState), taken)
+		}
 	}
 
 	// The event's trace_id goes on every send of the transition (and on a send again when recovery
@@ -226,8 +263,10 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	// any step routes the instance to a loud terminal failure instead of advancing with inconsistent
 	// state; internal events emitted before the failure are cleared by routeToFailed.
 	var emitted []InternalEventRow
-	if err := inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted); err != nil {
-		return inst.routeToFailed(ctx, event, actx, err, taken)
+	if !internal {
+		if err := inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted); err != nil {
+			return inst.routeToFailed(ctx, event, actx, err, taken)
+		}
 	}
 	if err := inst.executeActions(ctx, chosen.Actions, event, actx, &emitted); err != nil {
 		return inst.routeToFailed(ctx, event, actx, err, taken)
@@ -235,10 +274,11 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 
 	// Advance state
 	prevState := inst.CurrentState
-	inst.CurrentState = chosen.TargetState
-
-	if err := inst.executeActions(ctx, targetStateDef.EntryActions, event, actx, &emitted); err != nil {
-		return inst.routeToFailed(ctx, event, actx, err, taken)
+	if !internal {
+		inst.CurrentState = chosen.TargetState
+		if err := inst.executeActions(ctx, targetStateDef.EntryActions, event, actx, &emitted); err != nil {
+			return inst.routeToFailed(ctx, event, actx, err, taken)
+		}
 	}
 
 	// Commit the new state
@@ -246,7 +286,7 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	now := nowMS(actx.Clock)
 	inst.UpdatedAtMS = now
 
-	isTerminal := inst.isTerminalState(chosen.TargetState)
+	isTerminal := !internal && inst.isTerminalState(chosen.TargetState)
 	if isTerminal {
 		inst.Status = terminalStatus(chosen.TargetState, inst.def.TerminalStates)
 		inst.TerminatedAtMS = &now
@@ -262,24 +302,60 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		return fmt.Errorf("persist transition %s→%s: %w", prevState, inst.CurrentState, err)
 	}
 
+	summary := fmt.Sprintf("transition %s → %s", prevState, inst.CurrentState)
+	if internal {
+		summary = fmt.Sprintf("internal transition in %s on %s", inst.CurrentState, eventName(event))
+	}
 	_ = actx.Store.AppendLog(ctx, WFLogEntry{
 		InstanceID: inst.InstanceID,
 		LoggedAtMS: now,
 		ActionType: "transition",
-		Summary:    fmt.Sprintf("transition %s → %s", prevState, inst.CurrentState),
+		Summary:    summary,
 		OK:         true,
 	})
 
 	return nil
 }
 
-// commit writes the instance as it is now, with mutation, in one transaction.
+// commit writes the instance as it is now, with mutation, in one transaction: with the messages it
+// kept since its last commit, or, once it ended, dropping every message it kept.
 func (inst *WFInstance) commit(ctx context.Context, actx ActionContext, mutation InstanceCommitMutation) error {
 	row, err := inst.ToRow(actx.Clock)
 	if err != nil {
 		return fmt.Errorf("instance %s: serialize: %w", inst.InstanceID, err)
 	}
-	return actx.Store.CommitInstanceMutation(ctx, row, mutation)
+	mutation.DropKeptMessages = inst.TerminatedAtMS != nil
+	if !mutation.DropKeptMessages {
+		for name := range inst.keptSince {
+			mutation.KeepMessages = append(mutation.KeepMessages, inst.kept[name].row)
+		}
+	}
+	if err := actx.Store.CommitInstanceMutation(ctx, row, mutation); err != nil {
+		return err
+	}
+	inst.keptSince = nil
+	return nil
+}
+
+// keep keeps msg, as received, under name (keep_message): the instance's next commit writes it,
+// replacing the message kept under that name before.
+func (inst *WFInstance) keep(name string, msg sdk.Message, actx ActionContext) error {
+	raw, err := sdk.MarshalMessage(msg)
+	if err != nil {
+		return err
+	}
+	if inst.kept == nil {
+		inst.kept = map[string]keptMessage{}
+	}
+	if inst.keptSince == nil {
+		inst.keptSince = map[string]bool{}
+	}
+	inst.kept[name] = keptMessage{
+		msg: msg,
+		row: KeptMessageRow{InstanceID: inst.InstanceID, Name: name, MessageJSON: string(raw), KeptAtMS: nowMS(actx.Clock)},
+	}
+	inst.keptSince[name] = true
+	return nil
 }
 
 func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Message, actx ActionContext, taken takenEvent) error {
@@ -434,7 +510,7 @@ func (inst *WFInstance) drain(ctx context.Context, actx ActionContext, countAtte
 				return fmt.Errorf("count the attempt of internal event %d: %w", row.EventID, err)
 			}
 		}
-		msg, err := buildInternalEventMessage(row)
+		msg, err := buildInternalEventMessage(row, inst.ThreadID)
 		if err != nil {
 			return fmt.Errorf("build internal event %d: %w", row.EventID, err)
 		}
@@ -508,12 +584,17 @@ func terminalStatus(stateName string, terminalStates []string) string {
 	}
 }
 
-// matchesEvent checks whether a transition's event_match matches the incoming message, by its msg.
+// matchesEvent checks whether a transition's event_match matches the incoming message: by its msg,
+// by its sender (src, the name the router stamps), or by both, and then both must match. An
+// event_match with neither (validation refuses it) matches nothing.
 func matchesEvent(match EventMatch, msg sdk.Message) bool {
-	if strings.TrimSpace(match.Msg) == "" {
+	if strings.TrimSpace(match.Msg) == "" && match.Src == "" {
 		return false
 	}
-	return msg.Meta.Msg != nil && *msg.Meta.Msg == match.Msg
+	if match.Msg != "" && (msg.Meta.Msg == nil || *msg.Meta.Msg != match.Msg) {
+		return false
+	}
+	return match.Src == "" || msg.SourceL2Name() == match.Src
 }
 
 // messageToMap converts an sdk.Message to a plain map for use in CEL evaluation
@@ -568,9 +649,17 @@ func msgName(msg sdk.Message) string {
 	return "(no msg)"
 }
 
-func buildInternalEventMessage(row InternalEventRow) (sdk.Message, error) {
+// eventName names an event in the instance's log: its msg, and its sender when it has one.
+func eventName(msg sdk.Message) string {
+	if src := msg.SourceL2Name(); src != "" {
+		return fmt.Sprintf("%s from %s", msgName(msg), src)
+	}
+	return msgName(msg)
+}
+
+// buildInternalEventMessage is the event an internal event row makes, on the instance's thread.
+func buildInternalEventMessage(row InternalEventRow, threadID string) (sdk.Message, error) {
 	msgName := row.MsgName
-	threadID := row.InstanceID
 	payload := []byte(row.PayloadJSON)
 	if len(payload) == 0 {
 		payload = []byte(`{}`)
@@ -593,9 +682,16 @@ func buildInternalEventMessage(row InternalEventRow) (sdk.Message, error) {
 
 func actionSummary(action ActionDefinition) string {
 	switch action.Type {
-	case "send_message":
+	case "send_message", "forward":
+		if action.Message != "" {
+			return fmt.Sprintf("%s %s to %s", action.Type, action.Message, action.Target)
+		}
 		if action.Target != "" {
-			return fmt.Sprintf("send_message to %s", action.Target)
+			return fmt.Sprintf("%s to %s", action.Type, action.Target)
+		}
+	case "keep_message":
+		if action.Name != "" {
+			return fmt.Sprintf("keep_message %s", action.Name)
 		}
 	case "emit_internal_event":
 		if action.Meta != nil && action.Meta.Msg != "" {

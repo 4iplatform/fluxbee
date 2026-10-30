@@ -13,15 +13,15 @@ use fluxbee_ai_sdk::{
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
     create_function_calling_model, create_llm_client, extract_text, is_infrastructure_message,
     note_infrastructure_message, resolve_model_input_from_payload_with_options,
-    resolve_response_envelope_output_schema, AgentTool, AiAccount, AiBehaviorOutput, AiFinalOutput,
-    AiNode, AiProvider, AiUserArtifact, ControlRequest, FunctionCallingConfig,
-    FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult,
-    FunctionRunInput, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
-    ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
-    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
-    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
-    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
-    MSG_PING, MSG_STATUS,
+    resolve_response_envelope_contract, set_reply_evaluation, AgentTool, AiAccount,
+    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, ContractAnswer,
+    ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
+    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
+    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
+    LlmClient, LlmRequest, Message, ModelInputOptions, ModelSettings, NodeRuntime,
+    ResolvedModelInput, ResponseContract, RuntimeConfig, TenantSource, ThreadStateDeleteTool,
+    ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard,
+    ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -52,6 +52,8 @@ const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
 const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
+/// The most of a WF's `vars` the model reads, as JSON (`render_wf_prompt_block`).
+const WF_VARS_PROMPT_MAX_BYTES: usize = 8 * 1024;
 const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
 /// The largest file `read_blob` reads: an attachment's cap (the AI SDK's text_payload).
 const READ_BLOB_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -475,6 +477,24 @@ struct BehaviorContext {
     tool_ran: AtomicBool,
 }
 
+/// One message's answer: its reply and, under a response contract with a `text_field`, the whole
+/// object the model answered with, which the reply carries in `meta.context.evaluation`
+/// (`ResponseContract::answer`).
+#[derive(Debug, PartialEq)]
+struct AiChatAnswer {
+    output: AiBehaviorOutput,
+    evaluation: Option<Value>,
+}
+
+impl From<AiBehaviorOutput> for AiChatAnswer {
+    fn from(output: AiBehaviorOutput) -> Self {
+        Self {
+            output,
+            evaluation: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GenerateCsvArtifactArgs {
     filename: String,
@@ -894,9 +914,15 @@ impl AiNode for GenericAiNode {
                 (extract_text(&msg.payload).unwrap_or_default(), None)
             };
         let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
-        // What the person wrote, without the memory block in front: what the history keeps.
+        let wf_block = render_wf_prompt_block(msg.meta.context.as_ref());
+        // What the model reads before the message: the memory block, then the WF's.
+        let prompt_blocks = [cognition_block.as_deref(), wf_block.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // What the person wrote, without the blocks in front: what the history keeps.
         let user_text = input.clone();
-        let input = inject_memory_package_into_text_input(&input, cognition_block.as_deref());
+        let input = inject_prompt_blocks_into_text_input(&input, &prompt_blocks);
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
                 node_name = %self.node_name,
@@ -905,13 +931,16 @@ impl AiNode for GenericAiNode {
                 sender = ?incoming_sender_hint(&msg),
                 thread_id = ?behavior_ctx.thread_id,
                 memory_package = msg.meta.memory_package.is_some(),
+                wf_block = wf_block.is_some(),
                 input_len = input.len(),
                 input_preview = %text_preview(&input, 240),
                 "incoming user message"
             );
         }
-        let output = match &behavior {
-            NodeBehavior::Echo => AiBehaviorOutput::text(format!("Echo: {input}")),
+        let answer = match &behavior {
+            NodeBehavior::Echo => {
+                AiChatAnswer::from(AiBehaviorOutput::text(format!("Echo: {input}")))
+            }
             NodeBehavior::AiChat(ai) => {
                 // What this request runs on: the node's provider and model, or the hive's.
                 let engine = match effective_ai_engine(ai, &self.config_dir).for_request() {
@@ -932,10 +961,9 @@ impl AiNode for GenericAiNode {
                 let input_parts = if ai.multimodal {
                     if let Some(resolved) = resolved_user_input.as_ref() {
                         match build_model_user_content_parts(resolved).await {
-                            Ok(parts) => Some(inject_memory_package_into_input_parts(
-                                parts,
-                                cognition_block.as_deref(),
-                            )),
+                            Ok(parts) => {
+                                Some(inject_prompt_blocks_into_input_parts(parts, &prompt_blocks))
+                            }
                             Err(err) => {
                                 tracing::warn!(
                                     node_name = %self.node_name,
@@ -967,7 +995,7 @@ impl AiNode for GenericAiNode {
                     )
                     .await
                 {
-                    Ok(output) => output,
+                    Ok(answer) => answer,
                     Err(err) if err.to_string().contains("missing AI api key") => {
                         tracing::warn!(
                             node_name = %self.node_name,
@@ -1030,8 +1058,8 @@ impl AiNode for GenericAiNode {
             }
         };
 
-        let payload = match build_ai_behavior_response(output) {
-            Ok(payload) => payload,
+        let (payload, evaluation) = match build_ai_behavior_response(answer.output) {
+            Ok(payload) => (payload, answer.evaluation),
             Err(err) => {
                 tracing::warn!(
                     node_name = %self.node_name,
@@ -1039,10 +1067,14 @@ impl AiNode for GenericAiNode {
                     error = %err,
                     "failed to build final AI response with user-facing artifacts; replying with artifact generation error payload"
                 );
-                ai_final_output_error_payload(&err)
+                (ai_final_output_error_payload(&err), None)
             }
         };
-        Ok(Some(build_reply_message_runtime_src(&msg, payload)))
+        let mut reply = build_reply_message_runtime_src(&msg, payload);
+        if let Some(evaluation) = evaluation {
+            set_reply_evaluation(&mut reply, evaluation);
+        }
+        Ok(Some(reply))
     }
 }
 
@@ -1056,7 +1088,7 @@ impl GenericAiNode {
         user_text: &str,
         ctx: &BehaviorContext,
         meta: &Meta,
-    ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
+    ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
         let credential = self
             .resolve_ai_credential(engine.provider)
             .await
@@ -1068,11 +1100,12 @@ impl GenericAiNode {
             ai.base_url.clone(),
             account.clone(),
         );
-        let output_schema = resolve_response_envelope_output_schema(meta)?;
+        let contract = resolve_response_envelope_contract(meta)?;
+        let output_schema = contract.as_ref().map(|contract| &contract.output_schema);
         let files = Arc::new(ReplyFiles::default());
         let tool_registry = self.build_tool_registry(ctx, &files)?;
         let tool_count = tool_registry.definitions().len();
-        let output_contract_mode = match (output_schema.as_ref(), tool_count > 0) {
+        let output_contract_mode = match (output_schema, tool_count > 0) {
             (Some(_), true) => "fallback_instruction",
             (Some(_), false) => "structured_output",
             (None, _) => "free_text",
@@ -1083,14 +1116,15 @@ impl GenericAiNode {
             src_ilk = ?ctx.src_ilk,
             tool_count,
             output_contract_mode,
-            output_schema_name = ?output_schema.as_ref().map(|schema| schema.name()),
+            output_schema_name = ?output_schema.map(|schema| schema.name()),
+            text_field = ?contract.as_ref().and_then(|contract| contract.text_field.as_deref()),
             provider = %credential.provider,
             model = %engine.model,
             "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
             let prompt = self.agent_prompt().await;
-            let system = match &output_schema {
+            let system = match output_schema {
                 Some(schema) => format!(
                     "{prompt}\n\n{}",
                     build_output_schema_fallback_instruction(schema)?
@@ -1107,7 +1141,7 @@ impl GenericAiNode {
                 account,
             );
             let watched = ToolRunWatch::new(model.as_ref(), &ctx.tool_ran);
-            if let Some(output) = self
+            if let Some(answer) = self
                 .run_tool_loop(
                     &watched,
                     &tool_registry,
@@ -1117,32 +1151,32 @@ impl GenericAiNode {
                     input.clone(),
                     input_parts.clone(),
                     user_text,
+                    contract.as_ref(),
                 )
                 .await?
             {
-                return Ok(output);
+                return Ok(answer);
             }
         }
 
-        let req = fluxbee_ai_sdk::llm::LlmRequest {
+        let req = LlmRequest {
             model: engine.model.clone(),
             system: Some(self.agent_prompt().await),
             input,
             input_parts,
-            output_schema,
+            output_schema: output_schema.cloned(),
             max_output_tokens: None,
             model_settings: Some(ai.model_settings.clone()),
         };
-        let response = fluxbee_ai_sdk::llm::LlmClient::generate(client.as_ref(), req).await?;
-        self.persist_immediate_turn(ai, ctx, user_text, &response.content)
-            .await;
-        Ok(AiBehaviorOutput::text(response.content))
+        self.run_plain_call(client.as_ref(), req, ai, ctx, user_text, contract.as_ref())
+            .await
     }
 
-    /// One message's tool loop, and its reply: the model's own text with every file its tools made
-    /// and the link of every page it published (`tool_loop_output`, FINDINGS A-98, A-99). `None`
-    /// when the model ended without text, made no file and published no page: the caller then asks
-    /// it once more, without tools.
+    /// One message's tool loop, and its answer (`tool_loop_answer`): the model's own text with
+    /// every file its tools made and the link of every page it published (`tool_loop_output`,
+    /// FINDINGS A-98, A-99), or, under a `text_field`, that field of its object. `None` when the
+    /// model ended without text, made no file and published no page: the caller then asks it once
+    /// more, without tools.
     async fn run_tool_loop(
         &self,
         model: &dyn FunctionCallingModel,
@@ -1153,26 +1187,56 @@ impl GenericAiNode {
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         user_text: &str,
-    ) -> fluxbee_ai_sdk::Result<Option<AiBehaviorOutput>> {
+        contract: Option<&ResponseContract>,
+    ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
         let run_input =
             self.build_function_run_input(input, input_parts, ctx, ai, immediate_memory);
         let result = runner.run_with_input(model, tools, run_input).await?;
-        let Some(output) = tool_loop_output(
+        let Some(answer) = tool_loop_answer(
             tool_loop_text(&result),
             files.take(),
             &published_links(&result.items),
-        ) else {
+            contract,
+        )?
+        else {
             return Ok(None);
         };
-        if matches!(output, AiBehaviorOutput::Final(_)) {
-            self.log_final_output(ctx, &output);
+        if matches!(answer.output, AiBehaviorOutput::Final(_)) {
+            self.log_final_output(ctx, &answer.output);
         }
-        let summary_text = summarize_behavior_output(&output);
-        self.persist_immediate_turn(ai, ctx, user_text, &summary_text)
+        self.persist_immediate_turn(ai, ctx, user_text, &assistant_turn_text(&answer))
             .await;
-        Ok(Some(output))
+        Ok(Some(answer))
+    }
+
+    /// One message's call without tools, which asks the model for the contract's object when the
+    /// message names a contract, and its answer under that contract (`ResponseContract::answer`).
+    async fn run_plain_call(
+        &self,
+        client: &dyn LlmClient,
+        request: LlmRequest,
+        ai: &AiChatRuntime,
+        ctx: &BehaviorContext,
+        user_text: &str,
+        contract: Option<&ResponseContract>,
+    ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
+        let response = client.generate(request).await?;
+        let answer = match contract {
+            Some(contract) => contract.answer(response.content)?,
+            None => ContractAnswer {
+                text: response.content,
+                evaluation: None,
+            },
+        };
+        let answer = AiChatAnswer {
+            output: AiBehaviorOutput::text(answer.text),
+            evaluation: answer.evaluation,
+        };
+        self.persist_immediate_turn(ai, ctx, user_text, &assistant_turn_text(&answer))
+            .await;
+        Ok(answer)
     }
 
     /// The journal's line for a reply that carries files: their names and the length of its text,
@@ -3079,6 +3143,33 @@ fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
     value.truncate(end);
 }
 
+/// The answer of one message's tool loop: its reply (`tool_loop_output`) and, under a response
+/// contract with a `text_field`, its evaluation. There the model's `text` is the contract's object:
+/// that field is the reply's text, blank or not, and the object its evaluation
+/// (`ResponseContract::answer`). A loop that wrote nothing, made no file and published no page has
+/// no answer, as without the contract; one that made a file or published a page but wrote no
+/// object fails, as an object without the field does.
+fn tool_loop_answer(
+    text: Option<String>,
+    files: Vec<AiUserArtifact>,
+    links: &[String],
+    contract: Option<&ResponseContract>,
+) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
+    let Some(contract) = contract.filter(|contract| contract.text_field.is_some()) else {
+        return Ok(tool_loop_output(text, files, links).map(AiChatAnswer::from));
+    };
+    if text.is_none() && files.is_empty() && links.is_empty() {
+        return Ok(None);
+    }
+    let answer = contract.answer(text.unwrap_or_default())?;
+    let output = tool_loop_output(Some(answer.text.clone()), files, links)
+        .unwrap_or_else(|| AiBehaviorOutput::text(answer.text));
+    Ok(Some(AiChatAnswer {
+        output,
+        evaluation: answer.evaluation,
+    }))
+}
+
 /// The reply of one message's tool loop (FINDINGS A-98, A-99): the model's `text`
 /// (`tool_loop_text`), with every file its tools made, in the order they were made, and with each
 /// of the `links` its pages were published at that the text does not carry, on a line of its own,
@@ -3198,6 +3289,17 @@ fn files_fallback_line(files: &[AiUserArtifact]) -> String {
         format!("Aca esta el archivo solicitado: {names}")
     } else {
         format!("Aca estan los archivos solicitados: {names}")
+    }
+}
+
+/// The assistant's turn an answer leaves in the immediate memory: under a `text_field`, the whole
+/// object the model answered with, as compact JSON, which is what the contract asks it to write and
+/// never blank (a blank turn fails every later one: Anthropic refuses an empty text block);
+/// otherwise its reply (`summarize_behavior_output`).
+fn assistant_turn_text(answer: &AiChatAnswer) -> String {
+    match &answer.evaluation {
+        Some(evaluation) => evaluation.to_string(),
+        None => summarize_behavior_output(&answer.output),
     }
 }
 
@@ -6623,6 +6725,16 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
                 "retryable": false
             })
         }
+        // The model answered, but not with the object the message's response contract asks for.
+        fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput { detail } => json!({
+            "type": "error",
+            "code": "invalid_structured_output",
+            "message": format!(
+                "The AI's answer is not the object its response contract asks for: {}",
+                trim_chars(detail, 220)
+            ),
+            "retryable": false
+        }),
         other => json!({
             "type": "error",
             "code": "ai_runtime_error",
@@ -7054,27 +7166,72 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
     Some(lines.join("\n"))
 }
 
-fn inject_memory_package_into_text_input(input: &str, cognition_block: Option<&str>) -> String {
-    let Some(block) = cognition_block.filter(|value| !value.trim().is_empty()) else {
-        return input.to_string();
-    };
-    if input.trim().is_empty() {
-        return block.to_string();
+/// The WF's block, `meta.context.wf` (docs/wf-orchestration-v1.md §5.2.1), as the model reads it:
+/// the path the message took, from its `trail`, and the WF's `vars` as JSON, cut at
+/// `WF_VARS_PROMPT_MAX_BYTES` with a line that says so. `None` without a block, or with neither a
+/// trail nor vars in it.
+fn render_wf_prompt_block(context: Option<&Value>) -> Option<String> {
+    let wf = context?.get("wf")?;
+    let mut lines = vec!["Workflow context:".to_string()];
+    let trail = wf
+        .get("trail")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if !trail.is_empty() {
+        lines.push(format!("Path: {}", trail.join(" -> ")));
     }
-    format!("{block}\n\nCurrent user message:\n{input}")
+    let vars = wf
+        .get("vars")
+        .filter(|vars| !vars.is_null() && vars.as_object().is_none_or(|vars| !vars.is_empty()));
+    if let Some(vars) = vars {
+        let mut json = vars.to_string();
+        let len = json.len();
+        if len > WF_VARS_PROMPT_MAX_BYTES {
+            truncate_to_byte_budget(&mut json, WF_VARS_PROMPT_MAX_BYTES);
+            json.push_str(&format!(
+                "\n[cut at {WF_VARS_PROMPT_MAX_BYTES} of {len} bytes]"
+            ));
+        }
+        lines.push(format!("Variables: {json}"));
+    }
+    (lines.len() > 1).then(|| lines.join("\n"))
 }
 
-fn inject_memory_package_into_input_parts(
+/// `input` as the model reads it, after `blocks`: the memory block, then the WF's.
+fn inject_prompt_blocks_into_text_input(input: &str, blocks: &[&str]) -> String {
+    let blocks = blocks
+        .iter()
+        .copied()
+        .filter(|block| !block.trim().is_empty())
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return input.to_string();
+    }
+    let blocks = blocks.join("\n\n");
+    if input.trim().is_empty() {
+        return blocks;
+    }
+    format!("{blocks}\n\nCurrent user message:\n{input}")
+}
+
+/// The message's parts as the model reads them: each of `blocks` first, as a text part of its own,
+/// in their order.
+fn inject_prompt_blocks_into_input_parts(
     mut parts: Vec<fluxbee_ai_sdk::ModelContentPart>,
-    cognition_block: Option<&str>,
+    blocks: &[&str],
 ) -> Vec<fluxbee_ai_sdk::ModelContentPart> {
-    let Some(block) = cognition_block.filter(|value| !value.trim().is_empty()) else {
-        return parts;
-    };
-    let mut enriched = Vec::with_capacity(parts.len() + 1);
-    enriched.push(fluxbee_ai_sdk::ModelContentPart::Text {
-        text: block.to_string(),
-    });
+    let mut enriched = blocks
+        .iter()
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| fluxbee_ai_sdk::ModelContentPart::Text {
+            text: block.to_string(),
+        })
+        .collect::<Vec<_>>();
     enriched.append(&mut parts);
     enriched
 }
@@ -8293,25 +8450,25 @@ mod tests {
     }
 
     #[test]
-    fn inject_memory_package_into_text_input_prefixes_cognition_block() {
+    fn inject_prompt_blocks_into_text_input_prefixes_cognition_block() {
         let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
         let enriched =
-            inject_memory_package_into_text_input("please help with this refund", Some(&block));
+            inject_prompt_blocks_into_text_input("please help with this refund", &[&block]);
         assert!(enriched.contains("Conversation memory:"));
         assert!(enriched.contains("Dominant context: refund dispute"));
         assert!(enriched.contains("Current user message:\nplease help with this refund"));
     }
 
     #[test]
-    fn inject_memory_package_into_input_parts_adds_leading_text_part() {
+    fn inject_prompt_blocks_into_input_parts_adds_leading_text_part() {
         let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
-        let enriched = inject_memory_package_into_input_parts(
+        let enriched = inject_prompt_blocks_into_input_parts(
             vec![fluxbee_ai_sdk::ModelContentPart::Text {
                 text: "hello".to_string(),
             }],
-            Some(&block),
+            &[&block],
         );
         assert_eq!(enriched.len(), 2);
         assert!(matches!(
@@ -8322,6 +8479,128 @@ mod tests {
             &enriched[1],
             fluxbee_ai_sdk::ModelContentPart::Text { text } if text == "hello"
         ));
+    }
+
+    /// A WF's block as Case 1's WF sends it to invoice (docs/wf-orchestration-v1.md §5.2.1).
+    fn sample_wf_context() -> Value {
+        json!({
+            "io": {"channel": "api"},
+            "wf": {
+                "trail": ["IO.api@motherbee", "WF.sales.invoice@worker1"],
+                "vars": {"order": {"product": "Pro", "quantity": 10, "unit_price": 49}}
+            }
+        })
+    }
+
+    #[test]
+    fn the_wf_block_shows_the_trail_as_a_path_and_the_vars_as_json() {
+        let block = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        assert_eq!(
+            block,
+            "Workflow context:\n\
+             Path: IO.api@motherbee -> WF.sales.invoice@worker1\n\
+             Variables: {\"order\":{\"product\":\"Pro\",\"quantity\":10,\"unit_price\":49}}"
+        );
+
+        // Either part alone.
+        let trail_only = json!({"wf": {"trail": ["WF.sales.invoice@worker1"], "vars": {}}});
+        assert_eq!(
+            render_wf_prompt_block(Some(&trail_only)).as_deref(),
+            Some("Workflow context:\nPath: WF.sales.invoice@worker1")
+        );
+        let vars_only = json!({"wf": {"vars": {"invoice": {"number": "A-1"}}}});
+        assert_eq!(
+            render_wf_prompt_block(Some(&vars_only)).as_deref(),
+            Some("Workflow context:\nVariables: {\"invoice\":{\"number\":\"A-1\"}}")
+        );
+
+        // No block, or nothing in it.
+        assert_eq!(render_wf_prompt_block(None), None);
+        for context in [
+            json!({"io": {"channel": "api"}}),
+            json!({"wf": {}}),
+            json!({"wf": {"trail": [], "vars": {}}}),
+            json!({"wf": {"trail": [" ", 7], "vars": null}}),
+            json!({"wf": "WF.sales.invoice@worker1"}),
+        ] {
+            assert_eq!(render_wf_prompt_block(Some(&context)), None, "{context}");
+        }
+    }
+
+    #[test]
+    fn the_wf_blocks_vars_are_cut_at_8_kib_with_a_mark() {
+        let note = "ñ".repeat(WF_VARS_PROMPT_MAX_BYTES);
+        let context = json!({"wf": {"vars": {"note": note}}});
+        let whole = json!({"note": note}).to_string();
+
+        let block = render_wf_prompt_block(Some(&context)).expect("the WF's block");
+        let (json, mark) = block
+            .strip_prefix("Workflow context:\nVariables: ")
+            .and_then(|vars| vars.rsplit_once('\n'))
+            .expect("the variables and the mark");
+        assert_eq!(mark, format!("[cut at 8192 of {} bytes]", whole.len()));
+        // Cut where a character starts, at most 8 KiB in.
+        assert!(json.len() <= WF_VARS_PROMPT_MAX_BYTES);
+        assert!(json.len() > WF_VARS_PROMPT_MAX_BYTES - "ñ".len());
+        assert!(whole.starts_with(json));
+
+        // At 8 KiB or less, whole and unmarked.
+        let fits = json!({"wf": {"vars": {"note": "x".repeat(WF_VARS_PROMPT_MAX_BYTES - 11)}}});
+        let block = render_wf_prompt_block(Some(&fits)).expect("the WF's block");
+        assert!(!block.contains("[cut at"));
+        assert_eq!(
+            block.len(),
+            "Workflow context:\nVariables: ".len() + WF_VARS_PROMPT_MAX_BYTES
+        );
+    }
+
+    /// With both blocks the model reads the memory first, then the WF's, then the message: as text
+    /// and as parts alike.
+    #[test]
+    fn the_memory_block_comes_first_then_the_wf_block_then_the_message() {
+        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
+            .expect("memory block");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+
+        let text = inject_prompt_blocks_into_text_input("dale, facturámelo", &[&memory, &wf]);
+        assert_eq!(
+            text,
+            format!("{memory}\n\n{wf}\n\nCurrent user message:\ndale, facturámelo")
+        );
+        assert_eq!(
+            inject_prompt_blocks_into_text_input("dale, facturámelo", &[&wf]),
+            format!("{wf}\n\nCurrent user message:\ndale, facturámelo")
+        );
+        assert_eq!(
+            inject_prompt_blocks_into_text_input("dale, facturámelo", &[]),
+            "dale, facturámelo"
+        );
+
+        let image = fluxbee_ai_sdk::ModelContentPart::Image {
+            media_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+            detail: None,
+        };
+        let parts = inject_prompt_blocks_into_input_parts(
+            vec![
+                fluxbee_ai_sdk::ModelContentPart::Text {
+                    text: "dale, facturámelo".to_string(),
+                },
+                image.clone(),
+            ],
+            &[&memory, &wf],
+        );
+        assert_eq!(
+            parts,
+            vec![
+                fluxbee_ai_sdk::ModelContentPart::Text { text: memory },
+                fluxbee_ai_sdk::ModelContentPart::Text { text: wf },
+                fluxbee_ai_sdk::ModelContentPart::Text {
+                    text: "dale, facturámelo".to_string(),
+                },
+                image,
+            ]
+        );
     }
 
     #[test]
@@ -8898,9 +9177,11 @@ mod tests {
                 "send both".to_string(),
                 None,
                 "send both",
+                None,
             )
             .await
             .expect("the tool loop")
+            .map(|answer| answer.output)
     }
 
     /// A-98, A-99: a turn that makes two files. The model gets back each file's name, type and
@@ -9239,6 +9520,423 @@ mod tests {
             ]),
             [LINK, "https://fluxbee.example/public/other"]
         );
+    }
+
+    /// A contract as Case 1's WF gives sales (docs/wf-orchestration-v1.md §5.2.1): the answer's
+    /// text is its `reply`.
+    fn sales_contract() -> ResponseContract {
+        ResponseContract::from_value(&json!({
+            "kind": "json_object_v1",
+            "required": ["reply", "area"],
+            "properties": {
+                "reply": {"type": "string"},
+                "area": {"type": "string", "enum": ["sales", "invoice"]},
+                "quantity": {"type": "integer"}
+            },
+            "text_field": "reply"
+        }))
+        .expect("a valid contract")
+    }
+
+    /// One message's tool loop with `model`, through the tools every message gets, under
+    /// `contract`.
+    async fn tool_loop_answer_under(
+        model: &ScriptedModel,
+        contract: &ResponseContract,
+    ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
+        let ctx = BehaviorContext::default();
+        let files = Arc::new(ReplyFiles::default());
+        let tools = test_node()
+            .build_tool_registry(&ctx, &files)
+            .expect("registry");
+        test_node()
+            .run_tool_loop(
+                model,
+                &tools,
+                &files,
+                &chat_runtime(None, None),
+                &ctx,
+                "dale, facturámelo".to_string(),
+                None,
+                "dale, facturámelo",
+                Some(contract),
+            )
+            .await
+    }
+
+    /// Under a `text_field`, the tool loop's reply is that field of the model's object, with the
+    /// files its tools made, and the whole object is the answer's evaluation; without one, the
+    /// reply is the model's text as it is.
+    #[tokio::test]
+    async fn under_a_text_field_the_tool_loop_answers_that_field_and_the_object() {
+        let model = ScriptedModel::new(
+            vec![(
+                "generate_csv_artifact",
+                json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
+            )],
+            Some(r#"{"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10}"#),
+        );
+        let answer = tool_loop_answer_under(&model, &sales_contract())
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
+        let AiBehaviorOutput::Final(reply) = &answer.output else {
+            panic!("a reply with its file: {answer:?}");
+        };
+        assert_eq!(reply.text.as_deref(), Some("Te paso con facturación."));
+        assert_eq!(reply.artifacts[0].filename, "pedido.csv");
+        assert_eq!(
+            answer.evaluation,
+            Some(json!({"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10}))
+        );
+
+        // Without a call, in a fence: the object as a structured call takes it.
+        let model = ScriptedModel::new(Vec::new(), None)
+            .with_call_text("```json\n{\"reply\": \"Hola, ¿qué plan?\", \"area\": \"sales\"}\n```");
+        assert_eq!(
+            tool_loop_answer_under(&model, &sales_contract())
+                .await
+                .expect("the tool loop"),
+            Some(AiChatAnswer {
+                output: AiBehaviorOutput::text("Hola, ¿qué plan?"),
+                evaluation: Some(json!({"reply": "Hola, ¿qué plan?", "area": "sales"})),
+            })
+        );
+
+        // A blank text is still the answer: the object is.
+        let model = ScriptedModel::new(Vec::new(), None)
+            .with_call_text(r#"{"reply": "", "area": "invoice"}"#);
+        assert_eq!(
+            tool_loop_answer_under(&model, &sales_contract())
+                .await
+                .expect("the tool loop"),
+            Some(AiChatAnswer {
+                output: AiBehaviorOutput::text(""),
+                evaluation: Some(json!({"reply": "", "area": "invoice"})),
+            })
+        );
+
+        // Without a text_field, nothing changes.
+        let plain = ResponseContract {
+            text_field: None,
+            ..sales_contract()
+        };
+        let model = ScriptedModel::new(Vec::new(), None)
+            .with_call_text(r#"{"reply": "Hola", "area": "sales"}"#);
+        assert_eq!(
+            tool_loop_answer_under(&model, &plain)
+                .await
+                .expect("the tool loop"),
+            Some(AiChatAnswer::from(AiBehaviorOutput::text(
+                r#"{"reply": "Hola", "area": "sales"}"#
+            )))
+        );
+    }
+
+    /// Under a `text_field`, a tool loop whose model does not answer the contract's object fails,
+    /// and the sender gets `invalid_structured_output`; one that wrote nothing, made no file and
+    /// published no page leaves the answer to the call without tools, as without the contract.
+    #[tokio::test]
+    async fn under_a_text_field_a_tool_loop_without_the_object_is_an_error() {
+        for text in [
+            "Te paso con facturación.",
+            r#"{"area": "invoice"}"#,
+            r#"{"reply": 7, "area": "invoice"}"#,
+            r#"{"reply": "Listo.", "area": "refunds"}"#,
+        ] {
+            let model = ScriptedModel::new(Vec::new(), None).with_call_text(text);
+            let err = tool_loop_answer_under(&model, &sales_contract())
+                .await
+                .expect_err("not the contract's object");
+            assert!(
+                matches!(
+                    err,
+                    fluxbee_ai_sdk::AiSdkError::InvalidStructuredOutput { .. }
+                ),
+                "{text}: {err}"
+            );
+            let payload = ai_chat_failure_payload(&err, false);
+            assert_eq!(payload["type"], "error");
+            assert_eq!(payload["code"], "invalid_structured_output");
+            assert_eq!(payload["retryable"], json!(false));
+        }
+
+        // A file, and no object.
+        let model = ScriptedModel::new(
+            vec![(
+                "generate_text_artifact",
+                json!({"filename": "nota.txt", "content": "hola"}),
+            )],
+            None,
+        );
+        assert!(matches!(
+            tool_loop_answer_under(&model, &sales_contract()).await,
+            Err(fluxbee_ai_sdk::AiSdkError::InvalidStructuredOutput { .. })
+        ));
+
+        // No text, no file, no link.
+        let model = ScriptedModel::new(vec![("no_such_tool", json!({}))], None);
+        assert_eq!(
+            tool_loop_answer_under(&model, &sales_contract())
+                .await
+                .expect("the tool loop"),
+            None
+        );
+    }
+
+    /// The call without tools answers under the contract as the tool loop does: the `text_field`
+    /// as the reply's text and the object as its evaluation, an output that is not the object an
+    /// error, and, without a `text_field`, the model's text as it is.
+    #[tokio::test]
+    async fn under_a_text_field_the_call_without_tools_answers_that_field_and_the_object() {
+        let call = |content: &str, contract: ResponseContract| {
+            let client =
+                fluxbee_ai_sdk::MockLlmClient::with_responses(vec![fluxbee_ai_sdk::LlmResponse {
+                    content: content.to_string(),
+                }]);
+            async move {
+                let request = LlmRequest {
+                    model: "gpt-5.5".to_string(),
+                    system: None,
+                    input: "dale, facturámelo".to_string(),
+                    input_parts: None,
+                    output_schema: Some(contract.output_schema.clone()),
+                    max_output_tokens: None,
+                    model_settings: None,
+                };
+                test_node()
+                    .run_plain_call(
+                        &client,
+                        request,
+                        &chat_runtime(None, None),
+                        &BehaviorContext::default(),
+                        "dale, facturámelo",
+                        Some(&contract),
+                    )
+                    .await
+            }
+        };
+
+        let object = r#"{"reply": "Te paso con facturación.", "area": "invoice"}"#;
+        assert_eq!(
+            call(object, sales_contract()).await.expect("an answer"),
+            AiChatAnswer {
+                output: AiBehaviorOutput::text("Te paso con facturación."),
+                evaluation: Some(json!({"reply": "Te paso con facturación.", "area": "invoice"})),
+            }
+        );
+
+        let err = call(r#"{"area": "invoice"}"#, sales_contract())
+            .await
+            .expect_err("not the contract's object");
+        assert_eq!(
+            ai_chat_failure_payload(&err, false)["code"],
+            "invalid_structured_output"
+        );
+
+        let plain = ResponseContract {
+            text_field: None,
+            ..sales_contract()
+        };
+        assert_eq!(
+            call(object, plain).await.expect("an answer"),
+            AiChatAnswer::from(AiBehaviorOutput::text(object))
+        );
+    }
+
+    /// One message `text` that a WF sent with its block `wf`, as `on_message` hands it to the tool
+    /// loop: behind the block for the model, alone for the history. The model answers `answer`;
+    /// what it read of the user's turns comes back.
+    async fn history_turn(
+        node: &GenericAiNode,
+        ai: &AiChatRuntime,
+        ctx: &BehaviorContext,
+        wf: &str,
+        text: &str,
+        answer: &'static str,
+    ) -> Vec<String> {
+        let model = ScriptedModel::new(Vec::new(), None).with_call_text(answer);
+        let files = Arc::new(ReplyFiles::default());
+        let tools = node.build_tool_registry(ctx, &files).expect("registry");
+        node.run_tool_loop(
+            &model,
+            &tools,
+            &files,
+            ai,
+            ctx,
+            inject_prompt_blocks_into_text_input(text, &[wf]),
+            None,
+            text,
+            None,
+        )
+        .await
+        .expect("the tool loop")
+        .expect("an answer");
+        let seen = model.seen.lock().expect("seen");
+        seen[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionLoopItem::UserText { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The model reads the WF's block before the message, and the history keeps what the person
+    /// wrote: the next message's model reads that turn without the block.
+    #[tokio::test]
+    async fn the_history_keeps_what_the_person_wrote_without_the_wf_block() {
+        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
+        let node = GenericAiNode {
+            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
+            ..test_node()
+        };
+        let ai = AiChatRuntime {
+            immediate_memory: ImmediateMemorySection {
+                enabled: true,
+                ..ImmediateMemorySection::default()
+            },
+            ..chat_runtime(None, None)
+        };
+        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
+        let ctx = BehaviorContext {
+            src_ilk: Some(src_ilk.to_string()),
+            thread_id: Some("thread:sim-wf-1".to_string()),
+            ..BehaviorContext::default()
+        };
+        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+
+        assert_eq!(
+            history_turn(
+                &node,
+                &ai,
+                &ctx,
+                &wf,
+                "dale, facturámelo",
+                "Listo, te facturo."
+            )
+            .await,
+            [format!("{wf}\n\nCurrent user message:\ndale, facturámelo")]
+        );
+        let record = node
+            .immediate_memory_store
+            .as_ref()
+            .expect("the store")
+            .get(src_ilk)
+            .await
+            .expect("the record")
+            .expect("a record");
+        let kept = record
+            .recent_interactions
+            .iter()
+            .map(|interaction| interaction.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["dale, facturámelo", "Listo, te facturo."]);
+
+        assert_eq!(
+            history_turn(&node, &ai, &ctx, &wf, "gracias", "De nada.").await,
+            [
+                "dale, facturámelo".to_string(),
+                format!("{wf}\n\nCurrent user message:\ngracias")
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Under a `text_field`, the history keeps the whole object as the assistant's turn: what the
+    /// contract asks the model to write, and never blank, even when its reply is (a blank turn
+    /// would fail every later one).
+    #[tokio::test]
+    async fn under_a_text_field_the_history_keeps_the_object_as_the_assistants_turn() {
+        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
+        let node = GenericAiNode {
+            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
+            ..test_node()
+        };
+        let ai = AiChatRuntime {
+            immediate_memory: ImmediateMemorySection {
+                enabled: true,
+                ..ImmediateMemorySection::default()
+            },
+            ..chat_runtime(None, None)
+        };
+        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
+        let ctx = BehaviorContext {
+            src_ilk: Some(src_ilk.to_string()),
+            thread_id: Some("thread:sim-wf-1".to_string()),
+            ..BehaviorContext::default()
+        };
+        let model = ScriptedModel::new(Vec::new(), None)
+            .with_call_text(r#"{"reply": "", "area": "invoice"}"#);
+        let files = Arc::new(ReplyFiles::default());
+        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
+        let answer = node
+            .run_tool_loop(
+                &model,
+                &tools,
+                &files,
+                &ai,
+                &ctx,
+                "dale, facturámelo".to_string(),
+                None,
+                "dale, facturámelo",
+                Some(&sales_contract()),
+            )
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
+        assert_eq!(answer.output, AiBehaviorOutput::text(""));
+
+        let record = node
+            .immediate_memory_store
+            .as_ref()
+            .expect("the store")
+            .get(src_ilk)
+            .await
+            .expect("the record")
+            .expect("a record");
+        let kept = record
+            .recent_interactions
+            .iter()
+            .map(|interaction| interaction.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            ["dale, facturámelo", r#"{"area":"invoice","reply":""}"#]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Through `on_message`, a message from a WF reaches the model behind the memory block and
+    /// the WF's (an echo node answers what its model would read), and the reply carries no `wf`
+    /// back.
+    #[tokio::test]
+    async fn a_message_from_a_wf_reaches_the_model_behind_the_memory_and_the_wf_blocks() {
+        let node = test_node();
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+        let mut msg = sample_user_request_with_context(
+            sample_wf_context(),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.meta.thread_id = Some("thread:sim-wf-1".to_string());
+        msg.meta.memory_package = Some(sample_memory_package());
+
+        let reply = node
+            .on_message(msg)
+            .await
+            .expect("on_message")
+            .expect("a reply");
+
+        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
+            .expect("memory block");
+        let wf = render_wf_prompt_block(Some(&sample_wf_context())).expect("the WF's block");
+        assert_eq!(
+            reply.payload["content"],
+            format!("Echo: {memory}\n\n{wf}\n\nCurrent user message:\nhola")
+        );
+        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
     }
 
     /// A file named as an earlier one of the same reply takes its place, in the earlier one's

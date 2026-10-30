@@ -262,7 +262,7 @@ pub fn build_output_schema_fallback_instruction(
         .join(", ");
     let fields = field_specs.join(", ");
     Ok(format!(
-        "Return only valid JSON. Do not include markdown fences or extra text. The top-level value must be an object with exactly these fields: {fields}. Required fields: {required_fields}. Do not include properties outside this schema."
+        "Return only valid JSON. Do not include markdown fences or extra text. The top-level value must be an object with exactly these fields: {fields}. Required fields: {required_fields}. Every field you include holds a value of its type, never null. Do not include properties outside this schema."
     ))
 }
 
@@ -554,13 +554,37 @@ fn build_openai_response_format(output_schema: &OutputSchemaSpec) -> Result<Valu
 }
 
 fn validate_structured_output(raw: &str, output_schema: &OutputSchemaSpec) -> Result<String> {
-    let candidate = extract_json_candidate(raw)?;
-    let parsed: Value =
-        serde_json::from_str(&candidate).map_err(|err| AiSdkError::InvalidStructuredOutput {
-            detail: format!("json_parse_error: {err}"),
-        })?;
-    validate_value_against_schema(&parsed, output_schema.json_schema())?;
+    let parsed = parse_structured_output(raw, output_schema)?;
     serde_json::to_string(&parsed).map_err(AiSdkError::from)
+}
+
+/// The object a model's `raw` answer holds, checked against `output_schema`: its JSON, also inside
+/// a fence or among other text (`extract_json_candidate`). An answer without that object is
+/// `InvalidStructuredOutput`.
+pub(crate) fn parse_structured_output(
+    raw: &str,
+    output_schema: &OutputSchemaSpec,
+) -> Result<Value> {
+    let parsed = extract_json_candidate(raw).and_then(|candidate| {
+        let parsed: Value = serde_json::from_str(&candidate).map_err(|err| {
+            AiSdkError::InvalidStructuredOutput {
+                detail: format!("json_parse_error: {err}"),
+            }
+        })?;
+        validate_value_against_schema(&parsed, output_schema.json_schema())?;
+        Ok(parsed)
+    });
+    if let Err(err) = &parsed {
+        // What the model wrote, to tune the prompt that led to it: the error says only why.
+        tracing::warn!(
+            schema = %output_schema.name(),
+            error = %err,
+            output_len = raw.len(),
+            output_preview = %raw.chars().take(200).collect::<String>(),
+            "a model's answer is not the object its schema asks for"
+        );
+    }
+    parsed
 }
 
 fn extract_json_candidate(raw: &str) -> Result<String> {
@@ -574,7 +598,11 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
     if let Some(stripped) = trimmed.strip_prefix("```") {
         let stripped = stripped.trim_start_matches(|c| c != '\n');
         let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
-        let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
+        // The object ends at the last closing fence: text after it is the model's, not the
+        // object's.
+        let stripped = stripped
+            .rfind("```")
+            .map_or(stripped, |end| &stripped[..end]);
         let inner = stripped.trim();
         if inner.is_empty() {
             return Err(AiSdkError::InvalidStructuredOutput {
@@ -1604,6 +1632,9 @@ fn build_anthropic_function_messages(
                 "role": "user",
                 "content": content.iter().map(model_part_to_anthropic).collect::<Result<Vec<_>>>()?,
             })),
+            // A blank one is left out, as a blank system block is: Anthropic refuses it, and a
+            // history that keeps one would fail every later turn.
+            FunctionLoopItem::AssistantText { content } if content.trim().is_empty() => {}
             FunctionLoopItem::AssistantText { content } => messages.push(json!({
                 "role": "assistant",
                 "content": [{"type":"text", "text":content}],
@@ -2258,7 +2289,60 @@ mod tests {
         assert!(instruction.contains("Required fields: success, human_message"));
         assert!(instruction.contains("error_code:string(missing_data|unknown)"));
         assert!(instruction.contains("Do not include markdown fences or extra text"));
+        assert!(instruction.contains("never null"));
         assert!(instruction.contains("Do not include properties outside this schema"));
+    }
+
+    /// The object a model wrote in a fence is that object, with a line for the person after the
+    /// fence or without one.
+    #[test]
+    fn a_fenced_object_followed_by_text_is_that_object() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{"ok":{"type":"boolean"}},
+                "required":["ok"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        for raw in [
+            "```json\n{\"ok\":true}\n```\n¿Algo más?",
+            "```json\n{\"ok\":true}\n```",
+            "```\n{\"ok\":true}\n```\n",
+        ] {
+            assert_eq!(
+                parse_structured_output(raw, &spec).expect(raw),
+                json!({"ok": true})
+            );
+        }
+    }
+
+    /// A blank assistant turn never reaches Anthropic, which refuses an empty text block: a history
+    /// that kept one would fail every later turn.
+    #[test]
+    fn a_blank_assistant_turn_is_left_out_of_an_anthropic_request() {
+        let items = vec![
+            FunctionLoopItem::UserText {
+                content: "hola".to_string(),
+            },
+            FunctionLoopItem::AssistantText {
+                content: " ".to_string(),
+            },
+            FunctionLoopItem::UserText {
+                content: "dale".to_string(),
+            },
+        ];
+        let (_, messages) = build_anthropic_function_messages(&None, &items).expect("messages");
+        assert_eq!(
+            messages,
+            vec![
+                json!({"role":"user","content":[{"type":"text","text":"hola"}]}),
+                json!({"role":"user","content":[{"type":"text","text":"dale"}]}),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::errors::{AiSdkError, Result};
-use crate::llm::OutputSchemaSpec;
+use crate::llm::{parse_structured_output, OutputSchemaSpec};
 
 pub use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 
@@ -106,10 +106,25 @@ fn sanitize_reply_context(context: Option<Value>, options: ReplyContextOptions) 
     obj.remove("thread_id");
     obj.remove("src_ilk");
     obj.remove("response_envelope");
+    // The request's WF block and evaluation: a WF puts its own block on every message it sends,
+    // and an answer carries only its own evaluation (`ResponseContract::answer`).
+    obj.remove("wf");
+    obj.remove("evaluation");
     if !options.preserve_final_response_contract {
         obj.remove("final_response_contract");
     }
     Some(Value::Object(obj))
+}
+
+/// Puts an answer's evaluation (`ContractAnswer::evaluation`) in the reply's
+/// `meta.context.evaluation`, where a WF branches on it.
+pub fn set_reply_evaluation(reply: &mut Message, evaluation: Value) {
+    let mut context = match reply.meta.context.take() {
+        Some(Value::Object(context)) => context,
+        _ => serde_json::Map::new(),
+    };
+    context.insert("evaluation".to_string(), evaluation);
+    reply.meta.context = Some(Value::Object(context));
 }
 
 pub fn extract_response_envelope(meta: &Meta) -> Result<Option<Value>> {
@@ -120,10 +135,10 @@ pub fn extract_final_response_contract(meta: &Meta) -> Result<Option<Value>> {
     extract_context_object_field(meta, "final_response_contract")
 }
 
-pub fn resolve_response_envelope_output_schema(meta: &Meta) -> Result<Option<OutputSchemaSpec>> {
+pub fn resolve_response_envelope_contract(meta: &Meta) -> Result<Option<ResponseContract>> {
     extract_response_envelope(meta)?
         .as_ref()
-        .map(response_contract_to_output_schema_spec)
+        .map(ResponseContract::from_value)
         .transpose()
 }
 
@@ -134,6 +149,65 @@ pub fn resolve_final_response_contract_output_schema(
         .as_ref()
         .map(response_contract_to_output_schema_spec)
         .transpose()
+}
+
+/// A response contract (`json_object_v1`, `response_contract_to_output_schema_spec`) as an agent
+/// answers it: the schema of the object its model answers with and, when the contract names one,
+/// the `text_field` whose value is the answer's text (docs/wf-orchestration-v1.md §5.2.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResponseContract {
+    pub output_schema: OutputSchemaSpec,
+    pub text_field: Option<String>,
+}
+
+/// An answer under a response contract (`ResponseContract::answer`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractAnswer {
+    /// The answer's text: the model's output, or the value of the contract's `text_field`.
+    pub text: String,
+    /// With a `text_field`, the whole object the model answered with, which the answer carries in
+    /// `meta.context.evaluation`.
+    pub evaluation: Option<Value>,
+}
+
+impl ResponseContract {
+    /// The contract `contract` describes; an invalid one is `InvalidResponseContract`.
+    pub fn from_value(contract: &Value) -> Result<Self> {
+        let output_schema = response_contract_to_output_schema_spec(contract)?;
+        let text_field = contract
+            .get("text_field")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(Self {
+            output_schema,
+            text_field,
+        })
+    }
+
+    /// The answer the model's output `raw` gives under this contract. Without a `text_field`, `raw`
+    /// as it is. With one, the object in `raw`, checked against the schema as a structured call
+    /// checks it, is the evaluation, and that field's value the text; an output that is not that
+    /// object is `InvalidStructuredOutput`.
+    pub fn answer(&self, raw: String) -> Result<ContractAnswer> {
+        let Some(text_field) = self.text_field.as_deref() else {
+            return Ok(ContractAnswer {
+                text: raw,
+                evaluation: None,
+            });
+        };
+        let evaluation = parse_structured_output(&raw, &self.output_schema)?;
+        let text = evaluation
+            .get(text_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| AiSdkError::InvalidStructuredOutput {
+                detail: format!("type_mismatch:{text_field}:string"),
+            })?
+            .to_string();
+        Ok(ContractAnswer {
+            text,
+            evaluation: Some(evaluation),
+        })
+    }
 }
 
 pub fn response_contract_to_output_schema_spec(contract: &Value) -> Result<OutputSchemaSpec> {
@@ -255,6 +329,38 @@ pub fn response_contract_to_output_schema_spec(contract: &Value) -> Result<Outpu
         }
 
         schema_properties.insert(field_name.to_string(), Value::Object(translated));
+    }
+
+    // The property whose value is the answer's text (`ResponseContract::answer`): one every answer
+    // has, a string.
+    if let Some(text_field) = obj.get("text_field") {
+        let text_field =
+            text_field
+                .as_str()
+                .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                    detail: "response contract.text_field must be a string".to_string(),
+                })?;
+        if !required
+            .iter()
+            .any(|field| field.as_str() == Some(text_field))
+        {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: format!(
+                    "response contract.text_field '{text_field}' must be listed in response contract.required"
+                ),
+            });
+        }
+        let field_type = schema_properties
+            .get(text_field)
+            .and_then(|schema| schema.get("type"))
+            .and_then(Value::as_str);
+        if field_type != Some("string") {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: format!(
+                    "response contract.text_field '{text_field}' must be a property of type string"
+                ),
+            });
+        }
     }
 
     OutputSchemaSpec::new(
@@ -491,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_response_envelope_output_schema_reads_and_translates() {
+    fn resolve_response_envelope_contract_reads_and_translates() {
         let meta = Meta {
             context: Some(json!({
                 "response_envelope":{
@@ -502,10 +608,14 @@ mod tests {
             })),
             ..Meta::default()
         };
-        let spec = resolve_response_envelope_output_schema(&meta)
+        let contract = resolve_response_envelope_contract(&meta)
             .expect("ok")
-            .expect("schema should exist");
-        assert_eq!(spec.json_schema()["properties"]["ok"]["type"], "boolean");
+            .expect("contract should exist");
+        assert_eq!(
+            contract.output_schema.json_schema()["properties"]["ok"]["type"],
+            "boolean"
+        );
+        assert_eq!(contract.text_field, None);
     }
 
     #[test]
@@ -552,5 +662,184 @@ mod tests {
             })),
             Err(AiSdkError::InvalidResponseContract { .. })
         ));
+    }
+
+    /// A WF's block and an evaluation are the request's: an answer carries neither back, only its
+    /// own evaluation.
+    #[test]
+    fn a_reply_never_carries_the_requests_wf_block_or_evaluation() {
+        let request = Message {
+            routing: Routing {
+                src: "WF.sales.invoice@worker1".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("AI.sales@worker1".to_string()),
+                ttl: 16,
+                trace_id: "trace-wf".to_string(),
+            },
+            meta: Meta {
+                context: Some(json!({
+                    "wf": {
+                        "trail": ["IO.api@motherbee", "WF.sales.invoice@worker1"],
+                        "vars": {"order": {"quantity": 10}}
+                    },
+                    "evaluation": {"area": "invoice"},
+                    "io": {"channel": "api"},
+                })),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+
+        let mut reply =
+            build_reply_message_runtime_src(&request, json!({"type":"text","content":"hola"}));
+        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+
+        // Its own evaluation goes beside the rest of its context.
+        set_reply_evaluation(&mut reply, json!({"area": "sales"}));
+        assert_eq!(
+            reply.meta.context,
+            Some(json!({"io": {"channel": "api"}, "evaluation": {"area": "sales"}}))
+        );
+        let mut bare = build_reply_message_runtime_src(
+            &Message {
+                meta: Meta::default(),
+                ..request
+            },
+            json!({"type":"text","content":"hola"}),
+        );
+        set_reply_evaluation(&mut bare, json!({"area": "sales"}));
+        assert_eq!(
+            bare.meta.context,
+            Some(json!({"evaluation": {"area": "sales"}}))
+        );
+    }
+
+    /// A contract whose answer has a text, `reply`, an `area`, a `quantity` and an optional
+    /// `note`, with `text_field` as given.
+    fn text_field_contract(text_field: Value) -> Value {
+        json!({
+            "kind": "json_object_v1",
+            "required": ["reply", "area", "quantity"],
+            "properties": {
+                "reply": {"type": "string"},
+                "area": {"type": "string", "enum": ["sales", "invoice"]},
+                "quantity": {"type": "integer"},
+                "note": {"type": "string"}
+            },
+            "text_field": text_field
+        })
+    }
+
+    #[test]
+    fn a_contracts_text_field_is_a_required_string_property() {
+        let contract = ResponseContract::from_value(&text_field_contract(json!("reply")))
+            .expect("a valid contract");
+        assert_eq!(contract.text_field.as_deref(), Some("reply"));
+        // The model's schema has the properties alone.
+        assert_eq!(
+            contract.output_schema,
+            response_contract_to_output_schema_spec(&text_field_contract(json!("reply")))
+                .expect("its schema")
+        );
+        assert!(contract
+            .output_schema
+            .json_schema()
+            .get("text_field")
+            .is_none());
+
+        for (text_field, detail) in [
+            (json!(7), "response contract.text_field must be a string"),
+            (json!(null), "response contract.text_field must be a string"),
+            (
+                json!("note"),
+                "response contract.text_field 'note' must be listed in response contract.required",
+            ),
+            (
+                json!("missing"),
+                "response contract.text_field 'missing' must be listed in response contract.required",
+            ),
+            (
+                json!("quantity"),
+                "response contract.text_field 'quantity' must be a property of type string",
+            ),
+        ] {
+            let contract = text_field_contract(text_field.clone());
+            for err in [
+                ResponseContract::from_value(&contract).expect_err("an invalid text_field"),
+                response_contract_to_output_schema_spec(&contract)
+                    .expect_err("an invalid text_field"),
+            ] {
+                assert!(
+                    matches!(&err, AiSdkError::InvalidResponseContract { detail: got } if got == detail),
+                    "text_field {text_field}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_under_a_text_field_is_that_field_with_the_whole_object() {
+        let contract =
+            ResponseContract::from_value(&text_field_contract(json!("reply"))).expect("contract");
+        let object =
+            json!({"reply": "Te paso con facturación.", "area": "invoice", "quantity": 10});
+
+        let answer = contract.answer(object.to_string()).expect("an answer");
+        assert_eq!(
+            answer,
+            ContractAnswer {
+                text: "Te paso con facturación.".to_string(),
+                evaluation: Some(object.clone()),
+            }
+        );
+        // In a fence or among other text, as a structured call takes it.
+        let fenced = contract
+            .answer(format!("Listo:\n```json\n{object}\n```"))
+            .expect("an answer");
+        assert_eq!(fenced, answer);
+        // A blank text is still the answer.
+        let blank = contract
+            .answer(r#"{"reply": "", "area": "invoice", "quantity": 1}"#.to_string())
+            .expect("an answer");
+        assert_eq!(blank.text, "");
+
+        // Without a text_field, the output as it is, unchecked.
+        let mut plain = text_field_contract(json!(null));
+        plain
+            .as_object_mut()
+            .expect("an object")
+            .remove("text_field");
+        let plain = ResponseContract::from_value(&plain).expect("contract");
+        assert_eq!(plain.text_field, None);
+        assert_eq!(
+            plain.answer("not json".to_string()).expect("an answer"),
+            ContractAnswer {
+                text: "not json".to_string(),
+                evaluation: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_output_that_is_not_the_contracts_object_is_invalid_structured_output() {
+        let contract =
+            ResponseContract::from_value(&text_field_contract(json!("reply"))).expect("contract");
+        for raw in [
+            "",
+            "Te paso con facturación.",
+            r#"["Te paso con facturación."]"#,
+            r#"{"area": "invoice", "quantity": 10}"#,
+            r#"{"reply": 7, "area": "invoice", "quantity": 10}"#,
+            r#"{"reply": "ok", "area": "refunds", "quantity": 10}"#,
+            r#"{"reply": "ok", "area": "invoice", "quantity": 10, "extra": true}"#,
+        ] {
+            let err = contract
+                .answer(raw.to_string())
+                .expect_err("not the contract's object");
+            assert!(
+                matches!(err, AiSdkError::InvalidStructuredOutput { .. }),
+                "{raw}: {err}"
+            );
+        }
     }
 }

@@ -112,6 +112,9 @@ VALUES (?, ?, 'running', 'start', '{}', '{}', '', ?, ?);`,
 			t.Fatalf("%s counts its replays (attempts)", table)
 		}
 	}
+	if !columnExists(t, db, "wf_instances", "thread_id") || !tableExists(t, db, "wf_kept_messages") {
+		t.Fatal("an instance keeps its thread and its kept messages (v4)")
+	}
 	if !indexExists(t, db, "idx_wfie_instance") {
 		t.Fatalf("migration did not create idx_wfie_instance")
 	}
@@ -411,12 +414,13 @@ VALUES ('wfi:running', 'user', 'NEXT', '{}', 'trace-left', 1);`,
 	}
 	for id, hash := range map[string]string{"wfi:running": "hash-invoice", "wfi:done": "", "wfi:orphan": ""} {
 		row, err := store.GetInstance(ctx, id)
-		if err != nil || row.DefinitionHash != hash {
-			t.Fatalf("%s: definition_hash %q, want %q (%v)", id, row.DefinitionHash, hash, err)
+		if err != nil || row.DefinitionHash != hash || row.ThreadID != id {
+			t.Fatalf("%s: definition_hash %q (want %q), thread %q (%v)", id, row.DefinitionHash, hash, row.ThreadID, err)
 		}
 	}
-	if !tableExists(t, db, "wf_inbound_events") || tableExists(t, db, "wf_definitions_by_type") || !indexExists(t, db, "idx_wfi_definition") {
-		t.Fatal("v3 tables")
+	if !tableExists(t, db, "wf_inbound_events") || tableExists(t, db, "wf_definitions_by_type") || !indexExists(t, db, "idx_wfi_definition") ||
+		!tableExists(t, db, "wf_kept_messages") || !indexExists(t, db, "idx_wfi_thread") {
+		t.Fatal("v3 and v4 tables")
 	}
 	// The queue a v2 store left keeps its event, which has run at no start yet.
 	if events, err := store.ListAllInternalEvents(ctx); err != nil || len(events) != 1 || events[0].MsgName != "NEXT" || events[0].Attempts != 0 {
@@ -425,6 +429,89 @@ VALUES ('wfi:running', 'user', 'NEXT', '{}', 'trace-left', 1);`,
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
 		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
+}
+
+// 0.1.91 (schema v4, wf-orchestration-v1 §5.2.1, item 11): each instance of a v3 store keeps its
+// thread, its own id, which is what its sends carried, indexed; the messages an instance keeps get
+// their table. What the v3 store held stays as it was.
+func TestEnsureWFSchemaMigratesV3ToThreads(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v3.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	v3Stmts := []string{
+		`CREATE TABLE wf_definitions (hash TEXT PRIMARY KEY, workflow_type TEXT NOT NULL, definition_json TEXT NOT NULL, loaded_at_ms INTEGER NOT NULL);`,
+		`CREATE TABLE wf_instances (
+    instance_id TEXT PRIMARY KEY, workflow_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','cancelling','completed','cancelled','failed')),
+    current_state TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+    current_trace_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    terminated_at_ms INTEGER, definition_hash TEXT NOT NULL DEFAULT '');`,
+		`CREATE INDEX idx_wfi_status ON wf_instances(status);`,
+		`CREATE INDEX idx_wfi_created ON wf_instances(created_at_ms);`,
+		`CREATE INDEX idx_wfi_definition ON wf_instances(definition_hash);`,
+		`CREATE TABLE wf_instance_log (log_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, logged_at_ms INTEGER NOT NULL, action_type TEXT NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL DEFAULT 1, error_detail TEXT NOT NULL DEFAULT '');`,
+		`CREATE TABLE wf_instance_timers (instance_id TEXT NOT NULL, timer_key TEXT NOT NULL, scheduled_at_ms INTEGER NOT NULL, fire_at_ms INTEGER NOT NULL, PRIMARY KEY (instance_id, timer_key));`,
+		`CREATE TABLE wf_internal_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, msg_type TEXT NOT NULL, msg_name TEXT NOT NULL, payload_json TEXT NOT NULL, trace_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`,
+		`CREATE TABLE wf_inbound_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('create','event')), message_json TEXT NOT NULL, received_at_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`,
+		`INSERT INTO wf_definitions VALUES ('hash-asking', 'asking', '{}', 5);`,
+		`INSERT INTO wf_instances (instance_id, workflow_type, status, current_state, state_json, created_at_ms, updated_at_ms, definition_hash)
+VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', 1, 1, 'hash-asking'), ('wfi:done', 'asking', 'completed', 'answered', '{}', 1, 2, 'hash-asking');`,
+		`INSERT INTO wf_inbound_events (instance_id, kind, message_json, received_at_ms) VALUES ('wfi:running', 'event', '{}', 3);`,
+		`PRAGMA user_version=3;`,
+	}
+	for _, stmt := range v3Stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v3 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	for _, id := range []string{"wfi:running", "wfi:done"} {
+		row, err := store.GetInstance(ctx, id)
+		if err != nil || row.ThreadID != id || row.DefinitionHash != "hash-asking" {
+			t.Fatalf("%s takes its own id as its thread: %+v %v", id, row, err)
+		}
+	}
+	if row, _ := store.GetInstance(ctx, "wfi:running"); row.StateJSON != `{"n":1}` || row.Status != "running" {
+		t.Fatalf("the instance stays as it was: %+v", row)
+	}
+	if events, err := store.ListInboundEvents(ctx); err != nil || len(events) != 1 {
+		t.Fatalf("the journal stays: %+v %v", events, err)
+	}
+	if !indexExists(t, db, "idx_wfi_thread") || !tableExists(t, db, "wf_kept_messages") {
+		t.Fatal("v4 tables")
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 4 {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+
+	// The migrated store keeps an instance's messages, and drops them when it ends.
+	running, _ := store.GetInstance(ctx, "wfi:running")
+	keep := InstanceCommitMutation{KeepMessages: []KeptMessageRow{{InstanceID: "wfi:running", Name: "customer", MessageJSON: `{"payload":{"x":1}}`, KeptAtMS: 4}}}
+	if err := store.CommitInstanceMutation(ctx, running, keep); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err := store.ListKeptMessages(ctx, "wfi:running"); err != nil || len(kept) != 1 || kept[0].Name != "customer" {
+		t.Fatalf("kept: %+v %v", kept, err)
+	}
+	running.Status, running.TerminatedAtMS = "completed", newNullInt64(5)
+	if err := store.CommitInstanceMutation(ctx, running, InstanceCommitMutation{DropKeptMessages: true}); err != nil {
+		t.Fatal(err)
+	}
+	if kept, _ := store.ListKeptMessages(ctx, "wfi:running"); len(kept) != 0 {
+		t.Fatalf("dropped when it ends: %+v", kept)
 	}
 	if err := ensureWFSchema(db); err != nil {
 		t.Fatalf("a second run is a no-op: %v", err)

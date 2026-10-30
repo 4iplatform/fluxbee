@@ -50,6 +50,10 @@ func executeAction(ctx context.Context, path string, action ActionDefinition, in
 	switch action.Type {
 	case "send_message":
 		return execSendMessage(ctx, action, inst, event, actx)
+	case "forward":
+		return execForward(ctx, action, inst, event, actx)
+	case "keep_message":
+		return execKeepMessage(action, inst, event, actx)
 	case "emit_internal_event":
 		return execEmitInternalEvent(action, inst, event, actx, emitted)
 	case "schedule_timer":
@@ -101,6 +105,9 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 	return nil
 }
 
+// execSendMessage sends a message the WF writes: its msg and payload from the definition, on the
+// instance's thread (every message the instance sends carries it, so the agents keep one memory per
+// conversation and their answers come back here), with its meta.context and the WF's block.
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("send_message: no dispatcher configured")
@@ -122,82 +129,210 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		msgName = action.Meta.Msg
 	}
 
-	// thread_id = instance_id (enables response correlation)
-	threadID := inst.InstanceID
-	// gap-5: an explicit thread_id_ref overrides instance_id for a TERMINAL reply to an external
-	// ingress caller (answer on the caller's own thread; no reply-back to this instance is expected).
-	if threadRef := strings.TrimSpace(action.ThreadIDRef); threadRef != "" {
-		resolved, err := lookupRef(threadRef, inst.Input, inst.StateVars, eventMap)
-		if err != nil {
-			return fmt.Errorf("send_message: resolve thread_id_ref %q: %w", threadRef, err)
-		}
-		s, ok := resolved.(string)
-		if !ok {
-			return fmt.Errorf("send_message: thread_id_ref %q resolved to non-string %T", threadRef, resolved)
-		}
-		if strings.TrimSpace(s) == "" {
-			return fmt.Errorf("send_message: thread_id_ref %q resolved to an empty string", threadRef)
-		}
-		threadID = s
+	// gap-3: an optional meta.context (e.g. {response_envelope: {...}} to request AI structured
+	// output), resolved with the same $ref rules as the payload, and the WF's block over it, a trail
+	// that starts at this node.
+	metaContext := map[string]any{}
+	if err := writeActionContext(metaContext, action, inst, eventMap); err != nil {
+		return fmt.Errorf("send_message: %w", err)
 	}
-
-	// gap-3: resolve an optional meta.context (e.g. {response_envelope: {...}} to request AI
-	// structured output) with the same $ref rules as the payload, and carry it on the frame's
-	// meta.context so ai-generic can read it.
-	var contextRaw json.RawMessage
-	if action.Meta != nil && action.Meta.Context != nil {
-		resolvedCtx, err := Resolve(action.Meta.Context, inst.Input, inst.StateVars, eventMap)
-		if err != nil {
-			return fmt.Errorf("send_message: resolve meta.context: %w", err)
-		}
-		ctxBytes, err := wfcel.EncodeJSON(resolvedCtx)
-		if err != nil {
-			return fmt.Errorf("send_message: marshal meta.context: %w", err)
-		}
-		contextRaw = ctxBytes
+	contextRaw, err := withWFBlock(metaContext, []string{actx.Dispatcher.NodeL2Name()}, action, inst, eventMap)
+	if err != nil {
+		return fmt.Errorf("send_message: %w", err)
 	}
-	// trace_id = original event trace_id (idempotency on re-execution)
-	traceID := inst.CurrentTraceID
-	if traceID == "" {
-		traceID = event.Routing.TraceID
-	}
-
-	src := actx.Dispatcher.NodeUUID()
 
 	// The target is a node name written in the definition, validated when it loaded (a valid L2
 	// name, never a SY.* or RT.* node).
-	target := action.Target
-
-	msgNameCopy := msgName
-	threadIDCopy := threadID
+	threadID := inst.ThreadID
 	msg := sdk.Message{
 		Routing: sdk.Routing{
-			Src:     src,
-			Dst:     sdk.UnicastDestination(target),
+			Src:     actx.Dispatcher.NodeUUID(),
+			Dst:     sdk.UnicastDestination(action.Target),
 			TTL:     16,
-			TraceID: traceID,
+			TraceID: transitionTraceID(inst, event),
 		},
 		Meta: sdk.Meta{
 			MsgType:  wfMsgType,
-			Msg:      &msgNameCopy,
-			ThreadID: &threadIDCopy,
+			Msg:      &msgName,
+			ThreadID: &threadID,
 			Context:  contextRaw,
 		},
 		Payload: raw,
 	}
+	return sendWithRetry(ctx, actx, "send_message", msg)
+}
 
-	// A transient backpressure/reconnect makes NodeSender.Send return "sender queue full" (a
-	// non-blocking channel send). With send_message defaulting to on_error=fail (gap-2), a single such
-	// blip would needlessly route a healthy instance to terminal failure. Retry a few times with a
-	// short, ctx-aware backoff so a momentarily full queue drains before the error is treated as fatal;
-	// a permanent condition (dead connection) still fails after the attempts. A message over the
-	// frame limit is refused the same way every time, so it fails at once.
+// execForward sends a message on as it was received (wf-orchestration-v1 §5.2.1, item 5): the
+// event's, or the one kept under action.Message. Its payload goes out byte for byte, never decoded,
+// and its meta is the message's (type, msg, src_ilk, dst_ilk, ich, scope, priority and context)
+// without memory_package. What the WF changes is metadata: the destination (a target written in
+// the definition), the thread (the instance's), the context keys the action writes and the WF's
+// block, whose trail is the message's own (or its sender's name) and this node.
+func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
+	if actx.Dispatcher == nil {
+		return fmt.Errorf("forward: no dispatcher configured")
+	}
+	source, err := inst.messageToForward(action.Message, event)
+	if err != nil {
+		return fmt.Errorf("forward: %w", err)
+	}
+
+	metaContext := map[string]any{}
+	if len(source.Meta.Context) > 0 && string(source.Meta.Context) != "null" {
+		if metaContext, err = wfcel.DecodeJSONObject(source.Meta.Context); err != nil {
+			return fmt.Errorf("forward: the message's context: %w", err)
+		}
+	}
+	trail := append(messageTrail(source, metaContext), actx.Dispatcher.NodeL2Name())
+	eventMap := messageToMap(event)
+	if err := writeActionContext(metaContext, action, inst, eventMap); err != nil {
+		return fmt.Errorf("forward: %w", err)
+	}
+	contextRaw, err := withWFBlock(metaContext, trail, action, inst, eventMap)
+	if err != nil {
+		return fmt.Errorf("forward: %w", err)
+	}
+
+	meta := source.Meta
+	meta.MemoryPackage = nil
+	threadID := inst.ThreadID
+	meta.ThreadID = &threadID
+	meta.Context = contextRaw
+	msg := sdk.Message{
+		Routing: sdk.Routing{
+			Src:     actx.Dispatcher.NodeUUID(),
+			Dst:     sdk.UnicastDestination(action.Target),
+			TTL:     16,
+			TraceID: transitionTraceID(inst, event),
+		},
+		Meta:    meta,
+		Payload: source.Payload,
+	}
+	return sendWithRetry(ctx, actx, "forward", msg)
+}
+
+// execKeepMessage keeps the event's message, whole and as received, under the action's name: a later
+// forward sends it (wf-orchestration-v1 §5.2.1, item 6). A later keep under the same name replaces
+// it; the instance's commit writes it, and it goes when the instance ends.
+func execKeepMessage(action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
+	if !receivedFromANode(event) {
+		return fmt.Errorf("keep_message %q: %s is no message a node sent (a TIMER_FIRED or an internal event is never kept)", action.Name, msgName(event))
+	}
+	if err := inst.keep(action.Name, event, actx); err != nil {
+		return fmt.Errorf("keep_message %q: %w", action.Name, err)
+	}
+	return nil
+}
+
+// messageToForward is the message a forward sends: the one kept under name, or else the event's,
+// when a node sent it.
+func (inst *WFInstance) messageToForward(name string, event sdk.Message) (sdk.Message, error) {
+	if name != "" {
+		kept, ok := inst.kept[name]
+		if !ok {
+			return sdk.Message{}, fmt.Errorf("no message is kept under %q", name)
+		}
+		return kept.msg, nil
+	}
+	if !receivedFromANode(event) {
+		return sdk.Message{}, fmt.Errorf("%s is no message a node sent (a TIMER_FIRED or an internal event is never forwarded)", msgName(event))
+	}
+	return event, nil
+}
+
+// receivedFromANode reports whether msg is a message a node sent the WF, which keep_message keeps and
+// forward sends: it carries its sender's router-stamped name (an internal event has none) and is no
+// system message (a TIMER_FIRED, a control verb).
+func receivedFromANode(msg sdk.Message) bool {
+	return msg.SourceL2Name() != "" && !sdk.IsSystemKind(msg.Meta.MsgType)
+}
+
+// messageTrail is the trail a message brings: its own (meta.context.wf.trail, the nodes it went
+// through), or its sender's name when it has none.
+func messageTrail(msg sdk.Message, metaContext map[string]any) []string {
+	if block, ok := metaContext[wfcel.ContextWF].(map[string]any); ok {
+		if hops, ok := block["trail"].([]any); ok && len(hops) > 0 {
+			trail := make([]string, 0, len(hops)+1)
+			for _, hop := range hops {
+				name, ok := hop.(string)
+				if !ok {
+					return []string{msg.SourceL2Name()}
+				}
+				trail = append(trail, name)
+			}
+			return trail
+		}
+	}
+	return []string{msg.SourceL2Name()}
+}
+
+// writeActionContext writes the keys of the action's meta.context, $ref-resolved, over metaContext:
+// a send_message's whole context, the keys a forward changes on the message's own.
+func writeActionContext(metaContext map[string]any, action ActionDefinition, inst *WFInstance, eventMap map[string]any) error {
+	if action.Meta == nil || action.Meta.Context == nil {
+		return nil
+	}
+	resolved, err := Resolve(action.Meta.Context, inst.Input, inst.StateVars, eventMap)
+	if err != nil {
+		return fmt.Errorf("resolve meta.context: %w", err)
+	}
+	written, ok := resolved.(map[string]any)
+	if !ok {
+		return fmt.Errorf("meta.context resolved to %T, not a JSON object", resolved)
+	}
+	for key, value := range written {
+		metaContext[key] = value
+	}
+	return nil
+}
+
+// withWFBlock is metaContext with the WF's block (meta.context.wf, wf-orchestration-v1 §5.2.1,
+// item 7), as the message goes: trail, the nodes the message went through, and vars, what the
+// action's vars writes, $ref-resolved: the deterministic context the WF gives the receiver.
+func withWFBlock(metaContext map[string]any, trail []string, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
+	hops := make([]any, len(trail))
+	for i, name := range trail {
+		hops[i] = name
+	}
+	block := map[string]any{"trail": hops}
+	if action.Vars != nil {
+		vars, err := Resolve(action.Vars, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return nil, fmt.Errorf("resolve vars: %w", err)
+		}
+		block["vars"] = vars
+	}
+	metaContext[wfcel.ContextWF] = block
+	raw, err := wfcel.EncodeJSON(metaContext)
+	if err != nil {
+		return nil, fmt.Errorf("marshal meta.context: %w", err)
+	}
+	return raw, nil
+}
+
+// transitionTraceID is the trace_id of the event the instance takes, which every send of its
+// transition carries (and a send again, when recovery runs the event again).
+func transitionTraceID(inst *WFInstance, event sdk.Message) string {
+	if inst.CurrentTraceID != "" {
+		return inst.CurrentTraceID
+	}
+	return event.Routing.TraceID
+}
+
+// sendWithRetry sends msg, the message of an action of type verb. A transient backpressure/reconnect
+// makes NodeSender.Send return "sender queue full" (a non-blocking channel send). With send_message
+// and forward defaulting to on_error=fail (gap-2), a single such blip would needlessly route a
+// healthy instance to terminal failure. Retry a few times with a short, ctx-aware backoff so a
+// momentarily full queue drains before the error is treated as fatal; a permanent condition (dead
+// connection) still fails after the attempts. A message over the frame limit is refused the same
+// way every time, so it fails at once.
+func sendWithRetry(ctx context.Context, actx ActionContext, verb string, msg sdk.Message) error {
 	var sendErr error
 	for attempt := 0; attempt < sendMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("send_message: cancelled during send retry: %w", ctx.Err())
+				return fmt.Errorf("%s: cancelled during send retry: %w", verb, ctx.Err())
 			case <-time.After(sendRetryBackoff):
 			}
 		}
@@ -206,16 +341,58 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		}
 		var tooLarge *sdk.MessageTooLargeError
 		if errors.As(sendErr, &tooLarge) {
-			return fmt.Errorf("send_message: %w", sendErr)
+			return fmt.Errorf("%s: %w", verb, sendErr)
 		}
 	}
-	return fmt.Errorf("send_message: dispatch failed after %d attempts: %w", sendMaxAttempts, sendErr)
+	return fmt.Errorf("%s: dispatch failed after %d attempts: %w", verb, sendMaxAttempts, sendErr)
 }
 
 const (
 	sendMaxAttempts  = 4
 	sendRetryBackoff = 50 * time.Millisecond
 )
+
+// timerTime resolves a timer action's time when the action runs: its fire_in or its fire_at, each a
+// literal or a $ref (a time taken from state, or from an agent's answer), checked then: a duration
+// that parses, or an RFC3339 time, 60 s ahead at least (SY.timer's floor). It returns when the timer
+// fires, and the fire_in it was given (zero for a fire_at).
+func timerTime(action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) (time.Time, time.Duration, error) {
+	resolve := func(field string, value any) (string, error) {
+		resolved, err := Resolve(value, inst.Input, inst.StateVars, messageToMap(event))
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", field, err)
+		}
+		text, ok := resolved.(string)
+		if !ok {
+			return "", fmt.Errorf("%s resolved to %T, not a string", field, resolved)
+		}
+		return text, nil
+	}
+	now := actx.Clock()
+	if wfcel.IsTimeSet(action.FireAt) {
+		text, err := resolve("fire_at", action.FireAt)
+		if err != nil {
+			return time.Time{}, 0, err
+		}
+		if err := wfcel.CheckFireAt(text); err != nil {
+			return time.Time{}, 0, fmt.Errorf("fire_at %q: %w", text, err)
+		}
+		fireAt, _ := time.Parse(time.RFC3339, text)
+		if fireAt.Sub(now) < minTimerDuration {
+			return time.Time{}, 0, fmt.Errorf("fire_at %s is less than 60s ahead", text)
+		}
+		return fireAt, 0, nil
+	}
+	text, err := resolve("fire_in", action.FireIn)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	if err := wfcel.CheckFireIn(text); err != nil {
+		return time.Time{}, 0, fmt.Errorf("fire_in %q: %w", text, err)
+	}
+	in, _ := parseWorkflowDuration(text)
+	return now.Add(in), in, nil
+}
 
 func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Timer == nil {
@@ -230,33 +407,21 @@ func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFIns
 		opts.MissedWithinMS = action.MissedWithinMS
 	}
 
-	var fireAtMS int64
-
-	if action.FireIn != "" {
-		d, err := parseWorkflowDuration(action.FireIn)
-		if err != nil {
-			return fmt.Errorf("schedule_timer: parse fire_in %q: %w", action.FireIn, err)
-		}
-		if d < minTimerDuration {
-			return fmt.Errorf("schedule_timer: fire_in %s is less than 60s minimum", action.FireIn)
-		}
-		fireAtMS = actx.Clock().Add(d).UnixMilli()
-		if _, err := actx.Timer.ScheduleIn(ctx, d, opts); err != nil {
-			return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
-		}
+	fireAt, in, err := timerTime(action, inst, event, actx)
+	if err != nil {
+		return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
+	}
+	if in > 0 {
+		_, err = actx.Timer.ScheduleIn(ctx, in, opts)
 	} else {
-		fireAt, err := time.Parse(time.RFC3339, action.FireAt)
-		if err != nil {
-			return fmt.Errorf("schedule_timer: parse fire_at %q: %w", action.FireAt, err)
-		}
-		fireAtMS = fireAt.UnixMilli()
-		if _, err := actx.Timer.Schedule(ctx, fireAt, opts); err != nil {
-			return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
-		}
+		_, err = actx.Timer.Schedule(ctx, fireAt, opts)
+	}
+	if err != nil {
+		return fmt.Errorf("schedule_timer %q: %w", action.TimerKey, err)
 	}
 
 	// Record in local timer index (fire-and-forget to SY.timer is already done above)
-	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), fireAtMS)
+	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), fireAt.UnixMilli())
 }
 
 func execCancelTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, actx ActionContext) error {
@@ -309,30 +474,15 @@ func execRescheduleTimer(ctx context.Context, action ActionDefinition, inst *WFI
 	}
 
 	clientRef := timerClientRef(inst.InstanceID, action.TimerKey)
-
-	var newFireAtMS int64
-	if action.FireIn != "" {
-		d, err := parseWorkflowDuration(action.FireIn)
-		if err != nil {
-			return fmt.Errorf("reschedule_timer: parse fire_in: %w", err)
-		}
-		newFireAt := actx.Clock().Add(d)
-		newFireAtMS = newFireAt.UnixMilli()
-		if err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt); err != nil {
-			return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
-		}
-	} else {
-		newFireAt, err := time.Parse(time.RFC3339, action.FireAt)
-		if err != nil {
-			return fmt.Errorf("reschedule_timer: parse fire_at: %w", err)
-		}
-		newFireAtMS = newFireAt.UnixMilli()
-		if err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt); err != nil {
-			return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
-		}
+	newFireAt, _, err := timerTime(action, inst, event, actx)
+	if err != nil {
+		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
+	}
+	if err := actx.Timer.RescheduleByClientRef(ctx, clientRef, newFireAt); err != nil {
+		return fmt.Errorf("reschedule_timer %q: %w", action.TimerKey, err)
 	}
 
-	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), newFireAtMS)
+	return actx.Store.RegisterTimer(ctx, inst.InstanceID, action.TimerKey, nowMS(actx.Clock), newFireAt.UnixMilli())
 }
 
 func execSetVariable(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {

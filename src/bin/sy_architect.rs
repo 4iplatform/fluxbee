@@ -27297,7 +27297,7 @@ mod tests {
                     "opa_policy_bundle".to_string()
                 ],
                 from_version: 0,
-                seed_version: 2,
+                seed_version: 3,
                 seeds: 3,
                 observed_kept: 2,
             }
@@ -27329,7 +27329,7 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .filter(|entry| entry.seed_kind == "manual" && entry.seed_version == Some(2))
+                .filter(|entry| entry.seed_kind == "manual" && entry.seed_version == Some(3))
                 .count(),
             3
         );
@@ -27341,7 +27341,7 @@ mod tests {
         // Manual entries newer than the built-in seeds (an older Archi started) are left as they
         // are, and so is a cookbook whose observed entries pushed its seeds out.
         let mut newer = old_seed("config_only_ai_runtime");
-        newer["seed_version"] = json!(3);
+        newer["seed_version"] = json!(4);
         for kept in [
             vec![newer, observed("runtime_package_ai_sales")],
             vec![observed("runtime_package_ai_sales")],
@@ -27366,13 +27366,13 @@ mod tests {
         const PINS: [(&str, u64, &str); 4] = [
             (
                 cookbook_paths::DESIGN,
-                2,
-                "5a2b5fad379c10a23ff6181fefa0546a45a1f9c74c93ae02a14b758a09dab7a5",
+                3,
+                "95e4853ff877cf7d5ea163c22b60bc49d803648b27ff56efd430fe7cc70ac80f",
             ),
             (
                 cookbook_paths::ARTIFACT,
-                2,
-                "98e3ebf02600e0765757b0ec29b3b574956c3fd5f007ae0a5c37fddfefe8da5c",
+                3,
+                "e59e46048361aa6fa0be52512e293119e03b58cf14dd19304a1a430b8986c94c",
             ),
             (
                 cookbook_paths::PLAN_COMPILE,

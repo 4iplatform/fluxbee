@@ -227,7 +227,7 @@ out when empty.
 | `result_origin` | responder | `node` when the action was blocked (`derive_action_outcome`). |
 | `result_detail_code` | — | Defined in both SDKs; nothing sets it. |
 | `priority` | sender | A free hint, visible to the OPA policy; the router does not act on it. |
-| `context` | sender | Free JSON for the receiver and the OPA policy. IO nodes put the channel facts in `context.io`; the AI SDK reads `response_envelope` and `final_response_contract` from it (`crates/fluxbee_ai_sdk/src/message.rs`). |
+| `context` | sender | Free JSON for the receiver and the OPA policy. IO nodes put the channel facts in `context.io`; the AI SDK reads `response_envelope` and `final_response_contract` from it (`crates/fluxbee_ai_sdk/src/message.rs`). A WF puts its block in `context.wf`, which ai.generic shows its model, and an agent's answer to a contract with a `text_field` carries the contract's object in `context.evaluation` (`nodes/ai/ai-generic/README.md`). |
 | `via_tap` | **router only** | `true` on a tap copy, the copy a router sends to a monitoring target; such a copy is never tapped again. Serialized only when true. Missing from the Go `Meta`. |
 
 ### 3.6 Removed fields
@@ -586,8 +586,8 @@ not read `ich`.
 - An agent's reply speaks as the agent, to whoever spoke. `build_reply_meta`
   (`crates/fluxbee_ai_sdk/src/message.rs`) copies the incoming `meta`, sets `dst_ilk` to the
   incoming `src_ilk`, clears `src_ilk` and `memory_package`, and drops `thread_id`, `src_ilk`,
-  `response_envelope` and, unless told to keep it, `final_response_contract` from `context`. The
-  runtime then stamps the agent's ILK (`RuntimeConfig.self_ilk_id`,
+  `response_envelope`, `wf`, `evaluation` and, unless told to keep it, `final_response_contract`
+  from `context`. The runtime then stamps the agent's ILK (`RuntimeConfig.self_ilk_id`,
   `crates/fluxbee_ai_sdk/src/runtime.rs`). A reply never carries the human's ILK as its own;
   `thread_id` and `ich` stay.
 - Reply routing (`build_reply_routing`): `dst` the incoming `src`, the same `trace_id`, `ttl` the

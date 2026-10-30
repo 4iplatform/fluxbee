@@ -336,6 +336,7 @@ func instanceSummary(row WFInstanceRow) map[string]any {
 	}
 	return map[string]any{
 		"instance_id":      row.InstanceID,
+		"thread_id":        row.ThreadID,
 		"workflow_type":    row.WorkflowType,
 		"definition_hash":  row.DefinitionHash,
 		"status":           row.Status,

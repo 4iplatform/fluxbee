@@ -81,7 +81,9 @@ async fn connect_example_node() -> Result<Arc<RouterDispatcher>, NodeError> {
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
     let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
     let nodes_dir = state_dir.join("nodes");
-    let node_name = format!("WF.client.example.{}@motherbee", std::process::id());
+    // A fixed name: a WF starts an instance only from the nodes its definition's start_from names
+    // (0.1.91), and the example workflow wf.invoice names this one.
+    let node_name = "WF.client.example@motherbee".to_string();
     let node_config = NodeConfig {
         name: node_name,
         router_socket: socket_dir,

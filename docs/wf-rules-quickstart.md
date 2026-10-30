@@ -50,17 +50,24 @@ A workflow is a JSON with states, transitions, CEL guards and actions. The syste
 
 ### Full example: `WF.invoice`
 
-The workflow of the spec's case study (`docs/spec-systemnode-wf-v1_1.md` §19). It asks an agent to
-check the customer's data, for a structured answer; creates the invoice through `IO.quickbooks`;
-and asks the billing agent to deliver it. When data is missing, it tells the billing agent and ends:
-a person answers the agent of their conversation, never a WF instance, and the agent requests the
-invoice again.
+The workflow of the spec's case study (`docs/spec-systemnode-wf-v1_1.md` §19). The billing
+system asks for an invoice through its IO node, `IO.api.billing@motherbee`, the only node in its
+`start_from`. It asks an agent to check the customer's data, for a structured answer; creates the
+invoice through `IO.quickbooks`; and asks the billing agent to deliver it. When data is missing, it
+tells the billing agent and ends: the agent asks the customer, who answers it, never a WF instance,
+and the billing system asks for the invoice again once it has the data.
+
+A WF that sits at an IO node's exit and hands a conversation among agents is the example package
+`go/nodes/wf/examples/packages/wf.sales.invoice` (`docs/wf-orchestration-v1.md` §5.2): it uses
+`forward`, `keep_message`, the WF's block and a timer time from an agent's answer (§4), and
+internal transitions (§5).
 
 ```json
 {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
-  "description": "Issues an invoice: has the customer's data checked, creates the invoice and has it delivered; tells the billing agent what is missing.",
+  "description": "Issues an invoice the billing system asks for: has the customer's data checked, creates the invoice and has the billing agent deliver it; tells the billing agent what is missing.",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id", "items"],
@@ -105,7 +112,7 @@ invoice again.
                 "required": ["complete", "missing"],
                 "properties": {
                   "complete": { "type": "boolean" },
-                  "missing": { "type": "array", "items": { "type": "string" } }
+                  "missing": { "type": "string" }
                 }
               }
             }
@@ -139,7 +146,7 @@ invoice again.
             {
               "type": "set_variable",
               "name": "missing_data_request",
-              "value": "'The invoice for customer %s needs: %s. Ask the customer, then request the invoice again.'.format([input.customer_id, json_parse(event.payload.content).missing.join(', ')])"
+              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, json_parse(event.payload.content).missing])"
             }
           ]
         },
@@ -163,7 +170,7 @@ invoice again.
     },
     {
       "name": "missing_data_requested",
-      "description": "Terminal: tells the billing agent what is missing. The customer answers the agent, never this instance; the agent requests the invoice again.",
+      "description": "Terminal: tells the billing agent what is missing, and ends. The agent asks the customer, who answers it, never this instance; the billing system asks for the invoice again once it has the data.",
       "entry_actions": [
         {
           "type": "send_message",
@@ -549,7 +556,8 @@ equality between an `int` and a `double` works when a side comes from `input`, `
 
 `event` holds `msg`, `type`, `thread_id`, `trace_id`, `src` (the node that sent it, as the router
 stamps it), `context` and `payload`; for a `TIMER_FIRED`, also `timer_key`, the key the timer was
-scheduled with.
+scheduled with. An agent's answer to a response contract that names a `text_field` carries its
+whole evaluation in `event.context.evaluation`, and the text in `event.payload.content`.
 
 **Bounds.** A guard runs at most 10 ms: it is stopped there, and a guard that is stopped or errs is
 false. A `set_variable` value has a cost limit (1,000,000 CEL cost units): past it the action fails.
@@ -569,6 +577,16 @@ has(event.payload.missing_data)
 **Match a specific timer** (on a `TIMER_FIRED` transition):
 ```
 event.timer_key == 'validation_timeout'
+```
+
+**Branch on an agent's evaluation** (a response contract with a `text_field`):
+```
+event.context.evaluation.area == 'invoice'
+```
+
+**An agent's error answer** (to a forwarded message, which has no `msg`):
+```
+event.payload.type == 'error'
 ```
 
 **Compare strings:**
@@ -615,11 +633,12 @@ Actions are the effects the workflow executes. Fixed vocabulary in v1:
 Every message a WF sends is a `user` message: `meta` takes `msg` (and `context`, see below), never
 `type`, and `target` is a node name written in the definition (never a `SY.*` or `RT.*` node). A WF
 that chooses among destinations writes one transition per destination, each with its guard and its
-`send_message`; there is no destination taken from data. A definition with `meta.type` or
-`target_ref` is refused, by its path.
+`send_message`; there is no destination taken from data. Every message an instance sends carries the
+instance's thread, the conversation's (the thread of the message that started it). A definition
+with `meta.type`, `target_ref` or `thread_id_ref` is refused, by its path.
 
-The `{"$ref": "..."}` values are resolved at execution time, in `send_message` and
-`emit_internal_event`, the actions that take one. A `$ref` is a dot path rooted at `input.`, `state.`
+The `{"$ref": "..."}` values are resolved at execution time, in the payloads, `meta.context` and
+`vars` of `send_message`, `forward` and `emit_internal_event`, and in the times of the timer actions. A `$ref` is a dot path rooted at `input.`, `state.`
 or `event.` (another root, such as a typo `inptu.x`, is refused at load); an object whose `$ref`
 holds `#`, `/` or `:` (a JSON Schema's `"$ref": "#/definitions/item"`) is a literal, like
 everything else.
@@ -631,8 +650,57 @@ it is `null`. A `$ref` holds only `$ref` and `default`, and its default is a lit
 is refused at load (a typo such as `defualt` included), by its path.
 
 `meta.context` is resolved the same way, and goes on the message's `meta.context`: to ask an agent for
-a structured answer, `"context": {"response_envelope": {...}}`. An agent answers with the request's
-`msg`, and its error as `<msg>.error`, which needs a transition of its own.
+a structured answer, `"context": {"response_envelope": {...}}`, checked at load by the rules the
+agent reads it with: `kind` `json_object_v1`, `required` names among the `properties`, each of type
+string, boolean, integer or number, `enum` on a string only. An agent answers with the request's
+`msg`. Its error answer is a payload of type `error`, which needs a transition of its own; its
+`msg` is `<msg>.error` only when the request had a `msg` (a forwarded person's message has none, so
+the guard `event.payload.type == 'error'` takes it). A contract that names a `text_field` (a
+required string property) gets the answer's text in that field, and the whole object in
+`event.context.evaluation`.
+
+`vars`, an object resolved the same way, goes in the WF's block, below.
+
+### The WF's block, `meta.context.wf`
+
+Every message a WF sends, a `send_message` or a `forward`, carries it: `trail`, the nodes the
+message went through, and `vars`, what the action's `vars` writes (left out without one). An agent
+shows it to its model before the person's text, and never sends it back. An action's
+`meta.context` never writes `wf`.
+
+```json
+{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "quantity": 10 } } } }
+```
+
+### `forward` — send a message on as it was received
+
+```json
+{
+  "type": "forward",
+  "target": "AI.invoice@worker1",
+  "message": "customer",
+  "meta": { "context": { "response_envelope": { "kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply"], "properties": { "reply": { "type": "string" } } } } },
+  "vars": { "order": { "$ref": "state.order" } }
+}
+```
+
+It sends the event's message, or the one kept under `message`. The payload goes out byte for byte,
+never decoded, and the meta is the message's: every field of it but `memory_package`, so the
+person's ILK travels intact. The WF changes metadata only: the destination, the thread (the
+instance's), the `meta.context` keys the action writes, and its block, whose trail is the message's
+own and this node. It has no `meta.msg` and no `payload`, and it fails the instance (by default)
+when there is no message: a `TIMER_FIRED`, an internal event, or a name not kept yet. On a
+transition matched on `TIMER_FIRED`, a `forward` without `message` and a `keep_message` are refused
+at load.
+
+### `keep_message` — keep the event's message for a later `forward`
+
+```json
+{ "type": "keep_message", "name": "customer" }
+```
+
+Whole and as received; a later keep under the same name replaces it. It is committed with the
+transition, survives a restart, and goes when the instance ends.
 
 ### `schedule_timer` — schedule a timer through SY.timer
 
@@ -645,8 +713,14 @@ a structured answer, `"context": {"response_envelope": {...}}`. An agent answers
 }
 ```
 
-Minimum duration: 60 seconds. `missed_policy` is SY.timer's, for a fire SY.timer itself is late
-with: `fire` (it delivers the late fire), `drop` (it does not), `fire_if_within` (it delivers it
+Minimum duration: 60 seconds. `fire_in` (or `fire_at`) also takes a `$ref`, resolved when the
+action runs, with the 60 s floor checked then: a time from state, or from an agent's answer.
+
+```json
+{ "type": "schedule_timer", "timer_key": "payment_due", "fire_in": { "$ref": "state.invoice.due_in" }, "on_error": "fail" }
+```
+
+`missed_policy` is SY.timer's, for a fire SY.timer itself is late with: `fire` (it delivers the late fire), `drop` (it does not), `fire_if_within` (it delivers it
 within `missed_within_ms`). The WF's own recovery does not apply it: a WF that restarts gives its
 instance a fire SY.timer lost, or a past-due timer's fire, whatever the policy, `drop` included.
 
@@ -693,6 +767,7 @@ workflow
 ├── wf_schema_version    "1"
 ├── workflow_type         workflow name
 ├── description           free text
+├── start_from            node names whose messages start an instance (required)
 ├── input_schema          JSON Schema of the event that creates instances
 ├── initial_state         name of the state where instances start
 ├── terminal_states       list of states that end the instance
@@ -702,9 +777,9 @@ workflow
     ├── entry_actions[]   actions on ENTERING the state
     ├── exit_actions[]    actions on LEAVING the state
     └── transitions[]     transition rules
-        ├── event_match   { "msg": "MESSAGE_NAME" }   (msg only: no type)
+        ├── event_match   { "msg": "MESSAGE_NAME" }, { "src": "NODE@hive" } or both (no type)
         ├── guard         CEL expression → true/false
-        ├── target_state  name of the target state
+        ├── target_state  name of the target state; without it, the transition is internal
         └── actions[]     actions when taking this transition
 ```
 
@@ -716,6 +791,12 @@ exit_actions of the current state
 ```
 
 Transitions are evaluated in declaration order. The first one whose `event_match` matches and whose `guard` returns `true` is the one taken.
+
+An `event_match` names the event by its `msg`, by its sender (`src`, the name the router stamps), or
+by both, and then both must match: a person's message and an agent's answer to it have no `msg`.
+A transition without a `target_state` is **internal**: it runs its actions and stays in its state,
+with no exit or entry actions (its timers keep running), as when a due date that fires while an
+agent answers is noted for the next state.
 
 ---
 
@@ -732,7 +813,7 @@ Transitions are evaluated in declaration order. The first one whose `event_match
    curl -X POST .../wf-rules/apply -d '{workflow_name, tenant_id, auto_spawn: true}'
    → the WF node starts
 
-4. Test by sending messages to the WF node
+4. Test by sending messages to the WF node, from a node its start_from names
 
 5. Iterate: edit JSON → compile_apply (steps 2+3 together)
    curl -X POST .../wf-rules -d '{workflow_name, definition, tenant_id, auto_spawn: true}'
@@ -767,15 +848,19 @@ Transitions are evaluated in declaration order. The first one whose `event_match
 
 **Timers:** all the workflow's timers go through `SY.timer` of the WF's hive, and the WF takes a `TIMER_FIRED` only from it, and only for a timer it scheduled itself (`owner_l2_name`): a fire of a timer another node scheduled is dropped. Minimum duration 60 seconds. If the WF node restarts, it recovers its pending timers automatically: it fires the ones it missed in the order they fire, reading each again first (a fire that cancels a later timer keeps that one from firing), and a timer that fired before the restart does not fire again. If `SY.timer` does not answer at start, the node starts anyway, reports itself `DEGRADED` (`timers_not_reconciled`), and reconciles its timers when `SY.timer` answers; a timer scheduled in the meantime that SY.timer never got is scheduled again then.
 
-**Messages a WF takes:** a `user` message, which starts an instance or reaches the running instance on its thread, and a `TIMER_FIRED`. Any other `system` message is control, never a workflow event: it is dropped and never answered. `event_match` matches on `msg` only (a definition with `event_match.type` is refused).
+**Messages a WF takes:** a `user` message, which starts an instance or reaches the running instance on its thread, and a `TIMER_FIRED`. Any other `system` message is control, never a workflow event: it is dropped and never answered. `event_match` matches on `msg`, `src` or both (a definition with `event_match.type` is refused).
+
+**One instance per conversation, and only the nodes involved:** an instance lives on the thread of the message that started it, and a message on that thread reaches it, but only from a node the definition names: one in `start_from`, in an `event_match.src`, or a target of a `send_message` or a `forward` (and SY.timer for its own timers). Anyone else is dropped, never answered. A message from a `start_from` node on a thread no instance holds starts a new instance there, as `input_schema` allows: a person who writes again after their instance ended starts a new one on the same conversation. `start_from` names IO nodes and WFs, never an agent (which only answers) nor a `SY.*` or `RT.*` node.
+
+**A message the state has no transition for** is logged (`unhandled event ... in state ...`) and dropped: it is never queued for a later state. A definition that may get a message early handles it where it can arrive, with an internal transition (one without `target_state`) when it must not leave the state.
 
 **Downstream idempotency:** the WF delivers an event at least once: it saves the event before running its transition, and a crash before the transition commits runs it again at the next start, its creation included. The nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`: a repeated send keeps its `trace_id`. Each start counts the attempts of an event it runs again: one already run at 3 starts (an event that keeps taking the node down) is not run again, its instance fails (`replay_exhausted`), and the node goes on.
 
-**Replies, errors and late answers:** a reply (a `*_RESPONSE`, an `INVALID_INPUT`, an agent's `<msg>.error`) reaches only the instance whose thread it carries; it never starts an instance and is never answered. An answer on the thread of an instance of this node that ended (its timer fired first, say) is a late answer: dropped and never answered, instead of a new instance that would ask the agent again. A message that starts no instance (its payload fails `input_schema`) gets an `INVALID_INPUT` only when it is a named request.
+**Replies, errors and late answers:** a reply (a `*_RESPONSE`, an `INVALID_INPUT`, an agent's `<msg>.error`) reaches only the instance whose thread it carries; it never starts an instance and is never answered. A late answer from a node outside `start_from` (an agent's, after its instance ended: its timer fired first, say) is dropped, never answered, only while no instance runs on its thread, instead of a new instance that would ask the agent again; once the conversation's next instance runs there, the late answer reaches it, as any message on its thread from a node the definition names. A message that starts no instance (its payload fails `input_schema`) gets an `INVALID_INPUT` only when it is a named request.
 
 **Limits enforced:** at most 100 internal events may follow one event; past that the instance fails (`internal_event_cap`). A panic in a transition fails that instance (`transition_panic`), never the node. A guard stops at 10 ms (false), a `set_variable` at its cost limit (the action fails), and an event at 3 starts (`replay_exhausted`). The store commits with `synchronous=FULL`, so a transition whose messages went out is on disk.
 
-**Response correlation:** when the WF sends a `send_message`, it sets `meta.thread_id = instance_id`. The nodes that answer must copy that `thread_id` into their response so the WF correlates it with the right instance.
+**Response correlation:** every message an instance sends carries the instance's thread in `meta.thread_id`: the thread of the message that started it, or the `instance_id` when that message had none. The nodes that answer must copy that `thread_id` into their response so the WF correlates it with the right instance.
 
 **Cancel an in-flight instance:** the WF node's instance verbs (`WF_CANCEL_INSTANCE`,
 `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_GET_CODE`, `WF_HELP`) answer only `SY.admin@motherbee`
@@ -786,11 +871,10 @@ curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice@$HIVE/messages" \
   -H "Content-Type: application/json" \
   -d '{"msg_type": "system", "msg": "WF_CANCEL_INSTANCE", "payload": {"instance_id": "wfi:...", "reason": "operator"}}'
 ```
-The instance id (`wfi:...`) is the `meta.thread_id` of every message the instance sends, and the
-node's journal logs it when the instance starts:
+The node's journal logs the instance id (`wfi:...`) and its thread when the instance starts:
 ```bash
 journalctl -u fluxbee-node-WF.invoice-motherbee | grep 'create accepted'
-# wf: create accepted instance_id=wfi:550e8400-... workflow_type=invoice initial_state=validating_data trace_id=... src_l2="AI.billing@motherbee"
+# wf: create accepted instance_id=wfi:550e8400-... thread_id=conv-7c1e workflow_type=invoice initial_state=validating_data trace_id=... src_l2="AI.billing@motherbee"
 ```
 
 **See active instances:**

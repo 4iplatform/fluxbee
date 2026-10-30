@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -171,12 +172,26 @@ func (e *MessageTooLargeError) Error() string {
 	return fmt.Sprintf("message too large: %d bytes (max %d)", e.Size, e.Max)
 }
 
+// MarshalMessage is msg as a frame carries it: its JSON without HTML
+// escaping. json.Marshal writes <, > and & as <, > and &,
+// inside a payload passed as raw JSON too, so a payload a node forwards as
+// it received it went out changed (and longer).
+func MarshalMessage(msg Message) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(msg); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
 // Send queues msg for the router. A message whose frame is over the limit
 // is refused with *MessageTooLargeError before it is queued: queued, it
 // would make the writer drop the connection. A full queue fails with
 // "sender queue full".
 func (s *NodeSender) Send(msg Message) error {
-	data, err := json.Marshal(msg)
+	data, err := MarshalMessage(msg)
 	if err != nil {
 		return err
 	}
@@ -367,7 +382,7 @@ func PerformHandshake(conn net.Conn, fullName, uuidValue, version string) (*Mess
 	if err != nil {
 		return nil, nil, err
 	}
-	data, err := json.Marshal(hello)
+	data, err := MarshalMessage(hello)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -57,12 +57,13 @@ func from(sender string, msg sdk.Message) sdk.Message {
 	return msg
 }
 
-// putRunningInstance stores a running instance of rt's current definition in state, as a previous
-// run of the node left it.
+// putRunningInstance stores a running instance of rt's current definition in state, on its own id
+// as its thread, as a previous run of the node left it.
 func putRunningInstance(t *testing.T, rt *NodeRuntime, instanceID, state string) {
 	t.Helper()
 	if err := rt.Store.CreateInstance(context.Background(), WFInstanceRow{
 		InstanceID:     instanceID,
+		ThreadID:       instanceID,
 		WorkflowType:   rt.Def.WorkflowType,
 		DefinitionHash: rt.DefHash,
 		Status:         "running",

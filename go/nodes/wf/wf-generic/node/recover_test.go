@@ -162,6 +162,7 @@ func workflowJSONWithTimerRefire() string {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
   "description": "re-schedules timeout on timer fire",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],
@@ -443,6 +444,7 @@ func TestATimerScheduledWhileDegradedIsScheduledAgain(t *testing.T) {
 const raceWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "race",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "waiting",
   "terminal_states": ["done"],
@@ -485,7 +487,7 @@ func TestATimerScheduledAfterTheListWasAskedKeepsItsRow(t *testing.T) {
 		t.Fatalf("the row stays as it is: kept=%v, scheduled again %d times", ok, len(timer.scheduled)-scheduled)
 	}
 
-	answer := from("AI.host@motherbee", msgWithName("ANSWER"))
+	answer := from("IO.in@motherbee", msgWithName("ANSWER"))
 	answer.Meta.ThreadID = &instanceID
 	if err := Dispatch(context.Background(), answer, rt); err != nil {
 		t.Fatal(err)
@@ -508,6 +510,7 @@ func remindWorkflowJSON(deadlineKey string, deadlineFirst bool) string {
 	return fmt.Sprintf(`{
   "wf_schema_version": "1",
   "workflow_type": "remind",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "waiting",
   "terminal_states": ["timed_out", "done"],

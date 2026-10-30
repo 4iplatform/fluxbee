@@ -1,0 +1,8 @@
+{
+  "name": "wf.sales.invoice",
+  "version": "0.0.1",
+  "type": "workflow",
+  "description": "Case 1 of wf-orchestration-v1 (§5.2): one instance per conversation of IO.api.sales; sales hands an invoice to invoicing, whose due date fires a payment check by payments.",
+  "runtime_base": "wf.engine",
+  "config_template": "config/default-config.json"
+}

@@ -12,8 +12,9 @@
 - **Case 0 (§5.1)** was decided by the operator on 2026-10-28. It was built, and validated on 8.x
   in 0.1.90 (2026-10-29; ledger 0.1.90).
 - **Case 1 (§5.2)** is the operator's circuit of 2026-10-29: a sale handed to invoicing, then a
-  due-date timer and a payment check. All its decisions were taken on 2026-10-29. Next: its build
-  design. The operator: close the WF topic completely, case by case; Archi through Cloud waits.
+  due-date timer and a payment check. Its decisions were taken, and it was built and reviewed, on
+  2026-10-29 (§5.2.1, §5.2.3). Next: the release 0.1.91 and the validation on 8.x (§5.2.2). The
+  operator: close the WF topic completely, case by case; Archi through Cloud waits.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -371,7 +372,7 @@ This is the single place for the track. The cases are worked here one at a time.
   - a send to an agent with `thread_id_ref` loops (A-116, Case 2's correlation);
   - SY.timer takes a timer for another node from any node (A-115).
 
-### 5.2 Case 1: the operator's circuit (being decided, 2026-10-29)
+### 5.2 Case 1: the operator's circuit (decided and built, 2026-10-29)
 
 **The circuit:**
 1. A registered person writes. The IO node hands every message to the WF, which sends it to
@@ -408,7 +409,8 @@ IO node's exit as the router, however many agents take part.
   its own memory of the conversation at the forwarded message, and never sees what was said to
   sales.
 - An agent's model sees the payload's text and attachments and its memory package. It never sees
-  `meta.context` (the message handler in nodes/ai/ai-generic/src/bin/ai_node_runner.rs).
+  `meta.context` (the message handler in nodes/ai/ai-generic/src/bin/ai_node_runner.rs). Since
+  Case 1 it also sees the WF's block, `meta.context.wf` (§5.2.1).
 - IO.api sends every message to one configured `io.dst_node`, here the WF. It only takes messages
   in: it ignores any answer (`run_router_loop`), and this version has no outbound delivery
   (docs/io/io-api-node-spec.md).
@@ -442,7 +444,7 @@ Which of them a WF uses is its author's choice (*"flavor del programador"*).
 **Decided: only the nodes involved drive an instance** (A-123): those written in the definition,
 and SY.timer for the WF's own timers. *"Determinístico… no veo por qué algo adaptable."*
 
-**Next:** build Case 1 as §5.2.1 describes. Then one review round, the release (0.1.91), and the
+**Built** as §5.2.1 describes, then one review round (§5.2.3). Next: the release (0.1.91) and the
 validation on 8.x (§5.2.2). The operator, 2026-10-29: *"avanzá como describís… terminá cuando esté
 todo probado"*.
 
@@ -478,7 +480,9 @@ todo probado"*.
    - `thread_id_ref` leaves the language, because the instance's thread already answers a caller on
      its own thread. A definition that still has it is refused, as `target_ref` was in 0.1.90.
 2. **`start_from`, required:** the node names whose messages start an instance. Each is a valid
-   name with a hive, never SY.\* or RT.\*.
+   name with a hive, never SY.\*, RT.\* or AI.\*. An agent only answers (§1), so its message is
+   never a request; an agent in `start_from` that the WF also asks would have its late answer start
+   a new instance, the WF↔AI loop of A-118 (the review round, §5.2.3).
 3. **Only the nodes involved drive an instance** (A-123). The involved nodes are those in
    `start_from`, those in any `event_match.src`, and every `send_message` or `forward` target. An
    event follows this order:
@@ -488,47 +492,73 @@ todo probado"*.
    3. on the thread of a running instance: that instance;
    4. a message from a `start_from` node that is not a reply: a new instance on its thread, as the
       `input_schema` allows (an `INVALID_INPUT` otherwise, unless it is never answered);
-   5. anything else, such as an answer to an ended instance: dropped, never answered.
+   5. anything else, such as an agent's answer: dropped, never answered.
 
    So a person who writes again after the instance ended starts a new one on the same
    conversation, at the initial state.
+   - The sender is judged by the running instance's own definition on its thread, and by the
+     current definition otherwise. Recovery drops a journaled creation whose sender the current
+     definition no longer starts from, and gives a running instance a creation replayed on its
+     thread.
+   - An agent's answer that arrives after its instance ended is dropped only while no instance
+     runs on the thread. When the conversation's next instance is running, the answer reaches it.
+   - A message the current state has no transition for is logged and dropped, never queued.
 4. **`event_match.src`:** a transition can match the sender's name, the router-stamped
    `event.src`, alone or together with `msg`. At least one of the two is required, and with both,
-   both must match.
+   both must match. The name is written with its hive, never SY.\* or RT.\*.
 5. **`forward`** sends a message on as it was received.
    - The message is the event's, or one kept earlier (`"message": "<name>"`, item 6).
    - The payload goes out byte for byte, never decoded.
-   - The meta is the message's (type, msg, `src_ilk`, `dst_ilk`, `ich`, scope, priority and
-     context), without `memory_package`.
+   - The meta is the message's, every field but `memory_package`.
    - What the WF changes, all of it metadata:
      - the destination, a `target` written in the definition;
      - the thread, which becomes the instance's;
      - the WF's block (item 7);
      - the `context` keys the action writes, resolved by the `$ref` rules, for instance
        `response_envelope`.
-   - It fails when there is no message to forward: a `TIMER_FIRED`, an internal event, or a name
-     never kept. Its `on_error` defaults to `fail`, as for `send_message`.
+   - It fails when there is no message to forward (a `TIMER_FIRED`, an internal event, a name never
+     kept), or when the message's context is not a JSON object. Its `on_error` defaults to `fail`,
+     as for `send_message`.
+   - Validation refuses `meta.msg` and `payload` on a forward, and a `message` that no
+     `keep_message` of the definition keeps.
 6. **`keep_message`** keeps the event's message, whole and as received, under a name:
    `{"type": "keep_message", "name": "customer"}`.
    - A later keep under the same name replaces it.
    - Kept messages are committed with the transition, and go when the instance ends.
+   - It refuses a `TIMER_FIRED` and an internal event, and its `on_error` defaults to `fail`.
 7. **The WF's block, `meta.context.wf`,** goes on every message a WF sends.
    - `trail` lists the nodes the message went through. A `forward` takes the message's own trail
      (or its sender's name, when it has none) and adds the WF's name. A `send_message` starts it
      with the WF's name.
    - `vars` holds what the action's `vars` writes, `$ref`-resolved: the WF's deterministic context
-     for the receiver.
-   - Neither action's `context` may write `wf`, and validation refuses it.
+     for the receiver. It is left out when the action has none.
+   - Neither action's `context` may write `wf`, and validation refuses it. A `wf` that a `$ref`
+     context brings is overwritten.
 8. **Timer times from state:** `fire_in` and `fire_at` take a literal or a `$ref`, in
-   `schedule_timer` and `reschedule_timer`. The value is resolved when the action runs, and the
-   60 s floor is checked then.
+   `schedule_timer` and `reschedule_timer`. The value is resolved when the action runs, must be a
+   string, and the 60 s floor is checked then, for `fire_at` too. A `$ref`'s default is checked at
+   load.
 9. **Internal transitions:** a transition without `target_state` runs its actions and stays in its
    state, with no exit or entry actions. An event that arrives early can then be noted without
    leaving the state, for instance a due date that fires while an agent is answering.
 10. **The Go SDK encodes frames without escaping HTML,** so a forwarded payload goes out as it came.
+    `wfcel.EncodeJSON` stops escaping too, and the journal and the kept messages use the frame's
+    encoding.
 11. **The store, schema v4:** an instance keeps its thread (indexed), and a new table holds its kept
     messages. A v3 instance takes its own id as its thread, which is what its sends carried.
+    `WF_LIST_INSTANCES` and `WF_GET_INSTANCE` return the thread.
+    - **The upgrade:** a definition from before 0.1.91 has no `start_from`, so it no longer loads.
+      Its node is FAILED_CONFIG until the workflow is redeployed, and its running instances fail
+      at the next start (`definition_unavailable`). 8.x had no WF deployed.
 12. **Validation (go/pkg/wfcel):** every rule above, naming the exact path of an error, as today.
+    The review round added (§5.2.3):
+    - an action refuses the fields of other action types;
+    - `keep_message`, and a `forward` without `message`, are refused in a transition matched on
+      `TIMER_FIRED`;
+    - a `target` with surrounding spaces is refused;
+    - a duration whose day count overflows is refused;
+    - a literal `response_envelope` is checked against the AI SDK's contract rules, `text_field`
+      included.
 
 **The agents (Rust):**
 1. **ai.generic shows the WF's block to the model,** before the person's text, the way it shows the
@@ -536,49 +566,77 @@ todo probado"*.
    - It shows the trail as a path, and `vars` as JSON, cut at 8 KiB with a mark.
    - It does so for text and multimodal input alike. The block is not kept in the conversation's
      history.
-2. **An answer never carries the request's `wf` back** (`sanitize_reply_context`).
+2. **An answer never carries the request's `wf` back** (`sanitize_reply_context`), nor the
+   request's `evaluation`: an answer carries only its own.
 3. **A response contract may name a `text_field`,** a required string property.
    - The answer's text is then that field, and the whole object goes in the answer's
      `meta.context.evaluation`. A WF delivers the text and branches on `event.context.evaluation`,
      without touching the content.
    - Without `text_field`, an answer stays what it is today.
-   - An output that is not an object with that field is answered as an error, with tools and
-     without them.
+   - An output that is not the contract's object is answered as an error, with tools and without
+     them. The whole object is checked: required fields, types, enums and no extra properties. The
+     object is found inside a fence or among other text. The error's code is
+     `invalid_structured_output`, not retryable; a `text_field` that is not a required string makes
+     the contract invalid (`ai_runtime_error`).
+   - The history keeps the whole object as the agent's turn, so a blank text never leaves a blank
+     turn (Anthropic refuses one).
+   - With tools, the contract is an instruction in the system prompt, checked afterwards; the
+     provider enforces it only on the call without tools. The instruction asks for a value of its
+     type in every field, never null.
 
 **Every definition in the repo changes** (pre-beta, no legacy):
 - `start_from` is added and `thread_id_ref` goes, in the examples, Archi's seeds, the docs,
   SY.admin's help example, the scaffold and the tests;
-- `wf.router` is rewritten with `forward`;
+- `wf.router` is rewritten with `forward` (0.0.7): a person's further message while an agent
+  answers goes to that agent;
+- the spec's case study (§19.2), with the quickstart, SY.admin's help example and the seeds, starts
+  from an IO node, `IO.api.billing@motherbee`, instead of the agent `AI.billing` (item 2);
+- `examples/wf_client.rs` connects as `WF.client.example@motherbee`, which `wf.invoice` names in
+  `start_from`; Archi's shape check refuses a definition without `start_from`;
 - a test still validates every definition in the docs.
 
-**Case 1's definition,** shipped as the example `wf.sales_invoice`:
-- **`start_from`:** the IO node. **The agents:** `AI.sales`, `AI.invoice` and `AI.payments`.
+**Case 1's definition,** shipped as the example `wf.sales.invoice` (a package name takes no `_`):
+- **`start_from`:** the IO node, `IO.api.sales@worker1`. **The agents:** `AI.sales`, `AI.invoice`
+  and `AI.payments`, on worker1.
 - **`start`** keeps the person's message (`customer`) and their `context.io`, and moves on to sales.
+  A message without `context.io` fails the instance: every IO node sends one.
 - **`sales_thinking`** forwards `customer` to sales with its contract: `reply`, `area` (sales or
-  invoice), `product`, `quantity` and `unit_price`.
+  invoice), `product`, `quantity` and `unit_price`, all required.
   - `area: invoice` → `invoice_thinking`, with the order kept in state.
   - Any other answer is delivered to the person → `sales_listening`.
-  - An error or a 120 s timeout → `failed`.
 - **`invoice_thinking`** forwards `customer` to invoice, with `vars.order` and its contract:
   `reply`, `area` (invoice or sales), `invoice_number`, `amount` and `due_in`.
-  - An issued invoice is delivered to the person, and the timer `payment_due` is set at `due_in`
-    → `invoice_listening`.
-  - `area: sales`, the agent handing back → `sales_thinking`, with the same message.
+  - An issued invoice (a number, a `due_in` such as `2m`, `1h` or `30d`, and none pending) is
+    delivered to the person, and the timer `payment_due` is set at `due_in` → `invoice_listening`.
+  - A number with a malformed `due_in` is delivered, without a payment check, and `last_error`
+    says so → `invoice_listening`.
+  - `area: sales`, the agent handing back: its answer is delivered, and sales holds the
+    conversation from the person's next message → `sales_listening`.
   - Any other answer is delivered → `invoice_listening`.
+- **Every thinking state:** an agent's error, or no answer in 120 s, sets `last_error` (for example
+  `AI.sales@worker1: error`) and goes to `sales_listening`. The conversation and a pending payment
+  check survive, and the person gets no answer to that message. A payments error or timeout also
+  clears the pending invoice, whose due date already fired. Each state has its own timer
+  (`sales_timeout`, `invoice_timeout`, `payments_timeout`), so a late fire of one never ends the
+  next.
 - **`sales_listening` and `invoice_listening`:** the person's next message is kept, and goes to the
-  agent in control.
+  agent in control. A later answer is delivered: in `sales_listening`, of sales, invoice or
+  payments; in `invoice_listening`, of invoice.
   - After 3 minutes without messages, invoice gives control back to sales.
   - After 3 minutes without messages, sales closes the instance, when no invoice is pending.
-- **`payments_thinking`** starts when `payment_due` fires. The WF writes to `AI.payments`: *the
-  payment period has ended; tell the customer it was not paid*. It adds `vars.invoice` and the
-  person's `context.io`.
-  - The answer is delivered → `sales_listening`, with nothing pending: the agent hands the case
-    back.
-- **`closed` and `failed`** are terminal.
+- **`payments_thinking`** starts when `payment_due` fires. The WF writes to `AI.payments`
+  (`PAYMENT_DUE`): *the payment period has ended; tell the customer it was not paid*. It adds
+  `vars.invoice` and the person's `context.io`.
+  - Payments answers free text, without a contract. Its answer is delivered → `sales_listening`,
+    with nothing pending: the agent hands the case back.
+- **`closed`** is terminal, and so is `failed`, kept for the engine's own failures (a
+  `payment_due` that cannot be scheduled).
 - **Early events:**
   - a `payment_due` that fires while an agent is answering is noted by an internal transition, and
     acted on in the next listening state;
   - a person's message during an answer goes to the same agent.
+- **One person message costs at most two agent calls:** sales, then invoice. A handback never asks
+  sales again with the same message, so the two agents cannot bounce it (§5.2.3).
 
 **Tests before the release:**
 - the Go unit tests of each item, under `-race`;
@@ -592,17 +650,21 @@ todo probado"*.
 - a message the WF writes itself carries no `src_ilk` (the rest of A-116);
 - IO.api delivers no answer, because it only takes messages in (the IO family's own track);
 - Archi's guide to writing WFs, with handback and inactivity timers as the recommended pair
-  (Case 4).
+  (Case 4);
+- a cap in the engine on the agent calls between two triggers, as a backstop for a definition
+  whose agents keep answering each other (A-125, with Case 4);
+- the contract enforced by the provider inside the tool loop too.
 
 #### 5.2.2 The validation on 8.x
 
 **The setup, from inside.** The operator asked for no extra pieces in the infrastructure.
-- Three agents in the `pruebas` tenant on worker1: `AI.gate0191.sales`, `.invoice` and
-  `.payments`. Their Spanish prompts follow their contracts, and a test invoice falls due in 2
-  minutes.
+- Three agents in the `pruebas` tenant on worker1: `AI.gate0191sales`, `AI.gate0191invoice` and
+  `AI.gate0191payments`, with immediate memory on. Their Spanish prompts follow their contracts,
+  and a test invoice falls due in 2 minutes.
 - `WF.gate0191@worker1`, deployed through SY.admin, with Case 1's definition on those names.
 - A client on worker1's router socket, named `IO.gate0191`, stands for the IO node. It sends a
-  registered person's messages and receives what the WF delivers.
+  registered person's messages, with a `meta.context.io` as an IO node does, and receives what the
+  WF delivers.
 
 **The script:**
 1. *"Hola, quiero cotizar 10 licencias del plan Pro"*: sales answers.
@@ -620,6 +682,38 @@ todo probado"*.
 - a restart of the WF in the middle keeps the conversation.
 
 Afterwards the gate's objects are removed. `pruebas`, its keys and `AI.pruebas` stay.
+
+#### 5.2.3 The review round (2026-10-29)
+
+Five reviewers, each blind to the others' lens: the engine, security, the definition language, the
+docs, and the agents. Everything below was fixed before the release.
+- **One person's message could bounce between sales and invoice forever** (security). A handback
+  asked sales again with the same message, and each hop re-armed the answer timer; a probe made 101
+  agent requests from one message. Now a handback delivers invoice's answer, and sales takes the
+  person's next message.
+- **An agent in `start_from` that the WF also asks** would have its late answer start a new
+  instance, the loop of A-118 (docs, engine, security). `start_from` refuses `AI.*` (§5.2.1 item 2).
+  The spec's case study had exactly that shape.
+- **The person could end a pending payment check** (security): an agent error or timeout failed
+  the instance with its timers, and a malformed `due_in` failed it after the invoice was
+  delivered. Errors and timeouts now go back to sales, and only a well-formed `due_in` sets the
+  timer.
+- **A late timer fire at a handoff could end the next state** (engine, language): one timer per
+  state.
+- **A replayed creation could put a second instance on a conversation's thread** (engine): it
+  becomes the running instance's event, and the registry refuses a second instance on a thread.
+- **A blank text under a `text_field` left a blank turn in the agent's history**, and Anthropic
+  refused every later turn of that person (agents): the history keeps the whole object.
+- **A `forward` with `name` instead of `message` loaded and forwarded the wrong message**
+  (language): an action refuses other types' fields.
+- **`wf.router` dropped a person's second message while an agent answered** (language, docs).
+- **Smaller:** a target with spaces, a day count that overflowed, a `keep_message` on a timer's
+  transition, a contract the agents refuse (now checked at load), a fenced object followed by text,
+  the model's output missing from a failure's log, and the docs: the late-answer rule, the upgrade,
+  what a forward copies, who can start an instance, and Archi's seeds and SY.admin's help on errors
+  and sender-only matches.
+- **Kept open:** a cap on agent calls between two triggers (A-125, with Case 4), and the contract
+  enforced by the provider inside the tool loop.
 
 ## 6. Docs that drift from the code
 

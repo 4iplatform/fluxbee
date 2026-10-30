@@ -372,7 +372,7 @@ func TestANodeWithoutAConfigInUseAnswersControlAndDropsWorkflowTraffic(t *testin
 	}
 
 	sent := len(disp.sent)
-	if err := Dispatch(context.Background(), from("AI.billing@motherbee", msgWithName("INVOICE_REQUEST")), rt); err != nil {
+	if err := Dispatch(context.Background(), from("IO.api.billing@motherbee", msgWithName("INVOICE_REQUEST")), rt); err != nil {
 		t.Fatal(err)
 	}
 	if len(disp.sent) != sent {
@@ -527,7 +527,7 @@ func TestTheWFAnswersUseTheKeysTheSpecShows(t *testing.T) {
 		sort.Strings(names)
 		return strings.Join(names, ",")
 	}
-	const summaryKeys = "created_at_ms,current_state,definition_hash,instance_id,status,terminated_at_ms,updated_at_ms,workflow_type"
+	const summaryKeys = "created_at_ms,current_state,definition_hash,instance_id,status,terminated_at_ms,thread_id,updated_at_ms,workflow_type"
 
 	list := ask(MsgWFListInstances, `{"status": "running", "limit": 0}`)
 	if keys(list) != "count,instances,ok" || list["ok"] != true || list["count"] != float64(1) {
@@ -543,8 +543,8 @@ func TestTheWFAnswersUseTheKeysTheSpecShows(t *testing.T) {
 		t.Fatalf("WF_GET_INSTANCE = %v", got)
 	}
 	instance := got["instance"].(map[string]any)
-	if keys(instance) != "created_at_ms,current_state,definition_hash,input,instance_id,recent_log,state_variables,status,terminated_at_ms,updated_at_ms,workflow_type" ||
-		instance["instance_id"] != instanceID || instance["status"] != "running" || instance["terminated_at_ms"] != nil {
+	if keys(instance) != "created_at_ms,current_state,definition_hash,input,instance_id,recent_log,state_variables,status,terminated_at_ms,thread_id,updated_at_ms,workflow_type" ||
+		instance["instance_id"] != instanceID || instance["thread_id"] != instanceID || instance["status"] != "running" || instance["terminated_at_ms"] != nil {
 		t.Fatalf("the instance: %v", instance)
 	}
 	if input := instance["input"].(map[string]any); input["customer_id"] != "c1" {

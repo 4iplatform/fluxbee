@@ -117,6 +117,7 @@ definition_v1() {
   "wf_schema_version": "1",
   "workflow_type": "$WF_NAME",
   "description": "e2e test workflow v1",
+  "start_from": ["IO.test@$HIVE_ID"],
   "input_schema": {
     "type": "object",
     "required": ["request_id"],
@@ -181,6 +182,7 @@ definition_v2() {
   "wf_schema_version": "1",
   "workflow_type": "$WF_NAME",
   "description": "e2e test workflow v2 - updated",
+  "start_from": ["IO.test@$HIVE_ID"],
   "input_schema": {
     "type": "object",
     "required": ["request_id"],

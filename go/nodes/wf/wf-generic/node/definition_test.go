@@ -121,6 +121,7 @@ func validWorkflowJSON() string {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
   "description": "issues invoice",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],

@@ -24,10 +24,13 @@ type RecoverOptions struct {
 //
 //  1. every running instance, on the definition it was born with (by its hash; one that is not
 //     kept, or no longer loads, fails the instance: causeDefinitionUnavailable; so does a current
-//     state the definition does not have: causeStateNotInDefinition);
+//     state the definition does not have: causeStateNotInDefinition), on its thread, with the
+//     messages it kept;
 //  2. the internal events a crash left queued;
 //  3. the inbound events a crash left unfinished, run again in the order they came: an instance's
-//     event, or a creation, under the instance_id it had (at least once);
+//     event, or a creation, under the instance_id it had (at least once), when the current
+//     definition still starts from its sender; a creation whose thread a running instance holds
+//     (a later message started it while the creation's commit had failed) is that instance's event;
 //  4. the timer index against SY.timer. When SY.timer does not answer, the node starts anyway,
 //     DEGRADED (timersPending), and the receive loop reconciles when it answers;
 //  5. the definitions no running instance uses are dropped.
@@ -80,12 +83,24 @@ func (rt *NodeRuntime) loadRunningInstances(ctx context.Context) error {
 			}
 			continue
 		}
-		inst, err := FromRow(row, def)
+		kept, err := rt.Store.ListKeptMessages(ctx, row.InstanceID)
+		if err != nil {
+			return fmt.Errorf("recover: read the messages instance %s kept: %w", row.InstanceID, err)
+		}
+		inst, err := FromRow(row, def, kept)
 		if err != nil {
 			log.Printf("recover: skip instance %s: %v", row.InstanceID, err)
 			continue
 		}
-		rt.Registry.Add(inst)
+		// The store gives the instances in the order they started: the first one on a thread keeps
+		// it, and a later one on the same thread fails, loudly.
+		if err := rt.Registry.Add(inst); err != nil {
+			log.Printf("recover: REFUSED instance %s: %v", row.InstanceID, err)
+			cause := fmt.Errorf("%s: %v", causeThreadTaken, err)
+			if ferr := failStoredInstance(ctx, rt.ActCtx, row.InstanceID, row.CurrentState, cause); ferr != nil {
+				return fmt.Errorf("recover: %w", ferr)
+			}
+		}
 	}
 	log.Printf("recover: loaded %d running instances on %d definitions", rt.Registry.Count(), len(definitions))
 	return nil
@@ -169,6 +184,27 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 				continue
 			} else if !errors.Is(err, errInstanceNotFound) {
 				return fmt.Errorf("recover: read instance %s: %w", row.InstanceID, err)
+			}
+			// A running instance holds the message's thread: one a later message started while this
+			// creation's commit had failed. The message is that instance's event, as live dispatch
+			// takes it, and that instance's commit consumes it.
+			if inst, held := rt.Registry.GetByThread(creationThread(msg, row.InstanceID)); held {
+				if !inst.def.Involves(msg.SourceL2Name()) {
+					drop(fmt.Sprintf("instance %s holds its thread, and its definition does not involve %q", inst.InstanceID, msg.SourceL2Name()))
+					continue
+				}
+				if err := rt.Store.RetargetInboundEvent(ctx, row.EventID, inst.InstanceID); err != nil {
+					return fmt.Errorf("recover: give inbound event %d to instance %s: %w", row.EventID, inst.InstanceID, err)
+				}
+				log.Printf("recover: inbound event %d is an event of instance %s, which holds its thread", row.EventID, inst.InstanceID)
+				if err := rt.runEvent(ctx, inst, msg, row.EventID); err != nil {
+					log.Printf("recover: run inbound event %d on instance %s: %v", row.EventID, inst.InstanceID, err)
+				}
+				continue
+			}
+			if !rt.Def.StartsFrom(msg.SourceL2Name()) {
+				drop(fmt.Sprintf("the current definition does not start from %q", msg.SourceL2Name()))
+				continue
 			}
 			input, err := creationInput(rt.Def, msg)
 			if err != nil {

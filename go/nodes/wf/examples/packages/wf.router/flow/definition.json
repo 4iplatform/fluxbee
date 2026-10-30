@@ -1,7 +1,8 @@
 {
   "wf_schema_version": "1",
   "workflow_type": "router",
-  "description": "Ingress host/specialist router (v0.0.5). Triggered by a text/v1 relay from one of the two IO nodes written here, IO.wapp.acme@motherbee or IO.api.support@motherbee: keeps the inbound reply context (event.context.io) and the IO node that sent it (event.src), asks a HOST AI to triage, escalates to a SPECIALIST AI when the host answers ROUTE_SPECIALIST, and replies the final answer to the IO node it came from, with its reply context, so that node delivers it to the customer. The reply goes to a node name written in the definition, one transition per IO node. An agent's error arrives as <msg>.error, and a turn not answered in 120 s fails on its timer (event.timer_key).",
+  "description": "Ingress host/specialist router (v0.0.7). Started by a person's message from one of the two IO nodes written here, IO.wapp.acme@motherbee or IO.api.support@motherbee: keeps the message and the IO node that sent it (event.src), forwards the message as it came to a HOST AI, escalates it to a SPECIALIST AI when the host answers ROUTE_SPECIALIST, and forwards the final answer as it came to the IO node the question came from, one transition per IO node; the answer keeps the message's reply context (context.io), so that node delivers it to the customer. A person's further message while an agent answers is kept, as the question, and goes to that agent. An agent's error answer is a payload of type error, and a turn not answered in 120 s fails on its timer (event.timer_key).",
+  "start_from": ["IO.wapp.acme@motherbee", "IO.api.support@motherbee"],
   "input_schema": {
     "type": "object",
     "properties": {
@@ -14,39 +15,50 @@
   "states": [
     {
       "name": "asking_host",
-      "description": "Keep the ingress reply context and the IO node that sent it, send the question to the HOST AI, and await its triage decision.",
+      "description": "Keep the question and the IO node that sent it, forward the question to the HOST AI, and await its triage decision. A further message from the person is kept as the question and goes to the host too.",
       "entry_actions": [
-        { "type": "set_variable", "name": "reply_ctx", "value": "event.context.io" },
+        { "type": "keep_message", "name": "question" },
         { "type": "set_variable", "name": "origin", "value": "event.src" },
-        {
-          "type": "send_message",
-          "target": "AI.host@motherbee",
-          "meta": { "msg": "HOST_TURN" },
-          "payload": { "type": "text", "content": { "$ref": "input.content" } }
-        },
+        { "type": "forward", "target": "AI.host@motherbee" },
         { "type": "schedule_timer", "timer_key": "host_timeout", "fire_in": "120s", "missed_policy": "fire" }
       ],
       "exit_actions": [ { "type": "cancel_timer", "timer_key": "host_timeout" } ],
       "transitions": [
         {
-          "event_match": { "msg": "HOST_TURN.error" },
-          "guard": "true",
+          "event_match": { "src": "AI.host@motherbee" },
+          "guard": "event.payload.type == 'error'",
           "target_state": "failed",
           "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'host_error:' + event.payload.code" } ]
         },
         {
-          "event_match": { "msg": "HOST_TURN" },
+          "event_match": { "src": "AI.host@motherbee" },
           "guard": "event.payload.type == 'text' && event.payload.content.contains('ROUTE_SPECIALIST')",
           "target_state": "asking_specialist",
-          "actions": [ { "type": "set_variable", "name": "host_reply", "value": "event.payload.content" } ]
+          "actions": []
         },
         {
-          "event_match": { "msg": "HOST_TURN" },
+          "event_match": { "src": "AI.host@motherbee" },
           "guard": "event.payload.type == 'text'",
           "target_state": "replying",
           "actions": [
-            { "type": "set_variable", "name": "final_answer", "value": "event.payload.content" },
+            { "type": "keep_message", "name": "answer" },
             { "type": "set_variable", "name": "answered_by", "value": "'host'" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.wapp.acme@motherbee" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "question" },
+            { "type": "forward", "target": "AI.host@motherbee", "message": "question" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.support@motherbee" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "question" },
+            { "type": "forward", "target": "AI.host@motherbee", "message": "question" }
           ]
         },
         {
@@ -59,31 +71,42 @@
     },
     {
       "name": "asking_specialist",
-      "description": "The host escalated (ROUTE_SPECIALIST): send the same question to the SPECIALIST AI and await its answer.",
+      "description": "The host escalated (ROUTE_SPECIALIST): forward the question, as it came, to the SPECIALIST AI and await its answer. A further message from the person is kept as the question and goes to the specialist too.",
       "entry_actions": [
-        {
-          "type": "send_message",
-          "target": "AI.specialist@motherbee",
-          "meta": { "msg": "SPECIALIST_TURN" },
-          "payload": { "type": "text", "content": { "$ref": "input.content" } }
-        },
+        { "type": "forward", "target": "AI.specialist@motherbee", "message": "question" },
         { "type": "schedule_timer", "timer_key": "specialist_timeout", "fire_in": "120s", "missed_policy": "fire" }
       ],
       "exit_actions": [ { "type": "cancel_timer", "timer_key": "specialist_timeout" } ],
       "transitions": [
         {
-          "event_match": { "msg": "SPECIALIST_TURN.error" },
-          "guard": "true",
+          "event_match": { "src": "AI.specialist@motherbee" },
+          "guard": "event.payload.type == 'error'",
           "target_state": "failed",
           "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'specialist_error:' + event.payload.code" } ]
         },
         {
-          "event_match": { "msg": "SPECIALIST_TURN" },
+          "event_match": { "src": "AI.specialist@motherbee" },
           "guard": "event.payload.type == 'text'",
           "target_state": "replying",
           "actions": [
-            { "type": "set_variable", "name": "final_answer", "value": "event.payload.content" },
+            { "type": "keep_message", "name": "answer" },
             { "type": "set_variable", "name": "answered_by", "value": "'specialist'" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.wapp.acme@motherbee" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "question" },
+            { "type": "forward", "target": "AI.specialist@motherbee", "message": "question" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.support@motherbee" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "question" },
+            { "type": "forward", "target": "AI.specialist@motherbee", "message": "question" }
           ]
         },
         {
@@ -96,7 +119,7 @@
     },
     {
       "name": "replying",
-      "description": "The answer is ready. One transition per IO node written here sends it back to the one the question came from, with its reply context.",
+      "description": "The answer is kept. One transition per IO node written here forwards it, as it came, to the one the question came from.",
       "entry_actions": [ { "type": "emit_internal_event", "meta": { "msg": "REPLY" } } ],
       "exit_actions": [],
       "transitions": [
@@ -104,33 +127,13 @@
           "event_match": { "msg": "REPLY" },
           "guard": "state.origin == 'IO.wapp.acme@motherbee'",
           "target_state": "answered",
-          "actions": [
-            {
-              "type": "send_message",
-              "target": "IO.wapp.acme@motherbee",
-              "meta": { "msg": "CUSTOMER_REPLY", "context": { "io": { "$ref": "state.reply_ctx" } } },
-              "payload": { "type": "text", "content": { "$ref": "state.final_answer" } }
-            }
-          ]
+          "actions": [ { "type": "forward", "target": "IO.wapp.acme@motherbee", "message": "answer" } ]
         },
         {
           "event_match": { "msg": "REPLY" },
           "guard": "state.origin == 'IO.api.support@motherbee'",
           "target_state": "answered",
-          "actions": [
-            {
-              "type": "send_message",
-              "target": "IO.api.support@motherbee",
-              "meta": { "msg": "CUSTOMER_REPLY", "context": { "io": { "$ref": "state.reply_ctx" } } },
-              "payload": { "type": "text", "content": { "$ref": "state.final_answer" } }
-            }
-          ]
-        },
-        {
-          "event_match": { "msg": "REPLY" },
-          "guard": "true",
-          "target_state": "failed",
-          "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'unknown_origin:' + state.origin" } ]
+          "actions": [ { "type": "forward", "target": "IO.api.support@motherbee", "message": "answer" } ]
         }
       ]
     },
@@ -143,7 +146,7 @@
     },
     {
       "name": "failed",
-      "description": "A turn errored or timed out, or the question came from an IO node this workflow does not answer.",
+      "description": "A turn errored or timed out.",
       "entry_actions": [],
       "exit_actions": [],
       "transitions": []

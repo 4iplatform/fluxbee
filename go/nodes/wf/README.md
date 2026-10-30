@@ -4,8 +4,9 @@ Sources of the `WF.*` nodes: the workflow engine and its example workflows.
 
 - `wf-generic/`: the engine, `wf.engine`, the base runtime every `WF.*` node runs
   ([wf-generic/README.md](wf-generic/README.md)).
-- `examples/packages/`: workflow packages on that engine (`wf.invoice`, `wf.router`); their
-  definitions validate in CI and run on the engine in its tests.
+- `examples/packages/`: workflow packages on that engine (`wf.invoice`, `wf.router`, and
+  `wf.sales.invoice`, Case 1 of the track: a conversation handed among agents at an IO node's exit);
+  their definitions validate in CI and run on the engine in its tests.
 
 The definition language and its validator are `go/pkg/wfcel`, shared with SY.wf-rules. The spec is
 [docs/spec-systemnode-wf-v1_1.md](../../../docs/spec-systemnode-wf-v1_1.md), the deploy guide

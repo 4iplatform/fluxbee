@@ -42,8 +42,9 @@ pub use message::{
     build_reply_message, build_reply_message_runtime_src,
     build_reply_message_runtime_src_with_options, build_reply_message_with_options,
     build_reply_routing, extract_final_response_contract, extract_response_envelope,
-    resolve_final_response_contract_output_schema, resolve_response_envelope_output_schema,
-    Destination, Message, Meta, ReplyContextOptions, Routing,
+    resolve_final_response_contract_output_schema, resolve_response_envelope_contract,
+    set_reply_evaluation, ContractAnswer, Destination, Message, Meta, ReplyContextOptions,
+    ResponseContract, Routing,
 };
 pub use node_trait::AiNode;
 pub use output::{

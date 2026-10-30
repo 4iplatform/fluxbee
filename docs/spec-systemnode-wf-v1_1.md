@@ -145,39 +145,42 @@ The ambiguity lived for a moment inside the AI node and came back resolved into 
 
 ## 5. How a WF is triggered
 
-A WF instance is born when a message arrives at the WF node that matches the WF's declared input schema. The WF never self-triggers. It is always a response to something that happened in the system.
+A WF instance is born when a message arrives at the WF node from a node its definition's `start_from` names, on a thread no running instance holds, and its payload matches the WF's declared input schema (§14.5). The WF never self-triggers. It is always a response to something that happened in the system.
+
+An instance is a conversation, since 0.1.91: it lives on the thread of the message that started it (§14.3), and every message it sends carries that thread, so the agents it talks to keep one memory per conversation and their answers come back to it. A person who writes again on that thread reaches the running instance; after it ended, a new one starts, at the initial state.
 
 ### 5.1 Possible triggers
 
-The following are the canonical sources from which WFs are triggered:
+Only a node the definition names in `start_from` starts an instance (§8.1, §14.5). OPA decides, besides, which nodes may send the WF anything (§17); it does not decide alone. The canonical sources:
 
-**From an AI node.** The most common case. An AI is conversing with a user, realizes the conversation requires a deterministic process, and delegates to a WF by emitting a message. Example: customer says "I need an invoice", AI understands, AI emits message to WF.invoice with the initial data.
+**From an IO node.** The most common case: a person's message, or an external event, arrives at an IO node, which hands it to the WF. A WF at an IO node's exit holds the person's conversation, one instance per conversation, and hands it among agents (`docs/wf-orchestration-v1.md` §5.2). Example: a payment processor webhook arrives at IO.payments, which sends it to WF.payment-reconciliation without passing through any AI.
 
-**From an IO node with a webhook or external event.** No reasoning needed — the external event directly maps to a process to run. Example: a payment processor webhook arrives at IO.payments, and OPA routes it directly to WF.payment-reconciliation without passing through any AI.
+**From another WF.** A WF, as part of its actions, can send a message to another WF, which takes it as any other trigger when it names the sender in `start_from`. Example: `WF.tenant-onboarding` in its final step sends a message to `WF.invoice` to create the first billing cycle.
+
+**Never from an agent.** An agent only answers (`docs/wf-orchestration-v1.md` §1): it never starts an instance, and `start_from` refuses an `AI.*` node, whose late answer would otherwise start one (a WF↔AI loop). A WF asks agents, and branches on their answers.
+
+**Never from a system node.** `SY.cognition`, `SY.admin` or any other `SY.*` or `RT.*` node never starts an instance: `start_from` refuses them.
 
 **From SY.timer: not built.** A `TIMER_FIRED` reaches only the running instance whose timer it is, and never starts one (§11.2); a periodic or scheduled start (an end-of-month close, say) is not built (`docs/wf-orchestration-v1.md` §4.4).
-
-**From another WF.** A WF, as part of its actions, can send a message to another WF. The receiving WF treats it as any other trigger. Example: `WF.tenant-onboarding` in its final step sends a message to `WF.invoice` to create the first billing cycle.
-
-**From SY.cognition.** A cognitive analysis detects a condition that requires a deterministic response. Example: cognition notices a support conversation has been stalled for 48 hours and emits a message to WF.escalation.
 
 ### 5.2 What cannot trigger a WF
 
 - **The WF itself** cannot spontaneously create new instances. Instances exist only as responses to incoming messages.
+- **A node outside `start_from`**, an agent and a system node included. Its message reaches a running instance on its thread when the definition names it (§14.5), and starts none.
 - **Archi** does not trigger WFs at runtime. Archi designs WFs and deploys them as code; once deployed, Archi has no privileged trigger path.
 - **External systems directly**. External systems talk to IO nodes, which then emit Fluxbee-native messages that OPA routes.
 
 ### 5.3 Deterministic triggers vs probabilistic triggers
 
-Triggers can be deterministic (timers, webhooks) or probabilistic (an AI deciding to delegate). **This is fine, as long as the distinction is explicit.**
+Triggers can be deterministic (a webhook, another WF) or human (a person's message, through an IO node, whatever it says). **This is fine, as long as the distinction is explicit.**
 
-The key property is that **once triggered, the WF is deterministic regardless of how the trigger happened**. The AI may be wrong to trigger the WF, but if it does, the WF behaves exactly as defined. If the trigger was a mistake, the WF either completes its process correctly (just on wrong data) or fails deterministically (e.g., the input schema rejects the payload). The damage is bounded because the execution is deterministic.
+The key property is that **once triggered, the WF is deterministic regardless of how the trigger happened**. The trigger may be a mistake, but if it comes, the WF behaves exactly as defined. If the trigger was a mistake, the WF either completes its process correctly (just on wrong data) or fails deterministically (e.g., the input schema rejects the payload). The damage is bounded because the execution is deterministic.
 
 **The boundary of determinism is the edge of the WF.** Outside, there can be all the probabilistic reasoning you want. Inside, there is none.
 
 ## 6. WF as a system toolbox
 
-WF nodes are not private components of specific flows. They are infrastructure: any node whose message OPA lets through can start an instance. Their self-description, `WF_HELP`, is not open to every node: like every `WF_*` control verb, a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (since 0.1.90, §15).
+WF nodes are not private components of specific flows. They are infrastructure: any node its definition names in `start_from`, whose message OPA lets through, can start an instance. Their self-description, `WF_HELP`, is not open to every node: like every `WF_*` control verb, a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (since 0.1.90, §15).
 
 ### 6.1 The hive-wide live catalog
 
@@ -189,7 +192,7 @@ This is self-description by pull, not registration by push. Each node is the aut
 
 ### 6.2 Authorization via OPA, not via the catalog
 
-Visibility and authorization are different. The catalog shows what exists; OPA decides who can use what. An AI can see in the catalog that `WF.refund` exists, but whether it is allowed to trigger it depends on OPA rules, which in identity v2 evaluate against `ilk_type`, `registration_status`, and the L2 name of the source node (see section 17).
+Visibility and authorization are different. The catalog shows what exists. Who starts an instance is the definition's `start_from`; OPA decides, besides, which nodes may send the WF anything, with rules that in identity v2 evaluate against `ilk_type`, `registration_status`, and the L2 name of the source node (see section 17). An AI can see in the catalog that `WF.refund` exists, but it never starts it: an agent only answers, and `start_from` names IO nodes and WFs.
 
 ---
 
@@ -272,6 +275,7 @@ A sketch (`...` stands for the states, §8.2; §19.2 is a complete definition):
   "wf_schema_version": "1",
   "workflow_type": "invoice",
   "description": "Issues an invoice, collects missing data if needed, delivers to customer.",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id", "items"],
@@ -307,6 +311,7 @@ Fields:
 | `wf_schema_version` | Version of the workflow schema format. Current: `"1"`. |
 | `workflow_type` | Unique name for this workflow type. Appears in logs and `WF_HELP`. |
 | `description` | Human-readable description for introspection. |
+| `start_from` | Required. The node names whose messages start an instance, each with its hive (`IO.api.sales@worker1`): IO nodes and WFs, never an `AI.*` node (an agent only answers, §5.1) nor a `SY.*` or `RT.*` node. A message from any other node starts none (§14.5). |
 | `input_schema` | JSON Schema for the initial event that creates an instance. Compiled to CEL types at load. |
 | `initial_state` | Name of the state where new instances begin. |
 | `terminal_states` | List of state names that end the instance when reached. |
@@ -357,9 +362,9 @@ Fields:
 
 | Field | Description |
 |---|---|
-| `event_match` | Which incoming events trigger this transition: `{"msg": "<name>"}`, matched on `meta.msg` only. Every message a WF takes is a `user` message, but a `TIMER_FIRED` (§14.2); `event_match.type` left the language in 0.1.90 and is refused, by its path. |
+| `event_match` | Which incoming events trigger this transition: by `msg` (`meta.msg`), by `src` (the sender's name as the router stamps it, `event.src`: a node name with its hive, never a `SY.*` or `RT.*` node), or by both, and then both must match; at least one is required. A person's message and an agent's answer to it have no `msg`, so they are matched by their sender: `{"src": "AI.sales@worker1"}`. Every message a WF takes is a `user` message, but a `TIMER_FIRED` (§14.2); `event_match.type` left the language in 0.1.90 and is refused, by its path. |
 | `guard` | CEL expression evaluated against `input` (original trigger), `state` (current variables), `event` (incoming event). Must return boolean. |
-| `target_state` | Name of the state to transition to. |
+| `target_state` | Name of the state to transition to. Without it the transition is **internal**: it runs its actions and stays in its state, with no exit or entry actions (§9.1). |
 | `actions` | Array of actions executed as part of this transition, before entering the target state. |
 
 Within a single state, transitions are evaluated in the order they are declared. The first one whose `event_match` matches and whose `guard` evaluates to `true` is taken. If none match, the event is logged and ignored.
@@ -370,7 +375,7 @@ The `input_schema` validates the payload that creates an instance (JSON Schema);
 
 - `input` — the payload of the event that created the instance, as the `input_schema` accepted it. Immutable for the lifetime of the instance.
 - `state` — the current workflow variables. Typed as a dynamic map; individual field types are assigned as `set_variable` actions run. Guards referencing fields that have not been set yet evaluate to an error (which fails the guard).
-- `event` — the incoming event that triggered this evaluation: a flat map, not the whole message. Its keys are `msg`, `type`, `thread_id`, `trace_id`, `src` (the sender's L2 name, as the router stamps it), `context` (the parsed `meta.context`) and `payload`; a `TIMER_FIRED` also has `timer_key`, the key the timer was scheduled with (from the timer's `client_ref`, `wf:<instance_id>::<timer_key>`). The same map is the `event` root of `$ref`.
+- `event` — the incoming event that triggered this evaluation: a flat map, not the whole message. Its keys are `msg`, `type`, `thread_id`, `trace_id`, `src` (the sender's L2 name, as the router stamps it), `context` (the parsed `meta.context`) and `payload`; a `TIMER_FIRED` also has `timer_key`, the key the timer was scheduled with (from the timer's `client_ref`, `wf:<instance_id>::<timer_key>`). An internal event (§10.6) has no `src`, and the instance's thread. The same map is the `event` root of `$ref`.
 
 A built-in function `now()` returns the WF node's clock as Unix milliseconds (UTC); it is not SY.timer's. `json_parse(text)` decodes a JSON string. Numbers have one type everywhere, live and after a restart: a JSON integer is a CEL `int` and any other number a `double`, in `input`, `state`, `event` and `json_parse` alike, and in the definition's own literals (`3` goes out as `3`, `1.0` as `1.0`). A comparison or an equality between an `int` and a `double` works when a side comes from `input`, `state`, `event` or `json_parse` (`state.score > 7.5` with an `int` score); between two literals (`1 < 2.0`) it does not compile. Arithmetic that mixes them, and `%` on a `double`, fails (a guard that fails is false, a `set_variable` that fails fails its action): convert first, `double(state.n) * 1.1`, `int(state.n) % 2`.
 
@@ -379,16 +384,20 @@ A built-in function `now()` returns the WF node's clock as Unix milliseconds (UT
 When a WF node loads its workflow definition, it runs these checks:
 
 1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused.
+1a. `start_from` names at least one node, each a node name with its hive, never a `SY.*`, `RT.*` or `AI.*` node: an agent only answers, and one that starts instances and that the WF asks would have its late answer start a new instance, which asks it again (a WF↔AI loop).
 2. `input_schema` is valid JSON Schema.
 3. `initial_state` exists in `states`.
 4. All `terminal_states` exist in `states`; a state named `failed` is one of them.
-5. Every `target_state` in every transition exists in `states`.
-6. Every transition has an `event_match.msg` and a guard, and every guard CEL expression compiles.
-7. Every action has a known `type` and valid parameters.
-8. For `send_message` actions, the `target` is syntactically a valid L2 name, and not a `SY.*` or `RT.*` node.
-8a. No action has `meta.type` or `target_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 (every message a WF sends is a `user` message, to a node name written in the definition; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
-9. For `schedule_timer` and `reschedule_timer` actions, the duration is ≥ 60 seconds (see section 11).
-10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles.
+5. Every `target_state` in every transition exists in `states`; a transition without one is internal.
+6. Every transition has a guard, and an `event_match` with a `msg`, a `src` or both, a `src` being a node name with its hive, never a `SY.*` or `RT.*` node; and every guard CEL expression compiles.
+7. Every action has a known `type` and valid parameters, and only the fields of its type: a field of another type is refused, by its path (a `forward` with a `name` instead of a `message` would forward the event).
+8. For `send_message` and `forward` actions, the `target` is syntactically a valid L2 name, without spaces around it, and not a `SY.*` or `RT.*` node. A `forward` has no `meta.msg` and no `payload` (it keeps the message's own), and the `message` it names is one a `keep_message` of the definition keeps.
+8a. No action has `meta.type`, `target_ref` or `thread_id_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 and 0.1.91 (every message a WF sends is a `user` message, to a node name written in the definition, on the instance's thread; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
+8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), and its `vars` is a JSON object.
+8c. A `meta.context.response_envelope` written in the definition (not a `$ref`) follows the rules the agent reads it with (`response_contract_to_output_schema_spec` in the AI SDK): `kind` `json_object_v1`; `required`, a non-empty list of names among the `properties`; `properties`, a non-empty object of properties each of `type` `string`, `boolean`, `integer` or `number`; an `enum`, a list of strings, only on a string; a `text_field`, when there is one, a string listed in `required` whose property is a string. An agent refuses a contract that breaks one, and the instance would wait for an answer that never comes.
+8d. On a transition matched on `msg` `TIMER_FIRED`, no `keep_message` and no `forward` without `message`, among its actions, its state's exit actions and its target's entry actions: a `TIMER_FIRED` is no node's message.
+9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is ≥ 60 seconds (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. A duration in days is at most `106751d`, the most a duration holds.
+10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
 
 Any failure returns a load error with a specific path to the offending element. The node does not accept events until the workflow loads successfully.
@@ -407,16 +416,18 @@ Entry actions run when the instance enters the state (including from `initial_st
     → [target state: entry_actions]
 ```
 
-If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `set_variable` and `emit_internal_event` (a lost message or an unset variable leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer.
+An **internal transition** (one without a `target_state`) runs its own actions only and stays in its state: no exit or entry actions run, so the state's timers keep running. An event that arrives early is noted without leaving the state (a due date that fires while an agent is answering, say), and the next state acts on it. A transition whose `target_state` is its own state leaves the state and enters it again.
+
+If an action fails, its `on_error` decides: `fail` halts the transition and routes the instance to its terminal `failed` state (running that state's entry actions, best-effort, when the definition declares it); `continue` logs the failure and goes on. The default is `fail` for `send_message`, `forward`, `keep_message`, `set_variable` and `emit_internal_event` (a lost message, a message not kept or an unset variable leaves the instance inconsistent), `continue` for the timer actions. A send to a node that is not connected is not a failure the WF sees: the router's `UNREACHABLE` comes back as a notice, which the WF does not answer.
 
 ### 9.2 Transition evaluation
 
-When an event arrives at an instance (resolved via `instance_id` in the event, or created as a new instance for initial trigger events), the runtime:
+When an event arrives at an instance (resolved by its `meta.thread_id`, the instance's thread, or created as a new instance for a trigger, §14.5), the runtime:
 
 1. Acquires the per-instance mutex.
 2. Loads the current state.
 3. Iterates transitions of the current state in declaration order.
-4. For each, evaluates `event_match` against the event's metadata.
+4. For each, evaluates `event_match` against the event: its `meta.msg` and its router-stamped sender.
 5. If matched, evaluates `guard` in the CEL environment.
 6. If guard evaluates to `true`, this transition is taken. Stop evaluation.
 7. If no transition matches, logs the event as "unhandled" and ignores it.
@@ -439,7 +450,7 @@ Variables are not globally visible across instances. Each instance has its own `
 
 ## 10. Actions (the primitive vocabulary)
 
-Actions are the side effects available to a workflow. The set is **fixed and small in v1**. A workflow cannot define custom actions. New action types require a runtime release.
+Actions are the side effects available to a workflow. The set is **fixed and small in v1**: `send_message`, `forward`, `keep_message`, the timer actions, `set_variable` and `emit_internal_event`. A workflow cannot define custom actions. New action types require a runtime release.
 
 ### 10.1 `send_message`
 
@@ -467,11 +478,13 @@ Fields:
 |---|---|
 | `target` | L2 name of the target node, written in the definition. Validated at load: a valid L2 name, never a `SY.*` or `RT.*` node. |
 | `meta.msg` | The `meta.msg` field of the outgoing message. |
-| `meta.context` | Optional. Resolved like the payload, and sent as the message's `meta.context` (to ask an agent for a structured answer: `{"response_envelope": {...}}`). |
-| `thread_id_ref` | Optional. A `$ref` path whose string replaces the outgoing `thread_id` (by default the `instance_id`), for a terminal reply to an external caller on its own thread. |
+| `meta.context` | Optional. A JSON object, resolved like the payload, and sent as the message's `meta.context` (to ask an agent for a structured answer: `{"response_envelope": {...}}`, which, written in the definition, is checked at load by the agent's rules, §8.5). It never writes `wf`, the WF's own block (§10.9). |
+| `vars` | Optional. A JSON object, resolved like the payload, sent in the WF's block as `meta.context.wf.vars`: the deterministic context the WF gives the receiver (§10.9). |
 | `payload` | JSON object. See payload substitution rules below. |
 
 Every message a WF sends is a `user` message: there is no `meta.type` (before 0.1.90 it defaulted to `system`, and an agent answered a system message from its control plane, so the instance waited forever). A WF that chooses among destinations writes one transition per destination, each with its guard and its `send_message` to a name written there; no destination is taken from data (`target_ref` left the language in 0.1.90).
+
+Every message an instance sends, a `send_message` or a `forward` (§10.7), carries the instance's thread (§14.3): the thread of the message that started it, the conversation's, or the instance's own id when that message had none. An agent keeps one memory per conversation, and its answer comes back on that thread, to the instance. `thread_id_ref`, which replaced the thread with one taken from data, left the language in 0.1.91, and is refused, by its path.
 
 **Payload substitution rules.**
 
@@ -532,9 +545,11 @@ Fields:
 | Field | Description |
 |---|---|
 | `timer_key` | A stable identifier for this timer within the instance. Must be unique within an instance. Used to cancel or reschedule it later. |
-| `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`). Minimum 60s. |
-| `fire_at` | Alternative to `fire_in`. ISO 8601 absolute UTC timestamp. |
+| `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`), or a `$ref` to one. Minimum 60s. |
+| `fire_at` | Alternative to `fire_in`. RFC 3339 absolute UTC timestamp, or a `$ref` to one, 60 s ahead at least. |
 | `missed_policy` | Forwarded to SY.timer. `"fire"`, `"drop"`, or `"fire_if_within"` with `missed_within_ms`. |
+
+**A time from state.** `fire_in` and `fire_at` take a `$ref` (with an optional literal `default`, §10.1), resolved when the action runs: the time can come from the instance's state or from an agent's answer, as when an invoice's due date sets the timer that checks its payment (`"fire_in": {"$ref": "state.invoice.due_in"}`). The value must then be a string that parses, and the 60 s floor is checked then; one that does not fails the action, under its `on_error` (a timer action continues by default, so a time an agent gives is worth `"on_error": "fail"`). A literal is checked at load.
 
 **Identification through `client_ref`.**
 
@@ -582,7 +597,7 @@ Changes the fire time of an existing scheduled timer.
 }
 ```
 
-Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op.
+Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op. Its `fire_in` or `fire_at` is a literal or a `$ref`, as in `schedule_timer`.
 
 ### 10.5 `set_variable`
 
@@ -669,7 +684,68 @@ If an instance reaches a terminal state, any queued internal events for that ins
 
 At most 100 internal events may follow one inbound event (its own transition's and the ones they lead to). One more fails the instance, with the cause `internal_event_cap`, instead of an `emit_internal_event` that emits itself again holding the node's receive loop forever.
 
-### 10.7 What is NOT in v1
+### 10.7 `forward`
+
+Sends a message on **as it was received** (since 0.1.91): the event's message, or one kept earlier with `keep_message` (§10.8). A WF that sits at an IO node's exit uses it to hand a person's message to the agent that holds the conversation, and the agent's answer back to the person, without touching the message's content.
+
+```json
+{
+  "type": "forward",
+  "target": "AI.invoice@worker1",
+  "message": "customer",
+  "meta": {
+    "context": {
+      "response_envelope": { "kind": "json_object_v1", "strict": true, "text_field": "reply", "required": ["reply"], "properties": { "reply": { "type": "string" } } }
+    }
+  },
+  "vars": { "order": { "$ref": "state.order" } }
+}
+```
+
+Fields:
+
+| Field | Description |
+|---|---|
+| `target` | L2 name of the target node, written in the definition, as for `send_message`. |
+| `message` | Optional. The name a `keep_message` kept a message under; without it, the event's message. |
+| `meta.context` | Optional. The keys the action writes over the message's own `meta.context`, resolved like a payload (`response_envelope`, say). It never writes `wf`. |
+| `vars` | Optional. As for `send_message`: `meta.context.wf.vars` (§10.9). |
+
+What goes out:
+
+- **The payload, byte for byte**, never decoded: its text, its attachments, the order of its keys and its numbers as they came (`1.10` stays `1.10`, `<b>` stays `<b>`).
+- **The meta is the message's**: every field of it but `memory_package` (its type, `msg`, `src_ilk`, `dst_ilk`, `ich`, `scope`, `priority`, `context` and any other), and the WF sets the thread and the context. The person's ILK travels intact, for the agent's memory and the IO node's delivery.
+- **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; and the WF's block, whose trail is the message's own and this node.
+
+A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` on a transition matched on `TIMER_FIRED` (§8.5).
+
+### 10.8 `keep_message`
+
+Keeps the event's message, whole and as received, under a name, for a later `forward` (since 0.1.91):
+
+```json
+{ "type": "keep_message", "name": "customer" }
+```
+
+- A later `keep_message` under the same name replaces it.
+- Kept messages are committed with the transition (§13.1, `wf_kept_messages`), survive a restart, and go when the instance ends.
+- It fails when the event is no message a node sent (a `TIMER_FIRED`, an internal event); its `on_error` defaults to `fail`. On a transition matched on `TIMER_FIRED` it is refused at load (§8.5).
+
+The pattern of a conversation: the initial state keeps the person's message (`customer`), and each state that hands the conversation to an agent forwards `customer` to it; a listening state keeps the person's next message under the same name.
+
+### 10.9 The WF's block: `meta.context.wf`
+
+Every message a WF sends, a `send_message` or a `forward`, carries the WF's block in `meta.context.wf` (since 0.1.91): deterministic context for the receiver, which an agent shows its model before the person's text.
+
+```json
+{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } } } }
+```
+
+- **`trail`** lists the nodes the message went through. A `forward` takes the message's own trail (or its sender's name, when it has none) and adds the WF's name; a `send_message` starts it with the WF's name. An agent's answer never carries the request's `wf` back, so a forwarded answer's trail starts at the agent.
+- **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
+- An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
+
+### 10.10 What is NOT in v1
 
 The following action types are intentionally excluded from v1 and reserved for future versions:
 
@@ -679,7 +755,7 @@ The following action types are intentionally excluded from v1 and reserved for f
 - `http_request` — direct HTTP calls
 - `fetch_data` — data retrieval from external sources
 
-Anything these would enable, v1 expresses through combinations of `send_message` and transitions on the response events. This is more verbose but keeps the runtime small and the semantics pure.
+Anything these would enable, v1 expresses through combinations of `send_message`, `forward` and transitions on the response events. This is more verbose but keeps the runtime small and the semantics pure.
 
 ## 11. Timers in WF
 
@@ -787,7 +863,7 @@ If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transit
 
 ### 13.1 What is stored
 
-Per WF node, a single SQLite file `wf_instances.db` (schema version 3, since 0.1.90) contains the tables below. It runs in WAL mode with `synchronous` `FULL`, as SY.timer's store does: a commit is on disk when it returns, so a power loss does not take back a transition whose messages went out (before 0.1.90 it was `NORMAL`).
+Per WF node, a single SQLite file `wf_instances.db` (schema version 4, since 0.1.91) contains the tables below. It runs in WAL mode with `synchronous` `FULL`, as SY.timer's store does: a commit is on disk when it returns, so a power loss does not take back a transition whose messages went out (before 0.1.90 it was `NORMAL`).
 
 **`wf_definitions`** — workflow definitions, kept by hash.
 
@@ -817,11 +893,13 @@ CREATE TABLE wf_instances (
     created_at_ms     INTEGER NOT NULL,
     updated_at_ms     INTEGER NOT NULL,
     terminated_at_ms  INTEGER,
-    definition_hash   TEXT NOT NULL DEFAULT ''
+    definition_hash   TEXT NOT NULL DEFAULT '',
+    thread_id         TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 ```
 
-`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart.
+`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance.
 
 **`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
 
@@ -830,6 +908,22 @@ Cap per instance: 100 entries, FIFO. Older entries are pruned when adding new on
 **`wf_instance_timers`** — the index of the timers each instance has scheduled (`instance_id`, `timer_key`, `scheduled_at_ms`, `fire_at_ms`), reconciled with SY.timer at startup (§11.4).
 
 **`wf_internal_events`** — durable FIFO queue of internal synthetic events emitted by `emit_internal_event` and not yet consumed (`event_id`, `instance_id`, `msg_type`, `msg_name`, `payload_json`, `trace_id`, `created_at_ms`, `attempts`). These rows are transient runtime state, not history. They exist only until the corresponding internal event is consumed or the instance terminates.
+
+**`wf_kept_messages`** — the messages `keep_message` kept (§10.8), by instance and name, whole and as received (`message_json`); committed with the transition, and dropped when the instance ends.
+
+```sql
+CREATE TABLE wf_kept_messages (
+    instance_id   TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    message_json  TEXT NOT NULL,
+    kept_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, name)
+);
+```
+
+A store of schema version 3 migrates at the node's start: each instance takes its own id as its thread, which is what its sends carried.
+
+**The upgrade to 0.1.91.** A definition written before 0.1.91 no longer loads: it has no `start_from`, and may have `thread_id_ref`. Its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with `start_from`, and the running instances born with such a definition fail at the next start (`definition_unavailable`).
 
 **`wf_inbound_events`** — the inbound journal: an event the runtime took and has not finished, with the starts that ran it again (`attempts`, §14.4).
 
@@ -848,7 +942,7 @@ CREATE TABLE wf_inbound_events (
 
 - Full transition history with CEL evaluation details — too verbose, not needed for the documented introspection use cases.
 - Intermediate snapshots of `state` per transition — only the current `state_json` is kept.
-- Raw incoming messages — only the derivative log entries. An inbound event stays in `wf_inbound_events` only until its transition commits.
+- Raw incoming messages — only the derivative log entries. An inbound event stays in `wf_inbound_events` only until its transition commits, and a message `keep_message` kept stays in `wf_kept_messages` only until its instance ends.
 - Outgoing messages beyond their log entry — the message itself is not saved.
 - Consumed internal events — only pending internal events remain in `wf_internal_events`; once consumed, they are deleted.
 
@@ -865,9 +959,9 @@ In v1, true event-sourced replay is **not** implemented — only the current sta
 When a WF node restarts:
 
 1. Opens `wf_instances.db` and keeps the definition it runs (by its hash).
-2. Loads all instances with `status IN ('running', 'cancelling')`, each on the definition it was born with; fails those whose definition is not available (`definition_unavailable`) or does not have their current state (`state_not_in_definition`).
+2. Loads all instances with `status IN ('running', 'cancelling')`, each on the definition it was born with, on its thread, with the messages it kept; fails those whose definition is not available (`definition_unavailable`) or does not have their current state (`state_not_in_definition`).
 3. Drains any pending internal events for each recovered instance, in FIFO order, until each queue is empty or the instance becomes terminal, each one counting its attempt first (§14.4).
-4. Runs again every inbound event left in `wf_inbound_events`, in the order they came: an event of an instance, or a creation under the `instance_id` it had, each one counting its attempt first; one already run at 3 starts is not run again (§14.4).
+4. Runs again every inbound event left in `wf_inbound_events`, in the order they came: an event of an instance, or a creation under the `instance_id` it had (when the current definition still starts from its sender), each one counting its attempt first; one already run at 3 starts is not run again (§14.4).
 5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, it starts `DEGRADED` and reconciles from the receive loop.
 6. Drops the definitions no running instance uses, and enters the receive loop.
 
@@ -914,7 +1008,7 @@ Handlers:
 - `WF_GET_CODE` — returns the current workflow definition.
 - `TIMER_FIRED` — from SY.timer of its own hive only, for a timer this node scheduled: routes to the instance its `client_ref` names (§11.2).
 - Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too).
-- Any other message — matched against a running instance by `meta.thread_id`, or, if it is no reply and no late answer, and it matches the `input_schema`, creates a new instance (§14.5).
+- Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread (§14.5).
 
 The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `ECHO`, `ECHO_REPLY`, `UNREACHABLE`, `TTL_EXCEEDED`, `TIMER_HELP`, or a system message without a name — SY.timer's rule and the AI nodes'.
 
@@ -922,14 +1016,14 @@ Internal events emitted by `emit_internal_event` do **not** enter through this i
 
 ### 14.3 Instance creation
 
-When an incoming event looks like a trigger (no running instance on its thread, it is no reply and no late answer, and its payload matches the `input_schema`):
+When an incoming event looks like a trigger (it comes from a `start_from` node, no running instance holds its thread, it is no reply, and its payload matches the `input_schema`):
 
 1. Validate payload against `input_schema`.
 2. If validation fails, respond with `INVALID_INPUT` error — only to a named request: a message without a name, a reply and a notice are never answered (§14.5).
-3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it.
+3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it. The instance's thread is the event's `meta.thread_id`, the conversation's, or the `instance_id` when the event has none; every message the instance sends carries it.
 4. Acquire the per-instance mutex.
 5. Run entry actions of the initial state.
-6. In one commit: create the instance row (`current_state = initial_state`, or terminal; `input_json = <payload>`; its definition's hash), enqueue its internal events, and delete the journaled event. A crash before this commit leaves no instance at all, and the journaled creation for recovery, which runs it again under the same `instance_id`.
+6. In one commit: create the instance row (`current_state = initial_state`, or terminal; `input_json = <payload>`; its definition's hash; its thread), enqueue its internal events, write the messages it kept, and delete the journaled event. A crash before this commit leaves no instance at all, and the journaled creation for recovery, which runs it again under the same `instance_id`.
 7. Drain the instance's internal event queue until empty or terminal.
 8. Release mutex.
 
@@ -959,29 +1053,29 @@ The alternative — guaranteeing exactly-once through write-ahead logging of pen
 
 ### 14.5 Event correlation: which instance does this event belong to?
 
-When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or invalid. The resolution order is strict:
+When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or neither. An instance is a conversation: it lives on the thread of the message that started it (§14.3). Only the nodes written in the definition drive an instance (FINDINGS A-123): those of its `start_from`, of an `event_match.src`, and the targets of its `send_message` and `forward` actions, plus SY.timer for the WF's own timers. The resolution order is strict (since 0.1.91):
 
 1. **If `meta.msg == "TIMER_FIRED"`**: taken only from SY.timer of the WF's own hive, and only for a timer this node scheduled (`owner_l2_name`). The event is for the instance its `client_ref` names. If the instance does not run (terminated, expired, never existed), log "orphaned timer" and discard.
 
-2. **If `meta.thread_id` is present and matches a running instance**: the event is for that instance. This is the standard mechanism for response messages from AI / IO nodes that the WF previously contacted via `send_message`. The WF runtime sets `meta.thread_id = instance_id` on outgoing `send_message` actions, and target nodes are expected to copy this value to the `meta.thread_id` of their response.
+2. **If the sender is no node the definition involves**: log and discard, never answered. On the thread of a running instance, that instance's own definition decides (it may be older than the current one, §13.1); otherwise the current definition.
 
-3. **If it is a reply** — any `*_RESPONSE`, an `INVALID_INPUT`, or an agent's error (`<msg>.error`) — that matched no instance: log and discard. A reply never starts an instance and is never answered, so two WFs cannot bounce an `INVALID_INPUT` (FINDINGS A-119).
+3. **If `meta.thread_id` is the thread of a running instance**: the event is for that instance. This is how a person's next message reaches their conversation's instance, and how the answer of an AI / IO node the WF contacted comes back: the WF sets `meta.thread_id` to the instance's thread on every message it sends, and target nodes are expected to copy this value to the `meta.thread_id` of their response. An event the instance's current state has no transition for is logged and dropped (§8.3): it is never queued for a later state.
 
-4. **If `meta.thread_id` names an instance of this node that ended** (its timer fired, it was cancelled or failed, or a first copy of the answer finished it): a late answer. Log and discard, never answered. An agent answers with the request's own `msg` and thread, so step 3 does not see it, and as a new instance it would ask the agent again: a WF↔AI loop. A thread that names another node's instance (a WF that sends to this one carries its own) is no instance of this node, and goes on to step 5.
+4. **If the sender is a `start_from` node and the message is no reply** (a reply is any `*_RESPONSE`, an `INVALID_INPUT`, or an agent's error named `<msg>.error`): a new instance on its thread (§14.3), as the `input_schema` allows. If the schema refuses it, respond with `INVALID_INPUT`, unless the message has no name: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce an `INVALID_INPUT` (FINDINGS A-119).
 
-5. **Otherwise**: try to interpret the event as a new instance trigger. Validate the payload against the workflow's `input_schema`. If valid, create a new instance with this event as the trigger (§14.3). If invalid, respond with `INVALID_INPUT` error, unless the message has no name.
+5. **Otherwise** — an answer to an instance that ended (its timer fired, it was cancelled or failed, or a first copy of the answer finished it), say: log and discard, never answered. An agent answers with the request's own `msg` and thread; as a new instance it would ask the agent again, a WF↔AI loop.
 
-A `system` message other than a `TIMER_FIRED` never reaches this order: it is dropped before (§14.2).
+So a person who writes again after their conversation's instance ended starts a new one on the same thread, at the initial state. A late answer from a node outside `start_from` (an agent's) is dropped only while no instance runs on its thread: once the conversation's next instance runs there, the late answer reaches it (step 3), like any message on its thread from a node the definition names. A `system` message other than a `TIMER_FIRED` never reaches this order: it is dropped before (§14.2).
 
 `emit_internal_event` is outside this correlation order. Once committed, it is already attached to a specific instance in `wf_internal_events` and is consumed from there directly by the runtime.
 
 This order is fixed in v1 and not configurable. It reflects the reality of how messages flow in Fluxbee:
 
 - Timer events have explicit instance correlation in their `client_ref`.
-- Response messages preserve thread context via thread_id.
-- Trigger messages either carry a fresh thread_id or no correlation at all.
+- A conversation keeps its thread, from the IO node through the WF to the agents and back.
+- A trigger comes from a node the definition names in `start_from`, on a thread no instance holds.
 
-**Contract for nodes responding to a WF**: when you receive a message from a WF (typically a `send_message` action), copy `meta.thread_id` into the `meta.thread_id` of your response. This is how the WF correlates your response with the instance that asked the question. If you don't preserve thread_id, your response will be treated as a new instance trigger, which is almost certainly not what you want.
+**Contract for nodes responding to a WF**: when you receive a message from a WF (a `send_message` or a `forward`), copy `meta.thread_id` into the `meta.thread_id` of your response. This is how the WF correlates your response with the instance that asked the question. If you don't preserve thread_id, your response reaches no instance and is dropped.
 
 This contract is implicit in many systems (HTTP correlation IDs, RPC call IDs, etc.) but here it is explicit and load-bearing. The WF cannot work without it.
 
@@ -1004,7 +1098,7 @@ Response (for §19.2's workflow):
   "payload": {
     "ok": true,
     "workflow_type": "invoice",
-    "description": "Issues an invoice: has the customer's data checked, creates the invoice and has it delivered; tells the billing agent what is missing.",
+    "description": "Issues an invoice the billing system asks for: has the customer's data checked, creates the invoice and has the billing agent deliver it; tells the billing agent what is missing.",
     "initial_state": "validating_data",
     "states": ["validating_data", "missing_data_requested", "creating_invoice", "delivering_to_customer", "completed", "failed", "cancelled"],
     "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
@@ -1013,7 +1107,7 @@ Response (for §19.2's workflow):
 }
 ```
 
-`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is OPA's (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
+`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is the definition's `start_from` (§8.1), among the senders OPA lets through (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
 
 Archi does not read `WF_HELP` today (§19.5).
 
@@ -1061,6 +1155,7 @@ Returns compact rows:
     "instances": [
       {
         "instance_id": "wfi:550e8400-e29b-41d4-a716-446655440000",
+        "thread_id": "conv-7c1e",
         "workflow_type": "invoice",
         "definition_hash": "4f1c9a0e7d2b...",
         "status": "running",
@@ -1084,6 +1179,7 @@ SY.wf-rules reads `ok` and `count` of it (`{"status": "running", "limit": 0}`) f
     "ok": true,
     "instance": {
       "instance_id": "wfi:550e8400-e29b-41d4-a716-446655440000",
+      "thread_id": "conv-7c1e",
       "workflow_type": "invoice",
       "definition_hash": "4f1c9a0e7d2b...",
       "status": "running",
@@ -1107,7 +1203,7 @@ SY.wf-rules reads `ok` and `count` of it (`{"status": "running", "limit": 0}`) f
 }
 ```
 
-The keys are these, in snake_case, since 0.1.90 (before, the instances went out with the store's Go field names). A refusal is `{"ok": false, "error": "<code>", "detail": "..."}` (`INVALID_REQUEST`, `INSTANCE_NOT_FOUND`, `STORE_ERROR`).
+The keys are these, in snake_case, since 0.1.90 (before, the instances went out with the store's Go field names); `thread_id`, the instance's thread (§14.3), since 0.1.91. A refusal is `{"ok": false, "error": "<code>", "detail": "..."}` (`INVALID_REQUEST`, `INSTANCE_NOT_FOUND`, `STORE_ERROR`).
 
 Read-only. No ability to modify state or force transitions.
 
@@ -1115,7 +1211,7 @@ Read-only. No ability to modify state or force transitions.
 
 ### 17.1 The model
 
-Authorization for triggering a WF lives entirely in OPA. The WF node itself does not authorize — it trusts the router, which trusts OPA, which reads identity data from the SHM region written by `SY.identity`.
+Authorization for triggering a WF lives entirely in OPA. The WF node itself does not authorize — it trusts the router, which trusts OPA, which reads identity data from the SHM region written by `SY.identity`. What the WF does check is deterministic and written in its definition (since 0.1.91): it takes workflow traffic only from the nodes the definition names, and starts an instance only from those of its `start_from` (§14.5).
 
 For v1 of WF, authorization is expressed using the primitives that identity v2 already provides:
 
@@ -1128,27 +1224,21 @@ This is sufficient for the vast majority of real authorization cases. More granu
 
 ### 17.2 Example: authorize `WF.invoice`
 
-Typical rule: only AI nodes in the billing family, and fully-registered human operators, may initiate an invoice workflow.
+Typical rule: only the billing system's IO node may ask for an invoice, and only on behalf of a fully-registered human. Who starts an instance is, besides, the definition's `start_from` (§14.5): OPA lets a message through, and the definition decides what it does.
 
 ```rego
-# AI billing nodes can invoice
+# the billing system's IO node asks for invoices
 allow {
     input.routing.dst == "WF.invoice@motherbee"
     input.meta.msg == "INVOICE_REQUEST"
-    startswith(input.routing.src_l2_name, "AI.billing")
-}
-
-# fully-registered humans can invoice
-allow {
-    input.routing.dst == "WF.invoice@motherbee"
-    input.meta.msg == "INVOICE_REQUEST"
+    input.routing.src_l2_name == "IO.api.billing@motherbee"
     src := data.identity[input.meta.src_ilk]
     src.ilk_type == "human"
     src.registration_status == "complete"
 }
 ```
 
-Both rules combine into "the source is either an AI billing node or a complete human ILK". Anyone else — including agents from other families, temporary humans, or system nodes not explicitly authorized — is rejected.
+Anyone else — other IO nodes, temporary humans, or system nodes not explicitly authorized — is rejected. An agent never asks: it only answers (§5.1).
 
 ### 17.3 Example: authorize `WF.payment-reconciliation` (webhook-only)
 
@@ -1174,7 +1264,7 @@ allow {
     input.meta.msg == "INVOICE_REQUEST"
     src := data.identity[input.meta.src_ilk]
     src.tenant_id == "tnt:pilot-customer-uuid"
-    src.ilk_type == "agent"
+    src.ilk_type == "human"
 }
 ```
 
@@ -1182,7 +1272,7 @@ allow {
 
 - The WF does not inspect identity data itself.
 - The WF does not maintain its own authorization rules or allowlists.
-- The WF does not validate the source of workflow traffic beyond the input schema. It does check the sender of its control verbs (SY.admin@motherbee and SY.wf-rules of its hive) and of a `TIMER_FIRED` (SY.timer of its hive, for a timer the WF scheduled), which the router does not protect.
+- The WF does not validate the source of workflow traffic beyond the input schema and the nodes its definition names (`start_from`, `event_match.src`, the targets of its sends; §14.5). It does check the sender of its control verbs (SY.admin@motherbee and SY.wf-rules of its hive) and of a `TIMER_FIRED` (SY.timer of its hive, for a timer the WF scheduled), which the router does not protect.
 
 All authorization is upstream, in OPA, reading identity v2 data. The WF simply receives messages that passed the gate and executes deterministically. If a WF instance receives a message, it trusts that the router (through OPA) approved it.
 
@@ -1221,10 +1311,10 @@ This is the reference example used throughout the document. It demonstrates all 
 
 ### 19.1 Business description
 
-The task: when a customer (or an AI agent on their behalf) requests an invoice, the workflow must:
+The task: when the billing system asks for an invoice for a customer, through its IO node (`IO.api.billing@motherbee`), the workflow must:
 
 1. Have an AI node check that the customer data is complete enough to invoice, for a structured answer.
-2. If incomplete, tell the billing agent (the AI node in the conversation with the customer) what is missing, and end. The customer answers the agent, through the IO node of their channel, never this instance; the agent requests the invoice again once it has the data.
+2. If incomplete, tell the billing agent (the AI node in the conversation with the customer) what is missing, and end. The agent asks the customer, who answers it through the IO node of their channel, never this instance; the billing system asks for the invoice again once it has the data.
 3. Once complete, invoke an external invoicing system (IO.quickbooks) to create the invoice.
 4. Wait for confirmation of invoice creation.
 5. Have the billing agent deliver the invoice to the customer, for a structured answer.
@@ -1238,7 +1328,8 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
 {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
-  "description": "Issues an invoice: has the customer's data checked, creates the invoice and has it delivered; tells the billing agent what is missing.",
+  "description": "Issues an invoice the billing system asks for: has the customer's data checked, creates the invoice and has the billing agent deliver it; tells the billing agent what is missing.",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id", "items"],
@@ -1283,7 +1374,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
                 "required": ["complete", "missing"],
                 "properties": {
                   "complete": { "type": "boolean" },
-                  "missing": { "type": "array", "items": { "type": "string" } }
+                  "missing": { "type": "string" }
                 }
               }
             }
@@ -1317,7 +1408,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
             {
               "type": "set_variable",
               "name": "missing_data_request",
-              "value": "'The invoice for customer %s needs: %s. Ask the customer, then request the invoice again.'.format([input.customer_id, json_parse(event.payload.content).missing.join(', ')])"
+              "value": "'The invoice for customer %s cannot be issued yet: it needs %s. Ask the customer for it.'.format([input.customer_id, json_parse(event.payload.content).missing])"
             }
           ]
         },
@@ -1341,7 +1432,7 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
     },
     {
       "name": "missing_data_requested",
-      "description": "Terminal: tells the billing agent what is missing. The customer answers the agent, never this instance; the agent requests the invoice again.",
+      "description": "Terminal: tells the billing agent what is missing, and ends. The agent asks the customer, who answers it, never this instance; the billing system asks for the invoice again once it has the data.",
       "entry_actions": [
         {
           "type": "send_message",
@@ -1501,8 +1592,9 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
 
 - **All four WF properties present:** multi-step (validation → creation → delivery), memory between steps (state variables accumulating), deterministic (every transition is a guard-based decision, no ambiguity), lives in time (timers of minutes to 24 hours).
 - **Clean separation AI/WF/IO:** the WF delegates ambiguous work (validating data sufficiency, delivering the invoice to a person) to AI nodes, and the structured work (creating the invoice) to an IO node. The WF itself does no reasoning.
-- **Asking an agent:** the WF writes the agent a text (`set_variable` builds it with CEL's `format`, and `$ref` carries it), asks for a structured answer (`meta.context.response_envelope`), and branches on its fields with `json_parse(event.payload.content)`. The agent answers with the request's own `msg` (`VALIDATE_INVOICE_DATA`), never a `*_RESPONSE`, and its error as `<msg>.error`, which has a transition of its own.
-- **No wait for a person:** a person answers the agent of their conversation, never a WF instance, so `missing_data_requested` tells the agent and ends. The agent's acknowledgement then names an instance that ended: a late answer, which the WF drops (§14.5) instead of starting a new instance with it.
+- **Asking an agent:** the WF writes the agent a text (`set_variable` builds it with CEL's `format`, and `$ref` carries it), asks for a structured answer (`meta.context.response_envelope`, whose fields are scalars: the agent takes a string, boolean, integer or number), and branches on its fields with `json_parse(event.payload.content)`. The agent answers with the request's own `msg` (`VALIDATE_INVOICE_DATA`), never a `*_RESPONSE`; its error answer is a payload of type `error`, named `<msg>.error` because the request has a `msg`, and has a transition of its own.
+- **Who starts it:** `IO.api.billing@motherbee`, the billing system's IO node, the only node in `start_from`. The instance lives on the thread of its request, and every message the instance sends carries that thread. The agents are targets: they answer, and start nothing.
+- **No wait for a person:** a person answers the agent of their conversation, never a WF instance, so `missing_data_requested` tells the agent and ends. The agent's acknowledgement then comes from a node outside `start_from`, on a thread no instance holds: it is dropped (§14.5), instead of starting a new instance.
 - **A field that may be missing:** `currency` is optional, so its `$ref` gives a default (`USD`); a `$ref` without one fails the action when the field is not there.
 - **Timer usage:** SLA-style timeouts at every wait state, cancelled on exit. This is the standard pattern.
 - **Failure handling:** every wait state has a timer-driven path to `failed`, with the reason stored as a variable for post-mortem.
@@ -1510,31 +1602,32 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
 
 ### 19.4 Authorization in OPA for this example
 
-With identity v2, the authorization rule for `WF.invoice` uses source L2 name matching and ILK type:
+Who starts an instance is the definition's `start_from`: `IO.api.billing@motherbee`. With identity v2, OPA decides, besides, which messages reach `WF.invoice` at all, by source L2 name and ILK type:
 
 ```rego
-# AI billing nodes are allowed
+# the billing system's IO node, for fully-registered humans
 allow {
     input.routing.dst == "WF.invoice@motherbee"
-    input.meta.msg == "INVOICE_REQUEST"
-    startswith(input.routing.src_l2_name, "AI.billing")
-}
-
-# fully-registered humans are allowed
-allow {
-    input.routing.dst == "WF.invoice@motherbee"
-    input.meta.msg == "INVOICE_REQUEST"
+    input.routing.src_l2_name == "IO.api.billing@motherbee"
     src := data.identity[input.meta.src_ilk]
     src.ilk_type == "human"
     src.registration_status == "complete"
 }
+
+# the nodes the workflow asks, answering
+answering := {"AI.billing-validator@motherbee", "AI.billing@motherbee", "IO.quickbooks@motherbee"}
+
+allow {
+    input.routing.dst == "WF.invoice@motherbee"
+    answering[input.routing.src_l2_name]
+}
 ```
 
-This means any AI agent whose L2 name starts with `AI.billing` can trigger an invoice flow, as can any human ILK that has completed registration. Temporary humans, support agents, sales agents, and IO nodes without explicit permission are rejected.
+The first rule lets the billing system ask for an invoice on behalf of a human ILK that has completed registration; the second lets the answers through. Neither starts anything by itself: an answer reaches only the running instance on its thread, and only a `start_from` node starts one (§14.5).
 
 ### 19.5 What Archi sees when designing new workflows
 
-Archi cannot read `WF_HELP` today: a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (§15), and SY.admin has no WF action that asks it and shows the answer (§16). What Archi reads is the definition, through SY.wf-rules (`wf_rules_get_workflow`: the current definition, its version and hash), and the input schema in it. If Archi designs a new billing-related AI agent and names it `AI.billing.collections@motherbee`, the OPA rule above accepts it because of the prefix match — no policy change needed.
+Archi cannot read `WF_HELP` today: a WF answers it only to `SY.admin@motherbee` and `SY.wf-rules` of its hive (§15), and SY.admin has no WF action that asks it and shows the answer (§16). What Archi reads is the definition, through SY.wf-rules (`wf_rules_get_workflow`: the current definition, its version and hash), and the input schema and `start_from` in it. If Archi adds a source of invoice requests (another IO node, or another WF), it names it in the definition's `start_from`, and a redeploy applies it; OPA has to let its messages through too. An agent is never one: it only answers.
 
 This is the Archi-first loop: definitions as data, simple OPA rules using identity primitives, deterministic execution.
 
@@ -1560,10 +1653,11 @@ This is the Archi-first loop: definitions as data, simple OPA rules using identi
 | `$ref` wrapper for payload substitution | Avoids ambiguity between literal strings and path lookups; supports any JSON type |
 | `client_ref` deterministic timer identification | Eliminates race window between schedule and operation; requires SY.timer v1.1 |
 | At-least-once with downstream idempotency | Honest contract; alternative (exactly-once with WAL) too complex for v1 |
-| Strict event correlation order | The WF's own timer first (by its `client_ref`), then a running instance's thread, then replies and late answers dropped, then a new instance (§14.5) — predictable, no ambiguity |
+| Strict event correlation order | The WF's own timer first (by its `client_ref`), then a sender the definition does not name dropped, then a running instance's thread, then a new instance from a `start_from` node, and anything else dropped (§14.5) — predictable, no ambiguity |
+| One instance per conversation | An instance lives on the thread of the message that started it, so the agents keep one memory per conversation and a person's next message reaches it (since 0.1.91) |
 | WF owns timer recovery on restart | The WF is the only one that can update instance state when a timer fires; reconciliation is its responsibility |
 | No override from admin (read-only) | If a WF is stuck, fix the code and redeploy; never patch runtime state |
-| Who may start an instance is OPA's, consuming identity v2 primitives (`ilk_type`, `registration_status`, L2 name patterns) | Centralized policy, agnostic to future identity evolution; the WF itself checks only what the router does not protect: the senders of its control verbs and of a `TIMER_FIRED`, and the owner of a fired timer (§17.5) |
+| Who may send a WF anything is OPA's, consuming identity v2 primitives (`ilk_type`, `registration_status`, L2 name patterns) | Centralized policy, agnostic to future identity evolution; the WF itself checks what its definition writes (the nodes that start and drive an instance, §14.5) and what the router does not protect: the senders of its control verbs and of a `TIMER_FIRED`, and the owner of a fired timer (§17.5) |
 | Archi-first format | LLM consumers dominate the author base; humans are observers |
 | Each WF node runs exactly one workflow type | Monolithic instances, clean contract, easier to reason about |
 | Frozen workflow definition per instance | Instances outlive workflow updates; new version for new instances only |
@@ -1580,7 +1674,7 @@ This list is intentional. Each item was considered and deferred:
 - **Event sourcing with full replay.** Only current state is persisted. Future v2 may add an event log.
 - **Cross-instance queries.** "Give me all instances waiting on customer X" is not supported directly. Can be emulated by indexing state variables, but v1 does not provide this.
 - **Direct admin mutations.** No `wf_cancel_instance` or similar in admin. A cancel is a `WF_CANCEL_INSTANCE` from `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive; an operator sends it through SY.admin's `send_node_message` (§16).
-- **Scheduled starts.** An instance is started only by a message that is no reply and no late answer, never a `system` one (§14.2, §14.5). A `TIMER_FIRED` reaches only the running instance whose timer it is, so a timer on SY.timer whose target is the WF node starts nothing; a time-based start is not built (`docs/wf-orchestration-v1.md` §4.4).
+- **Scheduled starts.** An instance is started only by a message from a `start_from` node that is no reply, never a `system` one (§14.2, §14.5). A `TIMER_FIRED` reaches only the running instance whose timer it is, so a timer on SY.timer whose target is the WF node starts nothing; a time-based start is not built (`docs/wf-orchestration-v1.md` §4.4).
 
 ## 21. v1 limitations (explicit)
 
@@ -1590,7 +1684,7 @@ Workflow authors should be aware of these limits.
 
 - **Guard evaluation: 10 ms.** A guard is stopped at its timeout, and counts as false (§9.3).
 - **`set_variable` evaluation: 1,000,000 CEL cost units.** Past it the action fails (§10.5).
-- **Minimum timer duration: 60 seconds**, checked at load (SY.timer's own minimum).
+- **Minimum timer duration: 60 seconds** (SY.timer's own minimum), checked at load for a literal, and when the action runs for a `$ref` (§10.2).
 - **100 log entries per instance**, FIFO.
 - **Retention: 7 days for terminated instances** (default, configurable).
 - **At most 100 internal events after one event** (`internal_event_cap`).
@@ -1641,4 +1735,4 @@ Operational note: for managed `WF.*` nodes, `GET /hives/{hive}/nodes/{node_name}
 | **`state_json`** | The serialized current variables of an instance. |
 | **Soft abort** | Cancellation that stops future processing but does not reverse past side effects. |
 | **Terminal state** | A state declared as ending the instance. No transitions out. |
-| **Trigger pattern** | What starts a new instance: a message that is no `system` one, no reply and no late answer, whose payload the `input_schema` accepts (§14.5). Who may send one is OPA's. |
+| **Trigger pattern** | What starts a new instance: a message from a node in the definition's `start_from`, on a thread no running instance holds, that is no `system` one and no reply, whose payload the `input_schema` accepts (§14.5). OPA decides, besides, who may send the WF anything. |

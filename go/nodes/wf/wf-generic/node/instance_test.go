@@ -182,7 +182,7 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", validWorkflowJSON(), nil)
 
-	msg := from("AI.billing@motherbee", msgWithNameAndPayload("INVOICE_START", map[string]any{
+	msg := from("IO.api.billing@motherbee", msgWithNameAndPayload("INVOICE_START", map[string]any{
 		"wrong_field": "missing required customer_id",
 	}))
 	msg.Routing.Src = "src-uuid-1"
@@ -671,7 +671,7 @@ func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
 		t.Errorf("unexpected state change: %s", inst.CurrentState)
 	}
 	logs, _ := rt.Store.GetRecentLog(context.Background(), inst.InstanceID, 5)
-	if len(logs) == 0 || logs[0].Summary != "unhandled event TIMER_FIRED in state collecting_data" {
+	if len(logs) == 0 || logs[0].Summary != "unhandled event TIMER_FIRED from SY.timer@motherbee in state collecting_data" {
 		t.Fatalf("the fire must reach the instance: %+v", logs)
 	}
 }
@@ -684,9 +684,10 @@ func TestThreadIDCorrelation(t *testing.T) {
 	_ = rt.Store.CreateInstance(context.Background(), row)
 	rt.Registry.Add(inst)
 
-	// Message with thread_id = instance_id
+	// Message with thread_id = the instance's thread (its id: no thread started it), from the node
+	// the instance asked
 	threadID := "wfi:thread-test"
-	event := from("IO.validator@motherbee", sdk.Message{
+	event := from("IO.quickbooks@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-2"},
 		Meta: sdk.Meta{
 			MsgType:  "user",
@@ -780,7 +781,7 @@ func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
 func TestCreateAndDispatchDrainsInitialInternalEvent(t *testing.T) {
 	rt, _ := newTestRuntime(t, "", workflowJSONWithInitialInternalEvent(), nil)
 
-	msg := from("AI.billing@motherbee", msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"}))
+	msg := from("IO.api.billing@motherbee", msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"}))
 	if err := Dispatch(context.Background(), msg, rt); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -907,6 +908,7 @@ func workflowJSONWithInternalTransition() string {
   "wf_schema_version": "1",
   "workflow_type": "internal-transition",
   "description": "emit internal event from transition",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],
@@ -969,6 +971,7 @@ func workflowJSONWithInitialInternalEvent() string {
   "wf_schema_version": "1",
   "workflow_type": "initial-internal",
   "description": "emit internal event from initial entry actions",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],
@@ -1015,6 +1018,7 @@ func workflowJSONWithTwoInternalEvents() string {
   "wf_schema_version": "1",
   "workflow_type": "fifo-internal",
   "description": "multiple internal events preserve order",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],
@@ -1098,6 +1102,7 @@ func workflowJSONWithTargetEntryInternalEvent() string {
   "wf_schema_version": "1",
   "workflow_type": "entry-internal",
   "description": "target entry emits internal event",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],

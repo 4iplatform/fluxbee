@@ -1,0 +1,377 @@
+{
+  "wf_schema_version": "1",
+  "workflow_type": "sales.invoice",
+  "description": "Case 1 of wf-orchestration-v1 (§5.2): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales; when sales answers area invoice, the conversation goes to AI.invoice, which holds it until it hands it back (area sales: its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. A person's message costs two agent calls at most. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error or an answer that does not come in 120 s is noted in last_error, and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
+  "start_from": ["IO.api.sales@worker1"],
+  "input_schema": {
+    "type": "object",
+    "required": ["type"],
+    "properties": {
+      "type": { "type": "string" }
+    }
+  },
+  "initial_state": "start",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "start",
+      "description": "Keeps the person's message (customer) and their context.io, and moves on to sales.",
+      "entry_actions": [
+        { "type": "keep_message", "name": "customer" },
+        { "type": "set_variable", "name": "io", "value": "event.context.io" },
+        { "type": "set_variable", "name": "invoice_pending", "value": "false" },
+        { "type": "set_variable", "name": "payment_overdue", "value": "false" },
+        { "type": "emit_internal_event", "meta": { "msg": "TO_SALES" } }
+      ],
+      "exit_actions": [],
+      "transitions": [
+        { "event_match": { "msg": "TO_SALES" }, "guard": "true", "target_state": "sales_thinking", "actions": [] }
+      ]
+    },
+    {
+      "name": "sales_thinking",
+      "description": "Sales holds the conversation: the person's message (customer) goes to AI.sales with its contract (reply, area, product, quantity, unit_price). Area invoice hands the conversation to invoice, with the order kept in state; any other answer goes to the person. Entered only from a person's message. A message from the person meanwhile goes to sales too; a payment_due meanwhile is noted, and acted on in the next listening state. An error or no answer in 120 s goes back to listening, noted in last_error.",
+      "entry_actions": [
+        {
+          "type": "forward",
+          "target": "AI.sales@worker1",
+          "message": "customer",
+          "meta": {
+            "context": {
+              "response_envelope": {
+                "kind": "json_object_v1",
+                "strict": true,
+                "text_field": "reply",
+                "required": ["reply", "area", "product", "quantity", "unit_price"],
+                "properties": {
+                  "reply": { "type": "string" },
+                  "area": { "type": "string", "enum": ["sales", "invoice"] },
+                  "product": { "type": "string" },
+                  "quantity": { "type": "integer" },
+                  "unit_price": { "type": "number" }
+                }
+              }
+            }
+          }
+        },
+        { "type": "schedule_timer", "timer_key": "sales_timeout", "fire_in": "120s" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "sales_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: error'" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.area == 'invoice'",
+          "target_state": "invoice_thinking",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "order",
+              "value": "{'product': event.context.evaluation.product, 'quantity': event.context.evaluation.quantity, 'unit_price': event.context.evaluation.unit_price}"
+            }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "true",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "message": "customer",
+              "meta": {
+                "context": {
+                  "response_envelope": {
+                    "kind": "json_object_v1",
+                    "strict": true,
+                    "text_field": "reply",
+                    "required": ["reply", "area", "product", "quantity", "unit_price"],
+                    "properties": {
+                      "reply": { "type": "string" },
+                      "area": { "type": "string", "enum": ["sales", "invoice"] },
+                      "product": { "type": "string" },
+                      "quantity": { "type": "integer" },
+                      "unit_price": { "type": "number" }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'sales_timeout'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: timeout'" } ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
+        }
+      ]
+    },
+    {
+      "name": "sales_listening",
+      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
+      "entry_actions": [
+        { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
+        { "type": "emit_internal_event", "meta": { "msg": "CHECK_PAYMENT" } }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "idle" } ],
+      "transitions": [
+        { "event_match": { "msg": "CHECK_PAYMENT" }, "guard": "state.payment_overdue", "target_state": "payments_thinking", "actions": [] },
+        { "event_match": { "msg": "CHECK_PAYMENT" }, "guard": "true", "actions": [] },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "target_state": "sales_thinking",
+          "actions": [ { "type": "keep_message", "name": "customer" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.payload.type != 'error'",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.payload.type != 'error'",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "AI.payments@worker1" },
+          "guard": "event.payload.type != 'error'",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'payment_due'", "target_state": "payments_thinking", "actions": [] },
+        { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'idle' && !state.invoice_pending", "target_state": "closed", "actions": [] },
+        { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'idle'", "actions": [] }
+      ]
+    },
+    {
+      "name": "invoice_thinking",
+      "description": "Invoice holds the conversation: the person's message (customer) goes to AI.invoice with vars.order and its contract (reply, area, invoice_number, amount, due_in: a duration in minutes, hours or days, such as 2m, 1h or 30d). An invoice issued goes to the person and, with a due_in of that form, sets the timer payment_due at it; without one, last_error says so and no payment check follows. Area sales hands the conversation back: its reply goes to the person, and sales takes the person's next message. Any other answer goes to the person. A message from the person meanwhile goes to invoice too; a payment_due meanwhile is noted. An error or no answer in 120 s gives control back to sales, noted in last_error.",
+      "entry_actions": [
+        {
+          "type": "forward",
+          "target": "AI.invoice@worker1",
+          "message": "customer",
+          "meta": {
+            "context": {
+              "response_envelope": {
+                "kind": "json_object_v1",
+                "strict": true,
+                "text_field": "reply",
+                "required": ["reply", "area", "invoice_number", "amount", "due_in"],
+                "properties": {
+                  "reply": { "type": "string" },
+                  "area": { "type": "string", "enum": ["invoice", "sales"] },
+                  "invoice_number": { "type": "string" },
+                  "amount": { "type": "number" },
+                  "due_in": { "type": "string" }
+                }
+              }
+            }
+          },
+          "vars": { "order": { "$ref": "state.order" } }
+        },
+        { "type": "schedule_timer", "timer_key": "invoice_timeout", "fire_in": "120s" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "invoice_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.invoice@worker1: error'" } ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.context.evaluation.area == 'sales'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.context.evaluation.invoice_number != '' && !state.invoice_pending && event.context.evaluation.due_in.matches('^[1-9][0-9]*[mhd]$')",
+          "target_state": "invoice_listening",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1" },
+            {
+              "type": "set_variable",
+              "name": "invoice",
+              "value": "{'invoice_number': event.context.evaluation.invoice_number, 'amount': event.context.evaluation.amount, 'due_in': event.context.evaluation.due_in}"
+            },
+            { "type": "set_variable", "name": "invoice_pending", "value": "true" },
+            { "type": "schedule_timer", "timer_key": "payment_due", "fire_in": { "$ref": "state.invoice.due_in" }, "on_error": "fail" }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.context.evaluation.invoice_number != '' && !state.invoice_pending",
+          "target_state": "invoice_listening",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1" },
+            { "type": "set_variable", "name": "last_error", "value": "'AI.invoice@worker1: the invoice has no valid due_in, so no payment check'" }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "true",
+          "target_state": "invoice_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            {
+              "type": "forward",
+              "target": "AI.invoice@worker1",
+              "message": "customer",
+              "meta": {
+                "context": {
+                  "response_envelope": {
+                    "kind": "json_object_v1",
+                    "strict": true,
+                    "text_field": "reply",
+                    "required": ["reply", "area", "invoice_number", "amount", "due_in"],
+                    "properties": {
+                      "reply": { "type": "string" },
+                      "area": { "type": "string", "enum": ["invoice", "sales"] },
+                      "invoice_number": { "type": "string" },
+                      "amount": { "type": "number" },
+                      "due_in": { "type": "string" }
+                    }
+                  }
+                }
+              },
+              "vars": { "order": { "$ref": "state.order" } }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'invoice_timeout'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.invoice@worker1: timeout'" } ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
+        }
+      ]
+    },
+    {
+      "name": "invoice_listening",
+      "description": "Waits for the person, with invoice in control: their next message is kept and goes to invoice. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of invoice goes to the person. After 3 minutes without messages, invoice gives control back to sales.",
+      "entry_actions": [
+        { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
+        { "type": "emit_internal_event", "meta": { "msg": "CHECK_PAYMENT" } }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "idle" } ],
+      "transitions": [
+        { "event_match": { "msg": "CHECK_PAYMENT" }, "guard": "state.payment_overdue", "target_state": "payments_thinking", "actions": [] },
+        { "event_match": { "msg": "CHECK_PAYMENT" }, "guard": "true", "actions": [] },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "target_state": "invoice_thinking",
+          "actions": [ { "type": "keep_message", "name": "customer" } ]
+        },
+        {
+          "event_match": { "src": "AI.invoice@worker1" },
+          "guard": "event.payload.type != 'error'",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'payment_due'", "target_state": "payments_thinking", "actions": [] },
+        { "event_match": { "msg": "TIMER_FIRED" }, "guard": "event.timer_key == 'idle'", "target_state": "sales_listening", "actions": [] }
+      ]
+    },
+    {
+      "name": "payments_thinking",
+      "description": "The invoice fell due: the WF writes to AI.payments, with vars.invoice and the person's context.io, and the agent decides what to tell the customer. Its answer goes to the person, and control goes back to sales with nothing pending. A message from the person meanwhile goes to payments too. An error or no answer in 120 s also ends the payment check, noted in last_error.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "payment_overdue", "value": "false" },
+        {
+          "type": "send_message",
+          "target": "AI.payments@worker1",
+          "meta": { "msg": "PAYMENT_DUE", "context": { "io": { "$ref": "state.io" } } },
+          "vars": { "invoice": { "$ref": "state.invoice" } },
+          "payload": {
+            "type": "text",
+            "content": "The payment period of this invoice has ended, and it was not paid. Tell the customer that the invoice was not paid."
+          }
+        },
+        { "type": "schedule_timer", "timer_key": "payments_timeout", "fire_in": "120s" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "payments_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "AI.payments@worker1" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "sales_listening",
+          "actions": [
+            { "type": "set_variable", "name": "last_error", "value": "'AI.payments@worker1: error'" },
+            { "type": "set_variable", "name": "invoice_pending", "value": "false" }
+          ]
+        },
+        {
+          "event_match": { "src": "AI.payments@worker1" },
+          "guard": "true",
+          "target_state": "sales_listening",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1" },
+            { "type": "set_variable", "name": "invoice_pending", "value": "false" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            { "type": "forward", "target": "AI.payments@worker1", "message": "customer" }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payments_timeout'",
+          "target_state": "sales_listening",
+          "actions": [
+            { "type": "set_variable", "name": "last_error", "value": "'AI.payments@worker1: timeout'" },
+            { "type": "set_variable", "name": "invoice_pending", "value": "false" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "closed",
+      "description": "The conversation went 3 minutes without messages, with no invoice pending. A new message from the person starts a new instance, at sales.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "failed",
+      "description": "The engine's own failures: an action that failed, such as a payment_due whose time SY.timer would not take. No transition of this definition goes here.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}

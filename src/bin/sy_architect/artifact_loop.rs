@@ -679,6 +679,14 @@ mod tests {
                 json!({ "workflow_name": "test-wf", "definition": { "steps": [{ "id": "s1" }] } }),
                 "INVALID_WF_DEFINITION",
             ),
+            // No start_from: no node would start an instance (0.1.91).
+            (
+                json!({ "workflow_name": "test-wf", "definition": {
+                    "wf_schema_version": "1", "workflow_type": "test", "input_schema": { "type": "object" },
+                    "initial_state": "a", "terminal_states": ["a"], "states": [{ "name": "a" }]
+                } }),
+                "INVALID_WF_DEFINITION",
+            ),
         ] {
             bundle.artifact = artifact;
             let verdict = audit_artifact(&packet, &bundle);

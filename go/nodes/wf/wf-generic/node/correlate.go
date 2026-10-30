@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"runtime/debug"
@@ -15,20 +14,30 @@ import (
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 )
 
-// InstanceRegistry is a thread-safe in-memory map of running instances.
+// InstanceRegistry is a thread-safe in-memory map of running instances, by their id and by their
+// thread (one running instance per thread: a message on it reaches that instance, and a new one
+// starts on a thread only when none runs there).
 type InstanceRegistry struct {
 	mu        sync.RWMutex
 	instances map[string]*WFInstance
+	byThread  map[string]*WFInstance
 }
 
 func NewInstanceRegistry() *InstanceRegistry {
-	return &InstanceRegistry{instances: make(map[string]*WFInstance)}
+	return &InstanceRegistry{instances: make(map[string]*WFInstance), byThread: make(map[string]*WFInstance)}
 }
 
-func (r *InstanceRegistry) Add(inst *WFInstance) {
+// Add puts inst in the registry. It refuses an instance whose thread another running instance
+// holds: a message on a thread reaches one instance, so the second would never be reached again.
+func (r *InstanceRegistry) Add(inst *WFInstance) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if holder, held := r.byThread[inst.ThreadID]; held && holder.InstanceID != inst.InstanceID {
+		return fmt.Errorf("thread %q is held by running instance %s", inst.ThreadID, holder.InstanceID)
+	}
 	r.instances[inst.InstanceID] = inst
+	r.byThread[inst.ThreadID] = inst
+	return nil
 }
 
 func (r *InstanceRegistry) Get(instanceID string) (*WFInstance, bool) {
@@ -38,9 +47,20 @@ func (r *InstanceRegistry) Get(instanceID string) (*WFInstance, bool) {
 	return inst, ok
 }
 
+// GetByThread returns the running instance on threadID.
+func (r *InstanceRegistry) GetByThread(threadID string) (*WFInstance, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	inst, ok := r.byThread[threadID]
+	return inst, ok
+}
+
 func (r *InstanceRegistry) Remove(instanceID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if inst, ok := r.instances[instanceID]; ok && r.byThread[inst.ThreadID] == inst {
+		delete(r.byThread, inst.ThreadID)
+	}
 	delete(r.instances, instanceID)
 }
 
@@ -62,31 +82,30 @@ func (r *InstanceRegistry) All() []*WFInstance {
 
 // dispatchWorkflowEvent routes workflow traffic (no control verb, no notice, no system message but a
 // TIMER_FIRED: Dispatch has checked that a node sent it) to the instance it belongs to, or starts
-// one. The strict correlation order:
+// one. The strict correlation order (wf-orchestration-v1 §5.2.1, item 3):
 //
 //  1. TIMER_FIRED, from SY.timer of the WF's own hive, for a timer this node scheduled → the instance
 //     its client_ref names
-//  2. meta.thread_id matches a running instance → that instance
-//  3. a reply (a *_RESPONSE, an error answer) → dropped: it never starts an instance
-//  4. meta.thread_id names an instance of this node that ended → dropped, a late answer
-//  5. otherwise → a new instance, on the current definition
+//  2. from a sender the definition does not involve (no node of its start_from, of an
+//     event_match.src or a target of its sends: FINDINGS A-123) → dropped, never answered; on the
+//     thread of a running instance, that instance's definition decides, otherwise the current one
+//  3. meta.thread_id is the thread of a running instance → that instance
+//  4. from a start_from node, and no reply (a *_RESPONSE, an error answer) → a new instance on its
+//     thread, on the current definition, as its input_schema allows
+//  5. anything else (an answer to an instance that ended, say) → dropped, never answered
+//
+// So a person who writes again after their conversation's instance ended starts a new one, on the
+// same thread, at the initial state; an agent's late answer starts nothing.
 func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Message) error {
 	name := rawMsgName(msg)
+	sender := msg.SourceL2Name()
 	threadID := derefStringPtr(msg.Meta.ThreadID)
-	inst, onThread := rt.Registry.Get(threadID)
-	onThread = onThread && threadID != ""
-	if isReply(name) && !onThread {
-		// SY.timer's answers to the engine's own timer requests end here too.
-		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): a reply reaches only the running instance whose thread it carries, and starts none",
-			name, msg.SourceL2Name(), threadID, msg.Routing.TraceID)
-		return nil
-	}
 	log.Printf(
 		"wf: correlate inbound type=%s msg=%q src_uuid=%s src_l2=%q thread_id=%q trace_id=%s target=%q payload=%s",
 		msg.Meta.MsgType,
 		name,
 		msg.Routing.Src,
-		msg.SourceL2Name(),
+		sender,
 		threadID,
 		msg.Routing.TraceID,
 		derefStringPtr(msg.Meta.Target),
@@ -96,25 +115,27 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 	if name == sdk.MsgTimerFired {
 		return rt.takeTimerFired(ctx, msg)
 	}
+	inst, onThread := rt.Registry.GetByThread(threadID)
+	onThread = onThread && threadID != ""
+	def := rt.Def
+	if onThread {
+		def = inst.def
+	}
+	if !def.Involves(sender) {
+		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): the definition does not involve its sender",
+			msgName(msg), sender, threadID, msg.Routing.TraceID)
+		return nil
+	}
 	if onThread {
 		log.Printf("wf: correlate matched thread_id=%s instance_id=%s", threadID, inst.InstanceID)
 		return rt.deliver(ctx, inst, msg, "")
 	}
-	// A late answer: the thread names an instance of this node that ended (its timer fired, it was
-	// cancelled or failed, or a first copy of the answer finished it). An agent answers with the
-	// request's own msg and thread, so isReply does not see it, and as a new instance it would ask the
-	// agent again: a WF<->AI loop. Dropped, never answered. Another node's instance id on the thread
-	// (a WF that sends to this one carries its own) is no instance of this node, and starts one.
-	if strings.HasPrefix(threadID, instanceIDPrefix) {
-		row, err := rt.Store.GetInstance(ctx, threadID)
-		switch {
-		case err == nil:
-			log.Printf("wf: ignoring %s from %q (thread_id=%s trace_id=%s): a late answer to instance %s, which is %s",
-				name, msg.SourceL2Name(), threadID, msg.Routing.TraceID, row.InstanceID, row.Status)
-			return nil
-		case !errors.Is(err, errInstanceNotFound):
-			return fmt.Errorf("correlate thread_id %s: %w", threadID, err)
-		}
+	if !rt.Def.StartsFrom(sender) || isReply(name) {
+		// SY.timer's answers to the engine's own timer requests never get here (it is no node of the
+		// definition), and an agent's late answer ends here.
+		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): no running instance on its thread, and it starts none",
+			msgName(msg), sender, threadID, msg.Routing.TraceID)
+		return nil
 	}
 	return rt.create(ctx, msg)
 }
@@ -163,7 +184,9 @@ func (rt *NodeRuntime) deliver(ctx context.Context, inst *WFInstance, msg sdk.Me
 }
 
 func (rt *NodeRuntime) journal(ctx context.Context, instanceID, kind string, msg sdk.Message, firedTimerKey string) (int64, error) {
-	raw, err := json.Marshal(msg)
+	// As a frame carries it: a payload a transition forwards goes out byte for byte after a replay
+	// too.
+	raw, err := sdk.MarshalMessage(msg)
 	if err != nil {
 		return 0, fmt.Errorf("instance %s: journal %s: %w", instanceID, rawMsgName(msg), err)
 	}
@@ -232,15 +255,18 @@ func creationInput(def *WorkflowDefinition, msg sdk.Message) (map[string]any, er
 // runCreation creates the instance instanceID from the journaled msg and runs its initial
 // entry_actions. One commit writes the instance, enqueues its internal events and consumes the
 // journaled creation: a crash before it leaves the creation for recovery, which runs it again under
-// the same instance_id (and the same trace_id), so no instance is ever half-started.
+// the same instance_id (and the same trace_id), so no instance is ever half-started. The instance's
+// thread is msg's, or its own id when msg has none.
 func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanceID string, input map[string]any, inboundID int64) error {
 	def := rt.Def
 	inst := NewInstance(def, instanceID, def.WorkflowType, input, rt.ActCtx.Clock)
+	inst.ThreadID = creationThread(msg, instanceID)
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
 	log.Printf(
-		"wf: create accepted instance_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q",
+		"wf: create accepted instance_id=%s thread_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q",
 		instanceID,
+		inst.ThreadID,
 		def.WorkflowType,
 		def.InitialState,
 		msg.Routing.TraceID,
@@ -274,12 +300,27 @@ func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanc
 		}
 		log.Printf("wf: create committed instance_id=%s state=%s status=%s", instanceID, inst.CurrentState, inst.Status)
 		if inst.Status == "running" {
-			rt.Registry.Add(inst)
+			if err := rt.Registry.Add(inst); err != nil {
+				// An instance starts only on a thread no running instance holds (correlation, and
+				// recovery's replay of a creation), so this is a bug: the new instance fails, loudly,
+				// instead of taking the other's thread.
+				log.Printf("wf: REFUSED instance %s: %v", instanceID, err)
+				return rt.failInStore(ctx, inst, fmt.Errorf("%s: %v", causeThreadTaken, err))
+			}
 		}
 		return inst.drainInternalEvents(ctx, rt.ActCtx)
 	})
 	rt.settle(ctx, inst)
 	return err
+}
+
+// creationThread is the thread of the instance msg starts as instanceID: msg's, or the instance's own
+// id when msg has none.
+func creationThread(msg sdk.Message, instanceID string) string {
+	if threadID := derefStringPtr(msg.Meta.ThreadID); strings.TrimSpace(threadID) != "" {
+		return threadID
+	}
+	return instanceID
 }
 
 // protect runs the processing of one event for inst. A panic in it fails that instance

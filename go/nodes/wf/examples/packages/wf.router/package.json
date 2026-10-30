@@ -1,8 +1,8 @@
 {
   "name": "wf.router",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "type": "workflow",
-  "description": "Ingress host/specialist router: accepts a text/v1 relay from one of the IO nodes it names, triages via a host AI, escalates to a specialist AI, and replies back to the IO node the question came from, one transition per IO node.",
+  "description": "Ingress host/specialist router: started by a person's message from one of the IO nodes it names, it forwards the message as it came to a host AI, escalates it to a specialist AI, and forwards the answer as it came to the IO node the question came from, one transition per IO node; a person's further message goes to the agent answering.",
   "runtime_base": "wf.engine",
   "config_template": "config/default-config.json"
 }

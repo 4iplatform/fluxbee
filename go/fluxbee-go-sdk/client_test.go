@@ -197,6 +197,36 @@ func TestNodeSenderRefusesFrameOverTheLimit(t *testing.T) {
 	}
 }
 
+// A frame carries a raw payload byte for byte (wf-orchestration-v1 §5.2.1,
+// item 10): json.Marshal wrote <, > and & as <, > and &, so a
+// payload a WF forwards as it received it went out changed. Nothing follows
+// the JSON, the encoder's newline included.
+func TestAFrameCarriesARawPayloadByteForByte(t *testing.T) {
+	payload := `{"type":"text","content":"<b>1 & 2</b> > 0","amount":1.10,"z":1,"a":2}`
+	msg := Message{
+		Routing: Routing{Src: "src-1", Dst: UnicastDestination("AI.sales@worker1"), TTL: 16, TraceID: "trace-raw"},
+		Meta:    Meta{MsgType: "user", Context: json.RawMessage(`{"note":"a<b"}`)},
+		Payload: json.RawMessage(payload),
+	}
+	state := &connectionState{connected: true}
+	tx := make(chan []byte, 1)
+	sender := &NodeSender{uuid: "src-1", fullName: "WF.demo@worker1", tx: tx, state: state}
+	if err := sender.Send(msg); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	frame := string(<-tx)
+	if !strings.Contains(frame, `"payload":`+payload) || !strings.Contains(frame, `"context":{"note":"a<b"}`) {
+		t.Fatalf("the frame changed the payload or the context: %s", frame)
+	}
+	if strings.HasSuffix(frame, "\n") {
+		t.Fatalf("the frame ends with a newline: %q", frame)
+	}
+	var back Message
+	if err := json.Unmarshal([]byte(frame), &back); err != nil || string(back.Payload) != payload {
+		t.Fatalf("the frame reads back as it went: %s %v", back.Payload, err)
+	}
+}
+
 // A-75 — over a real socket: the oversize send is refused and the next
 // frame arrives on the same connection. Before, the writer dropped the
 // connection on the oversize frame and the node reconnected 500 ms later.

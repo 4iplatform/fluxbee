@@ -18,6 +18,7 @@ const askingWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "asking",
   "description": "asks an agent; gives up when its timer fires",
+  "start_from": ["IO.in@motherbee", "IO.api.billing@motherbee", "WF.upstream@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "asking",
   "terminal_states": ["answered", "timed_out", "failed"],
@@ -212,7 +213,7 @@ func TestErrorsRepliesAndNoticesAreNeverAnswered(t *testing.T) {
 			if err := Dispatch(context.Background(), text, rt); err != nil {
 				t.Fatal(err)
 			}
-			named := from("AI.billing@motherbee", msgWithNameAndPayload("START", map[string]any{"text": "hello"}))
+			named := from("IO.api.billing@motherbee", msgWithNameAndPayload("START", map[string]any{"text": "hello"}))
 			named.Routing.Src = "billing-uuid"
 			if err := Dispatch(context.Background(), named, rt); err != nil {
 				t.Fatal(err)
@@ -334,6 +335,7 @@ func TestAFiredTimerDoesNotFireAgainAfterARestart(t *testing.T) {
 	const counting = `{
   "wf_schema_version": "1",
   "workflow_type": "counting",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "waiting",
   "terminal_states": ["done"],
@@ -387,6 +389,7 @@ func TestAFiredTimerDoesNotFireAgainAfterARestart(t *testing.T) {
 const notifyAgentWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "notify",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "asking",
   "terminal_states": ["done"],
@@ -414,9 +417,10 @@ func answerAs(agent string, sent sdk.Message, payload string) sdk.Message {
 
 // An agent answers with the request's own msg and thread, so a late answer (its instance ended: its
 // timer fired, it was cancelled or failed, or a first copy of the answer finished it) is no reply by
-// name. It is dropped and never answered: started as a new instance it would ask the agent again, a
-// WF<->AI loop. A thread naming another node's instance (a WF that sends to this one) still starts
-// one.
+// name. It comes from a node the definition does not start from, so it is dropped and never
+// answered (wf-orchestration-v1 §5.2.1, item 3): started as a new instance it would ask the agent
+// again, a WF<->AI loop. A message from a start_from node (a WF that sends to this one, on its own
+// instance's thread) starts one on its thread.
 func TestALateAnswerNeverStartsAnInstance(t *testing.T) {
 	t.Run("after its timeout", func(t *testing.T) {
 		rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
@@ -452,9 +456,12 @@ func TestALateAnswerNeverStartsAnInstance(t *testing.T) {
 		thread := "wfi:00000000-0000-4000-8000-000000000001"
 		msg := from("WF.upstream@motherbee", msgWithName("START"))
 		msg.Meta.ThreadID = &thread
-		startInstance(t, rt, msg)
-		if len(disp.sent) != 1 {
-			t.Fatalf("a WF's send starts an instance on this one: %d sends", len(disp.sent))
+		instanceID := startInstance(t, rt, msg)
+		if len(disp.sent) != 1 || derefString(disp.sent[0].Meta.ThreadID) != thread {
+			t.Fatalf("a WF's send starts an instance on this one, on its thread: %+v", disp.sent)
+		}
+		if row := mustGetInstance(t, rt, instanceID); row.ThreadID != thread || instanceID == thread {
+			t.Fatalf("the instance: %+v", row)
 		}
 	})
 }
@@ -503,7 +510,7 @@ func TestASystemMessageIsNoWorkflowEvent(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
 	instanceID := startAsking(t, rt, disp, "trace-start")
 	sent := len(disp.sent)
-	start := from("AI.billing@motherbee", msgWithName("START"))
+	start := from("IO.api.billing@motherbee", msgWithName("START"))
 	start.Meta.MsgType = "system"
 	answer := from("AI.host@motherbee", msgWithNameAndPayload("ASK", map[string]any{"text": "an answer"}))
 	answer.Meta.MsgType = "SYSTEM"

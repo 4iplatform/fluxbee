@@ -2,6 +2,7 @@
   "wf_schema_version": "1",
   "workflow_type": "invoice",
   "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
+  "start_from": ["IO.api.billing@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id"],

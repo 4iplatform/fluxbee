@@ -192,8 +192,8 @@ command, and reads as queries, all to `SY.wf-rules@<hive in the URL>`
 The same operations exist without the hive prefix (`/wf-rules`, `/wf-rules/compile`, ...): the
 hive then comes from a `hive` (or `target`) field in the body or the query string, and defaults
 to the admin's own hive (`WfRulesRequest`, `wf_rules_request_from_query`).
-Example definitions ship in `go/nodes/wf/examples/packages/wf.invoice/flow/definition.json`
-and `.../wf.router/flow/definition.json`.
+Example definitions ship in `go/nodes/wf/examples/packages/wf.invoice/flow/definition.json`,
+`.../wf.router/flow/definition.json` and `.../wf.sales.invoice/flow/definition.json`.
 
 ## The WF engine runtime (`wf.engine`)
 
@@ -221,9 +221,11 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   `CONFIG_SET`; `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE`,
   `WF_CANCEL_INSTANCE`, answered only to SY.admin@motherbee and SY.wf-rules of the node's hive
   (`UNAUTHORIZED` otherwise); `TIMER_FIRED`, taken only from SY.timer of the node's hive. Any
-  other message is correlated to an existing instance or starts a new one
-  (`dispatchWorkflowEvent`, `node/correlate.go`); a reply (`*_RESPONSE`, `INVALID_INPUT`,
-  `<msg>.error`) never starts one, and a notice or a reply is never answered.
+  other message is taken only from a node the definition names (`start_from`, an
+  `event_match.src`, a target of its sends), and reaches the running instance on its thread or,
+  from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`, `node/correlate.go`);
+  a reply (`*_RESPONSE`, `INVALID_INPUT`, `<msg>.error`) never starts one, and a notice or a reply
+  is never answered.
 
 ## Config
 

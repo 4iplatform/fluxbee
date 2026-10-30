@@ -29058,7 +29058,14 @@ static ASKPASS_SEQ: AtomicU64 = AtomicU64::new(0);
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let dir = std::env::temp_dir();
     let seq = ASKPASS_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("jsr-askpass-{}-{}.sh", now_epoch_ms(), seq));
+    // The process id too: two processes on one host (two test runs) can share a millisecond and a
+    // sequence number, and `create_new` then fails with "File exists".
+    let path = dir.join(format!(
+        "jsr-askpass-{}-{}-{}.sh",
+        std::process::id(),
+        now_epoch_ms(),
+        seq
+    ));
     let contents = format!(
         "#!/bin/sh\nprintf '%s\\n' '{}'\n",
         shell_single_quote(password)
@@ -30889,7 +30896,7 @@ mod tests {
 
     #[test]
     fn core_backup_retention_keeps_the_newest_generations() {
-        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-{}", now_epoch_ms()));
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-{}", Uuid::new_v4()));
         // Fixed-width epoch suffixes, so lexical order IS chronological order. STAMPED: an
         // unstamped generation cannot be rolled back to, so retention collects it as junk.
         for id in [
@@ -30921,7 +30928,7 @@ mod tests {
 
     #[test]
     fn core_backup_retention_never_empties_the_store() {
-        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", now_epoch_ms()));
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", Uuid::new_v4()));
         stamp_generation(
             &root,
             "update-1700000000001",

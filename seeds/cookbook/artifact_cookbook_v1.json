@@ -34,7 +34,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 2
+    "seed_version": 3
   },
   {
     "layer": "artifact",
@@ -52,6 +52,9 @@
           "wf_schema_version": "1",
           "workflow_type": "invoice",
           "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
+          "start_from": [
+            "IO.api.billing@motherbee"
+          ],
           "input_schema": {
             "type": "object",
             "required": [
@@ -143,24 +146,25 @@
     "constraints": [
       "the artifact is what a wf_deployment carries: workflow_name and definition",
       "workflow_name is lowercase letters, digits and '-' in dot-separated parts, each starting with a letter, and matches the wf_deployment in the manifest",
-      "the definition is a wf_schema_version 1 state machine: workflow_type, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)",
+      "the definition is a wf_schema_version 1 state machine: workflow_type, start_from, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)",
+      "a definition names in start_from the nodes whose messages start an instance: IO nodes or WFs, each a node name with its hive, never an AI.* node (an agent only answers) nor a SY.* or RT.* node; only the nodes written in it drive an instance: those of start_from, of an event_match.src, and the targets of its send_message and forward actions",
       "every message a WF sends is a user message: an action's meta has msg (and, to ask an agent for a structured answer, context), never type",
       "a send_message target is a node name written in the definition; to choose among destinations, write one transition per destination with its guard",
       "a timer's key is event.timer_key: a timeout is a TIMER_FIRED transition with the guard event.timer_key == '<timer_key>'",
-      "an agent's error answer arrives as <msg>.error, so it needs a transition of its own",
+      "an agent's error answer is a payload of type 'error', so it needs a transition of its own; its msg is <msg>.error only when the request had a msg (a forwarded person's message has none: match its sender, with the guard event.payload.type == 'error')",
       "a $ref to a field that may be missing gives a default: {\"$ref\": \"event.context\", \"default\": {}}; a $ref without one fails the instance"
     ],
     "do_not_repeat": [
       "do not write a steps list: SY.wf-rules refuses any field its schema does not define",
       "do not send messages to nodes that do not exist in the desired_state manifest or the system",
-      "do not leave a transition without event_match.msg, target_state and guard",
-      "do not write meta.type, target_ref or event.payload.timer_key: SY.wf-rules refuses the first two, and the third is never set",
+      "do not leave a transition without a guard, nor its event_match without a msg, a src or both (a transition without target_state is internal: it stays in its state)",
+      "do not write meta.type, target_ref, thread_id_ref or event.payload.timer_key: SY.wf-rules refuses the first three, and the fourth is never set",
       "do not wait for an answer without a timer: an agent or a node that never answers leaves the instance waiting forever"
     ],
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 2
+    "seed_version": 3
   },
   {
     "layer": "artifact",
@@ -192,6 +196,6 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 2
+    "seed_version": 3
   }
 ]

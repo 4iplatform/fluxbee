@@ -5,8 +5,25 @@ Base runtime for instanceable `WF.*` nodes.
 This module holds the workflow engine in Go: it loads one workflow definition (validated by
 `go/pkg/wfcel`), runs its instances, and keeps them in SQLite (`wf_instances.db`).
 
-How it runs a workflow (0.1.90, docs/wf-orchestration-v1.md §5.1):
+How it runs a workflow (0.1.90 and 0.1.91, docs/wf-orchestration-v1.md §5.1 and §5.2.1):
 
+- **One instance per conversation.** An instance lives on the thread of the message that started it
+  (its own id when that message had none), and every message it sends carries that thread: the
+  agents keep one memory per conversation, and their answers, and the person's next message, come
+  back to it. A definition names in `start_from` the nodes whose messages start an instance, and only
+  the nodes it names (`start_from`, `event_match.src`, the targets of its sends) drive one; anyone
+  else is dropped, never answered (FINDINGS A-123). `start_from` names IO nodes and WFs, never an
+  agent or a `SY.*`/`RT.*` node. `thread_id_ref` left the language.
+- **The upgrade to 0.1.91.** A definition written before it has no `start_from` and no longer
+  loads: its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with
+  `start_from`, and its running instances fail at the next start (`definition_unavailable`).
+- **Forwarding.** `forward` sends a message on as it was received, the event's or one `keep_message`
+  kept: the payload byte for byte, every meta field but `memory_package`; the WF changes the
+  destination, the thread, the `meta.context` keys it writes and its block, `meta.context.wf` (the
+  trail of the nodes the message went through, and the action's `vars`), which every message a WF
+  sends carries. A transition matches by `msg`, by `src` or both; one without a `target_state` is
+  internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a `$ref`, checked when
+  the action runs. The Go SDK writes frames without HTML escaping.
 - **Every message a WF sends is a `user` message**, to a node name written in the definition, and
   every message it takes is a `user` message, but a `TIMER_FIRED`: any other `system` message is
   dropped, never answered. A definition with `meta.type`, `target_ref` or `event_match.type` is
@@ -16,9 +33,10 @@ How it runs a workflow (0.1.90, docs/wf-orchestration-v1.md §5.1):
   last one ends. A new instance takes the current definition.
 - **At least once.** An inbound event is saved in the store before its transition runs, and the
   transition's commit deletes it, with any earlier event of the instance a failed commit left; a
-  creation commits the instance, its internal events and the event in one transaction. After a
-  crash the start runs again whatever was left, under the same instance id and trace_id, counting
-  each event's attempts first: one already run at 3 starts is not run again, and its instance fails
+  creation commits the instance, its internal events, the messages it kept and the event in one
+  transaction (store schema v4: an instance's thread, and its kept messages). After a crash the
+  start runs again whatever was left, under the same instance id and trace_id, counting each
+  event's attempts first: one already run at 3 starts is not run again, and its instance fails
   (`replay_exhausted`). The store commits with `synchronous=FULL`.
 - **Timers.** A fired timer's key is `event.timer_key`. A `TIMER_FIRED` is taken only from SY.timer
   of the node's hive (`sy_timer_l2_name` must name it), only for a timer this node scheduled
@@ -30,8 +48,10 @@ How it runs a workflow (0.1.90, docs/wf-orchestration-v1.md §5.1):
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in
   snake_case keys. A router notice, a reply (`*_RESPONSE`, `INVALID_INPUT`, `<msg>.error`) and a
-  message without a name are never answered, and a reply never starts an instance; nor does a late
-  answer, one on the thread of an instance of this node that ended.
+  message without a name are never answered, and a reply never starts an instance. Nor does an
+  agent's late answer, which comes from no `start_from` node: it is dropped while no instance runs
+  on its thread, and reaches the conversation's next instance once one runs there. A message the
+  current state has no transition for is logged and dropped, never queued.
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default
   (`{"$ref": "event.context", "default": {}}`, taken for a missing or `null` field); a `$ref` holds
   only `$ref` and `default`, and its default is a literal. The state holds plain JSON, and a JSON
@@ -181,8 +201,9 @@ cargo run --example wf_client -- start WF.invoice@motherbee cust-001
 journalctl -u fluxbee-node-WF.invoice-motherbee | grep 'wf: create'
 ```
 
-The journal shows the instance the message started (`wf: create accepted instance_id=wfi:...`, then
-`wf: create committed ... state=... status=...`). A node spawned by hand, as in step 3, is unknown to
+The journal shows the instance the message started (`wf: create accepted instance_id=wfi:...
+thread_id=...`, then `wf: create committed ... state=... status=...`). The example client connects
+as `WF.client.example@motherbee`, which `wf.invoice` names in its `start_from`. A node spawned by hand, as in step 3, is unknown to
 SY.wf-rules: its `GET /hives/motherbee/wf-rules/status?workflow_name=invoice` answers
 `WORKFLOW_NOT_FOUND`. A workflow deployed through SY.wf-rules (`docs/wf-rules-quickstart.md`) has a
 status there, with its node's running instances (`jq .payload.wf_node`).

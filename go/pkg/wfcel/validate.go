@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
+
+// maxDurationDays is the most days a time.Duration holds.
+const maxDurationDays = math.MaxInt64 / int64(24*time.Hour)
 
 var (
 	l2NamePattern   = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9.-]*$`)
@@ -28,7 +34,7 @@ func LoadDefinitionFile(path string, clock ClockFunc) (*WorkflowDefinition, erro
 }
 
 func LoadDefinitionBytes(data []byte, source string, clock ClockFunc) (*WorkflowDefinition, error) {
-	if errs := removedFieldErrors(data); len(errs) > 0 {
+	if errs := fieldErrors(data); len(errs) > 0 {
 		return nil, errs
 	}
 	var def WorkflowDefinition
@@ -49,14 +55,17 @@ func LoadDefinitionBytes(data []byte, source string, clock ClockFunc) (*Workflow
 }
 
 // normalizeActionNumbers gives the literals of the definition's actions (payloads, meta.context,
-// set_variable values, $ref defaults) DecodeJSON's types: an integer literal is an int64 and any
-// other number a float64, so a send puts 3 on the wire as 3, and 1.0 as 1.0 (decoded as float64,
-// 3 went out as 3.0, which a Rust u64 field refuses). The input_schema keeps its numbers as written
-// (json.Number), which is how they reach the schema compiler and WF_HELP.
+// vars, timer times, set_variable values, $ref defaults) DecodeJSON's types: an integer literal is
+// an int64 and any other number a float64, so a send puts 3 on the wire as 3, and 1.0 as 1.0
+// (decoded as float64, 3 went out as 3.0, which a Rust u64 field refuses). The input_schema keeps
+// its numbers as written (json.Number), which is how they reach the schema compiler and WF_HELP.
 func normalizeActionNumbers(def *WorkflowDefinition) {
 	normalize := func(actions []ActionDefinition) {
 		for i := range actions {
 			actions[i].Payload = normalizeNumbers(actions[i].Payload)
+			actions[i].Vars = normalizeNumbers(actions[i].Vars)
+			actions[i].FireIn = normalizeNumbers(actions[i].FireIn)
+			actions[i].FireAt = normalizeNumbers(actions[i].FireAt)
 			actions[i].Value = normalizeNumbers(actions[i].Value)
 			if actions[i].Meta != nil {
 				actions[i].Meta.Context = normalizeNumbers(actions[i].Meta.Context)
@@ -72,10 +81,39 @@ func normalizeActionNumbers(def *WorkflowDefinition) {
 	}
 }
 
-// removedFieldErrors names, by their paths, the fields that left the definition language in 0.1.90
-// (wf-orchestration-v1 §5.1): the strict decoder refuses them too, but only as an unknown field,
-// without saying where or why. A definition that is not JSON is the decoder's to report.
-func removedFieldErrors(data []byte) ValidationErrors {
+// actionFields are the fields each action type takes besides type and on_error; actionMetaFields,
+// those of its meta. A field of another type is refused (fieldErrors): a forward with a name
+// instead of a message loaded, and forwarded the event.
+var (
+	actionFields = map[string][]string{
+		"send_message":        {"target", "meta", "vars", "payload"},
+		"forward":             {"target", "message", "meta", "vars"},
+		"keep_message":        {"name"},
+		"emit_internal_event": {"meta", "payload"},
+		"schedule_timer":      {"timer_key", "fire_in", "fire_at", "missed_policy", "missed_within_ms"},
+		"cancel_timer":        {"timer_key"},
+		"reschedule_timer":    {"timer_key", "fire_in", "fire_at"},
+		"set_variable":        {"name", "value"},
+	}
+	actionMetaFields = map[string][]string{
+		"send_message":        {"msg", "context"},
+		"forward":             {"context"},
+		"emit_internal_event": {"msg"},
+	}
+	// fieldHints say why a field is not a type's, where the reason is not obvious.
+	fieldHints = map[string]string{
+		"forward.name":     "a forward names the kept message it sends with message",
+		"forward.payload":  "a forward sends the message's payload as it was received",
+		"forward.meta.msg": "a forward keeps the message's own msg",
+	}
+)
+
+// fieldErrors names, by their paths, the fields an action has that are not its type's (another
+// type's field: a key no type has is the strict decoder's to report), and the fields that left the
+// definition language in 0.1.90 (wf-orchestration-v1 §5.1) and 0.1.91 (thread_id_ref, §5.2.1),
+// which the strict decoder refuses too, but only as an unknown field, without saying where or why.
+// A definition that is not JSON is the decoder's to report.
+func fieldErrors(data []byte) ValidationErrors {
 	var doc struct {
 		States []struct {
 			EntryActions []map[string]any `json:"entry_actions"`
@@ -89,16 +127,50 @@ func removedFieldErrors(data []byte) ValidationErrors {
 	if json.Unmarshal(data, &doc) != nil {
 		return nil
 	}
+	known := map[string]bool{}
+	for _, fields := range actionFields {
+		for _, field := range fields {
+			known[field] = true
+		}
+	}
 	var errs ValidationErrors
+	notOfType := func(path, actionType, field string) {
+		message := "is not a field of " + actionType
+		if hint, ok := fieldHints[actionType+"."+field]; ok {
+			message += ": " + hint
+		}
+		errs = append(errs, ValidationError{Path: path + "." + field, Message: message})
+	}
 	check := func(path string, actions []map[string]any) {
 		for i, action := range actions {
 			actionPath := fmt.Sprintf("%s[%d]", path, i)
 			if _, ok := action["target_ref"]; ok {
 				errs = append(errs, ValidationError{Path: actionPath + ".target_ref", Message: "is not part of the definition language: a WF sends to node names written in the definition, one transition per destination"})
 			}
-			if meta, ok := action["meta"].(map[string]any); ok {
-				if _, ok := meta["type"]; ok {
-					errs = append(errs, ValidationError{Path: actionPath + ".meta.type", Message: "is not part of the definition language: every message a WF sends is a user message"})
+			if _, ok := action["thread_id_ref"]; ok {
+				errs = append(errs, ValidationError{Path: actionPath + ".thread_id_ref", Message: "is not part of the definition language: every message an instance sends carries the instance's thread, the one of the message that started it"})
+			}
+			meta, _ := action["meta"].(map[string]any)
+			if _, ok := meta["type"]; ok {
+				errs = append(errs, ValidationError{Path: actionPath + ".meta.type", Message: "is not part of the definition language: every message a WF sends is a user message"})
+			}
+			actionType, _ := action["type"].(string)
+			fields, ok := actionFields[actionType]
+			if !ok {
+				// An unknown type is validateAction's to report.
+				continue
+			}
+			for _, field := range sortedKeys(action) {
+				if known[field] && !slices.Contains(fields, field) {
+					notOfType(actionPath, actionType, field)
+				}
+			}
+			if !slices.Contains(fields, "meta") {
+				continue
+			}
+			for _, field := range sortedKeys(meta) {
+				if (field == "msg" || field == "context") && !slices.Contains(actionMetaFields[actionType], field) {
+					notOfType(actionPath, actionType, "meta."+field)
 				}
 			}
 		}
@@ -118,6 +190,16 @@ func removedFieldErrors(data []byte) ValidationErrors {
 	return errs
 }
 
+// sortedKeys are object's keys, sorted, so errors come in the same order every time.
+func sortedKeys[V any](object map[string]V) []string {
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErrors {
 	var errs ValidationErrors
 	if def == nil {
@@ -129,6 +211,12 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	}
 	if strings.TrimSpace(def.WorkflowType) == "" {
 		errs = append(errs, ValidationError{Path: "workflow_type", Message: "must not be empty"})
+	}
+	if len(def.StartFrom) == 0 {
+		errs = append(errs, ValidationError{Path: "start_from", Message: "must name the nodes whose messages start an instance"})
+	}
+	for i, name := range def.StartFrom {
+		errs = append(errs, validateStarter(fmt.Sprintf("start_from[%d]", i), name)...)
 	}
 	if len(def.InputSchema) == 0 {
 		errs = append(errs, ValidationError{Path: "input_schema", Message: "must not be empty"})
@@ -161,11 +249,14 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 		for j := range state.Transitions {
 			transition := state.Transitions[j]
 			tPath := fmt.Sprintf("%s.transitions[%d]", path, j)
-			if strings.TrimSpace(transition.EventMatch.Msg) == "" {
-				errs = append(errs, ValidationError{Path: tPath + ".event_match.msg", Message: "must not be empty"})
+			switch {
+			case strings.TrimSpace(transition.EventMatch.Msg) == "" && transition.EventMatch.Src == "":
+				errs = append(errs, ValidationError{Path: tPath + ".event_match", Message: "must name a msg, a src or both"})
+			case transition.EventMatch.Msg != "" && strings.TrimSpace(transition.EventMatch.Msg) == "":
+				errs = append(errs, ValidationError{Path: tPath + ".event_match.msg", Message: "must not be blank"})
 			}
-			if strings.TrimSpace(transition.TargetState) == "" {
-				errs = append(errs, ValidationError{Path: tPath + ".target_state", Message: "must not be empty"})
+			if transition.EventMatch.Src != "" {
+				errs = append(errs, validateNodeName(tPath+".event_match.src", transition.EventMatch.Src)...)
 			}
 			if strings.TrimSpace(transition.Guard) == "" {
 				errs = append(errs, ValidationError{Path: tPath + ".guard", Message: "must not be empty"})
@@ -205,6 +296,10 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	}
 	for i, state := range def.States {
 		for j, transition := range state.Transitions {
+			// A transition without a target_state is internal: it stays in its state.
+			if transition.TargetState == "" {
+				continue
+			}
 			if _, ok := stateIndex[transition.TargetState]; !ok {
 				errs = append(errs, ValidationError{
 					Path:    fmt.Sprintf("states[%d].transitions[%d].target_state", i, j),
@@ -213,7 +308,127 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 			}
 		}
 	}
+	// A forward sends a kept message by a name some keep_message keeps: any other name is a typo,
+	// which at run time would fail the instance.
+	kept := map[string]bool{}
+	def.eachAction(func(_ string, action ActionDefinition) {
+		if action.Type == "keep_message" {
+			kept[action.Name] = true
+		}
+	})
+	def.eachAction(func(path string, action ActionDefinition) {
+		if action.Type == "forward" && action.Message != "" && !kept[action.Message] {
+			errs = append(errs, ValidationError{Path: path + ".message", Message: "must name a message a keep_message keeps"})
+		}
+	})
+	errs = append(errs, timerFiredErrors(def)...)
 	return errs
+}
+
+// timerFiredErrors refuses, on a transition matched on msg TIMER_FIRED, what needs a node's message:
+// a keep_message, and a forward without message (of the event). A TIMER_FIRED is no message a node
+// sent, so either would fail the instance when the timer fires. The transition's own actions run on
+// it, and so do its state's exit actions and its target's entry actions.
+func timerFiredErrors(def *WorkflowDefinition) ValidationErrors {
+	stateAt := map[string]int{}
+	for i, state := range def.States {
+		stateAt[state.Name] = i
+	}
+	var errs ValidationErrors
+	reported := map[string]bool{}
+	check := func(path string, actions []ActionDefinition, on string) {
+		for i, action := range actions {
+			actionPath := fmt.Sprintf("%s[%d]", path, i)
+			if reported[actionPath] {
+				continue
+			}
+			switch {
+			case action.Type == "keep_message":
+				errs = append(errs, ValidationError{Path: actionPath, Message: "a keep_message runs on the TIMER_FIRED of " + on + ", which is no node's message to keep"})
+			case action.Type == "forward" && action.Message == "":
+				errs = append(errs, ValidationError{Path: actionPath, Message: "a forward without message runs on the TIMER_FIRED of " + on + ", which is no node's message to forward: forward a kept one"})
+			default:
+				continue
+			}
+			reported[actionPath] = true
+		}
+	}
+	for i, state := range def.States {
+		for j, transition := range state.Transitions {
+			if transition.EventMatch.Msg != "TIMER_FIRED" {
+				continue
+			}
+			on := fmt.Sprintf("states[%d].transitions[%d]", i, j)
+			check(on+".actions", transition.Actions, on)
+			if transition.TargetState == "" {
+				continue
+			}
+			check(fmt.Sprintf("states[%d].exit_actions", i), state.ExitActions, on)
+			if target, ok := stateAt[transition.TargetState]; ok {
+				check(fmt.Sprintf("states[%d].entry_actions", target), def.States[target].EntryActions, on)
+			}
+		}
+	}
+	return errs
+}
+
+// eachAction calls visit with every action of def and its path, state by state: its entry actions,
+// its exit actions, then its transitions' actions.
+func (def *WorkflowDefinition) eachAction(visit func(path string, action ActionDefinition)) {
+	for i, state := range def.States {
+		path := fmt.Sprintf("states[%d]", i)
+		for j, action := range state.EntryActions {
+			visit(fmt.Sprintf("%s.entry_actions[%d]", path, j), action)
+		}
+		for j, action := range state.ExitActions {
+			visit(fmt.Sprintf("%s.exit_actions[%d]", path, j), action)
+		}
+		for j, transition := range state.Transitions {
+			for k, action := range transition.Actions {
+				visit(fmt.Sprintf("%s.transitions[%d].actions[%d]", path, j, k), action)
+			}
+		}
+	}
+}
+
+// StartsFrom reports whether a message from name, the router-stamped name of its sender, starts an
+// instance of def: name is in its start_from.
+func (def *WorkflowDefinition) StartsFrom(name string) bool {
+	if def == nil || name == "" {
+		return false
+	}
+	for _, starter := range def.StartFrom {
+		if starter == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Involves reports whether name, the router-stamped name of a message's sender, may drive an
+// instance of def: only the nodes written in it may (FINDINGS A-123), those of its start_from, of
+// an event_match.src, and the targets of its send_message and forward actions.
+func (def *WorkflowDefinition) Involves(name string) bool {
+	if def.StartsFrom(name) {
+		return true
+	}
+	if def == nil || name == "" {
+		return false
+	}
+	involved := false
+	for _, state := range def.States {
+		for _, transition := range state.Transitions {
+			if transition.EventMatch.Src == name {
+				involved = true
+			}
+		}
+	}
+	def.eachAction(func(_ string, action ActionDefinition) {
+		if (action.Type == "send_message" || action.Type == "forward") && action.Target == name {
+			involved = true
+		}
+	})
+	return involved
 }
 
 func ValidateInputPayload(def *WorkflowDefinition, input map[string]any) error {
@@ -235,9 +450,11 @@ func ValidateInputPayload(def *WorkflowDefinition, input map[string]any) error {
 
 func ParseWorkflowDuration(value string) (time.Duration, error) {
 	if match := dayDurationRE.FindStringSubmatch(strings.TrimSpace(value)); len(match) == 2 {
-		days, err := strconv.Atoi(match[1])
-		if err != nil {
-			return 0, fmt.Errorf("invalid duration %q", value)
+		days, err := strconv.ParseInt(match[1], 10, 64)
+		if err != nil || days > maxDurationDays {
+			// A day count past what a duration holds wrapped ("213504d" was 25m26s), and an agent's
+			// answer reaches it through a $ref.
+			return 0, fmt.Errorf("invalid duration %q: at most %dd", value, maxDurationDays)
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
@@ -261,24 +478,30 @@ func IsForbiddenSystemTarget(name string) bool {
 	return strings.HasPrefix(n, "SY.") || strings.HasPrefix(n, "RT.")
 }
 
-// isValidRefPath reports whether s is a well-formed $ref dot-path rooted at state/input/event with at
-// least one field (e.g. "event.payload.thread_id") — the form a thread_id_ref is resolved against.
-func isValidRefPath(s string) bool {
-	parts := strings.Split(strings.TrimSpace(s), ".")
-	if len(parts) < 2 {
-		return false
+// validateNodeName checks a node name a definition names a sender by (a start_from entry, an
+// event_match.src): a name with its hive, written as the router stamps it, never a SY.* or RT.*
+// node.
+func validateNodeName(path, name string) ValidationErrors {
+	switch {
+	case name != strings.TrimSpace(name) || !IsValidL2Name(name):
+		return ValidationErrors{{Path: path, Message: "must be a node name with its hive (e.g. \"IO.api.sales@worker1\")"}}
+	case IsForbiddenSystemTarget(name):
+		return ValidationErrors{{Path: path, Message: "must not be a SY.* / RT.* system node"}}
 	}
-	switch parts[0] {
-	case "state", "input", "event":
-	default:
-		return false
+	return nil
+}
+
+// validateStarter checks a start_from entry: a node name (validateNodeName), never an agent's. An
+// agent only answers (wf-orchestration-v1 §1), and one that starts instances and that the WF also
+// asks has its late answer start a new instance, which asks it again: a WF↔AI loop.
+func validateStarter(path, name string) ValidationErrors {
+	if errs := validateNodeName(path, name); len(errs) > 0 {
+		return errs
 	}
-	for _, p := range parts {
-		if strings.TrimSpace(p) == "" {
-			return false
-		}
+	if strings.HasPrefix(strings.ToUpper(name), "AI.") {
+		return ValidationErrors{{Path: path, Message: "must not be an AI.* node: an agent only answers, and its late answer would start a new instance (a WF↔AI loop)"}}
 	}
-	return true
+	return nil
 }
 
 func compileJSONSchema(schema map[string]any) (*jsonschema.Schema, error) {
@@ -313,31 +536,24 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 	}
 	switch action.Type {
 	case "send_message":
-		// The target is a node name written in the definition. A WF may NOT message SY.*/RT.*
-		// system nodes via send_message (that path bypasses VPN isolation in the router; timers use
-		// schedule_timer, not send_message).
-		switch {
-		case strings.TrimSpace(action.Target) == "":
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must not be empty"})
-		case !IsValidL2Name(action.Target):
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
-		case IsForbiddenSystemTarget(action.Target):
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"})
-		}
-		// gap-5: thread_id_ref, when set, must be a well-formed $ref dot-path (resolved at send time to
-		// the external caller's thread_id for a terminal reply).
-		if strings.TrimSpace(action.ThreadIDRef) != "" && !isValidRefPath(action.ThreadIDRef) {
-			errs = append(errs, ValidationError{Path: path + ".thread_id_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "event.payload.thread_id")`})
-		}
+		errs = append(errs, validateTarget(path, action.Target)...)
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
 		}
-		// gap-3: meta.context (used for response_envelope) is resolved like a payload — validate its
-		// $ref shape the same way so a bad ref is caught at publish, not silently dropped at send.
-		if action.Meta != nil && action.Meta.Context != nil {
-			errs = append(errs, validateRefPayload(path+".meta.context", action.Meta.Context)...)
-		}
+		errs = append(errs, validateSentContext(path, action)...)
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
+	case "forward":
+		// A forward sends the message as it was received: its payload is never decoded, and its meta
+		// keeps the message's msg. What it changes is metadata (wf-orchestration-v1 §5.2.1, item 5).
+		errs = append(errs, validateTarget(path, action.Target)...)
+		if action.Message != "" && !variablePattern.MatchString(action.Message) {
+			errs = append(errs, ValidationError{Path: path + ".message", Message: "must be a valid identifier"})
+		}
+		errs = append(errs, validateSentContext(path, action)...)
+	case "keep_message":
+		if !variablePattern.MatchString(action.Name) {
+			errs = append(errs, ValidationError{Path: path + ".name", Message: "must be a valid identifier"})
+		}
 	case "emit_internal_event":
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
@@ -348,14 +564,6 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 			errs = append(errs, ValidationError{Path: path + ".timer_key", Message: "must not be empty"})
 		}
 		errs = append(errs, validateTimerFireSpec(path, action.FireIn, action.FireAt)...)
-		if action.FireIn != "" {
-			duration, err := ParseWorkflowDuration(action.FireIn)
-			if err != nil {
-				errs = append(errs, ValidationError{Path: path + ".fire_in", Message: err.Error()})
-			} else if duration < MinTimerDuration {
-				errs = append(errs, ValidationError{Path: path + ".fire_in", Message: "must be at least 60s"})
-			}
-		}
 		errs = append(errs, validateMissedPolicy(path, action.MissedPolicy, action.MissedWithinMS)...)
 	case "cancel_timer":
 		if strings.TrimSpace(action.TimerKey) == "" {
@@ -366,14 +574,6 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 			errs = append(errs, ValidationError{Path: path + ".timer_key", Message: "must not be empty"})
 		}
 		errs = append(errs, validateTimerFireSpec(path, action.FireIn, action.FireAt)...)
-		if action.FireIn != "" {
-			duration, err := ParseWorkflowDuration(action.FireIn)
-			if err != nil {
-				errs = append(errs, ValidationError{Path: path + ".fire_in", Message: err.Error()})
-			} else if duration < MinTimerDuration {
-				errs = append(errs, ValidationError{Path: path + ".fire_in", Message: "must be at least 60s"})
-			}
-		}
 	case "set_variable":
 		if !variablePattern.MatchString(action.Name) {
 			errs = append(errs, ValidationError{Path: path + ".name", Message: "must be a valid identifier"})
@@ -394,18 +594,210 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 	return errs
 }
 
-func validateTimerFireSpec(path, fireIn, fireAt string) ValidationErrors {
-	hasFireIn := strings.TrimSpace(fireIn) != ""
-	hasFireAt := strings.TrimSpace(fireAt) != ""
+// validateTarget checks the target of a send_message or a forward: a node name written in the
+// definition. A WF may NOT message SY.*/RT.* system nodes (that path bypasses VPN isolation in the
+// router; timers use schedule_timer, not send_message).
+func validateTarget(path, target string) ValidationErrors {
+	switch {
+	case strings.TrimSpace(target) == "":
+		return ValidationErrors{{Path: path + ".target", Message: "must not be empty"}}
+	case target != strings.TrimSpace(target):
+		return ValidationErrors{{Path: path + ".target", Message: "must be a node name without spaces around it"}}
+	case !IsValidL2Name(target):
+		return ValidationErrors{{Path: path + ".target", Message: "must be a valid L2 name"}}
+	case IsForbiddenSystemTarget(target):
+		return ValidationErrors{{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"}}
+	}
+	return nil
+}
+
+// validateSentContext checks what a send_message or a forward writes in the message's meta.context:
+// meta.context, an object (or a $ref, resolved to one when the action runs) that never writes wf,
+// the WF's own block; and vars, an object whose values go in that block, $ref-resolved. Both follow
+// the $ref rules of a payload (gap-3), so a bad ref is caught at publish, not at send.
+func validateSentContext(path string, action ActionDefinition) ValidationErrors {
+	var errs ValidationErrors
+	if action.Meta != nil && action.Meta.Context != nil {
+		context, ok := action.Meta.Context.(map[string]any)
+		switch {
+		case !ok:
+			errs = append(errs, ValidationError{Path: path + ".meta.context", Message: "must be a JSON object"})
+		case !IsWorkflowRef(context):
+			if _, writesWF := context[ContextWF]; writesWF {
+				errs = append(errs, ValidationError{Path: path + ".meta.context." + ContextWF, Message: "is the WF's own block (trail and vars): the engine writes it, and an action's vars fills it"})
+			}
+			if envelope, ok := context["response_envelope"]; ok && !holdsWorkflowRef(envelope) {
+				errs = append(errs, validateResponseEnvelope(path+".meta.context.response_envelope", envelope)...)
+			}
+		}
+		errs = append(errs, validateRefPayload(path+".meta.context", action.Meta.Context)...)
+	}
+	if action.Vars != nil {
+		vars, ok := action.Vars.(map[string]any)
+		if !ok || IsWorkflowRef(vars) {
+			errs = append(errs, ValidationError{Path: path + ".vars", Message: "must be a JSON object, its values literals or $refs"})
+		} else {
+			errs = append(errs, validateRefPayload(path+".vars", vars)...)
+		}
+	}
+	return errs
+}
+
+// validateResponseEnvelope checks a response contract written in the definition by the rules an
+// agent reads it with (response_contract_to_output_schema_spec and extract_response_envelope in
+// crates/fluxbee_ai_sdk/src/message.rs): an agent refuses a contract that breaks one, and the
+// instance waits for an answer that never comes. strict is taken as the agent takes it: true when
+// it is the boolean true, false otherwise.
+func validateResponseEnvelope(path string, envelope any) ValidationErrors {
+	contract, ok := envelope.(map[string]any)
+	if !ok {
+		return ValidationErrors{{Path: path, Message: "must be a JSON object"}}
+	}
+	var errs ValidationErrors
+	if kind, ok := contract["kind"].(string); !ok || kind != "json_object_v1" {
+		errs = append(errs, ValidationError{Path: path + ".kind", Message: `must be "json_object_v1"`})
+	}
+	required, ok := contract["required"].([]any)
+	if !ok || len(required) == 0 {
+		errs = append(errs, ValidationError{Path: path + ".required", Message: "must be a non-empty list of property names"})
+	}
+	properties, ok := contract["properties"].(map[string]any)
+	if !ok || len(properties) == 0 {
+		errs = append(errs, ValidationError{Path: path + ".properties", Message: "must be a non-empty object"})
+	}
+	for i, field := range required {
+		fieldPath := fmt.Sprintf("%s.required[%d]", path, i)
+		name, ok := field.(string)
+		switch {
+		case !ok:
+			errs = append(errs, ValidationError{Path: fieldPath, Message: "must be a string"})
+		case strings.TrimSpace(name) == "":
+			errs = append(errs, ValidationError{Path: fieldPath, Message: "must not be empty"})
+		case properties != nil && !hasKey(properties, name):
+			errs = append(errs, ValidationError{Path: fieldPath, Message: fmt.Sprintf("must be one of the properties (%q is not)", name)})
+		}
+	}
+	propertyTypes := map[string]string{}
+	for _, name := range sortedKeys(properties) {
+		propertyPath := path + ".properties." + name
+		schema, ok := properties[name].(map[string]any)
+		if !ok {
+			errs = append(errs, ValidationError{Path: propertyPath, Message: "must be an object"})
+			continue
+		}
+		propertyType, _ := schema["type"].(string)
+		switch propertyType {
+		case "string", "boolean", "integer", "number":
+			propertyTypes[name] = propertyType
+		case "":
+			errs = append(errs, ValidationError{Path: propertyPath + ".type", Message: "is required"})
+		default:
+			errs = append(errs, ValidationError{Path: propertyPath + ".type", Message: "must be string, boolean, integer or number"})
+		}
+		enum, hasEnum := schema["enum"]
+		if !hasEnum {
+			continue
+		}
+		items, ok := enum.([]any)
+		switch {
+		case !ok:
+			errs = append(errs, ValidationError{Path: propertyPath + ".enum", Message: "must be a list"})
+		case propertyType != "string":
+			errs = append(errs, ValidationError{Path: propertyPath + ".enum", Message: "is only for a property of type string"})
+		case slices.ContainsFunc(items, func(item any) bool { _, isString := item.(string); return !isString }):
+			errs = append(errs, ValidationError{Path: propertyPath + ".enum", Message: "must hold strings only"})
+		}
+	}
+	if textField, ok := contract["text_field"]; ok {
+		name, isString := textField.(string)
+		switch {
+		case !isString:
+			errs = append(errs, ValidationError{Path: path + ".text_field", Message: "must be a string"})
+		case !slices.Contains(required, any(name)):
+			errs = append(errs, ValidationError{Path: path + ".text_field", Message: "must be listed in required"})
+		case propertyTypes[name] != "string":
+			errs = append(errs, ValidationError{Path: path + ".text_field", Message: "must be a property of type string"})
+		}
+	}
+	return errs
+}
+
+// hasKey reports whether object has key, whatever its value.
+func hasKey(object map[string]any, key string) bool {
+	_, ok := object[key]
+	return ok
+}
+
+// validateTimerFireSpec checks a timer action's time: exactly one of fire_in (a duration, 60 s at
+// least) and fire_at (an RFC3339 UTC time), each a literal string or a $ref. A $ref is resolved when
+// the action runs, and the 60 s floor checked then; its default, a literal, is checked here.
+func validateTimerFireSpec(path string, fireIn, fireAt any) ValidationErrors {
+	hasFireIn, hasFireAt := IsTimeSet(fireIn), IsTimeSet(fireAt)
 	switch {
 	case hasFireIn && hasFireAt:
 		return ValidationErrors{{Path: path, Message: "fire_in and fire_at are mutually exclusive"}}
 	case !hasFireIn && !hasFireAt:
 		return ValidationErrors{{Path: path, Message: "exactly one of fire_in or fire_at is required"}}
-	case hasFireAt:
-		if _, err := time.Parse(time.RFC3339, fireAt); err != nil {
-			return ValidationErrors{{Path: path + ".fire_at", Message: "must be RFC3339 UTC timestamp"}}
+	case hasFireIn:
+		return validateTimeValue(path+".fire_in", fireIn, `a duration (e.g. "5m")`, CheckFireIn)
+	default:
+		return validateTimeValue(path+".fire_at", fireAt, "an RFC3339 UTC timestamp", CheckFireAt)
+	}
+}
+
+// IsTimeSet reports whether a timer action sets a time field, fire_in or fire_at: anything but
+// nothing or a blank string.
+func IsTimeSet(value any) bool {
+	text, isString := value.(string)
+	return value != nil && (!isString || strings.TrimSpace(text) != "")
+}
+
+// validateTimeValue checks a timer time, a literal string or a $ref: the literal (or the $ref's
+// default) with check.
+func validateTimeValue(path string, value any, kind string, check func(string) error) ValidationErrors {
+	literal, isLiteral := value.(string)
+	if object, isObject := value.(map[string]any); isObject && IsWorkflowRef(object) {
+		ref, ok := AsRef(object)
+		if !ok {
+			return ValidationErrors{{Path: path, Message: `a $ref holds only $ref and default`}}
 		}
+		if err := validateRefPath(ref.Path); err != nil {
+			return ValidationErrors{{Path: path + ".$ref", Message: err.Error()}}
+		}
+		if !ref.HasDefault {
+			return nil
+		}
+		if literal, isLiteral = ref.Default.(string); !isLiteral {
+			return ValidationErrors{{Path: path + ".default", Message: "must be " + kind}}
+		}
+		path += ".default"
+	} else if !isLiteral {
+		return ValidationErrors{{Path: path, Message: "must be " + kind + " or a $ref"}}
+	}
+	if err := check(literal); err != nil {
+		return ValidationErrors{{Path: path, Message: err.Error()}}
+	}
+	return nil
+}
+
+// CheckFireIn checks a fire_in duration, written in the definition or resolved from a $ref: it
+// parses (ParseWorkflowDuration) and is 60 s at least, SY.timer's floor.
+func CheckFireIn(value string) error {
+	duration, err := ParseWorkflowDuration(value)
+	if err != nil {
+		return err
+	}
+	if duration < MinTimerDuration {
+		return fmt.Errorf("must be at least 60s")
+	}
+	return nil
+}
+
+// CheckFireAt checks a fire_at time: an RFC3339 UTC timestamp. Its 60 s floor depends on when the
+// action runs, and is checked then.
+func CheckFireAt(value string) error {
+	if _, err := time.Parse(time.RFC3339, value); err != nil {
+		return fmt.Errorf("must be RFC3339 UTC timestamp")
 	}
 	return nil
 }

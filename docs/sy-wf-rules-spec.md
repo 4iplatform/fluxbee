@@ -189,6 +189,7 @@ A sketch (`...` stands for the parts of the definition):
     "wf_schema_version": "1",
     "workflow_type": "invoice",
     "description": "Issues an invoice...",
+    "start_from": ["IO.api.billing@motherbee"],
     "input_schema": { ... },
     "initial_state": "validating_data",
     "terminal_states": ["completed", "failed", "cancelled"],
@@ -284,15 +285,17 @@ A sketch (`...` stands for the parts of the definition):
 
 Note that `ok: true` in this case reflects that sy.wf-rules successfully persisted the new definition. The node-level failure is reported in `wf_node.action`, not in the top-level error. This distinguishes "sy.wf-rules did its job but the downstream restart failed" from "sy.wf-rules itself failed". The operator typically reacts to `wf_node.action != "restarted"` with a retry or rollback.
 
-**Error:**
+**Error** (with `evnt.payload.ok == true` as the first guard of the third state; a guard is checked for its syntax and its roots, not for its fields):
 ```json
 {
   "ok": false,
   "node_name": "SY.wf-rules@motherbee",
   "state": "error",
+  "schema_version": 1,
+  "config_version": 0,
   "error": {
     "code": "COMPILE_ERROR",
-    "detail": "Guard compile failed at states[1].transitions[0].guard: undeclared reference to 'event.payload.complette' (did you mean 'event.payload.complete'?)"
+    "detail": "states[2].transitions[0].guard: ERROR: <input>:1:1: undeclared reference to 'evnt' (in container '')\n | evnt.payload.ok == true\n | ^"
   }
 }
 ```
@@ -444,22 +447,9 @@ Response:
 
 ## 6. Validation (the "compile" step)
 
-When `SY.wf-rules` receives a workflow definition for compile or compile_apply, it validates it with the WF engine's own validator (`go/pkg/wfcel`), so it runs the checks of `spec-systemnode-wf-v1_1.md` §8.5:
+When `SY.wf-rules` receives a workflow definition for compile or compile_apply, it validates it with the WF engine's own validator (`go/pkg/wfcel`), so it runs the checks of [spec-systemnode-wf-v1_1.md](spec-systemnode-wf-v1_1.md) §8.5, the one list of them: a definition SY.wf-rules stages is one the WF node loads.
 
-1. JSON structure valid per `wf_schema_version` (`"1"`); an unknown field is refused.
-2. `input_schema` is valid JSON Schema.
-3. `initial_state` exists in `states`.
-4. All `terminal_states` exist in `states`; a state named `failed` is one of them.
-5. Every `target_state` referenced in transitions exists in `states`.
-6. Every transition has an `event_match.msg` and a guard, and every guard compiles against the CEL environment (`input`, `state` and `event` as maps of dynamic values; `now()`, `json_parse()` and CEL's string extensions).
-7. Every action has a known type (from the WF action registry) and valid parameters.
-8. Every `send_message` target is a syntactically valid L2 name, and no `SY.*` or `RT.*` node.
-9. No action has `meta.type` or `target_ref`, and no transition has `event_match.type`: they left the language in 0.1.90, and a definition that still has one is refused, by its path.
-10. Every `schedule_timer` and `reschedule_timer` duration ≥ 60 seconds.
-11. Every `set_variable` name is a valid identifier, and its `value` a CEL expression, as a JSON string, that compiles.
-12. Every `$ref` rooted at `input.`, `state.` or `event.` has a path with no empty segment, holds only `$ref` and `default`, and its `default` is a literal, with no `$ref` inside. An object whose `$ref` has another root (a JSON Schema's `#/definitions/x`) is a literal.
-
-For item 6 (CEL compilation), `SY.wf-rules` includes `cel-go` as a dependency and compiles guards in-process. The compiled programs are NOT persisted — they serve only to validate. The WF node (`wf-generic`) recompiles CEL from the JSON at boot. This avoids cross-binary compatibility issues.
+For the guards (CEL compilation), `SY.wf-rules` includes `cel-go` as a dependency and compiles guards in-process. The compiled programs are NOT persisted — they serve only to validate. The WF node (`wf-generic`) recompiles CEL from the JSON at boot. This avoids cross-binary compatibility issues.
 
 If any check fails, the definition is NOT staged. The response includes the error code `COMPILE_ERROR` and a detail string with the path to the failing element (same pattern as wf-generic's load-time validation).
 

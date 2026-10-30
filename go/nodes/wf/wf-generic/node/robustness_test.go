@@ -79,6 +79,7 @@ func TestACELMapIsKeptAsPlainJSON(t *testing.T) {
 	const profiling = `{
   "wf_schema_version": "1",
   "workflow_type": "profiling",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "collecting",
   "terminal_states": ["done", "failed"],
@@ -110,7 +111,7 @@ func TestACELMapIsKeptAsPlainJSON(t *testing.T) {
 	}
 	send := func(instanceID, name string, payload map[string]any) {
 		t.Helper()
-		msg := from("AI.host@motherbee", msgWithNameAndPayload(name, payload))
+		msg := from("IO.in@motherbee", msgWithNameAndPayload(name, payload))
 		msg.Meta.ThreadID = &instanceID
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -153,6 +154,7 @@ func TestTheInternalEventCapFailsTheInstance(t *testing.T) {
 	const looping = `{
   "wf_schema_version": "1",
   "workflow_type": "looping",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "looping",
   "terminal_states": ["done"],
@@ -198,6 +200,7 @@ func TestNumbersKeepOneTypeLiveAndAfterARestart(t *testing.T) {
 	const counting = `{
   "wf_schema_version": "1",
   "workflow_type": "numbers",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}, "x": {"type": "number"}}},
   "initial_state": "counting",
   "terminal_states": ["checked"],
@@ -232,7 +235,7 @@ func TestNumbersKeepOneTypeLiveAndAfterARestart(t *testing.T) {
 	}
 	send := func(instanceID, name, payload string) {
 		t.Helper()
-		msg := from("AI.host@motherbee", msgWithName(name))
+		msg := from("IO.in@motherbee", msgWithName(name))
 		msg.Payload = json.RawMessage(payload)
 		msg.Meta.ThreadID = &instanceID
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
@@ -295,6 +298,7 @@ func TestThePanicGuardOfTheReceiveLoopKeepsTheNode(t *testing.T) {
 const replayWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "replay",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "waiting",
   "terminal_states": ["done"],
@@ -328,7 +332,7 @@ func (d *sendHook) SendMsg(msg sdk.Message) error {
 // journalGo journals a GO for instanceID as a start that crashed in its run leaves it, at attempts.
 func journalGo(t *testing.T, rt *NodeRuntime, instanceID string, attempts int) {
 	t.Helper()
-	msg := from("AI.host@motherbee", msgWithName("GO"))
+	msg := from("IO.in@motherbee", msgWithName("GO"))
 	msg.Meta.ThreadID = &instanceID
 	id, err := rt.journal(context.Background(), instanceID, inboundEvent, msg, "")
 	if err != nil {
@@ -407,7 +411,7 @@ func TestAnEventRunAtThreeStartsIsNotRunAgain(t *testing.T) {
 
 	// The node goes on.
 	healthy := "wfi:healthy"
-	goMsg := from("AI.host@motherbee", msgWithName("GO"))
+	goMsg := from("IO.in@motherbee", msgWithName("GO"))
 	goMsg.Meta.ThreadID = &healthy
 	if err := Dispatch(context.Background(), goMsg, after); err != nil {
 		t.Fatal(err)
@@ -458,7 +462,7 @@ func TestAStartCountsAnAttemptBeforeItRunsAnEventAgain(t *testing.T) {
 		var seen []string
 		rt.ActCtx.Dispatcher = &sendHook{mockDispatcher: mockDispatcher{l2name: testNodeName}, onSend: attemptsIn(t, rt.Store, "wfi:live", &seen)}
 		live := "wfi:live"
-		goMsg := from("AI.host@motherbee", msgWithName("GO"))
+		goMsg := from("IO.in@motherbee", msgWithName("GO"))
 		goMsg.Meta.ThreadID = &live
 		if err := Dispatch(context.Background(), goMsg, rt); err != nil {
 			t.Fatal(err)
@@ -511,6 +515,7 @@ func TestACommitConsumesTheEarlierEventsItHolds(t *testing.T) {
 	const definition = `{
   "wf_schema_version": "1",
   "workflow_type": "inc",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "counting",
   "terminal_states": ["done"],
@@ -529,7 +534,7 @@ func TestACommitConsumesTheEarlierEventsItHolds(t *testing.T) {
 	rt, disp := newTestRuntime(t, path, definition, nil)
 	id := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
 	inc := func(trace string) error {
-		msg := from("AI.host@motherbee", msgWithName("INC"))
+		msg := from("IO.in@motherbee", msgWithName("INC"))
 		msg.Meta.ThreadID = &id
 		msg.Routing.TraceID = trace
 		return Dispatch(context.Background(), msg, rt)
@@ -568,6 +573,7 @@ func TestADefinitionsNumbersGoOnTheWireAsWritten(t *testing.T) {
 	const definition = `{
   "wf_schema_version": "1",
   "workflow_type": "numbers",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object", "properties": {"limit": {"type": "integer", "maximum": 10}}},
   "initial_state": "sending",
   "terminal_states": ["sent"],
@@ -593,7 +599,7 @@ func TestADefinitionsNumbersGoOnTheWireAsWritten(t *testing.T) {
 	if got := string(disp.sent[0].Payload); got != `{"count":3,"limit":7,"list":[1,2.0],"one":1.0,"ratio":2.5}` {
 		t.Fatalf("payload on the wire: %s", got)
 	}
-	if got := string(disp.sent[0].Meta.Context); got != `{"backoff":1.5,"retries":3}` {
+	if got := string(disp.sent[0].Meta.Context); got != `{"backoff":1.5,"retries":3,"wf":{"trail":["WF.invoice@motherbee"]}}` {
 		t.Fatalf("meta.context on the wire: %s", got)
 	}
 	if got := string(disp.sent[1].Payload); got != `{"count":3,"limit":10,"list":[1,2.0],"one":1.0,"ratio":2.5}` {
@@ -620,6 +626,7 @@ func TestASlowGuardNeverRacesTheNextTransition(t *testing.T) {
 	definition := `{
   "wf_schema_version": "1",
   "workflow_type": "slowguard",
+  "start_from": ["IO.in@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "loading",
   "terminal_states": ["done"],
@@ -643,7 +650,7 @@ func TestASlowGuardNeverRacesTheNextTransition(t *testing.T) {
 	id := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
 	send := func(name string, payload any) {
 		t.Helper()
-		msg := from("AI.host@motherbee", msgWithName(name))
+		msg := from("IO.in@motherbee", msgWithName(name))
 		msg.Meta.ThreadID = &id
 		msg.Payload, _ = json.Marshal(payload)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {

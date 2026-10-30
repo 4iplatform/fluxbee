@@ -353,9 +353,9 @@ every turn and after the reload:
   a package.
 - If SY.cognition stops, the region keeps its last snapshot, and the router keeps serving it.
 
-**ai.generic** renders the package into a "Conversation memory" block ahead of the user's text
-(`render_memory_package_prompt_block`, `inject_memory_package_into_text_input` in
-`nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
+**ai.generic** renders the package into a "Conversation memory" block ahead of the user's text,
+before a WF's block when the message carries one (`render_memory_package_prompt_block`,
+`inject_prompt_blocks_into_text_input` in `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
 
 ---
 

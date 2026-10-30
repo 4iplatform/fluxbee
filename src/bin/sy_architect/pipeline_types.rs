@@ -690,9 +690,10 @@ pub fn valid_workflow_name(name: &str) -> bool {
 }
 
 /// What is wrong with the shape of a workflow definition as SY.wf-rules checks it (`wfcel`
-/// `ValidateDefinition`): `wf_schema_version` "1", a `workflow_type`, an `input_schema`, states
-/// each with a name of its own, and an `initial_state` and `terminal_states` among them. None when
-/// the shape is right; its guards and actions are SY.wf-rules' to check.
+/// `ValidateDefinition`): `wf_schema_version` "1", a `workflow_type`, a `start_from` that names
+/// the nodes whose messages start an instance, an `input_schema`, states each with a name of its
+/// own, and an `initial_state` and `terminal_states` among them. None when the shape is right; its
+/// node names, guards and actions are SY.wf-rules' to check.
 pub fn workflow_definition_shape_error(definition: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
     let text = |key: &str| {
@@ -709,6 +710,13 @@ pub fn workflow_definition_shape_error(definition: &serde_json::Value) -> Option
     }
     if text("workflow_type").trim().is_empty() {
         return Some("workflow_type must not be empty".to_string());
+    }
+    if definition
+        .get("start_from")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Some("start_from must name the nodes whose messages start an instance".to_string());
     }
     if definition
         .get("input_schema")

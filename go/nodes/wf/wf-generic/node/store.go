@@ -14,16 +14,21 @@ import (
 )
 
 const (
-	// wfSchemaVersion 3 (0.1.90): a definition is kept by its hash for as long as a running instance
-	// uses it, each instance records the hash it was born with, and an inbound event is journaled
-	// until its transition commits (wf-orchestration-v1 §5.1).
-	wfSchemaVersion = 3
+	// wfSchemaVersion 4 (0.1.91): an instance keeps its thread, the conversation's (indexed), and the
+	// messages keep_message kept (wf-orchestration-v1 §5.2.1). Version 3 (0.1.90): a definition is
+	// kept by its hash for as long as a running instance uses it, each instance records the hash it
+	// was born with, and an inbound event is journaled until its transition commits (§5.1).
+	wfSchemaVersion = 4
 	maxLogEntries   = 100
 )
 
 // WFInstanceRow is the persistent representation of a workflow instance.
 type WFInstanceRow struct {
-	InstanceID   string
+	InstanceID string
+	// ThreadID is the instance's thread: the thread_id of the message that started it, or the
+	// instance's own id when that message had none. Every message the instance sends carries it, and
+	// a message on it reaches the instance.
+	ThreadID     string
 	WorkflowType string
 	// DefinitionHash is the hash of the definition the instance was born with, and runs on until it
 	// ends (a redeploy does not move it).
@@ -91,11 +96,24 @@ type InboundEventRow struct {
 	Attempts int
 }
 
+// KeptMessageRow is a message keep_message kept, under its name, for its instance: whole, as
+// received, until the instance ends.
+type KeptMessageRow struct {
+	InstanceID  string
+	Name        string
+	MessageJSON string // the message as received (sdk.MarshalMessage)
+	KeptAtMS    int64
+}
+
 type InstanceCommitMutation struct {
 	ConsumedInternalEventID *int64
 	ConsumedInboundEventID  *int64
 	EnqueueInternalEvents   []InternalEventRow
 	ClearInternalEvents     bool
+	// KeepMessages are the messages the instance kept since its last commit, each replacing the one
+	// kept under its name; DropKeptMessages, set when the instance ends, drops all of them.
+	KeepMessages     []KeptMessageRow
+	DropKeptMessages bool
 }
 
 // Store is the SQLite-backed persistence layer for a single WF node.
@@ -152,11 +170,13 @@ var wfSchemaStatements = []string{
     created_at_ms     INTEGER NOT NULL,
     updated_at_ms     INTEGER NOT NULL,
     terminated_at_ms  INTEGER,
-    definition_hash   TEXT NOT NULL DEFAULT ''
+    definition_hash   TEXT NOT NULL DEFAULT '',
+    thread_id         TEXT NOT NULL DEFAULT ''
 );`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_definition ON wf_instances(definition_hash);`,
+	`CREATE INDEX IF NOT EXISTS idx_wfi_thread ON wf_instances(thread_id);`,
 	`CREATE TABLE IF NOT EXISTS wf_instance_log (
     log_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_id TEXT NOT NULL,
@@ -193,6 +213,13 @@ var wfSchemaStatements = []string{
     received_at_ms  INTEGER NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0
 );`,
+	`CREATE TABLE IF NOT EXISTS wf_kept_messages (
+    instance_id   TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    message_json  TEXT NOT NULL,
+    kept_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, name)
+);`,
 }
 
 func ensureWFSchema(db *sql.DB) error {
@@ -211,6 +238,11 @@ func ensureWFSchema(db *sql.DB) error {
 	if userVersion >= 1 && userVersion < 3 {
 		if err := migrateToDefinitionsByHash(tx); err != nil {
 			return fmt.Errorf("migrate wf schema to v3: %w", err)
+		}
+	}
+	if userVersion >= 1 && userVersion < 4 {
+		if err := migrateToThreads(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v4: %w", err)
 		}
 	}
 	for _, stmt := range wfSchemaStatements {
@@ -257,6 +289,22 @@ WHERE status IN ('running', 'cancelling');`,
 	}
 	if queues > 0 {
 		if _, err := tx.Exec(`ALTER TABLE wf_internal_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateToThreads takes a v3 store (or a v1 or v2 one, once at v3) to v4: each instance keeps its
+// thread, and an instance of before takes its own id, the thread its sends carried. The kept
+// messages' table and the thread's index are created at their v4 shape.
+func migrateToThreads(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE wf_instances ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';`,
+		`UPDATE wf_instances SET thread_id = instance_id;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}
 	}
@@ -314,20 +362,20 @@ WHERE hash != ? AND hash NOT IN (
 // errInstanceNotFound is GetInstance's error for an instance the store does not have.
 var errInstanceNotFound = errors.New("not found")
 
-const instanceColumns = `instance_id, workflow_type, definition_hash, status, current_state, input_json, state_json,
-       current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms`
+const instanceColumns = `instance_id, thread_id, workflow_type, definition_hash, status, current_state, input_json,
+       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms`
 
 // CreateInstance inserts a new workflow instance row.
 func (s *Store) CreateInstance(ctx context.Context, inst WFInstanceRow) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
 	return err
 }
 
 func instanceValues(inst WFInstanceRow) []any {
 	return []any{
-		inst.InstanceID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
+		inst.InstanceID, inst.ThreadID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
 		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
 		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS,
 	}
@@ -352,7 +400,8 @@ func (s *Store) GetInstance(ctx context.Context, instanceID string) (WFInstanceR
 
 // CommitInstanceMutation atomically writes the instance row (an instance's first commit creates it,
 // so a creation is one commit: its row, its internal events and its inbound event) with the
-// consumption of the event its transition took and the internal-event queue changes.
+// consumption of the event its transition took, the internal-event queue changes and the messages
+// it kept.
 func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, mutation InstanceCommitMutation) error {
 	if mutation.ClearInternalEvents && len(mutation.EnqueueInternalEvents) > 0 {
 		return fmt.Errorf("cannot enqueue internal events while clear_internal_events is set")
@@ -366,7 +415,7 @@ func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, 
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(instance_id) DO UPDATE SET
     status           = excluded.status,
     current_state    = excluded.current_state,
@@ -408,15 +457,54 @@ VALUES (?, ?, ?, ?, ?, ?);`,
 		}
 	}
 
+	if mutation.DropKeptMessages {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM wf_kept_messages WHERE instance_id = ?;`, inst.InstanceID); err != nil {
+			return err
+		}
+	} else {
+		for _, kept := range mutation.KeepMessages {
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO wf_kept_messages (instance_id, name, message_json, kept_at_ms)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(instance_id, name) DO UPDATE SET
+    message_json = excluded.message_json,
+    kept_at_ms   = excluded.kept_at_ms;`,
+				kept.InstanceID, kept.Name, kept.MessageJSON, kept.KeptAtMS); err != nil {
+				return err
+			}
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	return nil
 }
 
+// ListKeptMessages returns the messages an instance kept, by name.
+func (s *Store) ListKeptMessages(ctx context.Context, instanceID string) ([]KeptMessageRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT instance_id, name, message_json, kept_at_ms
+FROM wf_kept_messages WHERE instance_id = ? ORDER BY name;`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KeptMessageRow
+	for rows.Next() {
+		var r KeptMessageRow
+		if err := rows.Scan(&r.InstanceID, &r.Name, &r.MessageJSON, &r.KeptAtMS); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // FailInstance ends an instance as failed with no transition: what the engine does when it cannot
 // run one (its definition is gone, or the transition and the failure handling both panicked). Its
-// pending internal and inbound events go with it; its timers are the caller's.
+// pending internal and inbound events and its kept messages go with it; its timers are the
+// caller's.
 func (s *Store) FailInstance(ctx context.Context, instanceID string, nowMS int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -431,6 +519,7 @@ func (s *Store) FailInstance(ctx context.Context, instanceID string, nowMS int64
 WHERE instance_id = ?;`, []any{nowMS, nowMS, instanceID}},
 		{`DELETE FROM wf_internal_events WHERE instance_id = ?;`, []any{instanceID}},
 		{`DELETE FROM wf_inbound_events WHERE instance_id = ?;`, []any{instanceID}},
+		{`DELETE FROM wf_kept_messages WHERE instance_id = ?;`, []any{instanceID}},
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt.query, stmt.args...); err != nil {
@@ -440,11 +529,13 @@ WHERE instance_id = ?;`, []any{nowMS, nowMS, instanceID}},
 	return tx.Commit()
 }
 
-// LoadRunningInstances returns all instances with status 'running' or 'cancelling'.
+// LoadRunningInstances returns all instances with status 'running' or 'cancelling', in the order they
+// started.
 func (s *Store) LoadRunningInstances(ctx context.Context) ([]WFInstanceRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT `+instanceColumns+`
-FROM wf_instances WHERE status IN ('running', 'cancelling');`)
+FROM wf_instances WHERE status IN ('running', 'cancelling')
+ORDER BY created_at_ms, instance_id;`)
 	if err != nil {
 		return nil, err
 	}
@@ -484,7 +575,7 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 	for rows.Next() {
 		var r WFInstanceRow
 		if err := rows.Scan(
-			&r.InstanceID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
+			&r.InstanceID, &r.ThreadID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
 			&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
 			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS,
 		); err != nil {
@@ -554,6 +645,14 @@ func (s *Store) CountInboundAttempt(ctx context.Context, eventID int64) error {
 // CountInternalAttempt records, in its own commit, that a start runs the queued internal event again.
 func (s *Store) CountInternalAttempt(ctx context.Context, eventID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE wf_internal_events SET attempts = attempts + 1 WHERE event_id = ?;`, eventID)
+	return err
+}
+
+// RetargetInboundEvent makes the journaled event eventID an event of the running instance
+// instanceID: recovery's replay of a creation whose thread that instance holds. The instance's
+// commit then consumes it.
+func (s *Store) RetargetInboundEvent(ctx context.Context, eventID int64, instanceID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE wf_inbound_events SET instance_id = ?, kind = 'event' WHERE event_id = ?;`, instanceID, eventID)
 	return err
 }
 
@@ -813,6 +912,9 @@ WHERE terminated_at_ms IS NOT NULL AND terminated_at_ms < ?;`, cutoffMS)
 			return 0, err
 		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_inbound_events WHERE instance_id = ?;`, id); err != nil {
+			return 0, err
+		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_kept_messages WHERE instance_id = ?;`, id); err != nil {
 			return 0, err
 		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_instances WHERE instance_id = ?;`, id); err != nil {

@@ -13638,13 +13638,15 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
 
 /// The workflow definition of the wf_rules help examples: a valid one (SY.wf-rules compiles it, and
 /// the Go test of every shipped definition validates its copy,
-/// `go/pkg/wfcel/testdata/admin_help_definition.json`), written as a WF is written since 0.1.90:
-/// sends without a type, a timeout on `event.timer_key`.
+/// `go/pkg/wfcel/testdata/admin_help_definition.json`), written as a WF is written since 0.1.91:
+/// the nodes that start an instance in `start_from`, sends without a type, a timeout on
+/// `event.timer_key`.
 fn wf_rules_example_definition() -> serde_json::Value {
     serde_json::json!({
         "wf_schema_version": "1",
         "workflow_type": "invoice",
         "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
+        "start_from": ["IO.api.billing@motherbee"],
         "input_schema": {
             "type": "object",
             "required": ["customer_id"],
@@ -14261,14 +14263,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
-            "Every message a WF sends is a user message, to a node name written in the definition: an action with meta.type or target_ref is refused. A timer's key is event.timer_key; an agent's error answer is <msg>.error.",
+            "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.",
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
             "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
-            "Every message a WF sends is a user message, to a node name written in the definition: an action with meta.type or target_ref is refused. A timer's key is event.timer_key; an agent's error answer is <msg>.error.",
+            "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.",
         ],
         "wf_rules_apply" | "wf_rules_rollback" => vec![
             "workflow_name is required.",

@@ -45,13 +45,21 @@ func DecodeJSONObject(data []byte) (map[string]any, error) {
 }
 
 // EncodeJSON writes value as DecodeJSON reads it back: a float64 keeps its decimal point (7.0, not
-// 7), so it stays a double. A NaN or an infinity is not JSON, and is an error.
+// 7), so it stays a double. A NaN or an infinity is not JSON, and is an error. <, > and & are
+// written as they are, as a frame carries them (the Go SDK's MarshalMessage): json.Marshal wrote
+// them as <, > and & in every payload and context a WF sent.
 func EncodeJSON(value any) ([]byte, error) {
 	keyed, err := keepDoubles(value)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(keyed)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(keyed); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
 // ValueToJSON is the plain JSON value a CEL result is kept as (a set_variable): an int is an int64,

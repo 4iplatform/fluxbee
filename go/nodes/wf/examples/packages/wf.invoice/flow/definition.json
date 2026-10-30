@@ -1,7 +1,8 @@
 {
   "wf_schema_version": "1",
   "workflow_type": "invoice",
-  "description": "Manages the full lifecycle of an invoice: data collection, validation, sending, and completion.",
+  "description": "Manages the full lifecycle of an invoice: data collection, validation, sending, and completion. Started by the billing system through IO.api.billing, or by the repo's example client (examples/wf_client.rs).",
+  "start_from": ["IO.api.billing@motherbee", "WF.client.example@motherbee"],
   "input_schema": {
     "type": "object",
     "required": ["customer_id", "amount_cents"],
