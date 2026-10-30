@@ -14,8 +14,13 @@
 - **Case 1 (§5.2)** is the operator's circuit of 2026-10-29: a sale handed to invoicing, then a
   due-date timer and a payment check. Its decisions were taken, and it was built and reviewed, on
   2026-10-29 (§5.2.1, §5.2.3). It was released in 0.1.91 and validated on 8.x on 2026-10-30
-  (§5.2.2; ledger 0.1.91). Next: Cases 3 and 4 (§5), each decided with the operator first. The
-  operator: close the WF topic completely, case by case; Archi through Cloud waits.
+  (§5.2.2; ledger 0.1.91). The operator: close the WF topic completely, case by case; Archi
+  through Cloud waits.
+- **Case 3 (§5.3)** is the internal consultation: an agent asks a supervisor, and stays the
+  person's voice. It was decided with the operator on 2026-10-30, with the menu of options, the
+  catch, the cap on agent calls and the way back through io.slack. Case 4 (handing the
+  conversation to a person of the team) and Case 5 (Archi writes and operates WFs) follow. The
+  operator: *"no tomar otro tema hasta terminar este"*.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -293,13 +298,18 @@ This is the single place for the track. The cases are worked here one at a time.
 
   **Done in 0.1.91 (§5.2).**
 - **Case 2:** taken into Case 1 on 2026-10-29.
-- **Case 3, escalation.** A field of the agent's evaluation routes the case to a supervisor's IO
-  node (a name written in the definition), with its data.
-- **Case 4, Archi writes and operates WFs:**
-  - the guide and seeds;
+- **Case 3, the internal consultation (§5.3, decided 2026-10-30).** The agent asks a supervisor
+  through the WF, and stays the person's voice. With it come the menu of options, the catch, the
+  cap on agent calls (A-125), the way back through io.slack, and Archi's guide.
+- **Case 4, handing the conversation to a person of the team.** The WF bridges the person's IO
+  node and the team's until the conversation comes back. Its open questions are in §5.3.
+- **Case 5, Archi writes and operates WFs:**
   - a check before deploy, with `COMPILE_ERROR` back to the designer. Today's `check` is a
     compile, and it stages the definition (FINDINGS A-128);
-  - instances visible through SY.admin.
+  - instances visible through SY.admin;
+  - the pipeline's problems of §4.7.
+
+  Archi's guide to writing WFs moved into Case 3.
 - **Later, in the IO family:** writing first to a person who never wrote (FINDINGS A-114).
 
 ### 5.1 Case 0 (0.1.90): what is broken today. Decided by the operator, 2026-10-28
@@ -654,9 +664,9 @@ todo probado"*.
 - a message the WF writes itself carries no `src_ilk` (the rest of A-116);
 - IO.api delivers no answer, because it only takes messages in (the IO family's own track);
 - Archi's guide to writing WFs, with handback and inactivity timers as the recommended pair
-  (Case 4);
+  (Case 3, §5.3);
 - a cap in the engine on the agent calls between two triggers, as a backstop for a definition
-  whose agents keep answering each other (A-125, with Case 4);
+  whose agents keep answering each other (A-125, with Case 3, §5.3);
 - the contract enforced by the provider inside the tool loop too.
 
 #### 5.2.2 The validation on 8.x
@@ -722,7 +732,7 @@ Afterwards the gate's objects are removed. `pruebas`, its keys and `AI.pruebas` 
   - **The store:** the inbound journal and the internal events were empty at every check.
   - **Health** was clean on the four hives.
 - **Read from the WF's store, read only:** the instances' states and logs. SY.admin has no instance
-  actions yet (Case 4).
+  actions yet (Case 5).
 
 #### 5.2.3 The review round (2026-10-29)
 
@@ -753,8 +763,211 @@ docs, and the agents. Everything below was fixed before the release.
   the model's output missing from a failure's log, and the docs: the late-answer rule, the upgrade,
   what a forward copies, who can start an instance, and Archi's seeds and SY.admin's help on errors
   and sender-only matches.
-- **Kept open:** a cap on agent calls between two triggers (A-125, with Case 4), and the contract
+- **Kept open:** a cap on agent calls between two triggers (A-125, with Case 3), and the contract
   enforced by the provider inside the tool loop.
+
+### 5.3 Case 3: the internal consultation. Decided with the operator, 2026-10-30
+
+**The operator's split:** escalation is two cases, built and validated one after the other.
+- **The internal consultation (this case):** the agent asks a supervisor, the supervisor decides,
+  and the agent stays the person's only voice.
+- **Handing the conversation over (Case 4):** a person of the team takes the conversation, and the
+  WF bridges two IO nodes until it comes back.
+
+**The circuit:**
+1. A person asks sales for a 20% discount on 10 Pro licenses.
+2. Sales answers with the option `consult`. Its `question` carries the data to decide, and its
+   `reply` tells the person that it will check.
+3. The WF forwards the reply to the person. It writes the question to the supervisors' IO node,
+   `IO.slack.supervisores`, a name written in the definition, and waits, with a timer.
+4. A supervisor answers in Slack, in the thread of that post, and the answer reaches the same
+   instance.
+5. The WF forwards the answer to sales. Sales answers the person, and the WF delivers it.
+
+#### 5.3.1 Decided: the WF hands the agent a menu
+
+- **What an agent may do is fixed and clear, and never in its role:** *"me molesta que esté en el
+  prompt"*.
+  - Case 1's gate had to write the routing rules into the agents' roles.
+  - The contract reached the model only as `area:string(sales|invoice)`, appended to the system
+    prompt (`build_output_schema_fallback_instruction`, crates/fluxbee_ai_sdk/src/llm.rs).
+- **The WF sends the possible actions in the message,** *"como opciones y no otra cosa"*. Each WF
+  builds its own menu, and a role keeps only the agent's trade, so it stays reusable.
+- **The menu** is an action's `menu`. The engine writes it into the WF's block
+  (`meta.context.wf`), next to the trail and the variables. It has:
+  - `help`: a fixed text that gives the choice context, in case the person's message is unclear:
+    *"algo acotado pero que le dé contexto a la elección"*. The instance's data travels in `vars`,
+    as in Case 1;
+  - `options`: each with a `name`, a `description` and `params`. Each param has a type (string,
+    boolean, integer or number, with an enum for strings) and a description.
+
+  ```json
+  "menu": {
+    "help": "The person is buying licenses. Once they accept the quote, invoicing issues the invoice; a discount above 10% needs a supervisor's approval.",
+    "options": [
+      {"name": "answer",  "description": "You answer the person yourself."},
+      {"name": "invoice", "description": "They accepted the quote and ask for the invoice.",
+       "params": {"product": {"type": "string"}, "quantity": {"type": "integer"}, "unit_price": {"type": "number"}}},
+      {"name": "consult", "description": "A supervisor must approve something before you answer.",
+       "params": {"question": {"type": "string", "description": "What you ask, with the data to decide."}}}
+    ]
+  }
+  ```
+
+- **The agent answers `{reply, option, params}`:**
+  - `reply` is the text for the person, which the WF forwards or not;
+  - `option` and `params` are what the CEL reads: `event.context.evaluation.option`,
+    `event.context.evaluation.params.question`.
+- **"None of the options" is always an answer:** ai.generic adds `none` to every menu, with one
+  param, `reason`. A definition cannot use the name.
+- **An answer off the menu is an error, with no retries:** *"coincido en no hacer cosas raras con
+  esto, por ahora queda en error"*. These come back to the WF as an error payload:
+  - an option the menu does not have;
+  - a missing or mistyped param;
+  - no JSON at all.
+- **Limits,** checked at compile: `help` up to 600 characters; each description up to 200; up to
+  8 options, plus `none`.
+- **One way to ask an agent within a WF:** the menu takes the place of `response_envelope` and
+  `text_field` in a WF's actions. IO nodes keep `response_envelope` for their own callers (IO.api,
+  IO.cloud, the frontdesk).
+
+#### 5.3.2 Decided: the catch, as in .NET
+
+- *"El catch hacerlo igual que el .NET, que podés programar qué querés que haga, o el default,
+  que ahora sería log."*
+- **A definition may have a `catch`:** a list of transitions, like a state's.
+  - The engine tries it when the current state's transitions take nothing, in any state.
+  - A state can take `none` or an error with its own transitions first, as a local try/catch
+    does.
+- **What reaches it:**
+  - `none`;
+  - an agent's error: an answer off the menu, a timeout, a provider failure;
+  - any event no transition took.
+
+  Its guards tell them apart as any guard does: `event.context.evaluation.option == 'none'`,
+  `event.payload.type == 'error'`.
+- **What it does is the designer's choice:** for example, hand the conversation to a person
+  (Case 4), or ask another agent.
+- **Without a catch, or when none of its transitions takes the event, the default is the log,**
+  as today.
+  - The instance's log gets an `unhandled event` entry, and the instance stays where it was
+    (go/nodes/wf/wf-generic/node/instance.go, where no transition is chosen).
+  - The engine also writes a line to the node's log. Today it does not.
+- **Where the failures come from.** The operator asked whether only a badly built CEL leads here.
+  It does not:
+  - the model does not follow the menu. This is the likeliest;
+  - the provider fails;
+  - the definition offers an option that no transition takes.
+
+  wfcel also refuses, at compile, a guard that compares the option with a name that no menu has
+  (`option == "invoce"`).
+
+#### 5.3.3 Decided: the cap on agent calls (A-125) comes with the catch
+
+- **Why now:** the catch makes a loop easy to write. The agent fails, the catch asks the same agent
+  again, and so on.
+- **The cap:** the engine sends at most 8 messages to agents (`AI.*`) between two triggers. A
+  trigger is a message from an IO node or another WF, or a timer fire.
+- **Past the cap:**
+  - the send is not made;
+  - the instance takes it as an error, with the cause `agent_call_cap`: the catch if the
+    definition has one, else the log;
+  - the instance does not fail, so its timers stay. The next trigger starts a new count.
+
+#### 5.3.4 Decided: the way back belongs to the IO node
+
+- **The principle (the operator):** *"el que responde tiene que ser dueño o saber más que nadie
+  del dato para decidir.. en este caso parece ser el IO porque creó el evento de comunicación
+  inicial."*
+- **How it fails today,** verified:
+  - every message an instance sends carries the instance's thread (`meta.ThreadID`,
+    go/nodes/wf/wf-generic/node/actions.go);
+  - io.slack posts a message with no `reply_target` at the top level of its channel
+    (nodes/io/io-slack/src/main.rs, the outbound target);
+  - a reply in the thread of that post gets a new thread id, made from the channel and the post
+    (nodes/io/common/src/io_context.rs). So it misses the instance;
+  - an agent's answer carries the `context.io` of the message it answers
+    (crates/fluxbee_ai_sdk/src/message.rs). Sales' answer to the supervisor therefore carries the
+    supervisors' channel. Forwarded to a person's io.slack, it would be posted in that node's
+    channel, which the node forces, but with the other channel's `thread_ts`, which it keeps: a
+    thread that does not exist there.
+- **The design:** each IO node knows where a thread is on its side.
+  - **What io.slack records, on disk:** the thread id of each Slack thread it handles. That covers
+    the threads it makes from people's messages, and each post it makes on a thread it did not
+    know, such as the WF's question.
+  - **Why on disk:** a supervisor may answer hours later, after a restart.
+  - **In:** a reply in the thread of a recorded post takes that post's thread id.
+  - **Out:** a message on a recorded thread goes to that thread's place on the node's side. A
+    `reply_target` of another channel is ignored.
+  - **What the WF carries:** only the thread id.
+- **Scope:** io.slack, the normalized IO node. The other IO nodes follow in the IO family's track.
+- The operator expects thread ids to be *"otro debug grande cuando empecemos a hacer pruebas
+  reales"*.
+
+#### 5.3.5 Decided: Archi learns to write this, from one handbook
+
+- *"A Archi vamos a tener que ponerle info para que sepa programar esto… de hecho Fluxbee necesita
+  un handbook único, sería el de Archi, y que lo use el que quiera, sea humano o quien sea que
+  necesite, como un super-Archi."*
+- **Today,** verified:
+  - **What Archi reads:** its handbook, appended whole to its prompt (`build_archi_prompt`,
+    src/bin/sy_architect.rs; 39 KB), and its cookbook seeds.
+  - **The handbook's WF section (§4.2):** it has the rules up to `start_from`. It does not say
+    what a guard can read and call, and it does not explain `forward`, `keep_message`, the WF's
+    block or `text_field`.
+  - **The two WF seeds:** they hold the same example, a request to `IO.quickbooks` with no agent.
+  - **For people:** the reference is [wf-rules-quickstart](wf-rules-quickstart.md): CEL guards in
+    §3 and every action in §4.
+- **In this case:**
+  - the handbook's WF section becomes the one reference for writing a WF. It covers what a guard
+    reads and calls, the actions, the menu, the catch, `none` and the cap;
+  - Archi gets a seed with an agent and a menu;
+  - the quickstart's §3 and §4 point to the handbook instead of repeating it.
+- **Proposed: the handbook for all of Fluxbee as its own topic, after this track.** The handbook
+  goes whole into Archi's prompt, so gathering all of Fluxbee there means Archi reads it by
+  sections.
+
+#### 5.3.6 The build and the gate
+
+- **wfcel:**
+  - the menu: its shape, names and limits, with `none` reserved;
+  - the catch;
+  - guards checked against the menus' option names;
+  - `response_envelope` refused in a WF's action.
+- **The engine:**
+  - the menu goes into the WF's block;
+  - the catch, tried after the state's transitions;
+  - the default also logged to the node's log;
+  - the cap.
+- **ai.generic and its SDK:**
+  - the menu and the answer's contract are rendered in the WF's block of the message, so the
+    system prompt stays the role;
+  - `none` is added;
+  - the answer is checked against the menu;
+  - `reply` becomes the payload's text, and the object goes in `meta.context.evaluation`, as
+    `text_field` does.
+- **io.slack:** the thread records, in and out.
+- **Archi:** the handbook's WF section and a seed.
+- **The gate:**
+  1. Case 1 again, on the menu, with roles that keep only their trade.
+  2. The consultation, with the supervisors' side on a real io.slack in a test channel. To check
+     first: whether two io.slack nodes can share one Slack app over Socket Mode.
+
+  The gate's deployment stays up until the track ends, then one last run from zero (the operator,
+  2026-10-30).
+
+#### 5.3.7 Open, for Case 4
+
+- How the team member hands the conversation back: a word, a reaction, or an inactivity timer.
+- What the agent knows, when it takes the conversation back, of what was said meanwhile.
+- What the first message to the team's channel carries, so that a person can take over.
+
+**Withdrawn:**
+- the routing rules in the agents' roles (Case 1's gate);
+- the options as terminal tools. The tool list would change with each message, though it is fixed
+  as a stable prefix for the provider's cache, and the runner has no terminal tools;
+- a catch that every definition must have, first proposed on 2026-10-30. The operator chose
+  .NET's model: an optional catch, with the log as the default.
 
 ## 6. Docs that drift from the code
 

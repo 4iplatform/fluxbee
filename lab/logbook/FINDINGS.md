@@ -1078,7 +1078,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 4) — A wf-rules `check` stages the definition it checks
+### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 5) — A wf-rules `check` stages the definition it checks
 
 - **What happens** (go/sy-wf-rules/node/dispatch.go): `check` is `compile` under another name, and
   a compile writes the definition to `staged` ([sy-wf-rules](../../docs/nodes/sy-wf-rules.md),
@@ -1089,7 +1089,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     until the workflow's delete.
 - **Why it matters:** an `apply` without a `version` deploys whatever is staged. A check that Archi
   runs before asking the operator leaves its definition one `apply` away from going live.
-- **Next:** WF Case 4, the check before deploy
+- **Next:** WF Case 5, the check before deploy
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §4.7). It should be a read-only check,
   as OPA's `opa_check` is.
 
@@ -1159,9 +1159,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fixed in the example (0.1.91):** a handback delivers the answer and waits for the person, so
   one message costs at most two agent calls.
 - **Why it stays open:** Archi will write such definitions once its guide teaches handbacks
-  (Case 4), and a cycle is a definition bug the engine cannot tell from a bounded negotiation.
-- **Option, to decide with the operator in Case 4:** a cap in the engine on the messages an
-  instance sends between two triggers. Past it, the send fails and the instance fails with a cause.
+  (Case 3), and a cycle is a definition bug the engine cannot tell from a bounded negotiation.
+- **Decided with the operator on 2026-10-30, in WF Case 3**
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.3.3). Case 3's catch makes such a
+  loop easy to write, so the cap comes with it:
+  - at most 8 messages to agents between two triggers;
+  - past it, the send is not made, and the instance takes it as an error (`agent_call_cap`): the
+    catch, or else the log;
+  - the instance does not fail, so its timers stay.
+
+  The option first recorded here failed the instance.
 
 ### A-124 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
 

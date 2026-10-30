@@ -121,7 +121,7 @@
   - Fixed before the release, among others:
     - **One person's message could bounce between sales and invoice forever.** A probe made 101
       agent requests from one message. Now a handback delivers invoice's answer and waits for the
-      person. A-125 records an engine cap for Case 4.
+      person. A-125 records an engine cap, now with Case 3.
     - **An agent in `start_from`** would let its late answer start an instance. `start_from` now
       refuses it.
     - **An agent's error or timeout ended a pending payment check.** Both now go back to sales.
@@ -207,7 +207,7 @@
     - **After the close,** the person's next message started a new instance at sales.
   - **The store:** the inbound journal and the internal events were empty at every check. The
     instances' states and logs were read from the WF's store, read only, because SY.admin has no
-    instance actions yet (Case 4).
+    instance actions yet (Case 5).
   - **Health:** `failed=0`, `denials=0` on all 4, through the gate.
 - **Cleanup:**
   - the workflow `gate0191` was deleted with `force`, node and package;
