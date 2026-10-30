@@ -2458,14 +2458,18 @@ async fn run_outbound_loop(
             .context
             .as_ref()
             .and_then(extract_slack_post_target);
-        let mut thread = OutboundThread::resolve(
-            thread_records.as_deref(),
-            &binding.workspace_id,
-            &binding.conversation_id,
-            msg.meta.thread_id.as_deref(),
-            reply_target.as_ref(),
-            now_epoch_ms(),
-        );
+        // The span puts the message's trace_id on the resolution's log lines.
+        let mut thread = tracing::debug_span!("slack_outbound", trace_id = %msg.routing.trace_id)
+            .in_scope(|| {
+                OutboundThread::resolve(
+                    thread_records.as_deref(),
+                    &binding.workspace_id,
+                    &binding.conversation_id,
+                    msg.meta.thread_id.as_deref(),
+                    reply_target.as_ref(),
+                    now_epoch_ms(),
+                )
+            });
 
         let mut sent_any = false;
         match resolve_text_v1_for_outbound(

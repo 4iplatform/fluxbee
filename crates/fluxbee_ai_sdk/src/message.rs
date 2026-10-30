@@ -386,9 +386,9 @@ impl MenuContract {
     /// §5.3.6): an optional `help` of 1 to 600 characters, and 1 to 8 options. An option has a
     /// unique name, never `none`, a description of 1 to 200 characters, and up to 8 params. A
     /// param is a `string`, `boolean`, `integer` or `number`, with an optional description of up
-    /// to 200 characters and, for a string, an optional `enum` of 1 to 20 values. A name matches
-    /// `^[a-z][a-z0-9_]{0,31}$`. A field a menu does not have is refused, and a `null` one is
-    /// absent. `none`, with its `reason`, goes last. An invalid menu is `InvalidMenu`, naming the
+    /// to 200 characters and, for a string, an optional `enum` of 1 to 20 values, each not empty
+    /// and of its own. A text is never blank. A name matches `^[a-z][a-z0-9_]{0,31}$`. A field a
+    /// menu does not have is refused, and a `null` one is absent. `none`, with its `reason`, goes last. An invalid menu is `InvalidMenu`, naming the
     /// field.
     pub fn from_value(menu: &Value) -> Result<Self> {
         let menu = menu_object(menu, "menu", "a menu", &["help", "options"])?;
@@ -650,15 +650,24 @@ impl MenuParam {
                         ),
                     ));
                 }
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| invalid_menu(&path, "must hold strings only"))
-                    })
-                    .collect::<Result<Vec<_>>>()
+                let mut taken: Vec<String> = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| invalid_menu(&path, "must hold strings only"))?;
+                    let value_path = format!("{path}[{index}]");
+                    if value.trim().is_empty() {
+                        return Err(invalid_menu(&value_path, "must not be empty"));
+                    }
+                    if taken.iter().any(|earlier| earlier == value) {
+                        return Err(invalid_menu(
+                            &value_path,
+                            format!("must be unique in its enum ({value:?} is taken)"),
+                        ));
+                    }
+                    taken.push(value.to_string());
+                }
+                Ok(taken)
             })
             .transpose()?;
         Ok(Self {
@@ -741,11 +750,14 @@ fn menu_field<'a>(object: &'a Map<String, Value>, name: &str) -> Option<&'a Valu
     object.get(name).filter(|value| !value.is_null())
 }
 
-/// `value` at `path` as a text of `min` to `max` characters.
+/// `value` at `path` as a text of `min` to `max` characters, never blank.
 fn menu_text(value: &Value, path: &str, min: usize, max: usize) -> Result<String> {
     let text = value
         .as_str()
         .ok_or_else(|| invalid_menu(path, "must be a string"))?;
+    if !text.is_empty() && text.trim().is_empty() {
+        return Err(invalid_menu(path, "must not be blank"));
+    }
     let chars = text.chars().count();
     if chars < min || chars > max {
         let limit = if min == 0 {
@@ -1680,6 +1692,26 @@ mod tests {
             (
                 sales_menu_with(|m| m["options"][1]["params"]["product"]["enum"] = json!(["Pro", 1])),
                 "menu.options[1].params.product.enum: must hold strings only",
+            ),
+            (
+                sales_menu_with(|m| m["options"][1]["params"]["product"]["enum"] = json!(["Pro", " "])),
+                "menu.options[1].params.product.enum[1]: must not be empty",
+            ),
+            (
+                sales_menu_with(|m| m["options"][1]["params"]["product"]["enum"] = json!(["Pro", "Basic", "Pro"])),
+                "menu.options[1].params.product.enum[2]: must be unique in its enum (\"Pro\" is taken)",
+            ),
+            (
+                sales_menu_with(|m| m["help"] = json!("   ")),
+                "menu.help: must not be blank",
+            ),
+            (
+                sales_menu_with(|m| m["options"][0]["description"] = json!(" ")),
+                "menu.options[0].description: must not be blank",
+            ),
+            (
+                sales_menu_with(|m| m["options"][1]["params"]["product"]["description"] = json!("  ")),
+                "menu.options[1].params.product.description: must not be blank",
             ),
         ] {
             assert_eq!(menu_refusal(&menu), detail, "{menu}");

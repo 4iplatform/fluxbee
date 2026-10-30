@@ -227,7 +227,7 @@ out when empty.
 | `result_origin` | responder | `node` when the action was blocked (`derive_action_outcome`). |
 | `result_detail_code` | — | Defined in both SDKs; nothing sets it. |
 | `priority` | sender | A free hint, visible to the OPA policy; the router does not act on it. |
-| `context` | sender | Free JSON for the receiver and the OPA policy. IO nodes put the channel facts in `context.io`; the AI SDK reads `response_envelope` and `final_response_contract` from it (`crates/fluxbee_ai_sdk/src/message.rs`). A WF puts its block in `context.wf`, which ai.generic shows its model, and an agent's answer to a contract with a `text_field` carries the contract's object in `context.evaluation` (`nodes/ai/ai-generic/README.md`). |
+| `context` | sender | Free JSON for the receiver and the OPA policy. IO nodes put the channel facts in `context.io`; the AI SDK reads `response_envelope` and `final_response_contract` from it (`crates/fluxbee_ai_sdk/src/message.rs`). A WF puts its block in `context.wf`, which ai.generic shows its model; the block's `menu` asks the agent to choose among options. An agent's answer to a menu, or to a contract with a `text_field`, carries the checked object in `context.evaluation` (`nodes/ai/ai-generic/README.md`). |
 | `via_tap` | **router only** | `true` on a tap copy, the copy a router sends to a monitoring target; such a copy is never tapped again. Serialized only when true. Missing from the Go `Meta`. |
 
 ### 3.6 Removed fields

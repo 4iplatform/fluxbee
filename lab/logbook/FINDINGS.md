@@ -1078,7 +1078,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-131 🟡 OPEN (found 2026-10-30, building WF Case 3) — A fenced answer followed by another fenced block does not parse
+### A-132 🟡 OPEN (found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
+
+- **What happens:** go/nodes/wf/wf-generic/node: an instance's status may be `cancelling` in the
+  store's CHECK, and the engine reads it in instance.go (a fast path to `cancelled`, the internal
+  events' loop), dispatch.go (`WF_CANCEL_INSTANCE`), correlate.go and recover.go (timers left
+  alone).
+  - No code sets it: `WF_CANCEL_INSTANCE` runs the cancel transition at once
+    (`runCancelTransition`).
+- **Why it matters:** dead paths that a reader must reason about, in the engine's most delicate
+  code (recovery, cancellation).
+- **Fix:** remove the status from the engine and the store's CHECK, with its paths. Not done in
+  Case 3: it is not the case's code.
+
+### A-131 ✅ RESOLVED (0.1.92, WF Case 3; by tests) — A fenced answer followed by another fenced block does not parse
 
 - **What happens:** crates/fluxbee_ai_sdk/src/llm.rs, `extract_json_candidate`, cuts a fenced answer
   at the LAST closing fence.
@@ -1089,8 +1102,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Why it matters:** since 0.1.91, a fenced object followed by text is that object. This case
   escaped it, and a menu's answer goes through the same parse.
 - **Fix:** cut at the first closing fence after the object.
+- **Fixed in Case 3:** the object is the first whole JSON value, inside a fence or among other text
+  (`leading_json_value`), so a fence or braces after it are the model's, and a fence in the
+  object's own text stays in it. Without a whole value, the old cuts apply.
 
-### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: a "send to channel" reply is dropped, and a mention may arrive twice
+### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: a "send to channel" reply is dropped, a mention may arrive twice, and an empty message posts a fallback
 
 - **A reply with "Also send to #channel" never reaches the mesh.**
   - Slack gives it the subtype `thread_broadcast`, and the echo guard drops every message with a
@@ -1111,9 +1127,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     in io-common;
   - docs/io/io-slack.md said that inbound is `app_mention` only, and its IO context example had the
     old `slack_workspace` entrypoint and a `thread_ts` as the thread id.
+- **A message with no text posts a fallback in Spanish.** An outbound message whose text is empty
+  (an agent's empty `reply` that a WF forwards, say) posts "No pude entregar el mensaje en Slack (sin
+  contenido util)." to the person (nodes/io/io-slack/src/main.rs). The handbook (§4.2.4) and the
+  cookbook seeds guard that forward with `event.context.evaluation.reply != ''`.
 - **Next, in the IO family's track:**
   - relay a `thread_broadcast` as the plain message it is;
-  - deduplicate by the message (channel and `ts`), not by the event.
+  - deduplicate by the message (channel and `ts`), not by the event;
+  - drop a message with no text and no blocks, with a log line, instead of the fallback.
 
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 

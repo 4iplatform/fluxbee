@@ -44,8 +44,8 @@ type ActionContext struct {
 	Clock      ClockFunc
 }
 
-// executeAction executes a single action definition.
-// Errors are returned for logging by the caller; they do NOT halt the transition.
+// executeAction executes a single action definition. Its error goes to the caller (runActions),
+// which halts the transition when the action's on_error is fail.
 func executeAction(ctx context.Context, path string, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
 	switch action.Type {
 	case "send_message":

@@ -67,7 +67,7 @@ This is not a feature. It is the mechanism that makes the whole premise of Fluxb
 
 - A router with history. Routing single messages is what OPA does. WF coordinates processes that span many messages in time.
 - A middleware that intercepts messages between other nodes. WF is a destination like any other node. The router routes a message to a WF node if OPA decides that message should go there; WF never sits between other nodes.
-- A lenguaje general de programación. WF is a state machine with a small, fixed vocabulary of actions. If you find yourself wanting to write imperative code inside a WF, you are probably using the wrong tool.
+- A general-purpose programming language. WF is a state machine with a small, fixed vocabulary of actions. If you find yourself wanting to write imperative code inside a WF, you are probably using the wrong tool.
 - An AI with deterministic wrapping. WF does not reason. It evaluates. If reasoning is required, reasoning lives in an AI node that receives a question from the WF, with the options it may choose from (a menu, §10.10), and returns its choice, which the WF evaluates deterministically.
 - A place where ambiguity is resolved. If data is ambiguous, the WF delegates the ambiguity to an AI node, which returns something structured that the WF can evaluate. The WF itself never handles ambiguity directly.
 

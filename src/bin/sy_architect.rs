@@ -27246,6 +27246,13 @@ mod tests {
             .find(|(runtime_rel, _)| *runtime_rel == cookbook_paths::ARTIFACT)
             .map(|(_, seed)| *seed)
             .expect("the artifact seed");
+        // The built-in seeds' version, which a_changed_seed_raises_its_seed_version pins.
+        let seed_version = serde_json::from_str::<Vec<Value>>(seed)
+            .expect("seed")
+            .iter()
+            .map(cookbook_seed_version)
+            .max()
+            .expect("a seed_version");
         // A seed from before versions: no seed_version.
         let old_seed = |pattern_key: &str| {
             json!({
@@ -27297,7 +27304,7 @@ mod tests {
                     "opa_policy_bundle".to_string()
                 ],
                 from_version: 0,
-                seed_version: 3,
+                seed_version,
                 seeds: 3,
                 observed_kept: 2,
             }
@@ -27329,7 +27336,10 @@ mod tests {
         assert_eq!(
             entries
                 .iter()
-                .filter(|entry| entry.seed_kind == "manual" && entry.seed_version == Some(3))
+                .filter(|entry| {
+                    entry.seed_kind == "manual"
+                        && entry.seed_version == u32::try_from(seed_version).ok()
+                })
                 .count(),
             3
         );
@@ -27366,13 +27376,13 @@ mod tests {
         const PINS: [(&str, u64, &str); 4] = [
             (
                 cookbook_paths::DESIGN,
-                3,
-                "95e4853ff877cf7d5ea163c22b60bc49d803648b27ff56efd430fe7cc70ac80f",
+                4,
+                "7644772c2509e7b3b995639ff879096f6bb4b10c5a039e88c34e5de87898767f",
             ),
             (
                 cookbook_paths::ARTIFACT,
-                3,
-                "e59e46048361aa6fa0be52512e293119e03b58cf14dd19304a1a430b8986c94c",
+                4,
+                "0ab38ff93efd5354bec7aec05ff893fec5055eb97151281f0eac7e0f60e2d582",
             ),
             (
                 cookbook_paths::PLAN_COMPILE,

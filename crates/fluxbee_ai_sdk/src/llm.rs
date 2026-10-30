@@ -607,8 +607,12 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
     if let Some(stripped) = trimmed.strip_prefix("```") {
         let stripped = stripped.trim_start_matches(|c| c != '\n');
         let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
-        // The object ends at the last closing fence: text after it is the model's, not the
-        // object's.
+        // The object ends where its JSON ends: the closing fence, and any text or fenced block
+        // after it, is the model's (FINDINGS A-131). Without a whole value, it ends at the last
+        // closing fence.
+        if let Some(value) = leading_json_value(stripped.trim_start()) {
+            return Ok(value.to_string());
+        }
         let stripped = stripped
             .rfind("```")
             .map_or(stripped, |end| &stripped[..end]);
@@ -621,6 +625,14 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
         return Ok(inner.to_string());
     }
 
+    // Among other text, the object is the first whole one, whatever text follows it.
+    if let Some(value) = trimmed
+        .find('{')
+        .and_then(|start| leading_json_value(&trimmed[start..]))
+    {
+        return Ok(value.to_string());
+    }
+
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         return Ok(trimmed.to_string());
     }
@@ -630,6 +642,15 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
         _ => Err(AiSdkError::InvalidStructuredOutput {
             detail: "json_candidate_not_found".to_string(),
         }),
+    }
+}
+
+/// The JSON value `text` starts with, without what follows it, when it starts with a whole one.
+fn leading_json_value(text: &str) -> Option<&str> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    match values.next() {
+        Some(Ok(_)) => Some(&text[..values.byte_offset()]),
+        _ => None,
     }
 }
 
@@ -2321,12 +2342,26 @@ mod tests {
             "```json\n{\"ok\":true}\n```\n¿Algo más?",
             "```json\n{\"ok\":true}\n```",
             "```\n{\"ok\":true}\n```\n",
+            // FINDINGS A-131: another fenced block after the object's.
+            "```json\n{\"ok\":true}\n```\nPor ejemplo:\n```\nplan pro\n```",
+            // Text with braces after an object that is not fenced.
+            "Listo: {\"ok\":true} y {nada más}",
         ] {
             assert_eq!(
                 parse_structured_output(raw, &spec).expect(raw),
                 json!({"ok": true})
             );
         }
+    }
+
+    /// A fence in the object's own text stays in it: the object ends where its JSON ends.
+    #[test]
+    fn a_fence_inside_the_objects_text_stays_in_it() {
+        let raw = "```json\n{\"reply\":\"Mirá:\\n```\\nplan pro\\n```\"}\n```\nListo.";
+        assert_eq!(
+            extract_json_value(raw).expect(raw),
+            json!({"reply": "Mirá:\n```\nplan pro\n```"})
+        );
     }
 
     /// A blank assistant turn never reaches Anthropic, which refuses an empty text block: a history

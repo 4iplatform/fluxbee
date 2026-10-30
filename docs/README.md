@@ -57,7 +57,8 @@ One page per node: [rt-gateway](nodes/rt-gateway.md) (the router),
   [identity-v2.1-agent-definition-addendum](identity-v2.1-agent-definition-addendum.md).
 - **Workflows and timers:** [spec-systemnode-wf-v1_1](spec-systemnode-wf-v1_1.md),
   [sy-wf-rules-spec](sy-wf-rules-spec.md), [wf-rules-quickstart](wf-rules-quickstart.md),
-  [sy-timer](sy-timer.md).
+  [sy-timer](sy-timer.md). Writing a workflow is the handbook's §4.2
+  ([archi/handbook_fluxbee.md](archi/handbook_fluxbee.md)).
 - **Policy:** [opa-distribution](opa-distribution.md).
 - **AI nodes:** [ai-nodes-deploy-runbook](ai-nodes-deploy-runbook.md).
 

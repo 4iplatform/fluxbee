@@ -575,7 +575,8 @@ calls use `/hives/motherbee/...`.
 | Package format and publishing | [docs/history/runtime-packaging-cli-spec.md](docs/history/runtime-packaging-cli-spec.md) |
 | Packaging, build and install (Spanish) | [docs/packaging-and-build.md](docs/packaging-and-build.md) |
 | Operations: hive.yaml, add_hive, upgrades (Spanish) | [docs/history/07-operaciones.md](docs/history/07-operaciones.md) |
-| Workflows with SY.wf-rules (Spanish) | [docs/wf-rules-quickstart.md](docs/wf-rules-quickstart.md) |
+| Writing a workflow: the handbook's WF chapter, §4.2 | [docs/archi/handbook_fluxbee.md](docs/archi/handbook_fluxbee.md) |
+| Deploying and operating workflows with SY.wf-rules | [docs/wf-rules-quickstart.md](docs/wf-rules-quickstart.md) |
 | Original architecture, protocol, shared memory and routing specs (Spanish, older) | [docs/history/01-arquitectura.md](docs/history/01-arquitectura.md) to [docs/history/05-conectividad.md](docs/history/05-conectividad.md) |
 | Rust SDK | [crates/fluxbee_sdk/README.md](crates/fluxbee_sdk/README.md) |
 | AI SDK (Rust) | [crates/fluxbee_ai_sdk/README.md](crates/fluxbee_ai_sdk/README.md) |

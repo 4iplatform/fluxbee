@@ -1077,6 +1077,24 @@ Read in the code on 2026-10-30, at `32353f18`. Four pieces; the contracts betwee
 **Checks before the review round:** Rust fmt, clippy (`-D warnings`) and the workspace's tests; Go
 gofmt, vet and race tests in each module; the doc links. Then one review round, as in Case 1.
 
+**As built (2026-10-30),** where it differs from the above or adds to it:
+- **The quickstart's §5** (the structure, the catch and the default) points to the chapter too, with
+  §3 and §4: the catch had been written there while building, and one reference lives in one
+  place. The quickstart covers deploying and operating.
+- **The seeds' example** is `sales.consult`: an agent answers through a menu or consults the
+  supervisors, and a catch takes `none` and errors. The seeds are at `seed_version` 4.
+- **An agent's `reply` may be empty,** and io.slack posts a fallback for a message with no text
+  (FINDINGS A-130). The chapter and the seeds guard that forward with
+  `event.context.evaluation.reply != ''`.
+- **The agent checks the menu with exactly wfcel's limits,** blank texts and empty or repeated
+  `enum` values included.
+- **A menu's answer is the first whole JSON value,** fenced or among other text (FINDINGS A-131,
+  resolved).
+- **A blank `thread_ts` panicked io-common's thread id** (FINDINGS A-130): it is now the channel's
+  top level.
+- **Not checked at load:** a `meta.context` written whole by a `$ref` may carry a
+  `response_envelope`. An agent that gets one with a menu answers `conflicting_contracts`.
+
 **The gate:**
   1. Case 1 again, on the menu, with roles that keep only their trade.
   2. The consultation, with the supervisors' side on a real io.slack in a test channel. To check
@@ -1090,6 +1108,10 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
 - How the team member hands the conversation back: a word, a reaction, or an inactivity timer.
 - What the agent knows, when it takes the conversation back, of what was said meanwhile.
 - What the first message to the team's channel carries, so that a person can take over.
+- **Which posts io.slack records.** It records the place of each message that reaches it, and of
+  each post it makes on a thread it does not know. Its answer at a channel's top level is not
+  recorded, so a person who replies in that answer's Slack thread starts a new thread id, and a
+  new instance. Recording every post's `ts` would keep that reply on its conversation.
 
 **Withdrawn:**
 - the routing rules in the agents' roles (Case 1's gate);

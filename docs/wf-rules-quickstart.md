@@ -60,8 +60,8 @@ fails the request when an agent finds that no option fits (`none`).
 
 A WF that sits at an IO node's exit and hands a conversation among agents is the example package
 `go/nodes/wf/examples/packages/wf.sales.invoice` (`docs/wf-orchestration-v1.md` §5.2 and §5.3): it
-uses `forward`, `keep_message`, the WF's block, menus and a timer time from an agent's answer (§4),
-internal transitions and a catch (§5), and asks the supervisors through their IO node,
+uses `forward`, `keep_message`, the WF's block, menus and a timer time from an agent's answer,
+internal transitions and a catch (handbook §4.2), and asks the supervisors through their IO node,
 `IO.slack.supervisores`, when sales chooses `consult`.
 
 ```json
@@ -408,7 +408,7 @@ If there are validation errors (an invalid CEL guard, a referenced state that do
 
 A guard is checked for its syntax and its roots (`input`, `state`, `event`), not for its fields: a
 misspelled field (`event.payload.complette`) compiles, and at run time it is a guard that errs, so
-false. What it reads of an agent's evaluation is the exception (§4, `menu`): an option or a param
+false. What it reads of an agent's evaluation is the exception (handbook §4.2.4): an option or a param
 that no menu of the definition offers (`event.context.evaluation.option == 'complet'`) is refused,
 by its path.
 
@@ -546,345 +546,17 @@ curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/delete" \
 
 ---
 
-## 3. CEL guards quick reference
+## 3. Writing the definition
 
-Guards are [CEL](https://github.com/google/cel-go) expressions that decide whether a transition is taken. They are evaluated against three variables:
-
-| Variable | Content |
-|---|---|
-| `input` | The payload of the event that created the instance (immutable) |
-| `state` | Workflow variables, modified by `set_variable` |
-| `event` | The message that just arrived and triggered the evaluation |
-
-Built-in functions: `now()` returns the WF node's clock as Unix milliseconds (UTC), and
-`json_parse(text)` decodes a JSON string; CEL's string extensions are there too (`format`, `join`,
-`split`, ...).
-
-**Numbers.** A JSON integer is an `int` and any other number a `double`, in `input`, `state` and
-`event` alike, live and after a restart, and in the definition's own literals. A comparison or an
-equality between an `int` and a `double` works when a side comes from `input`, `state`, `event` or
-`json_parse` (`state.score > 7.5` with an `int` score); arithmetic that mixes them, and `%` on a
-`double`, fails. Convert first: `double(state.n) * 1.1`, `int(state.n) % 2`.
-
-`event` holds `msg`, `type`, `thread_id`, `trace_id`, `src` (the node that sent it, as the router
-stamps it), `context` and `payload`; for a `TIMER_FIRED`, also `timer_key`, the key the timer was
-scheduled with. An agent's answer to a menu (§4) carries its choice in `event.context.evaluation`,
-`{reply, option, params}`, and its `reply` in `event.payload.content`.
-
-**Bounds.** A guard runs at most 10 ms: it is stopped there, and a guard that is stopped or errs is
-false. A `set_variable` value has a cost limit (1,000,000 CEL cost units): past it the action fails.
-
-### Common patterns
-
-**Check a boolean field in the response:**
-```
-event.payload.ok == true
-```
-
-**Check that a field exists:**
-```
-has(event.payload.missing_data)
-```
-
-**Match a specific timer** (on a `TIMER_FIRED` transition):
-```
-event.timer_key == 'validation_timeout'
-```
-
-**Branch on the option an agent chose** (its menu's, §4), **and read its params:**
-```
-event.context.evaluation.option == 'invoice'
-event.context.evaluation.params.quantity > 5
-```
-
-**The agent found that no option fits** (`none`, with the param `reason`):
-```
-event.context.evaluation.option == 'none'
-```
-
-**An agent's error answer** (to a forwarded message, which has no `msg`), an answer off its menu
-included:
-```
-event.payload.type == 'error'
-```
-
-**Compare strings:**
-```
-event.payload.status == 'approved'
-```
-
-**Check a numeric value:**
-```
-state.retry_count < 3
-```
-
-**Combine conditions:**
-```
-event.payload.ok == true && state.retry_count < 5
-```
-
-**Check membership:**
-```
-event.payload.status in ['approved', 'auto_approved']
-```
+The reference for writing a definition is one chapter of Fluxbee's handbook, which people and Archi
+share: [§4.2, WF nodes and workflows](archi/handbook_fluxbee.md#42-wf-nodes-and-workflows). It
+covers the definition and its states (§4.2.1), what a guard reads and calls (§4.2.2), every action
+(§4.2.3), the menu that asks an agent to choose (§4.2.4), the catch, the default and the cap on
+agent calls (§4.2.5), and patterns (§4.2.6). This guide covers deploying and operating a WF.
 
 ---
 
-## 4. Actions quick reference
-
-Actions are the effects the workflow executes. Fixed vocabulary in v1:
-
-### `send_message` — send a message to another node
-
-```json
-{
-  "type": "send_message",
-  "target": "IO.quickbooks@motherbee",
-  "meta": { "msg": "INVOICE_CREATE_REQUEST" },
-  "payload": {
-    "customer_id": { "$ref": "input.customer_id" },
-    "items": { "$ref": "state.validated_items" },
-    "literal_field": "this is a literal string, not a reference"
-  }
-}
-```
-
-Every message a WF sends is a `user` message: `meta` takes `msg` (and `context`, see below), never
-`type`, and `target` is a node name written in the definition (never a `SY.*` or `RT.*` node). A WF
-that chooses among destinations writes one transition per destination, each with its guard and its
-`send_message`; there is no destination taken from data. Every message an instance sends carries the
-instance's thread, the conversation's (the thread of the message that started it). A definition
-with `meta.type`, `target_ref` or `thread_id_ref` is refused, by its path.
-
-The `{"$ref": "..."}` values are resolved at execution time, in the payloads, `meta.context` and
-`vars` of `send_message`, `forward` and `emit_internal_event`, and in the times of the timer actions. A `$ref` is a dot path rooted at `input.`, `state.`
-or `event.` (another root, such as a typo `inptu.x`, is refused at load); an object whose `$ref`
-holds `#`, `/` or `:` (a JSON Schema's `"$ref": "#/definitions/item"`) is a literal, like
-everything else.
-
-A `$ref` to a field that is not there fails the action, and with it, by its default `on_error`, the
-instance; a field that holds `null` gives `null`. For a field that may be missing, give a default:
-`{"$ref": "event.context", "default": {}}` takes the literal `{}` when there is no context, or when
-it is `null`. A `$ref` holds only `$ref` and `default`, and its default is a literal: anything else
-is refused at load (a typo such as `defualt` included), by its path.
-
-`meta.context` is resolved the same way, and goes on the message's `meta.context` (the person's
-`context.io` an IO node gave, say). It never writes `wf`, the WF's block below, nor
-`response_envelope`: a WF asks an agent with a `menu`, and a definition with
-`meta.context.response_envelope` is refused, by its path.
-
-`vars`, an object resolved the same way, goes in the WF's block, below.
-
-### `menu` — ask an agent to choose
-
-A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer it a menu: what it
-may do, fixed in the definition and never in its role.
-
-```json
-{
-  "type": "forward",
-  "target": "AI.sales@worker1",
-  "message": "customer",
-  "menu": {
-    "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
-    "options": [
-      { "name": "answer", "description": "You answer the person yourself." },
-      { "name": "invoice", "description": "They accepted the quote and ask for the invoice.",
-        "params": { "quantity": { "type": "integer" }, "plan": { "type": "string", "enum": ["basic", "pro"] } } },
-      { "name": "consult", "description": "A supervisor must approve something before you answer.",
-        "params": { "question": { "type": "string", "description": "What you ask, with the data to decide." } } }
-    ]
-  }
-}
-```
-
-- **The menu, checked at load:** `help` is optional, up to 600 characters; 1 to 8 options, each
-  with a `name` (`^[a-z][a-z0-9_]{0,31}$`, unique in its menu, never `none`), a `description` of 1 to
-  200 characters and up to 8 `params`. A param has a name of the same pattern, a `type` (`string`,
-  `boolean`, `integer` or `number`), an optional `description` up to 200 characters and, for a
-  string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode
-  code points. The menu is literal (no `$ref`), and a field it does not have is refused at every
-  level, by its path, as the agent refuses it.
-- **On the wire** it goes in the WF's block, `meta.context.wf.menu`, as written, with no empty field.
-- **The answer** is `{reply, option, params}`, in `event.context.evaluation`, and `reply`, the text
-  for the person, is its payload's text, which the WF forwards or not. The agent adds `none` to
-  every menu, with the param `reason`: none of the options fits.
-- **An answer off the menu is an error,** with no retries: an option the menu does not have, a
-  missing or mistyped param, or no JSON at all come back as a payload of type `error`
-  (`invalid_structured_output`).
-- **What reads the answer is checked against the menus:** a guard that compares
-  `event.context.evaluation.option` with a string (`==`, `!=`, `in`) names an option of one of the
-  definition's menus, or `none`; a guard, a `set_variable` value or a `$ref` that reads
-  `event.context.evaluation.params.<p>` names a param of one of them, or `reason`.
-
-An agent answers with the request's `msg`. Its error answer is a payload of type `error`, which needs
-a transition of its own, or the catch's (§5); its `msg` is `<msg>.error` only when the request had a
-`msg` (a forwarded person's message has none, so the guard `event.payload.type == 'error'` takes it).
-
-### The WF's block, `meta.context.wf`
-
-Every message a WF sends, a `send_message` or a `forward`, carries it: `trail`, the nodes the
-message went through; `vars`, what the action's `vars` writes; and `menu`, the action's menu (each
-left out when the action has none). An agent shows it to its model before the person's text, and
-never sends it back. An action's `meta.context` never writes `wf`.
-
-```json
-{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "quantity": 10 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
-```
-
-### `forward` — send a message on as it was received
-
-```json
-{
-  "type": "forward",
-  "target": "AI.invoice@worker1",
-  "message": "customer",
-  "meta": { "context": { "io": { "$ref": "state.io" } } },
-  "vars": { "order": { "$ref": "state.order" } },
-  "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." }, { "name": "handback", "description": "Sales takes the conversation back." } ] }
-}
-```
-
-It sends the event's message, or the one kept under `message`. The payload goes out byte for byte,
-never decoded, and the meta is the message's: every field of it but `memory_package`, so the
-person's ILK travels intact. The WF changes metadata only: the destination, the thread (the
-instance's), the `meta.context` keys the action writes, and its block, whose trail is the message's
-own and this node. It has no `meta.msg` and no `payload`, and it fails the instance (by default)
-when there is no message: a `TIMER_FIRED`, an internal event, or a name not kept yet. On a
-transition matched on `TIMER_FIRED`, a `forward` without `message` and a `keep_message` are refused
-at load.
-
-### `keep_message` — keep the event's message for a later `forward`
-
-```json
-{ "type": "keep_message", "name": "customer" }
-```
-
-Whole and as received; a later keep under the same name replaces it. It is committed with the
-transition, survives a restart, and goes when the instance ends.
-
-### `schedule_timer` — schedule a timer through SY.timer
-
-```json
-{
-  "type": "schedule_timer",
-  "timer_key": "customer_timeout",
-  "fire_in": "24h",
-  "missed_policy": "fire"
-}
-```
-
-Minimum duration: 60 seconds. `fire_in` (or `fire_at`) also takes a `$ref`, resolved when the
-action runs, with the 60 s floor checked then: a time from state, or from an agent's answer.
-
-```json
-{ "type": "schedule_timer", "timer_key": "payment_due", "fire_in": { "$ref": "state.invoice.due_in" }, "on_error": "fail" }
-```
-
-`missed_policy` is SY.timer's, for a fire SY.timer itself is late with: `fire` (it delivers the late fire), `drop` (it does not), `fire_if_within` (it delivers it
-within `missed_within_ms`). The WF's own recovery does not apply it: a WF that restarts gives its
-instance a fire SY.timer lost, or a past-due timer's fire, whatever the policy, `drop` included.
-
-### `cancel_timer` — cancel a pending timer
-
-```json
-{ "type": "cancel_timer", "timer_key": "customer_timeout" }
-```
-
-### `reschedule_timer` — reschedule an existing timer
-
-```json
-{ "type": "reschedule_timer", "timer_key": "sla_check", "fire_in": "30m" }
-```
-
-### `set_variable` — save a value in the instance state
-
-```json
-{ "type": "set_variable", "name": "invoice_id", "value": "event.payload.invoice_id" }
-```
-
-The `value` is a CEL expression, written as a JSON string. Examples: `"now()"`, `"'pending'"`,
-`"42"`, `"state.retry_count + 1"`, `"event.payload.result"`,
-`"'Customer %s'.format([input.customer_id])"`. A JSON number or boolean (`42`, `true`) is refused
-at load: it is no CEL expression.
-The state keeps plain JSON: a list, or a map with string keys, is kept as such; a value JSON cannot
-hold (bytes, a map with other keys) fails the action.
-
-### `emit_internal_event` — queue an event for the same instance
-
-```json
-{ "type": "emit_internal_event", "meta": { "msg": "INTERNAL_DONE" }, "payload": { "result": { "$ref": "state.result" } } }
-```
-
-The event is committed with the transition and runs right after it, on the same instance, as a
-`user` event named by `meta.msg`; at most 100 of them may follow one event.
-
----
-
-## 5. Structure of a workflow
-
-```
-workflow
-├── wf_schema_version    "1"
-├── workflow_type         workflow name
-├── description           free text
-├── start_from            node names whose messages start an instance (required)
-├── input_schema          JSON Schema of the event that creates instances
-├── initial_state         name of the state where instances start
-├── terminal_states       list of states that end the instance
-├── catch[]               optional: transitions tried when no transition of the current state takes an event
-│   ├── event_match       as a state's, or {} (every event)
-│   ├── guard             CEL expression → true/false
-│   ├── target_state      optional, as a state's
-│   └── actions[]         send_message, forward, keep_message, set_variable, emit_internal_event
-└── states[]
-    ├── name              unique state name
-    ├── description       free text
-    ├── entry_actions[]   actions on ENTERING the state
-    ├── exit_actions[]    actions on LEAVING the state
-    └── transitions[]     transition rules
-        ├── event_match   { "msg": "MESSAGE_NAME" }, { "src": "NODE@hive" } or both (no type)
-        ├── guard         CEL expression → true/false
-        ├── target_state  name of the target state; without it, the transition is internal
-        └── actions[]     actions when taking this transition
-```
-
-Execution order in a transition:
-```
-exit_actions of the current state
-  → actions of the transition
-    → entry_actions of the target state
-```
-
-Transitions are evaluated in declaration order. The first one whose `event_match` matches and whose `guard` returns `true` is the one taken.
-
-An `event_match` names the event by its `msg`, by its sender (`src`, the name the router stamps), or
-by both, and then both must match: a person's message and an agent's answer to it have no `msg`.
-A transition without a `target_state` is **internal**: it runs its actions and stays in its state,
-with no exit or entry actions (its timers keep running), as when a due date that fires while an
-agent answers is noted for the next state.
-
-**The catch**, as in .NET's `try`/`catch`: when no transition of the current state takes an event,
-in any state, the definition's `catch` transitions are tried in order, and a chosen one runs as a
-state's (with a `target_state`, the current state's exit actions, its own and the target's entry
-actions; without one, it stays). A state can take `none` or an error itself first, as a local
-`try` does. What reaches the catch: an agent's `none`, an agent's error (an answer off the menu, a
-timeout it reports, a provider failure), and any event no transition took; its guards tell them
-apart (`event.context.evaluation.option == 'none'`, `event.payload.type == 'error'`).
-- An empty `event_match` matches every event, a timer's fire and an internal event included.
-- It sets no timers: it goes to a state whose entry actions set them.
-- A `keep_message`, or a `forward` of the event (no `message`), needs an `event_match` that names a
-  `src`, so the event is a node's message: refused at load otherwise, and so are such actions among
-  the exit actions of the states it may leave and the entry actions of its target, when it has one.
-- Its `event_match.src` and its targets are nodes the definition involves (§8).
-
-**The default:** without a catch, or when none of its transitions takes the event, the instance's log
-gets `unhandled event <event> in state <state>`, the node's own log a line naming the instance, the
-state and the event, and the instance stays where it was. Both logs are local.
-
----
-
-## 6. Typical development cycle
+## 4. Typical development cycle
 
 ```
 1. Write/edit the workflow JSON
@@ -911,7 +583,7 @@ state and the event, and the instance stays where it was. Both logs are local.
 
 ---
 
-## 7. Endpoints (summary)
+## 5. Endpoints (summary)
 
 | Method | Path | Action |
 |---|---|---|
@@ -926,7 +598,7 @@ state and the event, and the instance stays where it was. Both logs are local.
 
 ---
 
-## 8. Operational notes
+## 6. Operational notes
 
 **In-flight instances on update:** when a new version is applied, the instances that were already running keep using the definition they were born with: each records its definition's hash, and the WF node keeps every definition a running instance uses (and drops it when the last one ends). Only new instances use the updated definition. This is transparent — nothing special needs to be done. An instance whose definition no longer loads (one written before 0.1.90 with `meta.type`, say) fails at the node's start.
 
@@ -936,7 +608,7 @@ state and the event, and the instance stays where it was. Both logs are local.
 
 **One instance per conversation, and only the nodes involved:** an instance lives on the thread of the message that started it, and a message on that thread reaches it, but only from a node the definition names: one in `start_from`, in an `event_match.src`, or a target of a `send_message` or a `forward`, the catch's included (and SY.timer for its own timers). Anyone else is dropped, never answered. A message from a `start_from` node on a thread no instance holds starts a new instance there, as `input_schema` allows: a person who writes again after their instance ended starts a new one on the same conversation. `start_from` names IO nodes and WFs, never an agent (which only answers) nor a `SY.*` or `RT.*` node.
 
-**A message the state has no transition for** goes to the catch (§5), and when the catch takes nothing either it is logged (`unhandled event ... in state ...`, in the instance's log and the node's) and dropped: it is never queued for a later state. A definition that may get a message early handles it where it can arrive, with an internal transition (one without `target_state`) when it must not leave the state.
+**A message the state has no transition for** goes to the catch (handbook §4.2.5), and when the catch takes nothing either it is logged (`unhandled event ... in state ...`, in the instance's log and the node's) and dropped: it is never queued for a later state. A definition that may get a message early handles it where it can arrive, with an internal transition (one without `target_state`) when it must not leave the state.
 
 **Downstream idempotency:** the WF delivers an event at least once: it saves the event before running its transition, and a crash before the transition commits runs it again at the next start, its creation included. The nodes that receive messages from a WF (AI, IO) must be idempotent with respect to `meta.trace_id`: a repeated send keeps its `trace_id`. Each start counts the attempts of an event it runs again: one already run at 3 starts (an event that keeps taking the node down) is not run again, its instance fails (`replay_exhausted`), and the node goes on.
 

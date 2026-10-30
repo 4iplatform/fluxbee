@@ -43,7 +43,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 3
+    "seed_version": 4
   },
   {
     "layer": "design",
@@ -100,7 +100,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 3
+    "seed_version": 4
   },
   {
     "layer": "design",
@@ -116,63 +116,383 @@
         "wf_deployments": [
           {
             "hive": "motherbee",
-            "workflow_name": "invoice",
+            "workflow_name": "sales.consult",
             "definition": {
               "wf_schema_version": "1",
-              "workflow_type": "invoice",
-              "description": "Asks IO.quickbooks for an invoice and waits for the validated data, ten minutes at most.",
-              "start_from": ["IO.api.billing@motherbee"],
+              "workflow_type": "sales.consult",
+              "description": "Every conversation enters through AI.sales, which answers the person or consults a supervisor; the WF hands it a menu with each message.",
+              "start_from": [
+                "IO.slack.ventas@motherbee"
+              ],
               "input_schema": {
-                "type": "object",
-                "required": ["customer_id"],
-                "properties": { "customer_id": { "type": "string" } }
+                "type": "object"
               },
-              "initial_state": "collecting_data",
-              "terminal_states": ["completed", "failed"],
+              "initial_state": "start",
+              "terminal_states": [
+                "closed"
+              ],
               "states": [
                 {
-                  "name": "collecting_data",
-                  "description": "Asks for the invoice and waits for its data.",
+                  "name": "start",
+                  "description": "Hands the person's first message to sales.",
                   "entry_actions": [
                     {
-                      "type": "send_message",
-                      "target": "IO.quickbooks@motherbee",
-                      "meta": { "msg": "INVOICE_CREATE_REQUEST" },
-                      "payload": { "customer_id": { "$ref": "input.customer_id" } }
+                      "type": "keep_message",
+                      "name": "customer"
                     },
-                    { "type": "schedule_timer", "timer_key": "collection_timeout", "fire_in": "10m" }
+                    {
+                      "type": "emit_internal_event",
+                      "meta": {
+                        "msg": "TO_SALES"
+                      },
+                      "payload": {}
+                    }
                   ],
-                  "exit_actions": [{ "type": "cancel_timer", "timer_key": "collection_timeout" }],
+                  "exit_actions": [],
                   "transitions": [
                     {
-                      "event_match": { "msg": "DATA_VALIDATION_RESPONSE" },
-                      "guard": "event.payload.complete == true",
-                      "target_state": "completed",
+                      "event_match": {
+                        "msg": "TO_SALES"
+                      },
+                      "guard": "true",
+                      "target_state": "sales_thinking",
                       "actions": [
-                        { "type": "set_variable", "name": "validated_at", "value": "now()" }
+                        {
+                          "type": "forward",
+                          "target": "AI.sales@worker1",
+                          "message": "customer",
+                          "menu": {
+                            "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person yourself."
+                              },
+                              {
+                                "name": "consult",
+                                "description": "A supervisor must approve something before you answer.",
+                                "params": {
+                                  "question": {
+                                    "type": "string",
+                                    "description": "What you ask, with the data to decide."
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "name": "sales_thinking",
+                  "description": "Sales answers with one option of its menu.",
+                  "entry_actions": [
+                    {
+                      "type": "schedule_timer",
+                      "timer_key": "sales_timeout",
+                      "fire_in": "5m"
+                    }
+                  ],
+                  "exit_actions": [
+                    {
+                      "type": "cancel_timer",
+                      "timer_key": "sales_timeout"
+                    }
+                  ],
+                  "transitions": [
+                    {
+                      "event_match": {
+                        "src": "AI.sales@worker1"
+                      },
+                      "guard": "event.context.evaluation.option == 'answer'",
+                      "target_state": "listening",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "IO.slack.ventas@motherbee"
+                        }
                       ]
                     },
                     {
-                      "event_match": { "msg": "TIMER_FIRED" },
-                      "guard": "event.timer_key == \"collection_timeout\"",
-                      "target_state": "failed",
+                      "event_match": {
+                        "src": "AI.sales@worker1"
+                      },
+                      "guard": "event.context.evaluation.option == 'consult' && event.context.evaluation.reply != ''",
+                      "target_state": "consulting",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "IO.slack.ventas@motherbee"
+                        },
+                        {
+                          "type": "send_message",
+                          "target": "IO.slack.supervisores@motherbee",
+                          "meta": {
+                            "msg": "CONSULT"
+                          },
+                          "payload": {
+                            "type": "text",
+                            "content": {
+                              "$ref": "event.context.evaluation.params.question"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "src": "AI.sales@worker1"
+                      },
+                      "guard": "event.context.evaluation.option == 'consult'",
+                      "target_state": "consulting",
+                      "actions": [
+                        {
+                          "type": "send_message",
+                          "target": "IO.slack.supervisores@motherbee",
+                          "meta": {
+                            "msg": "CONSULT"
+                          },
+                          "payload": {
+                            "type": "text",
+                            "content": {
+                              "$ref": "event.context.evaluation.params.question"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "src": "IO.slack.ventas@motherbee"
+                      },
+                      "guard": "true",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "AI.sales@worker1",
+                          "menu": {
+                            "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person yourself."
+                              },
+                              {
+                                "name": "consult",
+                                "description": "A supervisor must approve something before you answer.",
+                                "params": {
+                                  "question": {
+                                    "type": "string",
+                                    "description": "What you ask, with the data to decide."
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "msg": "TIMER_FIRED"
+                      },
+                      "guard": "event.timer_key == 'sales_timeout'",
+                      "target_state": "listening",
                       "actions": []
                     }
                   ]
                 },
                 {
-                  "name": "completed",
-                  "description": "Done.",
-                  "entry_actions": [],
-                  "exit_actions": [],
-                  "transitions": []
+                  "name": "consulting",
+                  "description": "Waits for a supervisor's answer in the thread of the question's post; sales keeps answering the person meanwhile.",
+                  "entry_actions": [
+                    {
+                      "type": "schedule_timer",
+                      "timer_key": "consult_timeout",
+                      "fire_in": "30m"
+                    }
+                  ],
+                  "exit_actions": [
+                    {
+                      "type": "cancel_timer",
+                      "timer_key": "consult_timeout"
+                    }
+                  ],
+                  "transitions": [
+                    {
+                      "event_match": {
+                        "src": "IO.slack.supervisores@motherbee"
+                      },
+                      "guard": "true",
+                      "target_state": "sales_thinking",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "AI.sales@worker1",
+                          "menu": {
+                            "help": "This is the supervisor's answer to your consultation. Tell the person what was decided.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person."
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "src": "IO.slack.ventas@motherbee"
+                      },
+                      "guard": "true",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "AI.sales@worker1",
+                          "menu": {
+                            "help": "A supervisor is still deciding on your consultation. Answer the person meanwhile, and promise nothing the supervisor has not approved.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person."
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "src": "AI.sales@worker1"
+                      },
+                      "guard": "event.context.evaluation.option == 'answer'",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "IO.slack.ventas@motherbee"
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "msg": "TIMER_FIRED"
+                      },
+                      "guard": "event.timer_key == 'consult_timeout'",
+                      "target_state": "sales_thinking",
+                      "actions": [
+                        {
+                          "type": "send_message",
+                          "target": "AI.sales@worker1",
+                          "meta": {
+                            "msg": "CONSULT_TIMEOUT"
+                          },
+                          "payload": {
+                            "type": "text",
+                            "content": "No supervisor answered your consultation within 30 minutes."
+                          },
+                          "menu": {
+                            "help": "Tell the person that the consultation got no answer yet, and what you can offer meanwhile.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person."
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
                 },
                 {
-                  "name": "failed",
-                  "description": "No validated data in time.",
+                  "name": "listening",
+                  "description": "Waits for the person's next message; the conversation closes after 30 quiet minutes.",
+                  "entry_actions": [
+                    {
+                      "type": "schedule_timer",
+                      "timer_key": "idle",
+                      "fire_in": "30m"
+                    }
+                  ],
+                  "exit_actions": [
+                    {
+                      "type": "cancel_timer",
+                      "timer_key": "idle"
+                    }
+                  ],
+                  "transitions": [
+                    {
+                      "event_match": {
+                        "src": "IO.slack.ventas@motherbee"
+                      },
+                      "guard": "true",
+                      "target_state": "sales_thinking",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "AI.sales@worker1",
+                          "menu": {
+                            "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
+                            "options": [
+                              {
+                                "name": "answer",
+                                "description": "You answer the person yourself."
+                              },
+                              {
+                                "name": "consult",
+                                "description": "A supervisor must approve something before you answer.",
+                                "params": {
+                                  "question": {
+                                    "type": "string",
+                                    "description": "What you ask, with the data to decide."
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "event_match": {
+                        "msg": "TIMER_FIRED"
+                      },
+                      "guard": "event.timer_key == 'idle'",
+                      "target_state": "closed",
+                      "actions": []
+                    }
+                  ]
+                },
+                {
+                  "name": "closed",
+                  "description": "The conversation ended.",
                   "entry_actions": [],
                   "exit_actions": [],
                   "transitions": []
+                }
+              ],
+              "catch": [
+                {
+                  "event_match": {
+                    "src": "AI.sales@worker1"
+                  },
+                  "guard": "event.context.evaluation.option == 'none' && event.context.evaluation.reply != ''",
+                  "actions": [
+                    {
+                      "type": "forward",
+                      "target": "IO.slack.ventas@motherbee"
+                    }
+                  ]
+                },
+                {
+                  "event_match": {
+                    "src": "AI.sales@worker1"
+                  },
+                  "guard": "event.payload.type == 'error'",
+                  "actions": []
                 }
               ]
             },
@@ -184,24 +504,32 @@
     "constraints": [
       "declare only the workflow: SY.wf-rules packages it and creates and runs its node, WF.<workflow_name>@<hive>",
       "workflow_name is lowercase letters, digits and '-' in dot-separated parts, each starting with a letter, and unique per hive",
-      "the definition is a wf_schema_version 1 state machine: workflow_type, start_from, input_schema, initial_state, terminal_states, and states with entry_actions, exit_actions and transitions (CEL guards)",
-      "a definition names in start_from the nodes whose messages start an instance: IO nodes or WFs, each a node name with its hive, never an AI.* node (an agent only answers) nor a SY.* or RT.* node; only the nodes written in it drive an instance: those of start_from, of an event_match.src, and the targets of its send_message and forward actions",
-      "every message a WF sends is a user message: an action's meta has msg (and, to ask an agent for a structured answer, context), never type",
+      "the definition is a wf_schema_version 1 state machine: workflow_type, start_from, input_schema, initial_state, terminal_states, states with entry_actions, exit_actions and transitions (CEL guards), and an optional catch",
+      "a definition names in start_from the nodes whose messages start an instance: IO nodes or WFs, each a node name with its hive, never an AI.* node (an agent only answers) nor a SY.* or RT.* node; only the nodes written in it drive an instance: those of start_from, of an event_match.src, and the targets of its send_message and forward actions, the catch's included",
+      "every message a WF sends is a user message: an action's meta has msg and context, never type",
       "a send_message target is a node name written in the definition; to choose among destinations, write one transition per destination with its guard",
+      "a WF asks an agent with a menu on a send_message or a forward to an AI.* node: an optional help, and 1 to 8 options, each a name, a description and optional typed params; the agent adds none, with the param reason",
+      "an agent's answer to a menu has its reply, maybe empty, in event.payload.content, and {reply, option, params} in event.context.evaluation: branch on event.context.evaluation.option, and forward the answer to the IO node to give the person the reply",
+      "an agent's error answer (an answer off the menu, a timeout, a provider failure) is a payload of type 'error', with no retry; its msg is <msg>.error only when the request had a msg (a forwarded person's message has none: match the agent by event_match.src, with the guard event.payload.type == 'error')",
+      "what no transition of the current state takes goes to the catch, a top-level list of transitions tried in any state (sends, forwards, keep_message, set_variable and emit_internal_event; no timers); what the catch does not take is logged as unhandled event, and the instance stays where it was",
+      "at most 8 messages go to agents between two triggers (a message from an IO node or a WF, or a timer's fire): past that the send is not made, and the instance gets one AGENT_CALL_CAP event, a payload of type 'error'",
       "a timer's key is event.timer_key: a timeout is a TIMER_FIRED transition with the guard event.timer_key == '<timer_key>'",
-      "an agent's error answer is a payload of type 'error', so it needs a transition of its own; its msg is <msg>.error only when the request had a msg (a forwarded person's message has none: match its sender, with the guard event.payload.type == 'error')",
       "a $ref to a field that may be missing gives a default: {\"$ref\": \"event.context\", \"default\": {}}; a $ref without one fails the instance"
     ],
     "do_not_repeat": [
       "do not declare the WF node in nodes, nor a runtime for it: SY.wf-rules makes both",
       "do not put the workflow definition content inside a node config — it goes in wf_deployments",
       "do not deploy a workflow on an ingress or egress hive: it has no SY.wf-rules",
-      "do not write meta.type, target_ref, thread_id_ref or event.payload.timer_key: SY.wf-rules refuses the first three, and the fourth is never set",
+      "do not write meta.type, target_ref, thread_id_ref, meta.context.response_envelope or event.payload.timer_key: SY.wf-rules refuses the first four, and the fifth is never set",
+      "do not put routing rules in an agent's role: the WF hands the agent a menu with each message, and the role keeps only the agent's trade",
+      "do not name a menu option none, nor read an option or a param that no menu of the definition has: SY.wf-rules refuses both",
+      "do not forward an agent's empty reply to an IO node: guard that forward with event.context.evaluation.reply != ''",
+      "do not ask an agent again with the same message: deliver its answer, then wait for the person's next message",
       "do not wait for an answer without a timer: an agent or a node that never answers leaves the instance waiting forever"
     ],
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 3
+    "seed_version": 4
   }
 ]
