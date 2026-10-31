@@ -1102,18 +1102,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - a hand-back by the inactivity timer brings no note.
 - **The operator's principle for this topic:** a thread_id means a conversation, with or without an
   agent. Cognition should process it, and the content belongs to the interlocutor, agent or not.
-- **The operator's open question:** is a conversation between agents "the same" in every aspect as
-  one with a person? *"veo menos cosas como el análisis de eventos o memorias pero, quién sabe"*.
-  Today cognition analyzes every turn the same way, whoever speaks (src/bin/sy_cognition.rs: the
-  semantic tagger gets the text with `src_ilk`, `dst_ilk` and `ich`). It does not tell a person
-  from an agent or a WF.
+- **The operator's open question (corrected by the operator, 2026-10-31):** cognition was built to
+  draw out a conversation's deep, abstract sense: the feeling, the history and the events. It also
+  shrinks the context as the conversation grows. That focus fits a conversation between an agent
+  and a person.
+  - The question is which conversations cognition analyzes, and how much of the analysis each one
+    gets, when every interlocutor is an agent. The question is not who speaks.
+  - The operator: *"si la conversación es entre dos agentes.. no sé si tiene sentido analizar el
+    sentir.. puede ser necesario pero no lo veo ahora"*.
+  - **Today:** cognition analyzes every communication it gets in full, whoever its interlocutors
+    are (src/bin/sy_cognition.rs). Its analysis covers contexts, reasons, memories, the episodes
+    an affect fires, and the summaries.
 - **What the topic must answer:**
   - who owns a communication with no agent;
   - which hive's cognition keeps it. The A-70 model has no cognition traffic between hives, and in
     Case 4 Juan comes in through io.slack on the motherbee while sales runs on worker1;
   - how the next agent sees what was said on the thread meanwhile;
   - who pays for the analysis. Today the agent's tenant pays for each turn's model calls;
-  - whether turns from an agent, or from a WF, get the same analysis as a person's.
+  - in a conversation whose interlocutors are all agents, which analysis runs: all of it, a part
+    (say the history and the compaction, without the feeling), or none.
 - **Status:** a new topic of its own, *"para darle foco"* (the operator). It is decided with the
   operator before anything is built, and it is not part of WF Case 4.
 
