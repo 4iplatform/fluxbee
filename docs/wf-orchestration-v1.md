@@ -768,6 +768,10 @@ docs, and the agents. Everything below was fixed before the release.
 
 ### 5.3 Case 3: the internal consultation. Decided with the operator, 2026-10-30
 
+**Validated on 8.x, 2026-10-30.** Built in 0.1.92. Its gate passed on its second run, with the
+agents' recent turns of 0.1.93 (cognition, FINDINGS A-134): Case 1 reached the invoice, and sales
+knew a supervisor's decision on the person's next question.
+
 **The operator's split:** escalation is two cases, built and validated one after the other.
 - **The internal consultation (this case):** the agent asks a supervisor, the supervisor decides,
   and the agent stays the person's only voice.
@@ -1123,7 +1127,8 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
 - What the first message to the team's channel carries, so that a person can take over.
 - **What the gate showed (2026-10-30):**
   - **A supervisor who answers in the channel,** not in the thread of the question, is not heard:
-    the reply has the channel's thread id, and the WF drops it. Natural for a person to do.
+    the reply has the channel's thread id, and the WF drops it. Natural for a person to do: the
+    operator's first answer went to the channel in both runs of the gate.
   - **A supervisor who asks the agent something** ("between 20% and 15%, which would you give?")
     gets no answer: the agent may only decide or wait.
 - **Which posts io.slack records.** It records the place of each message that reaches it, and of

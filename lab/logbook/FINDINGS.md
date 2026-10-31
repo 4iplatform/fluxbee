@@ -1078,7 +1078,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-134 🟡 OPEN, BEING BUILT (found 2026-10-30, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
+### A-134 ✅ VALIDATED ON 8.x (0.1.93, 2026-10-30; found the same day, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
 
 - **What happened in the gate:** with ai.generic's immediate memory off (A-133), the sales agent
   forgot its own quote and answered "which plan do you want?" to "dale, facturámelo", so it never
@@ -1115,8 +1115,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - a read of the region could tear; the router now copies before parsing, and caches the parse.
 - **Left:** turns taken before the worker loads a communication live only in the region until that
   load; a host reset in that window loses them.
-- **Next:** release 0.1.93, then the gate again: Case 1 to the invoice, and sales recalling a
-  supervisor's decision.
+- **Validated on 8.x** (0.1.93, the gate's second run, DEPLOYMENTS.md):
+  - Case 1 reached the end: "Dale, facturamelo" came with the quote before it, and sales handed
+    over to invoice;
+  - a supervisor approved a discount in the Slack thread, and the person's next question got the
+    approved total from sales' memory, 3.8 s later. That question reached sales 0.4 s after sales'
+    own answer, and its package already held that answer;
+  - SY.cognition@worker1 took every turn at intake (16), with no drops or errors.
 
 ### A-133 🟡 OPEN (found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
 
@@ -1138,8 +1143,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **To watch in the gate:** the package holds contexts, reasons, memories and episodes; the
   summarizer never sees a message's text, and the region is rewritten after two model calls.
   Whether sales knows a supervisor's decision on the person's next message is checked there.
-- **Next:** cognition becomes the agents' recent conversation too (A-134). The immediate memory
-  stays for SY.architect; for AI agents, remove it or key it by thread when that is in place.
+- **Cognition is the agents' recent conversation since 0.1.93** (A-134, validated on 8.x): the gate's
+  sales agent knew a supervisor's decision on the person's next message, with this memory off.
+- **Left:** `runtime.immediate_memory` is still an option of ai.generic, keyed by sender. The
+  immediate memory stays for SY.architect; for AI agents, remove it (the operator: no SDK memory for
+  them).
 
 ### A-132 🟡 OPEN (found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
 

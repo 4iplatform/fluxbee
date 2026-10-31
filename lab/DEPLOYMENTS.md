@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ live | snap `pre-wfcase3-0-1-92` (all 4 VMs) · `apt install fluxbee=0.1.91` + core-update of the spokes |
+| **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ live | snap `pre-cogturns-0-1-93` (all 4 VMs) · `apt install fluxbee=0.1.92` + core-update of the spokes |
+| **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
 | **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
 | **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ replaced by 0.1.91 | snap `pre-wfcase0-0-1-90` (deleted 2026-10-30) · `apt install fluxbee=0.1.89` + core-update of the spokes |
 | **0.1.89** | 2026-10-28 | `694becc` | motherbee + spokes (core); the gate's ai.generic `0.1.88-gate1` deleted on the motherbee before the deploy (A-122) | ✅ replaced by 0.1.90 | snap `pre-tools2-0-1-89` (all 4 VMs) · `apt install fluxbee=0.1.88` + core-update of the spokes |
@@ -101,6 +102,74 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.93 — Cognition carries each communication's last 20 turns, so an AI agent's next message has the turn before it (A-134)
+
+- **Date:** 2026-10-30 (ART) · **Previous version:** 0.1.92 · **Commit:** `c70ad89` (the code is
+  `bc37404`).
+- **Scope:** motherbee and the three spokes (core update). The gate's deployment of 0.1.92 stays up.
+- **Design:** FINDINGS A-134, decided with the operator on 2026-10-30 after 0.1.92's gate. An agent's
+  memory is cognition's, and ai.generic's immediate memory stays off.
+  - The old "20 messages" (the context window of `docs/history/11-context.md`) were never built in
+    the router. In March, cognition v2 gave the recent conversation to the AI SDK's immediate
+    memory, built for SY.architect, which cognition does not serve.
+  - The stream is not what delayed the turns: cognition's worker is serial, about 5 s a turn. So
+    the turns are taken at intake.
+  - One review round: two reviewers, ten findings, all fixed in `bc37404`.
+- **What changed:**
+  - **SY.cognition** keeps each communication's last 20 turns, 48 KiB at most. Each turn holds who
+    spoke, the sender's ILK, the node it came through, its text (2,000 characters at most), its
+    files, the menu choice and its time.
+    - The intake writes the turns and rewrites the memory region at once. The worker's labels
+      follow as before.
+    - The turns are kept in `cognition_threads`' payload, so they come back after a restart.
+  - **The memory package** is `package_version` 3 and carries the turns. The router copies the
+    region before parsing it and caches the parse. A package gives way so a delivery fits its
+    128 KiB frame.
+  - **SY.storage:** a thread row of the same turn replaces the stored one only when it was built
+    later (`source_ts`).
+  - **ai.generic** shows the turns as the recent conversation, one line each, and names the current
+    message's speaker.
+- **Deploy:**
+  - build of `c70ad89` in 20 min, deploy in 200 s;
+  - publish: the repo keeps 0.1.84 to 0.1.93 (0.1.83 pruned), and `dist/` dropped 0.1.92's .deb;
+  - snapshots `pre-cogturns-0-1-93` on the 4 VMs (`pre-wfcase3-0-1-92` was deleted);
+  - 0.1.93 on all 4 (core manifest `ab3d8310c3d3b82c`), with health clean;
+  - `wf.engine`, `ai.generic` and `io.slack` `current` are 0.1.93 on the motherbee and worker1. The
+    gate's agents, its WF, its io.slack and `AI.pruebas` run 0.1.93, HEALTHY;
+  - before the deploy, the new upsert was checked on PROD's PostgreSQL 16.15 with reads only. The
+    29 stored rows' `source_ts` cast, the row comparison orders as intended, and the statement
+    prepares;
+  - SY.storage restarted once at the vault's boot broadcast (`storage_postgres_url`), as it does at
+    every deploy.
+- **Gate**, second run, on fresh threads (`thread:gate0193-a` and `-c`):
+  - **Case 1, to the end:**
+    1. The person got sales' quote in 2.8 s.
+    2. "Dale, facturamelo" reached sales with its package; the prompt grew from 985 to 1,977
+       characters. Sales handed over, and invoice issued F-0192-4827 for 1,000 USD, due in 2
+       minutes, 5.4 s after the message.
+    3. "Gracias" handed the case back.
+    4. Payments' notice came 122.6 s after the invoice; then nothing more arrived.
+  - **The consultation**, with the operator as the supervisor in Slack:
+    1. Sales chose `consult` with a precise question (20 Pro licenses, 20% off, 1,600 USD a month),
+       and the person got "I will check".
+    2. The operator's first answer went to the channel, outside the post's thread, and was
+       dropped, as in the first run (a note for Case 4, wf-orchestration-v1 §5.3.7).
+    3. The answer in the thread, "Sí, véndelo", reached sales, which chose `decided`. The person got
+       the approval: 20% off, 1,600 USD a month.
+    4. The person asked "how much is it a month with the discount you approved?" Sales answered
+       from its memory in 3.8 s: 1,600 USD instead of 2,000. In the first run it consulted again
+       here.
+       - The question reached sales 0.4 s after sales' own answer, and its package already held
+         that answer.
+    5. Ten minutes followed with nothing more. Both instances closed.
+  - **Cognition:** SY.cognition@worker1 took all 16 turns at intake, with no drops or errors.
+    SY.storage stored each communication's row with its turns.
+  - **Health:** `failed=0`, `denials=0` on all 4.
+- **Rollback:**
+  - snapshot `pre-cogturns-0-1-93`;
+  - or `apt install fluxbee=0.1.92` plus the core update of the spokes. 0.1.92 ignores the turns in
+    the stored rows and in the region.
 
 ## 0.1.92 — The WF track, Case 3: the WF asks an agent with a menu, the catch and the default log, the cap on agent calls, io.slack's thread records, and Archi's WF chapter (wf-orchestration-v1 §5.3; A-125, A-131)
 
