@@ -1101,7 +1101,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   through. They are written at intake, before the slow worker, so the next message already has
   them. They go in the durable state too, so they survive a restart. SY.architect keeps the AI
   SDK's immediate memory.
-- **Next:** build it, then run the gate again: Case 1 to the invoice, and sales recalling a
+- **Built** (`65514ecb`, with its review's fixes in `bc374046`):
+  - a `MemoryTurn` per turn, with its direction, sender, the node it came through, its text (2,000
+    characters at most, one line when shown) and the agent's menu choice; 20 turns and 48 KiB at
+    most per communication;
+  - written at intake (`take_stream_batch`) and kept in `cognition_threads`;
+  - ai.generic shows them as the recent conversation, and names the current message's speaker.
+- **Its review** (two reviewers, ten findings, all fixed):
+  - a communication not loaded yet could erase its stored turns, and rows of one turn could be
+    applied out of order;
+  - a package could push a delivery past the router's 128 KiB frame, which is dropped silently: the
+    package now gives way;
+  - a read of the region could tear; the router now copies before parsing, and caches the parse.
+- **Left:** turns taken before the worker loads a communication live only in the region until that
+  load; a host reset in that window loses them.
+- **Next:** release 0.1.93, then the gate again: Case 1 to the invoice, and sales recalling a
   supervisor's decision.
 
 ### A-133 🟡 OPEN (found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
