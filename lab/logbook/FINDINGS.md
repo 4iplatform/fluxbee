@@ -1078,6 +1078,45 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-137 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+
+- **What happens:**
+  - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
+    whom, the ICH, the thread and the content (src/bin/sy_storage.rs, `turns`).
+  - **Cognition takes a turn only when an `AI.*` node sends it or receives it** (src/router/mod.rs:
+    the sender at entry, and `deliver_locally`).
+  - **A communication is (thread, agent).** Two agents in one thread are two communications, and
+    each agent gets only its own package (`package_for`).
+- **What it breaks:** when a conversation changes hands on its thread, the one who takes it does not
+  see what was said in between.
+  - **Between agents, today:** when sales takes the conversation back from invoice, it sees none of
+    invoice's turns. It sees only the facts the WF passes in its metadata (`meta.context.wf`).
+  - **With a person, in WF Case 4:** a team member (Juan) talks with the customer (Ana) on her thread
+    from 10:00 to 10:16, and no agent is in that part. At 10:17 Ana asks "¿entonces ya está la nota
+    de crédito?", and sales knows the conversation only up to its own summary.
+- **Decided for Case 4 (the operator, 2026-10-31):**
+  - the WF's trail in the metadata carries the facts: the team held the case from 10:00 to 10:16,
+    and Juan handed it back;
+  - the team member leaves a note when handing back, which reaches sales as a message and enters
+    its memory;
+  - a hand-back by the inactivity timer brings no note.
+- **The operator's principle for this topic:** a thread_id means a conversation, with or without an
+  agent. Cognition should process it, and the content belongs to the interlocutor, agent or not.
+- **The operator's open question:** is a conversation between agents "the same" in every aspect as
+  one with a person? *"veo menos cosas como el análisis de eventos o memorias pero, quién sabe"*.
+  Today cognition analyzes every turn the same way, whoever speaks (src/bin/sy_cognition.rs: the
+  semantic tagger gets the text with `src_ilk`, `dst_ilk` and `ich`). It does not tell a person
+  from an agent or a WF.
+- **What the topic must answer:**
+  - who owns a communication with no agent;
+  - which hive's cognition keeps it. The A-70 model has no cognition traffic between hives, and in
+    Case 4 Juan comes in through io.slack on the motherbee while sales runs on worker1;
+  - how the next agent sees what was said on the thread meanwhile;
+  - who pays for the analysis. Today the agent's tenant pays for each turn's model calls;
+  - whether turns from an agent, or from a WF, get the same analysis as a person's.
+- **Status:** a new topic of its own, *"para darle foco"* (the operator). It is decided with the
+  operator before anything is built, and it is not part of WF Case 4.
+
 ### A-136 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
 - **What happens:** the thread id comes from the message's place in Slack
