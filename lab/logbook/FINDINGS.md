@@ -1078,6 +1078,30 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-135 🔴 OPEN (found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
+
+- **What happens:** go/nodes/wf/wf-generic/node/correlate.go, `creationThread`. When a message from
+  a `start_from` node has no `meta.thread_id`, it starts an instance whose thread is the instance's
+  own id.
+  - Every send and forward of that instance carries that thread (actions.go).
+  - An agent's memory in cognition and the answers to the person would then be filed under an id
+    the WF made up.
+- **How a message gets there:** today `start_from` takes only IO.\* and WF.\* nodes, and neither
+  should send without a thread:
+  - The IO family's common layer always computes the thread (nodes/io/common, `compute_thread_id`).
+  - A WF sends on its instance's thread.
+
+  Only a sender that breaks that contract gets there: an IO node outside the common layer, or a
+  client on the router socket like the gates' own `IO.gate019x`.
+- **Why it is there:** it is left over from the first WF node (`9ba5c651`, 2026-04-14). Back then a
+  WF's `send_message` used the instance id as its thread. Case 1 (0.1.90, 0.1.91) moved the sends to
+  the instance's thread and kept this fallback.
+- **Why it matters:** it breaks a principle the operator stated on 2026-10-31. The thread belongs to
+  whoever opened the communication, the IO node (see the datum's-owner principle). A WF marks the
+  steps and the traffic's rules, and never owns a conversation.
+- **Fix (proposed):** a message with no thread starts no instance. It is dropped and logged, like
+  any other message that starts nothing, and `creationThread` goes. It goes with WF Case 4's build.
+
 ### A-134 ✅ VALIDATED ON 8.x (0.1.93, 2026-10-30; found the same day, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
 
 - **What happened in the gate:** with ai.generic's immediate memory off (A-133), the sales agent
