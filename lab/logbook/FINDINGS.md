@@ -1078,6 +1078,35 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-136 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
+
+- **What happens:** the thread id comes from the message's place in Slack
+  (nodes/io/common/src/io_context.rs, `slack_inbound_io_context`; nodes/io/io-slack/src/thread_records.rs).
+  - **At a channel's top level,** a message gets the channel's thread (`PersistentChannel`,
+    workspace + channel), and everyone who writes there shares it.
+  - **In a Slack thread,** a message gets the native thread's id, or the recorded one when the root
+    is a post io.slack recorded.
+- **What it breaks:**
+  - **A reply written in the channel is lost.** A team member who answers a case's post in the
+    channel, and not in its thread, lands on the channel's thread. No WF instance holds that
+    thread, so the message is dropped in silence. It happened in both runs of WF Case 3's gate
+    ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.3.7).
+  - **io.slack's own top-level answer is not recorded.** A reply in that answer's Slack thread
+    starts a new thread id (§5.3.7).
+- **The operator (2026-10-31):**
+  - A conversation always has a thread. What comes from that channel is the same interlocutor,
+    who changes thread but always has one.
+  - Placing a message in the right conversation is the IO node's job. The WF is not patched for it.
+  - **A future idea:** when an IO node cannot tell which thread a message belongs to, it asks
+    cognition. Cognition's AI reads the content and puts the conversation on the right thread.
+  - The IO nodes' current modes are not set in stone. They come from several eras of code, so read
+    the code to understand each mechanism.
+- **Meanwhile, decided for WF Case 4:** nothing that comes from an IO node ends in silence. Take a
+  message from an IO node the definition involves, on a thread with no conversation:
+  - when the definition starts conversations from that node, it starts one;
+  - otherwise the WF answers "not taken", and the IO node shows that to the writer as an error.
+- **Fix:** the IO family's review (the IO track).
+
 ### A-135 🔴 OPEN (found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
 
 - **What happens:** go/nodes/wf/wf-generic/node/correlate.go, `creationThread`. When a message from
