@@ -141,11 +141,13 @@ EOF
   - `behavior.capabilities` (now `behavior.multimodal`);
   - a `behavior.base_url` without `behavior.provider`, or on the other provider's host;
   - cognitive assets (`config.assets`), which go through `set_ilk_definition`;
+  - `runtime.immediate_memory`: ai.generic no longer keeps a memory of its own. It kept that one
+    per sender, which mixed customers in a WF's consultation; an agent's memory is cognition's
+    package, per conversation (FINDINGS A-133). Every `config.json` a `CONFIG_SET` wrote before its
+    removal has it: such a node boots FAILED_CONFIG until a `CONFIG_SET` without it;
   - any unknown field under `behavior` or `runtime`, `behavior.instructions` included.
-- **`runtime` has two parts:**
-  - `runtime.immediate_memory` (`enabled`, off by default; `recent_interactions_max`;
-    `summary_max_chars`) applies with the `CONFIG_SET`;
-  - `runtime.cognitive_definition` (`poll_interval_secs`, `blob_root`) applies at the next start.
+- **`runtime` has one part,** `runtime.cognitive_definition` (`poll_interval_secs`, `blob_root`),
+  which applies at the next start.
 - **Timeouts, workers and queue are the AI runtime's, not config:**
   - each model call has 5 min, its provider's own retries included;
   - a message has 47 min: up to 8 model turns of a tool loop, one plain call after them, and 2 min

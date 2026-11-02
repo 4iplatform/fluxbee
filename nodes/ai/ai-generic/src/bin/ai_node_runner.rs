@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Write};
@@ -17,12 +16,11 @@ use fluxbee_ai_sdk::{
     AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, ContractAnswer,
     ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
     FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionToolProvider,
-    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, LanceDbThreadStateStore,
-    LlmClient, LlmRequest, MenuContract, Message, MessageContract, ModelInputOptions,
-    ModelSettings, NodeRuntime, ResolvedModelInput, RuntimeConfig, TenantSource,
-    ThreadStateDeleteTool, ThreadStateGetTool, ThreadStatePutTool, ThreadStateStore,
-    ThreadStateToolsProvider, ToolCard, ToolCatalog, ToolErrorCode, ToolRunWatch, UsageRecorder,
-    MSG_PING, MSG_STATUS,
+    FunctionToolRegistry, HiveAiConfig, LanceDbThreadStateStore, LlmClient, LlmRequest,
+    MenuContract, Message, MessageContract, ModelInputOptions, ModelSettings, NodeRuntime,
+    ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateDeleteTool, ThreadStateGetTool,
+    ThreadStatePutTool, ThreadStateStore, ThreadStateToolsProvider, ToolCard, ToolCatalog,
+    ToolErrorCode, ToolRunWatch, UsageRecorder, MSG_PING, MSG_STATUS,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::managed_control_plane::{
@@ -45,11 +43,9 @@ use fluxbee_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::fs as tokio_fs;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
@@ -109,15 +105,6 @@ struct NodeSection {
     uuid_persistence_dir: String,
     config_dir: String,
     dynamic_config_dir: String,
-}
-
-/// `runtime.immediate_memory`: applied with each `CONFIG_SET`, like `behavior`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ImmediateMemorySection {
-    enabled: bool,
-    recent_interactions_max: usize,
-    summary_max_chars: usize,
 }
 
 /// `runtime.cognitive_definition`: read when the node starts, so a change applies at the next
@@ -196,19 +183,7 @@ struct EffectiveBehaviorSection {
 #[serde(deny_unknown_fields)]
 struct EffectiveRuntimeSection {
     #[serde(default)]
-    immediate_memory: Option<ImmediateMemorySection>,
-    #[serde(default)]
     cognitive_definition: Option<CognitiveDefinitionSection>,
-}
-
-impl Default for ImmediateMemorySection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            recent_interactions_max: 10,
-            summary_max_chars: 1_600,
-        }
-    }
 }
 
 impl Default for CognitiveDefinitionSection {
@@ -259,7 +234,6 @@ struct AiChatRuntime {
     /// `behavior.provider`; `None` follows the hive's (`effective_ai_engine`).
     provider: Option<AiProvider>,
     base_url: Option<String>,
-    immediate_memory: ImmediateMemorySection,
     multimodal: bool,
 }
 
@@ -294,7 +268,6 @@ struct GenericAiNode {
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
-    immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     /// Vault accessor over the canonical `Arc<RouterDispatcher>`. `None` when
     /// `self_ilk_id` / hive suffix is missing — the node still boots in a
     /// degraded state.
@@ -599,108 +572,6 @@ struct UnpublishHtmlArgs {
     url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PersistedImmediateMemoryRecord {
-    #[serde(default)]
-    summary: Option<fluxbee_ai_sdk::ConversationSummary>,
-    #[serde(default)]
-    recent_interactions: Vec<fluxbee_ai_sdk::ImmediateInteraction>,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct ImmediateMemoryStore {
-    root_dir: PathBuf,
-    key_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-}
-
-impl ImmediateMemoryStore {
-    fn new(root_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            root_dir: root_dir.into(),
-            key_gates: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn root_dir(&self) -> &std::path::Path {
-        &self.root_dir
-    }
-
-    fn records_dir(&self) -> PathBuf {
-        self.root_dir.join("threads")
-    }
-
-    fn key_file_path(&self, key: &str) -> PathBuf {
-        self.records_dir()
-            .join(format!("{}.json", sanitize_storage_key(key)))
-    }
-
-    async fn ensure_ready(&self) -> fluxbee_ai_sdk::Result<()> {
-        tokio_fs::create_dir_all(self.records_dir())
-            .await
-            .map_err(|err| {
-                fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                    "immediate memory init failed: {err}"
-                ))
-            })?;
-        Ok(())
-    }
-
-    async fn lock_key(&self, key: &str) -> OwnedMutexGuard<()> {
-        let safe = sanitize_storage_key(key);
-        let gate = {
-            let mut gates = self.key_gates.lock().await;
-            gates
-                .entry(safe)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        gate.lock_owned().await
-    }
-
-    async fn get(
-        &self,
-        key: &str,
-    ) -> fluxbee_ai_sdk::Result<Option<PersistedImmediateMemoryRecord>> {
-        if key.trim().is_empty() {
-            return Ok(None);
-        }
-        let _guard = self.lock_key(key).await;
-        let path = self.key_file_path(key);
-        let raw = match tokio_fs::read_to_string(&path).await {
-            Ok(v) => v,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                    "immediate memory read failed: {err}"
-                )))
-            }
-        };
-        let parsed = serde_json::from_str::<PersistedImmediateMemoryRecord>(&raw)?;
-        Ok(Some(parsed))
-    }
-
-    async fn put(
-        &self,
-        key: &str,
-        record: &PersistedImmediateMemoryRecord,
-    ) -> fluxbee_ai_sdk::Result<()> {
-        if key.trim().is_empty() {
-            return Ok(());
-        }
-        let _guard = self.lock_key(key).await;
-        self.ensure_ready().await?;
-        let path = self.key_file_path(key);
-        let raw = serde_json::to_string_pretty(record)?;
-        tokio_fs::write(path, raw).await.map_err(|err| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "immediate memory write failed: {err}"
-            ))
-        })?;
-        Ok(())
-    }
-}
-
 /// ai.generic's config-plane lifecycle IS the SDK's canonical one — no local re-definition, so it
 /// cannot drift from the shared control-plane.
 type NodeLifecycleState = ManagedNodeLifecycleState;
@@ -945,8 +816,6 @@ impl AiNode for GenericAiNode {
             .flatten()
             .collect::<Vec<_>>();
         let message_label = current_message_label(&msg);
-        // What the person wrote, without the blocks in front: what the history keeps.
-        let user_text = input.clone();
         let input = inject_prompt_blocks_into_text_input(&input, &prompt_blocks, &message_label);
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
@@ -1016,7 +885,6 @@ impl AiNode for GenericAiNode {
                         &engine,
                         input,
                         input_parts,
-                        &user_text,
                         &behavior_ctx,
                         contract.as_ref(),
                     )
@@ -1112,7 +980,6 @@ impl GenericAiNode {
         engine: &AiEngine,
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
-        user_text: &str,
         ctx: &BehaviorContext,
         contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
@@ -1172,11 +1039,9 @@ impl GenericAiNode {
                     &watched,
                     &tool_registry,
                     &files,
-                    ai,
                     ctx,
                     input.clone(),
                     input_parts.clone(),
-                    user_text,
                     contract,
                 )
                 .await?
@@ -1194,8 +1059,7 @@ impl GenericAiNode {
             max_output_tokens: None,
             model_settings: Some(ai.model_settings.clone()),
         };
-        self.run_plain_call(client.as_ref(), req, ai, ctx, user_text, contract)
-            .await
+        self.run_plain_call(client.as_ref(), req, contract).await
     }
 
     /// One message's tool loop, and its answer (`tool_loop_answer`): the model's own text with
@@ -1208,17 +1072,19 @@ impl GenericAiNode {
         model: &dyn FunctionCallingModel,
         tools: &FunctionToolRegistry,
         files: &ReplyFiles,
-        ai: &AiChatRuntime,
         ctx: &BehaviorContext,
         input: String,
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
-        user_text: &str,
         contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-        let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
-        let run_input =
-            self.build_function_run_input(input, input_parts, ctx, ai, immediate_memory);
+        // The agent's memory is cognition's package, in the input's memory block: never the AI
+        // SDK's immediate memory, which ai.generic kept per sender (FINDINGS A-133).
+        let run_input = FunctionRunInput {
+            current_user_message: input,
+            current_user_parts: input_parts,
+            immediate_memory: None,
+        };
         let result = runner.run_with_input(model, tools, run_input).await?;
         let Some(answer) = tool_loop_answer(
             tool_loop_text(&result),
@@ -1232,8 +1098,6 @@ impl GenericAiNode {
         if matches!(answer.output, AiBehaviorOutput::Final(_)) {
             self.log_final_output(ctx, &answer.output);
         }
-        self.persist_immediate_turn(ai, ctx, user_text, &assistant_turn_text(&answer))
-            .await;
         Ok(Some(answer))
     }
 
@@ -1244,9 +1108,6 @@ impl GenericAiNode {
         &self,
         client: &dyn LlmClient,
         request: LlmRequest,
-        ai: &AiChatRuntime,
-        ctx: &BehaviorContext,
-        user_text: &str,
         contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
         let response = client.generate(request).await?;
@@ -1257,13 +1118,10 @@ impl GenericAiNode {
                 evaluation: None,
             },
         };
-        let answer = AiChatAnswer {
+        Ok(AiChatAnswer {
             output: AiBehaviorOutput::text(answer.text),
             evaluation: answer.evaluation,
-        };
-        self.persist_immediate_turn(ai, ctx, user_text, &assistant_turn_text(&answer))
-            .await;
-        Ok(answer)
+        })
     }
 
     /// The journal's line for a reply that carries files: their names and the length of its text,
@@ -1312,178 +1170,6 @@ impl GenericAiNode {
         self.cognitive_definition.read().await.active_prompt.clone()
     }
 
-    fn build_function_run_input(
-        &self,
-        input: String,
-        input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
-        ctx: &BehaviorContext,
-        ai: &AiChatRuntime,
-        immediate_memory: Option<ImmediateConversationMemory>,
-    ) -> FunctionRunInput {
-        if !ai.immediate_memory.enabled {
-            return FunctionRunInput {
-                current_user_message: input,
-                current_user_parts: input_parts,
-                immediate_memory: None,
-            };
-        }
-        FunctionRunInput {
-            current_user_message: input,
-            current_user_parts: input_parts,
-            immediate_memory: immediate_memory.or_else(|| {
-                Some(ImmediateConversationMemory {
-                    thread_id: ctx.thread_id.clone(),
-                    scope_id: ctx.src_ilk.clone(),
-                    summary: None,
-                    recent_interactions: Vec::new(),
-                    active_operations: Vec::new(),
-                })
-            }),
-        }
-    }
-
-    async fn load_immediate_memory_for_input(
-        &self,
-        ai: &AiChatRuntime,
-        ctx: &BehaviorContext,
-    ) -> Option<ImmediateConversationMemory> {
-        if !ai.immediate_memory.enabled {
-            return None;
-        }
-        let src_ilk = ctx.src_ilk.as_deref()?;
-        let store = self.immediate_memory_store.as_ref()?;
-        let record = match store.get(src_ilk).await {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    node_name = %self.node_name,
-                    src_ilk = %src_ilk,
-                    thread_id = ?ctx.thread_id,
-                    error = %err,
-                    "immediate memory get failed; continuing without persisted context"
-                );
-                None
-            }
-        };
-
-        let (summary, recent_interactions) = if let Some(mut record) = record {
-            record.summary = record
-                .summary
-                .map(|summary| trim_summary(summary, ai.immediate_memory.summary_max_chars));
-            record.recent_interactions = prune_recent_interactions(
-                record.recent_interactions,
-                ai.immediate_memory.recent_interactions_max,
-            );
-            tracing::debug!(
-                node_name = %self.node_name,
-                src_ilk = %src_ilk,
-                thread_id = ?ctx.thread_id,
-                memory_hit = true,
-                recent_interactions = record.recent_interactions.len(),
-                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
-                summary_max_chars = ai.immediate_memory.summary_max_chars,
-                summary_refresh_status = "not_implemented_v1",
-                "immediate memory loaded"
-            );
-            (record.summary, record.recent_interactions)
-        } else {
-            tracing::debug!(
-                node_name = %self.node_name,
-                src_ilk = %src_ilk,
-                thread_id = ?ctx.thread_id,
-                memory_hit = false,
-                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
-                summary_max_chars = ai.immediate_memory.summary_max_chars,
-                summary_refresh_status = "not_implemented_v1",
-                "immediate memory loaded"
-            );
-            (None, Vec::new())
-        };
-
-        Some(ImmediateConversationMemory {
-            thread_id: ctx.thread_id.clone(),
-            scope_id: ctx.src_ilk.clone(),
-            summary,
-            recent_interactions,
-            active_operations: Vec::new(),
-        })
-    }
-
-    async fn persist_immediate_turn(
-        &self,
-        ai: &AiChatRuntime,
-        ctx: &BehaviorContext,
-        user_input: &str,
-        assistant_output: &str,
-    ) {
-        if !ai.immediate_memory.enabled {
-            return;
-        }
-        let Some(src_ilk) = ctx.src_ilk.as_deref() else {
-            return;
-        };
-        let Some(store) = self.immediate_memory_store.as_ref() else {
-            return;
-        };
-
-        let mut record = match store.get(src_ilk).await {
-            Ok(Some(record)) => record,
-            Ok(None) => PersistedImmediateMemoryRecord::default(),
-            Err(err) => {
-                tracing::warn!(
-                    node_name = %self.node_name,
-                    src_ilk = %src_ilk,
-                    thread_id = ?ctx.thread_id,
-                    error = %err,
-                    "immediate memory get-before-put failed; skipping persistence"
-                );
-                return;
-            }
-        };
-        record.summary = record
-            .summary
-            .map(|summary| trim_summary(summary, ai.immediate_memory.summary_max_chars));
-        record
-            .recent_interactions
-            .push(fluxbee_ai_sdk::ImmediateInteraction {
-                role: fluxbee_ai_sdk::ImmediateRole::User,
-                kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
-                content: trim_chars(user_input, IMMEDIATE_INTERACTION_MAX_CHARS),
-            });
-        record
-            .recent_interactions
-            .push(fluxbee_ai_sdk::ImmediateInteraction {
-                role: fluxbee_ai_sdk::ImmediateRole::Assistant,
-                kind: fluxbee_ai_sdk::ImmediateInteractionKind::Text,
-                content: trim_chars(assistant_output, IMMEDIATE_INTERACTION_MAX_CHARS),
-            });
-        record.recent_interactions = prune_recent_interactions(
-            record.recent_interactions,
-            ai.immediate_memory.recent_interactions_max,
-        );
-        record.updated_at = chrono::Utc::now().to_rfc3339();
-
-        if let Err(err) = store.put(src_ilk, &record).await {
-            tracing::warn!(
-                node_name = %self.node_name,
-                src_ilk = %src_ilk,
-                thread_id = ?ctx.thread_id,
-                error = %err,
-                "immediate memory put failed; continuing without persistence"
-            );
-        } else {
-            tracing::debug!(
-                node_name = %self.node_name,
-                src_ilk = %src_ilk,
-                thread_id = ?ctx.thread_id,
-                persisted_recent_interactions = record.recent_interactions.len(),
-                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
-                summary_refresh_status = "not_implemented_v1",
-                "immediate memory persisted"
-            );
-        }
-    }
-
     /// One message's tools. The file generators keep their files in `files`, the reply's.
     fn build_tool_registry(
         &self,
@@ -1504,7 +1190,6 @@ impl GenericAiNode {
         // Every base tool there is (`base_tool_cards`, the catalog), each when its card's
         // `present_when` holds. The state tools keep the sender's "hard state": bound to its
         // src_ilk, never to a key the model names (thread_id is conversational metadata only).
-        // Immediate memory is managed separately by the runner as short-horizon context.
         if let (Some(store), Some(src_ilk)) = (&self.thread_state_store, &ctx.src_ilk) {
             let provider = ThreadStateToolsProvider::new(store.clone(), src_ilk.clone());
             provider.register_tools(registry)?;
@@ -2070,7 +1755,6 @@ impl GenericAiNode {
                     "config.behavior.provider",
                     "config.behavior.base_url",
                     "config.behavior.multimodal",
-                    "config.runtime.immediate_memory",
                     "config.runtime.cognitive_definition"
                 ],
                 "resources": [
@@ -2093,7 +1777,8 @@ impl GenericAiNode {
                     "ai.generic defaults behavior.multimodal=true unless explicitly overridden; behavior.capabilities is refused (it became behavior.multimodal).",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
                     "The prompt is the agent ILK's definition; while it has none (no hashes, no asset loaded, ILK not found) the model runs a fixed unconfigured prompt.",
-                    "config.runtime.immediate_memory (enabled, recent_interactions_max, summary_max_chars) applies with CONFIG_SET; config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start."
+                    "config.runtime.cognitive_definition (poll_interval_secs, blob_root) applies at the next start.",
+                    "config.runtime.immediate_memory is refused: the agent's memory is the cognition package of its conversation, which the router attaches to its messages; ai.generic keeps none of its own."
                 ]
             },
             "effective_config": state.effective_config.as_ref().map(redact_secrets),
@@ -3347,43 +3032,6 @@ fn files_fallback_line(files: &[AiUserArtifact]) -> String {
         format!("Aca esta el archivo solicitado: {names}")
     } else {
         format!("Aca estan los archivos solicitados: {names}")
-    }
-}
-
-/// The assistant's turn an answer leaves in the immediate memory: under a `text_field` or a menu,
-/// the object the model answered with (a menu's as checked, with the reply the person got), as
-/// compact JSON, which is what the contract asks it to write and never blank (a blank turn fails
-/// every later one: Anthropic refuses an empty text block); otherwise its reply
-/// (`summarize_behavior_output`).
-fn assistant_turn_text(answer: &AiChatAnswer) -> String {
-    match &answer.evaluation {
-        Some(evaluation) => evaluation.to_string(),
-        None => summarize_behavior_output(&answer.output),
-    }
-}
-
-fn summarize_behavior_output(output: &AiBehaviorOutput) -> String {
-    match output {
-        AiBehaviorOutput::Text(text) => text.clone(),
-        AiBehaviorOutput::Final(final_output) => {
-            if let Some(text) = final_output
-                .text
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                return text.to_string();
-            }
-            if final_output.artifacts.is_empty() {
-                return "Generated final output without text.".to_string();
-            }
-            let filenames = final_output
-                .artifacts
-                .iter()
-                .map(|artifact| artifact.filename.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Generated user-facing artifact(s): {filenames}")
-        }
     }
 }
 
@@ -5766,7 +5414,6 @@ impl ManagedNodeConfigContract for AiGenericContract {
             "behavior.provider",
             "behavior.base_url",
             "behavior.multimodal",
-            "runtime.immediate_memory",
             "runtime.cognitive_definition",
         ]
     }
@@ -5996,15 +5643,14 @@ async fn run_managed_node(
             tracing::info!(node_name = %node_name, "no config.json; booting UNCONFIGURED")
         }
     }
-    // Stores live in a per-node subdir UNDER the node instance dir (like WF's wf_instances.db) so the
-    // generic purge (remove_dir_all of the instance dir) removes them on kill/respawn — nothing
-    // survives to shadow config or bleed conversation state/memory into a fresh spawn.
+    // The thread-state store lives in a per-node subdir UNDER the node instance dir (like WF's
+    // wf_instances.db) so the generic purge (remove_dir_all of the instance dir) removes it on
+    // kill/respawn — nothing survives to shadow config or bleed conversation state into a fresh
+    // spawn.
     let instance_dir = managed_node_instance_dir(&node_name)
         .unwrap_or_else(|_| PathBuf::from(node.dynamic_config_dir.clone()));
     let thread_state_store =
         init_thread_state_store(&node_name, instance_dir.join("thread-state")).await;
-    let immediate_memory_store =
-        init_immediate_memory_store(&node_name, instance_dir.join("immediate-memory")).await;
     // The effective config drives both the cognitive layer (BUG-3: honor runtime.cognitive_definition)
     // and the behavior; deserialize it once.
     let effective_doc: Option<EffectiveConfigDocument> = cp
@@ -6052,7 +5698,6 @@ async fn run_managed_node(
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
         thread_state_store,
-        immediate_memory_store,
         vault,
         usage,
         control_plane: Arc::new(RwLock::new(state)),
@@ -6286,11 +5931,6 @@ fn build_behavior_from_effective_config(
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let base_url = behavior.base_url.clone();
             validate_managed_base_url(behavior.provider, &base_url)?;
-            let immediate_memory = config
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.immediate_memory.clone())
-                .unwrap_or_default();
             let multimodal = behavior
                 .multimodal
                 .unwrap_or_else(default_multimodal_for_runtime);
@@ -6300,7 +5940,6 @@ fn build_behavior_from_effective_config(
                 model_settings,
                 provider: behavior.provider,
                 base_url,
-                immediate_memory,
                 multimodal,
             }))
         }
@@ -6385,6 +6024,20 @@ fn parse_effective_config_doc(
                 .into(),
         );
     }
+    // FINDINGS A-133: an agent's memory is cognition's, kept per conversation; the AI SDK's
+    // immediate memory, which ai.generic kept per sender, mixed customers in a WF's consultation.
+    // Refused with the reason, since every config.json a CONFIG_SET wrote before carries it.
+    if config
+        .get("runtime")
+        .and_then(|runtime| runtime.get("immediate_memory"))
+        .is_some()
+    {
+        return Err(
+            "runtime.immediate_memory is not accepted: ai.generic keeps no memory of its own; \
+             an agent's memory is the cognition package of its conversation"
+                .into(),
+        );
+    }
     Ok(serde_json::from_value::<EffectiveConfigDocument>(
         config.clone(),
     )?)
@@ -6416,9 +6069,6 @@ fn materialize_effective_defaults(
 }
 
 fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
-    if runtime.immediate_memory.is_none() {
-        runtime.immediate_memory = Some(ImmediateMemorySection::default());
-    }
     if runtime.cognitive_definition.is_none() {
         runtime.cognitive_definition = Some(CognitiveDefinitionSection::default());
     }
@@ -6932,22 +6582,6 @@ fn is_openai_attachment_param(param: &str) -> bool {
         || param.contains(".content")
 }
 
-fn sanitize_storage_key(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            output.push(ch);
-        } else {
-            output.push('_');
-        }
-    }
-    if output.is_empty() {
-        "ai-node".to_string()
-    } else {
-        output
-    }
-}
-
 async fn init_thread_state_store(
     node_name: &str,
     store_root: PathBuf,
@@ -6971,67 +6605,6 @@ async fn init_thread_state_store(
             None
         }
     }
-}
-
-async fn init_immediate_memory_store(
-    node_name: &str,
-    store_root: PathBuf,
-) -> Option<Arc<ImmediateMemoryStore>> {
-    let store = ImmediateMemoryStore::new(store_root);
-    match store.ensure_ready().await {
-        Ok(()) => {
-            tracing::info!(
-                node_name = %node_name,
-                path = %store.root_dir().display(),
-                "immediate memory store ready"
-            );
-            Some(Arc::new(store))
-        }
-        Err(err) => {
-            tracing::warn!(
-                node_name = %node_name,
-                error = %err,
-                "immediate memory store unavailable; continuing without immediate persistence"
-            );
-            None
-        }
-    }
-}
-
-fn prune_recent_interactions(
-    interactions: Vec<fluxbee_ai_sdk::ImmediateInteraction>,
-    max_items: usize,
-) -> Vec<fluxbee_ai_sdk::ImmediateInteraction> {
-    if max_items == 0 {
-        return Vec::new();
-    }
-    let len = interactions.len();
-    let keep_from = len.saturating_sub(max_items);
-    interactions.into_iter().skip(keep_from).collect()
-}
-
-fn trim_summary(
-    mut summary: fluxbee_ai_sdk::ConversationSummary,
-    max_chars: usize,
-) -> fluxbee_ai_sdk::ConversationSummary {
-    summary.goal = summary.goal.map(|v| trim_chars(&v, max_chars));
-    summary.current_focus = summary.current_focus.map(|v| trim_chars(&v, max_chars));
-    summary.decisions = summary
-        .decisions
-        .into_iter()
-        .map(|v| trim_chars(&v, max_chars))
-        .collect();
-    summary.confirmed_facts = summary
-        .confirmed_facts
-        .into_iter()
-        .map(|v| trim_chars(&v, max_chars))
-        .collect();
-    summary.open_questions = summary
-        .open_questions
-        .into_iter()
-        .map(|v| trim_chars(&v, max_chars))
-        .collect();
-    summary
 }
 
 fn trim_chars(value: &str, max_chars: usize) -> String {
@@ -7630,7 +7203,6 @@ mod tests {
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
-            immediate_memory_store: None,
             vault: None,
             usage: UsageRecorder::disabled(),
             control_plane: Arc::new(RwLock::new(ControlPlaneState::default())),
@@ -7815,7 +7387,7 @@ mod tests {
     /// Scripts what each asset read gives: valid bytes, missing, or unreadable.
     #[derive(Default)]
     struct ScriptedAssets {
-        files: HashMap<String, Vec<u8>>,
+        files: std::collections::HashMap<String, Vec<u8>>,
         unreadable: std::collections::HashSet<String>,
     }
 
@@ -8443,10 +8015,6 @@ mod tests {
                 "handler_timeout_ms",
             ),
             (
-                json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}, "runtime": {"immediate_memory": {"enabled": true, "active_operations_max": 8}}}),
-                "active_operations_max",
-            ),
-            (
                 json!({"behavior": {"kind": "ai_chat", "model": "gpt-5.5"}, "runtime": {"cognitive_definition": {"enabled": false}}}),
                 "enabled",
             ),
@@ -8490,15 +8058,72 @@ mod tests {
         let runtime = serde_json::to_value(&doc).expect("serialize")["runtime"].clone();
         assert_eq!(
             runtime,
-            json!({
-                "immediate_memory": {"enabled": false, "recent_interactions_max": 10, "summary_max_chars": 1600},
-                "cognitive_definition": {"poll_interval_secs": 10, "blob_root": null}
-            })
+            json!({"cognitive_definition": {"poll_interval_secs": 10, "blob_root": null}})
         );
         // What it writes reads back.
         assert!(
             parse_effective_config_doc(&serde_json::to_value(&doc).expect("serialize")).is_ok()
         );
+    }
+
+    /// ai.generic has no immediate memory (FINDINGS A-133). A config that still names it, as every
+    /// config.json a CONFIG_SET wrote before does, is refused with the reason: CONFIG_SET applies
+    /// nothing, and the node boots FAILED_CONFIG on it, and CONFIGURED on the same config without
+    /// it.
+    #[tokio::test]
+    async fn a_config_with_runtime_immediate_memory_is_refused_with_the_reason() {
+        const REASON: &str = "runtime.immediate_memory is not accepted";
+        // What a CONFIG_SET before wrote: the defaults it materialized.
+        let behavior = json!({"kind": "ai_chat", "model": "gpt-5.5", "multimodal": true});
+        let old_runtime = json!({
+            "immediate_memory": {"enabled": false, "recent_interactions_max": 10, "summary_max_chars": 1600},
+            "cognitive_definition": {"poll_interval_secs": 10, "blob_root": null}
+        });
+
+        let node = test_node();
+        let response = node
+            .handle_control_plane(config_set_request(
+                json!({"behavior": behavior, "runtime": old_runtime}),
+            ))
+            .await
+            .expect("control plane")
+            .expect("CONFIG_RESPONSE");
+        assert_eq!(response.payload["ok"], json!(false));
+        assert_eq!(response.payload["error"]["code"], json!("invalid_config"));
+        let message = response.payload["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(message.contains(REASON), "{message}");
+        assert!(node.behavior.read().await.is_none());
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
+
+        let root = std::env::temp_dir().join(format!("ai-generic-old-config-{}", Uuid::new_v4()));
+        let name = "AI.sales@motherbee";
+        let path = managed_node_config_path_with_root(name, &root).expect("path");
+        fs::create_dir_all(path.parent().expect("dir")).expect("node dir");
+        let contract = AiGenericContract {
+            node_name: name.to_string(),
+        };
+        let boot = |runtime: &Value| {
+            let config =
+                json!({"_system": {"config_version": 4}, "behavior": behavior, "runtime": runtime});
+            fs::write(&path, config.to_string()).expect("config.json");
+            fluxbee_sdk::managed_control_plane::bootstrap_managed_control_plane_with_root(
+                name, &contract, &root,
+            )
+            .expect("bootstrap")
+        };
+        let state = boot(&old_runtime);
+        assert_eq!(state.current_state, NodeLifecycleState::FailedConfig);
+        assert_eq!(state.config_version, 4);
+        let reason = state.last_error.expect("its reason").message;
+        assert!(reason.contains(REASON), "{reason}");
+        let state = boot(&json!({"cognitive_definition": old_runtime["cognitive_definition"]}));
+        assert_eq!(state.current_state, NodeLifecycleState::Configured);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8550,7 +8175,6 @@ mod tests {
                 model_settings: ModelSettings::default(),
                 provider: Some(AiProvider::OpenAi),
                 base_url: None,
-                immediate_memory: ImmediateMemorySection::default(),
                 multimodal: true,
             }));
         }
@@ -9638,11 +9262,9 @@ mod tests {
                 model,
                 tools,
                 files,
-                &chat_runtime(None, None),
                 &BehaviorContext::default(),
                 "send both".to_string(),
                 None,
-                "send both",
                 None,
             )
             .await
@@ -10032,11 +9654,9 @@ mod tests {
                 model,
                 &tools,
                 &files,
-                &chat_runtime(None, None),
                 &ctx,
                 "dale, facturámelo".to_string(),
                 None,
-                "dale, facturámelo",
                 Some(contract),
             )
             .await
@@ -10210,179 +9830,8 @@ mod tests {
             model_settings: None,
         };
         test_node()
-            .run_plain_call(
-                &client,
-                request,
-                &chat_runtime(None, None),
-                &BehaviorContext::default(),
-                "dale, facturámelo",
-                Some(&contract),
-            )
+            .run_plain_call(&client, request, Some(&contract))
             .await
-    }
-
-    /// One message `text` that a WF sent with its block `wf`, as `on_message` hands it to the tool
-    /// loop: behind the block for the model, alone for the history. The model answers `answer`;
-    /// what it read of the user's turns comes back.
-    async fn history_turn(
-        node: &GenericAiNode,
-        ai: &AiChatRuntime,
-        ctx: &BehaviorContext,
-        wf: &str,
-        text: &str,
-        answer: &'static str,
-    ) -> Vec<String> {
-        let model = ScriptedModel::new(Vec::new(), None).with_call_text(answer);
-        let files = Arc::new(ReplyFiles::default());
-        let tools = node.build_tool_registry(ctx, &files).expect("registry");
-        node.run_tool_loop(
-            &model,
-            &tools,
-            &files,
-            ai,
-            ctx,
-            inject_prompt_blocks_into_text_input(text, &[wf], "Current user message:"),
-            None,
-            text,
-            None,
-        )
-        .await
-        .expect("the tool loop")
-        .expect("an answer");
-        let seen = model.seen.lock().expect("seen");
-        seen[0]
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                FunctionLoopItem::UserText { content } => Some(content.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The model reads the WF's block before the message, and the history keeps what the person
-    /// wrote: the next message's model reads that turn without the block.
-    #[tokio::test]
-    async fn the_history_keeps_what_the_person_wrote_without_the_wf_block() {
-        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
-        let node = GenericAiNode {
-            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
-            ..test_node()
-        };
-        let ai = AiChatRuntime {
-            immediate_memory: ImmediateMemorySection {
-                enabled: true,
-                ..ImmediateMemorySection::default()
-            },
-            ..chat_runtime(None, None)
-        };
-        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
-        let ctx = BehaviorContext {
-            src_ilk: Some(src_ilk.to_string()),
-            thread_id: Some("thread:sim-wf-1".to_string()),
-            ..BehaviorContext::default()
-        };
-        let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
-
-        assert_eq!(
-            history_turn(
-                &node,
-                &ai,
-                &ctx,
-                &wf,
-                "dale, facturámelo",
-                "Listo, te facturo."
-            )
-            .await,
-            [format!("{wf}\n\nCurrent user message:\ndale, facturámelo")]
-        );
-        let record = node
-            .immediate_memory_store
-            .as_ref()
-            .expect("the store")
-            .get(src_ilk)
-            .await
-            .expect("the record")
-            .expect("a record");
-        let kept = record
-            .recent_interactions
-            .iter()
-            .map(|interaction| interaction.content.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(kept, ["dale, facturámelo", "Listo, te facturo."]);
-
-        assert_eq!(
-            history_turn(&node, &ai, &ctx, &wf, "gracias", "De nada.").await,
-            [
-                "dale, facturámelo".to_string(),
-                format!("{wf}\n\nCurrent user message:\ngracias")
-            ]
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// Under a `text_field`, the history keeps the whole object as the assistant's turn: what the
-    /// contract asks the model to write, and never blank, even when its reply is (a blank turn
-    /// would fail every later one).
-    #[tokio::test]
-    async fn under_a_text_field_the_history_keeps_the_object_as_the_assistants_turn() {
-        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
-        let node = GenericAiNode {
-            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
-            ..test_node()
-        };
-        let ai = AiChatRuntime {
-            immediate_memory: ImmediateMemorySection {
-                enabled: true,
-                ..ImmediateMemorySection::default()
-            },
-            ..chat_runtime(None, None)
-        };
-        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
-        let ctx = BehaviorContext {
-            src_ilk: Some(src_ilk.to_string()),
-            thread_id: Some("thread:sim-wf-1".to_string()),
-            ..BehaviorContext::default()
-        };
-        let model = ScriptedModel::new(Vec::new(), None)
-            .with_call_text(r#"{"reply": "", "area": "invoice"}"#);
-        let files = Arc::new(ReplyFiles::default());
-        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
-        let answer = node
-            .run_tool_loop(
-                &model,
-                &tools,
-                &files,
-                &ai,
-                &ctx,
-                "dale, facturámelo".to_string(),
-                None,
-                "dale, facturámelo",
-                Some(&sales_contract()),
-            )
-            .await
-            .expect("the tool loop")
-            .expect("an answer");
-        assert_eq!(answer.output, AiBehaviorOutput::text(""));
-
-        let record = node
-            .immediate_memory_store
-            .as_ref()
-            .expect("the store")
-            .get(src_ilk)
-            .await
-            .expect("the record")
-            .expect("a record");
-        let kept = record
-            .recent_interactions
-            .iter()
-            .map(|interaction| interaction.content.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            ["dale, facturámelo", r#"{"area":"invoice","reply":""}"#]
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     /// Through `on_message`, a message from a WF reaches the model behind the memory block and
@@ -10423,8 +9872,8 @@ mod tests {
 
     /// Twenty turns of 2,000 characters, the most cognition keeps, push nothing out: the model reads
     /// the memory block, the WF's block and the message whole, the message last, both through
-    /// `on_message` and on the tool loop, where the AI SDK cuts only the history around the
-    /// message (FINDINGS A-71). The agents run without that history.
+    /// `on_message` and on the tool loop. On the tool loop the message is all it reads: ai.generic
+    /// gives the AI SDK no history of its own, the only part the SDK cuts (FINDINGS A-71, A-133).
     #[tokio::test]
     async fn twenty_long_turns_leave_the_wf_block_and_the_message_whole() {
         let mut package = sample_memory_package();
@@ -10472,30 +9921,15 @@ mod tests {
         let files = Arc::new(ReplyFiles::default());
         let ctx = BehaviorContext::default();
         let tools = node.build_tool_registry(&ctx, &files).expect("registry");
-        node.run_tool_loop(
-            &model,
-            &tools,
-            &files,
-            &chat_runtime(None, None),
-            &ctx,
-            input.clone(),
-            None,
-            "hola",
-            None,
-        )
-        .await
-        .expect("the tool loop")
-        .expect("an answer");
+        node.run_tool_loop(&model, &tools, &files, &ctx, input.clone(), None, None)
+            .await
+            .expect("the tool loop")
+            .expect("an answer");
         let seen = model.seen.lock().expect("seen");
-        let read = seen[0]
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                FunctionLoopItem::UserText { content } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(read, [input.as_str()]);
+        let [FunctionLoopItem::UserText { content }] = seen[0].items.as_slice() else {
+            panic!("the message alone: {:?}", seen[0].items);
+        };
+        assert_eq!(content, &input);
         assert!(input.ends_with(&format!("{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")));
     }
 
@@ -10707,84 +10141,6 @@ mod tests {
         }
     }
 
-    /// Under a WF's menu, the history keeps the checked object with the reply the person got: the
-    /// fixed line that names the files, when the model's reply is blank.
-    #[tokio::test]
-    async fn under_a_menu_the_history_keeps_the_reply_the_person_got() {
-        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
-        let node = GenericAiNode {
-            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
-            ..test_node()
-        };
-        let ai = AiChatRuntime {
-            immediate_memory: ImmediateMemorySection {
-                enabled: true,
-                ..ImmediateMemorySection::default()
-            },
-            ..chat_runtime(None, None)
-        };
-        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
-        let ctx = BehaviorContext {
-            src_ilk: Some(src_ilk.to_string()),
-            thread_id: Some("thread:sim-wf-1".to_string()),
-            ..BehaviorContext::default()
-        };
-        let model = ScriptedModel::new(
-            vec![(
-                "generate_csv_artifact",
-                json!({"filename": "pedido.csv", "rows": [["Pro", "10"]]}),
-            )],
-            Some(r#"{"reply": "", "option": "answer"}"#),
-        );
-        let files = Arc::new(ReplyFiles::default());
-        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
-        let text = "mandame el pedido";
-        let answer = node
-            .run_tool_loop(
-                &model,
-                &tools,
-                &files,
-                &ai,
-                &ctx,
-                text.to_string(),
-                None,
-                text,
-                Some(&sample_menu_contract()),
-            )
-            .await
-            .expect("the tool loop")
-            .expect("an answer");
-        let AiBehaviorOutput::Final(reply) = &answer.output else {
-            panic!("a reply with its file: {answer:?}");
-        };
-        assert_eq!(
-            reply.text.as_deref(),
-            Some("Aca esta el archivo solicitado: pedido.csv")
-        );
-
-        let record = node
-            .immediate_memory_store
-            .as_ref()
-            .expect("the store")
-            .get(src_ilk)
-            .await
-            .expect("the record")
-            .expect("a record");
-        let kept = record
-            .recent_interactions
-            .iter()
-            .map(|interaction| interaction.content.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            [
-                text,
-                r#"{"option":"answer","params":{},"reply":"Aca esta el archivo solicitado: pedido.csv"}"#
-            ]
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
     /// The call without tools answers under a menu as the tool loop does.
     #[tokio::test]
     async fn under_a_menu_the_call_without_tools_answers_the_reply_and_the_checked_object() {
@@ -10870,85 +10226,6 @@ mod tests {
                     .expect("the instruction")
             )
         );
-    }
-
-    /// Under a WF's menu, the model reads the menu in the WF's block, and the history keeps what
-    /// the person wrote, without the block, and the checked object as the assistant's turn.
-    #[tokio::test]
-    async fn under_a_menu_the_history_keeps_what_the_person_wrote_and_the_checked_object() {
-        let root = std::env::temp_dir().join(format!("ai-generic-history-{}", Uuid::new_v4()));
-        let node = GenericAiNode {
-            immediate_memory_store: Some(Arc::new(ImmediateMemoryStore::new(&root))),
-            ..test_node()
-        };
-        let ai = AiChatRuntime {
-            immediate_memory: ImmediateMemorySection {
-                enabled: true,
-                ..ImmediateMemorySection::default()
-            },
-            ..chat_runtime(None, None)
-        };
-        let src_ilk = "ilk:11111111-1111-4111-8111-111111111111";
-        let ctx = BehaviorContext {
-            src_ilk: Some(src_ilk.to_string()),
-            thread_id: Some("thread:sim-wf-1".to_string()),
-            ..BehaviorContext::default()
-        };
-        let contract = sample_menu_contract();
-        let wf = render_wf_prompt_block(Some(&sample_wf_menu_context()), contract.menu())
-            .expect("the WF's block");
-        let text = "quiero 20% de descuento";
-        let model = ScriptedModel::new(Vec::new(), None).with_call_text(
-            r#"{"reply": "Lo consulto.", "option": "consult", "params": {"question": "¿20%?", "discount": 20}}"#,
-        );
-        let files = Arc::new(ReplyFiles::default());
-        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
-        let answer = node
-            .run_tool_loop(
-                &model,
-                &tools,
-                &files,
-                &ai,
-                &ctx,
-                inject_prompt_blocks_into_text_input(text, &[&wf], "Current user message:"),
-                None,
-                text,
-                Some(&contract),
-            )
-            .await
-            .expect("the tool loop")
-            .expect("an answer");
-        assert_eq!(answer.output, AiBehaviorOutput::text("Lo consulto."));
-        {
-            let seen = model.seen.lock().expect("seen");
-            assert!(seen[0].items.iter().any(|item| matches!(
-                item,
-                FunctionLoopItem::UserText { content }
-                    if *content == format!("{wf}\n\nCurrent user message:\n{text}")
-            )));
-        }
-
-        let record = node
-            .immediate_memory_store
-            .as_ref()
-            .expect("the store")
-            .get(src_ilk)
-            .await
-            .expect("the record")
-            .expect("a record");
-        let kept = record
-            .recent_interactions
-            .iter()
-            .map(|interaction| interaction.content.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kept,
-            [
-                text,
-                r#"{"option":"consult","params":{"question":"¿20%?"},"reply":"Lo consulto."}"#
-            ]
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     /// A file named as an earlier one of the same reply takes its place, in the earlier one's
@@ -11490,7 +10767,6 @@ mod tests {
             model_settings: ModelSettings::default(),
             provider,
             base_url: None,
-            immediate_memory: ImmediateMemorySection::default(),
             multimodal: true,
         }
     }

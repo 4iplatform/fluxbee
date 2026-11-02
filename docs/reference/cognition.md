@@ -26,9 +26,9 @@ A function or constant named without a path lives in `sy_cognition.rs`. The wire
   call, so the next message delivered to the agent carries the turn before it (§3.4). Everything
   else comes from a worker that takes the turns one at a time, with up to two model calls each,
   and lags behind when turns come faster than that (§3).
-- **Who replaced what:** the agents' recent conversation comes from here, not from ai.generic's
-  immediate memory, which stays off for them (FINDINGS A-133). SY.architect keeps the AI SDK's
-  immediate memory.
+- **Who replaced what:** the agents' recent conversation comes from here: ai.generic no longer has
+  an immediate memory of its own (FINDINGS A-133). SY.architect keeps the AI SDK's immediate
+  memory.
 - **A communication** is `(thread_id, agent ILK)` (`CommunicationKey`): one thread, and the
   agent that serves it. Two agents in one thread are two communications. The memory is never
   keyed by hive or by node; the node is only how the router finds the agent.
@@ -485,7 +485,7 @@ before a WF's block when the message carries one (`render_memory_package_prompt_
 - After the blocks, the message being answered is named the same way: `Current user message,
   from <ILK> via <node>:` (`current_message_label`), a line of the text or a text part of its own.
 - The AI SDK cuts nothing of what the model reads ahead of the message: it cuts only the
-  immediate memory's history (FINDINGS A-71), which the agents run without. With 20 turns of
+  immediate memory's history (FINDINGS A-71), which ai.generic never gives it. With 20 turns of
   2,000 characters the block passes 40,000 characters (some 10,000 tokens a call, and again on
   each turn of a tool loop), and the WF's block and the message still follow it whole.
 

@@ -6,6 +6,8 @@ Consumidores iniciales:
 - `SY.architect`
 - futuros nodos `AI.*`
 
+ai.generic, the `AI.*` runtime, no longer uses it: an agent's memory is cognition's (§18).
+
 ## 1. Purpose
 
 This document defines the **immediate conversation memory** that should be native to `fluxbee_ai_sdk`.
@@ -450,17 +452,9 @@ This work is correct when:
 - [x] AI-SDK-IM5. Add optional SDK helper for summary refresh/update
 - [x] AI-SDK-IM6. Document immediate-memory usage for future `AI.*` nodes
 
-## 18. Adoption status in `ai_node_runner` (as of March 26, 2026)
+## 18. Adoption status in `ai_node_runner`
 
-Current status in runner:
-
-- `openai_chat` path supports `FunctionRunInput` and `run_with_input(...)` when `runtime.immediate_memory.enabled=true`.
-- Canonical key used by runner is `src_ilk` (with `thread_id` preserved as metadata).
-- Runner persists and rehydrates short-horizon `recent_interactions` per `src_ilk`.
-- Runner currently sends `active_operations` as empty in v1.
-- Runner does not implement summary refresh yet; this remains a next phase.
-
-Important:
-
-- This does not replace `thread_state_*` tools.
-- `thread_state` and `immediate_memory` are separate stores and separate semantics.
+ai.generic no longer has it (FINDINGS A-133). Its `runtime.immediate_memory` was kept per
+`src_ilk`, so a WF's consultation mixed customers; an agent's memory is cognition's package, per
+conversation (`docs/reference/cognition.md`), and a config with `runtime.immediate_memory` is
+refused. SY.architect keeps this memory, and so does SY.frontdesk.gov, off in its baked config.

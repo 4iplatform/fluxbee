@@ -80,7 +80,7 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
 | `provider` | `openai` or `anthropic`: the API the node speaks and the key it reads ([The key](#the-key)). Without it, the hive's, read on each request |
 | `model_settings` | `max_output_tokens`; an answer cut at it is a `provider_output_truncated` error. `temperature` and `top_p` are accepted too, but current models reject `temperature` (gpt-5.5, Claude 5): leave it out |
 | `base_url` | optional, and rarely needed: the full URL the request is posted to. It needs `provider`, and it must be `https` on that provider's host (`api.openai.com` or `api.anthropic.com`); the node's environment can lift the host rule with `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` |
-| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory and WF blocks included, and whole: the tool loop cuts only the history before it, 1,200 characters an interaction |
+| `multimodal` | `true` by default: images and documents reach the model. With it off, the input goes as plain text, memory and WF blocks included, and whole |
 
 `behavior.vault_key`, `behavior.api_key`, `behavior.api_key_env`, `behavior.openai`,
 `config.secrets` and `config.assets` are refused, as is any other unknown field under `behavior`,
@@ -101,14 +101,15 @@ it:
 
 ### `config.runtime`
 
-- **`runtime.immediate_memory`:** short-term memory per sender `src_ilk`: `enabled` (default
-  `false`), `recent_interactions_max` (default 10), `summary_max_chars` (default 1,600). It applies
-  with the `CONFIG_SET`. Agents run with it off: their recent conversation comes from cognition's
-  package ([Messages](#messages)).
 - **`runtime.cognitive_definition`:** `poll_interval_secs` (default 10, between 1 and 300) and
   `blob_root` (default `/var/lib/fluxbee/blob`). It applies at the next start.
 - **Nothing else:** any other `runtime` field is refused. Timeouts, workers and queue are the AI
   runtime's (`RuntimeConfig::default()`); see [Messages](#messages).
+- **`runtime.immediate_memory` is refused with its reason** (FINDINGS A-133): the node kept that
+  memory per sender, so a WF's consultation mixed customers, and it no longer has one. An agent's
+  memory is cognition's package, per conversation ([Messages](#messages)). Every `config.json` a
+  `CONFIG_SET` wrote before its removal has it, the default included: such a node boots
+  FAILED_CONFIG until a `CONFIG_SET` without it.
 
 ## The key
 
@@ -178,9 +179,9 @@ On every request the node reads the key of its provider from SY.vault:
     turn's line of its own; files are counted (`[2 attachments]`), and an answer that chose from
     a WF's menu says so, even with a blank text (`chose invoice {"quantity":10}`). The message
     being answered is not among them.
-  - This is the agents' recent conversation: SY.cognition takes each turn as it arrives, so the
-    next message carries the one before it. Run agents with `runtime.immediate_memory` off; it is
-    kept per sender, not per conversation (FINDINGS A-133).
+  - This is the agents' recent conversation, and their only one: SY.cognition takes each turn as
+    it arrives, so the next message carries the one before it. The node keeps no history of its
+    own (FINDINGS A-133).
   - **The message being answered names its sender the same way,** once a block comes before it:
     `Current user message, from <sender ILK> via <node>:`, the node being the first of a WF's
     trail or else the sender. As text, a line ahead of the message; as parts, a text part of its
@@ -196,8 +197,6 @@ On every request the node reads the key of its provider from SY.vault:
   (`IO.api@motherbee -> WF.sales.invoice@worker1`), `vars` as JSON, cut at 8 KiB with a line that
   says so, and the menu.
   - Text and multimodal input alike: as parts, each block is a text part of its own, first.
-  - The conversation's history (`runtime.immediate_memory`) keeps what the person wrote, without
-    either block.
 - **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`. Its
   `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`,
   `final_response_contract`, `wf` and `evaluation`: an answer never carries the request's WF block
@@ -213,8 +212,7 @@ On every request the node reads the key of its provider from SY.vault:
     `"text_field": "reply"`. The reply's text is then that field's value, and the whole object goes
     in the reply's `meta.context.evaluation`. The object is checked on both paths, with tools and
     without them. A `text_field` that is not a required `string` property makes the contract
-    invalid. The history keeps the whole object as the agent's turn, so a blank text never leaves a
-    blank turn.
+    invalid.
   - **Who uses it:** a caller that is not a WF. A WF asks an agent with a menu (below): wfcel
     refuses `meta.context.response_envelope` in a WF's actions.
 - **A WF's menu:** a WF asks an agent to choose with `meta.context.wf.menu`
@@ -238,13 +236,11 @@ On every request the node reads the key of its provider from SY.vault:
     `invalid_structured_output`, not retryable, whose message ends with `not_json`,
     `unknown_option:<x>`, `missing_param:<p>` or `type_mismatch:<p>:<type>`.
   - **The reply's** text is `reply`, and its `meta.context.evaluation` the checked object, which a
-    WF reads as `event.context.evaluation.option` and `event.context.evaluation.params.<p>`. The
-    history keeps that object as the agent's turn, as under a `text_field`.
+    WF reads as `event.context.evaluation.option` and `event.context.evaluation.params.<p>`.
   - **`reply` is the text the person gets.** When the tool loop adds to the model's reply (the
     fixed line that names the files, for a blank reply, or a published page's link on a line of its
-    own; see [Tools](#tools)), the evaluation's `reply` and the history's object carry it too. So a
-    WF that forwards only a reply that is not blank still delivers the files and the links
-    (FINDINGS A-98, A-99).
+    own; see [Tools](#tools)), the evaluation's `reply` carries it too. So a WF that forwards only a
+    reply that is not blank still delivers the files and the links (FINDINGS A-98, A-99).
   - **The journal:** the "AI chat request prepared" line names the message's contract, `none`,
     `envelope` or `menu`.
 - **Attachments** (`text/v1` `attachments[]` and `content_ref`):

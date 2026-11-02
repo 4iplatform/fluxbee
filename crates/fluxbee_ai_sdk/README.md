@@ -293,7 +293,8 @@ So, in an AI node:
 
 - use `meta.memory_package` for conversational context, and `meta.thread_id` as conversation
   metadata;
-- keep hard state and immediate memory keyed by `src_ilk`;
+- keep hard state keyed by `src_ilk`, and no immediate memory: the package is the agent's memory
+  (FINDINGS A-133);
 - do not read the memory region (`jsr-memory-<hive>`) or PostgreSQL.
 
 ## Immediate memory
@@ -305,10 +306,11 @@ For continuity between turns, call `run_with_input(...)` with a `FunctionRunInpu
 - `recent_interactions`;
 - `active_operations`;
 - `thread_id`, as conversation metadata;
-- `scope_id`, which in ai.generic is the sender's `src_ilk`.
+- `scope_id`, which in SY.frontdesk.gov is the sender's `src_ilk`.
 
-ai.generic stores immediate memory by `src_ilk`, not by `thread_id`, and only when
-`runtime.immediate_memory.enabled` is true in its config (off by default).
+SY.architect uses it, and SY.frontdesk.gov keeps it by `src_ilk`, off in its baked config.
+ai.generic no longer has it: an agent's memory is cognition's package, per conversation (FINDINGS
+A-133).
 
 ```rust
 use fluxbee_ai_sdk::{
