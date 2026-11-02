@@ -112,7 +112,9 @@ Managed runtime note:
   `metadata.resource_type: slack`. The node reads it at start, on a `VAULT_SECRET_CHANGED` and
   every 60 s, and runs degraded until it has it.
 - Its thread records, the thread id of each Slack place it handles, are `slack_threads.db` next to
-  its `config.json` (`docs/io/io-slack.md` §2.4).
+  its `config.json`, with the open menus of its posts (`docs/io/io-slack.md` §2.4).
+- A WF's menu shows as buttons only when the Slack app has Interactivity on
+  (`docs/io/io-slack.md` §3.3).
 - Launch, secret and config: `docs/io/io-slack-deploy-runbook.md` §3 (steps 4 and 5) and §5.
 
 Optional env vars (they override the managed config):

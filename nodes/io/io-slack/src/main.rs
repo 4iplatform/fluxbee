@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod not_taken;
+mod slack_menu;
 mod thread_records;
 
 use anyhow::Result;
@@ -45,16 +47,18 @@ use io_common::text_v1_blob::{
     resolve_text_v1_for_outbound, InboundAttachmentInput, IoBlobContractError, IoBlobRuntimeConfig,
     IoTextBlobConfig,
 };
+use not_taken::RelayedMessages;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
+use slack_menu::{close_subject_menu, handle_interactive, Interactions, WfPost};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thread_records::{
     map_inbound_thread, open_node_thread_records, run_thread_records_expiry_loop, OutboundThread,
-    SlackThreadRecords,
+    SlackThreadRecords, Subject,
 };
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -224,6 +228,10 @@ async fn main() -> Result<()> {
         tokio::spawn(run_thread_records_expiry_loop(records));
     }
 
+    // The messages and clicks this node relays lately, so the WF engine's NOT_TAKEN for one is shown
+    // to whoever wrote it (see not_taken).
+    let relayed = Arc::new(RelayedMessages::new());
+
     // Woken by the SY.vault `VAULT_SECRET_CHANGED` broadcast (handled in run_outbound_loop) so a
     // Cloud-side token update (put/rotate/delete) reloads credentials IMMEDIATELY instead of waiting
     // for the next poll tick — this is the primary path now that Slack token rotation is disabled and
@@ -297,6 +305,7 @@ async fn main() -> Result<()> {
         blob_payload_cfg.clone(),
         vault_change_notify.clone(),
         thread_records.clone(),
+        relayed.clone(),
     ));
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
@@ -318,6 +327,7 @@ async fn main() -> Result<()> {
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
         thread_records,
+        relayed.clone(),
     ));
 
     let relay_flush_task = tokio::spawn(run_relay_flush_loop(
@@ -326,6 +336,7 @@ async fn main() -> Result<()> {
         identity,
         provisioner,
         inbound,
+        relayed,
     ));
 
     let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
@@ -1193,6 +1204,83 @@ impl SlackClients {
         Ok(resp.ts)
     }
 
+    /// Replaces a post's blocks: a menu's post, closed (slack_menu).
+    async fn update_message(&self, channel: &str, ts: &str, blocks: Value) -> Result<()> {
+        self.call_web_api(
+            "chat.update",
+            &serde_json::json!({"channel": channel, "ts": ts, "blocks": blocks}),
+        )
+        .await
+    }
+
+    /// Posts a message only `user` sees, its text escaped (`post_ephemeral_body`): "Not taken"
+    /// (not_taken), and a menu's "This is no longer open." (slack_menu).
+    async fn post_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<()> {
+        self.call_web_api(
+            "chat.postEphemeral",
+            &post_ephemeral_body(channel, user, text, thread_ts),
+        )
+        .await
+    }
+
+    /// Opens a modal with a click's `trigger_id`, which Slack honors for 3 seconds: an option's
+    /// params (slack_menu).
+    async fn open_view(&self, trigger_id: &str, view: Value) -> Result<()> {
+        self.call_web_api(
+            "views.open",
+            &serde_json::json!({"trigger_id": trigger_id, "view": view}),
+        )
+        .await
+    }
+
+    /// Calls a Web API method with a JSON body and the bot token, for an answer that is only `ok`:
+    /// a refusal is an error, with Slack's code and its messages (which name a Block Kit field it
+    /// refuses).
+    async fn call_web_api(&self, api: &str, body: &Value) -> Result<()> {
+        #[derive(Deserialize)]
+        struct OkResp {
+            ok: bool,
+            error: Option<String>,
+            response_metadata: Option<SlackResponseMetadata>,
+        }
+
+        #[derive(Deserialize)]
+        struct SlackResponseMetadata {
+            messages: Option<Vec<String>>,
+        }
+        let slack_bot_token = self.slack_bot_token().await?;
+        let url = format!("https://slack.com/api/{api}");
+
+        let resp: OkResp = self
+            .slack_send_with_retry(api, || {
+                self.http
+                    .post(url.as_str())
+                    .bearer_auth(&slack_bot_token)
+                    .json(body)
+            })
+            .await?
+            .json()
+            .await?;
+        if !resp.ok {
+            let detail = resp
+                .response_metadata
+                .and_then(|m| m.messages)
+                .map(|msgs| msgs.join(" | "))
+                .unwrap_or_else(|| "-".to_string());
+            return Err(anyhow::anyhow!(
+                "{api} failed: {} detail={detail}",
+                resp.error.unwrap_or_else(|| "unknown".to_string()),
+            ));
+        }
+        Ok(())
+    }
+
     async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
         let slack_bot_token = self.slack_bot_token().await?;
         let response = self
@@ -1344,6 +1432,20 @@ fn post_message_body(
     body
 }
 
+/// The body of a `chat.postEphemeral` to `user` in `channel`, in the Slack thread `thread_ts` or at
+/// the top level: `text` escaped (`escape_slack_text`), as a post's.
+fn post_ephemeral_body(channel: &str, user: &str, text: &str, thread_ts: Option<&str>) -> Value {
+    let mut body = serde_json::json!({
+        "channel": channel,
+        "user": user,
+        "text": escape_slack_text(text),
+    });
+    if let Some(ts) = thread_ts {
+        body["thread_ts"] = Value::String(ts.to_string());
+    }
+    body
+}
+
 /// `text` as Slack shows it, as written: `&`, `<` and `>` become `&amp;`, `&lt;` and `&gt;`, as
 /// Slack's formatting rules ask of text that is not markup. The text the node posts is a payload's,
 /// which a person or an agent wrote: unescaped, a `<!channel>`, `<!here>`, `<@U…>` or
@@ -1408,9 +1510,17 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
 #[derive(Debug, Deserialize)]
 struct SocketEnvelope {
     envelope_id: String,
+    /// What the envelope carries: `events_api` (the events the node relays), `interactive` (a click
+    /// on a menu's button or a modal's submission, slack_menu), `slash_commands`.
+    #[serde(rename = "type", default)]
+    kind: String,
     #[serde(default)]
     payload: serde_json::Value,
 }
+
+/// The envelope of a click or a modal's submission, which Slack sends once the app has
+/// Interactivity on.
+const ENVELOPE_INTERACTIVE: &str = "interactive";
 
 /// Read-idle timeout for the Socket Mode WS. Slack pings the client ~every 30s and rotates the socket
 /// every ~30-60min; if no frame arrives within this window the socket is treated as dead and we
@@ -1435,9 +1545,28 @@ async fn run_inbound_socket_mode(
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
     thread_records: Option<Arc<SlackThreadRecords>>,
+    relayed: Arc<RelayedMessages>,
 ) -> Result<()> {
     let sender = dispatcher.sender_snapshot();
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
+    // A click on a menu's button, or a modal's submission, goes to the mesh as a message from the
+    // person who clicked, with what a message from Slack gets (see slack_menu).
+    let interactions = Arc::new(Interactions {
+        config: config.clone(),
+        control_plane: control_plane.clone(),
+        dispatcher: dispatcher.clone(),
+        identity_provision_cfg: identity_provision_cfg.clone(),
+        self_ilk_id: self_ilk_id.clone(),
+        self_tenant_id: self_tenant_id.clone(),
+        ensured_bindings: ensured_bindings.clone(),
+        slack: slack.clone(),
+        records: thread_records.clone(),
+        identity: identity.clone(),
+        provisioner: provisioner.clone(),
+        inbound: inbound.clone(),
+        sender: sender.clone(),
+        relayed: relayed.clone(),
+    });
 
     // Reconnect backoff (exponential, capped). Reset to the floor after a successful connect so a
     // long-lived socket never inherits a stale large backoff.
@@ -1560,6 +1689,14 @@ async fn run_inbound_socket_mode(
                 break;
             }
             tracing::debug!("slack envelope acked");
+
+            // A click on a menu's button or a modal's submission, acked at once like any envelope:
+            // its own task, so a modal opens within the 3 seconds its trigger lasts whatever the
+            // loop is busy with.
+            if env.kind == ENVELOPE_INTERACTIVE {
+                tokio::spawn(handle_interactive(interactions.clone(), env.payload));
+                continue;
+            }
 
             let payload = env.payload;
 
@@ -1759,6 +1896,7 @@ async fn run_inbound_socket_mode(
                         inbound.clone(),
                         turn,
                         "relay immediate flush",
+                        &relayed,
                     )
                     .await;
                     continue;
@@ -1794,18 +1932,12 @@ async fn run_inbound_socket_mode(
                 .process_inbound(
                     identity.as_ref(),
                     Some(provisioner.as_ref()),
-                    ResolveOrCreateInput {
-                        channel: "slack".to_string(),
-                        external_id: slack_external_id(&config.node_name, &user),
-                        src_ilk_override: None,
-                        tenant_id: None,
-                        tenant_hint: Some(binding.workspace_id.clone()),
-                        attributes: serde_json::json!({
-                            "workspace_id": binding.workspace_id,
-                            "conversation_id": binding.conversation_id
-                        }),
-                        ilk_type: Some("human".to_string()),
-                    },
+                    slack_identity_input(
+                        &config.node_name,
+                        &binding.workspace_id,
+                        &binding.conversation_id,
+                        &user,
+                    ),
                     None,
                     io_ctx,
                     payload,
@@ -1832,7 +1964,7 @@ async fn run_inbound_socket_mode(
                 .await;
             }
 
-            dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound").await;
+            dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound", &relayed).await;
         }
     }
 }
@@ -1891,20 +2023,31 @@ fn build_slack_relay_fragment(
             .collect(),
         raw_payload: Some(raw_payload),
         io_context,
-        identity_input: ResolveOrCreateInput {
-            channel: "slack".to_string(),
-            external_id: slack_external_id(node_name, user),
-            src_ilk_override: None,
-            tenant_id: None,
-            tenant_hint: Some(workspace_id.to_string()),
-            attributes: serde_json::json!({
-                "workspace_id": workspace_id,
-                "conversation_id": conversation_id
-            }),
-            ilk_type: Some("human".to_string()),
-        },
+        identity_input: slack_identity_input(node_name, workspace_id, conversation_id, user),
         dst_node_override: None,
         flush_hints: RelayFlushHints::default(),
+    }
+}
+
+/// Who wrote a message in the bound channel, as identity resolves or provisions them: a Slack user
+/// of this node, a human of the workspace. A click on a menu is resolved the same way (slack_menu).
+fn slack_identity_input(
+    node_name: &str,
+    workspace_id: &str,
+    conversation_id: &str,
+    user: &str,
+) -> ResolveOrCreateInput {
+    ResolveOrCreateInput {
+        channel: "slack".to_string(),
+        external_id: slack_external_id(node_name, user),
+        src_ilk_override: None,
+        tenant_id: None,
+        tenant_hint: Some(workspace_id.to_string()),
+        attributes: serde_json::json!({
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id
+        }),
+        ilk_type: Some("human".to_string()),
     }
 }
 
@@ -1966,6 +2109,7 @@ async fn dispatch_assembled_turn(
     inbound: Arc<Mutex<InboundProcessor>>,
     turn: AssembledTurn,
     send_context: &str,
+    relayed: &RelayedMessages,
 ) {
     let outcome = inbound
         .lock()
@@ -1973,14 +2117,22 @@ async fn dispatch_assembled_turn(
         .process_assembled_turn(identity, Some(provisioner), turn)
         .await;
 
-    dispatch_inbound_outcome(sender, outcome, send_context).await;
+    dispatch_inbound_outcome(sender, outcome, send_context, relayed).await;
 }
 
-async fn dispatch_inbound_outcome(sender: NodeSender, outcome: InboundOutcome, send_context: &str) {
+async fn dispatch_inbound_outcome(
+    sender: NodeSender,
+    outcome: InboundOutcome,
+    send_context: &str,
+    relayed: &RelayedMessages,
+) {
     match outcome {
         InboundOutcome::SendNow(msg) => {
             let trace_id = msg.routing.trace_id.clone();
             let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
+            // Remembered before it goes, so the WF engine's NOT_TAKEN, which may come back at once,
+            // finds whoever wrote it (see not_taken).
+            relayed.remember(&msg, now_epoch_ms());
             // M1: Socket Mode mandates ACKing the Slack envelope within ~3s, so we ack BEFORE this
             // handoff — Slack will not redeliver. NodeSender::send buffers through a transient router
             // reconnect (no loss there), so the only way this errors is a terminal disconnect. That is
@@ -2008,6 +2160,7 @@ async fn run_relay_flush_loop(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
+    relayed: Arc<RelayedMessages>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     loop {
@@ -2022,6 +2175,7 @@ async fn run_relay_flush_loop(
                 inbound.clone(),
                 turn,
                 "relay scheduled flush",
+                &relayed,
             )
             .await;
         }
@@ -2383,6 +2537,7 @@ async fn run_outbound_loop(
     blob_payload_cfg: IoTextBlobConfig,
     vault_change_notify: Arc<Notify>,
     thread_records: Option<Arc<SlackThreadRecords>>,
+    relayed: Arc<RelayedMessages>,
 ) -> Result<()> {
     let mut incoming_rx = dispatcher
         .take_command_receiver(RPC_CH_INCOMING)
@@ -2464,6 +2619,16 @@ async fn run_outbound_loop(
             continue;
         }
 
+        // The WF engine's answer to a message it took nowhere (docs/wf-orchestration-v1.md §5.4.6):
+        // whoever wrote it sees "Not taken", where they wrote. Only a fixed text, chosen by the
+        // reason, is posted, never the answer's own words (see not_taken).
+        if is_control_plane_msg_type(&msg.meta.msg_type)
+            && meta_msg.eq_ignore_ascii_case(not_taken::MSG_NOT_TAKEN)
+        {
+            not_taken::show(&slack, &relayed, &msg).await;
+            continue;
+        }
+
         // Everything below this line POSTS TO A CUSTOMER'S SLACK CHANNEL. Mesh control traffic is
         // not user content and must never get there.
         //
@@ -2512,16 +2677,40 @@ async fn run_outbound_loop(
             }
         };
         // Where in the bound channel the message goes is the thread records' call: its thread id's
-        // place when a person opened it; a new post at the top level when the node opened its
-        // places, since each of its posts serves one message; else its reply_target when that is
-        // this channel; else a new post at the top level, recorded. Another channel's
-        // reply_target is never read: an agent's answer carries the one of the message it
-        // answers, which can be another node's.
+        // place when a person opened it; when the node opened its places, the thread of its post
+        // for a message that continues or ends the post's subject (its mark, `same` or `end`), else
+        // a new post at the top level, since each of its posts serves one message; else its
+        // reply_target when that is this channel; else a new post at the top level, recorded.
+        // Another channel's reply_target is never read: an agent's answer carries the one of the
+        // message it answers, which can be another node's.
         let reply_target = msg
             .meta
             .context
             .as_ref()
             .and_then(extract_slack_post_target);
+        // The WF's block: the message's mark, the facts under its text and a menu for people (see
+        // slack_menu).
+        let wf_post = WfPost::read(
+            msg.meta.context.as_ref(),
+            msg.meta.thread_id.as_deref(),
+            thread_records.is_some(),
+        );
+        // A message that ends its subject with nothing to post (no text, no blocks, no files) only
+        // closes it: it posts nothing, and no fallback (docs/wf-orchestration-v1.md §5.4.2).
+        if wf_post.only_closes(&msg.payload) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                "an end mark with nothing to post: the subject only closes"
+            );
+            close_subject_menu(
+                &slack,
+                thread_records.as_deref(),
+                msg.meta.thread_id.as_deref(),
+                &binding.conversation_id,
+            )
+            .await;
+            continue;
+        }
         // The span puts the message's trace_id on the resolution's log lines.
         let mut thread = tracing::debug_span!("slack_outbound", trace_id = %msg.routing.trace_id)
             .in_scope(|| {
@@ -2531,6 +2720,7 @@ async fn run_outbound_loop(
                     &binding.conversation_id,
                     msg.meta.thread_id.as_deref(),
                     reply_target.as_ref(),
+                    wf_post.subject,
                     now_epoch_ms(),
                 )
             });
@@ -2548,8 +2738,8 @@ async fn run_outbound_loop(
                 // M4: a Block Kit message legitimately carries its content in `blocks` with an empty
                 // top-level `text` (text is only the notification fallback). Post when EITHER is
                 // present, else a blocks-only reply was silently dropped into the "sin contenido"
-                // fallback below.
-                let blocks = msg.payload.get("blocks").cloned();
+                // fallback below. The WF's facts and menu make the blocks (see slack_menu).
+                let blocks = wf_post.blocks(&resolved.text, msg.payload.get("blocks"));
                 let has_text = !resolved.text.trim().is_empty();
                 let has_blocks = blocks
                     .as_ref()
@@ -2564,12 +2754,13 @@ async fn run_outbound_loop(
                         text_preview = %truncate(&resolved.text, 120),
                         "sending slack message"
                     );
+                    let post_thread_ts = thread.thread_ts().map(str::to_string);
                     let posted = slack
                         .post_message(
                             &binding.conversation_id,
                             &resolved.text,
                             thread.thread_ts(),
-                            blocks,
+                            blocks.clone(),
                         )
                         .await;
                     match posted {
@@ -2577,6 +2768,18 @@ async fn run_outbound_loop(
                             sent_any = true;
                             thread.posted(ts.as_deref(), now_epoch_ms());
                             tracing::debug!("slack message sent");
+                            if let (Some(ts), Some(blocks)) = (ts.as_deref(), blocks.as_ref()) {
+                                wf_post
+                                    .menu_posted(
+                                        &slack,
+                                        thread_records.as_deref(),
+                                        &binding.conversation_id,
+                                        ts,
+                                        post_thread_ts.as_deref(),
+                                        blocks,
+                                    )
+                                    .await;
+                            }
                         }
                         Err(e) => tracing::warn!(error=?e, "failed to send slack message"),
                     }
@@ -2668,6 +2871,17 @@ async fn run_outbound_loop(
                     tracing::warn!(error=?error, "failed to send final outbound fallback")
                 }
             }
+        }
+
+        // `end` ends the subject: its open menu closes, after the message's posts.
+        if wf_post.subject == Subject::End {
+            close_subject_menu(
+                &slack,
+                thread_records.as_deref(),
+                msg.meta.thread_id.as_deref(),
+                &binding.conversation_id,
+            )
+            .await;
         }
     }
 }
@@ -3195,8 +3409,9 @@ mod tests {
         build_slack_inbound_payload_from_parts, build_system_reply, classify_slack_inbound,
         decode_slack_text, default_slack_allowed_mimes, extract_runtime_relay_config,
         extract_slack_tokens_from_vault_value, is_control_plane_msg_type, parse_retry_after,
-        post_message_body, slack_relay_policy_from_config, slack_vault_key, vault_change_is_slack,
-        SlackClients, SlackRelayConfig, SlackRuntimeState,
+        post_ephemeral_body, post_message_body, slack_relay_policy_from_config, slack_vault_key,
+        vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState, SocketEnvelope,
+        ENVELOPE_INTERACTIVE,
     };
     use std::time::Duration;
 
@@ -3642,5 +3857,54 @@ mod tests {
         ] {
             assert_eq!(decode_slack_text(sent), written, "{sent}");
         }
+    }
+
+    /// A message only one person sees ("Not taken", "This is no longer open.") is posted as any
+    /// other: its text escaped, in the person's Slack thread or at the top level.
+    #[test]
+    fn an_ephemeral_message_is_posted_escaped_where_the_person_wrote() {
+        assert_eq!(
+            post_ephemeral_body(
+                "C0SUPERVISORS",
+                "U0JUAN",
+                "Not taken: <!here> & more",
+                Some("1793000000.000100"),
+            ),
+            json!({
+                "channel": "C0SUPERVISORS",
+                "user": "U0JUAN",
+                "text": "Not taken: &lt;!here&gt; &amp; more",
+                "thread_ts": "1793000000.000100",
+            })
+        );
+        assert_eq!(
+            post_ephemeral_body("C0SUPERVISORS", "U0JUAN", "This is no longer open.", None),
+            json!({"channel": "C0SUPERVISORS", "user": "U0JUAN", "text": "This is no longer open."})
+        );
+    }
+
+    /// A Socket Mode envelope names what it carries: the events the node relays, or a click on a
+    /// menu (`interactive`), which the inbound loop hands to slack_menu.
+    #[test]
+    fn a_socket_envelope_names_what_it_carries() {
+        let interactive: SocketEnvelope = serde_json::from_value(json!({
+            "envelope_id": "e1",
+            "type": "interactive",
+            "accepts_response_payload": true,
+            "payload": {"type": "block_actions"}
+        }))
+        .expect("envelope");
+        assert_eq!(interactive.kind, ENVELOPE_INTERACTIVE);
+        assert_eq!(interactive.payload["type"], "block_actions");
+        let event: SocketEnvelope = serde_json::from_value(json!({
+            "envelope_id": "e2",
+            "type": "events_api",
+            "payload": {"type": "event_callback"}
+        }))
+        .expect("envelope");
+        assert_eq!(event.kind, "events_api");
+        let bare: SocketEnvelope =
+            serde_json::from_value(json!({"envelope_id": "e3"})).expect("envelope");
+        assert_eq!(bare.kind, "");
     }
 }

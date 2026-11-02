@@ -16,6 +16,17 @@
 //!   before, and recorded. Any other is posted at the top level of the channel, and the post's `ts`
 //!   is recorded for its thread id.
 //!
+//! - **The marks** (docs/wf-orchestration-v1.md §5.4.2, built as §5.4.10 piece 4): a WF marks each
+//!   message it sends an IO node with `meta.context.wf.subject` (`Subject`). On a thread id with a
+//!   post the node opened, `same` and `end` go into that post's Slack thread, with no new post and
+//!   nothing forgotten, so a case keeps one Slack thread; `new`, or no mark, opens a new post as
+//!   above. On an unrecorded thread id every mark goes as `new`, and a place a person opened takes
+//!   every message, whatever its mark.
+//! - **The open menus** (§5.4.4): the node's post that shows a WF's menu as buttons (slack_menu) is
+//!   recorded with its channel, its `ts`, the Slack thread it is in, its thread id, the menu and the
+//!   post's blocks. A thread id has one open menu per channel: a new one takes the older's place,
+//!   and `end` takes it, each to close the older post.
+//!
 //! So a WF's question, which carries the instance's thread id, is answered on that thread id when a
 //! supervisor replies in the Slack thread of its post. A second question on the thread id, days
 //! later, is a new post in the channel's view, and a late reply to the first one gets its own
@@ -24,21 +35,23 @@
 //! conversation is on this side.
 //!
 //! The records are a SQLite file next to the node's `config.json`, because a supervisor may answer
-//! hours later, after a restart. A record unused for 30 days is deleted, at start and daily. When the
-//! records fail, the node logs it and works without them: a message keeps the thread id io-common
-//! computes, and an outbound one goes to the `reply_target` of the node's own channel, or else to the
-//! top level. Marking a record used is best effort: a record found is used even when that fails.
+//! hours later, after a restart. A record unused for 30 days is deleted, at start and daily, and so
+//! is a menu open for 30 days. When the records fail, the node logs it and works without them: a
+//! message keeps the thread id io-common computes, an outbound one goes to the `reply_target` of the
+//! node's own channel, or else to the top level, and a menu shows no buttons. Marking a record used
+//! is best effort: a record found is used even when that fails.
 
 use anyhow::Result;
 use io_common::io_context::{IoContext, SlackPostTarget};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// The records' file, in the node's own directory, next to its `config.json`.
 const THREAD_RECORDS_FILE: &str = "slack_threads.db";
-/// A record unused this long is deleted.
+/// A record unused this long is deleted, and a menu open this long.
 const RECORD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often the unused records are deleted, besides at start.
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -46,6 +59,11 @@ const EXPIRY_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// One row per Slack place: `thread_ts` is empty for the channel's top level, the times are Unix
 /// milliseconds, and `opened_by_node` is 1 for a place the node opened with its own post at the top
 /// level, 0 for one a person opened. The index serves the outbound lookup, by thread id.
+///
+/// One row per open menu (`OpenMenu`): the post that shows it, `channel_id` and `ts`, the Slack
+/// thread it is in (`thread_ts`, empty at the top level), the thread id a click goes on, the menu
+/// and the post's blocks as JSON, and since when it is open. The unique index keeps one open menu
+/// per thread id in a channel. A file from before the menus gains their table when it opens.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS slack_threads (
     thread_id      TEXT NOT NULL,
@@ -57,7 +75,21 @@ CREATE TABLE IF NOT EXISTS slack_threads (
     PRIMARY KEY (channel_id, thread_ts)
 );
 CREATE INDEX IF NOT EXISTS slack_threads_by_thread_id ON slack_threads (thread_id, channel_id);
+CREATE TABLE IF NOT EXISTS slack_menus (
+    channel_id TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    thread_ts  TEXT NOT NULL,
+    thread_id  TEXT NOT NULL,
+    menu       TEXT NOT NULL,
+    blocks     TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, ts)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS slack_menus_by_thread_id ON slack_menus (thread_id, channel_id);
 "#;
+
+/// The columns of an `OpenMenu`, in `OpenMenu::from_row`'s order.
+const MENU_COLUMNS: &str = "channel_id, ts, thread_ts, thread_id, menu, blocks";
 
 /// The node's thread records. One connection, shared by the inbound and outbound loops; every call
 /// is a short query on a local file and never holds the lock across an `.await`.
@@ -72,8 +104,93 @@ enum ThreadPlaces {
     Unrecorded,
     /// A place a person opened: its `thread_ts`, empty for the top level.
     PersonOpened(String),
-    /// Only posts the node opened, each of which served its one message.
-    NodePosts,
+    /// Only posts the node opened, each of which served its one message: the `ts` of the one used
+    /// last. A new post forgets the older ones, so there is one.
+    NodePosts(String),
+}
+
+/// The mark a WF puts on a message it sends an IO node, `meta.context.wf.subject`
+/// (docs/wf-orchestration-v1.md §5.4.2): whether the message opens a subject, continues the subject
+/// of the WF's last message on its conversation to this node, or ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Subject {
+    /// `new`, or no mark: as before the marks. A post the node opens serves one message.
+    #[default]
+    New,
+    /// `same`: into the Slack thread of the node's post on the thread id, so a case keeps one
+    /// Slack thread.
+    Same,
+    /// `end`: where `same` puts it, when it has something to post. Then the subject's open menu is
+    /// closed (slack_menu).
+    End,
+}
+
+impl Subject {
+    /// The mark in a message's `meta.context`. No mark is `New`, and so is one this node does not
+    /// know, with a log line.
+    pub(crate) fn of_context(context: Option<&Value>) -> Self {
+        let mark = context
+            .and_then(|context| context.get("wf"))
+            .and_then(|wf| wf.get("subject"));
+        match mark {
+            None | Some(Value::Null) => Self::New,
+            Some(mark) => match mark.as_str() {
+                Some("new") => Self::New,
+                Some("same") => Self::Same,
+                Some("end") => Self::End,
+                _ => {
+                    tracing::warn!(
+                        subject = %mark,
+                        "unknown subject mark on an outbound message; it goes as a new subject"
+                    );
+                    Self::New
+                }
+            },
+        }
+    }
+}
+
+/// An open menu (docs/wf-orchestration-v1.md §5.4.4): the node's post that shows a WF's menu as
+/// buttons, and what a click on it needs (slack_menu).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenMenu {
+    /// The post's channel.
+    pub(crate) channel_id: String,
+    /// The post's `ts`.
+    pub(crate) ts: String,
+    /// The Slack thread the post is in, empty at the top level: where a click on it is answered.
+    pub(crate) thread_ts: String,
+    /// The thread id a click goes on: the one of the message that brought the menu.
+    pub(crate) thread_id: String,
+    /// The menu, as the WF sent it.
+    pub(crate) menu: Value,
+    /// The post's blocks, which closing the menu posts again without its buttons.
+    pub(crate) blocks: Value,
+}
+
+impl OpenMenu {
+    /// A row of `MENU_COLUMNS`. Its JSON texts are parsed by the caller (`parsed`), so a row that
+    /// does not parse is an error of the records, not a panic in the row's mapping.
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<(Self, String, String)> {
+        Ok((
+            Self {
+                channel_id: row.get(0)?,
+                ts: row.get(1)?,
+                thread_ts: row.get(2)?,
+                thread_id: row.get(3)?,
+                menu: Value::Null,
+                blocks: Value::Null,
+            },
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    }
+
+    fn parsed((mut menu, menu_json, blocks_json): (Self, String, String)) -> Result<Self> {
+        menu.menu = serde_json::from_str(&menu_json)?;
+        menu.blocks = serde_json::from_str(&blocks_json)?;
+        Ok(menu)
+    }
 }
 
 impl SlackThreadRecords {
@@ -88,6 +205,12 @@ impl SlackThreadRecords {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Records in memory, for the tests of the modules that use them.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Result<Self> {
+        Self::with_connection(Connection::open_in_memory()?)
     }
 
     /// A panic elsewhere while the lock was held leaves the connection usable, so the records keep
@@ -119,7 +242,8 @@ impl SlackThreadRecords {
 
     /// What the records hold for a thread id in a channel (`ThreadPlaces`). A place a person opened
     /// is marked used (`touch`), and of two, the thread id goes to the one used last. The node's
-    /// own posts are not: the message opens a new one, and they are forgotten once it goes out.
+    /// own posts are not: a message with no mark opens a new one, and they are forgotten once it
+    /// goes out; one that continues the subject marks the post it goes to (`mark_used`).
     fn place_of_thread(
         &self,
         thread_id: &str,
@@ -138,12 +262,17 @@ impl SlackThreadRecords {
             .optional()?;
         Ok(match found {
             None => ThreadPlaces::Unrecorded,
-            Some((_, true)) => ThreadPlaces::NodePosts,
+            Some((ts, true)) => ThreadPlaces::NodePosts(ts),
             Some((thread_ts, false)) => {
                 Self::touch(&conn, channel_id, &thread_ts, now_ms);
                 ThreadPlaces::PersonOpened(thread_ts)
             }
         })
+    }
+
+    /// Marks a place used (`touch`): the node's post whose subject a message continues.
+    fn mark_used(&self, channel_id: &str, thread_ts: &str, now_ms: u64) {
+        Self::touch(&self.conn(), channel_id, thread_ts, now_ms);
     }
 
     /// Marks a place used, which keeps it from the expiry. Best effort: when it fails (a full disk,
@@ -234,12 +363,109 @@ impl SlackThreadRecords {
 
     /// Deletes the records unused for [`RECORD_TTL`], and says how many went.
     fn expire(&self, now_ms: u64) -> Result<usize> {
-        let ttl_ms = u64::try_from(RECORD_TTL.as_millis()).unwrap_or(u64::MAX);
         Ok(self.conn().execute(
             "DELETE FROM slack_threads WHERE last_used_at < ?1",
-            params![now_ms.saturating_sub(ttl_ms)],
+            params![expired_before(now_ms)],
         )?)
     }
+
+    /// Records an open menu, and takes the open menu its thread id had in its channel, which the
+    /// new one replaces: the caller closes the older post. Both or neither.
+    pub(crate) fn open_menu(&self, menu: &OpenMenu, now_ms: u64) -> Result<Option<OpenMenu>> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let older = Self::take_menu_where(
+            &transaction,
+            "thread_id = ?1 AND channel_id = ?2",
+            params![menu.thread_id, menu.channel_id],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO slack_menus \
+                 (channel_id, ts, thread_ts, thread_id, menu, blocks, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                menu.channel_id,
+                menu.ts,
+                menu.thread_ts,
+                menu.thread_id,
+                serde_json::to_string(&menu.menu)?,
+                serde_json::to_string(&menu.blocks)?,
+                now_ms
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(older)
+    }
+
+    /// The open menu a post shows, if any.
+    pub(crate) fn menu_of_post(&self, channel_id: &str, ts: &str) -> Result<Option<OpenMenu>> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                &format!(
+                    "SELECT {MENU_COLUMNS} FROM slack_menus WHERE channel_id = ?1 AND ts = ?2"
+                ),
+                params![channel_id, ts],
+                OpenMenu::from_row,
+            )
+            .optional()?;
+        found.map(OpenMenu::parsed).transpose()
+    }
+
+    /// Takes the open menu of a thread id in a channel, if any: its subject ends, and the caller
+    /// closes its post.
+    pub(crate) fn take_menu_of_thread(
+        &self,
+        thread_id: &str,
+        channel_id: &str,
+    ) -> Result<Option<OpenMenu>> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction()?;
+        let taken = Self::take_menu_where(
+            &transaction,
+            "thread_id = ?1 AND channel_id = ?2",
+            params![thread_id, channel_id],
+        )?;
+        transaction.commit()?;
+        Ok(taken)
+    }
+
+    /// Deletes the menu `condition` finds, if any, and returns it.
+    fn take_menu_where(
+        conn: &Connection,
+        condition: &str,
+        values: impl rusqlite::Params + Copy,
+    ) -> Result<Option<OpenMenu>> {
+        let found = conn
+            .query_row(
+                &format!("SELECT {MENU_COLUMNS} FROM slack_menus WHERE {condition}"),
+                values,
+                OpenMenu::from_row,
+            )
+            .optional()?;
+        if found.is_some() {
+            conn.execute(
+                &format!("DELETE FROM slack_menus WHERE {condition}"),
+                values,
+            )?;
+        }
+        found.map(OpenMenu::parsed).transpose()
+    }
+
+    /// Deletes the menus open for [`RECORD_TTL`], and says how many went. Their posts keep their
+    /// buttons, and a click on one is answered as on any closed menu (slack_menu).
+    fn expire_menus(&self, now_ms: u64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM slack_menus WHERE created_at < ?1",
+            params![expired_before(now_ms)],
+        )?)
+    }
+}
+
+/// The time before which a record is past [`RECORD_TTL`].
+fn expired_before(now_ms: u64) -> u64 {
+    let ttl_ms = u64::try_from(RECORD_TTL.as_millis()).unwrap_or(u64::MAX);
+    now_ms.saturating_sub(ttl_ms)
 }
 
 /// The node's records, opened in its own directory, or `None` when they cannot open: the node then
@@ -288,6 +514,15 @@ fn expire_unused(records: &SlackThreadRecords, now_ms: u64) {
         }
         Err(err) => {
             tracing::warn!(error = %err, "slack thread records: deleting the unused ones failed")
+        }
+    }
+    match records.expire_menus(now_ms) {
+        Ok(0) => {}
+        Ok(expired) => {
+            tracing::info!(expired, "slack menus open for 30 days forgotten")
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "slack thread records: forgetting the old menus failed")
         }
     }
 }
@@ -359,8 +594,9 @@ pub(crate) fn map_inbound_thread(
 /// Where an outbound message's posts go in the node's channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutboundPlace {
-    /// Its thread id is recorded at a place a person opened, or the message's first post opened
-    /// its place: that thread, `None` for the top level.
+    /// Its thread id is recorded at a place a person opened, or it continues the subject of the
+    /// node's post on its thread id, or the message's first post opened its place: that thread,
+    /// `None` for the top level.
     Recorded(Option<String>),
     /// Unrecorded, with a `reply_target` of the node's own channel: that thread, `None` for the top
     /// level, as before the records.
@@ -382,14 +618,17 @@ pub(crate) struct OutboundThread<'a> {
 
 impl<'a> OutboundThread<'a> {
     /// Out: `workspace_id` and `channel_id` are the node's binding, `thread_id` the message's
-    /// `meta.thread_id` and `reply_target` its `meta.context.io.reply_target`. A `reply_target` of
-    /// another channel, or another workspace, is never read, and on a recorded thread id none is.
+    /// `meta.thread_id`, `reply_target` its `meta.context.io.reply_target` and `subject` its mark.
+    /// A `reply_target` of another channel, or another workspace, is never read, and on a recorded
+    /// thread id none is. The mark matters only on a thread id the node opened its post for: `same`
+    /// and `end` go into that post's thread.
     pub(crate) fn resolve(
         records: Option<&'a SlackThreadRecords>,
         workspace_id: &str,
         channel_id: &'a str,
         thread_id: Option<&'a str>,
         reply_target: Option<&SlackPostTarget>,
+        subject: Subject,
         now_ms: u64,
     ) -> Self {
         let thread_id = thread_id.map(str::trim).filter(|id| !id.is_empty());
@@ -411,7 +650,26 @@ impl<'a> OutboundThread<'a> {
                         place,
                     };
                 }
-                Ok(ThreadPlaces::NodePosts) => {
+                Ok(ThreadPlaces::NodePosts(post_ts)) if subject != Subject::New => {
+                    // The message continues, or ends, the subject of the node's post: into its
+                    // thread, with no new post and nothing forgotten, and the post is used.
+                    records.mark_used(channel_id, &post_ts, now_ms);
+                    let place = OutboundPlace::Recorded(Some(post_ts));
+                    tracing::debug!(
+                        channel_id = %channel_id,
+                        thread_id = %thread_id,
+                        subject = ?subject,
+                        place = ?place,
+                        "outbound message on the subject of the node's post on this thread id"
+                    );
+                    return Self {
+                        records: Some(records),
+                        channel_id,
+                        record_as: None,
+                        place,
+                    };
+                }
+                Ok(ThreadPlaces::NodePosts(_)) => {
                     // Each of the node's posts served its one message: this one opens a new post,
                     // whatever reply target it carries, and `posted` forgets the older ones.
                     tracing::debug!(
@@ -582,7 +840,24 @@ mod tests {
         thread_id: Option<&'a str>,
         reply_target: Option<&SlackPostTarget>,
     ) -> OutboundThread<'a> {
-        OutboundThread::resolve(records, WORKSPACE, CHANNEL, thread_id, reply_target, NOW)
+        resolve_marked(records, thread_id, reply_target, Subject::New)
+    }
+
+    fn resolve_marked<'a>(
+        records: Option<&'a SlackThreadRecords>,
+        thread_id: Option<&'a str>,
+        reply_target: Option<&SlackPostTarget>,
+        subject: Subject,
+    ) -> OutboundThread<'a> {
+        OutboundThread::resolve(
+            records,
+            WORKSPACE,
+            CHANNEL,
+            thread_id,
+            reply_target,
+            subject,
+            NOW,
+        )
     }
 
     /// A record as (thread_id, channel_id, thread_ts, created_at, last_used_at, opened_by_node).
@@ -640,6 +915,7 @@ mod tests {
             CHANNEL,
             Some(thread_id),
             None,
+            Subject::New,
             now_ms,
         );
         assert_eq!(thread.place, OutboundPlace::NewPost, "{thread_id}");
@@ -980,6 +1256,7 @@ mod tests {
                 CHANNEL,
                 Some("thread:sha256:used"),
                 None,
+                Subject::New,
                 NOW - 2 * DAY_MS,
             );
             assert_eq!(used.thread_ts(), Some("1793000000.000802"));
@@ -1249,6 +1526,7 @@ mod tests {
                 CHANNEL,
                 Some(person_thread.as_str()),
                 None,
+                Subject::New,
                 at,
             );
             assert_eq!(
@@ -1275,5 +1553,305 @@ mod tests {
             resolve(Some(&records), Some(person_thread.as_str()), None).place,
             OutboundPlace::Recorded(Some("1793000000.001300".to_string()))
         );
+    }
+
+    /// The marks (docs/wf-orchestration-v1.md §5.4.2): on a thread id with the node's post, `same`
+    /// and `end` go into the post's Slack thread, with no new post and nothing forgotten, whatever
+    /// reply target they carry, and the post is used. A case keeps one Slack thread: a reply there
+    /// still reaches the thread id. `new` opens a new post, as before, which `same` follows next.
+    #[test]
+    fn same_and_end_go_into_the_thread_of_the_nodes_post() {
+        let records = records();
+        post_at_top_level(&records, WF_THREAD, "1793000000.001400", NOW - DAY_MS);
+        let elsewhere_here = target(CHANNEL, Some("1793000000.000999"));
+
+        for subject in [Subject::Same, Subject::End] {
+            for reply_target in [None, Some(&elsewhere_here)] {
+                let mut thread =
+                    resolve_marked(Some(&records), Some(WF_THREAD), reply_target, subject);
+                assert_eq!(
+                    thread.place,
+                    OutboundPlace::Recorded(Some("1793000000.001400".to_string())),
+                    "{subject:?}"
+                );
+                // The message's posts go into the thread, and record nothing.
+                thread.posted(Some("1793000000.001401"), NOW);
+                assert_eq!(thread.thread_ts(), Some("1793000000.001400"));
+            }
+        }
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.001400", NOW - DAY_MS, NOW)]
+        );
+        let mut reply = inbound(Some("1793000000.001400"));
+        map_inbound_thread(
+            Some(&records),
+            &mut reply,
+            Some("1793000000.001400"),
+            NOW + 1,
+        );
+        assert_eq!(reply.conversation.thread_id.as_deref(), Some(WF_THREAD));
+
+        let mut new = resolve_marked(Some(&records), Some(WF_THREAD), None, Subject::New);
+        assert_eq!(new.place, OutboundPlace::NewPost);
+        new.posted(Some("1793000000.001500"), NOW + 2);
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.001500", NOW + 2, NOW + 2)]
+        );
+        assert_eq!(
+            resolve_marked(Some(&records), Some(WF_THREAD), None, Subject::Same).thread_ts(),
+            Some("1793000000.001500")
+        );
+    }
+
+    /// On an unrecorded thread id every mark goes as `new`: to this channel's reply target, or to a
+    /// new post at the top level, recorded. A place a person opened takes every message, whatever
+    /// its mark, and so does the node without records.
+    #[test]
+    fn a_mark_changes_nothing_on_an_unrecorded_thread_id_or_a_persons_place() {
+        let records = records();
+        let here = target(CHANNEL, Some("1793000000.001600"));
+        for subject in [Subject::New, Subject::Same, Subject::End] {
+            assert_eq!(
+                resolve_marked(
+                    Some(&records),
+                    Some("thread:sha256:agent"),
+                    Some(&here),
+                    subject
+                )
+                .place,
+                OutboundPlace::ReplyTarget(Some("1793000000.001600".to_string()))
+            );
+            assert_eq!(
+                resolve_marked(Some(&records), Some(WF_THREAD), None, subject).place,
+                OutboundPlace::NewPost
+            );
+            assert_eq!(
+                resolve_marked(None, Some(WF_THREAD), None, subject).place,
+                OutboundPlace::NewPost
+            );
+        }
+        let mut same = resolve_marked(Some(&records), Some(WF_THREAD), None, Subject::Same);
+        same.posted(Some("1793000000.001601"), NOW);
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.001601", NOW, NOW)]
+        );
+
+        records
+            .record(PERSON_THREAD, CHANNEL, "1793000000.001602", NOW)
+            .expect("record");
+        records
+            .record_node_post(PERSON_THREAD, CHANNEL, "1793000000.001603", NOW)
+            .expect("record");
+        for subject in [Subject::New, Subject::Same, Subject::End] {
+            assert_eq!(
+                resolve_marked(Some(&records), Some(PERSON_THREAD), None, subject).place,
+                OutboundPlace::Recorded(Some("1793000000.001602".to_string())),
+                "{subject:?}"
+            );
+        }
+    }
+
+    /// The mark is the WF's block's `subject`: `new`, `same` or `end`. None, `null`, or one this
+    /// node does not know is `new`, and so is a `subject` outside the block.
+    #[test]
+    fn the_mark_is_read_from_the_wf_block() {
+        let context = |subject: Value| json!({"io": {}, "wf": {"trail": [], "subject": subject}});
+        for (subject, mark) in [
+            (json!("new"), Subject::New),
+            (json!("same"), Subject::Same),
+            (json!("end"), Subject::End),
+            (json!("End"), Subject::New),
+            (json!(null), Subject::New),
+            (json!(1), Subject::New),
+        ] {
+            assert_eq!(
+                Subject::of_context(Some(&context(subject.clone()))),
+                mark,
+                "{subject}"
+            );
+        }
+        assert_eq!(
+            Subject::of_context(Some(&json!({"wf": {"trail": []}}))),
+            Subject::New
+        );
+        assert_eq!(
+            Subject::of_context(Some(&json!({"subject": "end"}))),
+            Subject::New
+        );
+        assert_eq!(Subject::of_context(None), Subject::New);
+    }
+
+    /// An open menu of the node's post `ts` on a thread id, at the channel's top level.
+    fn menu(thread_id: &str, ts: &str) -> OpenMenu {
+        OpenMenu {
+            channel_id: CHANNEL.to_string(),
+            ts: ts.to_string(),
+            thread_ts: String::new(),
+            thread_id: thread_id.to_string(),
+            menu: json!({"options": [{"name": "handback", "description": "Hand it back."}]}),
+            blocks: json!([{"type": "actions", "block_id": "wf_menu", "elements": []}]),
+        }
+    }
+
+    /// The open menus (docs/wf-orchestration-v1.md §5.4.4): one per thread id in a channel. A new
+    /// one takes the older's place and returns it, to close its post; `end` takes it; a post with
+    /// no open menu has none. Other thread ids, and other channels, keep theirs.
+    #[test]
+    fn a_thread_id_has_one_open_menu_per_channel() {
+        let records = records();
+        let first = menu(WF_THREAD, "1793000000.001700");
+        assert_eq!(records.open_menu(&first, NOW).expect("open"), None);
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001700")
+                .expect("lookup"),
+            Some(first.clone())
+        );
+
+        let other_thread = menu(PERSON_THREAD, "1793000000.001701");
+        let mut other_channel = menu(WF_THREAD, "1793000000.001702");
+        other_channel.channel_id = "C0OTHER".to_string();
+        assert_eq!(records.open_menu(&other_thread, NOW).expect("open"), None);
+        assert_eq!(records.open_menu(&other_channel, NOW).expect("open"), None);
+
+        let mut second = menu(WF_THREAD, "1793000000.001703");
+        second.thread_ts = "1793000000.001700".to_string();
+        assert_eq!(
+            records.open_menu(&second, NOW + 1).expect("open"),
+            Some(first)
+        );
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001700")
+                .expect("lookup"),
+            None
+        );
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001703")
+                .expect("lookup"),
+            Some(second.clone())
+        );
+
+        assert_eq!(
+            records
+                .take_menu_of_thread(WF_THREAD, CHANNEL)
+                .expect("take"),
+            Some(second)
+        );
+        assert_eq!(
+            records
+                .take_menu_of_thread(WF_THREAD, CHANNEL)
+                .expect("take"),
+            None
+        );
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001701")
+                .expect("lookup"),
+            Some(other_thread)
+        );
+        assert_eq!(
+            records
+                .menu_of_post("C0OTHER", "1793000000.001702")
+                .expect("lookup"),
+            Some(other_channel)
+        );
+    }
+
+    /// A file from before the menus gains their table when it opens, in place, and keeps its
+    /// records. A menu open for 30 days is forgotten at start and by the daily pass.
+    #[test]
+    fn an_older_file_gains_the_menus_and_old_menus_are_forgotten() {
+        let dir = temp_node_dir("menus");
+        {
+            let conn = Connection::open(dir.join(THREAD_RECORDS_FILE)).expect("file");
+            conn.execute_batch(
+                "CREATE TABLE slack_threads (
+                    thread_id      TEXT NOT NULL,
+                    channel_id     TEXT NOT NULL,
+                    thread_ts      TEXT NOT NULL,
+                    created_at     INTEGER NOT NULL,
+                    last_used_at   INTEGER NOT NULL,
+                    opened_by_node INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (channel_id, thread_ts)
+                );",
+            )
+            .expect("the schema before the menus");
+            conn.execute(
+                "INSERT INTO slack_threads VALUES (?1, ?2, ?3, ?4, ?4, 1)",
+                params![WF_THREAD, CHANNEL, "1793000000.001800", NOW],
+            )
+            .expect("a record");
+        }
+        let records = open_thread_records(&dir, NOW).expect("open");
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.001800", NOW, NOW)]
+        );
+        records
+            .open_menu(&menu(WF_THREAD, "1793000000.001800"), NOW - 31 * DAY_MS)
+            .expect("open");
+        records
+            .open_menu(&menu(PERSON_THREAD, "1793000000.001801"), NOW - 29 * DAY_MS)
+            .expect("open");
+        drop(records);
+
+        // At start.
+        let records = open_thread_records(&dir, NOW).expect("reopen");
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001800")
+                .expect("lookup"),
+            None
+        );
+        assert!(records
+            .menu_of_post(CHANNEL, "1793000000.001801")
+            .expect("lookup")
+            .is_some());
+        // The daily pass, two days on.
+        assert_eq!(records.expire_menus(NOW + 2 * DAY_MS).expect("expire"), 1);
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.001801")
+                .expect("lookup"),
+            None
+        );
+        drop(records);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the menus fail, or a row does not read, the calls say so and nothing panics: the caller
+    /// logs it, and a click is answered as on a closed menu (slack_menu). A take that cannot read
+    /// its row undoes its delete.
+    #[test]
+    fn when_the_menus_fail_the_calls_say_so() {
+        let records = records();
+        records
+            .open_menu(&menu(WF_THREAD, "1793000000.001900"), NOW)
+            .expect("open");
+        records
+            .conn()
+            .execute("UPDATE slack_menus SET menu = 'not json'", [])
+            .expect("a row that does not read");
+        assert!(records.menu_of_post(CHANNEL, "1793000000.001900").is_err());
+        assert!(records.take_menu_of_thread(WF_THREAD, CHANNEL).is_err());
+        let left: i64 = records
+            .conn()
+            .query_row("SELECT COUNT(*) FROM slack_menus", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 1);
+
+        records
+            .conn()
+            .execute_batch("DROP TABLE slack_menus")
+            .expect("drop");
+        assert!(records
+            .open_menu(&menu(WF_THREAD, "1793000000.001901"), NOW)
+            .is_err());
+        assert!(records.expire_menus(NOW).is_err());
     }
 }
