@@ -116,8 +116,9 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 // execSendMessage sends a message the WF writes: its msg and payload from the definition, on the
 // instance's thread (every message the instance sends carries it, so the agents keep one memory per
 // conversation and their answers come back here), with its meta.context and the WF's block. It carries
-// the instance's person as its src_ilk and ich, when the message that started the instance had them:
-// an agent files it under the person, as it does a forwarded message (wf-orchestration-v1 §5.4.3).
+// the instance's person as its src_ilk and ich, when the instance has one: an agent files it under the
+// person, as it does a forwarded message (wf-orchestration-v1 §5.4.3). An instance whose thread
+// several people write on has none (notePerson).
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("send_message: no dispatcher configured")

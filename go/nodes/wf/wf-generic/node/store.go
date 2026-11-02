@@ -45,7 +45,8 @@ type WFInstanceRow struct {
 	UpdatedAtMS    int64
 	TerminatedAtMS sql.NullInt64
 	// PersonILK and PersonICH are the instance's person: the src_ilk and ich of the message that
-	// started it, empty when it had none. A send_message carries them (the rest of FINDINGS A-116).
+	// started it, empty when it had none, or once a message from a start_from node carried another
+	// person. A send_message carries them (the rest of FINDINGS A-116).
 	PersonILK string
 	PersonICH string
 }
@@ -486,7 +487,9 @@ ON CONFLICT(instance_id) DO UPDATE SET
     state_json       = excluded.state_json,
     current_trace_id = excluded.current_trace_id,
     updated_at_ms    = excluded.updated_at_ms,
-    terminated_at_ms = excluded.terminated_at_ms;`, instanceValues(inst)...); err != nil {
+    terminated_at_ms = excluded.terminated_at_ms,
+    person_ilk       = excluded.person_ilk,
+    person_ich       = excluded.person_ich;`, instanceValues(inst)...); err != nil {
 		return err
 	}
 

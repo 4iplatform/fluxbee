@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,10 +59,22 @@ func startAsking(t *testing.T, rt *NodeRuntime, disp *mockDispatcher, traceID st
 	return instanceID
 }
 
-// realTimerFired is SY.timer's TIMER_FIRED as the router delivers it (the shared wire fixture of the
-// Go and Rust SDKs, go/fluxbee-go-sdk/testdata/timer_wire), for a WF timer: SY.timer hands back the
-// client_ref and the payload the WF scheduled it with (emitTimerFired in go/sy-timer/scheduler.go).
-func realTimerFired(t *testing.T, instanceID, timerKey string) sdk.Message {
+// realTimerFired is SY.timer's TIMER_FIRED of the timer timerKey of instanceID, which rt's index has
+// pending: SY.timer fires it at the fire_at the WF scheduled it for.
+func realTimerFired(t *testing.T, rt *NodeRuntime, instanceID, timerKey string) sdk.Message {
+	t.Helper()
+	timer, pending, err := rt.Store.GetTimerForInstance(context.Background(), instanceID, timerKey)
+	if err != nil || !pending {
+		t.Fatalf("instance %s has no timer %s pending: %v", instanceID, timerKey, err)
+	}
+	return timerFiredAt(t, instanceID, timerKey, timer.FireAtMS)
+}
+
+// timerFiredAt is SY.timer's TIMER_FIRED as the router delivers it (the shared wire fixture of the
+// Go and Rust SDKs, go/fluxbee-go-sdk/testdata/timer_wire), for a WF timer scheduled for scheduledMS:
+// SY.timer hands back the client_ref and the payload the WF scheduled it with, and the time it was
+// scheduled for (emitTimerFired in go/sy-timer/scheduler.go).
+func timerFiredAt(t *testing.T, instanceID, timerKey string, scheduledMS int64) sdk.Message {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "fluxbee-go-sdk", "testdata", "timer_wire", "event_timer_fired.json"))
 	if err != nil {
@@ -78,6 +91,8 @@ func realTimerFired(t *testing.T, instanceID, timerKey string) sdk.Message {
 	payload["owner_l2_name"] = testNodeName
 	payload["client_ref"] = timerClientRef(instanceID, timerKey)
 	payload["user_payload"] = map[string]any{"instance_id": instanceID, "timer_key": timerKey}
+	payload["scheduled_fire_at_utc_ms"] = scheduledMS
+	payload["actual_fire_at_utc_ms"] = scheduledMS + 123
 	if msg.Payload, err = json.Marshal(payload); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +106,7 @@ func realTimerFired(t *testing.T, instanceID, timerKey string) sdk.Message {
 func TestARealTimerFiredReachesAnEventTimerKeyGuard(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
 	instanceID := startAsking(t, rt, disp, "trace-start")
-	fired := realTimerFired(t, instanceID, "ask_timeout")
+	fired := realTimerFired(t, rt, instanceID, "ask_timeout")
 	if fired.SourceL2Name() != "SY.timer@motherbee" || rawMsgName(fired) != sdk.MsgTimerFired {
 		t.Fatalf("fixture: %+v", fired.Routing)
 	}
@@ -118,7 +133,7 @@ func TestAForgedTimerFiredIsRefused(t *testing.T) {
 	instanceID := startAsking(t, rt, disp, "trace-start")
 	sent := len(disp.sent)
 	for _, forger := range []string{"AI.evil@motherbee", "SY.timer@worker1", "WF.other@motherbee"} {
-		forged := realTimerFired(t, instanceID, "ask_timeout")
+		forged := realTimerFired(t, rt, instanceID, "ask_timeout")
 		forged.Routing.SrcL2Name = &forger
 		if err := Dispatch(context.Background(), forged, rt); err != nil {
 			t.Fatalf("Dispatch from %s: %v", forger, err)
@@ -251,8 +266,10 @@ func TestErrorsRepliesAndNoticesAreNeverAnswered(t *testing.T) {
 }
 
 // FINDINGS A-135: a message with no thread starts no instance, since a WF never makes up a thread. An
-// IO node hears so for any message; any other sender only for a named request (wf-orchestration-v1
-// §5.4.10), so a WF or an agent that sends a request with no thread hears why it went nowhere.
+// IO node gets a NOT_TAKEN no_thread for any message, and shows it to whoever wrote; any other sender
+// only for a named request (wf-orchestration-v1 §5.4.10), the answer on the request's trace. A WF or
+// an agent acts on none: a WF drops a system message but a TIMER_FIRED, and ai.generic ignores a
+// system message it does not know.
 func TestAMessageWithNoThreadStartsNothing(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
 	unnamed := from("WF.upstream@motherbee", sdk.Message{Routing: sdk.Routing{Src: "upstream-uuid", TraceID: "t-unnamed"}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{}`)})
@@ -274,7 +291,7 @@ func TestAMessageWithNoThreadStartsNothing(t *testing.T) {
 		answered = append(answered, msg.Routing.Dst.Value())
 	}
 	if rows, _ := rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 || strings.Join(answered, ", ") != "upstream-uuid, agent-uuid, io-uuid" {
-		t.Fatalf("nothing starts, and the named requests and the IO node's text hear why: %d instances, answered %v", len(rows), answered)
+		t.Fatalf("nothing starts, and the named requests and the IO node's text get a NOT_TAKEN: %d instances, answered %v", len(rows), answered)
 	}
 }
 
@@ -298,6 +315,155 @@ func TestANotTakenThatCannotGoFailsNothing(t *testing.T) {
 	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
 		t.Fatalf("the event is consumed: %+v", events)
 	}
+}
+
+// The default's NOT_TAKEN is a notice, no action of the definition: it goes once the commit consumed
+// the event. A commit that fails sends none, and the start that runs the event again sends it once.
+// Before, it went ahead of the commit, and a crash between the two sent it twice.
+func TestTheDefaultsNotTakenGoesOnceItsEventIsConsumed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wf.db")
+	rt, disp := newTestRuntime(t, path, askingWorkflowJSON, nil)
+	instanceID := startAsking(t, rt, disp, "trace-start")
+	odd := func(trace string) sdk.Message {
+		msg := from("IO.in@motherbee", msgWithName("ODD"))
+		msg.Routing.Src, msg.Routing.TraceID = "io-uuid", trace
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
+		return msg
+	}
+	// journaled records, at each NOT_TAKEN, its trace and how many events the journal holds.
+	var journaled []string
+	seen := func(store *Store) func(sdk.Message) {
+		return func(msg sdk.Message) {
+			if notTakenReason(t, msg) != notTakenNotExpected {
+				return
+			}
+			events, err := store.ListInboundEvents(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			journaled = append(journaled, fmt.Sprintf("%s: %d", msg.Routing.TraceID, len(events)))
+		}
+	}
+	rt.ActCtx.Dispatcher = &sendHook{mockDispatcher: mockDispatcher{l2name: testNodeName, uuid: "wf-uuid"}, onSend: seen(rt.Store)}
+
+	if err := Dispatch(context.Background(), odd("trace-odd-1"), rt); err != nil {
+		t.Fatal(err)
+	}
+	// The commit of the next one fails: its event stays journaled, and no NOT_TAKEN goes.
+	if _, err := rt.Store.db.Exec(`CREATE TRIGGER fail_commit BEFORE UPDATE ON wf_instances BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Dispatch(context.Background(), odd("trace-odd-2"), rt); err == nil {
+		t.Fatal("the commit fails")
+	}
+	if _, err := rt.Store.db.Exec(`DROP TRIGGER fail_commit;`); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(journaled, ", ") != "trace-odd-1: 0" {
+		t.Fatalf("a NOT_TAKEN goes only with its event consumed: %v", journaled)
+	}
+
+	// The next start runs the event again: its commit goes, and then its NOT_TAKEN, once.
+	restart(t, path, askingWorkflowJSON, seen(openedStore(t, path)))
+	if strings.Join(journaled, ", ") != "trace-odd-1: 0, trace-odd-2: 0" {
+		t.Fatalf("the event run again sends its NOT_TAKEN once, consumed: %v", journaled)
+	}
+}
+
+// snoozingWorkflowJSON reminds IO.in when its timer remind fires, 5 minutes after the start; SNOOZE
+// moves the timer to 10 minutes from then, and STOP cancels it.
+const snoozingWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "snoozing",
+  "start_from": ["IO.in@motherbee"],
+  "input_schema": {"type": "object"},
+  "initial_state": "waiting",
+  "terminal_states": ["reminded"],
+  "states": [
+    {
+      "name": "waiting",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "remind", "fire_in": "5m"}],
+      "transitions": [
+        {"event_match": {"msg": "SNOOZE"}, "guard": "true", "actions": [{"type": "reschedule_timer", "timer_key": "remind", "fire_in": "10m"}]},
+        {"event_match": {"msg": "STOP"}, "guard": "true", "actions": [{"type": "cancel_timer", "timer_key": "remind"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'remind'", "target_state": "reminded",
+         "actions": [{"type": "send_message", "target": "IO.in@motherbee", "meta": {"msg": "REMINDER"}, "payload": {"text": "time"}}]}
+      ]
+    },
+    {"name": "reminded"}
+  ]
+}`
+
+// TIMER_CANCEL and TIMER_RESCHEDULE go fire-and-forget: a fire on its way when the instance cancelled
+// or moved its timer, or one SY.timer sends after a cancel or a reschedule it never got, still comes.
+// The engine takes a fire only for the timer the instance has in the index, at the time it has it
+// (a little earlier too: SY.timer counts a fire_in from when it gets the schedule). The fire of a
+// cancelled timer is dropped, and so is one scheduled for a time the instance moved its timer from:
+// that timer is scheduled again at its fire_at, since SY.timer fires a timer once. The node's log says
+// why, and the instance's log keeps nothing of a dropped fire.
+func TestAFireOfATimerTheInstanceCancelledOrMovedIsDropped(t *testing.T) {
+	timer := &mockTimerSender{}
+	rt, disp := newTestRuntime(t, "", snoozingWorkflowJSON, timer)
+	dispatch := func(msg sdk.Message) {
+		t.Helper()
+		if err := Dispatch(context.Background(), msg, rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := func(thread string) (string, int64) {
+		t.Helper()
+		instanceID := startInstance(t, rt, ioMessage(thread, "", `{}`))
+		remind, _, err := rt.Store.GetTimerForInstance(context.Background(), instanceID, "remind")
+		if err != nil || remind.FireAtMS != fixedClock().Add(5*time.Minute).UnixMilli() {
+			t.Fatalf("the timer remind, 5 minutes ahead: %+v %v", remind, err)
+		}
+		return instanceID, remind.FireAtMS
+	}
+	// dropped dispatches fired, and checks that the engine dropped it, saying why: the instance stays
+	// waiting, its log keeps nothing of the fire, and nothing is sent.
+	dropped := func(instanceID string, fired sdk.Message, why string) {
+		t.Helper()
+		logged, sent := lastLog(t, rt, instanceID), len(disp.sent)
+		out := nodeLog(t, func() { dispatch(fired) })
+		if !strings.Contains(out, `TIMER_FIRED "remind" for instance `+instanceID+" dropped") || !strings.Contains(out, why) {
+			t.Fatalf("the node's log says the fire was dropped (%s): %s", why, out)
+		}
+		if row := mustGetInstance(t, rt, instanceID); row.CurrentState != "waiting" || lastLog(t, rt, instanceID) != logged || len(disp.sent) != sent {
+			t.Fatalf("a dropped fire reached the instance: %+v %+v", row, lastLog(t, rt, instanceID))
+		}
+	}
+	reminded := func(instanceID string) {
+		t.Helper()
+		if row := mustGetInstance(t, rt, instanceID); row.CurrentState != "reminded" {
+			t.Fatalf("the timer's own fire reaches the instance: %+v", row)
+		}
+	}
+
+	// The timer's own fire.
+	onTime, _ := start("conv-on-time")
+	dispatch(realTimerFired(t, rt, onTime, "remind"))
+	reminded(onTime)
+
+	// Cancelled: the fire SY.timer sends at the time the timer had is dropped.
+	cancelled, at := start("conv-cancelled")
+	dispatch(ioMessage("conv-cancelled", "STOP", `{}`))
+	dropped(cancelled, timerFiredAt(t, cancelled, "remind", at), "the instance has no such timer")
+
+	// Moved: four minutes in, SNOOZE moves the timer to 14 minutes from the start. A fire at the time
+	// it had is dropped, and the timer is scheduled again for when it fires now; a fire within the
+	// tolerance before that is the timer's own.
+	moved, at := start("conv-moved")
+	rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(4 * time.Minute) }
+	dispatch(ioMessage("conv-moved", "SNOOZE", `{}`))
+	schedules := len(timer.scheduled)
+	dropped(moved, timerFiredAt(t, moved, "remind", at), "the instance moved the timer to")
+	remind, pending, _ := rt.Store.GetTimerForInstance(context.Background(), moved, "remind")
+	if !pending || remind.FireAtMS != fixedClock().Add(14*time.Minute).UnixMilli() ||
+		len(timer.scheduled) != schedules+1 || timer.scheduled[schedules] != timerClientRef(moved, "remind") {
+		t.Fatalf("the moved timer is scheduled again at its fire_at: %+v %v", remind, timer.scheduled)
+	}
+	dispatch(timerFiredAt(t, moved, "remind", remind.FireAtMS-timerFireTolerance.Milliseconds()))
+	reminded(moved)
 }
 
 // crashingDispatcher records what it sends, and closes the store's database right after a send to
@@ -438,7 +604,7 @@ func TestAFiredTimerDoesNotFireAgainAfterARestart(t *testing.T) {
 	if timers, _ := before.Store.ListTimersForInstance(context.Background(), instanceID); len(timers) != 1 {
 		t.Fatalf("the timer is in the index: %+v", timers)
 	}
-	if err := Dispatch(context.Background(), realTimerFired(t, instanceID, "tick"), before); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, before, instanceID, "tick"), before); err != nil {
 		t.Fatal(err)
 	}
 	if timers, _ := before.Store.ListTimersForInstance(context.Background(), instanceID); len(timers) != 0 {
@@ -499,7 +665,7 @@ func TestALateAnswerNeverStartsAnInstance(t *testing.T) {
 		rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
 		instanceID := startAsking(t, rt, disp, "trace-start")
 		ask := disp.sent[len(disp.sent)-1]
-		if err := Dispatch(context.Background(), realTimerFired(t, instanceID, "ask_timeout"), rt); err != nil {
+		if err := Dispatch(context.Background(), realTimerFired(t, rt, instanceID, "ask_timeout"), rt); err != nil {
 			t.Fatal(err)
 		}
 		sent := len(disp.sent)
@@ -547,7 +713,7 @@ func TestATimerFiredOfAnotherOwnerIsRefused(t *testing.T) {
 	instanceID := startAsking(t, rt, disp, "trace-start")
 	sent := len(disp.sent)
 	forge := func(edit func(payload map[string]any)) sdk.Message {
-		fired := realTimerFired(t, instanceID, "ask_timeout")
+		fired := realTimerFired(t, rt, instanceID, "ask_timeout")
 		var payload map[string]any
 		if err := json.Unmarshal(fired.Payload, &payload); err != nil {
 			t.Fatal(err)
@@ -568,7 +734,7 @@ func TestATimerFiredOfAnotherOwnerIsRefused(t *testing.T) {
 		}
 	}
 	// SY.timer's own fire of the WF's timer still reaches the guard.
-	if err := Dispatch(context.Background(), realTimerFired(t, instanceID, "ask_timeout"), rt); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, rt, instanceID, "ask_timeout"), rt); err != nil {
 		t.Fatal(err)
 	}
 	if row := mustGetInstance(t, rt, instanceID); row.CurrentState != "timed_out" {

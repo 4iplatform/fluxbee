@@ -25,7 +25,8 @@ const (
 	MsgWFGetCodeResponse        = "WF_GET_CODE_RESPONSE"
 
 	// msgNotTaken is the engine's own error answer (wf-orchestration-v1 §5.4.6): the WF took the
-	// message nowhere, and its reason says why (answerNotTaken).
+	// message nowhere, and its reason says why. An IO node shows it to whoever wrote; a WF and an
+	// agent act on none (answerNotTaken).
 	msgNotTaken = "NOT_TAKEN"
 
 	errCodeUnauthorized = "UNAUTHORIZED"
@@ -153,8 +154,10 @@ func isNotice(msg sdk.Message) bool {
 
 // isReply reports whether a message named name answers a request: any *_RESPONSE, the engine's own
 // error answer (NOT_TAKEN), or an agent's error (<msg>.error). A reply reaches the instance whose
-// thread it carries, and nothing else: it never starts an instance and is never answered, so two WFs
-// cannot bounce a NOT_TAKEN (FINDINGS A-119).
+// thread it carries, and nothing else: it never starts an instance and is never answered. The
+// engine's NOT_TAKEN is a system message, which Dispatch drops before it gets here (a WF acts on no
+// system message but a TIMER_FIRED); one that comes as a workflow message is a reply all the same, so
+// two WFs cannot bounce it (FINDINGS A-119).
 func isReply(name string) bool {
 	return strings.HasSuffix(name, "_RESPONSE") || name == msgNotTaken || strings.HasSuffix(name, ".error")
 }

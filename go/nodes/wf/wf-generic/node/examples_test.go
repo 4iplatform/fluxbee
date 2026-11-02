@@ -169,7 +169,7 @@ func TestTheRouterExampleRepliesToTheIONodeTheQuestionCameFrom(t *testing.T) {
 	}
 
 	timedOut, _ := ask("IO.api.support@motherbee")
-	if err := Dispatch(context.Background(), realTimerFired(t, timedOut, "host_timeout"), rt); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, rt, timedOut, "host_timeout"), rt); err != nil {
 		t.Fatal(err)
 	}
 	if reason := failure(timedOut); reason != "host_timeout" {
@@ -199,7 +199,7 @@ func TestTheInvoiceExampleDefaultsTheCurrencyAndTimesOut(t *testing.T) {
 		t.Fatalf("amount_cents on the wire: %s", msg.Payload)
 	}
 
-	if err := Dispatch(context.Background(), realTimerFired(t, instanceID, "collection_timeout"), rt); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, rt, instanceID, "collection_timeout"), rt); err != nil {
 		t.Fatal(err)
 	}
 	if row := mustGetInstance(t, rt, instanceID); row.CurrentState != "failed" || row.Status != "failed" {
@@ -211,21 +211,36 @@ func TestTheInvoiceExampleDefaultsTheCurrencyAndTimesOut(t *testing.T) {
 }
 
 // fakeSYTimer is SY.timer as the WF sees it: it keeps the WF's pending timers by client_ref, at the
-// time they fire, and lists them.
+// time they fire, counted from now (the WF node's clock, the fixed clock when it has none), and lists
+// them. A schedule whose client_ref is pending keeps the pending timer, as SY.timer does. cancelErr,
+// when set, is the error of every cancel: the cancel never leaves the WF, and the timer stays.
 type fakeSYTimer struct {
-	owner   string
-	pending map[string]time.Time
+	owner     string
+	pending   map[string]time.Time
+	now       func() time.Time
+	cancelErr error
 }
 
 func (f *fakeSYTimer) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
-	f.pending[opts.ClientRef] = fixedClock().Add(d)
+	now := fixedClock()
+	if f.now != nil {
+		now = f.now()
+	}
+	if _, pending := f.pending[opts.ClientRef]; !pending {
+		f.pending[opts.ClientRef] = now.Add(d)
+	}
 	return "", nil
 }
 func (f *fakeSYTimer) Schedule(_ context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
-	f.pending[opts.ClientRef] = fireAt
+	if _, pending := f.pending[opts.ClientRef]; !pending {
+		f.pending[opts.ClientRef] = fireAt
+	}
 	return "", nil
 }
 func (f *fakeSYTimer) CancelByClientRef(_ context.Context, ref string) error {
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
 	delete(f.pending, ref)
 	return nil
 }
@@ -244,11 +259,11 @@ func (f *fakeSYTimer) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo
 	return timers, nil
 }
 
-// timerFiredFor is SY.timer's TIMER_FIRED of the timer node scheduled for instanceID, as SY.timer of
-// node's hive sends it.
-func timerFiredFor(t *testing.T, node, instanceID, timerKey string) sdk.Message {
+// timerFiredFor is SY.timer's TIMER_FIRED of the timer node scheduled for instanceID, to fire at at,
+// as SY.timer of node's hive sends it.
+func timerFiredFor(t *testing.T, node, instanceID, timerKey string, at time.Time) sdk.Message {
 	t.Helper()
-	fired := realTimerFired(t, instanceID, timerKey)
+	fired := timerFiredAt(t, instanceID, timerKey, at.UnixMilli())
 	var payload map[string]any
 	if err := json.Unmarshal(fired.Payload, &payload); err != nil {
 		t.Fatal(err)
@@ -302,6 +317,7 @@ func newSalesConversation(t *testing.T) *salesConversation {
 		definition: exampleDefinition(t, "wf.sales.invoice"),
 		timer:      &fakeSYTimer{owner: salesWFNode, pending: map[string]time.Time{}},
 	}
+	c.timer.now = func() time.Time { return c.rt.ActCtx.Clock() }
 	c.start()
 	return c
 }
@@ -440,16 +456,17 @@ func (c *salesConversation) notTaken(msg sdk.Message, reason string) {
 	}
 }
 
-// fire fires the instance's pending timer key, as SY.timer does.
+// fire fires the instance's pending timer key, as SY.timer does: at the time SY.timer has for it.
 func (c *salesConversation) fire(key string) {
 	c.t.Helper()
 	instanceID := c.running().InstanceID
 	ref := timerClientRef(instanceID, key)
-	if _, ok := c.timer.pending[ref]; !ok {
+	at, ok := c.timer.pending[ref]
+	if !ok {
 		c.t.Fatalf("%s is not pending: %v", key, c.timer.pending)
 	}
 	delete(c.timer.pending, ref)
-	c.dispatch(timerFiredFor(c.t, salesWFNode, instanceID, key))
+	c.dispatch(timerFiredFor(c.t, salesWFNode, instanceID, key, at))
 }
 
 func (c *salesConversation) pending(key string) (time.Time, bool) {
@@ -769,12 +786,14 @@ func TestTheSalesInvoiceExampleSurvivesItsAgents(t *testing.T) {
 		t.Fatalf("the payment check stays: %v %v", c.timer.pending, c.state())
 	}
 
-	// A stale fire of invoice's timeout, cancelled when invoice's state was left, is nobody's here.
+	// A stale fire of invoice's timeout, which the instance cancelled when invoice's state was left
+	// (the cancel lost on its way to SY.timer), never reaches the instance: the engine drops it.
 	instanceID := c.running().InstanceID
-	c.dispatch(timerFiredFor(t, salesWFNode, instanceID, "invoice_timeout"))
+	logged, sent := lastLog(t, c.rt, instanceID), len(c.disp.sent)
+	c.dispatch(timerFiredFor(t, salesWFNode, instanceID, "invoice_timeout", fixedClock().Add(120*time.Second)))
 	c.inState("sales_listening")
-	if entry := lastLog(t, c.rt, instanceID); entry.Summary != "unhandled event TIMER_FIRED from SY.timer@worker1 in state sales_listening" {
-		t.Fatalf("the stale fire: %+v", entry)
+	if entry := lastLog(t, c.rt, instanceID); entry != logged || len(c.disp.sent) != sent {
+		t.Fatalf("the stale fire reached the instance: %+v", entry)
 	}
 
 	// The due date fires; payments does not answer in time: the check ends, noted, and the

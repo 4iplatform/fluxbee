@@ -192,11 +192,12 @@ func (c *seedConversation) inState(state string) string {
 func (c *seedConversation) fire(instanceID, key string) {
 	c.t.Helper()
 	ref := timerClientRef(instanceID, key)
-	if _, ok := c.timer.pending[ref]; !ok {
+	at, ok := c.timer.pending[ref]
+	if !ok {
 		c.t.Fatalf("%s is not pending: %v", key, c.timer.pending)
 	}
 	delete(c.timer.pending, ref)
-	c.dispatch(timerFiredFor(c.t, seedWFNode, instanceID, key))
+	c.dispatch(timerFiredFor(c.t, seedWFNode, instanceID, key, at))
 }
 
 // The seeds' sales.consult on the engine: sales' answers reach the person in whatever state they

@@ -700,26 +700,180 @@ WHEN NEW.input_json = '{"text":"first"}' BEGIN SELECT RAISE(ABORT, 'disk I/O err
 	}
 }
 
-// A creation an engine of before FINDINGS A-135 journaled without a thread, and a crash left, starts
-// nothing at the next start: a WF never makes up a thread. It is dropped, and the node goes on.
-func TestAReplayedCreationWithNoThreadStartsNothing(t *testing.T) {
+// relistenedWorkflowJSON is listeningWorkflowJSON redeployed to start from IO.other: it still hears
+// IO.in, and a WF.upstream's message ends it.
+const relistenedWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "listening",
+  "start_from": ["IO.other@motherbee"],
+  "input_schema": {"type": "object", "required": ["text"]},
+  "initial_state": "listening",
+  "terminal_states": ["done"],
+  "states": [
+    {
+      "name": "listening",
+      "entry_actions": [{"type": "set_variable", "name": "heard", "value": "[event.payload.text]"}],
+      "transitions": [
+        {"event_match": {"src": "IO.in@motherbee"}, "guard": "true", "actions": [{"type": "set_variable", "name": "heard", "value": "state.heard + [event.payload.text]"}]},
+        {"event_match": {"src": "WF.upstream@motherbee"}, "guard": "true", "target_state": "done"}
+      ]
+    },
+    {"name": "done"}
+  ]
+}`
+
+// A creation a crash left journaled, which starts nothing at the next start, is dropped and answered
+// as live dispatch answers it (wf-orchestration-v1 §5.4.6): one an engine of before FINDINGS A-135
+// journaled with no thread (no_thread), one from a node the current definition no longer starts from
+// (no_conversation), and one its input_schema refuses (invalid_input). Who hears is answerNotTaken's
+// rule: an IO node, for each; a WF only for a named request, and only no_thread or invalid_input; a
+// node the current definition does not involve, never.
+func TestAReplayedCreationThatStartsNothingIsAnswered(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wf.db")
 	rt, _ := newTestRuntime(t, path, listeningWorkflowJSON, nil)
-	threadless := from("IO.in@motherbee", msgWithNameAndPayload("", map[string]any{"text": "left"}))
-	threadless.Meta.Msg = nil
-	if _, err := rt.journal(context.Background(), "wfi:threadless", inboundCreate, threadless, ""); err != nil {
-		t.Fatal(err)
+	journal := func(instanceID, sender, name, thread string, payload map[string]any) {
+		t.Helper()
+		msg := from(sender, msgWithNameAndPayload(name, payload))
+		msg.Routing.Src, msg.Routing.TraceID = sender+"-uuid", "trace-"+instanceID
+		if name == "" {
+			msg.Meta.Msg = nil
+		}
+		if thread != "" {
+			msg.Meta.ThreadID = &thread
+		}
+		if _, err := rt.journal(context.Background(), instanceID, inboundCreate, msg, ""); err != nil {
+			t.Fatal(err)
+		}
 	}
+	journal("wfi:threadless", "IO.in@motherbee", "", "", map[string]any{"text": "left"})
+	journal("wfi:moved", "IO.in@motherbee", "", "conv-moved", map[string]any{"text": "hi"})
+	journal("wfi:refused", "IO.other@motherbee", "", "conv-refused", map[string]any{"note": "no text"})
+	journal("wfi:upstream-threadless", "WF.upstream@motherbee", "START", "", map[string]any{"text": "hi"})
+	journal("wfi:upstream", "WF.upstream@motherbee", "START", "conv-upstream", map[string]any{"text": "hi"})
+	journal("wfi:upstream-text", "WF.upstream@motherbee", "", "", map[string]any{"text": "hi"})
+	journal("wfi:stranger", "IO.stranger@motherbee", "", "conv-stranger", map[string]any{"text": "hi"})
 
-	rt, disp := newTestRuntime(t, path, listeningWorkflowJSON, &mockTimerLister{})
+	// The node starts again on the definition redeployed.
+	rt, disp := newTestRuntime(t, path, relistenedWorkflowJSON, &mockTimerLister{})
 	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatal(err)
 	}
-	if rows, _ := rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 || len(disp.sent) != 0 {
-		t.Fatalf("the creation started an instance: %+v, sent %+v", rows, disp.sent)
+	if rows, _ := rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 {
+		t.Fatalf("a creation started an instance: %+v", rows)
 	}
 	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
-		t.Fatalf("the creation is dropped: %+v", events)
+		t.Fatalf("the creations are dropped: %+v", events)
+	}
+	var answered []string
+	for _, msg := range disp.sent {
+		answered = append(answered, fmt.Sprintf("%s to %s on %q (%s)", notTakenReason(t, msg), msg.Routing.Dst.Value(), derefString(msg.Meta.ThreadID), msg.Routing.TraceID))
+	}
+	want := []string{
+		`no_thread to IO.in@motherbee-uuid on "" (trace-wfi:threadless)`,
+		`no_conversation to IO.in@motherbee-uuid on "conv-moved" (trace-wfi:moved)`,
+		`invalid_input to IO.other@motherbee-uuid on "conv-refused" (trace-wfi:refused)`,
+		`no_thread to WF.upstream@motherbee-uuid on "" (trace-wfi:upstream-threadless)`,
+	}
+	if strings.Join(answered, "; ") != strings.Join(want, "; ") {
+		t.Fatalf("the replayed creations' answers:\n got %v\nwant %v", answered, want)
+	}
+}
+
+// personWorkflowJSON starts on IO.channel's messages, the people of a channel, and writes AI.host at
+// each message: the people's, the team's (IO.team) and the agent's own answers.
+const personWorkflowJSON = `{
+  "wf_schema_version": "1",
+  "workflow_type": "person",
+  "start_from": ["IO.channel@motherbee"],
+  "input_schema": {"type": "object"},
+  "initial_state": "noting",
+  "terminal_states": ["done"],
+  "states": [
+    {
+      "name": "noting",
+      "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "NOTE"}, "payload": {"text": "first"}}],
+      "transitions": [
+        {"event_match": {"src": "IO.channel@motherbee"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "NOTE"}, "payload": {"text": "person"}}]},
+        {"event_match": {"src": "IO.team@motherbee"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "NOTE"}, "payload": {"text": "team"}}]},
+        {"event_match": {"src": "AI.host@motherbee"}, "guard": "true",
+         "actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "NOTE"}, "payload": {"text": "agent"}}]}
+      ]
+    },
+    {"name": "done"}
+  ]
+}`
+
+// The instance's person is the src_ilk its start_from nodes' messages share (wf-orchestration-v1
+// §5.4.3): a send_message carries it, whoever else writes on the thread (the team's IO node, an
+// agent), and a message of theirs with no src_ilk changes nothing. A message from a start_from node
+// with another person, as on a Slack channel's top level, where io.slack gives everyone one thread,
+// leaves the instance with no single person: its own messages carry none from then on, after a
+// restart too, and the node's log says so once. Before, they carried the first writer's identity, and
+// an agent bound per-person state to it for everyone.
+func TestAThreadSeveralPeopleWriteOnLeavesTheInstanceNoPerson(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wf.db")
+	rt, disp := newTestRuntime(t, path, personWorkflowJSON, nil)
+	const ana, anaICH, bruno, brunoICH = "ilk:00000000-0000-4000-8000-0000000000a1", "ich:slack:ana", "ilk:00000000-0000-4000-8000-0000000000b2", "ich:slack:bruno"
+	say := func(sender, ilk, ich string) {
+		t.Helper()
+		thread := "conv-channel"
+		msg := from(sender, sdk.Message{Routing: sdk.Routing{Src: "x-uuid", TraceID: "trace-" + ilk}, Meta: sdk.Meta{MsgType: "user", ThreadID: &thread}, Payload: json.RawMessage(`{"text":"hi"}`)})
+		if ilk != "" {
+			msg.Meta.SrcIlk = &ilk
+		}
+		if ich != "" {
+			msg.Meta.Ich = &ich
+		}
+		if err := Dispatch(context.Background(), msg, rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// carries is the person the WF's last message to the agent carries.
+	carries := func() string {
+		t.Helper()
+		msg := sentTo(t, disp, "AI.host@motherbee")
+		return strings.TrimSpace(derefString(msg.Meta.SrcIlk) + " " + derefString(msg.Meta.Ich))
+	}
+
+	// One person: every message the WF writes carries them.
+	say("IO.channel@motherbee", ana, anaICH)
+	say("IO.team@motherbee", "ilk:00000000-0000-4000-8000-0000000000cc", "ich:slack:juan")
+	say("AI.host@motherbee", "ilk:00000000-0000-4000-8000-0000000000dd", "")
+	say("IO.channel@motherbee", "", "")
+	say("IO.channel@motherbee", ana, anaICH)
+	if len(disp.sent) != 5 || carries() != ana+" "+anaICH {
+		t.Fatalf("one person's instance: %d sends, the last carries %q", len(disp.sent), carries())
+	}
+
+	// Bruno writes on the same thread: the instance has no single person.
+	logged := nodeLog(t, func() {
+		say("IO.channel@motherbee", bruno, brunoICH)
+		if carries() != "" {
+			t.Fatalf("with two people, the WF's message carries %q", carries())
+		}
+		say("IO.channel@motherbee", ana, anaICH)
+		if carries() != "" {
+			t.Fatalf("once two people write, the WF's message carries %q", carries())
+		}
+	})
+	if strings.Count(logged, "more than one person writes on thread conv-channel") != 1 {
+		t.Fatalf("the node's log says so once: %s", logged)
+	}
+	inst, _ := rt.Registry.GetByThread("conv-channel")
+	if row := mustGetInstance(t, rt, inst.InstanceID); row.PersonILK != "" || row.PersonICH != "" {
+		t.Fatalf("the store keeps no person: %+v", row)
+	}
+
+	// After a restart, still none.
+	rt, disp = newTestRuntime(t, path, personWorkflowJSON, &mockTimerLister{})
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatal(err)
+	}
+	say("IO.channel@motherbee", ana, anaICH)
+	if carries() != "" {
+		t.Fatalf("after a restart, the WF's message carries %q", carries())
 	}
 }
 

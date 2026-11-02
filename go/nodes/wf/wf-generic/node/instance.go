@@ -84,6 +84,7 @@ type WFInstance struct {
 	// PersonILK and PersonICH are the instance's person, the src_ilk and ich of the message that
 	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) carries them, so
 	// an agent files it under the person, as it does a forwarded one (the rest of FINDINGS A-116).
+	// Both go when a message from a start_from node carries another person (notePerson).
 	PersonILK string
 	PersonICH string
 	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit
@@ -240,6 +241,7 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	if startsATrigger(event, actx.Dispatcher.NodeL2Name()) {
 		inst.calls = agentCalls{}
 	}
+	inst.notePerson(event)
 
 	// Find the current state definition
 	stateDef := inst.findState(inst.CurrentState)
@@ -261,8 +263,9 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		// The default: the event is logged, in the instance's log and in the node's (both local,
 		// wf-orchestration-v1 §5.3.2), and the instance stays where it was. An IO node's message is
 		// answered NOT_TAKEN (not_expected): nothing from an IO ends in silence (§5.4.6), and the IO
-		// node shows it to whoever wrote. Its send is no action of the definition: a failure is logged,
-		// and the event is consumed all the same.
+		// node shows it to whoever wrote. That answer is a notice, no action of the definition: it goes
+		// once the commit consumed the event, so a start that runs the event again after a crash sends
+		// it once, and a failure to send it is logged.
 		log.Printf("instance %s: unhandled event %s in state %s (trace_id=%s): no transition of the state nor of the catch takes it",
 			inst.InstanceID, eventName(event), inst.CurrentState, event.Routing.TraceID)
 		now := nowMS(actx.Clock)
@@ -274,15 +277,15 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 			OK:          false,
 			ErrorDetail: "no matching transition",
 		})
-		detail := fmt.Sprintf("the conversation's instance is in state %s, where no transition and no catch takes the message", inst.CurrentState)
-		if err := answerNotTaken(actx, event, notTakenNotExpected, detail); err != nil {
-			log.Printf("instance %s: %v", inst.InstanceID, err)
-		}
 		if taken.durable() {
 			inst.UpdatedAtMS = now
 			if err := inst.commit(ctx, actx, taken.mutation()); err != nil {
 				return fmt.Errorf("consume unhandled event: %w", err)
 			}
+		}
+		detail := fmt.Sprintf("the conversation's instance is in state %s, where no transition and no catch takes the message", inst.CurrentState)
+		if err := answerNotTaken(actx, event, notTakenNotExpected, detail); err != nil {
+			log.Printf("instance %s: %v", inst.InstanceID, err)
 		}
 		return nil
 	}
@@ -364,6 +367,26 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	})
 
 	return nil
+}
+
+// notePerson keeps the instance's person only while the messages from its start_from nodes share it.
+// A message from one of them with another, non-empty src_ilk means several people write on the
+// instance's thread (io.slack gives a Slack channel's top level one thread for everyone): the
+// instance has no single person, and its person goes, the node's log says so once, and the event's
+// commit writes it. The WF's own messages carry none from then on: an agent binds per-person state to
+// a message's src_ilk, and the first writer's would mix with the others'. A message from any other
+// node (the team's IO node, an agent) never counts.
+func (inst *WFInstance) notePerson(event sdk.Message) {
+	if inst.PersonILK == "" && inst.PersonICH == "" {
+		return
+	}
+	writer := derefStringPtr(event.Meta.SrcIlk)
+	if writer == "" || writer == inst.PersonILK || !inst.def.StartsFrom(event.SourceL2Name()) {
+		return
+	}
+	log.Printf("instance %s: more than one person writes on thread %s (%s, now %s): the instance has no single person, and its own messages carry none from now on",
+		inst.InstanceID, inst.ThreadID, inst.PersonILK, writer)
+	inst.PersonILK, inst.PersonICH = "", ""
 }
 
 // commit writes the instance as it is now, with mutation, in one transaction: with the messages it

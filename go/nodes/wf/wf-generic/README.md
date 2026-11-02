@@ -12,9 +12,12 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   (a message without one starts none: a WF never makes up a thread), and every message it sends
   carries that thread: the agents keep one memory per conversation, and their answers, and the
   person's next message, come back to it. A `send_message` carries the instance's person too, the
-  `src_ilk` and `ich` of the message that started it. A definition names in `start_from` the nodes
-  whose messages start an instance, and only the nodes it names (`start_from`, `event_match.src`,
-  the targets of its sends) drive one; anyone else is dropped, never answered (FINDINGS A-123).
+  `src_ilk` and `ich` of the message that started it, while the messages of its `start_from` nodes
+  share it: once one carries another person (a thread several people write on, as a Slack
+  channel's top level), the instance has no person, and its sends carry none. A definition names in
+  `start_from` the nodes whose messages start an instance, and only the nodes it names
+  (`start_from`, `event_match.src`, the targets of its sends) drive one; anyone else is dropped,
+  never answered (FINDINGS A-123).
   `start_from` names IO nodes and WFs, never an agent or a `SY.*`/`RT.*` node. `thread_id_ref` left
   the language.
 - **The upgrade to 0.1.91.** A definition written before it has no `start_from` and no longer
@@ -66,11 +69,14 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   (`replay_exhausted`). The store commits with `synchronous=FULL`.
 - **Timers.** A fired timer's key is `event.timer_key`. A `TIMER_FIRED` is taken only from SY.timer
   of the node's hive (`sy_timer_l2_name` must name it), only for a timer this node scheduled
-  (`owner_l2_name`), and by its `client_ref` alone; a fired timer's index row goes with it, so a
-  restart does not fire it again. A restart fires the timers it missed in the order they fire,
-  reading each row again first. If SY.timer does not answer at start, the node starts `DEGRADED`
-  and reconciles its timers when SY.timer answers; a timer SY.timer never got is scheduled again
-  then, and one scheduled after the list was asked is left alone.
+  (`owner_l2_name`), by its `client_ref` alone, and only while the instance has that timer in the
+  index at that time: a fire of a timer it cancelled is dropped, and so is one of a timer it moved
+  (a `TIMER_CANCEL` or a `TIMER_RESCHEDULE` goes fire-and-forget), which is scheduled again at its
+  `fire_at`. A fired timer's index row goes with it, so a restart does not fire it again. A
+  restart fires the timers it missed in the order they fire, reading each row again first. If
+  SY.timer does not answer at start, the node starts `DEGRADED` and reconciles its timers when
+  SY.timer answers; a timer SY.timer never got is scheduled again then, and one scheduled after the
+  list was asked is left alone.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in
   snake_case keys. A router notice and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) are never
@@ -83,7 +89,9 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   (it has none), `no_conversation` (no instance holds its thread, and it starts none),
   `invalid_input` (`input_schema` refuses it) or `not_expected` (its instance took nothing). An
   `IO.*` node gets it for any message, named or not; any other sender only for a named request, and
-  only `no_thread` and `invalid_input`. It took `INVALID_INPUT`'s place.
+  only `no_thread` and `invalid_input`; a WF and an agent act on none. A start that drops a
+  creation a crash left, which starts nothing now, answers it the same way. The default's
+  `not_expected` goes once its event is consumed. It took `INVALID_INPUT`'s place.
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default
   (`{"$ref": "event.context", "default": {}}`, taken for a missing or `null` field); a `$ref` holds
   only `$ref` and `default`, and its default is a literal. The state holds plain JSON, and a JSON

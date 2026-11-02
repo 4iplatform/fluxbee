@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
@@ -85,7 +86,7 @@ func (r *InstanceRegistry) All() []*WFInstance {
 // one. The strict correlation order (wf-orchestration-v1 §5.2.1, item 3, and §5.4.10):
 //
 //  1. TIMER_FIRED, from SY.timer of the WF's own hive, for a timer this node scheduled → the instance
-//     its client_ref names
+//     its client_ref names, when the instance has that timer, at that time (takeTimerFired)
 //  2. from a sender the definition does not involve (no node of its start_from, of an
 //     event_match.src or a target of its sends: FINDINGS A-123) → dropped, never answered; on the
 //     thread of a running instance, that instance's definition decides, otherwise the current one
@@ -100,8 +101,9 @@ func (r *InstanceRegistry) All() []*WFInstance {
 // A NOT_TAKEN goes to whoever answerNotTaken says: an IO node for any message that is no reply and no
 // notice; anyone else only for a named request, and only no_thread and invalid_input. So a person who
 // writes again after their conversation's instance ended starts a new one, on the same thread, at the
-// initial state; a supervisor's message on a thread no instance holds hears that no conversation
-// takes it; an agent's late answer starts nothing, and is never answered.
+// initial state; a supervisor who writes on a thread no instance holds is shown, by their IO node,
+// that no conversation takes the message; an agent's late answer starts nothing, and is never
+// answered.
 //
 // The node's log gets a payload's first characters only for a message that reaches an instance or
 // starts one: when every message of a node comes to the WF (a Slack channel's, say), the log must
@@ -143,23 +145,48 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 	if !hasThread {
 		log.Printf("wf: ignoring %s from %q (trace_id=%s): it has no thread, and a WF never makes one up",
 			msgName(msg), sender, msg.Routing.TraceID)
-		return answerNotTaken(rt.ActCtx, msg, notTakenNoThread, "the message has no thread_id, and a WF never makes one up")
+		return answerNotTaken(rt.ActCtx, msg, notTakenNoThread, noThreadDetail)
 	}
 	if !rt.Def.StartsFrom(sender) || isReply(name) {
 		// SY.timer's answers to the engine's own timer requests never get here (it is no node of the
 		// definition), and an agent's late answer ends here.
 		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): no running instance on its thread, and it starts none",
 			msgName(msg), sender, threadID, msg.Routing.TraceID)
-		return answerNotTaken(rt.ActCtx, msg, notTakenNoConversation,
-			fmt.Sprintf("no running instance holds thread %q, and a message from %s starts none", threadID, sender))
+		return answerNotTaken(rt.ActCtx, msg, notTakenNoConversation, noConversationDetail(threadID, sender))
 	}
 	return rt.create(ctx, msg)
 }
+
+// noThreadDetail and noConversationDetail are the details of a NOT_TAKEN no_thread and
+// no_conversation, as live dispatch and recovery's replay of a creation give them.
+const noThreadDetail = "the message has no thread_id, and a WF never makes one up"
+
+func noConversationDetail(threadID, sender string) string {
+	return fmt.Sprintf("no running instance holds thread %q, and a message from %s starts none", threadID, sender)
+}
+
+// timerFireTolerance is how much earlier than the timer's fire_at in the index a fire may say it was
+// scheduled for, and still be that timer's: SY.timer counts a fire_in from when it gets the schedule,
+// after the WF counted it, so its time is the index's or a little later.
+const timerFireTolerance = 2 * time.Second
 
 // takeTimerFired takes a TIMER_FIRED only from SY.timer of the WF's own hive, the one its timers are
 // scheduled on, and only for a timer this node scheduled: anyone else could fire an instance's timer
 // by its client_ref, and SY.timer lets any node schedule a timer whose fire goes to another, under
 // SY.timer's own name (FINDINGS A-119). A refused or orphaned fire is dropped, never answered.
+//
+// It takes a fire only for the timer the instance has in the index now. TIMER_CANCEL and
+// TIMER_RESCHEDULE go fire-and-forget, so a fire already on its way when the instance cancelled or
+// moved its timer, or one SY.timer sends after a cancel or a reschedule it never got, still comes:
+//   - the index has no such timer (the instance cancelled it, or took its fire already): the fire is
+//     dropped;
+//   - the index has it at a later fire_at than the fire was scheduled for (the instance moved it, or
+//     scheduled the key again, which SY.timer takes as the pending timer it has): the fire is
+//     dropped, and the timer is scheduled again at its fire_at. SY.timer fires a timer once, so this
+//     fire was its only one, and the timer would never fire otherwise.
+//
+// Recovery's fires of the timers lost while the node was down come from the index itself, and go to
+// the instance without this check (fireMissedTimer).
 func (rt *NodeRuntime) takeTimerFired(ctx context.Context, msg sdk.Message) error {
 	authority := timerAuthority(rt.NodeName)
 	if sender := msg.SourceL2Name(); sender != authority {
@@ -186,8 +213,30 @@ func (rt *NodeRuntime) takeTimerFired(ctx context.Context, msg sdk.Message) erro
 		log.Printf("wf: TIMER_FIRED %q for instance %q, which is not running: dropped (orphaned timer)", timerKey, instanceID)
 		return nil
 	}
+	timer, pending, err := rt.Store.GetTimerForInstance(ctx, instanceID, timerKey)
+	if err != nil {
+		return fmt.Errorf("TIMER_FIRED %q for instance %s: read its timer: %w", timerKey, instanceID, err)
+	}
+	if !pending {
+		log.Printf("wf: TIMER_FIRED %q for instance %s dropped (trace_id=%s): the instance has no such timer (it cancelled it, or took its fire already)",
+			timerKey, instanceID, msg.Routing.TraceID)
+		return nil
+	}
+	if timer.FireAtMS > fired.ScheduledFireAtUTCMS+timerFireTolerance.Milliseconds() {
+		log.Printf("wf: TIMER_FIRED %q for instance %s dropped (trace_id=%s): it was scheduled for %s, and the instance moved the timer to %s, when it is scheduled again",
+			timerKey, instanceID, msg.Routing.TraceID, msTime(fired.ScheduledFireAtUTCMS), msTime(timer.FireAtMS))
+		if rt.ActCtx.Timer != nil {
+			rt.scheduleAgain(ctx, timer, nowMS(rt.ActCtx.Clock))
+		}
+		return nil
+	}
 	log.Printf("wf: correlate matched timer_key=%s instance_id=%s payload=%s", timerKey, instanceID, payloadPreview(msg.Payload))
 	return rt.deliver(ctx, inst, msg, timerKey)
+}
+
+// msTime is a time in Unix milliseconds as the node's log writes it.
+func msTime(ms int64) string {
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
 }
 
 // deliver gives msg to inst at least once: it is journaled first, and its transition's commit
@@ -445,10 +494,14 @@ const (
 //   - an IO node (IO.*), for any message that is no reply and no notice, named or not: someone who
 //     writes is looking for a result, and the IO node shows it to them;
 //   - any other sender, only for a named request (neverAnswered), and only for no_thread and
-//     invalid_input, as INVALID_INPUT before it. A NOT_TAKEN to another WF's NOT_TAKEN would bounce
-//     between the two forever (FINDINGS A-119), and an agent's late answer starts nothing, unanswered.
+//     invalid_input, as INVALID_INPUT before it: the answer a named request's caller may wait for,
+//     on its trace. A WF and an agent act on none: a WF drops every system message but a
+//     TIMER_FIRED, and ai.generic ignores a system message it does not know. A NOT_TAKEN to another
+//     WF's NOT_TAKEN would bounce between the two forever (FINDINGS A-119), and an agent's late answer
+//     starts nothing, unanswered.
 //
-// A sender the definition does not involve never gets here (dispatchWorkflowEvent drops it first).
+// A sender the definition does not involve never gets here (dispatchWorkflowEvent, and recovery's
+// replay of a creation, drop it first).
 func answerNotTaken(actx ActionContext, msg sdk.Message, reason, detail string) error {
 	switch name := rawMsgName(msg); {
 	case actx.Dispatcher == nil || isNotice(msg) || isReply(name):

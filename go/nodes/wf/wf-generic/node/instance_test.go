@@ -612,6 +612,10 @@ func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
 	row, _ := inst.ToRow(fixedClock)
 	_ = rt.Store.CreateInstance(context.Background(), row)
 	rt.Registry.Add(inst)
+	// The instance's timer, in the index: a fire is taken only for a timer the instance has.
+	if err := rt.Store.RegisterTimer(context.Background(), "wfi:timer-test", "invoice_timeout", 1776099700000, 1776100000000); err != nil {
+		t.Fatal(err)
+	}
 
 	// Build a TIMER_FIRED message for this instance
 	clientRef := timerClientRef("wfi:timer-test", "invoice_timeout")

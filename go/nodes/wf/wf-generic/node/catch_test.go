@@ -117,10 +117,10 @@ func TestTheMenuGoesInTheWFBlockAsWritten(t *testing.T) {
 	}
 }
 
-// catchingWorkflowJSON asks AI.host with a menu. The state takes the agent's yes; its catch takes
-// the agent's none (to declined, through the state's exit actions and declined's entry actions), a
-// PING the state's guard refuses (internal), any error and any timer's fire (an empty event_match).
-// Anything else is the default's.
+// catchingWorkflowJSON asks AI.host with a menu, with a timer late that no state takes. The state
+// takes the agent's yes; its catch takes the agent's none (to declined, through the state's exit
+// actions and declined's entry actions), a PING the state's guard refuses (internal), any error and
+// any timer's fire (an empty event_match). Anything else is the default's.
 const catchingWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "catching",
@@ -141,7 +141,10 @@ const catchingWorkflowJSON = `{
   "states": [
     {
       "name": "asking",
-      "entry_actions": [{"type": "forward", "target": "AI.host@motherbee", "menu": {"options": [{"name": "yes", "description": "It is yes."}]}}],
+      "entry_actions": [
+        {"type": "forward", "target": "AI.host@motherbee", "menu": {"options": [{"name": "yes", "description": "It is yes."}]}},
+        {"type": "schedule_timer", "timer_key": "late", "fire_in": "5m"}
+      ],
       "exit_actions": [{"type": "set_variable", "name": "left", "value": "'asking'"}],
       "transitions": [
         {"event_match": {"src": "AI.host@motherbee"}, "guard": "event.context.evaluation.option == 'yes'", "target_state": "done"},
@@ -205,7 +208,7 @@ func TestTheCatchTakesWhatTheStateDoesNot(t *testing.T) {
 		t.Fatalf("the instance's log: %+v", entry)
 	}
 	dispatch(agentAnswer(t, "AI.host@motherbee", request, `{"type":"error","code":"invalid_structured_output","message":"unknown_option:maybe"}`, nil))
-	if err := Dispatch(context.Background(), realTimerFired(t, stays, "late"), rt); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, rt, stays, "late"), rt); err != nil {
 		t.Fatal(err)
 	}
 	state = mustState(t, rt, stays)
@@ -256,8 +259,9 @@ func TestWithoutACatchTheDefaultLogs(t *testing.T) {
 }
 
 // loopingWorkflowJSON asks AI.host again at each of its answers, a loop the cap on agent calls stops;
-// a message of IO.in and a timer's fire ask it too. The catch takes the cap's AGENT_CALL_CAP: it
-// keeps the error, asks the agent once more (past the cap, so not sent) and tells IO.out.
+// a message of IO.in and the fire of its timer tick ask it too. The catch takes the cap's
+// AGENT_CALL_CAP: it keeps the error, asks the agent once more (past the cap, so not sent) and tells
+// IO.out.
 const loopingWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "looping",
@@ -276,7 +280,10 @@ const loopingWorkflowJSON = `{
   "states": [
     {
       "name": "asking",
-      "entry_actions": [{"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "go"}}],
+      "entry_actions": [
+        {"type": "send_message", "target": "AI.host@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "go"}},
+        {"type": "schedule_timer", "timer_key": "tick", "fire_in": "5m"}
+      ],
       "transitions": [
         {"event_match": {"src": "AI.host@motherbee"}, "guard": "true",
          "actions": [
@@ -377,7 +384,7 @@ func TestTheCapOnAgentCallsStopsALoop(t *testing.T) {
 	}
 
 	// A timer's fire is a trigger too.
-	if err := Dispatch(context.Background(), realTimerFired(t, instanceID, "tick"), rt); err != nil {
+	if err := Dispatch(context.Background(), realTimerFired(t, rt, instanceID, "tick"), rt); err != nil {
 		t.Fatal(err)
 	}
 	if count("AI.host@motherbee") != 17 {
@@ -468,7 +475,7 @@ func TestWhatStartsATrigger(t *testing.T) {
 		msg  sdk.Message
 		want bool
 	}{
-		"SY.timer's TIMER_FIRED":       {realTimerFired(t, "wfi:1", "k"), true},
+		"SY.timer's TIMER_FIRED":       {timerFiredAt(t, "wfi:1", "k", nowMS(fixedClock)), true},
 		"recovery's TIMER_FIRED":       {buildSyntheticTimerFired("wfi:1", "k", "wf:wfi:1::k", sdk.TimerInfo{OwnerL2Name: testNodeName}, fixedClock), true},
 		"an IO node's message":         {named("IO.api.sales@worker1", "user", ""), true},
 		"a WF's message":               {named("WF.upstream@motherbee", "user", "ASK"), true},

@@ -32,6 +32,9 @@ type RecoverOptions struct {
 //     event, or a creation, under the instance_id it had (at least once), when the current
 //     definition still starts from its sender; a creation whose thread a running instance holds
 //     (a later message started it while the creation's commit had failed) is that instance's event;
+//     a creation that starts nothing (it has no thread, the current definition does not start from
+//     its sender, or its input_schema refuses it) is dropped and answered as live dispatch answers
+//     it, NOT_TAKEN;
 //  4. the timer index against SY.timer. When SY.timer does not answer, the node starts anyway,
 //     DEGRADED (timersPending), and the receive loop reconciles when it answers;
 //  5. the definitions no running instance uses are dropped.
@@ -158,16 +161,31 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 		return fmt.Errorf("recover: list inbound events: %w", err)
 	}
 	for _, row := range rows {
-		drop := func(why string) {
+		// drop reports whether the event left the journal.
+		drop := func(why string) bool {
 			log.Printf("recover: inbound event %d (%s for %s) dropped: %s", row.EventID, row.Kind, row.InstanceID, why)
 			if err := rt.Store.DeleteInboundEvent(ctx, row.EventID); err != nil {
 				log.Printf("recover: drop inbound event %d: %v", row.EventID, err)
+				return false
 			}
+			return true
 		}
 		var msg sdk.Message
 		if err := json.Unmarshal([]byte(row.MessageJSON), &msg); err != nil {
 			drop(fmt.Sprintf("not a message: %v", err))
 			continue
+		}
+		// refuse drops a creation that starts nothing, and then answers it as live dispatch does: a
+		// NOT_TAKEN to whoever answerNotTaken says, never to a sender the current definition does not
+		// involve (FINDINGS A-123). The answer goes once the drop went, so a later start does not send
+		// it again.
+		refuse := func(reason, why, detail string) {
+			if !drop(why) || !rt.Def.Involves(msg.SourceL2Name()) {
+				return
+			}
+			if err := answerNotTaken(rt.ActCtx, msg, reason, detail); err != nil {
+				log.Printf("recover: inbound event %d: %v", row.EventID, err)
+			}
 		}
 		if row.Attempts >= maxReplayAttempts {
 			rt.giveUpInbound(ctx, row, msg)
@@ -190,7 +208,7 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 			// never makes one up, so it starts nothing.
 			threadID := derefStringPtr(msg.Meta.ThreadID)
 			if strings.TrimSpace(threadID) == "" {
-				drop("it has no thread, and a WF never makes one up")
+				refuse(notTakenNoThread, "it has no thread, and a WF never makes one up", noThreadDetail)
 				continue
 			}
 			// A running instance holds the message's thread: one a later message started while this
@@ -211,12 +229,13 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 				continue
 			}
 			if !rt.Def.StartsFrom(msg.SourceL2Name()) {
-				drop(fmt.Sprintf("the current definition does not start from %q", msg.SourceL2Name()))
+				refuse(notTakenNoConversation, fmt.Sprintf("the current definition does not start from %q", msg.SourceL2Name()),
+					noConversationDetail(threadID, msg.SourceL2Name()))
 				continue
 			}
 			input, err := creationInput(rt.Def, msg)
 			if err != nil {
-				drop(fmt.Sprintf("the current definition takes no such input: %v", err))
+				refuse(notTakenInvalidInput, fmt.Sprintf("the current definition takes no such input: %v", err), err.Error())
 				continue
 			}
 			if err := rt.runCreation(ctx, msg, row.InstanceID, input, row.EventID); err != nil {
@@ -415,9 +434,10 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 }
 
 // scheduleAgain schedules again, at its fire_at (SY.timer's minimum ahead at least), a timer of the
-// index SY.timer does not have: its schedule went while SY.timer did not answer, or SY.timer lost it.
-// SY.timer keeps a pending timer with the same client_ref, so it never fires twice. The index does
-// not keep the timer's missed_policy: the new schedule has SY.timer's default, fire.
+// index SY.timer does not have: its schedule went while SY.timer did not answer, SY.timer lost it, or
+// SY.timer fired it at a time the instance had moved it from (takeTimerFired). SY.timer keeps a
+// pending timer with the same client_ref, so it never fires twice. The index does not keep the
+// timer's missed_policy: the new schedule has SY.timer's default, fire.
 func (rt *NodeRuntime) scheduleAgain(ctx context.Context, row TimerRow, nowMS int64) {
 	in := time.Duration(row.FireAtMS-nowMS) * time.Millisecond
 	if in < minTimerDuration {
