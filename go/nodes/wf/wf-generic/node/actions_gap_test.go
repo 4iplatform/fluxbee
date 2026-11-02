@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -161,12 +162,13 @@ func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	}
 }
 
-// Without a meta.context or vars, a send still carries the WF's block, with its trail; the thread of
-// an instance started by a message without one is the instance's own id.
+// Without a meta.context or vars, a send still carries the WF's block, with its trail, and the
+// instance's thread; without a person (the message that started the instance had no src_ilk nor
+// ich), it carries none.
 func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap2"}
 	actx := makeActx(t, disp, &mockTimerSender{})
-	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-2", "invoice", map[string]any{}, fixedClock)
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-2", "conv-2", "invoice", map[string]any{}, fixedClock)
 	action := ActionDefinition{
 		Type:    "send_message",
 		Target:  "AI.host@motherbee",
@@ -176,10 +178,56 @@ func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 	if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {
 		t.Fatalf("execSendMessage: %v", err)
 	}
-	if got := derefStringPtr(disp.sent[0].Meta.ThreadID); got != "wfi:inst-2" {
-		t.Fatalf("the thread of an instance started without one is its id, got %q", got)
+	if got := derefStringPtr(disp.sent[0].Meta.ThreadID); got != "conv-2" {
+		t.Fatalf("a send carries the instance's thread, got %q", got)
 	}
 	if got := string(disp.sent[0].Meta.Context); got != `{"wf":{"trail":["WF.invoice@motherbee"]}}` {
 		t.Fatalf("meta.context: %s", got)
+	}
+	if meta := disp.sent[0].Meta; meta.SrcIlk != nil || meta.Ich != nil {
+		t.Fatalf("no person: %+v", meta)
+	}
+}
+
+// Case 4 (wf-orchestration-v1 §5.4.10): a send carries the instance's person, the src_ilk and ich of
+// the message that started it, so an agent files the WF's own message under the person (the rest of
+// FINDINGS A-116); and a send to an IO node carries the action's subject in the WF's block, which
+// the IO node places it by.
+func TestASendCarriesThePersonAndTheSubject(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.sales@motherbee", uuid: "wf-uuid-person"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-3", "conv-3", "invoice", map[string]any{}, fixedClock)
+	inst.PersonILK, inst.PersonICH = "ilk:person", "ich:api:conv-3"
+	toAgent := ActionDefinition{Type: "send_message", Target: "AI.payments@motherbee", Meta: &ActionMeta{Msg: "PAYMENT_DUE"}, Payload: map[string]any{"type": "text", "content": "due"}}
+	toTeam := ActionDefinition{Type: "send_message", Target: "IO.slack.team@motherbee", Subject: "end", Meta: &ActionMeta{Msg: "CLOSE"}, Payload: map[string]any{"type": "text", "content": "closed"}}
+	for _, action := range []ActionDefinition{toAgent, toTeam} {
+		if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {
+			t.Fatalf("execSendMessage: %v", err)
+		}
+	}
+	for _, sent := range disp.sent {
+		if derefStringPtr(sent.Meta.SrcIlk) != "ilk:person" || derefStringPtr(sent.Meta.Ich) != "ich:api:conv-3" || derefStringPtr(sent.Meta.ThreadID) != "conv-3" {
+			t.Fatalf("a send carries the person, on the instance's thread: %+v", sent.Meta)
+		}
+	}
+	if got := string(disp.sent[0].Meta.Context); got != `{"wf":{"trail":["WF.sales@motherbee"]}}` {
+		t.Fatalf("a send without a subject has none: %s", got)
+	}
+	if got := string(disp.sent[1].Meta.Context); got != `{"wf":{"subject":"end","trail":["WF.sales@motherbee"]}}` {
+		t.Fatalf("the subject goes in the WF's block: %s", got)
+	}
+
+	// A forward carries the subject too, and the message's own person, never the instance's.
+	forwarded := from("IO.api.sales@motherbee", sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-person"},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:other"), ThreadID: strPtr("conv-3")},
+		Payload: json.RawMessage(`{"type":"text","content":"hi"}`),
+	})
+	if err := execForward(context.Background(), ActionDefinition{Type: "forward", Target: "IO.slack.team@motherbee", Subject: "same"}, inst, forwarded, actx); err != nil {
+		t.Fatal(err)
+	}
+	sent := disp.sent[2]
+	if derefStringPtr(sent.Meta.SrcIlk) != "ilk:other" || sent.Meta.Ich != nil || string(sent.Meta.Context) != `{"wf":{"subject":"same","trail":["IO.api.sales@motherbee","WF.sales@motherbee"]}}` {
+		t.Fatalf("the forward: %+v %s", sent.Meta, sent.Meta.Context)
 	}
 }

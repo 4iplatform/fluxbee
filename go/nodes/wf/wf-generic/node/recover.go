@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -185,10 +186,17 @@ func (rt *NodeRuntime) replayInbound(ctx context.Context) error {
 			} else if !errors.Is(err, errInstanceNotFound) {
 				return fmt.Errorf("recover: read instance %s: %w", row.InstanceID, err)
 			}
+			// A creation journaled by an engine of before FINDINGS A-135 may have no thread: a WF
+			// never makes one up, so it starts nothing.
+			threadID := derefStringPtr(msg.Meta.ThreadID)
+			if strings.TrimSpace(threadID) == "" {
+				drop("it has no thread, and a WF never makes one up")
+				continue
+			}
 			// A running instance holds the message's thread: one a later message started while this
 			// creation's commit had failed. The message is that instance's event, as live dispatch
 			// takes it, and that instance's commit consumes it.
-			if inst, held := rt.Registry.GetByThread(creationThread(msg, row.InstanceID)); held {
+			if inst, held := rt.Registry.GetByThread(threadID); held {
 				if !inst.def.Involves(msg.SourceL2Name()) {
 					drop(fmt.Sprintf("instance %s holds its thread, and its definition does not involve %q", inst.InstanceID, msg.SourceL2Name()))
 					continue
@@ -351,10 +359,6 @@ func (rt *NodeRuntime) reconcileTimers(ctx context.Context, syTimers []sdk.Timer
 			continue
 		}
 		inst, running := rt.Registry.Get(row.InstanceID)
-		// A cancelling instance's timers are left alone.
-		if running && inst.Status == "cancelling" {
-			continue
-		}
 
 		switch {
 		case existsInSY && syTimer.FireAtUTCMS > now:

@@ -171,7 +171,7 @@ func TestAForwardWithoutAMessageFailsTheInstance(t *testing.T) {
 	waiting[1].Actions = []ActionDefinition{{Type: "forward", Target: "AI.host@motherbee"}}
 	send := func(instanceID string, msg sdk.Message) {
 		t.Helper()
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)
 		}
@@ -218,10 +218,13 @@ const conversationWorkflowJSON = `{
   ]
 }`
 
-// 0.1.91 (items 1 and 3, FINDINGS A-123): an instance lives on the thread of the message that
-// started it, and only the nodes written in the definition drive it. A stranger, an involved node
-// that starts nothing, and a reply start nothing, and none is answered; a person who writes again
-// after the instance ended starts a new one on the same thread.
+// 0.1.91 (items 1 and 3, FINDINGS A-123) and Case 4 (wf-orchestration-v1 §5.4.10): an instance lives
+// on the thread of the message that started it, and only the nodes written in the definition drive
+// it. A stranger, a reply and an agent's message start nothing, and none is answered. An IO node the
+// definition involves hears, with a NOT_TAKEN, why its message went nowhere: it has no thread (a WF
+// never makes one up, A-135), no conversation takes it, the input_schema refuses it, or the instance
+// expects nothing of the kind. A person who writes again after the instance ended starts a new one on
+// the same thread.
 func TestTheCorrelationOrderOfAConversation(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", conversationWorkflowJSON, nil)
 	message := func(sender, name, thread string, payload map[string]any) sdk.Message {
@@ -250,24 +253,52 @@ func TestTheCorrelationOrderOfAConversation(t *testing.T) {
 		return len(rows)
 	}
 
-	// Nothing starts but a start_from node's message that is no reply, and only what the
-	// input_schema takes; a named message it refuses gets its INVALID_INPUT.
+	// notTaken checks that the last message the WF sent is a NOT_TAKEN for msg: to its sender's uuid,
+	// on its thread and trace, with reason.
+	notTaken := func(label string, msg sdk.Message, reason string) {
+		t.Helper()
+		answer := disp.sent[len(disp.sent)-1]
+		if notTakenReason(t, answer) != reason || answer.Routing.Dst.Value() != msg.Routing.Src || answer.Routing.TraceID != msg.Routing.TraceID ||
+			derefString(answer.Meta.ThreadID) != derefString(msg.Meta.ThreadID) {
+			t.Fatalf("%s: a NOT_TAKEN %s to its sender, on its thread and trace: %+v %s", label, reason, answer, answer.Payload)
+		}
+	}
+
+	// Nothing starts but a start_from node's message that is no reply, on a thread, and only what the
+	// input_schema takes. A stranger, an agent and a reply are never answered.
 	for label, msg := range map[string]sdk.Message{
-		"a stranger":                        message("AI.stranger@motherbee", "START", "", map[string]any{"text": "hi"}),
-		"the agent":                         message("AI.host@motherbee", "", "conv-1", map[string]any{"text": "hi"}),
-		"a node of an event_match.src":      message("IO.watch@motherbee", "NOTE", "conv-1", map[string]any{"text": "hi"}),
-		"a reply from a start_from node":    message("IO.in@motherbee", "X_RESPONSE", "conv-1", map[string]any{"text": "hi"}),
-		"an error from a start_from node":   message("IO.in@motherbee", "X.error", "conv-1", map[string]any{"text": "hi"}),
-		"a message the schema refuses (no)": message("IO.in@motherbee", "", "conv-1", map[string]any{}),
+		"a stranger":                      message("AI.stranger@motherbee", "START", "", map[string]any{"text": "hi"}),
+		"a stranger on a thread":          message("IO.stranger@motherbee", "START", "conv-1", map[string]any{"text": "hi"}),
+		"the agent":                       message("AI.host@motherbee", "", "conv-1", map[string]any{"text": "hi"}),
+		"the agent, named":                message("AI.host@motherbee", "ASK", "conv-1", map[string]any{"text": "hi"}),
+		"a reply from a start_from node":  message("IO.in@motherbee", "X_RESPONSE", "conv-1", map[string]any{"text": "hi"}),
+		"an error from a start_from node": message("IO.in@motherbee", "X.error", "conv-1", map[string]any{"text": "hi"}),
+		"the engine's NOT_TAKEN":          message("IO.in@motherbee", msgNotTaken, "conv-1", map[string]any{"text": "hi"}),
 	} {
 		dispatch(msg)
 		if instances() != 0 || len(disp.sent) != 0 {
 			t.Fatalf("%s: %d instances, sent %+v", label, instances(), disp.sent)
 		}
 	}
-	dispatch(message("IO.in@motherbee", "START", "conv-1", map[string]any{}))
-	if instances() != 0 || len(disp.sent) != 1 || derefString(disp.sent[0].Meta.Msg) != msgInvalidInput {
-		t.Fatalf("a named request the schema refuses gets INVALID_INPUT: %+v", disp.sent)
+	// An IO node the definition involves hears why, named or not.
+	for _, c := range []struct {
+		label  string
+		msg    sdk.Message
+		reason string
+	}{
+		{"a person's message with no thread", message("IO.in@motherbee", "", "", map[string]any{"text": "hi"}), notTakenNoThread},
+		{"a named request with a blank thread", message("IO.in@motherbee", "START", " ", map[string]any{"text": "hi"}), notTakenNoThread},
+		{"a node of an event_match.src with no thread", message("IO.watch@motherbee", "NOTE", "", nil), notTakenNoThread},
+		{"a node of an event_match.src", message("IO.watch@motherbee", "NOTE", "conv-1", map[string]any{"text": "hi"}), notTakenNoConversation},
+		{"a message the schema refuses", message("IO.in@motherbee", "", "conv-1", map[string]any{}), notTakenInvalidInput},
+		{"a named request the schema refuses", message("IO.in@motherbee", "START", "conv-1", map[string]any{}), notTakenInvalidInput},
+	} {
+		sent := len(disp.sent)
+		dispatch(c.msg)
+		if instances() != 0 || len(disp.sent) != sent+1 {
+			t.Fatalf("%s: %d instances, sent %+v", c.label, instances(), disp.sent[sent:])
+		}
+		notTaken(c.label, c.msg, c.reason)
 	}
 	disp.sent = nil
 
@@ -277,12 +308,20 @@ func TestTheCorrelationOrderOfAConversation(t *testing.T) {
 		t.Fatalf("the instance and its send are on the conversation's thread: %+v %+v", row, disp.sent[0].Meta)
 	}
 	// On its thread: a stranger drives nothing, a node of an event_match.src drives it, by its
-	// sender, and a message from the right sender but with another msg matches nothing.
+	// sender, and a message from the right sender but with another msg matches nothing: the instance's
+	// log keeps it, and the IO node hears it was not expected.
 	dispatch(message("AI.stranger@motherbee", "NOTE", "conv-1", nil))
 	dispatch(message("IO.watch@motherbee", "NOTE", "conv-1", nil))
-	dispatch(message("IO.watch@motherbee", "OTHER", "conv-1", nil))
-	dispatch(message("IO.in@motherbee", "NOTE", "conv-1", nil))
-	if row := mustGetInstance(t, rt, first); row.StateJSON != `{"notes":1}` || row.CurrentState != "asking" {
+	if len(disp.sent) != 1 {
+		t.Fatalf("a stranger, and a message taken, are not answered: %+v", disp.sent[1:])
+	}
+	other := message("IO.watch@motherbee", "OTHER", "conv-1", nil)
+	dispatch(other)
+	notTaken("another msg", other, notTakenNotExpected)
+	unexpected := message("IO.in@motherbee", "NOTE", "conv-1", nil)
+	dispatch(unexpected)
+	notTaken("a start_from node's message the state does not take", unexpected, notTakenNotExpected)
+	if row := mustGetInstance(t, rt, first); row.StateJSON != `{"notes":1}` || row.CurrentState != "asking" || len(disp.sent) != 3 {
 		t.Fatalf("only IO.watch's NOTE is taken: %+v", row)
 	}
 	if logs, _ := rt.Store.GetRecentLog(context.Background(), first, 3); logs[0].Summary != "unhandled event NOTE from IO.in@motherbee in state asking" ||
@@ -295,21 +334,20 @@ func TestTheCorrelationOrderOfAConversation(t *testing.T) {
 		t.Fatalf("the agent's answer: %+v", row)
 	}
 
-	// After the end: the agent's late answer starts nothing; the person's next message starts a new
-	// instance, on the same thread.
+	// After the end: the agent's late answer starts nothing, unanswered; a node of an event_match.src
+	// hears no conversation takes its message; the person's next message starts a new instance, on
+	// the same thread.
 	sent := len(disp.sent)
 	dispatch(message("AI.host@motherbee", "", "conv-1", map[string]any{"type": "text", "content": "late"}))
 	if instances() != 1 || len(disp.sent) != sent {
 		t.Fatalf("a late answer: %d instances", instances())
 	}
+	late := message("IO.watch@motherbee", "NOTE", "conv-1", nil)
+	dispatch(late)
+	notTaken("a note after the end", late, notTakenNoConversation)
 	second := startInstance(t, rt, message("IO.in@motherbee", "", "conv-1", map[string]any{"text": "again"}))
 	if row := mustGetInstance(t, rt, second); second == first || row.ThreadID != "conv-1" || row.CurrentState != "asking" {
 		t.Fatalf("a new instance on the conversation: %+v", row)
-	}
-	// A message without a thread starts one on the instance's own id.
-	third := startInstance(t, rt, message("IO.in@motherbee", "", "", map[string]any{"text": "new"}))
-	if row := mustGetInstance(t, rt, third); row.ThreadID != third {
-		t.Fatalf("an instance started without a thread: %+v", row)
 	}
 }
 
@@ -423,7 +461,7 @@ func TestAnInternalTransitionStaysWithoutExitOrEntryActions(t *testing.T) {
 	send := func(name string) {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithName(name))
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)
 		}
@@ -476,7 +514,7 @@ func TestAKeptMessageLivesAsLongAsItsInstance(t *testing.T) {
 	send := func(name string, payload map[string]any) {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithNameAndPayload(name, payload))
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)
 		}
@@ -550,7 +588,7 @@ func TestATimerTimeComesFromState(t *testing.T) {
 	send := func(instanceID, name string, payload map[string]any) WFInstanceRow {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithNameAndPayload(name, payload))
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)
 		}
@@ -659,6 +697,29 @@ WHEN NEW.input_json = '{"text":"first"}' BEGIN SELECT RAISE(ABORT, 'disk I/O err
 	}
 	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
 		t.Fatalf("its commit consumes the replayed creation: %+v", events)
+	}
+}
+
+// A creation an engine of before FINDINGS A-135 journaled without a thread, and a crash left, starts
+// nothing at the next start: a WF never makes up a thread. It is dropped, and the node goes on.
+func TestAReplayedCreationWithNoThreadStartsNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wf.db")
+	rt, _ := newTestRuntime(t, path, listeningWorkflowJSON, nil)
+	threadless := from("IO.in@motherbee", msgWithNameAndPayload("", map[string]any{"text": "left"}))
+	threadless.Meta.Msg = nil
+	if _, err := rt.journal(context.Background(), "wfi:threadless", inboundCreate, threadless, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	rt, disp := newTestRuntime(t, path, listeningWorkflowJSON, &mockTimerLister{})
+	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 || len(disp.sent) != 0 {
+		t.Fatalf("the creation started an instance: %+v, sent %+v", rows, disp.sent)
+	}
+	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
+		t.Fatalf("the creation is dropped: %+v", events)
 	}
 }
 

@@ -44,7 +44,7 @@ func TestAPanicInATransitionFailsOnlyThatInstance(t *testing.T) {
 	rt.ActCtx.Dispatcher = &panickingDispatcher{panicAt: "AI.panic@motherbee"}
 
 	boom := from("AI.host@motherbee", msgWithName("BOOM"))
-	boom.Meta.ThreadID = &doomed
+	boom.Meta.ThreadID = threadOf(t, rt, doomed)
 	err := Dispatch(context.Background(), boom, rt)
 	if err == nil || !strings.Contains(err.Error(), causeTransitionPanic) {
 		t.Fatalf("the panic is the dispatch's error, for the loop's log: %v", err)
@@ -63,7 +63,7 @@ func TestAPanicInATransitionFailsOnlyThatInstance(t *testing.T) {
 	}
 
 	answer := from("AI.host@motherbee", msgWithNameAndPayload("ASK", map[string]any{"text": "ok"}))
-	answer.Meta.ThreadID = &healthy
+	answer.Meta.ThreadID = threadOf(t, rt, healthy)
 	if err := Dispatch(context.Background(), answer, rt); err != nil {
 		t.Fatalf("the other instance goes on: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestACELMapIsKeptAsPlainJSON(t *testing.T) {
 	send := func(instanceID, name string, payload map[string]any) {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithNameAndPayload(name, payload))
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -171,7 +171,7 @@ func TestTheInternalEventCapFailsTheInstance(t *testing.T) {
   ]
 }`
 	rt, _ := newTestRuntime(t, "", looping, nil)
-	err := Dispatch(context.Background(), from("IO.in@motherbee", msgWithName("START")), rt)
+	err := Dispatch(context.Background(), onThread("conv-1", from("IO.in@motherbee", msgWithName("START"))), rt)
 	if err != nil {
 		t.Fatalf("the cap fails the instance, not the dispatch: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestNumbersKeepOneTypeLiveAndAfterARestart(t *testing.T) {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithName(name))
 		msg.Payload = json.RawMessage(payload)
-		msg.Meta.ThreadID = &instanceID
+		msg.Meta.ThreadID = threadOf(t, rt, instanceID)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -380,7 +380,7 @@ func TestAnEventRunAtThreeStartsIsNotRunAgain(t *testing.T) {
 	putRunningInstance(t, rt, "wfi:poisoned-internal", "working")
 	queueNext(t, rt, "wfi:poisoned-internal", maxReplayAttempts)
 	putRunningInstance(t, rt, "wfi:healthy", "waiting")
-	created, err := rt.journal(context.Background(), "wfi:never-committed", inboundCreate, from("IO.in@motherbee", msgWithName("START")), "")
+	created, err := rt.journal(context.Background(), "wfi:never-committed", inboundCreate, onThread("conv-never", from("IO.in@motherbee", msgWithName("START"))), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,7 +535,7 @@ func TestACommitConsumesTheEarlierEventsItHolds(t *testing.T) {
 	id := startInstance(t, rt, from("IO.in@motherbee", msgWithName("START")))
 	inc := func(trace string) error {
 		msg := from("IO.in@motherbee", msgWithName("INC"))
-		msg.Meta.ThreadID = &id
+		msg.Meta.ThreadID = threadOf(t, rt, id)
 		msg.Routing.TraceID = trace
 		return Dispatch(context.Background(), msg, rt)
 	}
@@ -651,7 +651,7 @@ func TestASlowGuardNeverRacesTheNextTransition(t *testing.T) {
 	send := func(name string, payload any) {
 		t.Helper()
 		msg := from("IO.in@motherbee", msgWithName(name))
-		msg.Meta.ThreadID = &id
+		msg.Meta.ThreadID = threadOf(t, rt, id)
 		msg.Payload, _ = json.Marshal(payload)
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)

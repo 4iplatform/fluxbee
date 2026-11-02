@@ -1,7 +1,7 @@
 {
   "wf_schema_version": "1",
   "workflow_type": "sales.invoice",
-  "description": "Cases 1 and 3 of wf-orchestration-v1 (§5.2, §5.3): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales, which the WF asks with a menu: answer, invoice or consult. Invoice hands the conversation to AI.invoice, which holds it until it hands it back (its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. Consult tells the person that sales will check (when sales' reply is not empty), and writes sales' question to the supervisors' IO.slack.supervisores@motherbee. Each supervisor's message in the thread of that post goes to sales, which says whether it decides the question (decided, which goes to the person) or not yet (wait, and the WF waits on); when no decision comes in 30 minutes the WF tells sales so. A supervisor's message while sales answers the person, or while invoicing or payments hold the conversation, is logged and dropped (the default). A person's message costs two agent calls at most, and no agent is asked twice with the same message. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error, or an answer that does not come in 120 s, is noted in last_error and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. The catch takes none from the agent the WF waits for (waiting_for): its reply goes to the person, its reason goes to last_error, and sales holds the conversation; it notes in last_error an error no state takes, such as the cap on agent calls. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
+  "description": "Cases 1, 3 and 4 of wf-orchestration-v1 (§5.2, §5.3, §5.4): one instance per conversation of IO.api.sales@worker1, the IO node at whose exit the WF sits. Every conversation enters through AI.sales, which the WF asks with a menu: answer, invoice, consult or handover. Invoice hands the conversation to AI.invoice, which holds it until it hands it back (its reply goes to the person, and sales takes the person's next message) or 3 minutes pass without a message. Consult tells the person that sales will check (when sales' reply is not empty), and writes sales' question to the supervisors' IO.slack.supervisores@motherbee. Each supervisor's message in the thread of that post goes to sales, which says whether it decides the question (decided, which goes to the person), not yet (wait, and the WF waits on), or asks sales something (answer_team: sales' reply goes to the supervisors, in the question's thread, and the WF waits on); when no decision comes in 30 minutes the WF tells sales so. Handover tells the person that a person of the team takes over (when sales' reply is not empty), and posts sales' summary to the same channel as a new subject, with the person's facts and a Handback button; the team and the person then talk through the WF, the person's messages going to the post's thread, until the team hands the conversation back (its click, with its note, goes to sales), nobody of the team takes it in 15 minutes, or the case goes quiet for 30 minutes. Each way the post ends with a text, and sales hears how the case came back and since when the team had it, and tells the person. A supervisor's message that no state expects, such as one while invoicing or payments hold the conversation or after a handover ended, is logged and gets the engine's NOT_TAKEN. A person's message costs two agent calls at most, and no agent is asked twice with the same message. An invoice issued with a due_in sets the timer payment_due at it; when it fires, the WF writes to AI.payments, whose answer goes to the person, and control goes back to sales with nothing pending. An agent's error, or an answer that does not come in 120 s, is noted in last_error and control goes back to sales; the person gets no answer to that message, and a pending payment_due stays. The catch takes none from the agent the WF waits for (waiting_for): its reply goes to the person, its reason goes to last_error, and sales holds the conversation; it notes in last_error an error no state takes, such as the cap on agent calls. After 3 minutes without messages and no invoice pending, the instance closes. The agents' answers go to the person as they came, through the IO node.",
   "start_from": ["IO.api.sales@worker1"],
   "input_schema": {
     "type": "object",
@@ -40,12 +40,13 @@
   "states": [
     {
       "name": "start",
-      "description": "Keeps the person's message (customer) and their context.io, and moves on to sales.",
+      "description": "Keeps the person's message (customer) and their context.io, and moves on to sales. team_subject says what the supervisors' channel has from this conversation: a consult's question, a handover's case, or nothing yet.",
       "entry_actions": [
         { "type": "keep_message", "name": "customer" },
         { "type": "set_variable", "name": "io", "value": "event.context.io" },
         { "type": "set_variable", "name": "invoice_pending", "value": "false" },
         { "type": "set_variable", "name": "payment_overdue", "value": "false" },
+        { "type": "set_variable", "name": "team_subject", "value": "''" },
         { "type": "emit_internal_event", "meta": { "msg": "TO_SALES" } }
       ],
       "exit_actions": [],
@@ -55,7 +56,7 @@
     },
     {
       "name": "sales_thinking",
-      "description": "Sales holds the conversation: the person's message (customer) goes to AI.sales with its menu. Answer goes to the person; invoice hands the conversation to invoice, with the order kept in state; consult tells the person that sales will check, and writes sales' question to the supervisors. Entered only from a person's message. A message from the person meanwhile goes to sales too; a payment_due meanwhile is noted, and acted on in the next listening state. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
+      "description": "Sales holds the conversation: the person's message (customer) goes to AI.sales with its menu. Answer goes to the person; invoice hands the conversation to invoice, with the order kept in state; consult tells the person that sales will check, and writes sales' question to the supervisors; handover tells the person that the team takes over, and hands the conversation to the team (with_team). Entered only from a person's message. A message from the person meanwhile goes to sales too; a payment_due meanwhile is noted, and acted on in the next listening state. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
         {
@@ -63,19 +64,16 @@
           "target": "AI.sales@worker1",
           "message": "customer",
           "menu": {
-            "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval.",
+            "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval, and a credit note needs a person of the team.",
             "options": [
-              { "name": "answer", "description": "You answer the person yourself." },
+              { "name": "answer" },
               {
                 "name": "invoice",
                 "description": "They accepted the quote and ask for the invoice.",
                 "params": { "product": { "type": "string" }, "quantity": { "type": "integer" }, "unit_price": { "type": "number" } }
               },
-              {
-                "name": "consult",
-                "description": "A supervisor must approve something before you answer. Your reply tells the person you will check.",
-                "params": { "question": { "type": "string", "description": "What you ask the supervisor, with the data to decide." } }
-              }
+              { "name": "consult" },
+              { "name": "handover" }
             ]
           }
         },
@@ -137,6 +135,18 @@
           ]
         },
         {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'handover' && event.context.evaluation.reply != ''",
+          "target_state": "with_team",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'handover'",
+          "target_state": "with_team",
+          "actions": []
+        },
+        {
           "event_match": { "src": "IO.api.sales@worker1" },
           "guard": "true",
           "actions": [
@@ -146,19 +156,16 @@
               "target": "AI.sales@worker1",
               "message": "customer",
               "menu": {
-                "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval.",
+                "help": "The person is buying licenses. Once they accept a quote, invoicing issues the invoice. A discount above 10% needs a supervisor's approval, and a credit note needs a person of the team.",
                 "options": [
-                  { "name": "answer", "description": "You answer the person yourself." },
+                  { "name": "answer" },
                   {
                     "name": "invoice",
                     "description": "They accepted the quote and ask for the invoice.",
                     "params": { "product": { "type": "string" }, "quantity": { "type": "integer" }, "unit_price": { "type": "number" } }
                   },
-                  {
-                    "name": "consult",
-                    "description": "A supervisor must approve something before you answer. Your reply tells the person you will check.",
-                    "params": { "question": { "type": "string", "description": "What you ask the supervisor, with the data to decide." } }
-                  }
+                  { "name": "consult" },
+                  { "name": "handover" }
                 ]
               }
             }
@@ -179,9 +186,10 @@
     },
     {
       "name": "consulting",
-      "description": "Sales' question is with the supervisors, at IO.slack.supervisores@motherbee, and the person was told that sales will check. A supervisor's message in the thread of that post goes to sales with vars.question, and sales says whether it decides the question. When none comes in 30 minutes, the WF tells sales so, and sales tells the person. A message from the person meanwhile goes to sales with the same menu, and sales' answer goes to the person; a payment_due meanwhile is noted.",
+      "description": "Sales' question is with the supervisors, at IO.slack.supervisores@motherbee, and the person was told that sales will check. A supervisor's message in the thread of that post goes to sales with vars.question, and sales says whether it decides the question, or answers the supervisors. When none comes in 30 minutes, the WF tells sales so, and sales tells the person. A message from the person meanwhile goes to sales with the same menu, and sales' answer goes to the person; a payment_due meanwhile is noted.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "'IO.slack.supervisores@motherbee'" },
+        { "type": "set_variable", "name": "team_subject", "value": "'consult'" },
         { "type": "schedule_timer", "timer_key": "consult_timeout", "fire_in": "30m" }
       ],
       "exit_actions": [ { "type": "cancel_timer", "timer_key": "consult_timeout" } ],
@@ -197,10 +205,7 @@
               "vars": { "question": { "$ref": "state.question" } },
               "menu": {
                 "help": "A supervisor wrote in the thread of the question in vars.question, which you asked about this conversation. Tell the person only what a supervisor decided.",
-                "options": [
-                  { "name": "decided", "description": "The message decides the question: you tell the person the decision." },
-                  { "name": "wait", "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty." }
-                ]
+                "options": [ { "name": "decided" }, { "name": "wait" }, { "name": "answer_team" } ]
               }
             }
           ]
@@ -217,7 +222,7 @@
               "vars": { "question": { "$ref": "state.question" } },
               "menu": {
                 "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
-                "options": [ { "name": "answer", "description": "You tell the person." } ]
+                "options": [ { "name": "answer" } ]
               },
               "payload": {
                 "type": "text",
@@ -238,7 +243,7 @@
               "vars": { "question": { "$ref": "state.question" } },
               "menu": {
                 "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
-                "options": [ { "name": "answer", "description": "You tell the person." } ]
+                "options": [ { "name": "answer" } ]
               }
             }
           ]
@@ -257,7 +262,7 @@
     },
     {
       "name": "sales_relaying",
-      "description": "Sales has a supervisor's message, or the news that no decision came, and tells the person: its answer or its decided goes to the person, with the person's context.io, and sales holds the conversation; its wait goes back to consulting, and the WF waits for the decision. A message from the person meanwhile goes to sales, to answer it; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
+      "description": "Sales has a supervisor's message, or the news that no decision came, and tells the person: its answer or its decided goes to the person, with the person's context.io, and sales holds the conversation; its wait goes back to consulting, and the WF waits for the decision; its answer_team goes to the supervisors, in the question's thread, and the WF waits on. A message from the person meanwhile goes to sales, to answer it; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
         { "type": "schedule_timer", "timer_key": "relay_timeout", "fire_in": "120s" }
@@ -283,6 +288,12 @@
           "actions": []
         },
         {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'answer_team'",
+          "target_state": "consulting",
+          "actions": [ { "type": "forward", "target": "IO.slack.supervisores@motherbee", "subject": "same" } ]
+        },
+        {
           "event_match": { "src": "IO.api.sales@worker1" },
           "guard": "true",
           "actions": [
@@ -294,7 +305,7 @@
               "vars": { "question": { "$ref": "state.question" } },
               "menu": {
                 "help": "You asked a supervisor the question in vars.question about this conversation. Tell the person what the supervisor decided or, when no decision came, that you could not confirm it yet.",
-                "options": [ { "name": "answer", "description": "You tell the person." } ]
+                "options": [ { "name": "answer" } ]
               }
             }
           ]
@@ -314,7 +325,7 @@
     },
     {
       "name": "sales_listening",
-      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person, but not a wait, and a supervisor's message that came after its wait goes to sales, which says whether it decides the question. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
+      "description": "Waits for the person, with sales in control: their next message is kept and goes to sales. A payment_due noted meanwhile, or firing now, goes to payments. A later answer of an agent (to a message the person sent while it was answering) goes to the person, but not a wait; sales' later answer_team goes to the supervisors, and its later handover hands the conversation to the team. A supervisor's message that came after its wait goes to sales, which says whether it decides the question, while the supervisors' channel has a consult's question from this conversation (team_subject); after a handover it is not taken. After 3 minutes without messages, sales closes the instance, when no invoice is pending.",
       "entry_actions": [
         { "type": "set_variable", "name": "waiting_for", "value": "''" },
         { "type": "schedule_timer", "timer_key": "idle", "fire_in": "3m" },
@@ -329,6 +340,23 @@
           "guard": "true",
           "target_state": "sales_thinking",
           "actions": [ { "type": "keep_message", "name": "customer" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'answer_team'",
+          "actions": [ { "type": "forward", "target": "IO.slack.supervisores@motherbee", "subject": "same" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'handover' && event.context.evaluation.reply != ''",
+          "target_state": "with_team",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'handover'",
+          "target_state": "with_team",
+          "actions": []
         },
         {
           "event_match": { "src": "AI.sales@worker1" },
@@ -347,7 +375,7 @@
         },
         {
           "event_match": { "src": "IO.slack.supervisores@motherbee" },
-          "guard": "true",
+          "guard": "state.team_subject == 'consult'",
           "target_state": "sales_relaying",
           "actions": [
             {
@@ -356,10 +384,7 @@
               "vars": { "question": { "$ref": "state.question", "default": "" } },
               "menu": {
                 "help": "A supervisor wrote in the thread of the question in vars.question, which you asked about this conversation. Tell the person only what a supervisor decided.",
-                "options": [
-                  { "name": "decided", "description": "The message decides the question: you tell the person the decision." },
-                  { "name": "wait", "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty." }
-                ]
+                "options": [ { "name": "decided" }, { "name": "wait" }, { "name": "answer_team" } ]
               }
             }
           ]
@@ -391,8 +416,8 @@
                   "due_in": { "type": "string", "description": "When it falls due, in minutes, hours or days, such as 2m, 1h or 30d." }
                 }
               },
-              { "name": "answer", "description": "You answer the person, and keep the conversation." },
-              { "name": "handback", "description": "The person's business with invoicing is done: sales takes the conversation back." }
+              { "name": "answer" },
+              { "name": "handback" }
             ]
           }
         },
@@ -464,8 +489,8 @@
                       "due_in": { "type": "string", "description": "When it falls due, in minutes, hours or days, such as 2m, 1h or 30d." }
                     }
                   },
-                  { "name": "answer", "description": "You answer the person, and keep the conversation." },
-                  { "name": "handback", "description": "The person's business with invoicing is done: sales takes the conversation back." }
+                  { "name": "answer" },
+                  { "name": "handback" }
                 ]
               }
             }
@@ -578,6 +603,212 @@
             { "type": "set_variable", "name": "last_error", "value": "'AI.payments@worker1: timeout'" },
             { "type": "set_variable", "name": "invoice_pending", "value": "false" }
           ]
+        }
+      ]
+    },
+    {
+      "name": "with_team",
+      "description": "A person of the team holds the conversation (Case 4): entered from sales' handover, it posts sales' summary to IO.slack.supervisores@motherbee as a new subject, with the person's facts from their context.io in vars and a menu with handback, which the team sees as a Handback button. A team message, a text and no click, is forwarded to the person, with the person's context.io: the first one takes the case, cancels team_untaken (15 minutes) and starts team_quiet (30 minutes), and each later one starts team_quiet again. A person's message is kept and goes to the team with subject same, in the post's thread, and once the case is taken it starts team_quiet again. The team's handback click ends the subject with a text and goes to sales, with its note; either timer ends the subject with a text and tells sales so. Sales hears how the case came back (came_back: handback, untaken or quiet) and since when the team had it (team_since). An agent's late answer is not delivered while the team has the conversation; a payment_due is noted.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'IO.slack.supervisores@motherbee'" },
+        { "type": "set_variable", "name": "team_subject", "value": "'handover'" },
+        { "type": "set_variable", "name": "team_taken", "value": "false" },
+        { "type": "set_variable", "name": "team_since", "value": "string(timestamp(now() / 1000))" },
+        {
+          "type": "send_message",
+          "target": "IO.slack.supervisores@motherbee",
+          "subject": "new",
+          "meta": { "msg": "HANDOVER" },
+          "vars": {
+            "channel": { "$ref": "state.io.channel", "default": "" },
+            "person": { "$ref": "state.io.sender.id", "default": "" },
+            "conversation": { "$ref": "state.io.conversation.id", "default": "" }
+          },
+          "menu": {
+            "help": "When you are done, hand the conversation back to sales, with a note of what was done and agreed.",
+            "options": [ { "name": "handback" } ]
+          },
+          "payload": { "type": "text", "content": { "$ref": "event.context.evaluation.params.summary" } }
+        },
+        { "type": "schedule_timer", "timer_key": "team_untaken", "fire_in": "15m" }
+      ],
+      "exit_actions": [
+        { "type": "cancel_timer", "timer_key": "team_untaken" },
+        { "type": "cancel_timer", "timer_key": "team_quiet" }
+      ],
+      "transitions": [
+        {
+          "event_match": { "src": "IO.slack.supervisores@motherbee" },
+          "guard": "has(event.context.evaluation) && event.context.evaluation.option == 'handback'",
+          "target_state": "back_from_team",
+          "actions": [
+            { "type": "set_variable", "name": "came_back", "value": "'handback'" },
+            {
+              "type": "send_message",
+              "target": "IO.slack.supervisores@motherbee",
+              "subject": "end",
+              "meta": { "msg": "HANDOVER_END" },
+              "payload": { "type": "text", "content": "Handed back to the agent." }
+            },
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "vars": { "came_back": { "$ref": "state.came_back" }, "team_since": { "$ref": "state.team_since" } },
+              "menu": {
+                "help": "The team had this conversation since vars.team_since, and gave it back to you: vars.came_back is handback (the team's note is in the message), untaken (nobody of the team took it) or quiet (it went quiet). Tell the person.",
+                "options": [ { "name": "answer" } ]
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.slack.supervisores@motherbee" },
+          "guard": "!has(event.context.evaluation) && !state.team_taken",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } },
+            { "type": "set_variable", "name": "team_taken", "value": "true" },
+            { "type": "cancel_timer", "timer_key": "team_untaken" },
+            { "type": "schedule_timer", "timer_key": "team_quiet", "fire_in": "30m" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.slack.supervisores@motherbee" },
+          "guard": "!has(event.context.evaluation)",
+          "actions": [
+            { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } },
+            { "type": "reschedule_timer", "timer_key": "team_quiet", "fire_in": "30m" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "state.team_taken",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            { "type": "forward", "target": "IO.slack.supervisores@motherbee", "subject": "same" },
+            { "type": "reschedule_timer", "timer_key": "team_quiet", "fire_in": "30m" }
+          ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            { "type": "forward", "target": "IO.slack.supervisores@motherbee", "subject": "same" }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'team_untaken'",
+          "target_state": "back_from_team",
+          "actions": [
+            { "type": "set_variable", "name": "came_back", "value": "'untaken'" },
+            {
+              "type": "send_message",
+              "target": "IO.slack.supervisores@motherbee",
+              "subject": "end",
+              "meta": { "msg": "HANDOVER_END" },
+              "payload": { "type": "text", "content": "Nobody from the team took this case; it went back to the agent." }
+            },
+            {
+              "type": "send_message",
+              "target": "AI.sales@worker1",
+              "meta": { "msg": "HANDOVER_UNTAKEN", "context": { "io": { "$ref": "state.io" } } },
+              "vars": { "came_back": { "$ref": "state.came_back" }, "team_since": { "$ref": "state.team_since" } },
+              "menu": {
+                "help": "The team had this conversation since vars.team_since, and gave it back to you: vars.came_back is handback (the team's note is in the message), untaken (nobody of the team took it) or quiet (it went quiet). Tell the person.",
+                "options": [ { "name": "answer" } ]
+              },
+              "payload": {
+                "type": "text",
+                "content": "Nobody of the team took the conversation in 15 minutes, and it is yours again. Tell the person, and help them as you can."
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'team_quiet'",
+          "target_state": "back_from_team",
+          "actions": [
+            { "type": "set_variable", "name": "came_back", "value": "'quiet'" },
+            {
+              "type": "send_message",
+              "target": "IO.slack.supervisores@motherbee",
+              "subject": "end",
+              "meta": { "msg": "HANDOVER_END" },
+              "payload": { "type": "text", "content": "The case went quiet; it went back to the agent." }
+            },
+            {
+              "type": "send_message",
+              "target": "AI.sales@worker1",
+              "meta": { "msg": "HANDOVER_QUIET", "context": { "io": { "$ref": "state.io" } } },
+              "vars": { "came_back": { "$ref": "state.came_back" }, "team_since": { "$ref": "state.team_since" } },
+              "menu": {
+                "help": "The team had this conversation since vars.team_since, and gave it back to you: vars.came_back is handback (the team's note is in the message), untaken (nobody of the team took it) or quiet (it went quiet). Tell the person.",
+                "options": [ { "name": "answer" } ]
+              },
+              "payload": {
+                "type": "text",
+                "content": "The conversation with the team went quiet for 30 minutes, and it is yours again. Tell the person, and help them as you can."
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
+        }
+      ]
+    },
+    {
+      "name": "back_from_team",
+      "description": "The team gave the conversation back: sales has the team's click, with its note, or the WF's text, with vars.came_back and vars.team_since, and tells the person. Its answer goes to the person, with the person's context.io, and sales holds the conversation. A message from the person meanwhile goes to sales, with the same vars and menu; a team message is not taken; a payment_due meanwhile is noted. An error or no answer in 120 s goes back to listening, noted in last_error; none goes to the catch.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "waiting_for", "value": "'AI.sales@worker1'" },
+        { "type": "schedule_timer", "timer_key": "back_timeout", "fire_in": "120s" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "back_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: error'" } ]
+        },
+        {
+          "event_match": { "src": "AI.sales@worker1" },
+          "guard": "event.context.evaluation.option == 'answer'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "forward", "target": "IO.api.sales@worker1", "meta": { "context": { "io": { "$ref": "state.io" } } } } ]
+        },
+        {
+          "event_match": { "src": "IO.api.sales@worker1" },
+          "guard": "true",
+          "actions": [
+            { "type": "keep_message", "name": "customer" },
+            {
+              "type": "forward",
+              "target": "AI.sales@worker1",
+              "message": "customer",
+              "vars": { "came_back": { "$ref": "state.came_back" }, "team_since": { "$ref": "state.team_since" } },
+              "menu": {
+                "help": "The team had this conversation since vars.team_since, and gave it back to you: vars.came_back is handback (the team's note is in the message), untaken (nobody of the team took it) or quiet (it went quiet). Tell the person.",
+                "options": [ { "name": "answer" } ]
+              }
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'back_timeout'",
+          "target_state": "sales_listening",
+          "actions": [ { "type": "set_variable", "name": "last_error", "value": "'AI.sales@worker1: timeout'" } ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.timer_key == 'payment_due'",
+          "actions": [ { "type": "set_variable", "name": "payment_overdue", "value": "true" } ]
         }
       ]
     },

@@ -75,9 +75,10 @@ const menuWireWorkflowJSON = `{
       "entry_actions": [
         {"type": "forward", "target": "AI.host@motherbee",
          "menu": {"help": "", "options": [
-           {"name": "answer", "description": "You answer <the> person & stop.", "params": {}},
+           {"name": "respond", "description": "You answer <the> person & stop.", "params": {}},
            {"name": "pick", "description": "You pick a plan.",
-            "params": {"seats": {"type": "integer", "description": "How many."}, "plan": {"type": "string", "description": "", "enum": ["basic", "pro"]}}}
+            "params": {"seats": {"type": "integer", "description": "How many."}, "plan": {"type": "string", "description": "", "enum": ["basic", "pro"]}}},
+           {"name": "consult"}
          ]}},
         {"type": "send_message", "target": "AI.other@motherbee", "meta": {"msg": "ASK"}, "payload": {"text": "hi"}}
       ]
@@ -90,17 +91,29 @@ const menuWireWorkflowJSON = `{
 // Case 3 (§5.3.6): the engine writes an action's menu in the WF's block (meta.context.wf.menu) as it
 // is written, but with no empty field, which the agent would read as present and refuse: an empty
 // help, an empty params and an empty description are left out. An option's params go in name order
-// (a map, which Go encodes sorted). A send without a menu has none.
+// (a map, which Go encodes sorted). A known option written by its name goes with the catalog's
+// description and params (Case 4, §5.4.10). A send without a menu has none.
 func TestTheMenuGoesInTheWFBlockAsWritten(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", menuWireWorkflowJSON, nil)
 	startInstance(t, rt, ioMessage("conv-menu", "", `{"type":"text","content":"hi"}`))
 	toHost := sentTo(t, disp, "AI.host@motherbee")
-	const want = `{"options":[{"name":"answer","description":"You answer <the> person & stop."},{"name":"pick","description":"You pick a plan.","params":{"plan":{"type":"string","enum":["basic","pro"]},"seats":{"type":"integer","description":"How many."}}}]}`
+	const want = `{"options":[{"name":"respond","description":"You answer <the> person & stop."},{"name":"pick","description":"You pick a plan.","params":{"plan":{"type":"string","enum":["basic","pro"]},"seats":{"type":"integer","description":"How many."}}},` +
+		`{"name":"consult","description":"A supervisor must approve something before you answer. Your reply tells the person you will check.","params":{"question":{"type":"string","description":"What you ask the supervisor, with the data to decide."}}}]}`
 	if got := string(rawBlock(t, toHost)["menu"]); got != want {
 		t.Fatalf("the menu on the wire:\n got %s\nwant %s", got, want)
 	}
 	if block := rawBlock(t, sentTo(t, disp, "AI.other@motherbee")); block["menu"] != nil || block["trail"] == nil {
 		t.Fatalf("a send without a menu: %v", block)
+	}
+
+	// WF_GET_CODE answers the definition as it was written: the known option by its name alone.
+	getCode := from(sdk.PrimaryAdminNode, msgWithName(MsgWFGetCode))
+	getCode.Meta.MsgType = sdk.SYSTEMKind
+	if err := Dispatch(context.Background(), getCode, rt); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := lastReply(t, disp)["definition_json"].(string); !strings.Contains(code, `{"name": "consult"}`) || strings.Contains(code, "A supervisor must approve") {
+		t.Fatalf("WF_GET_CODE: %s", code)
 	}
 }
 
@@ -145,7 +158,8 @@ const catchingWorkflowJSON = `{
 // are tried in order. A chosen one runs as a state's: with a target_state, the state's exit actions,
 // its own and the target's entry actions; without one it stays. An empty event_match matches every
 // event. When the catch takes nothing either, the default logs the event, in the instance's log and
-// in the node's, and the instance stays where it was.
+// in the node's, the instance stays where it was, and the IO node that sent it hears so (NOT_TAKEN
+// not_expected, Case 4).
 func TestTheCatchTakesWhatTheStateDoesNot(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", catchingWorkflowJSON, nil)
 	ask := func(thread string) (string, sdk.Message) {
@@ -200,17 +214,23 @@ func TestTheCatchTakesWhatTheStateDoesNot(t *testing.T) {
 		t.Fatalf("the catch's internal transitions: %+v %v", row, state)
 	}
 
-	// Nothing takes a plain message: the default logs it, in the instance's log and the node's.
+	// Nothing takes a plain message: the default logs it, in the instance's log and the node's, and
+	// answers the IO node.
 	sent := len(disp.sent)
-	logged := nodeLog(t, func() { dispatch(ioMessage("conv-stays", "", `{"type":"text","content":"hello?"}`)) })
+	plain := ioMessage("conv-stays", "", `{"type":"text","content":"hello?"}`)
+	logged := nodeLog(t, func() { dispatch(plain) })
 	if !strings.Contains(logged, "instance "+stays+": unhandled event (no msg) from IO.in@motherbee in state asking (trace_id=trace-conv-stays-)") {
 		t.Fatalf("the node's log: %s", logged)
 	}
 	if entry := lastLog(t, rt, stays); entry.Summary != "unhandled event (no msg) from IO.in@motherbee in state asking" || entry.OK || entry.ErrorDetail != "no matching transition" {
 		t.Fatalf("the instance's log: %+v", entry)
 	}
-	if row := mustGetInstance(t, rt, stays); row.CurrentState != "asking" || row.Status != "running" || len(disp.sent) != sent {
+	if row := mustGetInstance(t, rt, stays); row.CurrentState != "asking" || row.Status != "running" || len(disp.sent) != sent+1 {
 		t.Fatalf("the instance stays where it was: %+v", row)
+	}
+	if answer := disp.sent[sent]; notTakenReason(t, answer) != notTakenNotExpected || answer.Routing.Dst.Value() != plain.Routing.Src ||
+		answer.Routing.TraceID != plain.Routing.TraceID || derefString(answer.Meta.ThreadID) != "conv-stays" {
+		t.Fatalf("the IO node hears its message was not expected: %+v %s", answer, answer.Payload)
 	}
 }
 
@@ -221,7 +241,7 @@ func TestWithoutACatchTheDefaultLogs(t *testing.T) {
 	logged := nodeLog(t, func() {
 		if err := Dispatch(context.Background(), from("IO.in@motherbee", sdk.Message{
 			Routing: sdk.Routing{TraceID: "trace-odd"},
-			Meta:    sdk.Meta{MsgType: "user", Msg: strPtr("ODD"), ThreadID: strPtr(instanceID)},
+			Meta:    sdk.Meta{MsgType: "user", Msg: strPtr("ODD"), ThreadID: threadOf(t, rt, instanceID)},
 			Payload: json.RawMessage(`{}`),
 		}), rt); err != nil {
 			t.Fatal(err)

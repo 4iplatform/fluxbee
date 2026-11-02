@@ -96,18 +96,10 @@
                         "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
                         "options": [
                           {
-                            "name": "answer",
-                            "description": "You answer the person yourself."
+                            "name": "answer"
                           },
                           {
-                            "name": "consult",
-                            "description": "A supervisor must approve something first. Your reply tells the person you will check.",
-                            "params": {
-                              "question": {
-                                "type": "string",
-                                "description": "What you ask the supervisors, with the data to decide."
-                              }
-                            }
+                            "name": "consult"
                           }
                         ]
                       }
@@ -147,18 +139,10 @@
                         "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
                         "options": [
                           {
-                            "name": "answer",
-                            "description": "You answer the person yourself."
+                            "name": "answer"
                           },
                           {
-                            "name": "consult",
-                            "description": "A supervisor must approve something first. Your reply tells the person you will check.",
-                            "params": {
-                              "question": {
-                                "type": "string",
-                                "description": "What you ask the supervisors, with the data to decide."
-                              }
-                            }
+                            "name": "consult"
                           }
                         ]
                       }
@@ -210,12 +194,10 @@
                         "help": "A supervisor wrote in the thread of your question, in vars.question. Tell the person only what a supervisor decided.",
                         "options": [
                           {
-                            "name": "decided",
-                            "description": "The message decides the question: you tell the person the decision."
+                            "name": "decided"
                           },
                           {
-                            "name": "wait",
-                            "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty."
+                            "name": "wait"
                           }
                         ]
                       }
@@ -260,8 +242,7 @@
                         "help": "Your question, in vars.question, is still with the supervisors. Answer the person meanwhile, and promise nothing they have not approved.",
                         "options": [
                           {
-                            "name": "answer",
-                            "description": "You answer the person."
+                            "name": "answer"
                           }
                         ]
                       }
@@ -294,8 +275,7 @@
                         "help": "Tell the person that you could not confirm it yet, and what you can offer meanwhile.",
                         "options": [
                           {
-                            "name": "answer",
-                            "description": "You answer the person."
+                            "name": "answer"
                           }
                         ]
                       }
@@ -421,12 +401,10 @@
                     "help": "A supervisor wrote in the thread of your question, in vars.question, after you told the person. Tell the person only what a supervisor decided.",
                     "options": [
                       {
-                        "name": "decided",
-                        "description": "The message decides the question: you tell the person the decision."
+                        "name": "decided"
                       },
                       {
-                        "name": "wait",
-                        "description": "The message decides nothing yet, such as a question among supervisors: your reply is empty."
+                        "name": "wait"
                       }
                     ]
                   }

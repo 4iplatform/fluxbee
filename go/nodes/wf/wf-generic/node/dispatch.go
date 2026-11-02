@@ -24,8 +24,9 @@ const (
 	MsgWFGetCode                = "WF_GET_CODE"
 	MsgWFGetCodeResponse        = "WF_GET_CODE_RESPONSE"
 
-	// msgInvalidInput is the engine's own error answer: a message that starts no instance.
-	msgInvalidInput = "INVALID_INPUT"
+	// msgNotTaken is the engine's own error answer (wf-orchestration-v1 §5.4.6): the WF took the
+	// message nowhere, and its reason says why (answerNotTaken).
+	msgNotTaken = "NOT_TAKEN"
 
 	errCodeUnauthorized = "UNAUTHORIZED"
 	// errCodeTimersNotReconciled: the node runs, but its timers wait for SY.timer to answer
@@ -151,16 +152,17 @@ func isNotice(msg sdk.Message) bool {
 }
 
 // isReply reports whether a message named name answers a request: any *_RESPONSE, the engine's own
-// error answer (INVALID_INPUT), or an agent's error (<msg>.error). A reply reaches the instance
-// whose thread it carries, and nothing else: it never starts an instance and is never answered, so
-// two WFs cannot bounce an INVALID_INPUT (FINDINGS A-119).
+// error answer (NOT_TAKEN), or an agent's error (<msg>.error). A reply reaches the instance whose
+// thread it carries, and nothing else: it never starts an instance and is never answered, so two WFs
+// cannot bounce a NOT_TAKEN (FINDINGS A-119).
 func isReply(name string) bool {
-	return strings.HasSuffix(name, "_RESPONSE") || name == msgInvalidInput || strings.HasSuffix(name, ".error")
+	return strings.HasSuffix(name, "_RESPONSE") || name == msgNotTaken || strings.HasSuffix(name, ".error")
 }
 
-// neverAnswered reports whether msg gets no answer from the engine, an error included: a notice, a
-// reply, or a message without a name (the AI SDK's and SY.timer's rule). A message without a name,
-// as an IO node's text, still starts an instance.
+// neverAnswered reports whether msg gets no answer from the engine, an error included, when its
+// sender is no IO node: a notice, a reply, or a message without a name (the AI SDK's and SY.timer's
+// rule). An IO node's message without a name, a person's text, still starts an instance, and is
+// answered when it goes nowhere (answerNotTaken).
 func neverAnswered(msg sdk.Message) bool {
 	name := rawMsgName(msg)
 	return isNotice(msg) || name == "" || isReply(name)
@@ -390,7 +392,7 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 		if err != nil {
 			return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_NOT_FOUND", fmt.Sprintf("instance %q not found", req.InstanceID), rt)
 		}
-		if row.Status != "running" && row.Status != "cancelling" {
+		if row.Status != "running" {
 			return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_ALREADY_TERMINATED",
 				fmt.Sprintf("instance %q is already %s", req.InstanceID, row.Status), rt)
 		}
@@ -400,7 +402,7 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 	inst.Lock()
 	defer inst.Unlock()
 
-	if inst.Status != "running" && inst.Status != "cancelling" {
+	if inst.Status != "running" {
 		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_ALREADY_TERMINATED",
 			fmt.Sprintf("instance %q is already %s", req.InstanceID, inst.Status), rt)
 	}

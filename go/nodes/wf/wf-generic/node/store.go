@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -14,26 +15,28 @@ import (
 )
 
 const (
-	// wfSchemaVersion 4 (0.1.91): an instance keeps its thread, the conversation's (indexed), and the
-	// messages keep_message kept (wf-orchestration-v1 §5.2.1). Version 3 (0.1.90): a definition is
-	// kept by its hash for as long as a running instance uses it, each instance records the hash it
-	// was born with, and an inbound event is journaled until its transition commits (§5.1).
-	wfSchemaVersion = 4
+	// wfSchemaVersion 5 (Case 4, wf-orchestration-v1 §5.4.10): an instance keeps its person, the
+	// src_ilk and ich of the message that started it, and an instance's status is no longer
+	// cancelling, which nothing set (FINDINGS A-132). Version 4 (0.1.91): an instance keeps its thread,
+	// the conversation's (indexed), and the messages keep_message kept (§5.2.1). Version 3 (0.1.90): a
+	// definition is kept by its hash for as long as a running instance uses it, each instance records
+	// the hash it was born with, and an inbound event is journaled until its transition commits (§5.1).
+	wfSchemaVersion = 5
 	maxLogEntries   = 100
 )
 
 // WFInstanceRow is the persistent representation of a workflow instance.
 type WFInstanceRow struct {
 	InstanceID string
-	// ThreadID is the instance's thread: the thread_id of the message that started it, or the
-	// instance's own id when that message had none. Every message the instance sends carries it, and
-	// a message on it reaches the instance.
+	// ThreadID is the instance's thread: the thread_id of the message that started it (a message
+	// without one starts no instance, FINDINGS A-135). Every message the instance sends carries it,
+	// and a message on it reaches the instance.
 	ThreadID     string
 	WorkflowType string
 	// DefinitionHash is the hash of the definition the instance was born with, and runs on until it
 	// ends (a redeploy does not move it).
 	DefinitionHash string
-	Status         string // running, cancelling, completed, cancelled, failed
+	Status         string // running, completed, cancelled, failed
 	CurrentState   string
 	InputJSON      string // JSON-encoded input map
 	StateJSON      string // JSON-encoded state variable map
@@ -41,6 +44,10 @@ type WFInstanceRow struct {
 	CreatedAtMS    int64
 	UpdatedAtMS    int64
 	TerminatedAtMS sql.NullInt64
+	// PersonILK and PersonICH are the instance's person: the src_ilk and ich of the message that
+	// started it, empty when it had none. A send_message carries them (the rest of FINDINGS A-116).
+	PersonILK string
+	PersonICH string
 }
 
 // WFLogEntry is a single entry in the per-instance audit log.
@@ -162,7 +169,7 @@ var wfSchemaStatements = []string{
     instance_id       TEXT PRIMARY KEY,
     workflow_type     TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'running'
-                      CHECK(status IN ('running','cancelling','completed','cancelled','failed')),
+                      CHECK(status IN ('running','completed','cancelled','failed')),
     current_state     TEXT NOT NULL,
     input_json        TEXT NOT NULL DEFAULT '{}',
     state_json        TEXT NOT NULL DEFAULT '{}',
@@ -171,7 +178,9 @@ var wfSchemaStatements = []string{
     updated_at_ms     INTEGER NOT NULL,
     terminated_at_ms  INTEGER,
     definition_hash   TEXT NOT NULL DEFAULT '',
-    thread_id         TEXT NOT NULL DEFAULT ''
+    thread_id         TEXT NOT NULL DEFAULT '',
+    person_ilk        TEXT NOT NULL DEFAULT '',
+    person_ich        TEXT NOT NULL DEFAULT ''
 );`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
@@ -245,6 +254,11 @@ func ensureWFSchema(db *sql.DB) error {
 			return fmt.Errorf("migrate wf schema to v4: %w", err)
 		}
 	}
+	if userVersion >= 1 && userVersion < 5 {
+		if err := migrateToPersons(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v5: %w", err)
+		}
+	}
 	for _, stmt := range wfSchemaStatements {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("create wf schema: %w", err)
@@ -274,7 +288,7 @@ SELECT hash, workflow_type, definition_json, loaded_at_ms FROM wf_definitions_by
 		`ALTER TABLE wf_instances ADD COLUMN definition_hash TEXT NOT NULL DEFAULT '';`,
 		`UPDATE wf_instances SET definition_hash = COALESCE(
     (SELECT d.hash FROM wf_definitions_by_type d WHERE d.workflow_type = wf_instances.workflow_type), '')
-WHERE status IN ('running', 'cancelling');`,
+WHERE status = 'running';`,
 		`DROP TABLE wf_definitions_by_type;`,
 	}
 	for _, stmt := range stmts {
@@ -302,6 +316,56 @@ func migrateToThreads(tx *sql.Tx) error {
 	stmts := []string{
 		`ALTER TABLE wf_instances ADD COLUMN thread_id TEXT NOT NULL DEFAULT '';`,
 		`UPDATE wf_instances SET thread_id = instance_id;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migrateToPersons takes a v4 store (or an older one, once at v4) to v5. Each instance keeps its
+// person, the src_ilk and ich of the message that started it, empty for an instance of before. The
+// status loses cancelling, which nothing set (FINDINGS A-132): an instance a store of an older engine
+// left there ends cancelled, and the node's log says how many. Its journaled events are dropped at the
+// start, as any instance's that does not run, and the GC takes the rest with it. SQLite changes a
+// CHECK only by building the table again; its indexes are created again with the schema.
+func migrateToPersons(tx *sql.Tx) error {
+	ended, err := tx.Exec(`
+UPDATE wf_instances SET status = 'cancelled', current_trace_id = '', terminated_at_ms = COALESCE(terminated_at_ms, updated_at_ms)
+WHERE status = 'cancelling';`)
+	if err != nil {
+		return err
+	}
+	if count, _ := ended.RowsAffected(); count > 0 {
+		log.Printf("wf store: %d instance(s) left cancelling by an older engine ended cancelled (schema v5)", count)
+	}
+	stmts := []string{
+		`CREATE TABLE wf_instances_v5 (
+    instance_id       TEXT PRIMARY KEY,
+    workflow_type     TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'running'
+                      CHECK(status IN ('running','completed','cancelled','failed')),
+    current_state     TEXT NOT NULL,
+    input_json        TEXT NOT NULL DEFAULT '{}',
+    state_json        TEXT NOT NULL DEFAULT '{}',
+    current_trace_id  TEXT NOT NULL DEFAULT '',
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    terminated_at_ms  INTEGER,
+    definition_hash   TEXT NOT NULL DEFAULT '',
+    thread_id         TEXT NOT NULL DEFAULT '',
+    person_ilk        TEXT NOT NULL DEFAULT '',
+    person_ich        TEXT NOT NULL DEFAULT ''
+);`,
+		`INSERT INTO wf_instances_v5 (instance_id, workflow_type, status, current_state, input_json, state_json,
+    current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, definition_hash, thread_id)
+SELECT instance_id, workflow_type, status, current_state, input_json, state_json,
+    current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, definition_hash, thread_id
+FROM wf_instances;`,
+		`DROP TABLE wf_instances;`,
+		`ALTER TABLE wf_instances_v5 RENAME TO wf_instances;`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
@@ -343,13 +407,13 @@ SELECT hash, workflow_type, definition_json, loaded_at_ms FROM wf_definitions WH
 	return r, err == nil, err
 }
 
-// PruneDefinitions drops every kept definition but current and those a running or cancelling
-// instance still uses. It returns how many it dropped.
+// PruneDefinitions drops every kept definition but current and those a running instance still uses.
+// It returns how many it dropped.
 func (s *Store) PruneDefinitions(ctx context.Context, current string) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `
 DELETE FROM wf_definitions
 WHERE hash != ? AND hash NOT IN (
-    SELECT definition_hash FROM wf_instances WHERE status IN ('running', 'cancelling')
+    SELECT definition_hash FROM wf_instances WHERE status = 'running'
 );`, current)
 	if err != nil {
 		return 0, err
@@ -363,13 +427,13 @@ WHERE hash != ? AND hash NOT IN (
 var errInstanceNotFound = errors.New("not found")
 
 const instanceColumns = `instance_id, thread_id, workflow_type, definition_hash, status, current_state, input_json,
-       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms`
+       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, person_ilk, person_ich`
 
 // CreateInstance inserts a new workflow instance row.
 func (s *Store) CreateInstance(ctx context.Context, inst WFInstanceRow) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
 	return err
 }
 
@@ -377,7 +441,7 @@ func instanceValues(inst WFInstanceRow) []any {
 	return []any{
 		inst.InstanceID, inst.ThreadID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
 		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
-		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS,
+		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS, inst.PersonILK, inst.PersonICH,
 	}
 }
 
@@ -415,7 +479,7 @@ func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, 
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(instance_id) DO UPDATE SET
     status           = excluded.status,
     current_state    = excluded.current_state,
@@ -529,12 +593,11 @@ WHERE instance_id = ?;`, []any{nowMS, nowMS, instanceID}},
 	return tx.Commit()
 }
 
-// LoadRunningInstances returns all instances with status 'running' or 'cancelling', in the order they
-// started.
+// LoadRunningInstances returns all running instances, in the order they started.
 func (s *Store) LoadRunningInstances(ctx context.Context) ([]WFInstanceRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT `+instanceColumns+`
-FROM wf_instances WHERE status IN ('running', 'cancelling')
+FROM wf_instances WHERE status = 'running'
 ORDER BY created_at_ms, instance_id;`)
 	if err != nil {
 		return nil, err
@@ -577,7 +640,7 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 		if err := rows.Scan(
 			&r.InstanceID, &r.ThreadID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
 			&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
-			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS,
+			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS, &r.PersonILK, &r.PersonICH,
 		); err != nil {
 			return nil, err
 		}

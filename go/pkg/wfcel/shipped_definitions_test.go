@@ -2,6 +2,7 @@ package wfcel
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,6 +94,54 @@ func TestEveryWorkflowDefinitionInTheDocsValidates(t *testing.T) {
 	if found < 2 {
 		t.Fatalf("expected the spec's and the quickstart's workflow definitions, found %d", found)
 	}
+}
+
+// Archi's handbook lists the known options (docs/archi/handbook_fluxbee.md §4.2.4) as KnownOptions
+// declares them: the table between its known-options marks is the catalog rendered, so the list Archi
+// writes from never drifts from the one the load writes in (wf-orchestration-v1 §5.4.8).
+func TestTheHandbookListsTheKnownOptions(t *testing.T) {
+	const path, start, end = "docs/archi/handbook_fluxbee.md", "<!-- known-options:start -->", "<!-- known-options:end -->"
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handbook := string(raw)
+	if strings.Count(handbook, start) != 1 || strings.Count(handbook, end) != 1 {
+		t.Fatalf("%s holds the marks %s and %s once each", path, start, end)
+	}
+	_, rest, _ := strings.Cut(handbook, start)
+	listed, _, _ := strings.Cut(rest, end)
+	if got, want := strings.TrimSpace(listed), knownOptionsTable(); got != want {
+		t.Fatalf("%s lists other known options than KnownOptions; the table, rendered from it:\n%s\n\nthe handbook's:\n%s", path, want, got)
+	}
+}
+
+// knownOptionsTable renders KnownOptions as a markdown table, in the catalog's order: each option's
+// name, description and params, those in name order, each with its type (and its values, for an
+// enum) and its description.
+func knownOptionsTable() string {
+	rows := []string{"| Name | Description | Params |", "|---|---|---|"}
+	for _, option := range KnownOptions {
+		var params []string
+		for _, name := range sortedKeys(option.Params) {
+			param := option.Params[name]
+			kind := param.Type
+			if len(param.Enum) > 0 {
+				kind += ": " + strings.Join(param.Enum, ", ")
+			}
+			text := fmt.Sprintf("`%s` (%s)", name, kind)
+			if param.Description != "" {
+				text += ": " + param.Description
+			}
+			params = append(params, text)
+		}
+		row := fmt.Sprintf("| `%s` | %s |", option.Name, option.Description)
+		if len(params) > 0 {
+			row += " " + strings.Join(params, "; ")
+		}
+		rows = append(rows, row+" |")
+	}
+	return strings.Join(rows, "\n")
 }
 
 type fencedBlock struct {

@@ -544,7 +544,7 @@ func TestTheWFAnswersUseTheKeysTheSpecShows(t *testing.T) {
 	}
 	instance := got["instance"].(map[string]any)
 	if keys(instance) != "created_at_ms,current_state,definition_hash,input,instance_id,recent_log,state_variables,status,terminated_at_ms,thread_id,updated_at_ms,workflow_type" ||
-		instance["instance_id"] != instanceID || instance["thread_id"] != instanceID || instance["status"] != "running" || instance["terminated_at_ms"] != nil {
+		instance["instance_id"] != instanceID || instance["thread_id"] != *threadOf(t, rt, instanceID) || instance["status"] != "running" || instance["terminated_at_ms"] != nil {
 		t.Fatalf("the instance: %v", instance)
 	}
 	if input := instance["input"].(map[string]any); input["customer_id"] != "c1" {

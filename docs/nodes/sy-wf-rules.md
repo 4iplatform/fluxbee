@@ -67,8 +67,9 @@ request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
 
 `CompileWorkflow` (`node/compile.go`) checks the name, loads and validates the definition with
 `wfcel.LoadDefinitionBytes` (`COMPILE_ERROR` on failure, naming the path: the checks of the spec's
-§8.5, a menu's limits and its catch included), and writes it to `staged`. Nothing is published or
-deployed.
+§8.5, a menu's limits and its catch included), and writes it to `staged` as written: a known
+option stays written by its name alone, and the WF node's load writes the catalog's words in.
+Nothing is published or deployed.
 
 ### Apply and rollback (the deploy)
 
@@ -225,8 +226,10 @@ orchestrator refuses `run_node` of a `WF.*` node on a runtime that is not a work
   other message is taken only from a node the definition names (`start_from`, an
   `event_match.src`, a target of its sends), and reaches the running instance on its thread or,
   from a `start_from` node, starts a new one on it (`dispatchWorkflowEvent`, `node/correlate.go`);
-  a reply (`*_RESPONSE`, `INVALID_INPUT`, `<msg>.error`) never starts one, and a notice or a reply
-  is never answered.
+  a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) never starts one, and a notice or a reply
+  is never answered. A message it takes nowhere gets `NOT_TAKEN`, with its reason (`no_thread`,
+  `no_conversation`, `invalid_input` or `not_expected`): from an `IO.*` node, any message; from
+  any other node, only a named request, and only `no_thread` and `invalid_input`.
 
 ## Config
 

@@ -48,7 +48,7 @@ func TestARedeployKeepsARunningInstanceOnItsDefinition(t *testing.T) {
 
 	for _, instanceID := range []string{old, fresh} {
 		goMsg := from("IO.in@motherbee", msgWithName("GO"))
-		goMsg.Meta.ThreadID = &instanceID
+		goMsg.Meta.ThreadID = threadOf(t, v2, instanceID)
 		if err := Dispatch(context.Background(), goMsg, v2); err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestARefWithADefaultForwardsAMessageWithoutContext(t *testing.T) {
 	}
 
 	// No default: a message without text fails the send, and the instance.
-	if err := Dispatch(context.Background(), from("IO.in@motherbee", msgWithNameAndPayload("IN", map[string]any{})), rt); err != nil {
+	if err := Dispatch(context.Background(), onThread("conv-no-text", from("IO.in@motherbee", msgWithNameAndPayload("IN", map[string]any{}))), rt); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := rt.Store.ListInstances(context.Background(), "failed", 0, 0)

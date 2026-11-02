@@ -2,10 +2,13 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
+	"github.com/google/uuid"
 )
 
 // newTestRuntime is a WF node's runtime as startEngine builds it: the store at path (a new file
@@ -57,8 +60,43 @@ func from(sender string, msg sdk.Message) sdk.Message {
 	return msg
 }
 
-// putRunningInstance stores a running instance of rt's current definition in state, on its own id
-// as its thread, as a previous run of the node left it.
+// onThread is msg on thread, a conversation's: a message without one starts no instance (FINDINGS
+// A-135).
+func onThread(thread string, msg sdk.Message) sdk.Message {
+	msg.Meta.ThreadID = &thread
+	return msg
+}
+
+// threadOf is the thread of the instance instanceID, the conversation's: a message on it reaches the
+// instance.
+func threadOf(t *testing.T, rt *NodeRuntime, instanceID string) *string {
+	t.Helper()
+	thread := mustGetInstance(t, rt, instanceID).ThreadID
+	return &thread
+}
+
+// notTakenReason is the reason of msg when it is the engine's NOT_TAKEN: a system message whose
+// payload is {ok: false, error: not_taken, reason, detail}. "" for any other message.
+func notTakenReason(t *testing.T, msg sdk.Message) string {
+	t.Helper()
+	if derefString(msg.Meta.Msg) != msgNotTaken {
+		return ""
+	}
+	var payload struct {
+		OK     *bool  `json:"ok"`
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil || msg.Meta.MsgType != sdk.SYSTEMKind || payload.OK == nil || *payload.OK ||
+		payload.Error != "not_taken" || payload.Reason == "" || payload.Detail == "" {
+		t.Fatalf("a NOT_TAKEN is a system message with {ok: false, error: not_taken, reason, detail}: %+v %s (%v)", msg.Meta, msg.Payload, err)
+	}
+	return payload.Reason
+}
+
+// putRunningInstance stores a running instance of rt's current definition in state, as a previous run
+// of the node left it; its thread is its id, so a test reaches it by its id.
 func putRunningInstance(t *testing.T, rt *NodeRuntime, instanceID, state string) {
 	t.Helper()
 	if err := rt.Store.CreateInstance(context.Background(), WFInstanceRow{
@@ -77,9 +115,14 @@ func putRunningInstance(t *testing.T, rt *NodeRuntime, instanceID, state string)
 	}
 }
 
-// startInstance dispatches trigger and returns the id of the instance it starts.
+// startInstance dispatches trigger and returns the id of the instance it starts. A trigger without a
+// thread gets one of its own, a new conversation's, which threadOf gives back: a message without one
+// starts no instance (FINDINGS A-135).
 func startInstance(t *testing.T, rt *NodeRuntime, trigger sdk.Message) string {
 	t.Helper()
+	if strings.TrimSpace(derefString(trigger.Meta.ThreadID)) == "" {
+		trigger = onThread("conv-"+uuid.NewString(), trigger)
+	}
 	before := map[string]bool{}
 	for _, inst := range rt.Registry.All() {
 		before[inst.InstanceID] = true

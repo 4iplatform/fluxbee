@@ -79,14 +79,25 @@ type ActionMeta struct {
 
 // ContextWF is the key of the WF's block in the meta.context of every message a WF sends:
 // {"trail": [the nodes the message went through], "vars": {what the action's vars writes},
-// "menu": the action's menu, as written}.
+// "menu": the action's menu, as loaded, "subject": the action's subject}.
 const ContextWF = "wf"
 
-// Menu is what a WF offers an agent to choose from, on a send_message or a forward to an AI.* node
-// (wf-orchestration-v1 §5.3.1): help, a fixed text that gives the choice its context, and the
-// options. The agent answers {reply, option, params}: reply is the text for the person, option the
-// name of one of the options or none (which the agent adds to every menu, with the param reason),
-// and params that option's. The answer's meta.context.evaluation holds it, where a guard reads it.
+// The subjects a send_message or a forward to an IO node marks its message with
+// (wf-orchestration-v1 §5.4.2): new opens a subject; same continues the subject of the WF's last
+// message on the conversation to that node; end ends it. The IO node places the message by it, since
+// it owns the places, and an agent has none.
+const (
+	SubjectNew  = "new"
+	SubjectSame = "same"
+	SubjectEnd  = "end"
+)
+
+// Menu is what a WF offers to choose from, on a send_message or a forward to an agent (AI.*) or to an
+// IO node (IO.*) (wf-orchestration-v1 §5.3.1, §5.4.4): help, a fixed text that gives the choice its
+// context, and the options. An agent answers {reply, option, params}: reply is the text for the
+// person, option the name of one of the options or none (which the agent adds to every menu, with the
+// param reason), and params that option's. An IO node shows the menu to people, and a person's choice
+// comes back in the same shape. The answer's meta.context.evaluation holds it, where a guard reads it.
 type Menu struct {
 	Help    string       `json:"help,omitempty"`
 	Options []MenuOption `json:"options"`
@@ -115,6 +126,55 @@ const (
 	ReasonParam = "reason"
 )
 
+// KnownOptions is the catalog of the options Fluxbee knows (wf-orchestration-v1 §5.4.8), in the order
+// Archi's handbook lists them, declared once as the agent tools are. A definition writes a known
+// option by its name alone ({"name": "consult"}), and the load writes its description and params in;
+// a known name is never written with them, so it is never redefined, as none is not. What an option
+// does stays each definition's: the catalog fixes the words, not the flow. A definition's own options
+// ("invoice") are written whole. The handbook's table is rendered from this declaration, and a test
+// keeps the two equal.
+var KnownOptions = []MenuOption{
+	{Name: "answer", Description: "Your reply goes to the person."},
+	{
+		Name:        "consult",
+		Description: "A supervisor must approve something before you answer. Your reply tells the person you will check.",
+		Params:      map[string]MenuParam{"question": {Type: "string", Description: "What you ask the supervisor, with the data to decide."}},
+	},
+	{Name: "decided", Description: "The message decides the question: your reply tells the person the decision."},
+	{Name: "wait", Description: "The message decides nothing yet, such as a remark among supervisors: your reply is empty."},
+	{Name: "answer_team", Description: "The message asks you something: your reply goes to the team, not to the person."},
+	{
+		Name:        "handover",
+		Description: "A person of the team must take the conversation. Your reply tells the person; the summary goes to the team.",
+		Params:      map[string]MenuParam{"summary": {Type: "string", Description: "What the team needs to take over: who the person is, what they want, what was done."}},
+	},
+	{
+		Name:        "handback",
+		Description: "Hand the conversation back to the agent.",
+		Params:      map[string]MenuParam{"note": {Type: "string", Description: "What the agent must know: what was done and agreed."}},
+	},
+}
+
+// knownOption is the known option named name, a copy the caller may change, and whether there is
+// one.
+func knownOption(name string) (MenuOption, bool) {
+	for _, known := range KnownOptions {
+		if known.Name != name {
+			continue
+		}
+		option := MenuOption{Name: known.Name, Description: known.Description}
+		if known.Params != nil {
+			option.Params = make(map[string]MenuParam, len(known.Params))
+			for param, spec := range known.Params {
+				spec.Enum = append([]string(nil), spec.Enum...)
+				option.Params[param] = spec
+			}
+		}
+		return option, true
+	}
+	return MenuOption{}, false
+}
+
 // MsgAgentCallCap is the msg of the internal event the engine queues for an instance whose send to an
 // agent the cap on agent calls did not make (wf-orchestration-v1 §5.3.6). Like any internal event, it
 // has no sender.
@@ -136,9 +196,14 @@ type ActionDefinition struct {
 	// Vars is an object, $ref-resolved, that a send_message or a forward writes in the WF's block
 	// (meta.context.wf.vars): the deterministic context the WF gives the receiver.
 	Vars any `json:"vars,omitempty"`
-	// Menu is what a send_message or a forward to an agent (AI.*) offers it to choose from, written
-	// in the WF's block (meta.context.wf.menu) as it is written here: literal, with no $ref.
-	Menu     *Menu  `json:"menu,omitempty"`
+	// Menu is what a send_message or a forward to an agent (AI.*) or an IO node (IO.*) offers to
+	// choose from, written in the WF's block (meta.context.wf.menu) as it loaded: literal, with no
+	// $ref, and each known option written in by the catalog (KnownOptions).
+	Menu *Menu `json:"menu,omitempty"`
+	// Subject is the mark a send_message or a forward to an IO node (IO.*) gives its message, written
+	// in the WF's block (meta.context.wf.subject): SubjectNew, SubjectSame or SubjectEnd, literal.
+	// The IO node places the message by it.
+	Subject  string `json:"subject,omitempty"`
 	Payload  any    `json:"payload,omitempty"`
 	TimerKey string `json:"timer_key,omitempty"`
 	// FireIn (a duration) and FireAt (an RFC3339 UTC time) are a literal string or a $ref, resolved

@@ -115,7 +115,9 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 
 // execSendMessage sends a message the WF writes: its msg and payload from the definition, on the
 // instance's thread (every message the instance sends carries it, so the agents keep one memory per
-// conversation and their answers come back here), with its meta.context and the WF's block.
+// conversation and their answers come back here), with its meta.context and the WF's block. It carries
+// the instance's person as its src_ilk and ich, when the message that started the instance had them:
+// an agent files it under the person, as it does a forwarded message (wf-orchestration-v1 §5.4.3).
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("send_message: no dispatcher configured")
@@ -165,6 +167,12 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 			Context:  contextRaw,
 		},
 		Payload: raw,
+	}
+	if person := inst.PersonILK; person != "" {
+		msg.Meta.SrcIlk = &person
+	}
+	if ich := inst.PersonICH; ich != "" {
+		msg.Meta.Ich = &ich
 	}
 	return sendWithRetry(ctx, actx, "send_message", msg)
 }
@@ -295,9 +303,10 @@ func writeActionContext(metaContext map[string]any, action ActionDefinition, ins
 
 // withWFBlock is metaContext with the WF's block (meta.context.wf, wf-orchestration-v1 §5.2.1,
 // item 7), as the message goes: trail, the nodes the message went through; vars, what the action's
-// vars writes, $ref-resolved: the deterministic context the WF gives the receiver; and menu, the
-// action's menu as written, what an agent may choose from (§5.3.6). vars and menu are there only
-// when the action has them.
+// vars writes, $ref-resolved: the deterministic context the WF gives the receiver; menu, the action's
+// menu as it loaded, its known options written in, what an agent or an IO node's people may choose
+// from (§5.3.6, §5.4.4); and subject, the mark an IO node places the message by (§5.4.2). vars, menu
+// and subject are there only when the action has them.
 func withWFBlock(metaContext map[string]any, trail []string, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
 	hops := make([]any, len(trail))
 	for i, name := range trail {
@@ -313,6 +322,9 @@ func withWFBlock(metaContext map[string]any, trail []string, action ActionDefini
 	}
 	if action.Menu != nil {
 		block["menu"] = action.Menu
+	}
+	if action.Subject != "" {
+		block["subject"] = action.Subject
 	}
 	metaContext[wfcel.ContextWF] = block
 	raw, err := wfcel.EncodeJSON(metaContext)

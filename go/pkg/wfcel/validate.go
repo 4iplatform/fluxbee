@@ -54,10 +54,31 @@ func LoadDefinitionBytes(data []byte, source string, clock ClockFunc) (*Workflow
 		return nil, fmt.Errorf("%s: %w", source, err)
 	}
 	normalizeActionNumbers(&def)
+	expandKnownOptions(&def)
 	if errs := ValidateDefinition(&def, clock); len(errs) > 0 {
 		return nil, errs
 	}
 	return &def, nil
+}
+
+// expandKnownOptions writes in each menu option that names a known option (KnownOptions) the
+// catalog's description and params, before every other check (wf-orchestration-v1 §5.4.10): a
+// definition writes a known option by its name alone, and fieldErrors refuses one written with any
+// other field. So the menu's limits, and the checks of the guards and $refs against the menus, see
+// the options as the WF sends them. The definition's bytes stay as written: WF_GET_CODE answers
+// them, and SY.wf-rules stages them.
+func expandKnownOptions(def *WorkflowDefinition) {
+	def.eachAction(func(_ string, action ActionDefinition) {
+		// The action is a copy, but its menu is held by pointer: the options are changed in place.
+		if action.Menu == nil {
+			return
+		}
+		for i, option := range action.Menu.Options {
+			if known, ok := knownOption(option.Name); ok {
+				action.Menu.Options[i] = known
+			}
+		}
+	})
 }
 
 // normalizeActionNumbers gives the literals of the definition's actions (payloads, meta.context,
@@ -95,8 +116,8 @@ func normalizeActionNumbers(def *WorkflowDefinition) {
 // instead of a message loaded, and forwarded the event.
 var (
 	actionFields = map[string][]string{
-		"send_message":        {"target", "meta", "vars", "menu", "payload"},
-		"forward":             {"target", "message", "meta", "vars", "menu"},
+		"send_message":        {"target", "meta", "vars", "menu", "subject", "payload"},
+		"forward":             {"target", "message", "meta", "vars", "menu", "subject"},
 		"keep_message":        {"name"},
 		"emit_internal_event": {"meta", "payload"},
 		"schedule_timer":      {"timer_key", "fire_in", "fire_at", "missed_policy", "missed_within_ms"},
@@ -293,7 +314,9 @@ func fieldPath(path, name string) string {
 }
 
 // menuFieldErrors names, by their paths, the fields a menu, its options or their params have that are
-// not theirs (menuFields, menuOptionFields, menuParamFields). A value of the wrong JSON type is the
+// not theirs (menuFields, menuOptionFields, menuParamFields), and a known option (KnownOptions)
+// written with any field but its name: the catalog writes its description and params in
+// (expandKnownOptions), and a known name is never redefined. A value of the wrong JSON type is the
 // strict decoder's to report, and a field written with other capitals capitalErrors'.
 func menuFieldErrors(path string, menu map[string]any) ValidationErrors {
 	var errs ValidationErrors
@@ -312,6 +335,13 @@ func menuFieldErrors(path string, menu map[string]any) ValidationErrors {
 			continue
 		}
 		optionPath := fmt.Sprintf("%s.options[%d]", path, i)
+		if name, _ := option["name"].(string); len(option) > 1 {
+			if _, known := knownOption(name); known {
+				// Its other fields are none of a known option's: one error says so.
+				errs = append(errs, ValidationError{Path: optionPath, Message: name + " is a known option: write it by its name alone"})
+				continue
+			}
+		}
 		unknown(optionPath, option, menuOptionFields, "a menu option")
 		params, _ := option["params"].(map[string]any)
 		for _, name := range sortedKeys(params) {
@@ -714,6 +744,13 @@ func IsAgent(name string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(name)), "AI.")
 }
 
+// IsIO reports whether an L2 name is an IO node's (IO.*), case-insensitive as IsAgent: a subject
+// marks a message to one, a menu may be offered to its people, and the engine answers its messages
+// that nothing takes (NOT_TAKEN), since someone who writes is looking for a result.
+func IsIO(name string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(name)), "IO.")
+}
+
 // validateNodeName checks a node name a definition names a sender by (a start_from entry, an
 // event_match.src): a name with its hive, written as the router stamps it, never a SY.* or RT.*
 // node.
@@ -778,6 +815,7 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc, names
 		}
 		errs = append(errs, validateSentContext(path, action)...)
 		errs = append(errs, validateMenu(path, action)...)
+		errs = append(errs, validateSubject(path, action)...)
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
 	case "forward":
 		// A forward sends the message as it was received: its payload is never decoded, and its meta
@@ -788,6 +826,7 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc, names
 		}
 		errs = append(errs, validateSentContext(path, action)...)
 		errs = append(errs, validateMenu(path, action)...)
+		errs = append(errs, validateSubject(path, action)...)
 	case "keep_message":
 		if !variablePattern.MatchString(action.Name) {
 			errs = append(errs, ValidationError{Path: path + ".name", Message: "must be a valid identifier"})
@@ -898,23 +937,24 @@ const (
 // menuNamePattern is the pattern of a menu option's name and of a param's.
 var menuNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 
-// validateMenu checks the menu of a send_message or a forward, offered only to an agent (AI.*):
-// help, when there is one, up to maxMenuHelp characters; 1 to maxMenuOptions options, each with a
-// name of its own in its menu, never none (the agent adds it), a description of 1 to
-// maxMenuDescription characters and up to maxMenuParams params; each param with a name, a type
-// (string, boolean, integer or number), a description up to maxMenuDescription characters and, for
-// a string only, an enum of 1 to maxMenuEnum values (validateMenuEnum). The menu is literal: the
-// strict decoder refuses a $ref in it, and fieldErrors a field it does not have. The engine writes
-// it with no empty field (an empty help, params or description is left out), which the agent would
-// refuse.
+// validateMenu checks the menu of a send_message or a forward, offered only to an agent (AI.*) or to
+// an IO node (IO.*), which shows it to people (wf-orchestration-v1 §5.4.4): help, when there is one,
+// up to maxMenuHelp characters; 1 to maxMenuOptions options, each with a name of its own in its menu,
+// never none (the agent adds it), a description of 1 to maxMenuDescription characters and up to
+// maxMenuParams params; each param with a name, a type (string, boolean, integer or number), a
+// description up to maxMenuDescription characters and, for a string only, an enum of 1 to
+// maxMenuEnum values (validateMenuEnum). It checks the menu as it loaded, with the known options
+// written in (expandKnownOptions). The menu is literal: the strict decoder refuses a $ref in it, and
+// fieldErrors a field it does not have. The engine writes it with no empty field (an empty help,
+// params or description is left out), which the agent would refuse.
 func validateMenu(path string, action ActionDefinition) ValidationErrors {
 	menu := action.Menu
 	if menu == nil {
 		return nil
 	}
 	path += ".menu"
-	if !IsAgent(action.Target) {
-		return ValidationErrors{{Path: path, Message: "is only for an agent (AI.*) target: it is what the WF offers the agent to choose from"}}
+	if !IsAgent(action.Target) && !IsIO(action.Target) {
+		return ValidationErrors{{Path: path, Message: "is only for an agent (AI.*) or an IO node (IO.*) target: it is what the WF offers an agent, or the people of an IO node, to choose from"}}
 	}
 	var errs ValidationErrors
 	switch {
@@ -963,6 +1003,21 @@ func validateMenu(path string, action ActionDefinition) ValidationErrors {
 	return errs
 }
 
+// validateSubject checks the subject of a send_message or a forward (wf-orchestration-v1 §5.4.2):
+// new, same or end, literal (the strict decoder refuses anything but a string), and only to an IO
+// node (IO.*), which places the message by it. An agent has no places, and takes no subject.
+func validateSubject(path string, action ActionDefinition) ValidationErrors {
+	switch {
+	case action.Subject == "":
+		return nil
+	case action.Subject != SubjectNew && action.Subject != SubjectSame && action.Subject != SubjectEnd:
+		return ValidationErrors{{Path: path + ".subject", Message: `must be "new", "same" or "end"`}}
+	case !IsIO(action.Target):
+		return ValidationErrors{{Path: path + ".subject", Message: "is only for an IO node (IO.*) target: the IO node places the message by it, and an agent or a WF has no places"}}
+	}
+	return nil
+}
+
 // validateMenuEnum checks the enum of a menu param: for a string only, 1 to maxMenuEnum values, each
 // one not empty and of its own.
 func validateMenuEnum(path string, param MenuParam) ValidationErrors {
@@ -1001,8 +1056,9 @@ func validateMenuDescription(path, description string, required bool) Validation
 	return nil
 }
 
-// menuNames are the option and param names the definition's menus offer, with the agent's own none
-// and reason: what a guard, a set_variable value or a $ref may read of an agent's evaluation.
+// menuNames are the option and param names the definition's menus offer, the known options' as the
+// catalog writes them in, with the agent's own none and reason: what a guard, a set_variable value or
+// a $ref may read of an evaluation, an agent's answer or a person's choice.
 type menuNames struct {
 	options map[string]bool
 	params  map[string]bool
@@ -1011,8 +1067,8 @@ type menuNames struct {
 func (def *WorkflowDefinition) menuNames() menuNames {
 	names := menuNames{options: map[string]bool{NoneOption: true}, params: map[string]bool{ReasonParam: true}}
 	def.eachAction(func(_ string, action ActionDefinition) {
-		// Only a send_message or a forward offers its menu to an agent: a menu on another action
-		// offers nothing, and widens no name a guard may use.
+		// Only a send_message or a forward offers its menu, to an agent or an IO node: a menu on
+		// another action offers nothing, and widens no name a guard may use.
 		if action.Menu == nil || (action.Type != "send_message" && action.Type != "forward") {
 			return
 		}

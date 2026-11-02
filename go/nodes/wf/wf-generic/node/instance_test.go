@@ -111,7 +111,7 @@ func TestInstanceCreationRunsEntryActions(t *testing.T) {
 	timer := &mockTimerSender{}
 	actx := makeActx(t, disp, timer)
 
-	inst := NewInstance(def, "wfi:test-001", def.WorkflowType, map[string]any{"customer_id": "cust-1"}, fixedClock)
+	inst := NewInstance(def, "wfi:test-001", "conv-1", def.WorkflowType, map[string]any{"customer_id": "cust-1"}, fixedClock)
 
 	// Persist before running entry_actions (as createAndDispatch does)
 	row, _ := inst.ToRow(fixedClock)
@@ -152,7 +152,7 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:t2", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t2", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -182,9 +182,9 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
 	rt, disp := newTestRuntime(t, "", validWorkflowJSON(), nil)
 
-	msg := from("IO.api.billing@motherbee", msgWithNameAndPayload("INVOICE_START", map[string]any{
+	msg := onThread("conv-1", from("IO.api.billing@motherbee", msgWithNameAndPayload("INVOICE_START", map[string]any{
 		"wrong_field": "missing required customer_id",
-	}))
+	})))
 	msg.Routing.Src = "src-uuid-1"
 
 	if err := Dispatch(context.Background(), msg, rt); err != nil {
@@ -196,8 +196,8 @@ func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
 	if len(disp.sent) != 1 {
 		t.Fatalf("expected one error reply, got %d", len(disp.sent))
 	}
-	if got := derefString(disp.sent[0].Meta.Msg); got != "INVALID_INPUT" {
-		t.Fatalf("expected INVALID_INPUT error msg, got %q", got)
+	if got := notTakenReason(t, disp.sent[0]); got != notTakenInvalidInput {
+		t.Fatalf("expected NOT_TAKEN invalid_input, got %q", got)
 	}
 	if events, err := rt.Store.ListInboundEvents(context.Background()); err != nil || len(events) != 0 {
 		t.Fatalf("a refused creation is never journaled: %v %v", events, err)
@@ -263,7 +263,7 @@ func TestWFCancelInstanceTransitionsImmediatelyToCancelled(t *testing.T) {
 	actx := makeActx(t, disp, timer)
 	reg := NewInstanceRegistry()
 
-	inst := NewInstance(def, "wfi:cancel-now", def.WorkflowType, map[string]any{"customer_id": "cust-1"}, fixedClock)
+	inst := NewInstance(def, "wfi:cancel-now", "conv-1", def.WorkflowType, map[string]any{"customer_id": "cust-1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	if err := actx.Store.CreateInstance(context.Background(), row); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
@@ -450,7 +450,7 @@ func TestRunTransitionNoMatchLogsUnhandled(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:t3", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t3", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -492,7 +492,7 @@ func TestRunTransitionGuardFalseNoTransition(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:t4", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t4", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -511,33 +511,6 @@ func TestRunTransitionGuardFalseNoTransition(t *testing.T) {
 	}
 }
 
-func TestRunTransitionCancellingGoesToCancelled(t *testing.T) {
-	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
-	if err != nil {
-		t.Fatalf("load def: %v", err)
-	}
-	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
-
-	inst := NewInstance(def, "wfi:t5", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
-	inst.Status = "cancelling"
-	row, _ := inst.ToRow(fixedClock)
-	_ = actx.Store.CreateInstance(context.Background(), row)
-
-	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("ANYTHING"), actx, takenEvent{})
-	inst.Unlock()
-
-	if err != nil {
-		t.Fatalf("RunTransition: %v", err)
-	}
-	if inst.Status != "cancelled" {
-		t.Errorf("expected status=cancelled, got %s", inst.Status)
-	}
-	if inst.TerminatedAtMS == nil {
-		t.Error("TerminatedAtMS should be set")
-	}
-}
-
 func TestTerminalStateCleansCancelledTimers(t *testing.T) {
 	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	if err != nil {
@@ -546,7 +519,7 @@ func TestTerminalStateCleansCancelledTimers(t *testing.T) {
 	timer := &mockTimerSender{}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, timer)
 
-	inst := NewInstance(def, "wfi:t6", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t6", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -587,7 +560,7 @@ func TestActionFailureDoesNotHaltTransition(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", sendErr: errSendFailed}
 	actx := makeActx(t, disp, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:t7", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t7", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -613,7 +586,7 @@ func TestSetVariableUpdatesStateVars(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:t8", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:t8", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -634,7 +607,7 @@ func TestSetVariableUpdatesStateVars(t *testing.T) {
 
 func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
 	rt, _ := newTestRuntime(t, "", validWorkflowJSON(), nil)
-	inst := NewInstance(rt.Def, "wfi:timer-test", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(rt.Def, "wfi:timer-test", "conv-1", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	inst.DefinitionHash = rt.DefHash
 	row, _ := inst.ToRow(fixedClock)
 	_ = rt.Store.CreateInstance(context.Background(), row)
@@ -678,15 +651,14 @@ func TestTimerFiredCorrelatesByClientRef(t *testing.T) {
 
 func TestThreadIDCorrelation(t *testing.T) {
 	rt, _ := newTestRuntime(t, "", validWorkflowJSON(), nil)
-	inst := NewInstance(rt.Def, "wfi:thread-test", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(rt.Def, "wfi:thread-test", "conv-1", rt.Def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	inst.DefinitionHash = rt.DefHash
 	row, _ := inst.ToRow(fixedClock)
 	_ = rt.Store.CreateInstance(context.Background(), row)
 	rt.Registry.Add(inst)
 
-	// Message with thread_id = the instance's thread (its id: no thread started it), from the node
-	// the instance asked
-	threadID := "wfi:thread-test"
+	// Message on the instance's thread, the conversation's, from the node the instance asked
+	threadID := "conv-1"
 	event := from("IO.quickbooks@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-2"},
 		Meta: sdk.Meta{
@@ -719,7 +691,7 @@ func TestTraceIDPreservedAcrossTransition(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee"}
 	actx := makeActx(t, disp, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:trace-test", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:trace-test", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -749,7 +721,7 @@ func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.internal@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:int-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:int-1", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -781,7 +753,7 @@ func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
 func TestCreateAndDispatchDrainsInitialInternalEvent(t *testing.T) {
 	rt, _ := newTestRuntime(t, "", workflowJSONWithInitialInternalEvent(), nil)
 
-	msg := from("IO.api.billing@motherbee", msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"}))
+	msg := onThread("conv-1", from("IO.api.billing@motherbee", msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"})))
 	if err := Dispatch(context.Background(), msg, rt); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
@@ -807,7 +779,7 @@ func TestInternalEventsPreserveFIFOOrder(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.fifo@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:int-fifo", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:int-fifo", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -839,7 +811,7 @@ func TestEmitInternalEventFromTargetEntryActionsIsDrainedAfterCommit(t *testing.
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.entry@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:int-entry", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:int-entry", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
@@ -868,7 +840,7 @@ func TestTerminalTransitionClearsQueuedInternalEvents(t *testing.T) {
 	}
 	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
 
-	inst := NewInstance(def, "wfi:clear-queue", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	inst := NewInstance(def, "wfi:clear-queue", "conv-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
 	row, _ := inst.ToRow(fixedClock)
 	_ = actx.Store.CreateInstance(context.Background(), row)
 	if err := actx.Store.EnqueueInternalEvents(context.Background(), []InternalEventRow{{

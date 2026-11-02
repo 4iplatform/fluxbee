@@ -5,29 +5,34 @@ Base runtime for instanceable `WF.*` nodes.
 This module holds the workflow engine in Go: it loads one workflow definition (validated by
 `go/pkg/wfcel`), runs its instances, and keeps them in SQLite (`wf_instances.db`).
 
-How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md §5.1, §5.2.1 and
-§5.3.6):
+How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration-v1.md §5.1, §5.2.1,
+§5.3.6 and §5.4.10):
 
 - **One instance per conversation.** An instance lives on the thread of the message that started it
-  (its own id when that message had none), and every message it sends carries that thread: the
-  agents keep one memory per conversation, and their answers, and the person's next message, come
-  back to it. A definition names in `start_from` the nodes whose messages start an instance, and only
-  the nodes it names (`start_from`, `event_match.src`, the targets of its sends) drive one; anyone
-  else is dropped, never answered (FINDINGS A-123). `start_from` names IO nodes and WFs, never an
-  agent or a `SY.*`/`RT.*` node. `thread_id_ref` left the language.
+  (a message without one starts none: a WF never makes up a thread), and every message it sends
+  carries that thread: the agents keep one memory per conversation, and their answers, and the
+  person's next message, come back to it. A `send_message` carries the instance's person too, the
+  `src_ilk` and `ich` of the message that started it. A definition names in `start_from` the nodes
+  whose messages start an instance, and only the nodes it names (`start_from`, `event_match.src`,
+  the targets of its sends) drive one; anyone else is dropped, never answered (FINDINGS A-123).
+  `start_from` names IO nodes and WFs, never an agent or a `SY.*`/`RT.*` node. `thread_id_ref` left
+  the language.
 - **The upgrade to 0.1.91.** A definition written before it has no `start_from` and no longer
   loads: its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with
   `start_from`, and its running instances fail at the next start (`definition_unavailable`).
 - **Forwarding.** `forward` sends a message on as it was received, the event's or one `keep_message`
   kept: the payload byte for byte, every meta field but `memory_package`; the WF changes the
   destination, the thread, the `meta.context` keys it writes and its block, `meta.context.wf` (the
-  trail of the nodes the message went through, the action's `vars`, and its `menu`), which every
-  message a WF sends carries. A transition matches by `msg`, by `src` or both; one without a
-  `target_state` is internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a
-  `$ref`, checked when the action runs. The Go SDK writes frames without HTML escaping.
+  trail of the nodes the message went through, the action's `vars`, its `menu`, and its `subject`,
+  `new`, `same` or `end`, on a send or a forward to an `IO.*` node), which every message a WF sends
+  carries. A transition matches by `msg`, by `src` or both; one without a `target_state` is
+  internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a `$ref`, checked
+  when the action runs. The Go SDK writes frames without HTML escaping.
 - **Asking an agent.** A `send_message` or a `forward` to an `AI.*` node may offer it a `menu`, the
-  options it may choose from; the engine writes it in the WF's block as written, with each option's
-  params in name order and no empty field. The agent answers `{reply, option, params}` in `meta.context.evaluation`, `none` with a
+  options it may choose from, and one to an `IO.*` node may offer it to its people; the engine
+  writes it in the WF's block as written, each known option with the catalog's description and
+  params (`wfcel.KnownOptions`), with each option's params in name order and no empty field. The
+  agent answers `{reply, option, params}` in `meta.context.evaluation`, `none` with a
   `reason` when no option fits, and an error payload for an answer off the menu. A definition with
   `meta.context.response_envelope` is refused: a WF asks an agent with `menu`. What a guard, a
   value or a `$ref` reads of the evaluation is checked against the definition's menus at load.
@@ -35,7 +40,8 @@ How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md �
   definition's `catch` transitions are tried in order, in any state (an empty `event_match` matches
   every event); a chosen one runs as a state's. When the catch takes nothing either, the default:
   the instance's log gets `unhandled event ... in state ...`, the node's log a line naming the
-  instance, the state and the event, and the instance stays where it was.
+  instance, the state and the event, and the instance stays where it was; an `IO.*` node's message
+  gets `NOT_TAKEN` (`not_expected`).
 - **The cap on agent calls.** At most 8 messages go to agents (`AI.*`) between two triggers, a
   trigger being a message from a node that is neither an agent nor the WF itself, or a timer's
   fire. Past it the send is not
@@ -53,7 +59,8 @@ How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md �
 - **At least once.** An inbound event is saved in the store before its transition runs, and the
   transition's commit deletes it, with any earlier event of the instance a failed commit left; a
   creation commits the instance, its internal events, the messages it kept and the event in one
-  transaction (store schema v4: an instance's thread, and its kept messages). After a crash the
+  transaction (store schema v5: an instance's thread, its person, and its kept messages; an
+  instance's status is `running`, `completed`, `cancelled` or `failed`). After a crash the
   start runs again whatever was left, under the same instance id and trace_id, counting each
   event's attempts first: one already run at 3 starts is not run again, and its instance fails
   (`replay_exhausted`). The store commits with `synchronous=FULL`.
@@ -66,11 +73,17 @@ How it runs a workflow (0.1.90, 0.1.91 and Case 3, docs/wf-orchestration-v1.md �
   then, and one scheduled after the list was asked is left alone.
 - **Who may talk to it.** `WF_HELP`, `WF_GET_INSTANCE`, `WF_LIST_INSTANCES`, `WF_GET_CODE` and
   `WF_CANCEL_INSTANCE` answer only SY.admin@motherbee and SY.wf-rules of the node's hive, in
-  snake_case keys. A router notice, a reply (`*_RESPONSE`, `INVALID_INPUT`, `<msg>.error`) and a
-  message without a name are never answered, and a reply never starts an instance. Nor does an
-  agent's late answer, which comes from no `start_from` node: it is dropped while no instance runs
-  on its thread, and reaches the conversation's next instance once one runs there. A message that
-  neither the current state nor the catch takes is logged and dropped, never queued.
+  snake_case keys. A router notice and a reply (`*_RESPONSE`, `NOT_TAKEN`, `<msg>.error`) are never
+  answered, and a reply never starts an instance. Nor does an agent's late answer, which comes from
+  no `start_from` node: it is dropped while no instance runs on its thread, and reaches the
+  conversation's next instance once one runs there. A message that neither the current state nor
+  the catch takes is logged and dropped, never queued.
+- **Not taken.** A message the WF takes nowhere gets `NOT_TAKEN`, a system message with
+  `{"ok": false, "error": "not_taken", "reason", "detail"}`, on its thread and trace: `no_thread`
+  (it has none), `no_conversation` (no instance holds its thread, and it starts none),
+  `invalid_input` (`input_schema` refuses it) or `not_expected` (its instance took nothing). An
+  `IO.*` node gets it for any message, named or not; any other sender only for a named request, and
+  only `no_thread` and `invalid_input`. It took `INVALID_INPUT`'s place.
 - **Robustness.** A `$ref` to a missing field fails the action unless it gives a default
   (`{"$ref": "event.context", "default": {}}`, taken for a missing or `null` field); a `$ref` holds
   only `$ref` and `default`, and its default is a literal. The state holds plain JSON, and a JSON

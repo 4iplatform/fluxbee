@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +191,9 @@ func TestStoreJournalsAnInboundEventUntilItsCommit(t *testing.T) {
 	}
 }
 
+// LoadRunningInstances loads the running instances, each with its thread and its person (Case 4,
+// wf-orchestration-v1 §5.4.10). An instance's status is never cancelling, which nothing set
+// (FINDINGS A-132): the store refuses it.
 func TestStoreLoadRunningInstances(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -207,14 +211,17 @@ func TestStoreLoadRunningInstances(t *testing.T) {
 		status string
 	}{
 		{"wfi:r1", "running"},
-		{"wfi:r2", "cancelling"},
+		{"wfi:r2", "cancelled"},
 		{"wfi:r3", "completed"},
+		{"wfi:r4", "running"},
 	}
 	for _, tc := range statuses {
 		r := base
 		r.InstanceID = tc.id
+		r.ThreadID = "conv-" + tc.id
 		r.Status = tc.status
 		r.CurrentState = "s"
+		r.PersonILK, r.PersonICH = "ilk:"+tc.id, "ich:api:"+tc.id
 		if err := s.CreateInstance(ctx, r); err != nil {
 			t.Fatalf("CreateInstance %s: %v", tc.id, err)
 		}
@@ -224,8 +231,17 @@ func TestStoreLoadRunningInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRunningInstances: %v", err)
 	}
-	if len(running) != 2 {
-		t.Fatalf("expected 2 running instances, got %d", len(running))
+	if len(running) != 2 || running[0].InstanceID != "wfi:r1" || running[1].InstanceID != "wfi:r4" {
+		t.Fatalf("expected the 2 running instances, got %+v", running)
+	}
+	if r := running[1]; r.PersonILK != "ilk:wfi:r4" || r.PersonICH != "ich:api:wfi:r4" || r.ThreadID != "conv-wfi:r4" {
+		t.Fatalf("an instance's person and thread: %+v", r)
+	}
+
+	cancelling := base
+	cancelling.InstanceID, cancelling.Status, cancelling.CurrentState = "wfi:r5", "cancelling", "s"
+	if err := s.CreateInstance(ctx, cancelling); err == nil || !strings.Contains(err.Error(), "CHECK constraint failed") {
+		t.Fatalf("a cancelling instance: %v", err)
 	}
 }
 

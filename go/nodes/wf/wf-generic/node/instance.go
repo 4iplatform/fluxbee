@@ -64,16 +64,16 @@ type WFInstance struct {
 
 	InstanceID string
 	// ThreadID is the instance's thread, the conversation's: the thread_id of the message that
-	// started it, or InstanceID when that message had none. Every message the instance sends carries
-	// it, so the agents keep one memory per conversation and their answers come back here
-	// (wf-orchestration-v1 §5.2.1, item 1).
+	// started it. A message without one starts no instance: a WF never makes up a thread (FINDINGS
+	// A-135). Every message the instance sends carries it, so the agents keep one memory per
+	// conversation and their answers come back here (wf-orchestration-v1 §5.2.1, item 1).
 	ThreadID     string
 	WorkflowType string
 	// DefinitionHash and def are the definition the instance was born with: it runs on it until it
 	// ends, whatever is deployed meanwhile.
 	DefinitionHash string
 	def            *WorkflowDefinition
-	Status         string // running | cancelling | completed | cancelled | failed
+	Status         string // running | completed | cancelled | failed
 	CurrentState   string
 	Input          map[string]any
 	StateVars      map[string]any // mutable state variables (state_json)
@@ -81,6 +81,11 @@ type WFInstance struct {
 	CreatedAtMS    int64
 	UpdatedAtMS    int64
 	TerminatedAtMS *int64
+	// PersonILK and PersonICH are the instance's person, the src_ilk and ich of the message that
+	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) carries them, so
+	// an agent files it under the person, as it does a forwarded one (the rest of FINDINGS A-116).
+	PersonILK string
+	PersonICH string
 	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit
 	// writes: kept since the last commit that went through.
 	kept      map[string]keptMessage
@@ -119,13 +124,13 @@ func (t takenEvent) mutation() InstanceCommitMutation {
 	return InstanceCommitMutation{ConsumedInboundEventID: t.inboundID, ConsumedInternalEventID: t.internalID}
 }
 
-// NewInstance creates a new WFInstance for the given definition and input, on its own id as its
-// thread (the creation sets the thread of the message that starts it, when it has one).
-func NewInstance(def *WorkflowDefinition, instanceID, workflowType string, input map[string]any, clock ClockFunc) *WFInstance {
+// NewInstance creates a new WFInstance for the given definition and input, on threadID, the thread of
+// the message that starts it.
+func NewInstance(def *WorkflowDefinition, instanceID, threadID, workflowType string, input map[string]any, clock ClockFunc) *WFInstance {
 	now := nowMS(clock)
 	return &WFInstance{
 		InstanceID:   instanceID,
-		ThreadID:     instanceID,
+		ThreadID:     threadID,
 		WorkflowType: workflowType,
 		def:          def,
 		Status:       "running",
@@ -160,6 +165,8 @@ func FromRow(row WFInstanceRow, def *WorkflowDefinition, kept []KeptMessageRow) 
 		CurrentTraceID: row.CurrentTraceID,
 		CreatedAtMS:    row.CreatedAtMS,
 		UpdatedAtMS:    row.UpdatedAtMS,
+		PersonILK:      row.PersonILK,
+		PersonICH:      row.PersonICH,
 	}
 	if row.TerminatedAtMS.Valid {
 		v := row.TerminatedAtMS.Int64
@@ -201,6 +208,8 @@ func (inst *WFInstance) ToRow(clock ClockFunc) (WFInstanceRow, error) {
 		CurrentTraceID: inst.CurrentTraceID,
 		CreatedAtMS:    inst.CreatedAtMS,
 		UpdatedAtMS:    nowMS(clock),
+		PersonILK:      inst.PersonILK,
+		PersonICH:      inst.PersonICH,
 	}
 	if inst.TerminatedAtMS != nil {
 		row.TerminatedAtMS = newNullInt64(*inst.TerminatedAtMS)
@@ -219,8 +228,8 @@ func (inst *WFInstance) Unlock() { inst.mu.Unlock() }
 //
 // The first transition of the current state whose event_match and guard take the event runs; when
 // none does, the first of the definition's catch (wf-orchestration-v1 §5.3.2); when the catch takes
-// nothing either, the default logs the event, in the instance's log and in the node's, and the
-// instance stays where it was.
+// nothing either, the default logs the event, in the instance's log and in the node's, the instance
+// stays where it was, and an IO node that sent it hears so: a NOT_TAKEN, not_expected (§5.4.6).
 //
 // Execution model (act-then-commit, at least once): the event is durable before this runs (in the
 // inbound journal or the internal-event queue, taken), the actions run (exit → transition →
@@ -230,11 +239,6 @@ func (inst *WFInstance) Unlock() { inst.mu.Unlock() }
 func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, actx ActionContext, taken takenEvent) error {
 	if startsATrigger(event, actx.Dispatcher.NodeL2Name()) {
 		inst.calls = agentCalls{}
-	}
-
-	// Fast-path: cancelling → immediate transition to 'cancelled'
-	if inst.Status == "cancelling" {
-		return inst.runCancelTransition(ctx, event, actx, taken)
 	}
 
 	// Find the current state definition
@@ -255,7 +259,10 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 
 	if chosen == nil {
 		// The default: the event is logged, in the instance's log and in the node's (both local,
-		// wf-orchestration-v1 §5.3.2), and the instance stays where it was.
+		// wf-orchestration-v1 §5.3.2), and the instance stays where it was. An IO node's message is
+		// answered NOT_TAKEN (not_expected): nothing from an IO ends in silence (§5.4.6), and the IO
+		// node shows it to whoever wrote. Its send is no action of the definition: a failure is logged,
+		// and the event is consumed all the same.
 		log.Printf("instance %s: unhandled event %s in state %s (trace_id=%s): no transition of the state nor of the catch takes it",
 			inst.InstanceID, eventName(event), inst.CurrentState, event.Routing.TraceID)
 		now := nowMS(actx.Clock)
@@ -267,6 +274,10 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 			OK:          false,
 			ErrorDetail: "no matching transition",
 		})
+		detail := fmt.Sprintf("the conversation's instance is in state %s, where no transition and no catch takes the message", inst.CurrentState)
+		if err := answerNotTaken(actx, event, notTakenNotExpected, detail); err != nil {
+			log.Printf("instance %s: %v", inst.InstanceID, err)
+		}
 		if taken.durable() {
 			inst.UpdatedAtMS = now
 			if err := inst.commit(ctx, actx, taken.mutation()); err != nil {
@@ -542,7 +553,7 @@ func (inst *WFInstance) drainLeftoverInternalEvents(ctx context.Context, actx Ac
 }
 
 func (inst *WFInstance) drain(ctx context.Context, actx ActionContext, countAttempts bool) error {
-	for drained := 0; inst.Status == "running" || inst.Status == "cancelling"; drained++ {
+	for drained := 0; inst.Status == "running"; drained++ {
 		row, ok, err := actx.Store.GetNextInternalEvent(ctx, inst.InstanceID)
 		if err != nil {
 			return fmt.Errorf("load internal event: %w", err)

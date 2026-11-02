@@ -356,11 +356,10 @@ what the agent may answer, and the role keeps only the agent's trade.
   "menu": {
     "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
     "options": [
-      {"name": "answer", "description": "You answer the person yourself."},
+      {"name": "answer"},
       {"name": "invoice", "description": "They accepted the quote and ask for the invoice.",
        "params": {"quantity": {"type": "integer"}, "plan": {"type": "string", "enum": ["basic", "pro"]}}},
-      {"name": "consult", "description": "A supervisor must approve something before you answer.",
-       "params": {"question": {"type": "string", "description": "What you ask, with the data to decide."}}}
+      {"name": "consult"}
     ]
   }
   ```
@@ -373,6 +372,21 @@ what the agent may answer, and the role keeps only the agent's trade.
     `boolean`, `integer` or `number`, and its optional description holds up to 200 characters.
   - `enum` is for strings only: 1 to 20 values, each non-empty and unique.
   - The menu is literal (no `$ref`), and a field it does not define is refused.
+
+The known options:
+
+<!-- known-options:start -->
+| Name | Description | Params |
+|---|---|---|
+| `answer` | Your reply goes to the person. | |
+| `consult` | A supervisor must approve something before you answer. Your reply tells the person you will check. | `question` (string): What you ask the supervisor, with the data to decide. |
+| `decided` | The message decides the question: your reply tells the person the decision. | |
+| `wait` | The message decides nothing yet, such as a remark among supervisors: your reply is empty. | |
+| `answer_team` | The message asks you something: your reply goes to the team, not to the person. | |
+| `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: who the person is, what they want, what was done. |
+| `handback` | Hand the conversation back to the agent. | `note` (string): What the agent must know: what was done and agreed. |
+<!-- known-options:end -->
+
 - **`none`:** the agent node adds it to every menu, with the param `reason`.
 - **The answer:**
   - it comes back with the request's `msg`. A forwarded message has none, so match the agent by

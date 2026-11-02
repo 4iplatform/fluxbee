@@ -82,20 +82,26 @@ func (r *InstanceRegistry) All() []*WFInstance {
 
 // dispatchWorkflowEvent routes workflow traffic (no control verb, no notice, no system message but a
 // TIMER_FIRED: Dispatch has checked that a node sent it) to the instance it belongs to, or starts
-// one. The strict correlation order (wf-orchestration-v1 §5.2.1, item 3):
+// one. The strict correlation order (wf-orchestration-v1 §5.2.1, item 3, and §5.4.10):
 //
 //  1. TIMER_FIRED, from SY.timer of the WF's own hive, for a timer this node scheduled → the instance
 //     its client_ref names
 //  2. from a sender the definition does not involve (no node of its start_from, of an
 //     event_match.src or a target of its sends: FINDINGS A-123) → dropped, never answered; on the
 //     thread of a running instance, that instance's definition decides, otherwise the current one
-//  3. meta.thread_id is the thread of a running instance → that instance
-//  4. from a start_from node, and no reply (a *_RESPONSE, an error answer) → a new instance on its
-//     thread, on the current definition, as its input_schema allows
-//  5. anything else (an answer to an instance that ended, say) → dropped, never answered
+//  3. meta.thread_id is the thread of a running instance → that instance; when neither its state
+//     nor the catch takes it, NOT_TAKEN not_expected (RunTransition)
+//  4. no thread → NOT_TAKEN no_thread: a WF never makes up a thread (FINDINGS A-135)
+//  5. not from a start_from node, or a reply (a *_RESPONSE, an error answer) → NOT_TAKEN
+//     no_conversation
+//  6. → a new instance on its thread, on the current definition, as its input_schema allows; when it
+//     refuses the message, NOT_TAKEN invalid_input
 //
-// So a person who writes again after their conversation's instance ended starts a new one, on the
-// same thread, at the initial state; an agent's late answer starts nothing.
+// A NOT_TAKEN goes to whoever answerNotTaken says: an IO node for any message that is no reply and no
+// notice; anyone else only for a named request, and only no_thread and invalid_input. So a person who
+// writes again after their conversation's instance ended starts a new one, on the same thread, at the
+// initial state; a supervisor's message on a thread no instance holds hears that no conversation
+// takes it; an agent's late answer starts nothing, and is never answered.
 //
 // The node's log gets a payload's first characters only for a message that reaches an instance or
 // starts one: when every message of a node comes to the WF (a Slack channel's, say), the log must
@@ -104,6 +110,7 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 	name := rawMsgName(msg)
 	sender := msg.SourceL2Name()
 	threadID := derefStringPtr(msg.Meta.ThreadID)
+	hasThread := strings.TrimSpace(threadID) != ""
 	log.Printf(
 		"wf: correlate inbound type=%s msg=%q src_uuid=%s src_l2=%q thread_id=%q trace_id=%s target=%q",
 		msg.Meta.MsgType,
@@ -119,7 +126,7 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 		return rt.takeTimerFired(ctx, msg)
 	}
 	inst, onThread := rt.Registry.GetByThread(threadID)
-	onThread = onThread && threadID != ""
+	onThread = onThread && hasThread
 	def := rt.Def
 	if onThread {
 		def = inst.def
@@ -133,12 +140,18 @@ func (rt *NodeRuntime) dispatchWorkflowEvent(ctx context.Context, msg sdk.Messag
 		log.Printf("wf: correlate matched thread_id=%s instance_id=%s payload=%s", threadID, inst.InstanceID, payloadPreview(msg.Payload))
 		return rt.deliver(ctx, inst, msg, "")
 	}
+	if !hasThread {
+		log.Printf("wf: ignoring %s from %q (trace_id=%s): it has no thread, and a WF never makes one up",
+			msgName(msg), sender, msg.Routing.TraceID)
+		return answerNotTaken(rt.ActCtx, msg, notTakenNoThread, "the message has no thread_id, and a WF never makes one up")
+	}
 	if !rt.Def.StartsFrom(sender) || isReply(name) {
 		// SY.timer's answers to the engine's own timer requests never get here (it is no node of the
 		// definition), and an agent's late answer ends here.
 		log.Printf("wf: ignoring %s from %q (thread_id=%q trace_id=%s): no running instance on its thread, and it starts none",
 			msgName(msg), sender, threadID, msg.Routing.TraceID)
-		return nil
+		return answerNotTaken(rt.ActCtx, msg, notTakenNoConversation,
+			fmt.Sprintf("no running instance holds thread %q, and a message from %s starts none", threadID, sender))
 	}
 	return rt.create(ctx, msg)
 }
@@ -231,7 +244,7 @@ func (rt *NodeRuntime) create(ctx context.Context, msg sdk.Message) error {
 		// A message that starts no instance leaves no text in the log.
 		log.Printf("wf: create rejected src_l2=%q thread_id=%q trace_id=%s detail=%v",
 			msg.SourceL2Name(), derefStringPtr(msg.Meta.ThreadID), msg.Routing.TraceID, err)
-		return rt.answerInvalidInput(ctx, msg, err.Error())
+		return answerNotTaken(rt.ActCtx, msg, notTakenInvalidInput, err.Error())
 	}
 	instanceID := newInstanceID()
 	inboundID, err := rt.journal(ctx, instanceID, inboundCreate, msg, "")
@@ -262,11 +275,12 @@ func creationInput(def *WorkflowDefinition, msg sdk.Message) (map[string]any, er
 // entry_actions. One commit writes the instance, enqueues its internal events and consumes the
 // journaled creation: a crash before it leaves the creation for recovery, which runs it again under
 // the same instance_id (and the same trace_id), so no instance is ever half-started. The instance's
-// thread is msg's, or its own id when msg has none.
+// thread is msg's, which its callers checked it has, and its person msg's src_ilk and ich.
 func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanceID string, input map[string]any, inboundID int64) error {
 	def := rt.Def
-	inst := NewInstance(def, instanceID, def.WorkflowType, input, rt.ActCtx.Clock)
-	inst.ThreadID = creationThread(msg, instanceID)
+	inst := NewInstance(def, instanceID, derefStringPtr(msg.Meta.ThreadID), def.WorkflowType, input, rt.ActCtx.Clock)
+	inst.PersonILK = derefStringPtr(msg.Meta.SrcIlk)
+	inst.PersonICH = derefStringPtr(msg.Meta.Ich)
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
 	log.Printf(
@@ -324,15 +338,6 @@ func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanc
 	})
 	rt.settle(ctx, inst)
 	return err
-}
-
-// creationThread is the thread of the instance msg starts as instanceID: msg's, or the instance's own
-// id when msg has none.
-func creationThread(msg sdk.Message, instanceID string) string {
-	if threadID := derefStringPtr(msg.Meta.ThreadID); strings.TrimSpace(threadID) != "" {
-		return threadID
-	}
-	return instanceID
 }
 
 // protect runs the processing of one event for inst. A panic in it fails that instance
@@ -401,7 +406,7 @@ func failStoredInstance(ctx context.Context, actx ActionContext, instanceID, sta
 // settle: an instance that ended leaves the registry, and the definition it was born with goes once
 // no running instance uses it.
 func (rt *NodeRuntime) settle(ctx context.Context, inst *WFInstance) {
-	if inst.Status == "running" || inst.Status == "cancelling" {
+	if inst.Status == "running" {
 		return
 	}
 	rt.Registry.Remove(inst.InstanceID)
@@ -421,28 +426,53 @@ func (rt *NodeRuntime) pruneDefinitions(ctx context.Context) {
 	}
 }
 
-// answerInvalidInput tells the sender of msg why it starts no instance, with an INVALID_INPUT,
-// unless msg is one the engine never answers (neverAnswered): an INVALID_INPUT to another WF's
-// INVALID_INPUT would bounce between the two forever (FINDINGS A-119).
-func (rt *NodeRuntime) answerInvalidInput(ctx context.Context, msg sdk.Message, detail string) error {
-	actx := rt.ActCtx
-	if actx.Dispatcher == nil || neverAnswered(msg) {
+// Why the WF took a message nowhere: the reason of its NOT_TAKEN (wf-orchestration-v1 §5.4.10).
+const (
+	// notTakenNoThread: the message has no thread, and a WF never makes one up (FINDINGS A-135).
+	notTakenNoThread = "no_thread"
+	// notTakenNoConversation: no running instance holds its thread, and it starts none.
+	notTakenNoConversation = "no_conversation"
+	// notTakenInvalidInput: it would start an instance, and the input_schema refuses it.
+	notTakenInvalidInput = "invalid_input"
+	// notTakenNotExpected: the instance on its thread took nothing, neither a transition nor the
+	// catch.
+	notTakenNotExpected = "not_expected"
+)
+
+// answerNotTaken tells the sender of msg that the WF took it nowhere (wf-orchestration-v1 §5.4.6):
+// a NOT_TAKEN, a system message to the sender's uuid with msg's trace_id and thread, and the payload
+// {ok: false, error: not_taken, reason, detail}. Who gets one:
+//   - an IO node (IO.*), for any message that is no reply and no notice, named or not: someone who
+//     writes is looking for a result, and the IO node shows it to them;
+//   - any other sender, only for a named request (neverAnswered), and only for no_thread and
+//     invalid_input, as INVALID_INPUT before it. A NOT_TAKEN to another WF's NOT_TAKEN would bounce
+//     between the two forever (FINDINGS A-119), and an agent's late answer starts nothing, unanswered.
+//
+// A sender the definition does not involve never gets here (dispatchWorkflowEvent drops it first).
+func answerNotTaken(actx ActionContext, msg sdk.Message, reason, detail string) error {
+	switch name := rawMsgName(msg); {
+	case actx.Dispatcher == nil || isNotice(msg) || isReply(name):
+		return nil
+	case wfcel.IsIO(msg.SourceL2Name()):
+	case neverAnswered(msg) || (reason != notTakenNoThread && reason != notTakenInvalidInput):
 		return nil
 	}
 	replyTo := msg.Routing.Src
 	if replyTo == "" {
 		return nil
 	}
-	log.Printf(
-		"wf: sending error response code=%s detail=%q reply_to=%s trace_id=%s src_l2=%q",
-		msgInvalidInput,
-		detail,
-		replyTo,
-		msg.Routing.TraceID,
-		msg.SourceL2Name(),
-	)
-	payload, _ := sdk.MarshalPayload(wfErrorPayload(msgInvalidInput, detail))
-	msgName := msgInvalidInput
+	log.Printf("wf: sending %s reason=%s detail=%q reply_to=%s trace_id=%s src_l2=%q",
+		msgNotTaken, reason, detail, replyTo, msg.Routing.TraceID, msg.SourceL2Name())
+	payload, err := sdk.MarshalPayload(map[string]any{
+		"ok":     false,
+		"error":  "not_taken",
+		"reason": reason,
+		"detail": detail,
+	})
+	if err != nil {
+		return fmt.Errorf("%s not sent: %w", msgNotTaken, err)
+	}
+	msgName := msgNotTaken
 	resp := sdk.Message{
 		Routing: sdk.Routing{
 			Src:     actx.Dispatcher.NodeUUID(),
@@ -456,7 +486,14 @@ func (rt *NodeRuntime) answerInvalidInput(ctx context.Context, msg sdk.Message, 
 		},
 		Payload: payload,
 	}
-	return actx.Dispatcher.SendMsg(resp)
+	if threadID := msg.Meta.ThreadID; threadID != nil {
+		thread := *threadID
+		resp.Meta.ThreadID = &thread
+	}
+	if err := actx.Dispatcher.SendMsg(resp); err != nil {
+		return fmt.Errorf("%s not sent: %w", msgNotTaken, err)
+	}
+	return nil
 }
 
 func derefStringPtr(value *string) string {

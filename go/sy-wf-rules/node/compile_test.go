@@ -98,6 +98,42 @@ func TestCompileWorkflowRejectsInvalidDefinitionAndDoesNotWriteStaged(t *testing
 	}
 }
 
+// Case 4 (wf-orchestration-v1 §5.4.10): a known option compiles written by its name alone, and is
+// staged as written: the WF node's load writes the catalog's description and params in, and
+// WF_GET_CODE answers the definition as it was written. A known option written with any other field
+// is refused, and nothing is staged.
+func TestAKnownOptionIsStagedByItsNameAlone(t *testing.T) {
+	withMenu := func(option map[string]any) map[string]any {
+		definition := validWorkflowDefinition()
+		state := definition["states"].([]any)[0].(map[string]any)
+		state["entry_actions"] = append(state["entry_actions"].([]any), map[string]any{
+			"type": "send_message", "target": "AI.billing@motherbee", "meta": map[string]any{"msg": "ASK"},
+			"menu": map[string]any{"options": []any{option}}, "payload": map[string]any{"text": "ready?"},
+		})
+		return definition
+	}
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: withMenu(map[string]any{"name": "answer"})}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	staged, err := svc.store.ReadDefinitionBytes("invoice", "staged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(staged), `"name": "answer"`) || strings.Contains(string(staged), "Your reply goes to the person.") {
+		t.Fatalf("the known option is staged as written:\n%s", staged)
+	}
+
+	svc = newTestService(t)
+	_, err = svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: withMenu(map[string]any{"name": "answer", "description": "You answer."})})
+	if err == nil || !strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), "answer is a known option: write it by its name alone") {
+		t.Fatalf("expected COMPILE_ERROR, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "staged", "definition.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no staged definition, got err=%v", err)
+	}
+}
+
 func newTestService(t *testing.T) *Service {
 	t.Helper()
 	cfg := NodeConfig{

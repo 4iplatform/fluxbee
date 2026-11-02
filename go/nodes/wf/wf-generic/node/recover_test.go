@@ -261,36 +261,6 @@ func TestRecoverOrphanedSYTimerCancelled(t *testing.T) {
 	}
 }
 
-func TestRecoverCancellingInstanceSkipsTimerReconcile(t *testing.T) {
-	futureMS := int64(1776100060000)
-	ref := timerClientRef("wfi:cancelling", "invoice_timeout")
-
-	timer := &mockTimerLister{
-		timerList: []sdk.TimerInfo{timerInfo(ref, futureMS)},
-	}
-	rt := recoverRuntime(t, validWorkflowJSON(), timer)
-
-	// Instance is in cancelling status
-	putRunningInstance(t, rt, "wfi:cancelling", "collecting_data")
-	if _, err := rt.Store.db.Exec(`UPDATE wf_instances SET status = 'cancelling' WHERE instance_id = 'wfi:cancelling';`); err != nil {
-		t.Fatal(err)
-	}
-	_ = rt.Store.RegisterTimer(context.Background(), "wfi:cancelling", "invoice_timeout", 1000, futureMS)
-
-	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
-		t.Fatalf("Recover: %v", err)
-	}
-
-	// Cancelling instance should still be in registry
-	if _, ok := rt.Registry.Get("wfi:cancelling"); !ok {
-		t.Error("cancelling instance should be in registry")
-	}
-	// Timer should NOT be cancelled (we skip reconciliation for cancelling instances)
-	if len(timer.cancelled) != 0 {
-		t.Errorf("cancelling instance: no timers should be touched, cancelled=%v", timer.cancelled)
-	}
-}
-
 func TestRecoverIdempotent(t *testing.T) {
 	futureMS := int64(1776100060000)
 	ref := timerClientRef("wfi:idem", "invoice_timeout")
@@ -488,7 +458,7 @@ func TestATimerScheduledAfterTheListWasAskedKeepsItsRow(t *testing.T) {
 	}
 
 	answer := from("IO.in@motherbee", msgWithName("ANSWER"))
-	answer.Meta.ThreadID = &instanceID
+	answer.Meta.ThreadID = threadOf(t, rt, instanceID)
 	if err := Dispatch(context.Background(), answer, rt); err != nil {
 		t.Fatal(err)
 	}

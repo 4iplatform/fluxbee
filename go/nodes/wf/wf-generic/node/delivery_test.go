@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,20 +44,18 @@ const askingWorkflowJSON = `{
   ]
 }`
 
-// startAsking starts an instance of askingWorkflowJSON on rt and returns its id (the thread of its
-// first send).
+// startAsking starts an instance of askingWorkflowJSON on rt, on a conversation of its own, and
+// returns its id; threadOf gives its thread.
 func startAsking(t *testing.T, rt *NodeRuntime, disp *mockDispatcher, traceID string) string {
 	t.Helper()
 	trigger := from("IO.in@motherbee", msgWithNameAndPayload("START", map[string]any{"customer_id": "c1"}))
 	trigger.Routing.TraceID = traceID
 	sent := len(disp.sent)
-	if err := Dispatch(context.Background(), trigger, rt); err != nil {
-		t.Fatalf("Dispatch START: %v", err)
-	}
+	instanceID := startInstance(t, rt, trigger)
 	if len(disp.sent) != sent+1 {
 		t.Fatalf("the creation asks the agent: sent %d", len(disp.sent)-sent)
 	}
-	return derefString(disp.sent[sent].Meta.ThreadID)
+	return instanceID
 }
 
 // realTimerFired is SY.timer's TIMER_FIRED as the router delivers it (the shared wire fixture of the
@@ -180,9 +179,11 @@ func TestTheControlVerbsAnswerOnlyTheAdminAndTheWFRulesOfTheHive(t *testing.T) {
 	}
 }
 
-// FINDINGS A-112/A-119: a router notice, a reply (a *_RESPONSE, an error answer, an agent's
-// <msg>.error) and a message without a name are never answered; a reply never starts an instance
-// either, even when the schema would take it. So two WFs cannot bounce an INVALID_INPUT.
+// FINDINGS A-112/A-119: a router notice and a reply (a *_RESPONSE, the engine's NOT_TAKEN, an
+// agent's <msg>.error) are never answered, and a reply never starts an instance either, even when the
+// schema would take it: two WFs cannot bounce a NOT_TAKEN. A message the schema refuses gets a
+// NOT_TAKEN invalid_input: from an IO node, named or not (wf-orchestration-v1 §5.4.6); from anyone
+// else, only a named request.
 func TestErrorsRepliesAndNoticesAreNeverAnswered(t *testing.T) {
 	strict := strings.Replace(askingWorkflowJSON, `"input_schema": {"type": "object"}`, `"input_schema": {"type": "object", "required": ["customer_id"]}`, 1)
 	for name, definition := range map[string]string{"permissive": askingWorkflowJSON, "strict": strict} {
@@ -190,10 +191,11 @@ func TestErrorsRepliesAndNoticesAreNeverAnswered(t *testing.T) {
 			rt, disp := newTestRuntime(t, "", definition, nil)
 			unreachable := sdk.MSGUnreachable
 			cases := map[string]sdk.Message{
-				"another WF's INVALID_INPUT": from("WF.other@motherbee", msgWithNameAndPayload(msgInvalidInput, map[string]any{"ok": false, "error": "INVALID_INPUT", "detail": "x"})),
-				"a *_RESPONSE":               from("WF.other@motherbee", msgWithNameAndPayload("WF_LIST_INSTANCES_RESPONSE", map[string]any{"ok": false, "error": "UNAUTHORIZED"})),
-				"an agent's error":           from("AI.host@motherbee", msgWithNameAndPayload("ASK.error", map[string]any{"code": "x"})),
-				"a router notice":            {Routing: sdk.Routing{Src: "router-uuid", TraceID: "t-notice"}, Meta: sdk.Meta{MsgType: "system", Msg: &unreachable}, Payload: json.RawMessage(`{"reason":"NODE_NOT_FOUND"}`)},
+				"another WF's NOT_TAKEN": onThread("conv-1", from("WF.upstream@motherbee", msgWithNameAndPayload(msgNotTaken, map[string]any{"ok": false, "error": "not_taken", "reason": "invalid_input", "detail": "x"}))),
+				"a WF's *_RESPONSE":      onThread("conv-1", from("WF.upstream@motherbee", msgWithNameAndPayload("WF_LIST_INSTANCES_RESPONSE", map[string]any{"ok": false, "error": "UNAUTHORIZED"}))),
+				"an IO node's reply":     onThread("conv-1", from("IO.in@motherbee", msgWithNameAndPayload("QUOTE_RESPONSE", map[string]any{"ok": true}))),
+				"an agent's error":       onThread("conv-1", from("AI.host@motherbee", msgWithNameAndPayload("ASK.error", map[string]any{"code": "x"}))),
+				"a router notice":        {Routing: sdk.Routing{Src: "router-uuid", TraceID: "t-notice"}, Meta: sdk.Meta{MsgType: "system", Msg: &unreachable}, Payload: json.RawMessage(`{"reason":"NODE_NOT_FOUND"}`)},
 			}
 			for label, msg := range cases {
 				if err := Dispatch(context.Background(), msg, rt); err != nil {
@@ -207,27 +209,94 @@ func TestErrorsRepliesAndNoticesAreNeverAnswered(t *testing.T) {
 				t.Fatalf("a reply started an instance: %+v", rows)
 			}
 
-			// A message without a name (an IO node's text) starts an instance, or, refused, gets no
-			// answer; a named request refused gets its INVALID_INPUT.
-			text := from("IO.in@motherbee", sdk.Message{Routing: sdk.Routing{Src: "io-uuid", TraceID: "t-text"}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{"text":"hello"}`)})
-			if err := Dispatch(context.Background(), text, rt); err != nil {
-				t.Fatal(err)
+			// A message without a name (an IO node's text) starts an instance, as a named request
+			// does. Refused, an IO node's message gets a NOT_TAKEN, named or not, and a WF's only
+			// when it is a named request.
+			unnamed := func(sender, src, thread string) sdk.Message {
+				return onThread(thread, from(sender, sdk.Message{Routing: sdk.Routing{Src: src, TraceID: "t-" + thread}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{"text":"hello"}`)}))
 			}
-			named := from("IO.api.billing@motherbee", msgWithNameAndPayload("START", map[string]any{"text": "hello"}))
-			named.Routing.Src = "billing-uuid"
-			if err := Dispatch(context.Background(), named, rt); err != nil {
-				t.Fatal(err)
+			named := func(sender, src, thread string) sdk.Message {
+				msg := onThread(thread, from(sender, msgWithNameAndPayload("START", map[string]any{"text": "hello"})))
+				msg.Routing.Src = src
+				return msg
+			}
+			for _, msg := range []sdk.Message{
+				unnamed("IO.in@motherbee", "io-uuid", "conv-text"),
+				named("IO.api.billing@motherbee", "billing-uuid", "conv-named"),
+				unnamed("WF.upstream@motherbee", "upstream-text-uuid", "conv-upstream-text"),
+				named("WF.upstream@motherbee", "upstream-uuid", "conv-upstream"),
+			} {
+				if err := Dispatch(context.Background(), msg, rt); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if name == "permissive" {
-				if rt.Registry.Count() != 2 {
-					t.Fatalf("a text and a request start instances: %d", rt.Registry.Count())
+				if rt.Registry.Count() != 4 {
+					t.Fatalf("texts and requests start instances: %d", rt.Registry.Count())
 				}
 				return
 			}
-			if rt.Registry.Count() != 0 || len(disp.sent) != 1 || derefString(disp.sent[0].Meta.Msg) != msgInvalidInput || disp.sent[0].Routing.Dst.Value() != "billing-uuid" {
-				t.Fatalf("only the named request gets an INVALID_INPUT: %+v", disp.sent)
+			var answered []string
+			for _, msg := range disp.sent {
+				if notTakenReason(t, msg) != notTakenInvalidInput {
+					t.Fatalf("a refused message gets a NOT_TAKEN invalid_input: %+v", msg)
+				}
+				answered = append(answered, msg.Routing.Dst.Value()+" "+derefString(msg.Meta.ThreadID))
+			}
+			if rt.Registry.Count() != 0 || strings.Join(answered, ", ") != "io-uuid conv-text, billing-uuid conv-named, upstream-uuid conv-upstream" {
+				t.Fatalf("the IO nodes' messages and the WF's named request get a NOT_TAKEN: %v", answered)
 			}
 		})
+	}
+}
+
+// FINDINGS A-135: a message with no thread starts no instance, since a WF never makes up a thread. An
+// IO node hears so for any message; any other sender only for a named request (wf-orchestration-v1
+// §5.4.10), so a WF or an agent that sends a request with no thread hears why it went nowhere.
+func TestAMessageWithNoThreadStartsNothing(t *testing.T) {
+	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
+	unnamed := from("WF.upstream@motherbee", sdk.Message{Routing: sdk.Routing{Src: "upstream-uuid", TraceID: "t-unnamed"}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{}`)})
+	named := from("WF.upstream@motherbee", msgWithNameAndPayload("START", map[string]any{"customer_id": "c1"}))
+	named.Routing.Src = "upstream-uuid"
+	agent := from("AI.host@motherbee", msgWithNameAndPayload("ASK", map[string]any{"text": "an answer"}))
+	agent.Routing.Src = "agent-uuid"
+	text := from("IO.in@motherbee", sdk.Message{Routing: sdk.Routing{Src: "io-uuid", TraceID: "t-text"}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{"text":"hi"}`)})
+	for _, msg := range []sdk.Message{unnamed, named, agent, text} {
+		if err := Dispatch(context.Background(), msg, rt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var answered []string
+	for _, msg := range disp.sent {
+		if notTakenReason(t, msg) != notTakenNoThread || msg.Meta.ThreadID != nil {
+			t.Fatalf("a NOT_TAKEN no_thread, on no thread: %+v %s", msg, msg.Payload)
+		}
+		answered = append(answered, msg.Routing.Dst.Value())
+	}
+	if rows, _ := rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 || strings.Join(answered, ", ") != "upstream-uuid, agent-uuid, io-uuid" {
+		t.Fatalf("nothing starts, and the named requests and the IO node's text hear why: %d instances, answered %v", len(rows), answered)
+	}
+}
+
+// The default's NOT_TAKEN is no action of the definition: when it cannot go, the node's log says so,
+// and the instance stays where it was, with the event consumed.
+func TestANotTakenThatCannotGoFailsNothing(t *testing.T) {
+	rt, disp := newTestRuntime(t, "", askingWorkflowJSON, nil)
+	instanceID := startAsking(t, rt, disp, "trace-start")
+	disp.sendErr = errors.New("sender queue full")
+	odd := from("IO.in@motherbee", msgWithName("ODD"))
+	odd.Routing.Src = "io-uuid"
+	odd.Meta.ThreadID = threadOf(t, rt, instanceID)
+	var err error
+	logged := nodeLog(t, func() { err = Dispatch(context.Background(), odd, rt) })
+	if err != nil || !strings.Contains(logged, "instance "+instanceID+": NOT_TAKEN not sent: sender queue full") {
+		t.Fatalf("the node's log says the NOT_TAKEN did not go: %v %s", err, logged)
+	}
+	if row := mustGetInstance(t, rt, instanceID); row.Status != "running" || row.CurrentState != "asking" {
+		t.Fatalf("the instance stays where it was: %+v", row)
+	}
+	if events, _ := rt.Store.ListInboundEvents(context.Background()); len(events) != 0 {
+		t.Fatalf("the event is consumed: %+v", events)
 	}
 }
 
@@ -260,7 +329,7 @@ func TestAnEventLeftByACrashRunsAgainWithItsTraceID(t *testing.T) {
 	before.ActCtx.Dispatcher = crash
 
 	answer := from("AI.host@motherbee", msgWithNameAndPayload("ASK", map[string]any{"text": "the answer"}))
-	answer.Meta.ThreadID = &instanceID
+	answer.Meta.ThreadID = threadOf(t, before, instanceID)
 	answer.Routing.TraceID = "trace-answer"
 	if err := Dispatch(context.Background(), answer, before); err == nil {
 		t.Fatal("the commit cannot succeed on a closed store")
@@ -297,7 +366,7 @@ func TestACreationLeftByACrashRunsAgainUnderItsInstanceID(t *testing.T) {
 	before, _ := newTestRuntime(t, path, askingWorkflowJSON, nil)
 	crash := &crashingDispatcher{store: before.Store, crashAt: "AI.host@motherbee"}
 	before.ActCtx.Dispatcher = crash
-	trigger := from("IO.in@motherbee", msgWithNameAndPayload("START", map[string]any{"customer_id": "c1"}))
+	trigger := onThread("conv-1", from("IO.in@motherbee", msgWithNameAndPayload("START", map[string]any{"customer_id": "c1"})))
 	trigger.Routing.TraceID = "trace-start"
 	if err := Dispatch(context.Background(), trigger, before); err == nil {
 		t.Fatal("the creation cannot commit on a closed store")
@@ -305,21 +374,25 @@ func TestACreationLeftByACrashRunsAgainUnderItsInstanceID(t *testing.T) {
 	if len(crash.sent) != 1 {
 		t.Fatalf("the creation asked before the crash: %+v", crash.sent)
 	}
-	instanceID := derefString(crash.sent[0].Meta.ThreadID)
 
 	after, disp := newTestRuntime(t, path, askingWorkflowJSON, &mockTimerLister{})
 	if rows, _ := after.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 0 {
 		t.Fatalf("no instance is half-started: %+v", rows)
 	}
+	journaled, _ := after.Store.ListInboundEvents(context.Background())
+	if len(journaled) != 1 || journaled[0].Kind != inboundCreate {
+		t.Fatalf("the creation is journaled: %+v", journaled)
+	}
+	instanceID := journaled[0].InstanceID
 	if err := after.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	if len(disp.sent) != 1 || derefString(disp.sent[0].Meta.ThreadID) != instanceID || disp.sent[0].Routing.TraceID != "trace-start" {
-		t.Fatalf("the creation runs again under its instance_id and trace_id: %+v", disp.sent)
+	if len(disp.sent) != 1 || derefString(disp.sent[0].Meta.ThreadID) != "conv-1" || disp.sent[0].Routing.TraceID != "trace-start" {
+		t.Fatalf("the creation runs again on its thread, with its trace_id: %+v", disp.sent)
 	}
 	row := mustGetInstance(t, after, instanceID)
-	if row.CurrentState != "asking" || row.Status != "running" || row.DefinitionHash != after.DefHash {
-		t.Fatalf("after recovery: %+v", row)
+	if row.CurrentState != "asking" || row.Status != "running" || row.DefinitionHash != after.DefHash || row.ThreadID != "conv-1" {
+		t.Fatalf("after recovery, under its instance_id: %+v", row)
 	}
 	if _, ok := after.Registry.Get(instanceID); !ok {
 		t.Fatal("the recreated instance is running")
@@ -514,7 +587,7 @@ func TestASystemMessageIsNoWorkflowEvent(t *testing.T) {
 	start.Meta.MsgType = "system"
 	answer := from("AI.host@motherbee", msgWithNameAndPayload("ASK", map[string]any{"text": "an answer"}))
 	answer.Meta.MsgType = "SYSTEM"
-	answer.Meta.ThreadID = &instanceID
+	answer.Meta.ThreadID = threadOf(t, rt, instanceID)
 	for _, msg := range []sdk.Message{start, answer} {
 		if err := Dispatch(context.Background(), msg, rt); err != nil {
 			t.Fatal(err)

@@ -396,9 +396,10 @@ When a WF node loads its workflow definition, it runs these checks:
 8. For `send_message` and `forward` actions, the `target` is syntactically a valid L2 name, without spaces around it, and not a `SY.*` or `RT.*` node. A `forward` has no `meta.msg` and no `payload` (it keeps the message's own), and the `message` it names is one a `keep_message` of the definition keeps.
 8a. No action has `meta.type`, `target_ref` or `thread_id_ref`, and no transition has `event_match.type`: they left the language in 0.1.90 and 0.1.91 (every message a WF sends is a `user` message, to a node name written in the definition, on the instance's thread; every message it takes is a `user` message, but a `TIMER_FIRED`), and a definition that still has one is refused, by its path.
 8b. A `send_message`'s or a `forward`'s `meta.context` is a JSON object (or a `$ref`) that does not write `wf`, the WF's own block (§10.9), nor `response_envelope` (a WF asks an agent with `menu`), and its `vars` is a JSON object.
-8c. A `menu` is on a `send_message` or a `forward` to an `AI.*` node only, and follows the limits the agent checks it with again (§10.10): `help` up to 600 characters; 1 to 8 options, each with a name of its own that matches `^[a-z][a-z0-9_]{0,31}$` and is never `none`, a description of 1 to 200 characters and up to 8 params; each param with a name of that pattern, a `type` (`string`, `boolean`, `integer` or `number`), a description up to 200 characters and, on a string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode code points. A menu has no field but these, at any level, and no `$ref`.
+8c. A `menu` is on a `send_message` or a `forward` to an `AI.*` or an `IO.*` node only, and follows the limits the agent checks it with again (§10.10), with each known option (Archi's handbook, §4.2.4) written by its name alone and loaded with the catalog's description and params: `help` up to 600 characters; 1 to 8 options, each with a name of its own that matches `^[a-z][a-z0-9_]{0,31}$` and is never `none`, a description of 1 to 200 characters and up to 8 params; each param with a name of that pattern, a `type` (`string`, `boolean`, `integer` or `number`), a description up to 200 characters and, on a string only, an `enum` of 1 to 20 values, each non-empty and of its own. Characters are Unicode code points. A menu has no field but these, at any level, and no `$ref`.
 8d. Where the event may be no node's message, no `keep_message` and no `forward` without `message`, either of which would fail the instance. On a state's transition that takes a `TIMER_FIRED` (matched on that `msg`) or an internal event, which has no sender (its `event_match` names no `src`, and its `msg` is `AGENT_CALL_CAP`, §9.6, or one an `emit_internal_event` of the definition emits): among its actions and, with a `target_state`, its state's exit actions and its target's entry actions. The error names the event: `the TIMER_FIRED of states[0].transitions[2]`, `the AGENT_CALL_CAP of ...`, `the internal event TO_SALES of ...`. The same for a catch transition whose `event_match` names no `src` (its event may be a timer's fire or an internal event): among its actions and, with a `target_state`, its target's entry actions and the exit actions of any state but a terminal one. A `forward` of a kept message goes anywhere.
 8e. What reads an agent's evaluation is checked against what it is, a menu's answer `{reply, option, params}` (§10.10), and against the definition's menus, those of its `send_message` and `forward` actions. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.<f>` names `reply`, `option` or `params` (`event.context.evaluation.optoin` and `event.context.evaluation.param.question` are refused). A guard that compares `event.context.evaluation.option` with a string literal (`==`, `!=`, `in`) names an option of one of the menus, or `none`; the empty string names no option, so `event.context.evaluation.option != ''` (any menu's answer) is no typo. A guard, a `set_variable` value or a `$ref` that reads `event.context.evaluation.params.<p>`, and a guard that looks for a name in them (`'question' in event.context.evaluation.params`), names a param of one of the menus, or `reason`. A name the evaluation or no menu has would be a guard that never matches, or a value that fails the instance.
+8f. A `subject` is on a `send_message` or a `forward` to an `IO.*` node only, and is `new`, `same` or `end`.
 9. For `schedule_timer` and `reschedule_timer` actions, exactly one of `fire_in` and `fire_at`, a literal or a `$ref`: a literal duration is ≥ 60 seconds (see section 11), and so is a `$ref`'s default; a `$ref` is checked when the action runs. A duration in days is at most `106751d`, the most a duration holds.
 10. Every `set_variable` uses a valid variable name, and its `value` is a CEL expression, written as a JSON string, that compiles; every `keep_message` keeps under a valid name.
 11. Every `$ref` that is a dot path (no `#`, `/` or `:`) is rooted at `input.`, `state.` or `event.` (a typo such as `inptu.x` is refused), has no empty segment, holds only `$ref` and `default` (`a $ref holds only $ref and default`), and its `default` is a literal, with no `$ref` inside (§10.1). A `$ref` that is not a string is refused.
@@ -475,7 +476,7 @@ A definition may have a `catch` (since Case 3, `docs/wf-orchestration-v1.md` §5
 - **Its actions and targets are the definition's own:** its `event_match.src` and its targets are nodes the definition involves (§14.5), and its `keep_message` keeps a message a `forward` may send.
 - **What it does is the designer's choice:** for example, hand the conversation to a person, ask another agent, or fail the instance, as in §19.2.
 
-**The default.** Without a catch, or when none of its transitions takes the event, the instance's log gets `unhandled event <msg> from <sender> in state <state>` (`no matching transition`), the node's own log a line naming the instance, the state and the event, and the instance stays where it was. Both logs are local.
+**The default.** Without a catch, or when none of its transitions takes the event, the instance's log gets `unhandled event <msg> from <sender> in state <state>` (`no matching transition`), the node's own log a line naming the instance, the state and the event, and the instance stays where it was. Both logs are local. An `IO.*` node's message, when it is no reply, is also answered `NOT_TAKEN`, reason `not_expected` (§14.5).
 
 ### 9.6 The cap on agent calls
 
@@ -520,12 +521,13 @@ Fields:
 | `meta.msg` | The `meta.msg` field of the outgoing message. |
 | `meta.context` | Optional. A JSON object, resolved like the payload, and sent as the message's `meta.context` (the person's `context.io`, say). It never writes `wf`, the WF's own block (§10.9), nor `response_envelope`: a WF asks an agent with `menu`. |
 | `vars` | Optional. A JSON object, resolved like the payload, sent in the WF's block as `meta.context.wf.vars`: the deterministic context the WF gives the receiver (§10.9). |
-| `menu` | Optional, to an `AI.*` target only. The options the agent may choose from, sent in the WF's block as `meta.context.wf.menu` (§10.10). |
+| `menu` | Optional, to an `AI.*` or an `IO.*` target only. The options the agent, or the IO node's people, may choose from, sent in the WF's block as `meta.context.wf.menu` (§10.10). |
+| `subject` | Optional, to an `IO.*` target only: `new`, `same` or `end`, literal. Sent in the WF's block as `meta.context.wf.subject`; the IO node places the message by it. |
 | `payload` | JSON object. See payload substitution rules below. |
 
 Every message a WF sends is a `user` message: there is no `meta.type` (before 0.1.90 it defaulted to `system`, and an agent answered a system message from its control plane, so the instance waited forever). A WF that chooses among destinations writes one transition per destination, each with its guard and its `send_message` to a name written there; no destination is taken from data (`target_ref` left the language in 0.1.90).
 
-Every message an instance sends, a `send_message` or a `forward` (§10.7), carries the instance's thread (§14.3): the thread of the message that started it, the conversation's, or the instance's own id when that message had none. An agent keeps one memory per conversation, and its answer comes back on that thread, to the instance. `thread_id_ref`, which replaced the thread with one taken from data, left the language in 0.1.91, and is refused, by its path.
+Every message an instance sends, a `send_message` or a `forward` (§10.7), carries the instance's thread (§14.3): the thread of the message that started it, the conversation's (a message without one starts no instance). An agent keeps one memory per conversation, and its answer comes back on that thread, to the instance. A `send_message` also carries the instance's person, the `src_ilk` and `ich` of the message that started it, when it had them. `thread_id_ref`, which replaced the thread with one taken from data, left the language in 0.1.91, and is refused, by its path.
 
 **Payload substitution rules.**
 
@@ -738,7 +740,7 @@ Sends a message on **as it was received** (since 0.1.91): the event's message, o
   "menu": {
     "options": [
       { "name": "issued", "description": "You issued the invoice.", "params": { "invoice_number": { "type": "string" }, "due_in": { "type": "string" } } },
-      { "name": "handback", "description": "Sales takes the conversation back." }
+      { "name": "handback" }
     ]
   }
 }
@@ -752,7 +754,8 @@ Fields:
 | `message` | Optional. The name a `keep_message` kept a message under; without it, the event's message. |
 | `meta.context` | Optional. The keys the action writes over the message's own `meta.context`, resolved like a payload (the person's `context.io`, say). It never writes `wf` nor `response_envelope`. |
 | `vars` | Optional. As for `send_message`: `meta.context.wf.vars` (§10.9). |
-| `menu` | Optional, to an `AI.*` target only. As for `send_message`: `meta.context.wf.menu` (§10.10). |
+| `menu` | Optional, to an `AI.*` or an `IO.*` target only. As for `send_message`: `meta.context.wf.menu` (§10.10). |
+| `subject` | Optional, to an `IO.*` target only. As for `send_message`: `meta.context.wf.subject`. |
 
 What goes out:
 
@@ -787,6 +790,7 @@ Every message a WF sends, a `send_message` or a `forward`, carries the WF's bloc
 - **`trail`** lists the nodes the message went through. A `forward` takes the message's own trail (or its sender's name, when it has none) and adds the WF's name; a `send_message` starts it with the WF's name. An agent's answer never carries the request's `wf` back, so a forwarded answer's trail starts at the agent.
 - **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
 - **`menu`** is the action's menu, as written but with no empty field and with each option's params in name order (§10.10); it is left out when the action has none.
+- **`subject`** is the action's subject (§10.1); it is left out when the action has none.
 - An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
 
 ### 10.10 `menu`: asking an agent
@@ -797,11 +801,10 @@ A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer 
 {
   "help": "The person is buying licenses. A discount above 10% needs a supervisor's approval.",
   "options": [
-    { "name": "answer", "description": "You answer the person yourself." },
+    { "name": "answer" },
     { "name": "invoice", "description": "They accepted the quote and ask for the invoice.",
       "params": { "quantity": { "type": "integer" }, "plan": { "type": "string", "enum": ["basic", "pro"] } } },
-    { "name": "consult", "description": "A supervisor must approve something before you answer.",
-      "params": { "question": { "type": "string", "description": "What you ask, with the data to decide." } } }
+    { "name": "consult" }
   ]
 }
 ```
@@ -881,7 +884,7 @@ The recovery flow is:
    - **In the index but not in SY.timer, `fire_at` ahead**: SY.timer never got it (it was scheduled while SY.timer did not answer) or lost it. The WF schedules it again, under the same `client_ref`, at its `fire_at` (60 s ahead at least), with `missed_policy` `fire` (the index does not keep the policy). Before 0.1.90 the index row went, and an instance waiting on that timer waited forever.
    - **Scheduled after the WF asked SY.timer for its list**: left alone, since the list could not have it.
 
-   A timer of an instance that no longer runs leaves the index, and a cancelling instance's timers are left alone. A timer **in SY.timer but not in the index** is an orphan; the WF cancels it.
+   A timer of an instance that no longer runs leaves the index. A timer **in SY.timer but not in the index** is an orphan; the WF cancels it.
 
 A timer's `missed_policy` is forwarded to SY.timer, and SY.timer applies it to its own late fires; the WF's synthetic fires at recovery do not apply it.
 
@@ -932,7 +935,7 @@ If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transit
 
 ### 13.1 What is stored
 
-Per WF node, a single SQLite file `wf_instances.db` (schema version 4, since 0.1.91) contains the tables below. It runs in WAL mode with `synchronous` `FULL`, as SY.timer's store does: a commit is on disk when it returns, so a power loss does not take back a transition whose messages went out (before 0.1.90 it was `NORMAL`).
+Per WF node, a single SQLite file `wf_instances.db` (schema version 5, since 0.1.94) contains the tables below. It runs in WAL mode with `synchronous` `FULL`, as SY.timer's store does: a commit is on disk when it returns, so a power loss does not take back a transition whose messages went out (before 0.1.90 it was `NORMAL`).
 
 **`wf_definitions`** — workflow definitions, kept by hash.
 
@@ -954,7 +957,7 @@ CREATE TABLE wf_instances (
     instance_id       TEXT PRIMARY KEY,
     workflow_type     TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'running'
-                      CHECK(status IN ('running','cancelling','completed','cancelled','failed')),
+                      CHECK(status IN ('running','completed','cancelled','failed')),
     current_state     TEXT NOT NULL,
     input_json        TEXT NOT NULL DEFAULT '{}',
     state_json        TEXT NOT NULL DEFAULT '{}',
@@ -963,12 +966,14 @@ CREATE TABLE wf_instances (
     updated_at_ms     INTEGER NOT NULL,
     terminated_at_ms  INTEGER,
     definition_hash   TEXT NOT NULL DEFAULT '',
-    thread_id         TEXT NOT NULL DEFAULT ''
+    thread_id         TEXT NOT NULL DEFAULT '',
+    person_ilk        TEXT NOT NULL DEFAULT '',
+    person_ich        TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 ```
 
-`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance.
+`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance. `person_ilk` and `person_ich` are the instance's person, the `src_ilk` and `ich` of the message that started it, which a `send_message` carries (§10.1).
 
 **`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A transition of the catch starts its summary with `catch[<i>]:`, and a send past the cap on agent calls is an action entry that is not ok, its `error_detail` starting with `agent_call_cap` (§9.6). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
 
@@ -990,7 +995,7 @@ CREATE TABLE wf_kept_messages (
 );
 ```
 
-A store of schema version 3 migrates at the node's start: each instance takes its own id as its thread, which is what its sends carried.
+A store of schema version 3 migrates at the node's start: each instance takes its own id as its thread, which is what its sends carried. A store of schema version 4 migrates too: each instance has no person, and one an older engine left `cancelling`, a status nothing set, ends `cancelled`.
 
 **The upgrade to 0.1.91.** A definition written before 0.1.91 no longer loads: it has no `start_from`, and may have `thread_id_ref`. Its node is `FAILED_CONFIG` (`invalid_definition`) until the workflow is redeployed with `start_from`, and the running instances born with such a definition fail at the next start (`definition_unavailable`).
 
@@ -1028,9 +1033,9 @@ In v1, true event-sourced replay is **not** implemented — only the current sta
 When a WF node restarts:
 
 1. Opens `wf_instances.db` and keeps the definition it runs (by its hash).
-2. Loads all instances with `status IN ('running', 'cancelling')`, each on the definition it was born with, on its thread, with the messages it kept; fails those whose definition is not available (`definition_unavailable`) or does not have their current state (`state_not_in_definition`).
+2. Loads all instances with `status = 'running'`, each on the definition it was born with, on its thread, with its person and the messages it kept; fails those whose definition is not available (`definition_unavailable`) or does not have their current state (`state_not_in_definition`).
 3. Drains any pending internal events for each recovered instance, in FIFO order, until each queue is empty or the instance becomes terminal, each one counting its attempt first (§14.4).
-4. Runs again every inbound event left in `wf_inbound_events`, in the order they came: an event of an instance, or a creation under the `instance_id` it had (when the current definition still starts from its sender), each one counting its attempt first; one already run at 3 starts is not run again (§14.4).
+4. Runs again every inbound event left in `wf_inbound_events`, in the order they came: an event of an instance, or a creation under the `instance_id` it had (when the current definition still starts from its sender, and the message has a thread), each one counting its attempt first; one already run at 3 starts is not run again (§14.4).
 5. Reconciles the timers with SY.timer (§11.4); when SY.timer does not answer, it starts `DEGRADED` and reconciles from the receive loop.
 6. Drops the definitions no running instance uses, and enters the receive loop.
 
@@ -1077,7 +1082,7 @@ Handlers:
 - `WF_GET_CODE` — returns the current workflow definition.
 - `TIMER_FIRED` — from SY.timer of its own hive only, for a timer this node scheduled: routes to the instance its `client_ref` names (§11.2).
 - Any other `system` message — dropped, logged and never answered: a system message is control, never a workflow event, but a `TIMER_FIRED` (since 0.1.90; the AI and IO nodes take the system kind only as control too).
-- Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread (§14.5).
+- Any other message — taken only from a node the definition names; matched against the running instance on its `meta.thread_id`, or, from a `start_from` node, if it is no reply and it matches the `input_schema`, creates a new instance on its thread; a message the WF takes nowhere may get `NOT_TAKEN` (§14.5).
 
 The `WF_*` control verbs answer only `SY.admin@motherbee` and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED` (FINDINGS A-119). Before any of this, a notice is dropped and never answered: a message the router made (no `routing.src_l2_name`), `HELLO`, `ANNOUNCE`, `WITHDRAW`, `ECHO`, `ECHO_REPLY`, `UNREACHABLE`, `TTL_EXCEEDED`, `TIMER_HELP`, or a system message without a name — SY.timer's rule and the AI nodes'.
 
@@ -1085,11 +1090,11 @@ Internal events emitted by `emit_internal_event` do **not** enter through this i
 
 ### 14.3 Instance creation
 
-When an incoming event looks like a trigger (it comes from a `start_from` node, no running instance holds its thread, it is no reply, and its payload matches the `input_schema`):
+When an incoming event looks like a trigger (it comes from a `start_from` node, it has a thread and no running instance holds it, it is no reply, and its payload matches the `input_schema`):
 
 1. Validate payload against `input_schema`.
-2. If validation fails, respond with `INVALID_INPUT` error — only to a named request: a message without a name, a reply and a notice are never answered (§14.5).
-3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it. The instance's thread is the event's `meta.thread_id`, the conversation's, or the `instance_id` when the event has none; every message the instance sends carries it.
+2. If validation fails, respond with `NOT_TAKEN`, reason `invalid_input`, to whoever §14.5 says.
+3. Generate a new `instance_id` (`wfi:<uuid>`), and save the event in the inbound journal under it. The instance's thread is the event's `meta.thread_id`, the conversation's, and every message the instance sends carries it; its person is the event's `src_ilk` and `ich`. A WF never makes up a thread: an event without one starts no instance (FINDINGS A-135).
 4. Acquire the per-instance mutex.
 5. Run entry actions of the initial state.
 6. In one commit: create the instance row (`current_state = initial_state`, or terminal; `input_json = <payload>`; its definition's hash; its thread), enqueue its internal events, write the messages it kept, and delete the journaled event. A crash before this commit leaves no instance at all, and the journaled creation for recovery, which runs it again under the same `instance_id`.
@@ -1128,11 +1133,15 @@ When an event arrives at the WF node, the runtime must decide whether it is for 
 
 2. **If the sender is no node the definition involves**: log and discard, never answered. On the thread of a running instance, that instance's own definition decides (it may be older than the current one, §13.1); otherwise the current definition.
 
-3. **If `meta.thread_id` is the thread of a running instance**: the event is for that instance. This is how a person's next message reaches their conversation's instance, and how the answer of an AI / IO node the WF contacted comes back: the WF sets `meta.thread_id` to the instance's thread on every message it sends, and target nodes are expected to copy this value to the `meta.thread_id` of their response. An event that neither the instance's current state nor the catch takes is logged and dropped (§9.5): it is never queued for a later state.
+3. **If `meta.thread_id` is the thread of a running instance**: the event is for that instance. This is how a person's next message reaches their conversation's instance, and how the answer of an AI / IO node the WF contacted comes back: the WF sets `meta.thread_id` to the instance's thread on every message it sends, and target nodes are expected to copy this value to the `meta.thread_id` of their response. An event that neither the instance's current state nor the catch takes is logged (§9.5), and answered `NOT_TAKEN`, reason `not_expected`: it is never queued for a later state.
 
-4. **If the sender is a `start_from` node and the message is no reply** (a reply is any `*_RESPONSE`, an `INVALID_INPUT`, or an agent's error named `<msg>.error`): a new instance on its thread (§14.3), as the `input_schema` allows. If the schema refuses it, respond with `INVALID_INPUT`, unless the message has no name: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce an `INVALID_INPUT` (FINDINGS A-119).
+4. **If the message has no thread**: `NOT_TAKEN`, reason `no_thread`. A WF never makes up a thread (since 0.1.94, FINDINGS A-135).
 
-5. **Otherwise** — an answer to an instance that ended (its timer fired, it was cancelled or failed, or a first copy of the answer finished it), say: log and discard, never answered. An agent answers with the request's own `msg` and thread; as a new instance it would ask the agent again, a WF↔AI loop.
+5. **If the sender is no `start_from` node, or the message is a reply** (a reply is any `*_RESPONSE`, a `NOT_TAKEN`, or an agent's error named `<msg>.error`): `NOT_TAKEN`, reason `no_conversation`. An answer to an instance that ended (its timer fired, it was cancelled or failed, or a first copy of the answer finished it) ends here. An agent answers with the request's own `msg` and thread; as a new instance it would ask the agent again, a WF↔AI loop.
+
+6. **Otherwise**: a new instance on its thread (§14.3), as the `input_schema` allows; if the schema refuses it, `NOT_TAKEN`, reason `invalid_input`.
+
+**`NOT_TAKEN`** (since 0.1.94, `docs/wf-orchestration-v1.md` §5.4.6; it took `INVALID_INPUT`'s place) is a `system` message to the sender's uuid, with the message's `trace_id` and `thread_id`, and the payload `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`. An `IO.*` node gets it for any message that is no reply and no notice, named or not, and shows it to whoever wrote. Any other sender gets it only for a named request, and only for `no_thread` and `invalid_input`: a reply, a notice and a message without a name are never answered, so two WFs cannot bounce a `NOT_TAKEN` (FINDINGS A-119), and an agent's late answer is never answered.
 
 The node's log names every message by its sender, `msg` and thread, and gets the first characters of its payload only when it reaches an instance or starts one: when every message of a node comes to the WF (a Slack channel's, say), the log keeps no text of those the WF discards.
 
@@ -1203,7 +1212,7 @@ No admin action mutates an instance in v1: there is **no** `wf_cancel_instance` 
 
 ### 16.1 Instance listing and retrieval
 
-`WF_LIST_INSTANCES` takes optional filters: `status` (`running`, `cancelling`, `completed`, `cancelled` or `failed`; absent, all), `limit` (newest first; `0` or absent, all) and `created_after_ms`:
+`WF_LIST_INSTANCES` takes optional filters: `status` (`running`, `completed`, `cancelled` or `failed`; absent, all), `limit` (newest first; `0` or absent, all) and `created_after_ms`:
 
 ```json
 {
@@ -1355,7 +1364,7 @@ A future iteration of identity may introduce a claims model that allows per-ILK 
 
 | Code | Description |
 |---|---|
-| `INVALID_INPUT` | Trigger event payload does not match `input_schema`. |
+| `NOT_TAKEN` | The WF took a message nowhere (§14.5), with its `reason`: `no_thread`, `no_conversation`, `invalid_input` (the payload does not match `input_schema`) or `not_expected`. It took `INVALID_INPUT`'s place in 0.1.94. |
 | `WORKFLOW_LOAD_FAILED` | Workflow definition failed load-time validation. Includes path to offending element. |
 | `GUARD_COMPILE_FAILED` | A CEL guard expression failed to compile. |
 | `GUARD_TIMEOUT` | A guard exceeded the 10ms evaluation limit. |
@@ -1365,12 +1374,11 @@ A future iteration of identity may introduce a claims model that allows per-ILK 
 | `TIMER_DURATION_BELOW_MINIMUM` | A `schedule_timer` action specifies < 60s. |
 | `INSTANCE_NOT_FOUND` | Referenced `instance_id` does not exist. |
 | `INSTANCE_ALREADY_TERMINATED` | Operation on a terminated instance. |
-| `INSTANCE_CANCELLING` | Operation on an instance that is already in cancelling state. |
 | `STORAGE_ERROR` | SQLite persistence error. |
 | `INTERNAL_ERROR` | Unclassified runtime error. |
 | `UNAUTHORIZED` | A `WF_*` control verb from a sender other than `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive (since 0.1.90). |
 
-What the engine answers today: `INVALID_INPUT`, `INVALID_REQUEST`, `INSTANCE_NOT_FOUND`, `INSTANCE_ALREADY_TERMINATED`, `STORE_ERROR` (not `STORAGE_ERROR`), `INTERNAL_ERROR`, `UNAUTHORIZED` and `node_not_configured`. The load-time codes above are not returned as such: a definition that fails validation is `invalid_definition` at the node (`FAILED_CONFIG`) and `COMPILE_ERROR` at SY.wf-rules, with the path; `GUARD_TIMEOUT` and `INSTANCE_CANCELLING` are never returned (a guard that times out is false).
+What the engine answers today: `NOT_TAKEN` (as a message of its own, `meta.msg`, with `error` `not_taken`), `INVALID_REQUEST`, `INSTANCE_NOT_FOUND`, `INSTANCE_ALREADY_TERMINATED`, `STORE_ERROR` (not `STORAGE_ERROR`), `INTERNAL_ERROR`, `UNAUTHORIZED` and `node_not_configured`. The load-time codes above are not returned as such: a definition that fails validation is `invalid_definition` at the node (`FAILED_CONFIG`) and `COMPILE_ERROR` at SY.wf-rules, with the path; `GUARD_TIMEOUT` is never returned (a guard that times out is false).
 
 ---
 

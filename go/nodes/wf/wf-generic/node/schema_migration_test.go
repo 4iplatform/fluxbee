@@ -493,7 +493,7 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', 1, 1, 'hash-ask
 		t.Fatal("v4 tables")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 4 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 
@@ -512,6 +512,100 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', 1, 1, 'hash-ask
 	}
 	if kept, _ := store.ListKeptMessages(ctx, "wfi:running"); len(kept) != 0 {
 		t.Fatalf("dropped when it ends: %+v", kept)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
+}
+
+// Case 4 (schema v5, wf-orchestration-v1 §5.4.10): each instance of a v4 store keeps its person,
+// empty for an instance of before, and the status loses cancelling (FINDINGS A-132): an instance an
+// older engine left cancelling ends cancelled. The table is built again, with its indexes, and what
+// the v4 store held stays as it was.
+func TestEnsureWFSchemaMigratesV4ToPersons(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v4.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	v4Stmts := []string{
+		`CREATE TABLE wf_definitions (hash TEXT PRIMARY KEY, workflow_type TEXT NOT NULL, definition_json TEXT NOT NULL, loaded_at_ms INTEGER NOT NULL);`,
+		`CREATE TABLE wf_instances (
+    instance_id TEXT PRIMARY KEY, workflow_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','cancelling','completed','cancelled','failed')),
+    current_state TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+    current_trace_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    terminated_at_ms INTEGER, definition_hash TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '');`,
+		`CREATE INDEX idx_wfi_status ON wf_instances(status);`,
+		`CREATE INDEX idx_wfi_created ON wf_instances(created_at_ms);`,
+		`CREATE INDEX idx_wfi_definition ON wf_instances(definition_hash);`,
+		`CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);`,
+		`CREATE TABLE wf_instance_log (log_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, logged_at_ms INTEGER NOT NULL, action_type TEXT NOT NULL, summary TEXT NOT NULL, ok INTEGER NOT NULL DEFAULT 1, error_detail TEXT NOT NULL DEFAULT '');`,
+		`CREATE TABLE wf_instance_timers (instance_id TEXT NOT NULL, timer_key TEXT NOT NULL, scheduled_at_ms INTEGER NOT NULL, fire_at_ms INTEGER NOT NULL, PRIMARY KEY (instance_id, timer_key));`,
+		`CREATE TABLE wf_internal_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, msg_type TEXT NOT NULL, msg_name TEXT NOT NULL, payload_json TEXT NOT NULL, trace_id TEXT NOT NULL, created_at_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`,
+		`CREATE TABLE wf_inbound_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, instance_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('create','event')), message_json TEXT NOT NULL, received_at_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);`,
+		`CREATE TABLE wf_kept_messages (instance_id TEXT NOT NULL, name TEXT NOT NULL, message_json TEXT NOT NULL, kept_at_ms INTEGER NOT NULL, PRIMARY KEY (instance_id, name));`,
+		`INSERT INTO wf_definitions VALUES ('hash-asking', 'asking', '{}', 5);`,
+		`INSERT INTO wf_instances (instance_id, workflow_type, status, current_state, state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, definition_hash, thread_id)
+VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', '', 1, 2, NULL, 'hash-asking', 'conv-1'),
+       ('wfi:cancelling', 'asking', 'cancelling', 'asking', '{}', 'trace-left', 1, 3, NULL, 'hash-asking', 'conv-2'),
+       ('wfi:done', 'asking', 'completed', 'answered', '{}', '', 1, 4, 4, 'hash-asking', 'conv-3');`,
+		`INSERT INTO wf_kept_messages VALUES ('wfi:running', 'customer', '{"payload":{"x":1}}', 2);`,
+		`PRAGMA user_version=4;`,
+	}
+	for _, stmt := range v4Stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v4 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	running, err := store.GetInstance(ctx, "wfi:running")
+	if err != nil || running.Status != "running" || running.StateJSON != `{"n":1}` || running.ThreadID != "conv-1" || running.DefinitionHash != "hash-asking" ||
+		running.UpdatedAtMS != 2 || running.TerminatedAtMS.Valid || running.PersonILK != "" || running.PersonICH != "" {
+		t.Fatalf("a running instance stays as it was, with no person: %+v %v", running, err)
+	}
+	if ended, err := store.GetInstance(ctx, "wfi:cancelling"); err != nil || ended.Status != "cancelled" || ended.TerminatedAtMS.Int64 != 3 || ended.CurrentTraceID != "" {
+		t.Fatalf("an instance left cancelling ends cancelled: %+v %v", ended, err)
+	}
+	if done, err := store.GetInstance(ctx, "wfi:done"); err != nil || done.Status != "completed" || done.TerminatedAtMS.Int64 != 4 {
+		t.Fatalf("an ended instance stays as it was: %+v %v", done, err)
+	}
+	if loaded, _ := store.LoadRunningInstances(ctx); len(loaded) != 1 || loaded[0].InstanceID != "wfi:running" {
+		t.Fatalf("only the running instance runs: %+v", loaded)
+	}
+	if kept, _ := store.ListKeptMessages(ctx, "wfi:running"); len(kept) != 1 {
+		t.Fatalf("the kept messages stay: %+v", kept)
+	}
+	for _, index := range []string{"idx_wfi_status", "idx_wfi_created", "idx_wfi_definition", "idx_wfi_thread"} {
+		if !indexExists(t, db, index) {
+			t.Fatalf("%s is created again", index)
+		}
+	}
+	if tableExists(t, db, "wf_instances_v5") {
+		t.Fatal("the rebuilt table takes the old one's name")
+	}
+	if _, err := db.Exec(`UPDATE wf_instances SET status = 'cancelling' WHERE instance_id = 'wfi:running';`); err == nil {
+		t.Fatal("the store refuses a cancelling instance")
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 5 {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+
+	// The migrated store keeps a new instance's person.
+	person := WFInstanceRow{InstanceID: "wfi:new", ThreadID: "conv-4", WorkflowType: "asking", Status: "running", CurrentState: "asking",
+		InputJSON: `{}`, StateJSON: `{}`, CreatedAtMS: 5, UpdatedAtMS: 5, PersonILK: "ilk:person", PersonICH: "ich:api:4"}
+	if err := store.CommitInstanceMutation(ctx, person, InstanceCommitMutation{}); err != nil {
+		t.Fatal(err)
+	}
+	if row, err := store.GetInstance(ctx, "wfi:new"); err != nil || row.PersonILK != "ilk:person" || row.PersonICH != "ich:api:4" {
+		t.Fatalf("a new instance's person: %+v %v", row, err)
 	}
 	if err := ensureWFSchema(db); err != nil {
 		t.Fatalf("a second run is a no-op: %v", err)

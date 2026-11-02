@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -276,19 +277,22 @@ type salesConversation struct {
 }
 
 const (
-	salesIO        = "IO.api.sales@worker1"
-	salesAgent     = "AI.sales@worker1"
-	invoiceAgent   = "AI.invoice@worker1"
-	paymentsAgent  = "AI.payments@worker1"
-	salesWFNode    = "WF.sales-invoice@worker1"
-	salesThread    = "conv-7"
-	salesIOContext = `{"io":{"reply_target":{"address":"conv-7","kind":"api"}}}`
+	salesIO       = "IO.api.sales@worker1"
+	salesAgent    = "AI.sales@worker1"
+	invoiceAgent  = "AI.invoice@worker1"
+	paymentsAgent = "AI.payments@worker1"
+	salesWFNode   = "WF.sales-invoice@worker1"
+	salesThread   = "conv-7"
+	// salesIOContext is the context.io of the person's messages, as IO.api writes it: who they are and
+	// where they write, and where an answer goes.
+	salesIOContext = `{"io":{"channel":"api","sender":{"kind":"api_subject","id":"ana@acme.example"},"conversation":{"kind":"api_conversation","id":"conv-7"},"reply_target":{"address":"conv-7","kind":"api"}}}`
 	personILK      = "ilk:00000000-0000-4000-8000-0000000000aa"
 	personICH      = "ich:api:conv-7"
 	// supervisorsIO is the supervisors' Slack channel, and supervisorsIOContext the context.io of a
-	// supervisor's answer there.
+	// supervisor's answer there; teamMemberILK is the person of the team who clicks a menu's button.
 	supervisorsIO        = "IO.slack.supervisores@motherbee"
 	supervisorsIOContext = `{"io":{"reply_target":{"address":"C0SUPERVISORS","kind":"slack_post","params":{"thread_ts":"1730289000.000100"}}}}`
+	teamMemberILK        = "ilk:00000000-0000-4000-8000-0000000000bb"
 )
 
 func newSalesConversation(t *testing.T) *salesConversation {
@@ -364,6 +368,76 @@ func (c *salesConversation) supervisor(text string) sdk.Message {
 	})
 	c.dispatch(msg)
 	return msg
+}
+
+// click is a person of the team's click on the menu of the WF's post, in Slack: io.slack sends it on
+// the conversation's thread, as the person who clicked, with meta.context.evaluation {option, params}
+// and a text of the option's name, then each param as name: value, one per line
+// (wf-orchestration-v1 §5.4.4).
+func (c *salesConversation) click(option string, params map[string]any) sdk.Message {
+	c.t.Helper()
+	c.turn++
+	thread, ilk := salesThread, teamMemberILK
+	text := option
+	for _, name := range sortedParams(params) {
+		text += fmt.Sprintf("\n%s: %v", name, params[name])
+	}
+	metaContext, err := json.Marshal(map[string]any{
+		"io":         json.RawMessage(`{"reply_target":{"address":"C0SUPERVISORS","kind":"slack_post","params":{"thread_ts":"1730289000.000100"}}}`),
+		"evaluation": map[string]any{"option": option, "params": params},
+	})
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	msg := from(supervisorsIO, sdk.Message{
+		Routing: sdk.Routing{Src: "slack-uuid", TraceID: fmt.Sprintf("trace-click-%d", c.turn)},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, ThreadID: &thread, Context: metaContext},
+		Payload: json.RawMessage(fmt.Sprintf(`{"type":"text","content":%q}`, text)),
+	})
+	c.dispatch(msg)
+	return msg
+}
+
+func sortedParams(params map[string]any) []string {
+	names := make([]string, 0, len(params))
+	for name := range params {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// at moves the WF node's clock to d after the fixed clock.
+func (c *salesConversation) at(d time.Duration) {
+	c.rt.ActCtx.Clock = func() time.Time { return fixedClock().Add(d) }
+}
+
+// io is the context.io a message carries, as fmt prints it.
+func (c *salesConversation) io(msg sdk.Message) string {
+	c.t.Helper()
+	var metaContext map[string]any
+	if err := json.Unmarshal(msg.Meta.Context, &metaContext); err != nil {
+		c.t.Fatalf("meta.context %s: %v", msg.Meta.Context, err)
+	}
+	return fmt.Sprint(metaContext["io"])
+}
+
+// personIO is the person's context.io, as fmt prints it.
+func (c *salesConversation) personIO() string {
+	var metaContext map[string]any
+	_ = json.Unmarshal([]byte(salesIOContext), &metaContext)
+	return fmt.Sprint(metaContext["io"])
+}
+
+// notTaken checks the last message the WF sent: a NOT_TAKEN with reason for msg, to its sender's uuid,
+// on its thread and trace.
+func (c *salesConversation) notTaken(msg sdk.Message, reason string) {
+	c.t.Helper()
+	answer := c.disp.sent[len(c.disp.sent)-1]
+	if notTakenReason(c.t, answer) != reason || answer.Routing.Dst.Value() != msg.Routing.Src || answer.Routing.TraceID != msg.Routing.TraceID ||
+		derefString(answer.Meta.ThreadID) != derefString(msg.Meta.ThreadID) {
+		c.t.Fatalf("a NOT_TAKEN %s to %s: %+v %s", reason, msg.Routing.Src, answer, answer.Payload)
+	}
 }
 
 // fire fires the instance's pending timer key, as SY.timer does.
@@ -464,10 +538,8 @@ func (c *salesConversation) options(msg sdk.Message) string {
 func (c *salesConversation) delivered(reply, agent string) {
 	c.t.Helper()
 	msg := c.sentTo(salesIO)
-	var metaContext map[string]any
-	_ = json.Unmarshal(msg.Meta.Context, &metaContext)
 	if string(msg.Payload) != fmt.Sprintf(`{"type":"text","content":%q}`, reply) || c.trail(msg) != "["+agent+" "+salesWFNode+"]" ||
-		fmt.Sprint(metaContext["io"]) != "map[reply_target:map[address:conv-7 kind:api]]" || derefString(msg.Meta.ThreadID) != salesThread {
+		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread {
 		c.t.Fatalf("the person gets %q from %s, with its trail and context.io: %s %s", reply, agent, msg.Payload, msg.Meta.Context)
 	}
 }
@@ -502,8 +574,13 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	toSales := c.sentTo(salesAgent)
 	if string(toSales.Payload) != string(first.Payload) || derefString(toSales.Meta.SrcIlk) != personILK || derefString(toSales.Meta.Ich) != personICH ||
 		toSales.Meta.Msg != nil || derefString(toSales.Meta.ThreadID) != salesThread || c.trail(toSales) != "["+salesIO+" "+salesWFNode+"]" ||
-		c.options(toSales) != "answer invoice consult" || !strings.Contains(string(toSales.Meta.Context), `"io":{"reply_target"`) {
+		c.options(toSales) != "answer invoice consult handover" || c.io(toSales) != c.personIO() {
 		t.Fatalf("sales gets the person's message: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
+	}
+	// The known options go as the catalog writes them (wf-orchestration-v1 §5.4.8).
+	if menu := fmt.Sprint(wfBlock(t, toSales)["menu"]); !strings.Contains(menu, "map[description:Your reply goes to the person. name:answer]") ||
+		!strings.Contains(menu, "summary:map[description:What the team needs to take over: who the person is, what they want, what was done. type:string]") {
+		t.Fatalf("sales' menu: %s", menu)
 	}
 
 	// 2. Sales answers: the answer goes to the person, and the WF listens.
@@ -558,12 +635,13 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.delivered("Sí, te la mando por mail.", invoiceAgent)
 	c.inState("invoice_listening")
 
-	// 8. The handback: the person thanks, invoice gives the conversation back to sales; its reply goes
-	// to the person, and sales is not asked again: it takes the person's next message.
+	// 8. The handback: the person thanks, invoice gives the conversation back to sales, with the known
+	// option's note; its reply goes to the person, and sales is not asked again: it takes the person's
+	// next message.
 	c.person("Gracias")
 	toInvoice = c.sentTo(invoiceAgent)
 	askedSales := c.count(salesAgent)
-	c.choose(invoiceAgent, toInvoice, "¡A vos! Te dejo con ventas.", "handback", nil)
+	c.choose(invoiceAgent, toInvoice, "¡A vos! Te dejo con ventas.", "handback", map[string]any{"note": "Invoice F-0001 issued, due in 2 minutes."})
 	c.delivered("¡A vos! Te dejo con ventas.", invoiceAgent)
 	c.inState("sales_listening")
 	if asked := c.count(salesAgent); asked != askedSales {
@@ -585,9 +663,10 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.delivered("Decime.", salesAgent)
 	c.inState("payments_thinking")
 	toPayments := c.sentTo(paymentsAgent)
+	// The WF's own message carries the person's src_ilk and ich (the rest of FINDINGS A-116).
 	if derefString(toPayments.Meta.Msg) != "PAYMENT_DUE" || !strings.Contains(string(toPayments.Payload), "was not paid") || c.trail(toPayments) != "["+salesWFNode+"]" ||
 		fmt.Sprint(wfBlock(t, toPayments)["vars"]) != "map[invoice:map[amount:1000 due_in:2m invoice_number:F-0001]]" || c.options(toPayments) != "notify" ||
-		!strings.Contains(string(toPayments.Meta.Context), `"io":{"reply_target":{"address":"conv-7","kind":"api"}}`) {
+		c.io(toPayments) != c.personIO() || derefString(toPayments.Meta.SrcIlk) != personILK || derefString(toPayments.Meta.Ich) != personICH {
 		t.Fatalf("payments gets the due date: %+v %s %s", toPayments.Meta, toPayments.Payload, toPayments.Meta.Context)
 	}
 
@@ -763,12 +842,26 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 		t.Fatalf("a message that decides nothing does not reach the person: %d", c.count(salesIO))
 	}
 
+	// 3b. A supervisor asks sales something (Case 4, wf-orchestration-v1 §5.4.7): sales answers the
+	// team (answer_team), and its reply goes to the supervisors, in the question's thread (subject
+	// same); the person gets nothing, and the WF waits for the decision again.
+	questions := c.count(supervisorsIO)
+	c.supervisor("¿Entre 20% y 15%, cuál darías vos?")
+	c.inState("sales_relaying")
+	c.choose(salesAgent, c.sentTo(salesAgent), "Daría 15%: el cliente compra seguido.", "answer_team", nil)
+	c.inState("consulting")
+	toTeam := c.sentTo(supervisorsIO)
+	if c.count(supervisorsIO) != questions+1 || string(toTeam.Payload) != `{"type":"text","content":"Daría 15%: el cliente compra seguido."}` ||
+		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.trail(toTeam) != "["+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent {
+		t.Fatalf("sales' answer goes to the team, in the question's thread: %s %s", toTeam.Payload, toTeam.Meta.Context)
+	}
+
 	// 4. A supervisor decides in the thread: the message goes to sales as it came, with the question
 	// and the menu, and the wait's timer goes.
 	answer := c.supervisor("Aprobado hasta 15%.")
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
-	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait" ||
+	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait answer_team" ||
 		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" {
 		t.Fatalf("sales gets the supervisor's answer: %s %s", toSales.Payload, toSales.Meta.Context)
 	}
@@ -797,7 +890,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
 	if derefString(toSales.Meta.Msg) != "CONSULT_UNANSWERED" || !strings.Contains(string(toSales.Payload), "No supervisor answered") || c.options(toSales) != "answer" ||
-		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+another+"]" || !strings.Contains(string(toSales.Meta.Context), `"io":{"reply_target":{"address":"conv-7","kind":"api"}}`) {
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+another+"]" || c.io(toSales) != c.personIO() {
 		t.Fatalf("sales hears that no supervisor answered: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
 	c.choose(salesAgent, toSales, "Todavía no me confirmaron, preguntame más tarde.", "answer", nil)
@@ -813,7 +906,13 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.choose(salesAgent, c.sentTo(salesAgent), "¡Me aprobaron 25% en 20 licencias!", "decided", nil)
 	c.delivered("¡Me aprobaron 25% en 20 licencias!", salesAgent)
 	c.inState("sales_listening")
-	if questions := c.count(supervisorsIO); questions != 2 {
+	questions = 0
+	for _, msg := range c.disp.sent {
+		if msg.Routing.Dst.Value() == supervisorsIO && derefString(msg.Meta.Msg) == "SUPERVISOR_QUESTION" {
+			questions++
+		}
+	}
+	if questions != 2 {
 		t.Fatalf("one question per consult: %d", questions)
 	}
 }
@@ -866,4 +965,236 @@ func TestTheSalesInvoiceExampleCatchesWhatItsStatesDoNot(t *testing.T) {
 	if c.state()["last_error"] != "unhandled error: invalid_output" || len(c.disp.sent) != sent {
 		t.Fatalf("the catch notes the error: %v", c.state())
 	}
+}
+
+// handOver has sales hand the conversation over, answering request: its reply for the person, and
+// the summary for the team. It checks the post the team gets: sales' summary as a new subject, with
+// the person's facts from their context.io and a menu with handback, as the catalog writes it, on
+// the conversation's thread and as the person's message (wf-orchestration-v1 §5.4.3).
+func (c *salesConversation) handOver(request sdk.Message, reply, summary string) {
+	c.t.Helper()
+	posts := c.count(supervisorsIO)
+	c.choose(salesAgent, request, reply, "handover", map[string]any{"summary": summary})
+	c.inState("with_team")
+	post := c.sentTo(supervisorsIO)
+	block := wfBlock(c.t, post)
+	if c.count(supervisorsIO) != posts+1 || derefString(post.Meta.Msg) != "HANDOVER" || string(post.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, summary) ||
+		block["subject"] != "new" || fmt.Sprint(block["vars"]) != "map[channel:api conversation:conv-7 person:ana@acme.example]" || c.options(post) != "handback" ||
+		derefString(post.Meta.ThreadID) != salesThread || derefString(post.Meta.SrcIlk) != personILK || derefString(post.Meta.Ich) != personICH {
+		c.t.Fatalf("the team gets the case: %+v %s %s", post.Meta, post.Payload, post.Meta.Context)
+	}
+	if menu := fmt.Sprint(block["menu"]); !strings.Contains(menu, "note:map[description:What the agent must know: what was done and agreed. type:string]") {
+		c.t.Fatalf("the Handback menu, as the catalog writes it: %s", menu)
+	}
+	if due, ok := c.pending("team_untaken"); !ok || !due.Equal(fixedClock().Add(15*time.Minute)) {
+		c.t.Fatalf("nobody took it in 15 minutes: %v", c.timer.pending)
+	}
+}
+
+// ended checks the last message the team got: it ends the case's subject, with text.
+func (c *salesConversation) ended(text string) {
+	c.t.Helper()
+	end := c.sentTo(supervisorsIO)
+	if derefString(end.Meta.Msg) != "HANDOVER_END" || wfBlock(c.t, end)["subject"] != "end" || string(end.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, text) {
+		c.t.Fatalf("the case's subject ends: %+v %s %s", end.Meta, end.Payload, end.Meta.Context)
+	}
+	for _, key := range []string{"team_untaken", "team_quiet"} {
+		if _, ok := c.pending(key); ok {
+			c.t.Fatalf("%s goes with the case: %v", key, c.timer.pending)
+		}
+	}
+}
+
+// Case 4 (wf-orchestration-v1 §5.4), the handover end to end: sales hands the conversation to a person
+// of the team. Its reply goes to the person, and its summary to the supervisors' channel as a new
+// subject, with the person's facts and a Handback menu. The person's messages go to the team, in the
+// post's thread (subject same), and the team's to the person; the first team message takes the case,
+// and from then each message starts "quiet" again. The team's handback click ends the subject with a
+// text and goes to sales as the team member's message, with how the case came back and since when
+// the team had it, and sales tells the person. Sales' late answer is not delivered while the team has
+// the conversation. A team message after the end is not expected, and one after the instance ended
+// finds no conversation: each gets the engine's NOT_TAKEN.
+func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
+	c := newSalesConversation(t)
+	const summary = "Ana (ana@acme.example) asks for a credit note on invoice F-0001, for 2 licenses she did not use."
+
+	// 1. The person asks for a credit note, and writes again while sales answers; sales hands the
+	// first message over: its reply goes to the person, and the case to the team.
+	c.person("Necesito una nota de crédito por 2 licencias de la factura F-0001")
+	first := c.sentTo(salesAgent)
+	c.person("¿Me ayudás?")
+	second := c.sentTo(salesAgent)
+	c.handOver(first, "Te paso con una persona del equipo, que te va a ayudar con la nota de crédito.", summary)
+	c.delivered("Te paso con una persona del equipo, que te va a ayudar con la nota de crédito.", salesAgent)
+	since := fixedClock().Truncate(time.Second).Format(time.RFC3339)
+	if c.state()["team_since"] != since || c.state()["team_subject"] != "handover" || c.state()["team_taken"] != false {
+		t.Fatalf("the team has the case since now: %v", c.state())
+	}
+
+	// 2. Sales' answer to the second message comes while the team has the conversation: it is not
+	// delivered.
+	sent := len(c.disp.sent)
+	c.choose(salesAgent, second, "Sí, decime.", "answer", nil)
+	c.inState("with_team")
+	if len(c.disp.sent) != sent {
+		t.Fatalf("a late answer was delivered: %+v", c.disp.sent[sent:])
+	}
+
+	// 3. The person writes before anyone took the case: the message goes to the team, in the post's
+	// thread, as the person's, and nobody took the case yet.
+	c.person("¿Hola? ¿Alguien?")
+	toTeam := c.sentTo(supervisorsIO)
+	if !strings.Contains(string(toTeam.Payload), "Alguien") || wfBlock(t, toTeam)["subject"] != "same" || derefString(toTeam.Meta.SrcIlk) != personILK ||
+		c.trail(toTeam) != "["+salesIO+" "+salesWFNode+"]" {
+		t.Fatalf("the person's message goes to the team: %s %s", toTeam.Payload, toTeam.Meta.Context)
+	}
+	if _, untaken := c.pending("team_untaken"); !untaken {
+		t.Fatal("only a team message takes the case")
+	}
+	if _, quiet := c.pending("team_quiet"); quiet {
+		t.Fatal("quiet counts once the case is taken")
+	}
+
+	// 4. Juan answers in the post's thread: the person gets it, with their own context.io, and the case
+	// is taken: "nobody took it" goes, and "quiet" counts.
+	c.supervisor("Hola Ana, soy Juan. Ya veo la factura F-0001, dame un minuto.")
+	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.trail(msg) != "["+supervisorsIO+" "+salesWFNode+"]" {
+		t.Fatalf("the team's message goes to the person: %s %s", msg.Payload, msg.Meta.Context)
+	}
+	if _, untaken := c.pending("team_untaken"); untaken || c.state()["team_taken"] != true {
+		t.Fatalf("a team message takes the case: %v %v", c.timer.pending, c.state())
+	}
+	if due, quiet := c.pending("team_quiet"); !quiet || !due.Equal(fixedClock().Add(30*time.Minute)) {
+		t.Fatalf("quiet counts once the case is taken: %v", c.timer.pending)
+	}
+
+	// 5. Ten minutes later the person writes, and two later Juan: each message starts "quiet" again.
+	c.at(10 * time.Minute)
+	c.person("Dale, gracias")
+	if due, _ := c.pending("team_quiet"); !due.Equal(fixedClock().Add(40 * time.Minute)) {
+		t.Fatalf("the person's message starts quiet again: %v", due)
+	}
+	c.at(12 * time.Minute)
+	c.supervisor("Listo, emití la nota de crédito NC-0001.")
+	if due, _ := c.pending("team_quiet"); !due.Equal(fixedClock().Add(42 * time.Minute)) {
+		t.Fatalf("the team's message starts quiet again: %v", due)
+	}
+	c.inState("with_team")
+
+	// 6. Juan clicks Handback, with a note: the case's subject ends with a text, and the click goes to
+	// sales as Juan's message, with how the case came back and since when the team had it.
+	note := "Emití la nota de crédito NC-0001 por 2 licencias; Ana la recibe por mail."
+	click := c.click("handback", map[string]any{"note": note})
+	c.ended("Handed back to the agent.")
+	c.inState("back_from_team")
+	toSales := c.sentTo(salesAgent)
+	if string(toSales.Payload) != string(click.Payload) || derefString(toSales.Meta.SrcIlk) != teamMemberILK || c.options(toSales) != "answer" ||
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[came_back:handback team_since:"+since+"]" || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" {
+		t.Fatalf("sales gets the click, with its note: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
+	}
+
+	// 7. Sales tells the person, with the person's context.io, and holds the conversation again.
+	c.choose(salesAgent, toSales, "Listo: Juan emitió la nota de crédito NC-0001, te llega por mail.", "answer", nil)
+	c.delivered("Listo: Juan emitió la nota de crédito NC-0001, te llega por mail.", salesAgent)
+	c.inState("sales_listening")
+
+	// 8. A team message, or a click, after the end: the instance's log keeps it, and the team hears it
+	// was not expected; nothing goes to sales.
+	asked := c.count(salesAgent)
+	late := c.supervisor("Me olvidaba: el mail sale mañana.")
+	c.notTaken(late, notTakenNotExpected)
+	lateClick := c.click("handback", map[string]any{"note": "otra vez"})
+	c.notTaken(lateClick, notTakenNotExpected)
+	if c.count(salesAgent) != asked || !c.logged("unhandled event (no msg) from "+supervisorsIO+" in state sales_listening") {
+		t.Fatalf("a team message after the end goes nowhere: %d", c.count(salesAgent)-asked)
+	}
+	c.inState("sales_listening")
+
+	// 9. The instance closes; a team message on the conversation's thread finds no conversation.
+	c.fire("idle")
+	if c.rt.Registry.Count() != 0 {
+		t.Fatal("the instance closes")
+	}
+	closed := c.supervisor("¿Sigue ahí?")
+	c.notTaken(closed, notTakenNoConversation)
+	if rows, _ := c.rt.Store.ListInstances(context.Background(), "", 0, 0); len(rows) != 1 {
+		t.Fatalf("a team message starts nothing: %d instances", len(rows))
+	}
+}
+
+// Case 4 (wf-orchestration-v1 §5.4.5): the WF's two timers hand the case back to sales. Nobody of the
+// team took it in 15 minutes, or a taken case went quiet for 30: the case's subject ends with a text,
+// and sales gets a fixed text with the person's context.io, how the case came back and since when the
+// team had it, and tells the person. A message from the person meanwhile goes to sales, with the same
+// facts. A payment_due while the team has the conversation is noted, and acted on once sales holds
+// it again.
+func TestTheSalesInvoiceExampleTakesTheCaseBackOnItsTimers(t *testing.T) {
+	since := fixedClock().Truncate(time.Second).Format(time.RFC3339)
+	backToSales := func(c *salesConversation, msgName, cameBack string) sdk.Message {
+		t.Helper()
+		c.inState("back_from_team")
+		toSales := c.sentTo(salesAgent)
+		if derefString(toSales.Meta.Msg) != msgName || !strings.Contains(string(toSales.Payload), "it is yours again") || c.options(toSales) != "answer" ||
+			fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[came_back:"+cameBack+" team_since:"+since+"]" || c.io(toSales) != c.personIO() ||
+			derefString(toSales.Meta.SrcIlk) != personILK || derefString(toSales.Meta.ThreadID) != salesThread {
+			t.Fatalf("sales hears the case came back (%s): %+v %s %s", cameBack, toSales.Meta, toSales.Payload, toSales.Meta.Context)
+		}
+		return toSales
+	}
+
+	t.Run("nobody took it", func(t *testing.T) {
+		c := newSalesConversation(t)
+		c.person("Necesito una nota de crédito")
+		c.handOver(c.sentTo(salesAgent), "", "Ana asks for a credit note.")
+		if c.count(salesIO) != 0 {
+			t.Fatal("an empty reply goes to no one")
+		}
+		c.fire("team_untaken")
+		c.ended("Nobody from the team took this case; it went back to the agent.")
+		toSales := backToSales(c, "HANDOVER_UNTAKEN", "untaken")
+
+		// The person writes meanwhile: sales gets it, with the same facts and menu.
+		c.person("¿Hay novedades?")
+		meanwhile := c.sentTo(salesAgent)
+		if !strings.Contains(string(meanwhile.Payload), "novedades") || c.options(meanwhile) != "answer" ||
+			fmt.Sprint(wfBlock(t, meanwhile)["vars"]) != "map[came_back:untaken team_since:"+since+"]" {
+			t.Fatalf("the person's message goes to sales: %s %s", meanwhile.Payload, meanwhile.Meta.Context)
+		}
+		c.choose(salesAgent, toSales, "Nadie del equipo está disponible ahora; sigo yo con tu nota de crédito.", "answer", nil)
+		c.delivered("Nadie del equipo está disponible ahora; sigo yo con tu nota de crédito.", salesAgent)
+		c.inState("sales_listening")
+	})
+
+	t.Run("quiet", func(t *testing.T) {
+		c := newSalesConversation(t)
+		// The person bought licenses, and their invoice falls due in 2 minutes.
+		c.person("Quiero 10 licencias Pro")
+		c.choose(salesAgent, c.sentTo(salesAgent), "Te paso con facturación.", "invoice", salesOrder())
+		c.choose(invoiceAgent, c.sentTo(invoiceAgent), "Factura F-0001, vence en 2 minutos.", "issued", issuedInvoice("F-0001", "2m"))
+		c.person("Gracias")
+		c.choose(invoiceAgent, c.sentTo(invoiceAgent), "¡A vos!", "handback", map[string]any{"note": "Invoice F-0001 issued."})
+		c.inState("sales_listening")
+
+		// They ask for a credit note: the team takes the case, and the due date fires meanwhile.
+		c.person("Necesito una nota de crédito por 2 licencias de la F-0001")
+		c.handOver(c.sentTo(salesAgent), "Te paso con el equipo.", "Ana asks for a credit note on F-0001.")
+		c.supervisor("Hola Ana, ya te ayudo.")
+		asked := c.count(paymentsAgent)
+		c.fire("payment_due")
+		if c.inState("with_team"); c.state()["payment_overdue"] != true || c.count(paymentsAgent) != asked {
+			t.Fatalf("a payment_due is noted, and waits: %v", c.state())
+		}
+
+		// The case goes quiet: it comes back to sales, which tells the person; with the conversation
+		// back at sales, the noted due date goes to payments.
+		c.fire("team_quiet")
+		c.ended("The case went quiet; it went back to the agent.")
+		toSales := backToSales(c, "HANDOVER_QUIET", "quiet")
+		c.choose(salesAgent, toSales, "Sigo yo con tu consulta.", "answer", nil)
+		c.delivered("Sigo yo con tu consulta.", salesAgent)
+		c.inState("payments_thinking")
+		if toPayments := c.sentTo(paymentsAgent); derefString(toPayments.Meta.Msg) != "PAYMENT_DUE" || c.count(paymentsAgent) != asked+1 {
+			t.Fatalf("payments gets the due date: %+v", toPayments.Meta)
+		}
+	})
 }
