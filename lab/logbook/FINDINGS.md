@@ -1095,7 +1095,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the summary's description: the person by name, with no internal ids. The catalog pins names and
     params, not descriptions (`TestTheKnownOptionsOnlyGrow`), so it may change.
 
-### A-139 🟡 OPEN (found 2026-11-02, WF Case 4's gate) — A WF's forward of an agent's answer to the person carries the `dst_ilk` of whoever the agent answered
+### A-139 🟡 OPEN, to fix as soon as possible (found 2026-11-02, WF Case 4's gate) — The ILKs on a WF's messages to IO nodes: a forwarded answer keeps the `dst_ilk` of whoever the agent answered, and a WF's own message names the person as its sender
 
 - **What happens:**
   - `forward` sends the message's meta as it came (go/nodes/wf/wf-generic/node/actions.go,
@@ -1117,8 +1117,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     and an agent's own sends (src/router/mod.rs, `deliver_locally`).
   - It is a wrong fact in the message, and A-138 makes the message's facts the record every node
     reads.
+- **The same family, read in the code the same day:** `send_message` puts the instance's person as
+  `src_ilk` and `ich` on every target (actions.go, `execSendMessage`). That is right for an agent,
+  which files the message under the person (A-116). On an IO node it is wrong: the post to the team
+  (`HANDOVER`, a consult's question) goes out as if the person had written it, with the person's
+  channel as its `ich`.
+- **The operator (2026-11-02):** important, to fix as soon as possible, together with the details
+  this whole test brought (the first run of Fluxbee as an AI system), and then the flow is tested
+  again while it is fresh.
 - **Fix (to decide):** with A-138. Or a forward to a `start_from` node names the instance's person as
-  `dst_ilk` when it has one.
+  `dst_ilk` when it has one, and a `send_message` to an IO node does not name the person as its
+  sender.
 
 ### A-138 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
