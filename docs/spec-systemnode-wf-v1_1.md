@@ -793,9 +793,9 @@ Every message a WF sends, a `send_message` or a `forward`, carries the WF's bloc
 - **`subject`** is the action's subject (§10.1); it is left out when the action has none.
 - An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
 
-### 10.10 `menu`: asking an agent
+### 10.10 `menu`: asking an agent or a person
 
-A `send_message` or a `forward` to an agent (`AI.*`, and only to one) may offer it a menu (since Case 3, `docs/wf-orchestration-v1.md` §5.3.1): what the agent may do there, fixed in the definition and never in its role, so a role keeps only the agent's trade. It is the one way to ask an agent within a WF: `meta.context.response_envelope`, which IO nodes keep for their own callers, is refused in a WF's action.
+A `send_message` or a `forward` to an agent (`AI.*`) may offer it a menu (since Case 3, `docs/wf-orchestration-v1.md` §5.3.1): what the agent may do there, fixed in the definition and never in its role, so a role keeps only the agent's trade. A send or a forward to an IO node (`IO.*`) may offer the same menu to the people there (since Case 4, §5.4.4): io.slack shows it as buttons, and a click comes back as a message from whoever clicked, with `event.context.evaluation` = `{option, params}`. It is the one way to ask an agent within a WF: `meta.context.response_envelope`, which IO nodes keep for their own callers, is refused in a WF's action.
 
 ```json
 {

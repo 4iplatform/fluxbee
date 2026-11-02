@@ -1390,7 +1390,7 @@ Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts betwee
   - `isReply` takes `NOT_TAKEN` instead of `INVALID_INPUT`, so it never starts an instance and is
     never answered.
 - **A-135:** a message with no thread starts nothing, and `creationThread` goes. A sender other than
-  an IO node gets a log line only.
+  an IO node gets `no_thread` only for a named request, as above; otherwise a log line.
 - **The rest of A-116, the instance's person:** the instance keeps the `src_ilk` and `ich` of the
   message that started it (new store columns `person_ilk` and `person_ich`). A `send_message`
   carries them as `meta.src_ilk` and `meta.ich`, when they are set.

@@ -143,6 +143,30 @@ func (c *seedConversation) to(node string) []string {
 	return got
 }
 
+// toSupervisors checks the supervisors' message number n (0 is the question): its text, and the
+// subject the WF marked it with.
+func (c *seedConversation) toSupervisors(n int, text, subject string) {
+	c.t.Helper()
+	var sent []sdk.Message
+	for _, msg := range c.disp.sent {
+		if msg.Routing.Dst.Value() == seedSupervisors {
+			sent = append(sent, msg)
+		}
+	}
+	if len(sent) != n+1 {
+		c.t.Fatalf("the supervisors got %d messages, want %d: %q", len(sent), n+1, c.to(seedSupervisors))
+	}
+	msg := sent[n]
+	var payload map[string]any
+	_ = json.Unmarshal(msg.Payload, &payload)
+	if got := fmt.Sprint(payload["content"]); got != text {
+		c.t.Fatalf("the supervisors' message %d: %q, want %q", n, got, text)
+	}
+	if got := fmt.Sprint(wfBlock(c.t, msg)["subject"]); got != subject {
+		c.t.Fatalf("the supervisors' message %d is marked %q, want %q", n, got, subject)
+	}
+}
+
 // person checks what the person got since the count was since: want, in order.
 func (c *seedConversation) person(since int, want ...string) {
 	c.t.Helper()
@@ -178,8 +202,10 @@ func (c *seedConversation) fire(instanceID, key string) {
 // The seeds' sales.consult on the engine: sales' answers reach the person in whatever state they
 // arrive, two at a time included; a consultation posts the question and waits; a supervisor's
 // message that decides nothing (wait) never reaches the person, a decision does, and so does one
-// that comes after the wait; an empty reply is never forwarded; an error gets the person an apology;
-// the wait and the conversation end on their timers.
+// that comes after the wait; a supervisor's question to sales (answer_team) gets its reply into the
+// question's thread (subject same), never to the person, during the consultation and after it; an
+// empty reply is never forwarded; an error gets the person an apology; the wait and the conversation
+// end on their timers.
 func TestTheSeedExampleConsultsTheSupervisors(t *testing.T) {
 	c := newSeedConversation(t)
 
@@ -216,12 +242,21 @@ func TestTheSeedExampleConsultsTheSupervisors(t *testing.T) {
 	// 4. A supervisor's message that decides nothing: sales says wait, and the person gets nothing.
 	c.say(seedSupervisors, "@ana, ¿este cliente pagó tarde?")
 	remark, options := c.asked()
-	if options != "decided wait " || fmt.Sprint(wfBlock(t, remark)["vars"]) != "map[question:¿20% en 20 Pro?]" {
+	if options != "decided wait answer_team " || fmt.Sprint(wfBlock(t, remark)["vars"]) != "map[question:¿20% en 20 Pro?]" {
 		t.Fatalf("sales gets the supervisor's message, with the question: %q %v", options, wfBlock(t, remark)["vars"])
 	}
 	c.choose(remark, "", "wait", nil)
 	c.inState("consulting")
 	c.person(4)
+
+	// 4b. A supervisor asks sales something: its reply goes into the question's thread (subject same),
+	// never to the person, and the consultation goes on.
+	c.say(seedSupervisors, "¿Entre 20% y 15%, cuál darías vos?")
+	question, _ := c.asked()
+	c.choose(question, "Daría 15%: es un cliente nuevo.", "answer_team", nil)
+	c.inState("consulting")
+	c.person(4)
+	c.toSupervisors(1, "Daría 15%: es un cliente nuevo.", "same")
 
 	// 5. The person writes, and the supervisor decides before sales answers it: the decision and the
 	// answer both reach the person, in the order sales gives them.
@@ -240,12 +275,21 @@ func TestTheSeedExampleConsultsTheSupervisors(t *testing.T) {
 	// 6. A supervisor writes after the decision: sales gets it, and its decision reaches the person.
 	c.say(seedSupervisors, "Corrijo: 12%.")
 	late, options := c.asked()
-	if options != "decided wait " {
+	if options != "decided wait answer_team " {
 		t.Fatalf("a late supervisor's message: %q", options)
 	}
 	c.choose(late, "Corrección: el descuento aprobado es 12%.", "decided", nil)
 	c.inState("talking")
 	c.person(6, "Corrección: el descuento aprobado es 12%.")
+
+	// 6b. A supervisor asks sales something after the decision: the catch sends its reply into the
+	// question's thread, never to the person.
+	c.say(seedSupervisors, "¿Por qué 12 y no 15?")
+	why, _ := c.asked()
+	c.choose(why, "Porque el cliente pagó tarde la última factura.", "answer_team", nil)
+	c.inState("talking")
+	c.person(7)
+	c.toSupervisors(2, "Porque el cliente pagó tarde la última factura.", "same")
 
 	// 7. An error: the person gets the WF's apology.
 	c.say(seedPersonIO, "¿Me mandás el link de pago?")

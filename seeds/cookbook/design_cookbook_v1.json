@@ -43,7 +43,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 4
+    "seed_version": 5
   },
   {
     "layer": "design",
@@ -100,7 +100,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 4
+    "seed_version": 5
   },
   {
     "layer": "design",
@@ -267,6 +267,9 @@
                               },
                               {
                                 "name": "wait"
+                              },
+                              {
+                                "name": "answer_team"
                               }
                             ]
                           }
@@ -292,6 +295,19 @@
                       },
                       "guard": "event.context.evaluation.option == 'wait'",
                       "actions": []
+                    },
+                    {
+                      "event_match": {
+                        "src": "AI.sales@worker1"
+                      },
+                      "guard": "event.context.evaluation.option == 'answer_team' && event.context.evaluation.reply != ''",
+                      "actions": [
+                        {
+                          "type": "forward",
+                          "target": "IO.slack.supervisores@motherbee",
+                          "subject": "same"
+                        }
+                      ]
                     },
                     {
                       "event_match": {
@@ -443,11 +459,24 @@
                   "event_match": {
                     "src": "AI.sales@worker1"
                   },
-                  "guard": "event.context.evaluation.option != 'wait' && event.context.evaluation.reply != ''",
+                  "guard": "event.context.evaluation.option != 'wait' && event.context.evaluation.option != 'answer_team' && event.context.evaluation.reply != ''",
                   "actions": [
                     {
                       "type": "forward",
                       "target": "IO.slack.ventas@motherbee"
+                    }
+                  ]
+                },
+                {
+                  "event_match": {
+                    "src": "AI.sales@worker1"
+                  },
+                  "guard": "event.context.evaluation.option == 'answer_team' && event.context.evaluation.reply != ''",
+                  "actions": [
+                    {
+                      "type": "forward",
+                      "target": "IO.slack.supervisores@motherbee",
+                      "subject": "same"
                     }
                   ]
                 },
@@ -474,6 +503,9 @@
                           },
                           {
                             "name": "wait"
+                          },
+                          {
+                            "name": "answer_team"
                           }
                         ]
                       }
@@ -495,13 +527,14 @@
       "each IO node whose messages the WF takes (its start_from nodes, and the supervisors' io.slack of a consultation) sends them to the WF: that node's config has io.dst_node: WF.<workflow_name>@<hive>",
       "every message a WF sends is a user message: an action's meta has msg and context, never type",
       "a send_message target is a node name written in the definition; to choose among destinations, write one transition per destination with its guard",
-      "a WF asks an agent with a menu on a send_message or a forward to an AI.* node: an optional help, and 1 to 8 options, each a name, a description and optional typed params; option and param names match ^[a-z][a-z0-9_]{0,31}$; the agent adds none, with the param reason",
+      "a WF asks an agent with a menu on a send_message or a forward to an AI.* node, and offers people one on a send or a forward to their IO.* node (io.slack shows it as buttons, and a click comes back as a message with event.context.evaluation {option, params}): an optional help, and 1 to 8 options, each a name, a description and optional typed params; option and param names match ^[a-z][a-z0-9_]{0,31}$; the agent adds none, with the param reason; a known option (answer, consult, decided, wait, answer_team, handover, handback) is written by its name alone, and SY.wf-rules writes its description and params",
       "an agent's answer to a menu has the text for the person, maybe empty, in event.payload.content and in event.context.evaluation.reply, and {reply, option, params} in event.context.evaluation: branch on event.context.evaluation.option, and forward the answer to the IO node to give the person the reply",
       "an agent's params are the person's words passed on by a model: guard them before acting on them, such as a price or an amount",
       "an agent's answers may arrive in any state (a person who writes twice gets two answers): the catch acts on them wherever they arrive",
-      "a consultation posts the question to the supervisors' io.slack, the only IO node that maps a reply in its post's thread back to the instance; each supervisor's message goes to the agent with a menu that lets it say the message decides nothing yet (wait), so only a decision reaches the person",
+      "a consultation posts the question to the supervisors' io.slack, the only IO node that maps a reply in its post's thread back to the instance; each supervisor's message goes to the agent with a menu that lets it say the message decides the question (decided), decides nothing yet (wait), or asks it something (answer_team, whose reply goes back to the supervisors' io.slack with subject same), so only a decision reaches the person",
       "an agent's error answer (an answer off the menu, a timeout, a provider failure) is a payload of type 'error', with no retry; its msg is <msg>.error only when the request had a msg (a forwarded person's message has none: match the agent by event_match.src, with the guard event.payload.type == 'error')",
-      "what no transition of the current state takes goes to the catch, a top-level list of transitions tried in any state (sends, forwards, keep_message, set_variable and emit_internal_event; no timers); what the catch does not take is logged as unhandled event, and the instance stays where it was",
+      "what no transition of the current state takes goes to the catch, a top-level list of transitions tried in any state (sends, forwards, keep_message, set_variable and emit_internal_event; no timers); what the catch does not take is logged as unhandled event, and the instance stays where it was; nothing from an IO node ends in silence: its message gets NOT_TAKEN, which the IO node shows to whoever wrote, when the instance takes nothing, when no instance holds its thread and it starts none, when it has no thread, or when input_schema refuses it",
+      "a send_message or a forward to an IO.* node may carry subject: new opens a subject, same continues the WF's last one on the conversation to that node, end ends it; io.slack keeps a subject in one Slack thread and closes its post's buttons on end",
       "at most 8 messages go to agents between two triggers (a message from an IO node or another WF, or a timer's fire): past that the send is not made, and the instance gets one AGENT_CALL_CAP event, a payload of type 'error'",
       "a timer's key is event.timer_key: a timeout is a TIMER_FIRED transition with the guard event.timer_key == '<timer_key>'",
       "a $ref to a field that may be missing gives a default: {\"$ref\": \"event.context\", \"default\": {}}; a $ref without one fails the instance"
@@ -512,7 +545,7 @@
       "do not deploy a workflow on an ingress or egress hive: it has no SY.wf-rules",
       "do not write meta.type, target_ref, thread_id_ref, meta.context.response_envelope or event.payload.timer_key: SY.wf-rules refuses the first four, and the fifth is never set",
       "do not put routing rules in an agent's role: the WF hands the agent a menu with each message, and the role keeps only the agent's trade",
-      "do not name a menu option none, nor read an option or a param that no menu of the definition has: SY.wf-rules refuses both",
+      "do not name a menu option none, nor write a known option with a description or params, nor read an option or a param that no menu of the definition has: SY.wf-rules refuses all three",
       "do not forward an agent's empty reply to an IO node: guard that forward with event.context.evaluation.reply != ''",
       "do not take a supervisor's first message as the decision: the agent says whether it decides the question",
       "do not ask an agent again with the same message: deliver its answer, then wait for the person's next message",
@@ -521,6 +554,6 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 4
+    "seed_version": 5
   }
 ]

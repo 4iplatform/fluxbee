@@ -235,7 +235,7 @@ operating one.
   an egress hive.
 - **A complete example:** the seeds `wf_node_with_workflow` and `workflow_definition`. An agent
   answers through a menu or consults the supervisors, and the catch acts on its answers wherever
-  they arrive.
+  they arrive. Handing the conversation to a person of the team is a pattern of §4.2.6.
 
 #### 4.2.1 The definition
 
@@ -252,7 +252,17 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
   - Only the nodes the definition names drive the instance: those of `start_from`, those of an
     `event_match.src`, and the targets of its sends, the catch's included. SY.timer drives it too,
     for its own timers. Anyone else is dropped.
-  - A `start_from` node's message on a thread that no instance holds starts a new instance.
+  - A `start_from` node's message on a thread that no instance holds starts a new instance. A
+    message with no thread starts nothing: a WF never makes up a thread.
+- **Nothing from an IO node ends in silence.** An IO node's message that nothing takes gets
+  `NOT_TAKEN`, which the IO node shows to whoever wrote, with its reason:
+  - `no_conversation`: no instance holds its thread, and it starts none;
+  - `no_thread`: it has no thread;
+  - `invalid_input`: `input_schema` refuses it;
+  - `not_expected`: the instance took nothing, neither a transition nor the catch.
+
+  Another sender gets it only for a named request. A sender the definition does not name gets
+  nothing.
 - **A state** has `name`, `description`, `entry_actions`, `exit_actions` and `transitions`. A state
   named `failed` must be terminal: an action that fails ends the instance there.
 - **A transition:**
@@ -304,15 +314,15 @@ Common guards:
 
 **The actions:**
 - **`send_message`** sends a message the WF writes. Its fields are `target`, `meta.msg`,
-  `meta.context`, `payload`, `vars` and `menu`.
+  `meta.context`, `payload`, `vars`, `menu` and `subject`.
   - `target` is a node name written in the definition, never a `SY.*` or `RT.*` node. To choose
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
-  - A message the WF writes carries no person's context. When an agent's answer to it must reach a
-    person, write the person's `io` context, kept in `state` from their message, in
-    `meta.context.io`.
+  - A message the WF writes carries the instance's person: the `src_ilk` and `ich` of the message
+    that started it. It carries no `io` context: when an agent's answer to it must reach a person,
+    write the person's `io` context, kept in `state` from their message, in `meta.context.io`.
 - **`forward`** sends the event's message, or the one kept under `message`, as it was received. Its
-  fields are `target`, `message`, `meta.context`, `vars` and `menu`.
+  fields are `target`, `message`, `meta.context`, `vars`, `menu` and `subject`.
   - The payload goes byte for byte. The meta goes too, the person's ILK included, but not
     `memory_package`.
   - The WF changes only the destination, the thread, the `meta.context` keys it writes, and its
@@ -339,18 +349,30 @@ Common guards:
     an answer needs one.
   - `missed_policy` is `fire`, `drop` or `fire_if_within` (with `missed_within_ms`). It covers
     only a fire that SY.timer itself delivers late.
+- **`subject`,** on a send or a forward to an `IO.*` node only, tells the IO node where the message
+  stands. The WF knows the subject; the IO node knows its places and places the message.
+  - `new`: the message opens a subject;
+  - `same`: it continues the subject of the WF's last message on this conversation to that node;
+  - `end`: it ends that subject.
+
+  io.slack keeps a subject in one Slack thread: `new` opens a post, `same` goes into its thread, and
+  `end` closes the post's buttons and marks it closed. Without `subject`, the IO node does as always.
 - **The WF's block.** Every send and forward carries `meta.context.wf`. An agent shows it to its
   model, and never sends it back. A send's `meta.context` never writes `wf`. The block holds:
   - `trail`: the nodes the message went through;
-  - `vars`: the action's `vars`;
-  - `menu`: the action's menu.
+  - `vars`: the action's `vars`, the facts the WF gives the receiver. io.slack shows them as a line
+    under the post;
+  - `menu`: the action's menu;
+  - `subject`: the action's subject.
 
-#### 4.2.4 Asking an agent: the menu
+#### 4.2.4 Asking an agent or a person: the menu
 
 A WF never puts routing rules in an agent's role. It hands the agent, with each message, a menu of
-what the agent may answer, and the role keeps only the agent's trade.
+what the agent may answer, and the role keeps only the agent's trade. A person gets the same menu
+through their IO node.
 
-- **`menu`** goes on a send or a forward to an `AI.*` node, and only to one:
+- **`menu`** goes on a send or a forward to an `AI.*` node, or to an `IO.*` node for the people
+  there:
 
   ```json
   "menu": {
@@ -372,6 +394,10 @@ what the agent may answer, and the role keeps only the agent's trade.
     `boolean`, `integer` or `number`, and its optional description holds up to 200 characters.
   - `enum` is for strings only: 1 to 20 values, each non-empty and unique.
   - The menu is literal (no `$ref`), and a field it does not define is refused.
+- **Known options.** Write a known option by its name alone, `{"name": "consult"}`, and the compiler
+  writes its description and params. A known name written with any other field is refused. An
+  option of the definition's own, such as `invoice`, is written whole. What an option does is
+  always the definition's: its transitions.
 
 The known options:
 
@@ -388,6 +414,15 @@ The known options:
 <!-- known-options:end -->
 
 - **`none`:** the agent node adds it to every menu, with the param `reason`.
+- **A menu for people,** sent to an IO node: io.slack shows each option as a button on the post, and
+  an option's params as a form, all of them required.
+  - A click comes back as a message from whoever clicked, on the conversation's thread, with
+    `event.context.evaluation` = `{option, params}`, and no `reply`.
+  - Its text is the option's name, then each param as `name: value`, one per line. Forward it to an
+    agent to pass it on in the person's own words.
+  - Tell a click from a text with `has(event.context.evaluation)`.
+  - A post's buttons stay until a new menu on the conversation or an `end` closes them. A click
+    after that gets "This is no longer open." from io.slack.
 - **The answer:**
   - it comes back with the request's `msg`. A forwarded message has none, so match the agent by
     `event_match.src`;
@@ -429,6 +464,7 @@ The known options:
   took.
 - **The default:** without a catch, or when the catch takes nothing, the event is logged locally,
   in the instance's log and the node's log, as `unhandled event`. The instance stays where it was.
+  An IO node's message also gets `NOT_TAKEN` (`not_expected`, §4.2.1).
 - **The cap:** at most 8 messages go to agents between two triggers. A trigger is a message from an
   IO node or another WF, or a timer fire.
   - Past the cap, the send is not made.
@@ -448,8 +484,25 @@ The known options:
   3. It writes the question (a `$ref` to the param) to the supervisors' io.slack, and waits with a
      timer. Only io.slack maps a reply in the thread of its post back to the instance's thread.
   4. Each supervisor's message in that thread reaches the instance. The WF forwards it to the agent
-     with a menu of two options: the message decides the question (`decided`), or decides nothing
-     yet (`wait`). Only a decision reaches the person.
+     with a menu of three options: the message decides the question (`decided`), decides nothing
+     yet (`wait`), or asks the agent something (`answer_team`). Only a decision reaches the person.
+     An `answer_team` reply goes to the supervisors' io.slack with `subject: same`, into the
+     question's thread, and the consultation goes on.
+- **Handing the conversation to a person of the team:**
+  1. The agent answers `handover`. The WF forwards its reply to the person, when it is not empty.
+  2. It posts the `summary` param to the team's io.slack with `subject: new`, the person's facts in
+     `vars`, and a menu with `handback`. Then it holds the conversation for the team, with a
+     "nobody took it" timer.
+  3. A team message is forwarded to the person, with the person's `io` context. The first one
+     cancels "nobody took it" and starts a "quiet" timer; each later one starts it again.
+  4. A person's message is kept and forwarded to the team with `subject: same`.
+  5. A `handback` click, or either timer, ends it: `end` to the team, with a fixed text, and the
+     conversation back to the agent. A click is forwarded to the agent, so the note reaches it in
+     the team member's words; on a timer, the WF sends the agent a fixed text. `vars` say how it
+     came back and since when the team had it.
+
+  While the team has the conversation, an agent's late answer is not delivered. The example package
+  `wf.sales.invoice` does all of it.
 - **Answers in any state:** a person who writes twice gets two answers, and a decision may cross an
   answer to the person. The catch acts on an agent's answers wherever they arrive.
 - **Late events:** handle a message where it can arrive. Use an internal transition when it must not
