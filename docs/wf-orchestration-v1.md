@@ -1458,25 +1458,18 @@ ai.generic: its config, its runner and its docs. SY.architect and the frontdesk 
   - Any other system message stays ignored, as today.
 - **The facts:** a message's `meta.context.wf.vars`, when it is a non-empty object, is a context line
   under its text: `key: value` pairs, escaped, each value cut at 200 characters, 10 keys at most.
-- **A-130:**
-  - a `thread_broadcast` is relayed as the plain message it is;
-  - the dedup is by message (channel and `ts`), not by event, so a mention that arrives twice goes
-    once;
-  - an outbound message with no text, no blocks and no files is dropped with a log line, instead of
-    the Spanish fallback. One that ends a subject still closes it;
-  - a `file_share` is relayed, with the checks a plain message gets and its files;
-  - a new place's files go under a first text post that names them, and that post's `ts` is
-    recorded.
-- **A-108:** files that io.slack's MIME list refuses are left out, and the text names them. The rest
-  goes.
-- **A-129:** an event or a click for another channel of the node's workspace is handed to the
-  io.slack node bound to that channel.
-  - That node is found in the identity's shared memory, from the binding's ICH (`slack_binding`,
-    `workspace/channel`), which names its owner node.
-  - The event goes as a `SLACK_EVENT` mesh message, which a node takes only from an `IO.slack.*`
-    sender.
-  - When no node binds the channel, a warn line, once per channel and hour.
-  - docs/io/io-slack.md says that one Slack app can serve several io.slack nodes.
+- **A message marked `end` with no text, no blocks and no files** closes the subject's open menu and
+  posts nothing.
+- **Only what the WF's test needs** (the operator, 2026-11-02): *"solo para terminar la prueba sobre
+  los casos de WF no quería cambiar el IO.slack ahora"*.
+  - This piece is built on today's io.slack, and io.slack's revamp in the IO track will redo it.
+  - The WF's side does not depend on it. The WF gives facts (the thread, `subject`, the menu, `vars`,
+    `NOT_TAKEN`), and each IO node decides what to do with them.
+- **Out of this case, to io.slack's revamp:** A-130, A-108 and A-129, first planned here.
+  - A-129's plan was a relay of events between io.slack nodes. The operator: it looks like a
+    workaround, and it is not how the system must end up.
+  - The test does not need it: each io.slack node of the gate has its own Slack app.
+  - The operator's definition for the revamp is in FINDINGS A-129.
 
 **5. Archi (after pieces 1 and 2):**
 - the handbook's §4.2: the catalog, `subject`, the menu for people, "not taken", and the handover
@@ -1500,8 +1493,7 @@ round.
    note.
 3. "Nobody took it" and "quiet", each with a short N.
 4. "Not taken": a message in a closed case's thread, a late click, and a message at the channel's
-   top level.
-5. A-130 in Slack: a reply with "Also send to #channel", and a reply with a file.
+   top level. On the person's side, a message with no thread (A-135).
 
 ## 6. Docs that drift from the code
 

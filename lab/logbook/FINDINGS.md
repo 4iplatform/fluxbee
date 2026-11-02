@@ -1362,6 +1362,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - drop a message with no text and no blocks, with a log line, instead of the fallback;
   - relay a `file_share` with the checks a plain message gets, and its files;
   - post a new place's files under a first text post (their names), whose `ts` is recorded.
+- **Planned into WF Case 4 on 2026-10-31, and taken out on 2026-11-02:** the operator wants
+  io.slack changed now only where the WF test needs it. It goes to io.slack's revamp (A-129 has the
+  operator's definition). Only one piece goes in Case 4, as part of its marks: a message that ends a
+  subject, with nothing to post, closes the menu and posts nothing
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.10).
 
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 
@@ -1386,6 +1391,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - or one node that serves several bindings.
 
   Either way, the doc says it, and a dropped event is logged above `debug`.
+- **Planned into WF Case 4 on 2026-10-31, and taken out on 2026-11-02.** The plan was a relay: the
+  node that gets another channel's event hands it to the node bound there, as a mesh message.
+  - The operator: it looks like a workaround, and not the way the system must end up. *"si sirve
+    para la prueba, dale para adelante"*, but the test does not need it, since each io.slack node
+    of the gate has its own Slack app.
+  - The operator does not want io.slack changed now beyond what the WF test needs: *"lo que no
+    quiero es abrir mil frentes"*.
+- **The operator's definition for io.slack's revamp (2026-11-02):**
+  - io.slack must manage its whole channel and its messages, not work half from outside through the
+    bot as today;
+  - Slack channels are unique, and each one is one ICH and one node: *"así es más acotado y
+    atómico"*;
+  - if that cannot be done, one IO.slack node per workspace, multiplexing its channels.
+- **Whether one node per channel can be done with one Slack app** (read on 2026-11-02, for the
+  revamp to decide):
+  - **Over Socket Mode, no:** Slack hands each event to any one of the app's connections.
+  - **Over Slack's HTTP events, yes:** an app has one Request URL, for its events and its
+    interactivity. The edge's fan-out endpoint, built for io.wapp (src/bin/sy_edge.rs,
+    `fanout_family`; docs/io-wapp-design.md §5), hands each event to the whole `IO.slack.*` family,
+    and each node takes its own channel. That is io.wapp's decided model for Meta's single webhook.
+- **Fix:** io.slack's revamp, in the IO track.
 
 ### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 5) — A wf-rules `check` stages the definition it checks
 
@@ -1943,6 +1969,8 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - or accept `text/html`.
 
   io.wapp sends the text only and drops every attachment, an older deferral.
+- **Planned into WF Case 4 on 2026-10-31, and taken out on 2026-11-02:** to io.slack's revamp (A-129
+  has the operator's definition).
 
 ### A-107 🔵 PENDING by the operator's choice (2026-10-27) — A published page cannot be updated under the same link
 
