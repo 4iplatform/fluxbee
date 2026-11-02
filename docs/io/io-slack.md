@@ -108,11 +108,13 @@ records are `slack_threads.db`, next to the node's `config.json`: one row per pl
   on its thread id opens a new post at the top level, whatever its `reply_target`. Once that post
   goes out, its `ts` is recorded, and the node forgets its older posts on the thread id. So a
   second question on a conversation, days later, shows in the channel, and a late reply under the
-  first question's post gets its own thread id: it never decides the second.
+  first question's post gets its own thread id: it never decides the second. The open menus of
+  the forgotten posts, on a post or in its Slack thread, close with them, in the same transaction
+  (§8.4), so their buttons no longer send clicks on the thread id.
 - **Out, an unrecorded thread id:** with a `reply_target` of the node's own channel, it is posted
   there, and recorded. Any other is posted at the top level, and the post's `ts` is recorded.
 - **The marks** ([wf-orchestration-v1](../wf-orchestration-v1.md) §5.4.2): a WF marks each message
-  it sends with `meta.context.wf.subject`.
+  it sends with `meta.context.wf.subject`, read only from a WF node (§8.4).
   - `new`, or no mark: as above.
   - `same`: on a thread id with the node's post, into that post's Slack thread, with no new post
     and nothing forgotten, so a case keeps one Slack thread. On an unrecorded thread id, as `new`.
@@ -196,9 +198,22 @@ each in a task of its own (`nodes/io/io-slack/src/slack_menu.rs`):
 A click outside the bound channel, or the bound workspace, is dropped with a `debug` line, as an
 event is.
 
-- **The Slack app needs Interactivity on**, under "Interactivity & Shortcuts". Over Socket Mode it
-  needs no Request URL. The bot token's scopes cover the calls: `chat:write` for `chat.update` and
-  `chat.postEphemeral`, and `views.open` with a click's `trigger_id`.
+- **The read loop only reads, acks and hands off** (`hand_off_envelope`):
+  - the `events_api` envelopes go to one event worker, through a queue of 1,024, which takes them
+    one at a time, in the order they came (`run_slack_event_worker`). A full queue drops an event
+    with an `error` line: it was acked, so Slack does not send it again;
+  - the `interactive` envelopes go to a task each, so a click's modal opens within the 3 seconds its
+    `trigger_id` lasts, whatever the worker is busy with (a file to download, a person to
+    provision);
+  - any other envelope is ignored.
+- **A click takes no lock an event holds:** it goes to the mesh through an inbound processor of its
+  own, so it never waits on an event's provisioning, and a first clicker's never holds up the
+  events.
+- **Clicks reach the node only when Interactivity is on** in the Slack app, under "Interactivity &
+  Shortcuts". Over Socket Mode it needs no Request URL. The buttons show without it, but a click
+  then shows Slack's own error to the person, and no envelope reaches the node. The bot token's
+  scopes cover the calls: `chat:write` for `chat.update` and `chat.postEphemeral`, and `views.open`
+  with a click's `trigger_id`.
 
 ---
 
@@ -465,6 +480,10 @@ Official limit reference:
 A WF's block, `meta.context.wf` ([wf-orchestration-v1](../wf-orchestration-v1.md) §5.4.3 and
 §5.4.4), adds to a post (`nodes/io/io-slack/src/slack_menu.rs`):
 
+- **Only from a WF:** the node reads the block, its mark included (§2.4), only when the message's
+  sender is a `WF.*` node, by the name its router stamps (`routing.src_l2_name`). Any other
+  sender's block is ignored, with a `warn` line: a node that knows a thread id could otherwise close
+  a case's menu with `end`, or plant buttons whose clicks go on that thread id.
 - **The facts:** `vars`, when it is a non-empty object, is a context line under the text, of
   `key: value` pairs: escaped, each value on one line and cut at 200 characters, 10 keys at most.
   Facts alone make no post.
@@ -478,8 +497,15 @@ A WF's block, `meta.context.wf` ([wf-orchestration-v1](../wf-orchestration-v1.md
 - **A post with facts or a menu is blocks:** the text in sections, escaped and `verbatim`, so Slack
   turns no `@channel`, mention, channel or URL in it into markup; then the facts, the help and the
   buttons. A payload's own `blocks` take the text's place. A post with neither is as before.
-- **Closing a menu**, by a new one on its thread id or by `end`, updates its post (`chat.update`):
-  the same blocks without the buttons, and a context line "Closed.".
+  - **A post holds Slack's 50 blocks.** A text's sections always leave room for the facts, the help
+    and the buttons; a payload's own blocks may not. Then the room goes to the buttons first, then
+    to the facts, and what does not fit is left out, with a `warn` line. A post with no room for
+    the buttons records no open menu. Own blocks past 50 go as they are, and Slack refuses them.
+  - The buttons' block id is `fluxbee_wf_menu`: a payload's own block with any other is never taken
+    for them.
+- **Closing a menu**, by a new one on its thread id, by `end`, or by a new post that makes the node
+  forget the menu's post (§2.4), updates its post (`chat.update`): the same blocks without the
+  buttons, and a context line "Closed.".
 - **A click on a button** (§3.3):
   - an option without params sends the click message at once;
   - an option with params opens a modal (`views.open`, with the click's `trigger_id`), with one
@@ -487,6 +513,9 @@ A WF's block, `meta.context.wf` ([wf-orchestration-v1](../wf-orchestration-v1.md
     boolean a yes/no select, and an enum a select of its values. Slack checks the inputs. The
     submission is checked again against the types, and dropped with a log line when it does not
     match;
+  - when the modal does not open (Slack refuses a `trigger_id` older than 3 seconds,
+    `expired_trigger_id`), the clicker gets "Could not open the form; click again.", which only
+    they see, where they clicked, and nothing goes;
   - a click on a post with no open menu gets "This is no longer open.", which only the clicker
     sees (`chat.postEphemeral`), and nothing goes.
 - **The click message** is a `user` message built as a relayed Slack message (§6, §7): from the
@@ -504,7 +533,12 @@ When a WF takes a message nowhere, it answers `NOT_TAKEN`
 `trace_id`, and a `reason` in its payload (`nodes/io/io-slack/src/not_taken.rs`).
 
 - The node remembers each message and click it relays, for 15 minutes and 2,000 at most: its
-  `trace_id`, its channel, its Slack thread and its Slack user.
+  `trace_id`, its channel, its Slack thread, its Slack user, and the node it was relayed to (its
+  `routing.dst`: the node's `io.dst_node` then).
+- A `NOT_TAKEN` counts only from the node the message was relayed to, when that node is a `WF.*`,
+  by the name its router stamps (`routing.src_l2_name`). One from any other sender is dropped with
+  a `warn` line, and takes nothing, so the WF's own still shows. A message relayed with no
+  `io.dst_node` (the router resolved it) shows none.
 - A `NOT_TAKEN` for a remembered `trace_id` posts "Not taken: " and the reason's text, which only
   that user sees, where they wrote (`chat.postEphemeral`):
   - `no_conversation`: "no conversation here takes this message";

@@ -51,7 +51,9 @@ use not_taken::RelayedMessages;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use slack_menu::{close_subject_menu, handle_interactive, Interactions, WfPost};
+use slack_menu::{
+    close_forgotten_menus, close_subject_menu, handle_interactive, Interactions, WfPost,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +62,7 @@ use thread_records::{
     map_inbound_thread, open_node_thread_records, run_thread_records_expiry_loop, OutboundThread,
     SlackThreadRecords, Subject,
 };
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
@@ -128,15 +131,7 @@ async fn main() -> Result<()> {
     ));
     let inbound = Arc::new(Mutex::new(InboundProcessor::new(
         sender.uuid().to_string(),
-        InboundConfig {
-            ttl: config.ttl,
-            dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
-            dedup_max_entries: config.dedup_max_entries,
-            dst_node: None,
-            provision_on_miss: true,
-            blob_runtime: Some(config.blob_runtime.clone()),
-            self_tenant_id: self_tenant_id.clone(),
-        },
+        slack_inbound_config(&config, self_tenant_id.clone()),
     )));
     let blob_toolkit = Arc::new(
         config
@@ -341,6 +336,21 @@ async fn main() -> Result<()> {
 
     let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
     Ok(())
+}
+
+/// The config of an inbound processor, which takes a person's message to the mesh: the events' and
+/// the clicks' (slack_menu). Its destination is the effective config's `io.dst_node`, set on the
+/// processor or given with each message.
+fn slack_inbound_config(config: &Config, self_tenant_id: Option<String>) -> InboundConfig {
+    InboundConfig {
+        ttl: config.ttl,
+        dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
+        dedup_max_entries: config.dedup_max_entries,
+        dst_node: None,
+        provision_on_miss: true,
+        blob_runtime: Some(config.blob_runtime.clone()),
+        self_tenant_id,
+    }
 }
 
 const RPC_CH_INCOMING: &str = "incoming";
@@ -947,10 +957,15 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// Slack's Web API, the base of every method's URL.
+const SLACK_WEB_API: &str = "https://slack.com/api";
+
 #[derive(Clone)]
 struct SlackClients {
     http: reqwest::Client,
     runtime: Arc<RwLock<SlackRuntimeState>>,
+    /// The base of the Web API's method URLs: `SLACK_WEB_API`, or a test's fake (`fake_web_api`).
+    web_api: String,
 }
 
 #[derive(Clone)]
@@ -998,7 +1013,13 @@ impl SlackClients {
                 config_generation: 0,
                 bot_user_id: None,
             })),
+            web_api: SLACK_WEB_API.to_string(),
         })
+    }
+
+    /// The URL of a Web API method.
+    fn web_api_url(&self, api: &str) -> String {
+        format!("{}/{api}", self.web_api)
     }
 
     async fn config_generation(&self) -> u64 {
@@ -1036,11 +1057,10 @@ impl SlackClients {
             user_id: Option<String>,
             error: Option<String>,
         }
+        let url = self.web_api_url("auth.test");
         let resp: AuthTestResp = self
             .slack_send_with_retry("auth.test", || {
-                self.http
-                    .post("https://slack.com/api/auth.test")
-                    .bearer_auth(&slack_bot_token)
+                self.http.post(url.as_str()).bearer_auth(&slack_bot_token)
             })
             .await
             .ok()?
@@ -1142,11 +1162,10 @@ impl SlackClients {
         }
         let slack_app_token = self.slack_app_token().await?;
 
+        let url = self.web_api_url("apps.connections.open");
         let resp: OpenResp = self
             .slack_send_with_retry("apps.connections.open", || {
-                self.http
-                    .post("https://slack.com/api/apps.connections.open")
-                    .bearer_auth(&slack_app_token)
+                self.http.post(url.as_str()).bearer_auth(&slack_app_token)
             })
             .await?
             .json()
@@ -1184,10 +1203,11 @@ impl SlackClients {
         }
         let slack_bot_token = self.slack_bot_token().await?;
 
+        let url = self.web_api_url("chat.postMessage");
         let resp: PostResp = self
             .slack_send_with_retry("chat.postMessage", || {
                 self.http
-                    .post("https://slack.com/api/chat.postMessage")
+                    .post(url.as_str())
                     .bearer_auth(&slack_bot_token)
                     .json(&body)
             })
@@ -1255,7 +1275,7 @@ impl SlackClients {
             messages: Option<Vec<String>>,
         }
         let slack_bot_token = self.slack_bot_token().await?;
-        let url = format!("https://slack.com/api/{api}");
+        let url = self.web_api_url(api);
 
         let resp: OkResp = self
             .slack_send_with_retry(api, || {
@@ -1329,10 +1349,11 @@ impl SlackClients {
         let slack_bot_token = self.slack_bot_token().await?;
 
         let length = bytes.len().to_string();
+        let get_url = self.web_api_url("files.getUploadURLExternal");
         let get_resp: GetUploadUrlResp = self
             .slack_send_with_retry("files.getUploadURLExternal", || {
                 self.http
-                    .post("https://slack.com/api/files.getUploadURLExternal")
+                    .post(get_url.as_str())
                     .bearer_auth(&slack_bot_token)
                     .form(&[("filename", filename), ("length", length.as_str())])
             })
@@ -1385,10 +1406,11 @@ impl SlackClients {
             complete_payload["thread_ts"] = serde_json::Value::String(ts.to_string());
         }
 
+        let complete_url = self.web_api_url("files.completeUploadExternal");
         let complete_resp: CompleteUploadResp = self
             .slack_send_with_retry("files.completeUploadExternal", || {
                 self.http
-                    .post("https://slack.com/api/files.completeUploadExternal")
+                    .post(complete_url.as_str())
                     .bearer_auth(&slack_bot_token)
                     .json(&complete_payload)
             })
@@ -1518,6 +1540,8 @@ struct SocketEnvelope {
     payload: serde_json::Value,
 }
 
+/// The envelope of the events the node relays, which the event worker takes in order.
+const ENVELOPE_EVENTS_API: &str = "events_api";
 /// The envelope of a click or a modal's submission, which Slack sends once the app has
 /// Interactivity on.
 const ENVELOPE_INTERACTIVE: &str = "interactive";
@@ -1528,6 +1552,43 @@ const ENVELOPE_INTERACTIVE: &str = "interactive";
 const SOCKET_READ_IDLE: Duration = Duration::from_secs(90);
 /// Ceiling for the exponential reconnect backoff.
 const SOCKET_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The events the read loop handed the event worker and the worker has not taken yet, at most. Past
+/// it an event is dropped, with an error line: it was acked, so Slack does not send it again.
+const SOCKET_EVENTS_QUEUE: usize = 1_024;
+
+/// Hands off an envelope the read loop acked, and never waits: an event goes to the event worker's
+/// queue, which keeps the events' order (`run_slack_event_worker`); a click on a menu's button or a
+/// modal's submission goes to a task of its own (slack_menu), so a modal opens within the 3 seconds
+/// its trigger lasts, whatever the worker is busy with; any other envelope is ignored.
+fn hand_off_envelope(
+    env: SocketEnvelope,
+    events: &mpsc::Sender<Value>,
+    interactions: &Arc<Interactions>,
+) {
+    match env.kind.as_str() {
+        ENVELOPE_EVENTS_API => {
+            if let Err(err) = events.try_send(env.payload) {
+                let reason = match err {
+                    TrySendError::Full(_) => "the event worker's queue is full",
+                    TrySendError::Closed(_) => "the event worker stopped",
+                };
+                // As M1 says of a send to the router: acked, the event is never sent again, so a
+                // drop is a loss, logged at error.
+                tracing::error!(
+                    envelope_id = %env.envelope_id,
+                    queue = SOCKET_EVENTS_QUEUE,
+                    reason,
+                    "LOST inbound Slack event: already ACKed to Slack (no redelivery) but not \
+                     handed to the event worker"
+                );
+            }
+        }
+        ENVELOPE_INTERACTIVE => {
+            tokio::spawn(handle_interactive(interactions.clone(), env.payload));
+        }
+        kind => tracing::debug!(kind, "ignoring a socket envelope the node does not take"),
+    }
+}
 
 async fn run_inbound_socket_mode(
     config: Config,
@@ -1550,23 +1611,48 @@ async fn run_inbound_socket_mode(
     let sender = dispatcher.sender_snapshot();
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
     // A click on a menu's button, or a modal's submission, goes to the mesh as a message from the
-    // person who clicked, with what a message from Slack gets (see slack_menu).
-    let interactions = Arc::new(Interactions {
-        config: config.clone(),
-        control_plane: control_plane.clone(),
-        dispatcher: dispatcher.clone(),
-        identity_provision_cfg: identity_provision_cfg.clone(),
-        self_ilk_id: self_ilk_id.clone(),
-        self_tenant_id: self_tenant_id.clone(),
-        ensured_bindings: ensured_bindings.clone(),
-        slack: slack.clone(),
-        records: thread_records.clone(),
-        identity: identity.clone(),
-        provisioner: provisioner.clone(),
-        inbound: inbound.clone(),
-        sender: sender.clone(),
-        relayed: relayed.clone(),
-    });
+    // person who clicked, with what a message from Slack gets, through an inbound processor of its
+    // own, never the events' (see slack_menu).
+    let interactions = Arc::new(Interactions::new(
+        config.clone(),
+        control_plane.clone(),
+        dispatcher.clone(),
+        identity_provision_cfg.clone(),
+        self_ilk_id.clone(),
+        self_tenant_id.clone(),
+        ensured_bindings.clone(),
+        slack.clone(),
+        thread_records.clone(),
+        identity.clone(),
+        provisioner.clone(),
+        relayed.clone(),
+    ));
+    // The events go to one worker, which takes them in the order they came. The read loop below
+    // only reads, acks and hands off: an event's files, or a first writer's provisioning, never
+    // keep the envelopes behind it unread, and a click's modal must open within the 3 seconds its
+    // trigger lasts.
+    let (events, events_rx) = mpsc::channel(SOCKET_EVENTS_QUEUE);
+    tokio::spawn(run_slack_event_worker(
+        events_rx,
+        config,
+        dispatcher,
+        identity_provision_cfg,
+        control_plane,
+        self_ilk_id,
+        self_tenant_id,
+        slack.clone(),
+        identity,
+        provisioner,
+        inbound,
+        relay,
+        ensured_bindings,
+        blob_toolkit,
+        blob_payload_cfg,
+        thread_records,
+        relayed,
+        sender,
+        mention_re,
+    ));
 
     // Reconnect backoff (exponential, capped). Reset to the floor after a successful connect so a
     // long-lived socket never inherits a stale large backoff.
@@ -1690,283 +1776,303 @@ async fn run_inbound_socket_mode(
             }
             tracing::debug!("slack envelope acked");
 
-            // A click on a menu's button or a modal's submission, acked at once like any envelope:
-            // its own task, so a modal opens within the 3 seconds its trigger lasts whatever the
-            // loop is busy with.
-            if env.kind == ENVELOPE_INTERACTIVE {
-                tokio::spawn(handle_interactive(interactions.clone(), env.payload));
-                continue;
-            }
-
-            let payload = env.payload;
-
-            // Parse Slack event callback payload (only what we need).
-            let payload_type = payload.get("type").and_then(|v| v.as_str());
-            if payload_type != Some("event_callback") {
-                continue;
-            }
-            let binding = match extract_runtime_slack_binding(
-                control_plane.read().await.effective_config.as_ref(),
-                &config,
-            ) {
-                Ok(binding) => binding,
-                Err(error) => {
-                    tracing::warn!(
-                        node_name = %config.node_name,
-                        error = %error,
-                        "dropping inbound Slack event: missing workspace_id/conversation_id binding"
-                    );
-                    continue;
-                }
-            };
-            let team_id = match payload.get("team_id").and_then(|v| v.as_str()) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            let event = match payload.get("event") {
-                Some(v) => v.clone(),
-                None => continue,
-            };
-            let channel = match event.get("channel").and_then(|v| v.as_str()) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            if team_id != binding.workspace_id || channel != binding.conversation_id {
-                tracing::debug!(
-                    node_name = %config.node_name,
-                    configured_workspace_id = %binding.workspace_id,
-                    configured_conversation_id = %binding.conversation_id,
-                    event_workspace_id = %team_id,
-                    event_conversation_id = %channel,
-                    "dropping inbound Slack event outside configured binding"
-                );
-                continue;
-            }
-            if let Err(err) = ensure_io_slack_binding_ich_registered(
-                &config.node_name,
-                &binding,
-                &dispatcher,
-                &identity_provision_cfg,
-                self_ilk_id.as_deref(),
-                self_tenant_id.as_deref(),
-                ensured_bindings.clone(),
-            )
-            .await
-            {
-                tracing::warn!(
-                    node_name = %config.node_name,
-                    workspace_id = %binding.workspace_id,
-                    conversation_id = %binding.conversation_id,
-                    error = %err,
-                    "dropping inbound Slack event: unable to ensure own binding ICH"
-                );
-                continue;
-            }
-            let message_id = payload
-                .get("event_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| event.get("event_id").and_then(|v| v.as_str()))
-                .or_else(|| event.get("ts").and_then(|v| v.as_str()))
-                .unwrap_or("unknown")
-                .to_string();
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            // `app_mention` plus ordinary messages in the BOUND channel. The binding was already
-            // checked above, so a `message` here is by definition in the configured conversation.
-            //
-            // Anything the node echoes back is posted BY the node, and Slack delivers that post
-            // straight back as a `message` event. Relaying it would hand the mesh its own output
-            // and whatever it answers gets posted again — an echo loop inside a customer's Slack.
-            // Three independent guards, because one bad frame is a live incident:
-            //   * `subtype` present  -> not a plain human message (bot_message, joins, edits,
-            //                           deletions, thread broadcasts...).
-            //   * `bot_id` present   -> posted by some bot, ours included.
-            //   * author == us       -> the airtight one; see `bot_user_id`.
-            // The third FAILS CLOSED: if we cannot establish who we are, we do not relay.
-            let me = if event_type == "message" {
-                slack.bot_user_id().await
-            } else {
-                None
-            };
-            if let Err(reason) = classify_slack_inbound(&event, event_type, me.as_deref()) {
-                // Say so. A bare `continue` here is invisible at EVERY level, which makes the two
-                // explanations for "nothing happens" indistinguishable from the outside: Slack
-                // delivering no events at all (app not subscribed) versus us dropping what it
-                // does deliver. Diagnosing that cost a live session.
-                tracing::debug!(
-                    node_name = %config.node_name,
-                    event_type = %event_type,
-                    reason = %reason,
-                    "ignoring inbound Slack event"
-                );
-                continue;
-            }
-            let user = match event.get("user").and_then(|v| v.as_str()) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            // A blank thread_ts is the channel's top level, like a missing one.
-            let thread_ts = event
-                .get("thread_ts")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            // The person's words as written: what Slack escapes in them is decoded.
-            let content = decode_slack_text(&mention_re.replace(raw_text, ""));
-
-            tracing::debug!(
-                team_id = %team_id,
-                user = %user,
-                channel = %channel,
-                thread_ts = thread_ts.as_deref().unwrap_or(""),
-                message_id = %message_id,
-                content_len = content.len(),
-                content_preview = %truncate(&content, 120),
-                event_type = %event_type,
-                "inbound Slack message"
-            );
-
-            let mut io_ctx = slack_inbound_io_context(
-                &binding.workspace_id,
-                &user,
-                &binding.conversation_id,
-                thread_ts.as_deref(),
-                &message_id,
-            );
-            // A reply in the Slack thread of a recorded post takes that post's thread id (a WF's
-            // question gets its answer back on the instance's thread); any other message keeps
-            // the computed one and records its place. Before dispatch, so an answer finds it.
-            map_inbound_thread(
-                thread_records.as_deref(),
-                &mut io_ctx,
-                thread_ts.as_deref(),
-                now_epoch_ms(),
-            );
-            let attachments = collect_slack_blob_attachments(
-                slack.as_ref(),
-                blob_toolkit.as_ref(),
-                &blob_payload_cfg,
-                &event,
-            )
-            .await;
-            let payload = match build_slack_inbound_payload_from_parts(
-                &team_id,
-                &user,
-                &binding.conversation_id,
-                thread_ts.as_deref(),
-                &message_id,
-                &content,
-                &attachments,
-            ) {
-                Some(payload) => payload,
-                None => {
-                    tracing::warn!(
-                        team_id = %team_id,
-                        user = %user,
-                        channel = %channel,
-                        message_id = %message_id,
-                        "dropping inbound event: no valid text/attachments after blob processing"
-                    );
-                    continue;
-                }
-            };
-
-            let relay_fragment = build_slack_relay_fragment(
-                &config.node_name,
-                &binding.workspace_id,
-                &user,
-                &binding.conversation_id,
-                thread_ts.as_deref(),
-                &message_id,
-                &content,
-                attachments,
-                payload.clone(),
-                io_ctx.clone(),
-            );
-
-            let relay_decision = relay.lock().await.handle_fragment(relay_fragment);
-            match relay_decision {
-                RelayDecision::Hold => continue,
-                RelayDecision::FlushNow(turn) => {
-                    dispatch_assembled_turn(
-                        sender.clone(),
-                        identity.as_ref(),
-                        provisioner.as_ref(),
-                        inbound.clone(),
-                        turn,
-                        "relay immediate flush",
-                        &relayed,
-                    )
-                    .await;
-                    continue;
-                }
-                RelayDecision::DropDuplicate => {
-                    tracing::debug!(message_id = %message_id, "relay dedup hit; dropping inbound fragment");
-                    continue;
-                }
-                RelayDecision::RejectCapacity => {
-                    tracing::warn!(
-                        team_id = %team_id,
-                        user = %user,
-                        channel = %channel,
-                        message_id = %message_id,
-                        "relay capacity reached; using fail-open direct inbound path"
-                    );
-                }
-                RelayDecision::DropExpired => {
-                    tracing::warn!(
-                        team_id = %team_id,
-                        user = %user,
-                        channel = %channel,
-                        message_id = %message_id,
-                        "relay dropped fragment due to expired/invalid session state"
-                    );
-                    continue;
-                }
-            }
-
-            let outcome = inbound
-                .lock()
-                .await
-                .process_inbound(
-                    identity.as_ref(),
-                    Some(provisioner.as_ref()),
-                    slack_identity_input(
-                        &config.node_name,
-                        &binding.workspace_id,
-                        &binding.conversation_id,
-                        &user,
-                    ),
-                    None,
-                    io_ctx,
-                    payload,
-                )
-                .await;
-
-            // First-contact gate (OFF by default, io.api's gate-then-forward pattern): if the
-            // sender is not registered yet, it is introduced to the frontdesk and the message still
-            // goes on to its destination. See io_common::frontdesk_gate.
-            if let InboundOutcome::SendNow(ref relayed) = outcome {
-                let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
-                    control_plane.read().await.effective_config.as_ref(),
-                );
-                io_common::frontdesk_gate::gate_then_forward(
-                    &sender,
-                    &gate,
-                    &config.island_id,
-                    "slack",
-                    &slack_external_id(&config.node_name, &user),
-                    self_tenant_id.as_deref(),
-                    relayed.meta.src_ilk.as_deref(),
-                    relayed.routing.trace_id.as_str(),
-                )
-                .await;
-            }
-
-            dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound", &relayed).await;
+            hand_off_envelope(env, &events, &interactions);
         }
     }
+}
+
+/// The event worker: takes the events the read loop hands it (`hand_off_envelope`) one at a time,
+/// in the order they came, and relays each person's message in the bound channel, its files as
+/// blobs, as the person who wrote it.
+async fn run_slack_event_worker(
+    mut events: mpsc::Receiver<Value>,
+    config: Config,
+    dispatcher: Arc<RouterDispatcher>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
+    slack: Arc<SlackClients>,
+    identity: Arc<dyn IdentityResolver>,
+    provisioner: Arc<dyn IdentityProvisioner>,
+    inbound: Arc<Mutex<InboundProcessor>>,
+    relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
+    blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
+    blob_payload_cfg: IoTextBlobConfig,
+    thread_records: Option<Arc<SlackThreadRecords>>,
+    relayed: Arc<RelayedMessages>,
+    sender: NodeSender,
+    mention_re: Regex,
+) {
+    while let Some(payload) = events.recv().await {
+        // Parse Slack event callback payload (only what we need).
+        let payload_type = payload.get("type").and_then(|v| v.as_str());
+        if payload_type != Some("event_callback") {
+            continue;
+        }
+        let binding = match extract_runtime_slack_binding(
+            control_plane.read().await.effective_config.as_ref(),
+            &config,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    error = %error,
+                    "dropping inbound Slack event: missing workspace_id/conversation_id binding"
+                );
+                continue;
+            }
+        };
+        let team_id = match payload.get("team_id").and_then(|v| v.as_str()) {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        let event = match payload.get("event") {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        let channel = match event.get("channel").and_then(|v| v.as_str()) {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        if team_id != binding.workspace_id || channel != binding.conversation_id {
+            tracing::debug!(
+                node_name = %config.node_name,
+                configured_workspace_id = %binding.workspace_id,
+                configured_conversation_id = %binding.conversation_id,
+                event_workspace_id = %team_id,
+                event_conversation_id = %channel,
+                "dropping inbound Slack event outside configured binding"
+            );
+            continue;
+        }
+        if let Err(err) = ensure_io_slack_binding_ich_registered(
+            &config.node_name,
+            &binding,
+            &dispatcher,
+            &identity_provision_cfg,
+            self_ilk_id.as_deref(),
+            self_tenant_id.as_deref(),
+            ensured_bindings.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                node_name = %config.node_name,
+                workspace_id = %binding.workspace_id,
+                conversation_id = %binding.conversation_id,
+                error = %err,
+                "dropping inbound Slack event: unable to ensure own binding ICH"
+            );
+            continue;
+        }
+        let message_id = payload
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| event.get("event_id").and_then(|v| v.as_str()))
+            .or_else(|| event.get("ts").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // `app_mention` plus ordinary messages in the BOUND channel. The binding was already
+        // checked above, so a `message` here is by definition in the configured conversation.
+        //
+        // Anything the node echoes back is posted BY the node, and Slack delivers that post
+        // straight back as a `message` event. Relaying it would hand the mesh its own output
+        // and whatever it answers gets posted again — an echo loop inside a customer's Slack.
+        // Three independent guards, because one bad frame is a live incident:
+        //   * `subtype` present  -> not a plain human message (bot_message, joins, edits,
+        //                           deletions, thread broadcasts...).
+        //   * `bot_id` present   -> posted by some bot, ours included.
+        //   * author == us       -> the airtight one; see `bot_user_id`.
+        // The third FAILS CLOSED: if we cannot establish who we are, we do not relay.
+        let me = if event_type == "message" {
+            slack.bot_user_id().await
+        } else {
+            None
+        };
+        if let Err(reason) = classify_slack_inbound(&event, event_type, me.as_deref()) {
+            // Say so. A bare `continue` here is invisible at EVERY level, which makes the two
+            // explanations for "nothing happens" indistinguishable from the outside: Slack
+            // delivering no events at all (app not subscribed) versus us dropping what it
+            // does deliver. Diagnosing that cost a live session.
+            tracing::debug!(
+                node_name = %config.node_name,
+                event_type = %event_type,
+                reason = %reason,
+                "ignoring inbound Slack event"
+            );
+            continue;
+        }
+        let user = match event.get("user").and_then(|v| v.as_str()) {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        // A blank thread_ts is the channel's top level, like a missing one.
+        let thread_ts = event
+            .get("thread_ts")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let raw_text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        // The person's words as written: what Slack escapes in them is decoded.
+        let content = decode_slack_text(&mention_re.replace(raw_text, ""));
+
+        tracing::debug!(
+            team_id = %team_id,
+            user = %user,
+            channel = %channel,
+            thread_ts = thread_ts.as_deref().unwrap_or(""),
+            message_id = %message_id,
+            content_len = content.len(),
+            content_preview = %truncate(&content, 120),
+            event_type = %event_type,
+            "inbound Slack message"
+        );
+
+        let mut io_ctx = slack_inbound_io_context(
+            &binding.workspace_id,
+            &user,
+            &binding.conversation_id,
+            thread_ts.as_deref(),
+            &message_id,
+        );
+        // A reply in the Slack thread of a recorded post takes that post's thread id (a WF's
+        // question gets its answer back on the instance's thread); any other message keeps
+        // the computed one and records its place. Before dispatch, so an answer finds it.
+        map_inbound_thread(
+            thread_records.as_deref(),
+            &mut io_ctx,
+            thread_ts.as_deref(),
+            now_epoch_ms(),
+        );
+        let attachments = collect_slack_blob_attachments(
+            slack.as_ref(),
+            blob_toolkit.as_ref(),
+            &blob_payload_cfg,
+            &event,
+        )
+        .await;
+        let payload = match build_slack_inbound_payload_from_parts(
+            &team_id,
+            &user,
+            &binding.conversation_id,
+            thread_ts.as_deref(),
+            &message_id,
+            &content,
+            &attachments,
+        ) {
+            Some(payload) => payload,
+            None => {
+                tracing::warn!(
+                    team_id = %team_id,
+                    user = %user,
+                    channel = %channel,
+                    message_id = %message_id,
+                    "dropping inbound event: no valid text/attachments after blob processing"
+                );
+                continue;
+            }
+        };
+
+        let relay_fragment = build_slack_relay_fragment(
+            &config.node_name,
+            &binding.workspace_id,
+            &user,
+            &binding.conversation_id,
+            thread_ts.as_deref(),
+            &message_id,
+            &content,
+            attachments,
+            payload.clone(),
+            io_ctx.clone(),
+        );
+
+        let relay_decision = relay.lock().await.handle_fragment(relay_fragment);
+        match relay_decision {
+            RelayDecision::Hold => continue,
+            RelayDecision::FlushNow(turn) => {
+                dispatch_assembled_turn(
+                    sender.clone(),
+                    identity.as_ref(),
+                    provisioner.as_ref(),
+                    inbound.clone(),
+                    turn,
+                    "relay immediate flush",
+                    &relayed,
+                )
+                .await;
+                continue;
+            }
+            RelayDecision::DropDuplicate => {
+                tracing::debug!(message_id = %message_id, "relay dedup hit; dropping inbound fragment");
+                continue;
+            }
+            RelayDecision::RejectCapacity => {
+                tracing::warn!(
+                    team_id = %team_id,
+                    user = %user,
+                    channel = %channel,
+                    message_id = %message_id,
+                    "relay capacity reached; using fail-open direct inbound path"
+                );
+            }
+            RelayDecision::DropExpired => {
+                tracing::warn!(
+                    team_id = %team_id,
+                    user = %user,
+                    channel = %channel,
+                    message_id = %message_id,
+                    "relay dropped fragment due to expired/invalid session state"
+                );
+                continue;
+            }
+        }
+
+        let outcome = inbound
+            .lock()
+            .await
+            .process_inbound(
+                identity.as_ref(),
+                Some(provisioner.as_ref()),
+                slack_identity_input(
+                    &config.node_name,
+                    &binding.workspace_id,
+                    &binding.conversation_id,
+                    &user,
+                ),
+                None,
+                io_ctx,
+                payload,
+            )
+            .await;
+
+        // First-contact gate (OFF by default, io.api's gate-then-forward pattern): if the
+        // sender is not registered yet, it is introduced to the frontdesk and the message still
+        // goes on to its destination. See io_common::frontdesk_gate.
+        if let InboundOutcome::SendNow(ref relayed) = outcome {
+            let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
+                control_plane.read().await.effective_config.as_ref(),
+            );
+            io_common::frontdesk_gate::gate_then_forward(
+                &sender,
+                &gate,
+                &config.island_id,
+                "slack",
+                &slack_external_id(&config.node_name, &user),
+                self_tenant_id.as_deref(),
+                relayed.meta.src_ilk.as_deref(),
+                relayed.routing.trace_id.as_str(),
+            )
+            .await;
+        }
+
+        dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound", &relayed).await;
+    }
+    tracing::warn!("the inbound event queue closed; the event worker stops");
 }
 
 fn build_slack_inbound_payload_from_parts(
@@ -2688,13 +2794,9 @@ async fn run_outbound_loop(
             .context
             .as_ref()
             .and_then(extract_slack_post_target);
-        // The WF's block: the message's mark, the facts under its text and a menu for people (see
-        // slack_menu).
-        let wf_post = WfPost::read(
-            msg.meta.context.as_ref(),
-            msg.meta.thread_id.as_deref(),
-            thread_records.is_some(),
-        );
+        // The WF's block: the message's mark, the facts under its text and a menu for people, read
+        // only from a WF node (see slack_menu).
+        let wf_post = WfPost::of_message(&msg, thread_records.is_some());
         // A message that ends its subject with nothing to post (no text, no blocks, no files) only
         // closes it: it posts nothing, and no fallback (docs/wf-orchestration-v1.md §5.4.2).
         if wf_post.only_closes(&msg.payload) {
@@ -2873,6 +2975,10 @@ async fn run_outbound_loop(
             }
         }
 
+        // A new post forgets the node's older posts on its thread id, and their open menus close
+        // with them (see thread_records), after the message's posts.
+        close_forgotten_menus(&slack, thread.take_forgotten_menus()).await;
+
         // `end` ends the subject: its open menu closes, after the message's posts.
         if wf_post.subject == Subject::End {
             close_subject_menu(
@@ -3001,6 +3107,13 @@ async fn handle_io_control_plane_message(
 
 fn is_control_plane_msg_type(msg_type: &str) -> bool {
     msg_type.eq_ignore_ascii_case(SYSTEM_KIND) || msg_type.eq_ignore_ascii_case("admin")
+}
+
+/// Whether a message's sender is a WF node, `WF.<name>@<hive>`, by the name its router stamps on
+/// it (`routing.src_l2_name`), which no sender chooses. The node reads a WF's block, and shows a
+/// `NOT_TAKEN`, only from a WF (slack_menu, not_taken).
+fn is_wf_node(src_l2_name: Option<&str>) -> bool {
+    src_l2_name.is_some_and(|name| name.starts_with("WF."))
 }
 
 async fn apply_io_config_set(
@@ -3403,6 +3516,141 @@ fn truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// A fake Slack Web API, for the tests: an HTTP server on the loopback that answers each method
+/// with `{"ok": true}`, or the answer its test gives, and keeps each call, in the order they came.
+/// A client of it (`FakeWebApi::client`) has credentials, and no call of it reaches Slack.
+#[cfg(test)]
+mod fake_web_api {
+    use super::SlackClients;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// The calls so far: each method, and its JSON body.
+    type Calls = Arc<Mutex<Vec<(String, Value)>>>;
+
+    pub(crate) struct FakeWebApi {
+        base: String,
+        calls: Calls,
+    }
+
+    impl FakeWebApi {
+        /// Starts the server: `answers` gives the answer of a method, in place of `{"ok": true}`.
+        pub(crate) async fn start(answers: &[(&str, Value)]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let base = format!("http://{}/api", listener.local_addr().expect("its address"));
+            let answers: Arc<HashMap<String, Value>> = Arc::new(
+                answers
+                    .iter()
+                    .map(|(api, answer)| (api.to_string(), answer.clone()))
+                    .collect(),
+            );
+            let calls = Calls::default();
+            let kept = calls.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(answer(stream, answers.clone(), kept.clone()));
+                }
+            });
+            Self { base, calls }
+        }
+
+        /// A Slack client of this Web API, with credentials, and no proxy between them.
+        pub(crate) async fn client(&self) -> SlackClients {
+            let mut slack = SlackClients::new().expect("client");
+            slack.http = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("http client");
+            slack.web_api = self.base.clone();
+            slack
+                .reload_credentials("test-app-token".to_string(), "test-bot-token".to_string())
+                .await;
+            slack
+        }
+
+        /// The calls so far, each method and its body, in the order they came.
+        pub(crate) fn calls(&self) -> Vec<(String, Value)> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        /// The bodies of the calls to `api` so far.
+        pub(crate) fn bodies(&self, api: &str) -> Vec<Value> {
+            self.calls()
+                .into_iter()
+                .filter(|(called, _)| called == api)
+                .map(|(_, body)| body)
+                .collect()
+        }
+
+        /// The bodies of the calls to `api`, once there are `count` of them, or after 5 seconds: a
+        /// spawned task calls when it calls.
+        pub(crate) async fn wait_for(&self, api: &str, count: usize) -> Vec<Value> {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let bodies = self.bodies(api);
+                if bodies.len() >= count || tokio::time::Instant::now() >= deadline {
+                    return bodies;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Reads one request, keeps its call, answers it, and closes the connection.
+    async fn answer(mut stream: TcpStream, answers: Arc<HashMap<String, Value>>, calls: Calls) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut body_at = None;
+        let mut body_len = 0;
+        while body_at.is_none_or(|at| request.len() < at + body_len) {
+            match stream.read(&mut chunk).await {
+                Ok(read) if read > 0 => request.extend_from_slice(&chunk[..read]),
+                _ => return,
+            }
+            if body_at.is_none() {
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    body_len = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|len| len.trim().parse().ok())
+                        .unwrap_or(0);
+                    body_at = Some(end + 4);
+                }
+            }
+        }
+        let body_at = body_at.unwrap_or(request.len());
+        let head = String::from_utf8_lossy(&request[..body_at]);
+        // The request line: `POST /api/<method> HTTP/1.1`.
+        let api = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|path| path.rsplit('/').next())
+            .unwrap_or_default()
+            .to_string();
+        let body = serde_json::from_slice(&request[body_at..]).unwrap_or(Value::Null);
+        calls.lock().expect("calls").push((api.clone(), body));
+        let answer = answers
+            .get(&api)
+            .cloned()
+            .unwrap_or_else(|| json!({"ok": true}))
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{answer}",
+            answer.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3411,7 +3659,7 @@ mod tests {
         extract_slack_tokens_from_vault_value, is_control_plane_msg_type, parse_retry_after,
         post_ephemeral_body, post_message_body, slack_relay_policy_from_config, slack_vault_key,
         vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState, SocketEnvelope,
-        ENVELOPE_INTERACTIVE,
+        ENVELOPE_EVENTS_API, ENVELOPE_INTERACTIVE,
     };
     use std::time::Duration;
 
@@ -3883,8 +4131,9 @@ mod tests {
         );
     }
 
-    /// A Socket Mode envelope names what it carries: the events the node relays, or a click on a
-    /// menu (`interactive`), which the inbound loop hands to slack_menu.
+    /// A Socket Mode envelope names what it carries: the events the node relays, which the read
+    /// loop hands to the event worker, or a click on a menu (`interactive`), which it hands to
+    /// slack_menu (`hand_off_envelope`).
     #[test]
     fn a_socket_envelope_names_what_it_carries() {
         let interactive: SocketEnvelope = serde_json::from_value(json!({
@@ -3902,7 +4151,7 @@ mod tests {
             "payload": {"type": "event_callback"}
         }))
         .expect("envelope");
-        assert_eq!(event.kind, "events_api");
+        assert_eq!(event.kind, ENVELOPE_EVENTS_API);
         let bare: SocketEnvelope =
             serde_json::from_value(json!({"envelope_id": "e3"})).expect("envelope");
         assert_eq!(bare.kind, "");

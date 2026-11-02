@@ -421,8 +421,8 @@ The known options:
   - Its text is the option's name, then each param as `name: value`, one per line. Forward it to an
     agent to pass it on in the person's own words.
   - Tell a click from a text with `has(event.context.evaluation)`.
-  - A post's buttons stay until a new menu on the conversation or an `end` closes them. A click
-    after that gets "This is no longer open." from io.slack.
+  - A post's buttons stay until a new menu or a new post (`subject: new`) on the conversation, or
+    an `end`, closes them. A click after that gets "This is no longer open." from io.slack.
 - **The answer:**
   - it comes back with the request's `msg`. A forwarded message has none, so match the agent by
     `event_match.src`;

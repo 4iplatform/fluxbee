@@ -25,7 +25,10 @@
 //! - **The open menus** (§5.4.4): the node's post that shows a WF's menu as buttons (slack_menu) is
 //!   recorded with its channel, its `ts`, the Slack thread it is in, its thread id, the menu and the
 //!   post's blocks. A thread id has one open menu per channel: a new one takes the older's place,
-//!   and `end` takes it, each to close the older post.
+//!   and `end` takes it, each to close the older post. A new post that forgets the node's older
+//!   posts takes their open menus too, on a post or in its Slack thread, in the same transaction,
+//!   to close them: a reply under a forgotten post gets its own thread id, so its buttons must not
+//!   still send clicks on the old one.
 //!
 //! So a WF's question, which carries the instance's thread id, is answered on that thread id when a
 //! supervisor replies in the Slack thread of its post. A second question on the thread id, days
@@ -313,17 +316,27 @@ impl SlackThreadRecords {
 
     /// Records the node's own post at the top level, `ts`, as the place it opened for a thread id,
     /// and forgets the older posts it opened for that thread id in the channel, each of which
-    /// served its one message: a late reply under one of them gets its own thread id. Both or
-    /// neither, and says how many it forgot.
+    /// served its one message: a late reply under one of them gets its own thread id. The open
+    /// menus of the posts it forgets, on a post or in its Slack thread, are taken with them, for
+    /// the caller to close: a click on one would still go on the thread id. All or nothing; it says
+    /// how many posts it forgot, and gives their menus.
     fn record_node_post(
         &self,
         thread_id: &str,
         channel_id: &str,
         ts: &str,
         now_ms: u64,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<OpenMenu>)> {
         let mut conn = self.conn();
         let transaction = conn.transaction()?;
+        let menus = Self::take_menus_where(
+            &transaction,
+            "channel_id = ?2 AND EXISTS (SELECT 1 FROM slack_threads AS post \
+             WHERE post.thread_id = ?1 AND post.channel_id = ?2 AND post.opened_by_node = 1 \
+             AND post.thread_ts <> ?3 \
+             AND post.thread_ts IN (slack_menus.ts, slack_menus.thread_ts))",
+            params![thread_id, channel_id, ts],
+        )?;
         let forgotten = transaction.execute(
             "DELETE FROM slack_threads \
              WHERE thread_id = ?1 AND channel_id = ?2 AND opened_by_node = 1 AND thread_ts <> ?3",
@@ -331,7 +344,7 @@ impl SlackThreadRecords {
         )?;
         Self::upsert(&transaction, thread_id, channel_id, ts, true, now_ms)?;
         transaction.commit()?;
-        Ok(forgotten)
+        Ok((forgotten, menus))
     }
 
     /// Records a place under a thread id, opened by the node or by a person. A place has one thread
@@ -430,26 +443,35 @@ impl SlackThreadRecords {
         Ok(taken)
     }
 
-    /// Deletes the menu `condition` finds, if any, and returns it.
+    /// Deletes the menu `condition` finds, if any, and returns it: a condition on a thread id in a
+    /// channel, which has one open menu.
     fn take_menu_where(
         conn: &Connection,
         condition: &str,
         values: impl rusqlite::Params + Copy,
     ) -> Result<Option<OpenMenu>> {
+        Ok(Self::take_menus_where(conn, condition, values)?.pop())
+    }
+
+    /// Deletes the menus `condition` finds, and returns them.
+    fn take_menus_where(
+        conn: &Connection,
+        condition: &str,
+        values: impl rusqlite::Params + Copy,
+    ) -> Result<Vec<OpenMenu>> {
         let found = conn
-            .query_row(
-                &format!("SELECT {MENU_COLUMNS} FROM slack_menus WHERE {condition}"),
-                values,
-                OpenMenu::from_row,
-            )
-            .optional()?;
-        if found.is_some() {
+            .prepare(&format!(
+                "SELECT {MENU_COLUMNS} FROM slack_menus WHERE {condition}"
+            ))?
+            .query_map(values, OpenMenu::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !found.is_empty() {
             conn.execute(
                 &format!("DELETE FROM slack_menus WHERE {condition}"),
                 values,
             )?;
         }
-        found.map(OpenMenu::parsed).transpose()
+        found.into_iter().map(OpenMenu::parsed).collect()
     }
 
     /// Deletes the menus open for [`RECORD_TTL`], and says how many went. Their posts keep their
@@ -614,6 +636,9 @@ pub(crate) struct OutboundThread<'a> {
     /// The thread id a post records its place under; `None` once there is nothing to record.
     record_as: Option<&'a str>,
     place: OutboundPlace,
+    /// The open menus of the node's posts that the message's new post made it forget
+    /// (`SlackThreadRecords::record_node_post`), for the caller to close.
+    forgotten_menus: Vec<OpenMenu>,
 }
 
 impl<'a> OutboundThread<'a> {
@@ -648,6 +673,7 @@ impl<'a> OutboundThread<'a> {
                         channel_id,
                         record_as: None,
                         place,
+                        forgotten_menus: Vec::new(),
                     };
                 }
                 Ok(ThreadPlaces::NodePosts(post_ts)) if subject != Subject::New => {
@@ -667,6 +693,7 @@ impl<'a> OutboundThread<'a> {
                         channel_id,
                         record_as: None,
                         place,
+                        forgotten_menus: Vec::new(),
                     };
                 }
                 Ok(ThreadPlaces::NodePosts(_)) => {
@@ -682,6 +709,7 @@ impl<'a> OutboundThread<'a> {
                         channel_id,
                         record_as: Some(thread_id),
                         place: OutboundPlace::NewPost,
+                        forgotten_menus: Vec::new(),
                     };
                 }
                 Ok(ThreadPlaces::Unrecorded) => {}
@@ -724,6 +752,7 @@ impl<'a> OutboundThread<'a> {
             channel_id,
             record_as,
             place,
+            forgotten_menus: Vec::new(),
         }
     }
 
@@ -740,8 +769,8 @@ impl<'a> OutboundThread<'a> {
     /// A post of the message went out; `ts` is the new Slack message's, when Slack answers one (a
     /// file upload does not). The first post that can records the place for the thread id, and the
     /// message's other posts go there: after a new post, into its thread. A new post is recorded
-    /// as the node's, and the node's older posts on the thread id are forgotten
-    /// (`SlackThreadRecords::record_node_post`).
+    /// as the node's, and the node's older posts on the thread id are forgotten, with their open
+    /// menus (`SlackThreadRecords::record_node_post`, `take_forgotten_menus`).
     pub(crate) fn posted(&mut self, ts: Option<&str>, now_ms: u64) {
         let (Some(records), Some(thread_id)) = (self.records, self.record_as) else {
             return;
@@ -761,10 +790,10 @@ impl<'a> OutboundThread<'a> {
         } else {
             records
                 .record(thread_id, self.channel_id, place, now_ms)
-                .map(|()| 0)
+                .map(|()| (0, Vec::new()))
         };
         match recorded {
-            Ok(forgotten) => {
+            Ok((forgotten, menus)) => {
                 tracing::debug!(
                     channel_id = %self.channel_id,
                     thread_ts = %place,
@@ -777,10 +806,12 @@ impl<'a> OutboundThread<'a> {
                         channel_id = %self.channel_id,
                         thread_id = %thread_id,
                         forgotten,
-                        "the node's older posts on this thread id are forgotten: a late reply \
-                         under one of them gets its own thread id"
+                        menus = menus.len(),
+                        "the node's older posts on this thread id are forgotten, with their open \
+                         menus: a late reply under one of them gets its own thread id"
                     );
                 }
+                self.forgotten_menus.extend(menus);
                 self.place = OutboundPlace::Recorded(thread_ts);
             }
             Err(err) => {
@@ -792,6 +823,13 @@ impl<'a> OutboundThread<'a> {
                 );
             }
         }
+    }
+
+    /// Takes the open menus of the posts the message's new post made the node forget, which the
+    /// caller closes (slack_menu): a click on one would still go on the thread id, while a reply
+    /// under its post gets a thread id of its own.
+    pub(crate) fn take_forgotten_menus(&mut self) -> Vec<OpenMenu> {
+        std::mem::take(&mut self.forgotten_menus)
     }
 }
 
@@ -1692,7 +1730,7 @@ mod tests {
             thread_ts: String::new(),
             thread_id: thread_id.to_string(),
             menu: json!({"options": [{"name": "handback", "description": "Hand it back."}]}),
-            blocks: json!([{"type": "actions", "block_id": "wf_menu", "elements": []}]),
+            blocks: json!([{"type": "actions", "block_id": "fluxbee_wf_menu", "elements": []}]),
         }
     }
 
@@ -1853,5 +1891,83 @@ mod tests {
             .open_menu(&menu(WF_THREAD, "1793000000.001901"), NOW)
             .is_err());
         assert!(records.expire_menus(NOW).is_err());
+    }
+
+    /// A new post forgets the node's older posts on its thread id, and takes their open menus in
+    /// the same transaction, for the caller to close: a menu on a forgotten post, or in its Slack
+    /// thread. Another thread id's menu, and another channel's, stay. When recording the new post
+    /// fails, nothing is forgotten and nothing taken.
+    #[test]
+    fn a_new_post_takes_the_open_menus_of_the_posts_it_forgets() {
+        let records = records();
+        post_at_top_level(&records, WF_THREAD, "1793000000.002000", NOW - DAY_MS);
+        // The subject's menu, on a post in the first post's Slack thread (a `same` with a menu).
+        let mut in_thread = menu(WF_THREAD, "1793000000.002001");
+        in_thread.thread_ts = "1793000000.002000".to_string();
+        records.open_menu(&in_thread, NOW - DAY_MS).expect("open");
+        let other_thread = menu(PERSON_THREAD, "1793000000.002002");
+        records
+            .open_menu(&other_thread, NOW - DAY_MS)
+            .expect("open");
+        let mut other_channel = menu(WF_THREAD, "1793000000.002000");
+        other_channel.channel_id = "C0OTHER".to_string();
+        records
+            .open_menu(&other_channel, NOW - DAY_MS)
+            .expect("open");
+
+        let mut second = resolve(Some(&records), Some(WF_THREAD), None);
+        assert_eq!(second.place, OutboundPlace::NewPost);
+        second.posted(Some("1793000000.002100"), NOW);
+        assert_eq!(second.take_forgotten_menus(), vec![in_thread]);
+        assert!(second.take_forgotten_menus().is_empty());
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.002001")
+                .expect("lookup"),
+            None
+        );
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.002002")
+                .expect("lookup"),
+            Some(other_thread)
+        );
+        assert_eq!(
+            records
+                .menu_of_post("C0OTHER", "1793000000.002000")
+                .expect("lookup"),
+            Some(other_channel)
+        );
+
+        // The second post's own menu, on the post itself.
+        let on_post = menu(WF_THREAD, "1793000000.002100");
+        records.open_menu(&on_post, NOW).expect("open");
+        records
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER record_fails BEFORE INSERT ON slack_threads \
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .expect("trigger");
+        let mut failed = resolve(Some(&records), Some(WF_THREAD), None);
+        failed.posted(Some("1793000000.002200"), NOW + 1);
+        assert!(failed.take_forgotten_menus().is_empty());
+        assert_eq!(
+            records
+                .menu_of_post(CHANNEL, "1793000000.002100")
+                .expect("lookup"),
+            Some(on_post.clone())
+        );
+        records
+            .conn()
+            .execute_batch("DROP TRIGGER record_fails")
+            .expect("drop");
+        let mut third = resolve(Some(&records), Some(WF_THREAD), None);
+        third.posted(Some("1793000000.002300"), NOW + 2);
+        assert_eq!(third.take_forgotten_menus(), vec![on_post]);
+        assert_eq!(
+            rows(&records),
+            vec![node_row(WF_THREAD, "1793000000.002300", NOW + 2, NOW + 2)]
+        );
     }
 }

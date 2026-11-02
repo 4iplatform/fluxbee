@@ -24,8 +24,10 @@ runtime + an instance managed by the orchestrator.
 - Admin API available (`BASE`, for example `http://127.0.0.1:8080`).
 - An active tenant for the binding: an IO.slack node never runs in the root tenant
   (`TENANT_ROOT_NOT_ALLOWED`).
-- For a WF's menu to show as buttons, the Slack app has Interactivity on, under "Interactivity &
-  Shortcuts": over Socket Mode it needs no Request URL ([io-slack](io-slack.md) §3.3).
+- A WF's menu shows as buttons either way; clicks reach the node only when Interactivity is on in
+  the Slack app, under "Interactivity & Shortcuts". Over Socket Mode it needs no Request URL.
+  Without it, a click shows Slack's own error to the person, and no envelope reaches the node
+  ([io-slack](io-slack.md) §3.3).
 - For a new build: `io-slack` buildable and `scripts/publish-io-runtime.sh`, run on the motherbee.
 
 Suggested variables:
