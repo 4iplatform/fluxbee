@@ -22,8 +22,8 @@
   validated on 8.x on 2026-10-30, with the agents' memory of 0.1.93. The operator: *"no tomar otro
   tema hasta terminar este"*.
 - **Case 4 (§5.4)** hands the conversation to a person of the team. It was decided with the
-  operator from 2026-10-31 to 2026-11-02, and released in 0.1.94 the same day; its gate is next.
-  Case 5 (Archi writes and operates WFs) follows.
+  operator from 2026-10-31 to 2026-11-02, released in 0.1.94, and validated on 8.x the same day
+  (§5.4.12; ledger 0.1.94). Case 5 (Archi writes and operates WFs) is next.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -1190,8 +1190,8 @@ security and the docs. Fixed before the release:
 
 ### 5.4 Case 4: handing the conversation to a person of the team. Decided with the operator, 2026-10-31 to 2026-11-02
 
-**Released in 0.1.94 (2026-11-02); its gate is next.** The decisions come from the design chat;
-the build design is §5.4.10, and the review round §5.4.11.
+**Released in 0.1.94 and validated on 8.x on 2026-11-02 (§5.4.12).** The decisions come from the
+design chat; the build design is §5.4.10, the review round §5.4.11, and the gate §5.4.12.
 
 **The circuit** (the chat's example):
 1. **10:00** Ana asks sales for a credit note, which only a person of the team can issue. Sales
@@ -1561,6 +1561,67 @@ logic. Fixed before the release:
     message reaches the person: rare, and the seed teaches the consultation, not every crossing;
   - io.slack's Spanish fallback texts, and a config change that waits on a provisioning, for
     io.slack's revamp.
+
+#### 5.4.12 The gate (0.1.94 on 8.x, 2026-11-02)
+
+Run as §5.4.10 says, on fresh threads (`thread:gate0194-*`), with the operator as the team in the
+test channel; Interactivity was turned on first. All of it passed. The times are from the person's
+side.
+- **The person's side, with no one in Slack:**
+  - **A message with no thread** got `NOT_TAKEN` `no_thread` at once, and started nothing (A-135).
+  - **A stranger on a conversation's thread** got nothing, not even `NOT_TAKEN`: the definition
+    does not involve its sender.
+  - **Case 1, short:** sales' quote in 2.4 s; invoice F-0192-0417 (1,000 USD, due in 2 minutes)
+    4.1 s after "Dale, facturamelo"; invoice answered the thanks; payments' notice came 122.8 s
+    after the invoice. The instance closed after 3 quiet minutes.
+- **The consultation,** with a supervisor's question:
+  1. Sales chose `consult` (20 Pro licenses at 20% off, 1,600 USD a month, for approval), and the
+     person was told that sales would check.
+  2. The operator asked sales in the post's thread "¿Y cuánto le quedaría con 15%?". Sales chose
+     `answer_team`, and its answer was in the same thread 3.2 s later.
+  3. "Aprobado 15%, no 20%." Sales chose `decided`, and the person got the approval 3.2 s later.
+  4. The person asked for the total, and sales answered from its memory: 1,700 USD a month.
+  5. The operator's second message, "Vale solo por esta semana.", came 6.4 s after the first, once
+     the decision was made. Sales took it as a late decision and told the person.
+- **The handover, end to end:**
+  1. Sales chose `handover`. Its summary was posted to the channel as a new post, with the facts
+     line, the menu's help and the Handback button.
+  2. The operator answered as Juan in the post's thread 66 s later; it reached the person and took
+     the case.
+  3. The person's "Gracias! Y cuando me llega?" was posted in that thread.
+  4. The operator clicked Handback and wrote a note (credit note NC-0001, by email in 48 hours).
+     The post lost its button and showed "Closed."; its thread got "Handed back to the agent.".
+  5. Sales told the person from the note. The person asked again, and sales answered from the
+     note in 2.4 s.
+- **"Nobody took it":** 123 s after the post, the post closed with its text, and sales told the
+  person. It happened three times: in its own run, and in the first two runs of "quiet", where no
+  answer reached the case within its 2 minutes.
+- **"Quiet":** the operator answered once. 180 s later the post closed with "The case went quiet;
+  it went back to the agent.", and sales told the person.
+- **"Not taken":**
+  - a message in the closed consultation's thread, and one at the channel's top level, each got
+    "Not taken: no conversation here takes this message", which only the writer sees, at once;
+  - in the second run of "quiet", the operator's answer went to the consultation's thread, which
+    Slack's side panel still had open. It got the same notice at once: §5.4.6's point, in real use.
+- **Not exercised live:**
+  - a click on a closed post ("This is no longer open."): a closed post keeps no button to click.
+    The path is in io.slack's code (slack_menu.rs), with no test of its own;
+  - two supervisors' messages within one evaluation of sales: the example's test covers it, and
+    live the second message came after the decision.
+- **Health:**
+  - `failed=0` and `denials=0` on all 4 hives;
+  - the WF's journal holds only the expected `NOT_TAKEN`s and the stranger;
+  - io.slack and SY.cognition@worker1 logged no warning after the upgrade's restart.
+- **Seen on the way:**
+  - **A-139:** a forwarded answer of sales to a supervisor or to a click reached the person with
+    that team member's `dst_ilk`;
+  - **A-140, for Case 5:**
+    - the example's texts repeat the timers' durations, so with the gate's short timers sales told
+      the person "15 minutos" and "30 minutos";
+    - the handover summary named the person's ILK and the IO node;
+  - **for io.slack's revamp (A-130):**
+    - an empty fact shows as "person:" (the gate's client sends no sender);
+    - Slack's own formatting reaches the person as typed (`_Hola…_`).
 
 ## 6. Docs that drift from the code
 

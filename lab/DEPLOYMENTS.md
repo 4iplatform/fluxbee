@@ -21,7 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory` | ✅ live | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
+| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory` | ✅ live, gate passed | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
 | **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
 | **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
 | **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
@@ -160,7 +160,38 @@
       It was the only agent whose `config.json` named it;
   - the gate's agents and IO.slack.gate0192 run 0.1.94, HEALTHY. io.slack opened its records
     (the open menus' table created in place) and connected Socket Mode.
-- **Gate:** with the operator, in Slack; recorded here when it runs.
+- **Gate,** 2026-11-02 from 15:56 to 17:27 ART, on fresh threads (`thread:gate0194-*`). The
+  operator was the team in the test channel, with Interactivity turned on first. All of it passed
+  (wf-orchestration-v1 §5.4.12):
+  - **The person's side alone:**
+    - a message with no thread got `NOT_TAKEN` `no_thread` at once, and started nothing (A-135);
+    - a stranger on a conversation's thread got nothing;
+    - Case 1, short: the quote in 2.4 s, invoice F-0192-0417 4.1 s after the order, and payments'
+      notice 122.8 s after the invoice.
+  - **The consultation:**
+    1. The operator asked sales in the post's thread; its `answer_team` was in that thread 3.2 s
+       later.
+    2. The decision reached the person 3.2 s after the operator's message, and sales answered
+       the total from memory.
+    3. A second message, after the decision, reached the person as a late decision.
+  - **The handover, end to end:**
+    1. The post carried the facts and the Handback button.
+    2. The operator's answer in its thread reached the person, and the person's reply was posted
+       in that thread.
+    3. The click with a note closed the post. Sales answered the person from the note, twice.
+  - **"Nobody took it"** closed the case at 123 s, three times. **"Quiet"** closed it 180 s after
+    the operator's one answer. In each, the post showed "Closed." with its text, and sales told
+    the person.
+  - **"Not taken":** shown only to the writer, at once, in a closed case's thread and at the
+    channel's top level. It also caught an answer the operator wrote in the wrong thread.
+  - **Not exercised live:**
+    - a click on a closed post, which keeps no button;
+    - two supervisors' messages within one evaluation. The example's test covers it.
+  - **Health:** `failed=0`, `denials=0` on all 4. The WF's journal held only the expected notices;
+    io.slack and cognition logged no warning after the upgrade's restart.
+  - **Seen on the way:** A-139 (a forwarded answer's `dst_ilk`), A-140 (a definition's texts, for
+    Case 5), and two cosmetics for io.slack's revamp (A-130).
+  - **The gate's deployment stays up** for Case 5 (WF.gate0192, its agents, IO.slack.gate0192).
 - **Rollback:**
   - snapshot `pre-wfcase4-0-1-94`;
   - or `apt install fluxbee=0.1.93` plus the core update of the spokes. Then the gate's WF needs

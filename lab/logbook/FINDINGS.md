@@ -1078,6 +1078,48 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-140 🟡 OPEN (found 2026-11-02, WF Case 4's gate; for Case 5) — A definition's texts can say what is no longer true, and the handover summary invites internal ids
+
+- **A text that repeats a timer's duration.** The example's texts to sales say "in 15 minutes" and
+  "for 30 minutes", the values of `team_untaken` and `team_quiet`
+  (go/nodes/wf/examples/packages/wf.sales.invoice). The gate cut the timers to 2 and 3 minutes, and
+  not the texts, so sales told the person "15 minutos" and "30 minutos". A text that repeats a value
+  written elsewhere in the definition goes stale when that value changes.
+- **The handover summary.** The catalog's `summary` asks for "who the person is" (go/pkg/wfcel,
+  `KnownOptions`). With no name in the person's context (the gate's client sends none), sales wrote
+  the person's ILK and the IO node's name in the post for the team: "Cliente (ilk:8fc94fa2…, canal
+  IO.gate0192)".
+- **Fix, with Case 5 (Archi writes WFs):**
+  - a rule in Archi's handbook: a text never repeats a value the definition holds elsewhere;
+  - the example's texts without the durations;
+  - the summary's description: the person by name, with no internal ids. The catalog pins names and
+    params, not descriptions (`TestTheKnownOptionsOnlyGrow`), so it may change.
+
+### A-139 🟡 OPEN (found 2026-11-02, WF Case 4's gate) — A WF's forward of an agent's answer to the person carries the `dst_ilk` of whoever the agent answered
+
+- **What happens:**
+  - `forward` sends the message's meta as it came (go/nodes/wf/wf-generic/node/actions.go,
+    `execForward`; [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2.1, item 5);
+  - an agent's reply goes to whoever spoke (crates/fluxbee_ai_sdk/src/message.rs:
+    `reply.dst_ilk = meta.src_ilk`).
+
+  So when sales answers a supervisor's message (the consultation's `decided`) or a team member's
+  click (the hand-back), the WF forwards that answer to the person's IO node with the supervisor's
+  or the clicker's ILK as `dst_ilk`, not the person's.
+- **Seen in the gate:**
+  - the two `decided` of the consultation, and sales' answer after the hand-back, reached the
+    person's client with the operator's ILK as `dst_ilk`;
+  - the answers to the person's own messages carried the person's.
+- **What it breaks today:** nothing seen.
+  - No IO node delivers by `dst_ilk` (read in nodes/io): io.slack, io.wapp and io.linkedhelper copy
+    it only into their own control answers, and io.linkedhelper sets it on its inbound only.
+  - The WF's leg to an IO node is not copied to cognition: the router copies a delivery to an agent
+    and an agent's own sends (src/router/mod.rs, `deliver_locally`).
+  - It is a wrong fact in the message, and A-138 makes the message's facts the record every node
+    reads.
+- **Fix (to decide):** with A-138. Or a forward to a `start_from` node names the instance's person as
+  `dst_ilk` when it has one.
+
 ### A-138 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
 - **The operator's direction (2026-10-31, put on the table as a topic 2026-11-02):** the facts
@@ -1204,7 +1246,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   0.1.94 a WF names a person only when its `start_from` nodes' messages share one
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.11). The cause stays here.
 
-### A-135 ✅ RESOLVED (0.1.94, WF Case 4; by tests, the gate checks it; found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
+### A-135 ✅ VALIDATED ON 8.x (0.1.94, 2026-11-02; found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
 
 - **What happens:** go/nodes/wf/wf-generic/node/correlate.go, `creationThread`. When a message from
   a `start_from` node has no `meta.thread_id`, it starts an instance whose thread is the instance's
@@ -1231,6 +1273,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   node gets `NOT_TAKEN` `no_thread`; another sender, only for a named request. A creation journaled
   without a thread is dropped at recovery, and answered the same way
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.10, §5.4.11).
+- **Validated on 8.x (2026-11-02):** the gate's message with no thread got `NOT_TAKEN` `no_thread`
+  at once, and started nothing ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
 ### A-134 ✅ VALIDATED ON 8.x (0.1.93, 2026-10-30; found the same day, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
 
@@ -1277,7 +1321,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     own answer, and its package already held that answer;
   - SY.cognition@worker1 took every turn at intake (16), with no drops or errors.
 
-### A-133 ✅ RESOLVED (0.1.94, WF Case 4; found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
+### A-133 ✅ VALIDATED ON 8.x (0.1.94, 2026-11-02; found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
 
 - **What happens:** `runtime.immediate_memory` (off by default) keeps an agent's recent turns per
   sender `src_ilk` (`load_immediate_memory_for_input`, `persist_immediate_turn` in
@@ -1306,6 +1350,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `runtime.immediate_memory` is refused with the reason, on CONFIG_SET and at boot. At the deploy,
   AI.pruebas@worker1 was the one agent whose `config.json` named it, and it got its config again
   without the key (DEPLOYMENTS.md, 0.1.94).
+- **Validated on 8.x (2026-11-02):** in the gate, the agents had only cognition's turns. Sales
+  answered the person from a supervisor's decision and from the team's note
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
 ### A-132 ✅ RESOLVED (0.1.94, WF Case 4; by tests; found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
 
@@ -1382,6 +1429,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   operator's definition). Only one piece goes in Case 4, as part of its marks: a message that ends a
   subject, with nothing to post, closes the menu and posts nothing
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.10).
+- **Seen in WF Case 4's gate (2026-11-02), for the revamp:**
+  - **An empty fact shows as its key alone** ("person:"). A WF's `vars` default to `""` when the
+    person's context has no such field, and the facts line prints every key
+    (slack_menu.rs, `facts_line`). In the gate the client sends no sender; an IO node does.
+  - **Slack's formatting reaches the person as typed.** The operator's message in italics reached
+    the person's IO node as `_Hola, soy Juan…_`: the text goes out in Slack's own markup, which
+    another channel does not read.
 
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 
@@ -1763,7 +1817,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
     SY.admin, naming the path. They covered `meta.type`, `target_ref`, `event_match.type`, a
     `$ref` with another root, and one with an extra key.
 
-### A-116 ✅ RESOLVED (0.1.94, WF Case 4; found 2026-10-27; the conversation and the forwarded person fixed in 0.1.91) — A WF in front of a conversation loses the person and the conversation for the agent
+### A-116 ✅ VALIDATED ON 8.x (0.1.94, 2026-11-02; found 2026-10-27; the conversation and the forwarded person fixed in 0.1.91) — A WF in front of a conversation loses the person and the conversation for the agent
 
 - **What happens** (go/nodes/wf/wf-generic/node/):
   - **What an instance sees** of a message (`messageToMap`, instance.go): `trace_id`, `msg`,
@@ -1804,6 +1858,9 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **Done in 0.1.94:** a message the WF writes carries the instance's person: the `src_ilk` and `ich`
   that its `start_from` nodes' messages share. On a thread several people write on, it carries
   none (the review, §5.4.11; A-136).
+- **Validated on 8.x (2026-11-02):** in the gate, the agents' answers to what the WF wrote itself
+  (payments' `PAYMENT_DUE`, "nobody took it", "quiet") went to the person's ILK
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
 ### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
