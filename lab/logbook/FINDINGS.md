@@ -1078,6 +1078,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-138 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
+
+- **The operator's direction (2026-10-31, put on the table as a topic 2026-11-02):** the facts
+  travel in the message itself: the trace, the nodes it passed through, and the state. Each node
+  then has the history of facts, not only the LLM's text, and decides within its own focus. *"la
+  traza de la conversación en el mensaje creo que es algo que va a ayudar en todo el análisis, no
+  solo para esto"*.
+- **Today, a part of it:**
+  - **The trail** (the operator's idea, decided in docs/wf-orchestration-v1.md §5, built in 0.1.91,
+    §5.2.1 item 7): `meta.context.wf.trail` lists the nodes a message went through.
+    - Only a WF writes it, when it sends or forwards (go/nodes/wf/wf-generic/node/actions.go,
+      `messageTrail`, `withWFBlock`).
+    - It holds names only, inside the WF's own block.
+    - An agent's answer, an IO's message and a message that goes through no WF carry none.
+  - **`routing.trace_id`** is one id, not a path. A WF's sends carry the id of the event they come
+    from (`transitionTraceID`).
+  - **The rest of the trail** is in the logs and in SY.storage's `turns`. No node reads them when it
+    decides.
+- **Its first uses, in WF Case 4:**
+  - the WF's facts: who held the case and when (A-137);
+  - the "same place" / "new subject" mark for io.slack;
+  - the facts of the first post to the team: who the person is, and which channel.
+- **Who it would serve:**
+  - the IO, to place a message;
+  - the agents, to know what happened besides what was said;
+  - cognition, to know which conversation a turn belongs to (A-137);
+  - debugging.
+- **What the topic must answer:**
+  - what the trace holds, and how far back;
+  - who writes each fact (the datum's owner);
+  - how its size is bounded;
+  - how it relates to `trace_id` and to the router stream's log records.
+- **Status:** a topic of its own, after the WF track. Case 4 uses the WF's facts and its own marks,
+  and builds no general trace.
+
 ### A-137 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
@@ -1113,6 +1148,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Today:** cognition analyzes every communication it gets in full, whoever its interlocutors
     are (src/bin/sy_cognition.rs). Its analysis covers contexts, reasons, memories, the episodes
     an affect fires, and the summaries.
+- **The operator's idea for telling them apart (2026-11-02):** a mark in the message, which
+  cognition reads to choose how much to analyze. It is the same pattern as Case 4's "same place" /
+  "new subject" mark: the message carries the fact, and each node decides what to do with it.
+  - **Today:** the router stamps a class on cognition's copy of each turn (`meta.action_class`,
+    src/router/mod.rs `cognition_copy`; crates/fluxbee_sdk/src/policy.rs). It classifies the
+    action, not the conversation: every user turn is `send_message`. Nothing in the message says
+    that every interlocutor is an agent.
+  - **Keep the turns between agents detectable,** even while they are not analyzed. A later
+    analysis of a whole process, a WF's included, could take them: problems between agents,
+    mostly prompt errors, or behavior close to human feeling, which models show more each day. The
+    operator: *"sin dudas es algo al futuro"*.
+  - The operator's doubt: the "soft" analysis, the feeling, does not serve between agents.
 - **What the topic must answer:**
   - who owns a communication with no agent;
   - which hive's cognition keeps it. The A-70 model has no cognition traffic between hives, and in
