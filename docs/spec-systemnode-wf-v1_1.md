@@ -741,7 +741,7 @@ Sends a message on **as it was received** (since 0.1.91): the event's message, o
   "menu": {
     "options": [
       { "name": "issued", "description": "You issued the invoice.", "params": { "invoice_number": { "type": "string" }, "due_in": { "type": "string" } } },
-      { "name": "handback" }
+      { "name": "done" }
     ]
   }
 }
