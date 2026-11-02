@@ -1455,7 +1455,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - or show who uses each asset in `list_agent_assets`, so that the operator sees it before
     deleting.
 
-### A-125 🟡 OPEN (found 2026-10-29, 0.1.91 review) — A WF whose agents keep answering each other runs without end
+### A-125 ✅ RESOLVED (0.1.92, WF Case 3; by tests; found 2026-10-29, the 0.1.91 review) — A WF whose agents keep answering each other runs without end
 
 - **What happens** (go/nodes/wf/wf-generic/node/): nothing bounds how many messages an instance
   sends between two triggers (a person's message, a timer fire). `maxInternalEventsPerEvent` bounds
@@ -1478,6 +1478,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the instance does not fail, so its timers stay.
 
   The option first recorded here failed the instance.
+- **Built in 0.1.92** (`maxAgentCallsPerTrigger`, go/nodes/wf/wf-generic/node), with its tests in
+  catch_test.go. The heading said OPEN until 2026-11-02.
 
 ### A-124 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
 

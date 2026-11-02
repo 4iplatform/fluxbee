@@ -18,9 +18,12 @@
   through Cloud waits.
 - **Case 3 (§5.3)** is the internal consultation: an agent asks a supervisor, and stays the
   person's voice. It was decided with the operator on 2026-10-30, with the menu of options, the
-  catch, the cap on agent calls and the way back through io.slack. Case 4 (handing the
-  conversation to a person of the team) and Case 5 (Archi writes and operates WFs) follow. The
-  operator: *"no tomar otro tema hasta terminar este"*.
+  catch, the cap on agent calls and the way back through io.slack. It was released in 0.1.92 and
+  validated on 8.x on 2026-10-30, with the agents' memory of 0.1.93. The operator: *"no tomar otro
+  tema hasta terminar este"*.
+- **Case 4 (§5.4)** hands the conversation to a person of the team. It was decided with the
+  operator from 2026-10-31 to 2026-11-02, and is being built for 0.1.94. Case 5 (Archi writes and
+  operates WFs) follows.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -301,8 +304,9 @@ This is the single place for the track. The cases are worked here one at a time.
 - **Case 3, the internal consultation (§5.3, decided 2026-10-30).** The agent asks a supervisor
   through the WF, and stays the person's voice. With it come the menu of options, the catch, the
   cap on agent calls (A-125), the way back through io.slack, and Archi's guide.
-- **Case 4, handing the conversation to a person of the team.** The WF bridges the person's IO
-  node and the team's until the conversation comes back. Its open questions are in §5.3.
+- **Case 4, handing the conversation to a person of the team (§5.4, decided 2026-11-02).** The WF
+  bridges the person's IO node and the team's until the conversation comes back. With it come the
+  subject marks, the menu for people, "not taken", and the catalog of known options.
 - **Case 5, Archi writes and operates WFs:**
   - a check before deploy, with `COMPILE_ERROR` back to the designer. Today's `check` is a
     compile, and it stages the definition (FINDINGS A-128);
@@ -1120,21 +1124,26 @@ gofmt, vet and race tests in each module; the doc links. Then one review round, 
   The gate's deployment stays up until the track ends, then one last run from zero (the operator,
   2026-10-30).
 
-#### 5.3.7 Open, for Case 4
+#### 5.3.7 Open, for Case 4 (answered in §5.4)
 
-- How the team member hands the conversation back: a word, a reaction, or an inactivity timer.
-- What the agent knows, when it takes the conversation back, of what was said meanwhile.
-- What the first message to the team's channel carries, so that a person can take over.
+- How the team member hands the conversation back: a button, or an inactivity timer (§5.4.4,
+  §5.4.5).
+- What the agent knows, when it takes the conversation back, of what was said meanwhile: the WF's
+  facts and the team member's note (§5.4.4). The rest is FINDINGS A-137, a topic of its own.
+- What the first message to the team's channel carries, so that a person can take over: the
+  agent's summary and the facts (§5.4.3).
 - **What the gate showed (2026-10-30):**
   - **A supervisor who answers in the channel,** not in the thread of the question, is not heard:
     the reply has the channel's thread id, and the WF drops it. Natural for a person to do: the
-    operator's first answer went to the channel in both runs of the gate.
+    operator's first answer went to the channel in both runs of the gate. Now it gets "not taken"
+    (§5.4.6); placing it is io.slack's, in the IO track (A-136).
   - **A supervisor who asks the agent something** ("between 20% and 15%, which would you give?")
-    gets no answer: the agent may only decide or wait.
+    gets no answer: the agent may only decide or wait. Now it has `answer_team` (§5.4.7).
 - **Which posts io.slack records.** It records the place of each message that reaches it, and of
   each post it makes on a thread it does not know. Its answer at a channel's top level is not
   recorded, so a person who replies in that answer's Slack thread starts a new thread id, and a
-  new instance. Recording every post's `ts` would keep that reply on its conversation.
+  new instance. Recording every post's `ts` would keep that reply on its conversation. Moved to the
+  IO track (A-136).
 
 **Withdrawn:**
 - the routing rules in the agents' roles (Case 1's gate);
@@ -1178,6 +1187,321 @@ security and the docs. Fixed before the release:
   the person's words, the param name rule, one reference per topic.
 - **Recorded for later:** io.slack drops a reply with a file and does not record a post with only
   files (A-130, the IO family's track); the engine's unused `cancelling` status (A-132).
+
+### 5.4 Case 4: handing the conversation to a person of the team. Decided with the operator, 2026-10-31 to 2026-11-02
+
+**Being built, for 0.1.94.** The decisions come from the design chat; the build design is §5.4.10.
+
+**The circuit** (the chat's example):
+1. **10:00** Ana asks sales for a credit note, which only a person of the team can issue. Sales
+   answers with the option `handover`. Its `summary` says what the team needs to know, and its
+   `reply` tells Ana that a person will take over.
+2. The WF forwards the reply to Ana. It posts the summary in the team's channel as a new post, with
+   the case's facts and a "Handback" button.
+3. **10:02** Juan answers in that post's thread, and his message goes to Ana. From then on, Ana's
+   messages go to that thread, and Juan's go to Ana.
+4. **10:16** Juan clicks "Handback" and writes a note in the field Slack opens. The post loses its
+   button and is marked closed. The note goes to sales, with the WF's facts.
+5. **10:17** Ana asks "¿entonces ya está la nota de crédito?", and sales answers from the note.
+
+#### 5.4.1 Decided: the WF regulates, and never owns the conversation
+
+- **The operator's frame:** the WF decides only what its code fixes deterministically. It never
+  writes an LLM's content, and it never owns a conversation or a thread.
+- **So a handover starts** with the agent's menu (`handover`), or with one of the WF's fixed rules:
+  the catch, the cap, a timer.
+- **The facts travel in the message** (the operator, 2026-10-31): the trail, the nodes it went
+  through, and the state. With them, each node decides within its own responsibility, by the
+  principle that the datum's owner decides.
+  - *"mismo caso en donde el agente sabe la decisión y el wf toma la acción con esos datos"*: the
+    WF knows the subject, and io.slack knows the places.
+  - The general trace in the message is a topic of its own (FINDINGS A-138). This case uses the
+    WF's facts and marks.
+
+#### 5.4.2 Decided: the WF marks the subject, and io.slack places the message
+
+- **The WF marks each message to an IO node** with `subject`:
+  - `new`: the message opens a subject;
+  - `same`: it continues the subject of the WF's last message on this conversation to this node;
+  - `end`: it ends that subject.
+- **io.slack places it,** since it owns the places (§5.3.4):
+  - `new`, or no mark: as today. A post the node opens serves one message;
+  - `same`: in the thread of the node's last post on the conversation, so a case keeps one Slack
+    thread;
+  - `end`: where `same` would put it, when it has text. Then io.slack closes the subject's open
+    menu (§5.4.4) and marks its post closed;
+  - a place a person opened takes every message, whatever the mark.
+- **An agent gets no mark,** since it has no places: the language takes `subject` only on a send or a
+  forward to an `IO.*` node.
+
+#### 5.4.3 Decided: the first post to the team
+
+- **Sales' summary, as written:** the `summary` param of its `handover`. The WF writes no text.
+- **The facts, in the action's `vars`:** who the person is and where they write, from the person's
+  IO context, which the WF keeps (`state.io`). io.slack renders a message's `vars` under its text,
+  as one line of facts.
+- **The last turns stay out for now:**
+  - Juan talks with Ana directly, and asks her when something is missing;
+  - cognition's package reaches only `AI.*` nodes;
+  - posting a customer's conversation in a team's channel is an exposure decision of its own.
+
+  If the gate shows that the summary falls short, they come in.
+- **The WF's own messages carry the person** (the rest of A-116): a `send_message` carries the
+  `src_ilk` and `ich` of the message that started the instance. Today it carries none, and the agent
+  logs `missing src_ilk`.
+
+#### 5.4.4 Decided: a menu for people, and the hand-back
+
+- **A menu is the same for an agent and a person.** The WF sends it in its block. An agent answers
+  it with an object; io.slack shows it as buttons.
+- **The hand-back is the known option `handback`** (§5.4.8), with the param `note`. io.slack shows a
+  "Handback" button on the post, and the click opens a Slack field for the note, which is required.
+- **The click comes back to the WF as a fact:** a message on the conversation's thread, from
+  whoever clicked (their ILK), with `meta.context.evaluation` =
+  `{"option": "handback", "params": {"note": "..."}}`.
+  - That is the shape of an agent's answer, so the same guards read both.
+  - Its text is the option's name, then each param as `name: value`, one per line.
+- **The note reaches sales as Juan's message:** the WF forwards the click, so sales' memory has it
+  under Juan.
+- **A hand-back by a timer brings no note:** the WF sends sales a fixed text written in its
+  definition.
+- **The operator:** the buttons are io.slack's presentation. They make the gate easier, but they are
+  not its key.
+
+#### 5.4.5 Decided: two timers, the WF's fixed rules
+
+- **"Nobody took it"** counts from the post, and only a message from the team cancels it. When it
+  fires, the WF closes the post (`end`) and tells sales, which tells the person.
+- **"Quiet"** counts once the case is taken. Each message, the person's or the team's, starts it
+  again. When it fires, the WF closes the post and hands the conversation back to sales.
+- **Each N is the definition's.** The operator: *"las reglas son cosas que se tiene que programar en
+  el wf"*.
+- **The three ends** (the button, nobody took it, quiet) send `end`, and io.slack closes the post. A
+  later click, or a message in the closed thread, gets "not taken" (§5.4.6).
+
+#### 5.4.6 Decided: nothing from an IO ends in silence
+
+- **A message from an IO node the definition involves:**
+  - on a thread with a running instance, when no transition and no catch takes it: the instance's
+    log gets its entry, as today, and the IO node gets "not taken";
+  - on a thread with no instance: when the definition starts from that node, it starts one.
+    Otherwise, "not taken";
+  - with no thread: "not taken", since a WF never makes up a thread (A-135).
+- **"Not taken" is the engine's answer `NOT_TAKEN`,** a system message to the sender, with a reason:
+  `no_conversation`, `not_expected`, `invalid_input` or `no_thread`. It takes `INVALID_INPUT`'s
+  place.
+- **The IO node shows it to whoever wrote, as an error.** io.slack posts a message that only that
+  person sees, where they wrote.
+- **Today's rules stay for everyone else:**
+  - a sender the definition does not involve is dropped, unanswered (A-123);
+  - an agent's late answer starts nothing (A-118);
+  - a WF gets an answer only to a named request (A-119).
+- **Why:** someone who writes is looking for a result. The cause on the Slack side is io.slack's
+  thread model (A-136, the IO track), and the WF is not patched for it.
+
+#### 5.4.7 Decided: a supervisor who asks the agent something
+
+- **Case 3's gate:** a supervisor asked "¿entre 20% y 15%, cuál darías vos?", and sales could only
+  answer `decided` or `wait`.
+- **A third option in the consultation's menu, `answer_team`:** sales' reply is for the team. The WF
+  forwards it to the team's node with `subject: same`, so it lands in the consultation's thread, and
+  the consultation goes on.
+- **No loop:** each round needs a person to write, and the cap bounds the agent calls. The engine
+  does not change for it; the menu is each definition's.
+
+#### 5.4.8 Decided: the catalog of known options
+
+- **The operator's idea:** *"un DEF para todo lo conocido y algo que sea a gusto del usuario"*, a
+  list that grows and makes writing Fluxbee's solutions easier for Archi.
+- **Today:**
+  - ai.generic knows no option, only the menu's contract;
+  - `none` is the only option in code (`wfcel.NoneOption`);
+  - every other option, and what it does, lives in each definition: the menu in the action, the
+    effect in the guards. The Case 1 example already describes `answer` in two ways.
+- **The catalog is declared once, in the definition language** (go/pkg/wfcel), as the agent tools
+  are ([agent-tools-v1](agent-tools-v1.md)):
+  - each known option has its name, its description and its params;
+  - a definition names a known option by its name alone, and the compiler writes its description
+    and params in;
+  - a known name is never redefined, as `none` is not today. A definition's own options (`invoice`)
+    are written whole, as today;
+  - what an option does stays the definition's: the catalog fixes the words, not the flow;
+  - Archi's handbook lists the catalog, and a test keeps the list equal to the declaration;
+  - the WF sends the whole menu, so the agent and the IO node do not change for it.
+- **The first known options:** `answer`, `consult`, `decided` and `wait` (Case 3), then
+  `answer_team`, `handover` and `handback` (this case). The operator's "supervisor" is `handover`,
+  named for what happens, because `consult` also goes to supervisors.
+- **The operator, on how much to build in each case:** *"fluxbee hoy es versión alpha no expuesta a
+  clientes... es mejor romper ahora que dejar para después y no hay backcompatibilidad"*.
+
+#### 5.4.9 Opened by this case, each a topic of its own
+
+- **A-136** (the IO track): io.slack splits one interlocutor's conversation by where they write in
+  Slack.
+- **A-137:** cognition follows only the conversations an agent is in. The question: which
+  conversations it analyzes, and how much, when every interlocutor is an agent. The operator's idea
+  is a mark in the message.
+- **A-138:** the conversation's trace in the message. The operator: *"ya veo la herramienta completa
+  en el mensaje para ver con el trail cómo funcionó o dónde falló"*.
+
+#### 5.4.10 The build design and the gate
+
+Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts between them are exact.
+
+**1. The definition language (go/pkg/wfcel):**
+- **`subject`** is a field of `send_message` and `forward` (`actionFields`): `new`, `same` or `end`,
+  literal, and only with an `IO.*` target. The engine writes it into the WF's block as
+  `meta.context.wf.subject`.
+- **`menu`** goes on a send or a forward to an `AI.*` or an `IO.*` node. A `WF.*` target takes none.
+- **The catalog,** `KnownOptions`, in this order:
+
+  | Name | Description | Params |
+  |---|---|---|
+  | `answer` | Your reply goes to the person. | |
+  | `consult` | A supervisor must approve something before you answer. Your reply tells the person you will check. | `question` (string): What you ask the supervisor, with the data to decide. |
+  | `decided` | The message decides the question: your reply tells the person the decision. | |
+  | `wait` | The message decides nothing yet, such as a remark among supervisors: your reply is empty. | |
+  | `answer_team` | The message asks you something: your reply goes to the team, not to the person. | |
+  | `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: who the person is, what they want, what was done. |
+  | `handback` | Hand the conversation back to the agent. | `note` (string): What the agent must know: what was done and agreed. |
+
+  - **At load,** an option written as `{"name": "<known>"}` alone takes the catalog's description
+    and params, before every other check.
+  - A known name with any other field is refused: "<name> is a known option: write it by its name
+    alone". An unknown name keeps today's rules.
+  - The checks of guards and `$ref`s against the menus see the options as expanded.
+  - **The handbook's table** (docs/archi/handbook_fluxbee.md §4.2.4, between
+    `<!-- known-options:start -->` and `<!-- known-options:end -->`) is rendered from
+    `KnownOptions`, and a test compares the two.
+
+**2. The engine (go/nodes/wf/wf-generic/node):**
+- **`NOT_TAKEN`** takes `INVALID_INPUT`'s place. It is a `system` message to the sender's uuid, with
+  the message's `trace_id` and `thread_id`, and the payload
+  `{"ok": false, "error": "not_taken", "reason": "<reason>", "detail": "<text>"}`.
+  - **To an `IO.*` sender the definition involves,** for any message that is no reply and no
+    notice, named or not:
+    - `no_thread`: a message with no thread (A-135);
+    - `no_conversation`: no running instance holds its thread, and it starts none;
+    - `invalid_input`: it would start one, and `input_schema` refuses it;
+    - `not_expected`: the instance took nothing, neither a transition nor the catch. The
+      instance's log keeps today's `unhandled event` entry.
+  - **To any other sender,** only a named request gets it (`neverAnswered`), for `no_thread` and
+    `invalid_input`, as `INVALID_INPUT` today.
+  - `isReply` takes `NOT_TAKEN` instead of `INVALID_INPUT`, so it never starts an instance and is
+    never answered.
+- **A-135:** a message with no thread starts nothing, and `creationThread` goes. A sender other than
+  an IO node gets a log line only.
+- **The rest of A-116, the instance's person:** the instance keeps the `src_ilk` and `ich` of the
+  message that started it (new store columns `person_ilk` and `person_ich`). A `send_message`
+  carries them as `meta.src_ilk` and `meta.ich`, when they are set.
+- **A-132:** the `cancelling` status goes, from the store's CHECK (migrated), and from instance.go,
+  dispatch.go, correlate.go and recover.go.
+- **The WF's block** gets `subject` when the action has one.
+- **The example** (go/nodes/wf/examples/packages/wf.sales.invoice) writes its known options by name,
+  and adds, on the same supervisors' node (`IO.slack.supervisores@motherbee`):
+  - `answer_team` in the consultation;
+  - `handover` in sales' menus. The handover forwards sales' reply to the person (when it is not
+    empty) and posts the summary with `subject: new`, the person's facts in `vars`, and a menu with
+    `handback`. Then the state `with_team`:
+    - a team message is forwarded to the person. The first one cancels "nobody took it"
+      (`team_untaken`, 15 minutes) and starts "quiet" (`team_quiet`, 30 minutes);
+    - a person's message is kept and forwarded to the team with `subject: same`. Once the case is
+      taken, it starts "quiet" again;
+    - a `handback` click: `end` to the team, and the click forwarded to sales with a menu of
+      `answer`;
+    - either timer: `end` to the team with a fixed text, and a fixed text to sales with a menu of
+      `answer`;
+    - on the way back, the facts in `vars`: how the case came back (`handback`, `untaken` or
+      `quiet`) and since when the team had it;
+    - an agent's late answer is not delivered while the team has the conversation, and a
+      `payment_due` is noted, as in the other states.
+- `shipped_definitions_test.go` and `seed_test.go` keep every definition in the docs and the seeds
+  valid.
+
+**3. ai.generic (nodes/ai/ai-generic): the rest of A-133.** `runtime.immediate_memory` goes from
+ai.generic: its config, its runner and its docs. SY.architect and the frontdesk keep the AI SDK's.
+
+**4. io.slack (nodes/io/io-slack, nodes/io/common):**
+- **The marks** (`meta.context.wf.subject`), in the thread records' outbound resolution:
+  - `same` on a thread id with node posts: the thread of the node's last post, with no new post and
+    nothing forgotten. On an unrecorded thread id: as `new`;
+  - `end`: as `same`, then the subject's open menu is closed;
+  - a place a person opened: unchanged, whatever the mark.
+- **The menu for people** (`meta.context.wf.menu` on an outbound message):
+  - **The post** gets an actions block, one button per option, labeled with its name (`_` as a
+    space, the first letter capitalized). The menu's `help`, when it has one, is a context line
+    above the buttons.
+  - **The records keep each open menu:** its channel, its message's `ts`, its thread id, the menu,
+    and the post's blocks. A thread id has one open menu per channel, and a new one closes the
+    older.
+  - **Closing a menu** is a `chat.update` of its post: the same blocks without the actions, and a
+    context line "Closed.".
+  - **A click** comes as a Socket Mode `interactive` envelope (`block_actions`), acked at once.
+    - An option without params sends the click message at once.
+    - An option with params opens a modal (`views.open`, with the click's `trigger_id`), with one
+      required input per param: a string is multiline text, an integer or a number is a number
+      input, a boolean is a yes/no select, and an enum is a select of its values. Slack checks the
+      inputs. The submission (`view_submission`) is acked at once, checked again against the
+      types, and dropped with a log line when it does not match.
+    - **The click message** goes on the menu's thread id, as the person who clicked (resolved or
+      provisioned as for a message), with `meta.context.evaluation` = `{"option", "params"}` and
+      the text of §5.4.4.
+    - A click on a post with no open menu gets "This is no longer open.", which only the clicker
+      sees, and nothing goes.
+- **"Not taken":** io.slack remembers, for 15 minutes, each message and click it relays: its
+  `trace_id`, its channel, its thread and its Slack user.
+  - A `NOT_TAKEN` with that `trace_id` posts "Not taken: <reason>", which only that user sees,
+    where they wrote.
+  - The reasons' texts: `no_conversation`, "no conversation here takes this message"; `not_expected`,
+    "the conversation does not expect a message from you now"; `invalid_input`, "the message is not
+    valid here"; `no_thread`, "the message has no conversation".
+  - Any other system message stays ignored, as today.
+- **The facts:** a message's `meta.context.wf.vars`, when it is a non-empty object, is a context line
+  under its text: `key: value` pairs, escaped, each value cut at 200 characters, 10 keys at most.
+- **A-130:**
+  - a `thread_broadcast` is relayed as the plain message it is;
+  - the dedup is by message (channel and `ts`), not by event, so a mention that arrives twice goes
+    once;
+  - an outbound message with no text, no blocks and no files is dropped with a log line, instead of
+    the Spanish fallback. One that ends a subject still closes it;
+  - a `file_share` is relayed, with the checks a plain message gets and its files;
+  - a new place's files go under a first text post that names them, and that post's `ts` is
+    recorded.
+- **A-108:** files that io.slack's MIME list refuses are left out, and the text names them. The rest
+  goes.
+- **A-129:** an event or a click for another channel of the node's workspace is handed to the
+  io.slack node bound to that channel.
+  - That node is found in the identity's shared memory, from the binding's ICH (`slack_binding`,
+    `workspace/channel`), which names its owner node.
+  - The event goes as a `SLACK_EVENT` mesh message, which a node takes only from an `IO.slack.*`
+    sender.
+  - When no node binds the channel, a warn line, once per channel and hour.
+  - docs/io/io-slack.md says that one Slack app can serve several io.slack nodes.
+
+**5. Archi (after pieces 1 and 2):**
+- the handbook's §4.2: the catalog, `subject`, the menu for people, "not taken", and the handover
+  pattern;
+- the seeds' `sales.consult`, on the catalog, with `answer_team`;
+- the quickstart's pointers.
+
+**Checks before the review round:** as in Case 3. Rust: fmt, clippy (`-D warnings`) and the
+workspace's tests. Go: gofmt, vet and the race tests of each module. The doc links. Then one review
+round.
+
+**The gate** (0.1.94 on 8.x), on Case 3's deployment, which stays up:
+- **Before it, the operator** turns on Interactivity in the Slack app `fluxbeetest` (A0B291N47KL),
+  under "Interactivity & Shortcuts". Socket Mode needs no Request URL and no new scope.
+- **The person** is the gate's client on the router socket. **The team** is the operator, in the
+  test channel, through IO.slack.gate0192.
+1. Case 1 and the consultation again, short, with a supervisor's question answered by
+   `answer_team`.
+2. The handover end to end: the post with its facts and its button, the operator's answer in the
+   thread, the person's message in it, the hand-back with a note, and sales' next answer from the
+   note.
+3. "Nobody took it" and "quiet", each with a short N.
+4. "Not taken": a message in a closed case's thread, a late click, and a message at the channel's
+   top level.
+5. A-130 in Slack: a reply with "Also send to #channel", and a reply with a file.
 
 ## 6. Docs that drift from the code
 
