@@ -22,8 +22,8 @@
   validated on 8.x on 2026-10-30, with the agents' memory of 0.1.93. The operator: *"no tomar otro
   tema hasta terminar este"*.
 - **Case 4 (§5.4)** hands the conversation to a person of the team. It was decided with the
-  operator from 2026-10-31 to 2026-11-02, and is being built for 0.1.94. Case 5 (Archi writes and
-  operates WFs) follows.
+  operator from 2026-10-31 to 2026-11-02, and released in 0.1.94 the same day; its gate is next.
+  Case 5 (Archi writes and operates WFs) follows.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -1190,7 +1190,8 @@ security and the docs. Fixed before the release:
 
 ### 5.4 Case 4: handing the conversation to a person of the team. Decided with the operator, 2026-10-31 to 2026-11-02
 
-**Being built, for 0.1.94.** The decisions come from the design chat; the build design is §5.4.10.
+**Released in 0.1.94 (2026-11-02); its gate is next.** The decisions come from the design chat;
+the build design is §5.4.10, and the review round §5.4.11.
 
 **The circuit** (the chat's example):
 1. **10:00** Ana asks sales for a credit note, which only a person of the team can issue. Sales

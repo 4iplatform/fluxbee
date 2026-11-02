@@ -1204,7 +1204,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   0.1.94 a WF names a person only when its `start_from` nodes' messages share one
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.11). The cause stays here.
 
-### A-135 🔴 OPEN (found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
+### A-135 ✅ RESOLVED (0.1.94, WF Case 4; by tests, the gate checks it; found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
 
 - **What happens:** go/nodes/wf/wf-generic/node/correlate.go, `creationThread`. When a message from
   a `start_from` node has no `meta.thread_id`, it starts an instance whose thread is the instance's
@@ -1227,6 +1227,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   steps and the traffic's rules, and never owns a conversation.
 - **Fix (proposed):** a message with no thread starts no instance. It is dropped and logged, like
   any other message that starts nothing, and `creationThread` goes. It goes with WF Case 4's build.
+- **Built in 0.1.94:** no instance starts without a thread, and `creationThread` is gone. An IO
+  node gets `NOT_TAKEN` `no_thread`; another sender, only for a named request. A creation journaled
+  without a thread is dropped at recovery, and answered the same way
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.10, §5.4.11).
 
 ### A-134 ✅ VALIDATED ON 8.x (0.1.93, 2026-10-30; found the same day, the 0.1.92 gate) — An AI agent sees no dialogue: cognition's package has labels and late summaries, never the turns
 
@@ -1273,7 +1277,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     own answer, and its package already held that answer;
   - SY.cognition@worker1 took every turn at intake (16), with no drops or errors.
 
-### A-133 🟡 OPEN (found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
+### A-133 ✅ RESOLVED (0.1.94, WF Case 4; found 2026-10-30, WF Case 3's review) — ai.generic's immediate memory is the sender's, not the conversation's
 
 - **What happens:** `runtime.immediate_memory` (off by default) keeps an agent's recent turns per
   sender `src_ilk` (`load_immediate_memory_for_input`, `persist_immediate_turn` in
@@ -1298,8 +1302,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Left:** `runtime.immediate_memory` is still an option of ai.generic, keyed by sender. The
   immediate memory stays for SY.architect; for AI agents, remove it (the operator: no SDK memory for
   them).
+- **Done in 0.1.94:** ai.generic has no immediate memory of its own. A config that names
+  `runtime.immediate_memory` is refused with the reason, on CONFIG_SET and at boot. At the deploy,
+  AI.pruebas@worker1 was the one agent whose `config.json` named it, and it got its config again
+  without the key (DEPLOYMENTS.md, 0.1.94).
 
-### A-132 🟡 OPEN (found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
+### A-132 ✅ RESOLVED (0.1.94, WF Case 4; by tests; found 2026-10-30, reviewing WF Case 3) — The WF engine keeps a `cancelling` status that nothing sets
 
 - **What happens:** go/nodes/wf/wf-generic/node: an instance's status may be `cancelling` in the
   store's CHECK, and the engine reads it in instance.go (a fast path to `cancelled`, the internal
@@ -1311,6 +1319,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   code (recovery, cancellation).
 - **Fix:** remove the status from the engine and the store's CHECK, with its paths. Not done in
   Case 3: it is not the case's code.
+- **Done in 0.1.94:** the status is gone from the engine, and the store's v5 migration rebuilds
+  `wf_instances` without it. A row an older engine left `cancelling` ends `cancelled`. On 8.x the
+  gate's store migrated with no instance running.
 
 ### A-131 ✅ RESOLVED (0.1.92, WF Case 3; by tests) — A fenced answer followed by another fenced block does not parse
 
@@ -1752,7 +1763,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
     SY.admin, naming the path. They covered `meta.type`, `target_ref`, `event_match.type`, a
     `$ref` with another root, and one with an extra key.
 
-### A-116 🟡 OPEN, IN PART (found 2026-10-27; the conversation and the forwarded person fixed in 0.1.91) — A WF in front of a conversation loses the person and the conversation for the agent
+### A-116 ✅ RESOLVED (0.1.94, WF Case 4; found 2026-10-27; the conversation and the forwarded person fixed in 0.1.91) — A WF in front of a conversation loses the person and the conversation for the agent
 
 - **What happens** (go/nodes/wf/wf-generic/node/):
   - **What an instance sees** of a message (`messageToMap`, instance.go): `trace_id`, `msg`,
@@ -1790,6 +1801,9 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **Still open:** a message the WF writes itself (`send_message`) carries no `src_ilk`, so the agent
   logs `missing src_ilk`. In the gate it was payments' `PAYMENT_DUE`. Recorded as left out of Case 1
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2.1).
+- **Done in 0.1.94:** a message the WF writes carries the instance's person: the `src_ilk` and `ich`
+  that its `start_from` nodes' messages share. On a thread several people write on, it carries
+  none (the review, §5.4.11; A-136).
 
 ### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 

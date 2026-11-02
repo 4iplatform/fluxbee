@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ live | snap `pre-cogturns-0-1-93` (all 4 VMs) · `apt install fluxbee=0.1.92` + core-update of the spokes |
+| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory` | ✅ live | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
+| **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
 | **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
 | **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
 | **0.1.90** | 2026-10-29 | `e6b07fc` | motherbee + spokes (core) | ✅ replaced by 0.1.91 | snap `pre-wfcase0-0-1-90` (deleted 2026-10-30) · `apt install fluxbee=0.1.89` + core-update of the spokes |
@@ -102,6 +103,71 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.94 — The WF track, Case 4: handing the conversation to a person of the team; the subject mark, a menu for people, NOT_TAKEN, the catalog of known options (wf-orchestration-v1 §5.4; A-135, A-116, A-132, A-133)
+
+- **Date:** 2026-11-02 (ART) · **Previous version:** 0.1.93 · **Commit:** `9ee729a6`.
+- **Scope:** motherbee and the three spokes (core update). Two steps of its own after the upgrade,
+  as §5.4.10 says: the gate's WF redeployed, and AI.pruebas' config set again.
+- **Design:** decided with the operator from 2026-10-31 to 2026-11-02, in a design chat
+  (wf-orchestration-v1 §5.4.1 to §5.4.9). Built by three agents, with Archi's part mine. One
+  review round, five reviewers (§5.4.11); its fixes went in before the release.
+- **What changed:**
+  - **The WF language** (go/pkg/wfcel):
+    - the catalog of known options, written by name alone: `answer`, `consult`, `decided`,
+      `wait`, `answer_team`, `handover`, `handback` and `done`. The catalog only grows, and a
+      test pins it;
+    - `subject` (`new`, `same`, `end`) on a send to an IO node;
+    - a menu for an IO node's people;
+    - a number out of range is refused by its path.
+
+    SY.wf-rules' apply and rollback now load what they publish.
+  - **The WF engine:**
+    - `NOT_TAKEN` replaces `INVALID_INPUT`, with a reason, so nothing from an IO node ends in
+      silence;
+    - a message with no thread starts nothing (A-135);
+    - a WF's own messages carry the instance's person, and none on a thread several people share
+      (A-116);
+    - the `cancelling` status is gone, and the store is migrated to v5 (A-132);
+    - a timer fire the instance cancelled or moved is dropped.
+  - **ai.generic:** no immediate memory of its own; a config that names it is refused (A-133).
+  - **io.slack:**
+    - the subject marks: a case keeps one Slack thread;
+    - a menu shows as buttons, and an option's params as a modal; a click comes back as a fact;
+    - `NOT_TAKEN` is shown only to whoever wrote;
+    - the WF's facts go as a line under the post;
+    - the read loop only reads, acks and hands off.
+
+    The app needs Interactivity on for clicks.
+  - **Archi:** the handbook's §4.2 (the catalog, `subject`, the menu for people, NOT_TAKEN, the
+    handover pattern), and the seeds' `sales.consult` with `answer_team` (`seed_version` 5).
+- **Checks before the release:** the full local CI, 25 of 25 (Rust fmt, clippy `-D warnings` and
+  tests in both workspaces; Go gofmt, vet and race tests in six modules; the doc links), before
+  and after the review's fixes.
+- **Deploy:**
+  - build of `9ee729a6` in 10 min; publish in 14 s (the repo keeps 0.1.85 to 0.1.94, `dist/`
+    dropped 0.1.93's .deb);
+  - snapshots `pre-wfcase4-0-1-94` on the 4 VMs (`pre-cogturns-0-1-93` was deleted);
+  - 0.1.94 on all 4 in 206 s (core manifest `4e226b2865e206ea`), with health clean:
+    `failed=0`, `denials=0` on all 4, the edge's certificate and io.web as before;
+  - `wf.engine`, `ai.generic` and `io.slack` `current` are 0.1.94 on the motherbee and worker1;
+  - **as expected after the upgrade:**
+    - WF.gate0192@worker1 came up DEGRADED, its 0.1.92 definition refused ("answer is a known
+      option: write it by its name alone"). Redeployed from the new example, cut to the gate's
+      timers: version 2, 12 states, HEALTHY. Its store migrated to v5, with no instance running;
+    - AI.pruebas@worker1 came up FAILED_CONFIG (`runtime.immediate_memory is not accepted`). It
+      got its config of that day without the key, as a replace (`config_version` 5): CONFIGURED.
+      It was the only agent whose `config.json` named it;
+  - the gate's agents and IO.slack.gate0192 run 0.1.94, HEALTHY. io.slack opened its records
+    (the open menus' table created in place) and connected Socket Mode.
+- **Gate:** with the operator, in Slack; recorded here when it runs.
+- **Rollback:**
+  - snapshot `pre-wfcase4-0-1-94`;
+  - or `apt install fluxbee=0.1.93` plus the core update of the spokes. Then the gate's WF needs
+    its 0.1.92 definition again (0.1.94's writes known options by name, which 0.1.93 does not
+    know), and AI.pruebas its earlier config. 0.1.93's engine takes the v5 store as migrated (it
+    checks only `user_version >= 4`); whether it reads the rebuilt table was not checked, so the
+    snapshot is the clean way back.
 
 ## 0.1.93 — Cognition carries each communication's last 20 turns, so an AI agent's next message has the turn before it (A-134)
 
