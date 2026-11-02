@@ -1420,6 +1420,11 @@ Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts betwee
 
 **3. ai.generic (nodes/ai/ai-generic): the rest of A-133.** `runtime.immediate_memory` goes from
 ai.generic: its config, its runner and its docs. SY.architect and the frontdesk keep the AI SDK's.
+- **Built** (`72bc2e62`): a config that still names it is refused with the reason, on CONFIG_SET
+  (`invalid_config`) and at boot (`FAILED_CONFIG`). No shim, as the operator asked.
+- **For the deploy:** every `config.json` a CONFIG_SET wrote before 0.1.94 carries the key, because
+  the node wrote its default there. After the upgrade, each such agent is set again with a
+  CONFIG_SET without it, one by one, and the release's notes list them.
 
 **4. io.slack (nodes/io/io-slack, nodes/io/common):**
 - **The marks** (`meta.context.wf.subject`), in the thread records' outbound resolution:
