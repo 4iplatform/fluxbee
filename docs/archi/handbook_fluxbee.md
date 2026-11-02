@@ -411,6 +411,7 @@ The known options:
 | `answer_team` | The message asks you something: your reply goes to the team, not to the person. | |
 | `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: who the person is, what they want, what was done. |
 | `handback` | Hand the conversation back to the agent. | `note` (string): What the agent must know: what was done and agreed. |
+| `done` | Your part is done: your reply goes to the person, and the conversation goes back to the agent that had it. | |
 <!-- known-options:end -->
 
 - **`none`:** the agent node adds it to every menu, with the param `reason`.

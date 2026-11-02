@@ -124,6 +124,10 @@ func ValueToJSON(val ref.Val) (any, error) {
 	return nil, fmt.Errorf("a %s value cannot be kept as JSON", val.Type().TypeName())
 }
 
+// normalizeNumbers gives value's numbers DecodeJSON's types: an int64 when it is an integer that fits
+// one, otherwise a float64. A number no float64 holds (1e400) is kept as its literal, a string: a
+// node's data is read as it came. A definition with one never gets here, since its load refuses it
+// with its path (fieldErrors).
 func normalizeNumbers(value any) any {
 	switch typed := value.(type) {
 	case json.Number:

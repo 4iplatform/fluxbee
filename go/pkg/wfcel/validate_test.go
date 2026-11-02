@@ -1367,6 +1367,89 @@ func TestASubjectMarksAMessageToAnIONode(t *testing.T) {
 	assertErrorContains(t, err, "states[0].entry_actions[1].subject: is only for an IO node (IO.*) target")
 	_, err = loadChanged(t, `{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer", "subject": "new"}`)
 	assertErrorContains(t, err, "states[0].entry_actions[0].subject: is not a field of keep_message")
+
+	// A menu goes with new or same: an end closes the subject's menu, and io.slack drops one that
+	// comes with it.
+	const menu = ` "menu": {"options": [{"name": "handback"}]},`
+	for _, subject := range []string{SubjectNew, SubjectSame} {
+		if _, err := loadChanged(t, send, send+` "subject": "`+subject+`",`+menu); err != nil {
+			t.Fatalf("a menu with subject %s: %v", subject, err)
+		}
+	}
+	_, err = loadChanged(t, send, send+` "subject": "end",`+menu)
+	assertErrorContains(t, err, "states[0].transitions[1].actions[0].subject: an end closes the subject's menu: a menu goes with new or same")
+}
+
+// The catalog only grows, at its end (wf-orchestration-v1 §5.4.8): every stored definition names
+// its known options by their names alone, and its guards and $refs read their params, so a name, a
+// param's name or a param's type that changed, or an option that went, would break each of them at
+// its next load. This test pins every option as it is, in its place: a new one goes at the end, and
+// a meaning that changes takes a new name.
+func TestTheKnownOptionsOnlyGrow(t *testing.T) {
+	pinned := []struct {
+		name   string
+		params map[string]string
+	}{
+		{"answer", nil},
+		{"consult", map[string]string{"question": "string"}},
+		{"decided", nil},
+		{"wait", nil},
+		{"answer_team", nil},
+		{"handover", map[string]string{"summary": "string"}},
+		{"handback", map[string]string{"note": "string"}},
+		{"done", nil},
+	}
+	if len(KnownOptions) < len(pinned) {
+		t.Fatalf("a known option went: %d in the catalog, %d pinned", len(KnownOptions), len(pinned))
+	}
+	for i, pin := range pinned {
+		option := KnownOptions[i]
+		params := map[string]string{}
+		for name, param := range option.Params {
+			params[name] = param.Type
+		}
+		if option.Name != pin.name || fmt.Sprint(params) != fmt.Sprint(pin.params) {
+			t.Fatalf("KnownOptions[%d] is %s with params %v, pinned %s with %v: a meaning that changes takes a new name, at the catalog's end",
+				i, option.Name, params, pin.name, pin.params)
+		}
+	}
+}
+
+// A number no double holds (1e400) is refused, with its path, wherever the definition has it. Read
+// as a float64 it failed the read of the definition's fields, and the checks of fieldErrors were
+// skipped: a known option written with its own words loaded, and so did a forward with name instead
+// of message. Its value was its literal, a string, which a payload sent where a number was written. A
+// number a double holds loads, however large or small.
+func TestANumberOutOfRangeIsRefusedWithItsPath(t *testing.T) {
+	const payload = `"payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}}`
+	const big = `"payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}, "amount": 1e400}`
+	_, err := loadChanged(t, payload, big)
+	assertErrorContains(t, err, "states[0].transitions[1].actions[0].payload.amount: 1e400 is out of range: a number must fit a double")
+
+	// The field checks run with it.
+	data := strings.Replace(menuWorkflowJSON(), payload, big, 1)
+	data = strings.Replace(data, `{"name": "answer"}`, `{"name": "answer", "description": "You answer."}`, 1)
+	data = strings.Replace(data, `"target": "AI.sales@worker1", "message": "customer"`, `"target": "AI.sales@worker1", "name": "customer"`, 1)
+	_, err = LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "states[0].entry_actions[1].menu.options[0]: answer is a known option: write it by its name alone")
+	assertErrorContains(t, err, "states[0].entry_actions[1].name: is not a field of forward")
+	assertErrorContains(t, err, "states[0].transitions[1].actions[0].payload.amount: 1e400 is out of range")
+
+	for _, c := range []struct{ from, to, want string }{
+		{`"meta": {"msg": "CONSULT"}`, `"meta": {"msg": "CONSULT", "context": {"limits": [1, -1e400]}}`,
+			"states[0].transitions[1].actions[0].meta.context.limits[1]: -1e400 is out of range"},
+		{`"input_schema": {"type": "object"}`, `"input_schema": {"type": "object", "properties": {"n": {"type": "number", "maximum": 2e308}}}`,
+			"input_schema.properties.n.maximum: 2e308 is out of range"},
+		{`{"type": "keep_message", "name": "customer"}`, `{"type": "keep_message", "name": "customer"},
+        {"type": "send_message", "target": "IO.out@motherbee", "meta": {"msg": "N"}, "vars": {"n": {"$ref": "state.m", "default": 1e999}}}`,
+			"states[0].entry_actions[1].vars.n.default: 1e999 is out of range"},
+	} {
+		_, err := loadChanged(t, c.from, c.to)
+		assertErrorContains(t, err, c.want)
+	}
+	if _, err := loadChanged(t, payload, `"payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}, "big": 1.7e308, "tiny": 1e-400, "huge": 123456789012345678901234567890}`); err != nil {
+		t.Fatalf("a number a double holds: %v", err)
+	}
 }
 
 // IsIO is case-insensitive, as IsAgent.

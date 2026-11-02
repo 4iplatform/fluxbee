@@ -31,10 +31,14 @@ func (s *Service) rollbackWorkflow(ctx context.Context, req RollbackRequest) (*R
 	if !workflowNamePattern.MatchString(workflowName) {
 		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
 	}
-	if _, err := s.store.ReadBackupMetadata(workflowName); err != nil {
+	backupMeta, err := s.store.ReadBackupMetadata(workflowName)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, WfRulesError{Code: "NO_BACKUP", Detail: "no backup workflow definition exists"}
 		}
+		return nil, err
+	}
+	if err := s.checkSlotLoads(workflowName, "backup", backupMeta.Version); err != nil {
 		return nil, err
 	}
 	if err := s.store.RotateToRollback(workflowName); err != nil {

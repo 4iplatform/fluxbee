@@ -77,7 +77,10 @@ Nothing is published or deployed.
 
 1. Rotates the slots (apply needs a staged version, else `NOTHING_STAGED`; with an explicit
    `version` it must match the staged one, else `VERSION_MISMATCH`; rollback needs a backup,
-   else `NO_BACKUP`).
+   else `NO_BACKUP`). First it loads the definition it is about to publish, the staged one or the
+   backup, with `wfcel.LoadDefinitionBytes`, as the WF node will: one staged or backed up by an
+   earlier release may no longer load (a known option written whole, say). It is then
+   `COMPILE_ERROR`, naming the path, and nothing rotates or is published.
 2. Publishes the `current` definition as a runtime package (`publishWorkflowPackage`,
    `node/package_publish.go`): it sends `publish_runtime_package` to `SY.admin@motherbee` with
    an inline package and `set_current: true`. The package is:

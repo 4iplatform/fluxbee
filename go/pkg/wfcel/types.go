@@ -133,6 +133,10 @@ const (
 // does stays each definition's: the catalog fixes the words, not the flow. A definition's own options
 // ("invoice") are written whole. The handbook's table is rendered from this declaration, and a test
 // keeps the two equal.
+//
+// The catalog only grows, at its end: every stored definition names its known options and reads
+// their params, so a name, a param's name or a param's type never changes, and none goes (a test
+// pins them). A meaning that changes takes a new name.
 var KnownOptions = []MenuOption{
 	{Name: "answer", Description: "Your reply goes to the person."},
 	{
@@ -153,6 +157,7 @@ var KnownOptions = []MenuOption{
 		Description: "Hand the conversation back to the agent.",
 		Params:      map[string]MenuParam{"note": {Type: "string", Description: "What the agent must know: what was done and agreed."}},
 	},
+	{Name: "done", Description: "Your part is done: your reply goes to the person, and the conversation goes back to the agent that had it."},
 }
 
 // knownOption is the known option named name, a copy the caller may change, and whether there is

@@ -147,9 +147,11 @@ var (
 // type's field: a key no type has is the strict decoder's to report), the fields a menu, its options
 // or their params have that are not theirs, the fields that left the definition language in 0.1.90
 // (wf-orchestration-v1 §5.1) and 0.1.91 (thread_id_ref, §5.2.1), which the strict decoder refuses
-// too, but only as an unknown field, without saying where or why, and the fields written with other
-// capitals (capitalErrors), which the strict decoder takes. A definition that is not JSON is the
-// decoder's to report.
+// too, but only as an unknown field, without saying where or why, the fields written with other
+// capitals (capitalErrors), which the strict decoder takes, and the numbers out of range
+// (numberErrors). It reads numbers as written: read as float64, a number out of range (1e400) failed
+// the whole read, and every check here was skipped. A definition that is not JSON is the decoder's to
+// report.
 func fieldErrors(data []byte) ValidationErrors {
 	type transition struct {
 		EventMatch map[string]any   `json:"event_match"`
@@ -163,7 +165,7 @@ func fieldErrors(data []byte) ValidationErrors {
 		} `json:"states"`
 		Catch []transition `json:"catch"`
 	}
-	if json.Unmarshal(data, &doc) != nil {
+	if decodeNumbersAsWritten(data, &doc) != nil {
 		return nil
 	}
 	known := map[string]bool{}
@@ -235,8 +237,38 @@ func fieldErrors(data []byte) ValidationErrors {
 		checkTransition(fmt.Sprintf("catch[%d]", j), t)
 	}
 	var raw any
-	_ = json.Unmarshal(data, &raw)
-	return append(errs, capitalErrors("", raw, reflect.TypeFor[WorkflowDefinition]())...)
+	_ = decodeNumbersAsWritten(data, &raw)
+	errs = append(errs, capitalErrors("", raw, reflect.TypeFor[WorkflowDefinition]())...)
+	return append(errs, numberErrors("", raw)...)
+}
+
+// decodeNumbersAsWritten decodes data into v with every number as written (json.Number).
+func decodeNumbersAsWritten(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v)
+}
+
+// numberErrors names, by their paths, the numbers of raw, a level of the definition as written,
+// that no double holds (1e400): read as a value, normalizeNumbers would keep one as its literal, a
+// string, and a payload would send "1e400" where its author wrote a number.
+func numberErrors(path string, raw any) ValidationErrors {
+	var errs ValidationErrors
+	switch typed := raw.(type) {
+	case json.Number:
+		if _, err := typed.Float64(); err != nil {
+			errs = append(errs, ValidationError{Path: path, Message: fmt.Sprintf("%s is out of range: a number must fit a double (about 1.8e308 at most)", typed)})
+		}
+	case map[string]any:
+		for _, key := range sortedKeys(typed) {
+			errs = append(errs, numberErrors(fieldPath(path, key), typed[key])...)
+		}
+	case []any:
+		for i, item := range typed {
+			errs = append(errs, numberErrors(fmt.Sprintf("%s[%d]", path, i), item)...)
+		}
+	}
+	return errs
 }
 
 // capitalErrors names, by their paths, the keys of raw, a level of the definition as written, that
@@ -1005,7 +1037,9 @@ func validateMenu(path string, action ActionDefinition) ValidationErrors {
 
 // validateSubject checks the subject of a send_message or a forward (wf-orchestration-v1 §5.4.2):
 // new, same or end, literal (the strict decoder refuses anything but a string), and only to an IO
-// node (IO.*), which places the message by it. An agent has no places, and takes no subject.
+// node (IO.*), which places the message by it. An agent has no places, and takes no subject. An end
+// takes no menu: the IO node closes the subject's menu with it (§5.4.4), and io.slack drops a menu
+// that comes with an end.
 func validateSubject(path string, action ActionDefinition) ValidationErrors {
 	switch {
 	case action.Subject == "":
@@ -1014,6 +1048,8 @@ func validateSubject(path string, action ActionDefinition) ValidationErrors {
 		return ValidationErrors{{Path: path + ".subject", Message: `must be "new", "same" or "end"`}}
 	case !IsIO(action.Target):
 		return ValidationErrors{{Path: path + ".subject", Message: "is only for an IO node (IO.*) target: the IO node places the message by it, and an agent or a WF has no places"}}
+	case action.Subject == SubjectEnd && action.Menu != nil:
+		return ValidationErrors{{Path: path + ".subject", Message: "an end closes the subject's menu: a menu goes with new or same"}}
 	}
 	return nil
 }

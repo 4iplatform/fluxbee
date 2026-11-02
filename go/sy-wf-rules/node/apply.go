@@ -45,6 +45,9 @@ func (s *Service) applyWorkflow(ctx context.Context, req ApplyRequest) (*ApplyRe
 			Detail: fmt.Sprintf("staged version=%d does not match requested version=%d", stagedMeta.Version, req.Version),
 		}
 	}
+	if err := s.checkSlotLoads(workflowName, "staged", stagedMeta.Version); err != nil {
+		return nil, err
+	}
 	if err := s.store.RotateToApply(workflowName); err != nil {
 		return nil, err
 	}

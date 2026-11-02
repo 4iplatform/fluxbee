@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +132,80 @@ func TestAKnownOptionIsStagedByItsNameAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "staged", "definition.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected no staged definition, got err=%v", err)
+	}
+}
+
+// A definition staged or backed up by an earlier release may no longer load: a known option written
+// whole, say, refused since Case 4. Apply and rollback load it as the WF node will before they
+// publish it, and answer COMPILE_ERROR with the paths the load names; the slots stay as they were,
+// and nothing is published. Before, the node took it, and failed at its next start.
+func TestApplyAndRollbackPublishNoDefinitionThatNoLongerLoads(t *testing.T) {
+	stale := validWorkflowDefinition()
+	state := stale["states"].([]any)[0].(map[string]any)
+	state["entry_actions"] = append(state["entry_actions"].([]any), map[string]any{
+		"type": "send_message", "target": "AI.billing@motherbee", "meta": map[string]any{"msg": "ASK"},
+		"menu":    map[string]any{"options": []any{map[string]any{"name": "answer", "description": "You answer."}}},
+		"payload": map[string]any{"text": "ready?"},
+	})
+	staleBytes, err := normalizeDefinitionBytes(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const why = "states[0].entry_actions[1].menu.options[0]: answer is a known option: write it by its name alone"
+	svc := newTestService(t)
+	admin := svc.admin.(*fakeAdminClient)
+	slotBecomesStale := func(slot string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(svc.store.Root(), "invoice", slot, "definition.json"), staleBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	compileAndApply := func() {
+		t.Helper()
+		if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := func() uint64 {
+		t.Helper()
+		meta, err := svc.store.ReadCurrentMetadata("invoice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return meta.Version
+	}
+
+	// Apply: version 2 is staged, and its definition no longer loads.
+	compileAndApply()
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatal(err)
+	}
+	slotBecomesStale("staged")
+	published := admin.publishCalls
+	_, err = svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"})
+	assertCompileError := func(err error, slot string, version uint64) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), fmt.Sprintf("the %s definition (version %d) no longer loads", slot, version)) ||
+			!strings.Contains(err.Error(), why) {
+			t.Fatalf("expected COMPILE_ERROR for the %s definition, got %v", slot, err)
+		}
+	}
+	assertCompileError(err, "staged", 2)
+	if _, err := svc.store.ReadStagedMetadata("invoice"); err != nil || current() != 1 || admin.publishCalls != published {
+		t.Fatalf("an apply that fails changes nothing: staged %v, current %d, %d publishes", err, current(), admin.publishCalls-published)
+	}
+
+	// Rollback: version 3 is applied over version 1, whose backed-up definition no longer loads.
+	compileAndApply()
+	slotBecomesStale("backup")
+	published = admin.publishCalls
+	_, err = svc.RollbackWorkflow(RollbackRequest{WorkflowName: "invoice"})
+	assertCompileError(err, "backup", 1)
+	if _, err := svc.store.ReadBackupMetadata("invoice"); err != nil || current() != 3 || admin.publishCalls != published {
+		t.Fatalf("a rollback that fails changes nothing: backup %v, current %d, %d publishes", err, current(), admin.publishCalls-published)
 	}
 }
 

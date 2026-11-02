@@ -457,7 +457,7 @@ If any check fails, the definition is NOT staged. The response includes the erro
 
 ## 7. Apply and node lifecycle coordination
 
-When a definition is applied (compile_apply or apply operations):
+When a definition is applied (compile_apply or apply operations), SY.wf-rules first loads the staged definition (on a rollback, the backup) as the WF node will (§6): one staged or backed up by an earlier release may no longer load. If it does not, it answers `COMPILE_ERROR` with the path to the failing element, and changes nothing. Then:
 
 1. Rotate sy.wf-rules state directories: `current/ → backup/`, `staged/ → current/`.
 2. Determine the target workflow runtime name: `wf.<workflow_name>`.

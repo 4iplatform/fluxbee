@@ -50,6 +50,22 @@ func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) 
 	return &meta, nil
 }
 
+// checkSlotLoads loads the definition of a slot as the WF node will, before an apply publishes the
+// staged one or a rollback the backup: one staged or backed up by an earlier release may no longer
+// load (a known option written whole, say), and published, it left the node FAILED_CONFIG at its
+// next start. A definition that does not load is a COMPILE_ERROR, with the paths the load names, and
+// the slots stay as they were.
+func (s *Service) checkSlotLoads(workflowName, slot string, version uint64) error {
+	definitionBytes, err := s.store.ReadDefinitionBytes(workflowName, slot)
+	if err != nil {
+		return err
+	}
+	if _, err := wfcel.LoadDefinitionBytes(definitionBytes, "", s.clock); err != nil {
+		return WfRulesError{Code: "COMPILE_ERROR", Detail: fmt.Sprintf("the %s definition (version %d) no longer loads: %v", slot, version, err)}
+	}
+	return nil
+}
+
 // decodeCompileRequest decodes a compile request with its definition's numbers as written
 // (json.Number), so they are staged as written: decoded as float64, 1.0 was staged as 1, an integer
 // to the engine, and an integer past 2^53 lost its last digits.
