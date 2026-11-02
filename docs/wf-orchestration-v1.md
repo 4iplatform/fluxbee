@@ -1330,7 +1330,8 @@ security and the docs. Fixed before the release:
   - the WF sends the whole menu, so the agent and the IO node do not change for it.
 - **The first known options:** `answer`, `consult`, `decided` and `wait` (Case 3), then
   `answer_team`, `handover` and `handback` (this case). The operator's "supervisor" is `handover`,
-  named for what happens, because `consult` also goes to supervisors.
+  named for what happens, because `consult` also goes to supervisors. The review added `done`, an
+  agent's hand-back with no note (§5.4.11).
 - **The operator, on how much to build in each case:** *"fluxbee hoy es versión alpha no expuesta a
   clientes... es mejor romper ahora que dejar para después y no hay backcompatibilidad"*.
 
@@ -1364,6 +1365,7 @@ Read in the code on 2026-11-02, at `3d9325b4`. Five pieces; the contracts betwee
   | `answer_team` | The message asks you something: your reply goes to the team, not to the person. | |
   | `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: who the person is, what they want, what was done. |
   | `handback` | Hand the conversation back to the agent. | `note` (string): What the agent must know: what was done and agreed. |
+  | `done` | Your part is done: your reply goes to the person, and the conversation goes back to the agent that had it. | |
 
   - **At load,** an option written as `{"name": "<known>"}` alone takes the catalog's description
     and params, before every other check.
@@ -1486,19 +1488,78 @@ ai.generic: its config, its runner and its docs. SY.architect and the frontdesk 
 workspace's tests. Go: gofmt, vet and the race tests of each module. The doc links. Then one review
 round.
 
+**The deploy's own steps** (the review, §5.4.11):
+- **The gate's WF goes down at the upgrade, until it is redeployed.** Its definition, Case 3's,
+  writes known options whole, which 0.1.94 refuses. So WF.gate0192@worker1 comes up with no
+  definition in use after the core update. It is redeployed from the new example right after.
+  Instances born on the old definition fail at recovery; none should be running.
+- **AI.pruebas@worker1 gets its config again,** without `runtime.immediate_memory` (piece 3). It is
+  the only agent whose `config.json` names it, checked on 2026-11-02.
+- **No rollback across 0.1.94 for these two** without redeploying them on the old version.
+
 **The gate** (0.1.94 on 8.x), on Case 3's deployment, which stays up:
 - **Before it, the operator** turns on Interactivity in the Slack app `fluxbeetest` (A0B291N47KL),
-  under "Interactivity & Shortcuts". Socket Mode needs no Request URL and no new scope.
+  under "Interactivity & Shortcuts". Socket Mode needs no Request URL and no new scope. Without
+  it, the buttons show, but a click shows Slack's own error and never reaches the node.
 - **The person** is the gate's client on the router socket. **The team** is the operator, in the
   test channel, through IO.slack.gate0192.
 1. Case 1 and the consultation again, short, with a supervisor's question answered by
-   `answer_team`.
+   `answer_team`, and two supervisor messages in a row.
 2. The handover end to end: the post with its facts and its button, the operator's answer in the
    thread, the person's message in it, the hand-back with a note, and sales' next answer from the
    note.
 3. "Nobody took it" and "quiet", each with a short N.
-4. "Not taken": a message in a closed case's thread, a late click, and a message at the channel's
-   top level. On the person's side, a message with no thread (A-135).
+4. "Not taken": a message in a closed case's thread, and a message at the channel's top level. A
+   click on a closed post gets io.slack's own "This is no longer open.". On the person's side, a
+   message with no thread (A-135).
+
+#### 5.4.11 The review round (2026-11-02)
+
+Five reviewers, each blind to the others' lens: the engine, the language, io.slack, security, and
+the example with the docs. No high finding in the code; one high in the example, from Case 3's
+logic. Fixed before the release:
+- **The example lost supervisors' messages and dropped the consultation** (the example):
+  - a supervisor's second message, while sales evaluated the first, got "not taken";
+  - the person's message during an evaluation took the instance out of the consultation, its timer
+    cancelled, and the decision then found no conversation.
+
+  The consultation now takes every supervisor's message, and ends only on a decision or on the
+  answer to its own timeout.
+- **A late answer promised what never happened** (the example): a late `consult`, `invoice` or
+  `handover` reached the person with nothing behind it. Each option now acts wherever it arrives;
+  while the team has the conversation, nothing is delivered.
+- **Case 1's invoicing took the team's `handback`,** which needs a note, so a hand-back without one
+  failed (the example). The catalog gained `done`: an agent's part is over, its reply goes to the
+  person, and the conversation goes back.
+- **A timer the WF cancelled or moved could still fire** (the engine, the example). The engine
+  drops a fire the instance no longer has, or has moved, and schedules a moved one again. The
+  example also guards "nobody took it" with `team_taken`.
+- **A WF's own messages carried the first writer's identity on a thread several people share**
+  (security). The instance's person is the one its `start_from` nodes' messages share; with two,
+  it has none. The cause is io.slack's thread model (A-136).
+- **Stale definitions failed only at a node's restart** (the language): SY.wf-rules' apply and
+  rollback now load what they publish. The deploy's steps above cover the gate's WF.
+- **io.slack:**
+  - its read loop handled events inline, so a click could miss its modal's 3 seconds behind a
+    file. The loop now only reads, acks and hands off, and a modal that does not open tells the
+    clicker;
+  - the WF's block and `NOT_TAKEN` were taken from any sender: now only from the WF the message
+    went to;
+  - a new post left the older post's buttons open; the WF's blocks could pass Slack's 50.
+- **Smaller:**
+  - `NOT_TAKEN` after the commit, so a crash sends it once;
+  - a replayed creation that starts nothing is answered;
+  - a number out of range is refused by its path;
+  - `end` takes no menu;
+  - the catalog only grows (a test pins it);
+  - a `none` to a supervisor's message tells nobody;
+  - the docs: only io.slack shows `NOT_TAKEN`, a click is matched by its IO node, the handover
+    pattern in full in Archi's handbook.
+- **Left as they are:**
+  - in the seeds' `sales.consult`, a `none` or an error while sales evaluates a supervisor's
+    message reaches the person: rare, and the seed teaches the consultation, not every crossing;
+  - io.slack's Spanish fallback texts, and a config change that waits on a provisioning, for
+    io.slack's revamp.
 
 ## 6. Docs that drift from the code
 

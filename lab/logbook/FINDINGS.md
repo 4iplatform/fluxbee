@@ -1199,6 +1199,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - when the definition starts conversations from that node, it starts one;
   - otherwise the WF answers "not taken", and the IO node shows that to the writer as an error.
 - **Fix:** the IO family's review (the IO track).
+- **Seen again in WF Case 4's review (2026-11-02):** on a thread several people write on, a WF's own
+  messages carried the first writer's identity, and an agent's per-person tools took it. Since
+  0.1.94 a WF names a person only when its `start_from` nodes' messages share one
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.11). The cause stays here.
 
 ### A-135 🔴 OPEN (found 2026-10-31, the WF Case 4 design chat) — A WF instance started by a message with no thread makes its own id the thread
 

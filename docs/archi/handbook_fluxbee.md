@@ -255,7 +255,8 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
   - A `start_from` node's message on a thread that no instance holds starts a new instance. A
     message with no thread starts nothing: a WF never makes up a thread.
 - **Nothing from an IO node ends in silence.** An IO node's message that nothing takes gets
-  `NOT_TAKEN`, which the IO node shows to whoever wrote, with its reason:
+  `NOT_TAKEN`, with its reason. io.slack shows it to whoever wrote; the other IO nodes ignore it
+  for now. The reasons:
   - `no_conversation`: no instance holds its thread, and it starts none;
   - `no_thread`: it has no thread;
   - `invalid_input`: `input_schema` refuses it;
@@ -318,9 +319,11 @@ Common guards:
   - `target` is a node name written in the definition, never a `SY.*` or `RT.*` node. To choose
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
-  - A message the WF writes carries the instance's person: the `src_ilk` and `ich` of the message
-    that started it. It carries no `io` context: when an agent's answer to it must reach a person,
-    write the person's `io` context, kept in `state` from their message, in `meta.context.io`.
+  - A message the WF writes carries the instance's person: the `src_ilk` and `ich` that the
+    messages of its `start_from` nodes share. On a thread several people write on, it carries
+    none.
+  - It carries no `io` context: when an agent's answer to it must reach a person, write the
+    person's `io` context, kept in `state` from their message, in `meta.context.io`.
 - **`forward`** sends the event's message, or the one kept under `message`, as it was received. Its
   fields are `target`, `message`, `meta.context`, `vars`, `menu` and `subject`.
   - The payload goes byte for byte. The meta goes too, the person's ILK included, but not
@@ -421,7 +424,9 @@ The known options:
     `event.context.evaluation` = `{option, params}`, and no `reply`.
   - Its text is the option's name, then each param as `name: value`, one per line. Forward it to an
     agent to pass it on in the person's own words.
-  - Tell a click from a text with `has(event.context.evaluation)`.
+  - Match a click by its IO node, `event_match.src`, and tell it from a text with
+    `has(event.context.evaluation)`. An agent's answer has an evaluation too, and a known option
+    may be on both menus.
   - A post's buttons stay until a new menu or a new post (`subject: new`) on the conversation, or
     an `end`, closes them. A click after that gets "This is no longer open." from io.slack.
 - **The answer:**
@@ -475,10 +480,10 @@ The known options:
 
 #### 4.2.6 Patterns
 
-- **Keep a conversation bounded:** a handback delivers the agent's answer, then waits for the
+- **Keep a conversation bounded:** an agent's `done` delivers its answer, then waits for the
   person's next message. Never ask an agent again with the same message.
 - **Give control back to the first agent** in two ways, and recommend both: the agent hands back
-  (an option), or an inactivity timer fires.
+  (the known option `done`), or an inactivity timer fires.
 - **A consultation:**
   1. The agent answers `consult`.
   2. The WF forwards the agent's reply to the person, when it is not empty.
@@ -491,19 +496,34 @@ The known options:
      question's thread, and the consultation goes on.
 - **Handing the conversation to a person of the team:**
   1. The agent answers `handover`. The WF forwards its reply to the person, when it is not empty.
-  2. It posts the `summary` param to the team's io.slack with `subject: new`, the person's facts in
-     `vars`, and a menu with `handback`. Then it holds the conversation for the team, with a
-     "nobody took it" timer.
-  3. A team message is forwarded to the person, with the person's `io` context. The first one
-     cancels "nobody took it" and starts a "quiet" timer; each later one starts it again.
-  4. A person's message is kept and forwarded to the team with `subject: same`.
-  5. A `handback` click, or either timer, ends it: `end` to the team, with a fixed text, and the
-     conversation back to the agent. A click is forwarded to the agent, so the note reaches it in
-     the team member's words; on a timer, the WF sends the agent a fixed text. `vars` say how it
-     came back and since when the team had it.
+  2. A state for the team. Its entry actions:
+     - post the `summary` param to the team's io.slack with `subject: new`, a menu with `handback`,
+       and the person's facts in `vars`, each a `$ref` with a default, such as
+       `{"$ref": "state.io.sender.id", "default": ""}` (a missing field fails the instance);
+     - set `team_taken` to `false`, and the time in a variable;
+     - schedule "nobody took it".
 
-  While the team has the conversation, an agent's late answer is not delivered. The example package
-  `wf.sales.invoice` does all of it.
+     Its exit actions cancel both timers.
+  3. A team message, a text (`!has(event.context.evaluation)`) from the team's io.slack, is
+     forwarded to the person, with the person's `io` context written in `meta.context.io`. The
+     first one sets `team_taken`, cancels "nobody took it" and schedules "quiet"; each later one
+     reschedules "quiet".
+  4. A person's message is kept and forwarded to the team with `subject: same`. Once the case is
+     taken, it reschedules "quiet" too.
+  5. A `handback` click from the team's io.slack, or either timer, ends it: `end` to the team, with a
+     fixed text, and the conversation back to the agent. Guard "nobody took it" with
+     `!state.team_taken`, since a fire may cross the first message.
+     - A click is forwarded to the agent with a menu with `answer`, so the note reaches it in the
+       team member's words.
+     - On a timer, the WF sends the agent a fixed text with that menu.
+     - `vars` say how it came back and since when the team had it.
+  6. The agent's answer goes to the person with the person's `io` context, and the agent holds the
+     conversation again.
+
+  While the team has the conversation, an agent's late answer is not delivered: handle the agent's
+  answers in the team's state, so that the catch does not deliver them.
+- **The catalog only grows:** a known option keeps its name and its params. A meaning that changes
+  takes a new name.
 - **Answers in any state:** a person who writes twice gets two answers, and a decision may cross an
   answer to the person. The catch acts on an agent's answers wherever they arrive.
 - **Late events:** handle a message where it can arrive. Use an internal transition when it must not
