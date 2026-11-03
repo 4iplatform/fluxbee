@@ -465,7 +465,9 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
     dispatched as the plan wrote it, with no model (`executor_step_has_nothing_to_fill`, since
     0.1.95). The model could only repeat its args, since a change is refused. Repeating a long one,
     a workflow's definition, outgrew the model's answer at WF Case 5's gate. Its events say "as
-    planned".
+    planned". The dispatch is the one the model's tool makes (`dispatch_internal_admin_command`),
+    so it routes every action the executor may run (0.1.97; 0.1.96's went through
+    `handle_admin_command_with_origin`, which answered `UNKNOWN_ACTION` for the wf-rules ones).
   - **A step with fields to fill** gets an LLM run, whose only tools are that step's action (and
     `get_admin_action_help` if `allow_help_lookup`). The prompt tells it to call the action with
     exactly the step's args (`admin_executor_prompt`). If the model calls no tool, SY.admin runs

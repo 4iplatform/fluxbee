@@ -3194,17 +3194,20 @@ async fn execute_admin_executor_step_fallback(
             );
         }
     };
-    let (_http_status, body) = match handle_admin_command_with_origin(
+    // The same dispatch the model's tool makes (`AdminExecutorStepTool`): every action the
+    // executor may run, the wf-rules ones included, which `handle_admin_command_with_origin`
+    // does not route. Boxed: that dispatch runs the executor itself (`executor_execute_plan`).
+    let internal = match Box::pin(dispatch_internal_admin_command(
         ctx,
         client,
         &step.action,
+        target.as_deref(),
         params,
-        target,
         AdminOrigin::Executor,
-    )
+    ))
     .await
     {
-        Ok(values) => values,
+        Ok(dispatched) => dispatched.envelope,
         Err(err) => {
             let failure = failure_from_detail(err.to_string(), "admin_action_failure");
             return (
@@ -3219,33 +3222,6 @@ async fn execute_admin_executor_step_fallback(
                     tool_name: Some(step.action.clone()),
                     tool_args_preview: Some(step.args.clone()),
                     result_preview: None,
-                    error_code: Some(failure.code.clone()),
-                    error_source: Some(failure.source.clone()),
-                    error_message: Some(failure.detail.clone()),
-                },
-                Some(failure),
-            );
-        }
-    };
-    let internal = match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(envelope) => envelope,
-        Err(err) => {
-            let failure = failure_from_detail(
-                format!("invalid fallback envelope json: {err}"),
-                "validation",
-            );
-            return (
-                AdminExecutorStepEvent {
-                    execution_id: execution_id.to_string(),
-                    step_id: step.id.clone(),
-                    step_index,
-                    step_action: step.action.clone(),
-                    status: "failed".to_string(),
-                    timestamp,
-                    summary: format!("{} -> failed", step.action),
-                    tool_name: Some(step.action.clone()),
-                    tool_args_preview: Some(step.args.clone()),
-                    result_preview: Some(serde_json::json!({ "raw_body": body })),
                     error_code: Some(failure.code.clone()),
                     error_source: Some(failure.source.clone()),
                     error_message: Some(failure.detail.clone()),
@@ -22724,6 +22700,73 @@ mod tests {
                 "{read}"
             );
         }
+    }
+
+    /// The direct dispatch routes every action the executor may run, a workflow's deploy included
+    /// (WF Case 5's gate: it went through `handle_admin_command_with_origin`, which answered
+    /// `UNKNOWN_ACTION` for `wf_rules_compile_apply`). The step reaches SY.wf-rules as the plan
+    /// wrote it, and its answer is the step's result.
+    #[tokio::test]
+    async fn a_fixed_workflow_deploy_step_reaches_wf_rules_as_planned() {
+        let (ctx, mut harness) = opa_test_admin("executor-direct-wf");
+        let step = AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "wf_rules_compile_apply".to_string(),
+            args: json!({
+                "hive": "worker1",
+                "workflow_name": "invoice",
+                "definition": wf_rules_example_definition(),
+                "auto_spawn": true,
+                "tenant_id": "tnt:77f601f7-c045-44dc-bb97-5aab22b067a4",
+            }),
+            executor_fill: None,
+        };
+        let client = Arc::clone(&ctx.rpc);
+        let dispatch = execute_admin_executor_step_fallback(
+            &ctx,
+            &client,
+            "run-1",
+            0,
+            &step,
+            ExecutorDirectDispatch::AsPlanned,
+        );
+        let wf_rules = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the deploy");
+            assert_eq!(sent.meta.msg.as_deref(), Some("CONFIG_SET"));
+            assert_eq!(dst_of(&sent), json!("SY.wf-rules@worker1"));
+            let config = &sent.payload["config"];
+            assert_eq!(config["operation"], json!("compile_apply"));
+            assert_eq!(config["definition"], wf_rules_example_definition());
+            assert_eq!(config["auto_spawn"], json!(true));
+            harness
+                .inject(reply_to(
+                    &sent,
+                    "CONFIG_RESPONSE",
+                    json!({
+                        "ok": true,
+                        "node_name": "SY.wf-rules@worker1",
+                        "state": "configured",
+                        "config_version": 1,
+                        "wf_node": { "node_name": "WF.invoice@worker1", "action": "restarted", "status": "ok" },
+                    }),
+                ))
+                .await
+                .unwrap();
+        };
+        let ((event, failure), ()) = tokio::join!(dispatch, wf_rules);
+        assert!(failure.is_none(), "{failure:?}");
+        assert_eq!(event.status, "done");
+        assert_eq!(event.summary, "wf_rules_compile_apply -> done (as planned)");
+        let answer = event.result_preview.expect("the step's answer");
+        assert_eq!(answer["status"], json!("ok"), "{answer}");
+        assert_eq!(
+            answer["payload"]["wf_node"]["status"],
+            json!("ok"),
+            "{answer}"
+        );
     }
 
     /// A step the plan left nothing to fill is dispatched as planned, without the model; one with
