@@ -1078,6 +1078,26 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-141 🟡 OPEN (found 2026-11-02, sweeping the journals of WF Case 4's gate; with Case 5's bugs) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
+
+- **Seen on 8.x:**
+  - At the 0.1.94 upgrade (2026-11-02, 18:52 UTC), the vault did not answer SY.frontdesk.gov's
+    lookup within 5 s (`vault action timed out`). It booted `Unconfigured`: "LLM path enables on
+    VAULT_SECRET_CHANGED".
+  - It stayed so until its next restart (2026-11-03, 02:58 UTC, the switch of the motherbee's
+    model), which found the key at once.
+- **Why:** its boot lookup is one-shot (`resolve_resource`,
+  nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs).
+  - A-26 made SY.architect, SY.storage and SY.identity wait for the vault at boot
+    (`resolve_resource_awaiting_vault`, `VAULT_BOOT_WAIT`), and SY.cognition waits too. SY.frontdesk.gov
+    was left out.
+  - SY.admin's executor key has the same one-shot read (`build_admin_executor_ai_runtime`,
+    src/bin/sy_admin.rs). This time its boot found the key.
+- **What it breaks:** after an upgrade, frontdesk's conversational path is off, and its
+  deterministic handoff still works. Nobody used it on 8.x meanwhile.
+- **Fix:** both boot reads wait for the vault, as their peers do (A-26). It goes with WF Case 5's
+  bugs ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5).
+
 ### A-140 🟡 OPEN (found 2026-11-02, WF Case 4's gate; for Case 5) — A definition's texts can say what is no longer true, and the handover summary invites internal ids
 
 - **A text that repeats a timer's duration.** The example's texts to sales say "in 15 minutes" and

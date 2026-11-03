@@ -1636,8 +1636,20 @@ side.
     their nodes, debugging them (*"un montón de temas"*).
 - **The topics, outside in.** The operator agreed to all four; each is decided in turn.
   1. **Archi writes a WF** from atomized cases in its handbook (§4.2): one mechanism each, which
-     Archi combines. A-140's rule goes with it: a text never repeats a value the definition holds
-     elsewhere.
+     Archi combines. A-140's rules go with it: a text never repeats a value the definition holds
+     elsewhere, and what goes to the team names the person, with no internal ids.
+     - **Decided (2026-11-02):** one small case per mechanism, each a definition that compiles
+       alone (the docs test compiles every definition in the handbook). The operator: a whole
+       case is never one of the normal patterns. Case 4's handover is not an atom; what is
+       extracted from it is: redirecting the conversation to another agent, escalating, and the
+       like.
+     - **Verified:** the handbook (57 KB) goes whole into the four roles of Archi's pipeline,
+       while of the cookbook only the first 8 entries go, in the file's order
+       (`build_designer_prompt`). The WF example is two seeds of 13 KB, the whole consultation.
+       So the atoms go in the handbook, and the cookbook keeps one small seed.
+     - **Verified:** each of those roles asks for at most 4,096 tokens an answer, thinking
+       included (the AI SDK's default; Archi sets no other), and the SDK gives a call 300 s. The
+       example's definition alone is 13 KB. Case 5 sizes both for a definition Archi writes.
   2. **A check before deploy** that stages nothing (A-128), with `COMPILE_ERROR` back to the
      designer (§4.7).
   3. **Deploying and updating without breaking what runs.** Each instance keeps its definition
@@ -1647,6 +1659,8 @@ side.
 
   The gate's deployment is mine to choose (the operator): Archi deploys a WF, its agents too, or
   io.slack as well.
+- **Archi's model (the operator, 2026-11-02):** Claude Opus 5.5, *"así programa la solución ese
+  modelo"*. Done the same night as a config change of the motherbee (ledger 0.1.94).
 - **The ILKs (A-139), decided 2026-11-02, built with Case 5.** The WF routes, so it owns the fact:
   - everything the WF sends to the person's IO node names the person as its `dst_ilk`;
   - a message the WF writes to an IO node does not name the person as its sender (`src_ilk`,
@@ -1672,6 +1686,8 @@ side.
     (2026-11-02, 18:45 to 20:40 UTC) holds only the upgrade's restarts, and SY.cognition logged no
     warning. Its open point is a mechanism, which conversations it follows (A-137): a topic of its
     own, like the trace (A-138).
+  - **The rest:** SY.frontdesk.gov, and SY.admin's executor, wait for the vault at boot as their
+    peers do (A-141). The upgrade's restart left frontdesk without its AI.
   - **A-140,** the example's texts and the handover summary, goes with topic 1.
   - **Case 5's own:** A-126 and A-127 (Archi and SY.admin around the agents), and A-128.
 - **Next:** topics 1 to 4, one at a time; then the build's design, its review and the gate. A run

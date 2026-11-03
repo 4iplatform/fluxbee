@@ -21,7 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory` | ✅ live, gate passed | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
+| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory`; later the motherbee's AI on `claude-opus-5-5` (Archi) | ✅ live, gate passed | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
 | **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
 | **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
 | **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
@@ -192,6 +192,20 @@
   - **Seen on the way:** A-139 (a forwarded answer's `dst_ilk`), A-140 (a definition's texts, for
     Case 5), and two cosmetics for io.slack's revamp (A-130).
   - **The gate's deployment stays up** for Case 5 (WF.gate0192, its agents, IO.slack.gate0192).
+- **Config, 2026-11-02 at 23:58 ART: the motherbee's AI on Claude Opus 5.5.** The operator: Archi
+  programs Case 5's solution with that model (wf-orchestration-v1 §5.5).
+  - The motherbee's `/etc/fluxbee/hive.yaml` names `claude-opus-5-5` as the anthropic model (backup
+    `hive.yaml.pre-opus-0-1-94`). SY.admin, SY.architect, SY.cognition and SY.frontdesk.gov were
+    restarted: all active.
+  - worker1 keeps `claude-sonnet-5-5`, so the agents and their cognition do not change.
+  - Archi's chat answered on `claude-opus-5-5` in 5 s. The check's session was deleted from its
+    history.
+  - The model is the motherbee's, not Archi's alone. SY.admin's executor and SY.frontdesk.gov use
+    it too. An AI node on the motherbee that names no model would use it, and so would a worker
+    that `add_hive` creates once the orchestrator restarts. SY.cognition@motherbee follows no
+    communication.
+  - SY.frontdesk.gov came up configured. It had booted without its AI at the upgrade (A-141).
+  - **Back:** the backup, and the same four restarts.
 - **Rollback:**
   - snapshot `pre-wfcase4-0-1-94`;
   - or `apt install fluxbee=0.1.93` plus the core update of the spokes. Then the gate's WF needs
