@@ -1759,8 +1759,9 @@ fn build_anthropic_function_messages(
 /// The longest one model call may take: one `generate` or one tool turn, the provider's own retries
 /// included (Anthropic's `send`). Past it the call fails with `AiSdkError::Timeout` and its usage
 /// record says `abandoned`, so a stuck connection costs one bounded call, never a worker. It is
-/// there for stuck connections, not slow answers: an Archi pipeline stage, or a reasoning model
-/// with no `max_output_tokens`, can rightly take minutes.
+/// there for stuck connections, not slow answers: a reasoning model with no `max_output_tokens`
+/// can rightly take minutes. A node whose calls rightly take longer (Archi's pipeline roles) gives
+/// its own limit (`create_function_calling_model_with_call_timeout`); the HTTP client sets none.
 pub const MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Bounds each call of the client it wraps; the factories wrap every client they hand out.
@@ -1770,11 +1771,8 @@ struct WithCallTimeout<C> {
 }
 
 impl<C> WithCallTimeout<C> {
-    fn new(inner: C) -> Self {
-        Self {
-            inner,
-            limit: MODEL_CALL_TIMEOUT,
-        }
+    fn new(inner: C, limit: Duration) -> Self {
+        Self { inner, limit }
     }
 
     async fn bounded<T>(&self, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -1820,14 +1818,14 @@ pub fn create_llm_client(
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(WithCallTimeout::new(client))
+            Arc::new(WithCallTimeout::new(client, MODEL_CALL_TIMEOUT))
         }
         AiProvider::Anthropic => {
             let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(WithCallTimeout::new(client))
+            Arc::new(WithCallTimeout::new(client, MODEL_CALL_TIMEOUT))
         }
     }
 }
@@ -1842,6 +1840,30 @@ pub fn create_function_calling_model(
     model_settings: ModelSettings,
     account: AiAccount,
 ) -> Arc<dyn FunctionCallingModel> {
+    create_function_calling_model_with_call_timeout(
+        provider,
+        api_key,
+        base_url,
+        model,
+        system,
+        model_settings,
+        account,
+        MODEL_CALL_TIMEOUT,
+    )
+}
+
+/// `create_function_calling_model` with each turn bounded by `call_timeout` instead of
+/// `MODEL_CALL_TIMEOUT`, for a node whose calls rightly take longer.
+pub fn create_function_calling_model_with_call_timeout(
+    provider: AiProvider,
+    api_key: impl Into<String>,
+    base_url: Option<String>,
+    model: impl Into<String>,
+    system: Option<String>,
+    model_settings: ModelSettings,
+    account: AiAccount,
+    call_timeout: Duration,
+) -> Arc<dyn FunctionCallingModel> {
     let api_key = api_key.into();
     let model = model.into();
     match provider {
@@ -1850,22 +1872,20 @@ pub fn create_function_calling_model(
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(WithCallTimeout::new(client.function_model(
-                model,
-                system,
-                model_settings,
-            )))
+            Arc::new(WithCallTimeout::new(
+                client.function_model(model, system, model_settings),
+                call_timeout,
+            ))
         }
         AiProvider::Anthropic => {
             let mut client = AnthropicMessagesClient::new(api_key, account);
             if let Some(base_url) = base_url {
                 client = client.with_base_url(base_url);
             }
-            Arc::new(WithCallTimeout::new(client.function_model(
-                model,
-                system,
-                model_settings,
-            )))
+            Arc::new(WithCallTimeout::new(
+                client.function_model(model, system, model_settings),
+                call_timeout,
+            ))
         }
     }
 }
@@ -2668,12 +2688,11 @@ mod tests {
         }
     }
 
+    /// Each call is bounded by the limit its client was made with: `MODEL_CALL_TIMEOUT`, or the one
+    /// a node gives (`create_function_calling_model_with_call_timeout`).
     #[tokio::test]
     async fn a_model_call_past_its_limit_is_a_timeout() {
-        let bounded = |delay| WithCallTimeout {
-            inner: SlowModel(delay),
-            limit: Duration::from_millis(50),
-        };
+        let bounded = |delay| WithCallTimeout::new(SlowModel(delay), Duration::from_millis(50));
         let request = || LlmRequest {
             model: "gpt-5.5".to_string(),
             system: None,

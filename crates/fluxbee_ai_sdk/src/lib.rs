@@ -33,10 +33,11 @@ pub use immediate_memory::{
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
 pub use llm::{
-    build_output_schema_fallback_instruction, create_function_calling_model, create_llm_client,
-    AiProvider, AiProviderConfigs, AiProviderModelConfig, EffectiveAiEngine, HiveAiConfig,
-    LlmClient, LlmRequest, LlmResponse, LlmStreamEvent, MockLlmClient, ModelSettings,
-    OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL, MODEL_CALL_TIMEOUT,
+    build_output_schema_fallback_instruction, create_function_calling_model,
+    create_function_calling_model_with_call_timeout, create_llm_client, AiProvider,
+    AiProviderConfigs, AiProviderModelConfig, EffectiveAiEngine, HiveAiConfig, LlmClient,
+    LlmRequest, LlmResponse, LlmStreamEvent, MockLlmClient, ModelSettings, OutputSchemaSpec,
+    DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL, MODEL_CALL_TIMEOUT,
 };
 pub use message::{
     build_reply_message, build_reply_message_runtime_src,
