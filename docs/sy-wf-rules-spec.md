@@ -260,12 +260,12 @@ A sketch (`...` stands for the parts of the definition):
 }
 ```
 
-**Partial success (apply rotated but node restart failed):**
+**Refused, the node does not run the definition (apply rotated but the node restart failed):**
 ```json
 {
-  "ok": true,
+  "ok": false,
   "node_name": "SY.wf-rules@motherbee",
-  "state": "configured",
+  "state": "error",
   "config_version": 4,
   "effective_config": {
     "current": {
@@ -280,11 +280,15 @@ A sketch (`...` stands for the parts of the definition):
     "action": "restart_failed",
     "error": "restart_node failed after explicit rebind: <detail from orchestrator>"
   },
-  "warning": "Definition applied to current/. WF node failed to restart. Retry apply or rollback."
+  "warning": "Package published and config rebound, but restart of the existing WF node failed.",
+  "error": {
+    "code": "WF_NODE_NOT_DEPLOYED",
+    "detail": "Package published and config rebound, but restart of the existing WF node failed: restart_node failed after explicit rebind: <detail from orchestrator>"
+  }
 }
 ```
 
-Note that `ok: true` in this case reflects that sy.wf-rules successfully persisted the new definition. The node-level failure is reported in `wf_node.action`, not in the top-level error. This distinguishes "sy.wf-rules did its job but the downstream restart failed" from "sy.wf-rules itself failed". The operator typically reacts to `wf_node.action != "restarted"` with a retry or rollback.
+Since 0.1.95 (the review of WF Case 5) a deploy whose WF node does not run the definition is refused, `WF_NODE_NOT_DEPLOYED`: a spawn or a restart that failed, a first deploy without `tenant_id`, a node SY.wf-rules could not query. Before, it answered `ok: true` with the failure only in `wf_node`, and SY.admin's executor and Archi took that for a deploy that ran, with no node running. The refusal still says what is current (`config_version`, `effective_config`: the rotation stands) and what happened to the node (`wf_node`, `warning`); the operator retries the apply or rolls back. A deploy that asked for no node (`auto_spawn` off, and none exists) is no failure: `ok: true`, `wf_node.reason` `auto_spawn disabled`. SY.admin answers the refusal 502.
 
 **Error** (with `evnt.payload.ok == true` as the first guard of the third state; a guard is checked for its syntax and its roots, not for its fields, but for what it reads of an agent's evaluation, which must be an option or a param of one of the definition's menus):
 ```json

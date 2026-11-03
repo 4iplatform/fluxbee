@@ -504,3 +504,43 @@ func TestRestartFailedCurrentAndPackageStillPresent(t *testing.T) {
 		t.Fatalf("dist package flow/definition.json missing after restart_failed: %v", err)
 	}
 }
+
+// A deploy whose WF node does not run its definition is refused, WF_NODE_NOT_DEPLOYED, with what is
+// current and what happened to the node: SY.admin's executor and Archi took the ok it answered before
+// for a deploy that ran (the review of WF Case 5). A node that runs it, or no node asked for, is ok.
+func TestADeployWhoseNodeDoesNotRunItIsRefused(t *testing.T) {
+	svc := newTestService(t)
+	current := WfRulesMetadata{Version: 3, Hash: "sha256:abc", WorkflowName: "invoice"}
+	running := WFNodeActionResult{NodeName: "WF.invoice@motherbee", Action: "restarted", Status: "ok"}
+	if answer := svc.deployAnswer(1, current, running, ""); answer["ok"] != true || answer["error"] != nil {
+		t.Fatalf("a node that runs the definition: %#v", answer)
+	}
+	noneAsked := WFNodeActionResult{NodeName: "WF.invoice@motherbee", Action: "none", Reason: reasonAutoSpawnDisabled}
+	if answer := svc.deployAnswer(1, current, noneAsked, ""); answer["ok"] != true {
+		t.Fatalf("no node asked for: %#v", answer)
+	}
+	for _, c := range []struct {
+		node    WFNodeActionResult
+		warning string
+		detail  string
+	}{
+		{WFNodeActionResult{NodeName: "WF.invoice@motherbee", Action: "restart_failed", Error: "tenant tnt:x not found"},
+			"Package published, but the first deploy spawn failed.",
+			"Package published, but the first deploy spawn failed: tenant tnt:x not found"},
+		{WFNodeActionResult{NodeName: "WF.invoice@motherbee", Action: "none", Reason: "admin client unavailable"},
+			"Package published, but the admin client is unavailable. Deployment did not run.",
+			"Package published, but the admin client is unavailable. Deployment did not run: admin client unavailable"},
+		{WFNodeActionResult{NodeName: "WF.invoice@motherbee", Action: "none", Reason: "node query failed"},
+			"",
+			"the definition is current, and its WF node does not run it: node query failed"},
+	} {
+		answer := svc.deployAnswer(1, current, c.node, c.warning)
+		failure, _ := answer["error"].(map[string]any)
+		if answer["ok"] != false || answer["state"] != "error" || failure["code"] != "WF_NODE_NOT_DEPLOYED" || failure["detail"] != c.detail {
+			t.Fatalf("%s: %#v", c.node.Action, answer)
+		}
+		if answer["config_version"] != uint64(3) || answer["wf_node"] != c.node || answer["effective_config"] == nil {
+			t.Fatalf("the refusal says what is current and what happened to the node: %#v", answer)
+		}
+	}
+}

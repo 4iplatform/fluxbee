@@ -134,8 +134,10 @@ compile and its apply leaves the staged and the current definitions as they were
    - no node and no `auto_spawn`: nothing (`auto_spawn disabled`); no `tenant_id`: nothing,
      with a warning (`tenant_id required for first deploy`).
 
-   The answer carries `wf_node` (`{node_name, action, status, reason, error}`) and a `warning`
-   when the package was published but the node step failed. The rule change stands either way.
+   The answer carries `wf_node` (`{node_name, action, status, reason, error}`), and a `warning`
+   when the package was published but the node step failed. The rule change stands either way,
+   but a node that does not run the definition refuses the deploy, `WF_NODE_NOT_DEPLOYED`, with
+   both (`deployAnswer`, 0.1.95): only `auto_spawn` off, with no node, is no failure.
 
 On a worker the package has to arrive by Syncthing before the node can use it. SY.wf-rules asks
 SY.admin for a `sync_hint` on the motherbee's `fluxbee-dist-runtimes` folder before the node
@@ -275,8 +277,9 @@ SY.wf-rules has no operator config: `CONFIG_SET` carries operations, not setting
   restarts it every 5 s.
 - A package that cannot be published fails the request (`PACKAGE_PUBLISH_FAILED`) after the
   slots already rotated: `current` holds the new version.
-- A node step that fails after publishing returns `status: ok` with `wf_node.action:
-  restart_failed` (or `none`) and a `warning`; re-run apply once the cause is fixed.
+- A node step that fails after publishing refuses the deploy, `WF_NODE_NOT_DEPLOYED` (SY.admin
+  502), with `wf_node.action` `restart_failed` (or `none`), the `warning` and what is current;
+  re-run apply once the cause is fixed.
 - `ORCHESTRATOR_ERROR` when SY.admin or the orchestrator refuses a node query or a delete.
 
 ## Health

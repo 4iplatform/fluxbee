@@ -452,7 +452,9 @@ Expected response (abridged):
 
 `wf_node.action` is `restarted` for a first spawn too; `restart_failed` (with `error`) when the
 node could not be rebound, restarted or spawned, and `none` (with `reason`) when nothing ran
-(`auto_spawn` off, or a first deploy without `tenant_id`).
+(`auto_spawn` off, or a first deploy without `tenant_id`). Any of those but `auto_spawn` off
+refuses the deploy, `502 WF_NODE_NOT_DEPLOYED`, with the same payload: the definition is current,
+and its node does not run it.
 
 ### 2.3 Compile + Apply in a single step
 

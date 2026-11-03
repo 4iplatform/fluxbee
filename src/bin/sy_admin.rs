@@ -10831,7 +10831,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // add_hive could not push the spoke's mesh TLS material (D32); fatal for the join.
         | "TLS_PUSH_FAILED"
         // teardown_node: a store did not do its step; the report says which.
-        | "TEARDOWN_INCOMPLETE" => 502,
+        | "TEARDOWN_INCOMPLETE"
+        // SY.wf-rules made a definition current, and its WF node does not run it: the spawn or
+        // the restart failed (`wf_node` in the payload says which).
+        | "WF_NODE_NOT_DEPLOYED" => 502,
         "SHM_NOT_FOUND"
         | "RUNTIME_MANIFEST_MISSING"
         | "MISSING_WAN_LISTEN"

@@ -377,21 +377,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
 			return
 		}
-		payload := map[string]any{
-			"ok":             true,
-			"node_name":      s.nodeName(),
-			"state":          "configured",
-			"schema_version": req.SchemaVersion,
-			"config_version": result.Current.Version,
-			"effective_config": map[string]any{
-				"current": buildMetadataSnapshot(result.Current),
-			},
-			"wf_node": result.WFNode,
-		}
-		if result.Warning != "" {
-			payload["warning"] = result.Warning
-		}
-		s.sendNodeConfigResponse(msg, payload)
+		s.sendNodeConfigResponse(msg, s.deployAnswer(req.SchemaVersion, result.Current, result.WFNode, result.Warning))
 	case "rollback":
 		var rollbackReq RollbackRequest
 		raw, err := json.Marshal(configMap)
@@ -408,21 +394,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
 			return
 		}
-		payload := map[string]any{
-			"ok":             true,
-			"node_name":      s.nodeName(),
-			"state":          "configured",
-			"schema_version": req.SchemaVersion,
-			"config_version": result.Current.Version,
-			"effective_config": map[string]any{
-				"current": buildMetadataSnapshot(result.Current),
-			},
-			"wf_node": result.WFNode,
-		}
-		if result.Warning != "" {
-			payload["warning"] = result.Warning
-		}
-		s.sendNodeConfigResponse(msg, payload)
+		s.sendNodeConfigResponse(msg, s.deployAnswer(req.SchemaVersion, result.Current, result.WFNode, result.Warning))
 	case "compile_apply":
 		compileReq, err := configCompileRequest(msg)
 		if err != nil {
@@ -445,21 +417,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
 			return
 		}
-		payload := map[string]any{
-			"ok":             true,
-			"node_name":      s.nodeName(),
-			"state":          "configured",
-			"schema_version": req.SchemaVersion,
-			"config_version": result.Current.Version,
-			"effective_config": map[string]any{
-				"current": buildMetadataSnapshot(result.Current),
-			},
-			"wf_node": result.WFNode,
-		}
-		if result.Warning != "" {
-			payload["warning"] = result.Warning
-		}
-		s.sendNodeConfigResponse(msg, payload)
+		s.sendNodeConfigResponse(msg, s.deployAnswer(req.SchemaVersion, result.Current, result.WFNode, result.Warning))
 	default:
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
@@ -578,6 +536,46 @@ func (s *Service) sendReply(
 	if _, err := send(errorPayload(fmt.Errorf("%s not sent: %w", name, err))); err != nil {
 		log.Printf("error %s not sent either (trace_id=%s): %v", name, request.Routing.TraceID, err)
 	}
+}
+
+// deployAnswer answers an apply, a rollback or a compile_apply whose definition is now current. It is
+// ok once the WF node runs it (wf_node's status ok), or when no node was asked for (auto_spawn off,
+// and none exists). Otherwise the deploy is refused, WF_NODE_NOT_DEPLOYED: the answer still says what
+// is current (config_version, effective_config) and what happened to the node (wf_node, warning), so
+// a caller never takes a node that does not run the definition for a deploy that ran.
+func (s *Service) deployAnswer(schemaVersion uint32, current WfRulesMetadata, wfNode WFNodeActionResult, warning string) map[string]any {
+	payload := map[string]any{
+		"ok":             true,
+		"node_name":      s.nodeName(),
+		"state":          "configured",
+		"schema_version": schemaVersion,
+		"config_version": current.Version,
+		"effective_config": map[string]any{
+			"current": buildMetadataSnapshot(current),
+		},
+		"wf_node": wfNode,
+	}
+	if warning != "" {
+		payload["warning"] = warning
+	}
+	if wfNode.Status == "ok" || (wfNode.Action == "none" && wfNode.Reason == reasonAutoSpawnDisabled) {
+		return payload
+	}
+	why := wfNode.Error
+	if why == "" {
+		why = wfNode.Reason
+	}
+	detail := strings.TrimSuffix(warning, ".")
+	switch {
+	case detail == "":
+		detail = "the definition is current, and its WF node does not run it: " + why
+	case why != "":
+		detail += ": " + why
+	}
+	payload["ok"] = false
+	payload["state"] = "error"
+	payload["error"] = map[string]any{"code": "WF_NODE_NOT_DEPLOYED", "detail": detail}
+	return payload
 }
 
 func buildMetadataSnapshot(meta WfRulesMetadata) map[string]any {

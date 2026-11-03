@@ -70,6 +70,10 @@ func untilRuntimeSynced(ctx context.Context, budget time.Duration, call func() e
 	}
 }
 
+// reasonAutoSpawnDisabled is the node step of a deploy that asked for no node, where none exists:
+// the one node step that is not a failure besides a node that runs the definition (deployAnswer).
+const reasonAutoSpawnDisabled = "auto_spawn disabled"
+
 type WFNodeActionResult struct {
 	NodeName string `json:"node_name"`
 	Action   string `json:"action"`
@@ -204,7 +208,7 @@ func (s *Service) deployPublishedWorkflow(ctx context.Context, workflowName stri
 		return WFNodeActionResult{
 			NodeName: nodeName,
 			Action:   "none",
-			Reason:   "auto_spawn disabled",
+			Reason:   reasonAutoSpawnDisabled,
 		}, ""
 	}
 	if tenantID == "" {
