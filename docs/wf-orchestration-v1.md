@@ -1661,6 +1661,18 @@ side.
   io.slack as well.
 - **Archi's model (the operator, 2026-11-02):** Claude Opus 5.5, *"así programa la solución ese
   modelo"*. Done the same night as a config change of the motherbee (ledger 0.1.94).
+  - **Later, Opus for Archi alone** (the operator, 2026-11-03). The build gives Archi a model of
+    its own: a `model` in its own config, set through SY.admin as ai.generic's `behavior.model` is,
+    and the hive's when it has none. The motherbee then goes back to Sonnet 5.5. Until then it
+    stays on Opus, and the operator watches its costs.
+  - **A token of its own needs no code.** A node's key is the one it owns, else one assigned to
+    it, else its tenant's general key (`resolve_resource`, crates/fluxbee_sdk/src/vault.rs).
+    SY.admin's vault put takes `metadata.assigned_nodes`. The operator makes a key for Archi at
+    Anthropic and hands it over by a file's path, and it is loaded assigned to SY.architect.
+  - **The limits go up in the build** (the operator: *"subí límites en costo de tokens"*):
+    - an answer of each of Archi's roles: 4,096 tokens today, thinking included;
+    - a pipeline task's budget: 250,000 tokens today (`TASK_AGENT_TOKEN_BUDGET`);
+    - a call's time: 300 s today (`MODEL_CALL_TIMEOUT`).
 - **The ILKs (A-139), decided 2026-11-02, built with Case 5.** The WF routes, so it owns the fact:
   - everything the WF sends to the person's IO node names the person as its `dst_ilk`;
   - a message the WF writes to an IO node does not name the person as its sender (`src_ilk`,
