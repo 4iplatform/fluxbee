@@ -150,7 +150,7 @@ var KnownOptions = []MenuOption{
 	{
 		Name:        "handover",
 		Description: "A person of the team must take the conversation. Your reply tells the person; the summary goes to the team.",
-		Params:      map[string]MenuParam{"summary": {Type: "string", Description: "What the team needs to take over: who the person is, what they want, what was done."}},
+		Params:      map[string]MenuParam{"summary": {Type: "string", Description: "What the team needs to take over: the person by name, what they want, what was done. No internal ids."}},
 	},
 	{
 		Name:        "handback",

@@ -40,7 +40,8 @@ func lastSent(t *testing.T, disp *mockDispatcher) (sdk.Message, map[string]any) 
 // agentAnswer is an agent's answer to request, as ai-generic builds it: the request's msg (with
 // ".error" for an error, when the request had one) and thread, and the request's context without
 // its thread_id, src_ilk, response_envelope, wf and evaluation (sanitize_reply_context); an answer
-// to a menu carries its evaluation, {reply, option, params}, in meta.context.evaluation.
+// to a menu carries its evaluation, {reply, option, params}, in meta.context.evaluation. It goes to
+// whoever spoke: its dst_ilk is the request's src_ilk (build_reply_meta).
 func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string, evaluation map[string]any) sdk.Message {
 	t.Helper()
 	answerContext := map[string]any{}
@@ -66,7 +67,7 @@ func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string
 	}
 	return from(agent, sdk.Message{
 		Routing: sdk.Routing{Src: "agent-uuid", TraceID: request.Routing.TraceID},
-		Meta:    sdk.Meta{MsgType: "user", Msg: msgName, ThreadID: request.Meta.ThreadID, Context: rawContext},
+		Meta:    sdk.Meta{MsgType: "user", Msg: msgName, DstIlk: request.Meta.SrcIlk, ThreadID: request.Meta.ThreadID, Context: rawContext},
 		Payload: json.RawMessage(payload),
 	})
 }
@@ -305,9 +306,11 @@ const (
 	personILK      = "ilk:00000000-0000-4000-8000-0000000000aa"
 	personICH      = "ich:api:conv-7"
 	// supervisorsIO is the supervisors' Slack channel, and supervisorsIOContext the context.io of a
-	// supervisor's answer there; teamMemberILK is the person of the team who clicks a menu's button.
+	// supervisor's answer there; supervisorILK is the supervisor who writes, and teamMemberILK the
+	// person of the team who clicks a menu's button.
 	supervisorsIO        = "IO.slack.supervisores@motherbee"
 	supervisorsIOContext = `{"io":{"reply_target":{"address":"C0SUPERVISORS","kind":"slack_post","params":{"thread_ts":"1730289000.000100"}}}}`
+	supervisorILK        = "ilk:00000000-0000-4000-8000-0000000000cc"
 	teamMemberILK        = "ilk:00000000-0000-4000-8000-0000000000bb"
 )
 
@@ -372,15 +375,15 @@ func (c *salesConversation) fail(agent string, request sdk.Message) {
 }
 
 // supervisor answers in Slack, in the thread of the WF's post: IO.slack.supervisores gives the answer
-// the thread it recorded for that post, the conversation's (wf-orchestration-v1 §5.3.4), and the
-// context.io of its own channel.
+// the thread it recorded for that post, the conversation's (wf-orchestration-v1 §5.3.4), the
+// supervisor as its src_ilk, and the context.io of its own channel.
 func (c *salesConversation) supervisor(text string) sdk.Message {
 	c.t.Helper()
 	c.turn++
-	thread := salesThread
+	thread, ilk := salesThread, supervisorILK
 	msg := from(supervisorsIO, sdk.Message{
 		Routing: sdk.Routing{Src: "slack-uuid", TraceID: fmt.Sprintf("trace-supervisor-%d", c.turn)},
-		Meta:    sdk.Meta{MsgType: "user", ThreadID: &thread, Context: json.RawMessage(supervisorsIOContext)},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, ThreadID: &thread, Context: json.RawMessage(supervisorsIOContext)},
 		Payload: json.RawMessage(fmt.Sprintf(`{"type":"text","content":%q}`, text)),
 	})
 	c.dispatch(msg)
@@ -552,13 +555,13 @@ func (c *salesConversation) options(msg sdk.Message) string {
 }
 
 // delivered checks the last message the person got: reply, from agent through the WF, with the
-// person's context.io.
+// person's context.io, and the person as its dst_ilk, whoever the agent answered (FINDINGS A-139).
 func (c *salesConversation) delivered(reply, agent string) {
 	c.t.Helper()
 	msg := c.sentTo(salesIO)
 	if string(msg.Payload) != fmt.Sprintf(`{"type":"text","content":%q}`, reply) || c.trail(msg) != "["+agent+" "+salesWFNode+"]" ||
-		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread {
-		c.t.Fatalf("the person gets %q from %s, with its trail and context.io: %s %s", reply, agent, msg.Payload, msg.Meta.Context)
+		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread || derefString(msg.Meta.DstIlk) != personILK {
+		c.t.Fatalf("the person gets %q from %s, with its trail, context.io and dst_ilk: %+v %s %s", reply, agent, msg.Meta, msg.Payload, msg.Meta.Context)
 	}
 }
 
@@ -597,7 +600,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	}
 	// The known options go as the catalog writes them (wf-orchestration-v1 §5.4.8).
 	if menu := fmt.Sprint(wfBlock(t, toSales)["menu"]); !strings.Contains(menu, "map[description:Your reply goes to the person. name:answer]") ||
-		!strings.Contains(menu, "summary:map[description:What the team needs to take over: who the person is, what they want, what was done. type:string]") {
+		!strings.Contains(menu, "summary:map[description:What the team needs to take over: the person by name, what they want, what was done. No internal ids. type:string]") {
 		t.Fatalf("sales' menu: %s", menu)
 	}
 
@@ -828,14 +831,15 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 
 	// 1. The person asks for a discount, and sales consults: its reply goes to the person, and its
 	// question to the supervisors, on the conversation's thread, with no menu and no context but the
-	// WF's block.
+	// WF's block, and no person: the WF wrote it (FINDINGS A-139).
 	c.person("Quiero 10 licencias Pro con 20% de descuento")
 	c.choose(salesAgent, c.sentTo(salesAgent), "Lo consulto con un supervisor y te aviso.", "consult", map[string]any{"question": question})
 	c.delivered("Lo consulto con un supervisor y te aviso.", salesAgent)
 	c.inState("consulting")
 	toSupervisors := c.sentTo(supervisorsIO)
 	if derefString(toSupervisors.Meta.Msg) != "SUPERVISOR_QUESTION" || string(toSupervisors.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, question) ||
-		derefString(toSupervisors.Meta.ThreadID) != salesThread || string(toSupervisors.Meta.Context) != `{"wf":{"trail":["`+salesWFNode+`"]}}` {
+		derefString(toSupervisors.Meta.ThreadID) != salesThread || string(toSupervisors.Meta.Context) != `{"wf":{"trail":["`+salesWFNode+`"]}}` ||
+		toSupervisors.Meta.SrcIlk != nil || toSupervisors.Meta.Ich != nil || toSupervisors.Meta.DstIlk != nil {
 		t.Fatalf("the supervisors get the question: %+v %s %s", toSupervisors.Meta, toSupervisors.Payload, toSupervisors.Meta.Context)
 	}
 	if due, ok := c.pending("consult_timeout"); !ok || !due.Equal(fixedClock().Add(30*time.Minute)) || c.state()["question"] != question || c.state()["waiting_for"] != supervisorsIO {
@@ -866,7 +870,8 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 
 	// 3b. A supervisor asks sales something (Case 4, wf-orchestration-v1 §5.4.7): sales answers the
 	// team (answer_team), and its reply goes to the supervisors, in the question's thread (subject
-	// same); the person gets nothing, and the WF waits for the decision again.
+	// same), as it came: to the supervisor sales answered; the person gets nothing, and the WF waits
+	// for the decision again.
 	questions := c.count(supervisorsIO)
 	c.supervisor("¿Entre 20% y 15%, cuál darías vos?")
 	c.inState("sales_relaying")
@@ -874,26 +879,34 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.inState("consulting")
 	toTeam := c.sentTo(supervisorsIO)
 	if c.count(supervisorsIO) != questions+1 || string(toTeam.Payload) != `{"type":"text","content":"Daría 15%: el cliente compra seguido."}` ||
-		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.trail(toTeam) != "["+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent {
-		t.Fatalf("sales' answer goes to the team, in the question's thread: %s %s", toTeam.Payload, toTeam.Meta.Context)
+		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.trail(toTeam) != "["+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent ||
+		derefString(toTeam.Meta.DstIlk) != supervisorILK {
+		t.Fatalf("sales' answer goes to the team, in the question's thread: %+v %s %s", toTeam.Meta, toTeam.Payload, toTeam.Meta.Context)
 	}
 
-	// 4. A supervisor decides in the thread: the message goes to sales as it came, with the question
-	// and the menu, and the wait's timer goes.
+	// 4. A supervisor decides in the thread: the message goes to sales as it came, the supervisor's
+	// included, with the question and the menu, and the wait's timer goes.
 	answer := c.supervisor("Aprobado hasta 15%.")
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
 	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait answer_team" ||
-		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" {
-		t.Fatalf("sales gets the supervisor's answer: %s %s", toSales.Payload, toSales.Meta.Context)
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" || derefString(toSales.Meta.SrcIlk) != supervisorILK {
+		t.Fatalf("sales gets the supervisor's answer: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
 	if _, ok := c.pending("consult_timeout"); ok {
 		t.Fatalf("the wait's timer goes: %v", c.timer.pending)
 	}
 
 	// 5. Sales tells the person: its decided, to a message from the supervisors' channel, goes to the
-	// person with the person's context.io, and sales holds the conversation.
-	c.choose(salesAgent, toSales, "Te puedo hacer 15% de descuento.", "decided", nil)
+	// person with the person's context.io, and sales holds the conversation. Sales answered the
+	// supervisor, and its answer names the supervisor as its dst_ilk; the WF names the person, whom it
+	// goes to (FINDINGS A-139).
+	decided := agentAnswer(t, salesAgent, toSales, `{"type":"text","content":"Te puedo hacer 15% de descuento."}`,
+		map[string]any{"reply": "Te puedo hacer 15% de descuento.", "option": "decided", "params": map[string]any{}})
+	if derefString(decided.Meta.DstIlk) != supervisorILK {
+		t.Fatalf("sales answers the supervisor: %+v", decided.Meta)
+	}
+	c.dispatch(decided)
 	c.delivered("Te puedo hacer 15% de descuento.", salesAgent)
 	c.inState("sales_listening")
 
@@ -992,7 +1005,8 @@ func TestTheSalesInvoiceExampleCatchesWhatItsStatesDoNot(t *testing.T) {
 // handOver has sales hand the conversation over, answering request: its reply for the person, and
 // the summary for the team. It checks the post the team gets: sales' summary as a new subject, with
 // the person's facts from their context.io and a menu with handback, as the catalog writes it, on
-// the conversation's thread and as the person's message (wf-orchestration-v1 §5.4.3).
+// the conversation's thread (wf-orchestration-v1 §5.4.3). The WF wrote it, so it names no person:
+// no src_ilk, no ich and no dst_ilk (FINDINGS A-139); the person is in the facts (vars).
 func (c *salesConversation) handOver(request sdk.Message, reply, summary string) {
 	c.t.Helper()
 	posts := c.count(supervisorsIO)
@@ -1002,7 +1016,7 @@ func (c *salesConversation) handOver(request sdk.Message, reply, summary string)
 	block := wfBlock(c.t, post)
 	if c.count(supervisorsIO) != posts+1 || derefString(post.Meta.Msg) != "HANDOVER" || string(post.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, summary) ||
 		block["subject"] != "new" || fmt.Sprint(block["vars"]) != "map[channel:api conversation:conv-7 person:ana@acme.example]" || c.options(post) != "handback" ||
-		derefString(post.Meta.ThreadID) != salesThread || derefString(post.Meta.SrcIlk) != personILK || derefString(post.Meta.Ich) != personICH {
+		derefString(post.Meta.ThreadID) != salesThread || post.Meta.SrcIlk != nil || post.Meta.Ich != nil || post.Meta.DstIlk != nil {
 		c.t.Fatalf("the team gets the case: %+v %s %s", post.Meta, post.Payload, post.Meta.Context)
 	}
 	if menu := fmt.Sprint(block["menu"]); !strings.Contains(menu, "note:map[description:What the agent must know: what was done and agreed. type:string]") {
@@ -1013,11 +1027,13 @@ func (c *salesConversation) handOver(request sdk.Message, reply, summary string)
 	}
 }
 
-// ended checks the last message the team got: it ends the case's subject, with text.
+// ended checks the last message the team got: it ends the case's subject, with text, and names no
+// person (FINDINGS A-139).
 func (c *salesConversation) ended(text string) {
 	c.t.Helper()
 	end := c.sentTo(supervisorsIO)
-	if derefString(end.Meta.Msg) != "HANDOVER_END" || wfBlock(c.t, end)["subject"] != "end" || string(end.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, text) {
+	if derefString(end.Meta.Msg) != "HANDOVER_END" || wfBlock(c.t, end)["subject"] != "end" || string(end.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, text) ||
+		end.Meta.SrcIlk != nil || end.Meta.Ich != nil || end.Meta.DstIlk != nil {
 		c.t.Fatalf("the case's subject ends: %+v %s %s", end.Meta, end.Payload, end.Meta.Context)
 	}
 	for _, key := range []string{"team_untaken", "team_quiet"} {
@@ -1077,11 +1093,12 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 		t.Fatal("quiet counts once the case is taken")
 	}
 
-	// 4. Juan answers in the post's thread: the person gets it, with their own context.io, and the case
-	// is taken: "nobody took it" goes, and "quiet" counts.
+	// 4. Juan answers in the post's thread: the person gets it, as Juan's, with their own context.io
+	// and as its dst_ilk, and the case is taken: "nobody took it" goes, and "quiet" counts.
 	c.supervisor("Hola Ana, soy Juan. Ya veo la factura F-0001, dame un minuto.")
-	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.trail(msg) != "["+supervisorsIO+" "+salesWFNode+"]" {
-		t.Fatalf("the team's message goes to the person: %s %s", msg.Payload, msg.Meta.Context)
+	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.trail(msg) != "["+supervisorsIO+" "+salesWFNode+"]" ||
+		derefString(msg.Meta.SrcIlk) != supervisorILK || derefString(msg.Meta.DstIlk) != personILK {
+		t.Fatalf("the team's message goes to the person: %+v %s %s", msg.Meta, msg.Payload, msg.Meta.Context)
 	}
 	if _, untaken := c.pending("team_untaken"); untaken || c.state()["team_taken"] != true {
 		t.Fatalf("a team message takes the case: %v %v", c.timer.pending, c.state())
@@ -1115,7 +1132,8 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 		t.Fatalf("sales gets the click, with its note: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
 
-	// 7. Sales tells the person, with the person's context.io, and holds the conversation again.
+	// 7. Sales tells the person, with the person's context.io, and holds the conversation again. Its
+	// answer to Juan's click reaches the person with the person as its dst_ilk (FINDINGS A-139).
 	c.choose(salesAgent, toSales, "Listo: Juan emitió la nota de crédito NC-0001, te llega por mail.", "answer", nil)
 	c.delivered("Listo: Juan emitió la nota de crédito NC-0001, te llega por mail.", salesAgent)
 	c.inState("sales_listening")

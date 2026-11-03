@@ -189,45 +189,79 @@ func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 	}
 }
 
-// Case 4 (wf-orchestration-v1 §5.4.10): a send carries the instance's person, the src_ilk and ich of
-// the message that started it, so an agent files the WF's own message under the person (the rest of
-// FINDINGS A-116); and a send to an IO node carries the action's subject in the WF's block, which
-// the IO node places it by.
-func TestASendCarriesThePersonAndTheSubject(t *testing.T) {
+// Case 4 (wf-orchestration-v1 §5.4.10) and Case 5 (§5.5.1, FINDINGS A-139): the ILKs of what the WF
+// sends are its facts, from the instance's person, the src_ilk and ich of the message that started
+// it. A send to an agent, or to a WF, carries the person as its src_ilk and ich, so an agent files
+// the WF's own message under the person (the rest of FINDINGS A-116). A send to an IO node names no
+// sender, since the WF wrote it: to the person's IO node (the definition's start_from) it names the
+// person as its dst_ilk, and to the team's IO node no person at all. A send to an IO node carries the
+// action's subject in the WF's block, which the IO node places it by.
+func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.sales@motherbee", uuid: "wf-uuid-person"}
 	actx := makeActx(t, disp, &mockTimerSender{})
 	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-3", "conv-3", "invoice", map[string]any{}, fixedClock)
 	inst.PersonILK, inst.PersonICH = "ilk:person", "ich:api:conv-3"
-	toAgent := ActionDefinition{Type: "send_message", Target: "AI.payments@motherbee", Meta: &ActionMeta{Msg: "PAYMENT_DUE"}, Payload: map[string]any{"type": "text", "content": "due"}}
-	toTeam := ActionDefinition{Type: "send_message", Target: "IO.slack.team@motherbee", Subject: "end", Meta: &ActionMeta{Msg: "CLOSE"}, Payload: map[string]any{"type": "text", "content": "closed"}}
-	for _, action := range []ActionDefinition{toAgent, toTeam} {
+	const personsIO = "IO.api.billing@motherbee" // the definition's start_from
+	send := func(target, subject string) sdk.Message {
+		t.Helper()
+		action := ActionDefinition{Type: "send_message", Target: target, Subject: subject, Meta: &ActionMeta{Msg: "NOTE"}, Payload: map[string]any{"type": "text", "content": "hi"}}
 		if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {
 			t.Fatalf("execSendMessage: %v", err)
 		}
+		return disp.sent[len(disp.sent)-1]
 	}
-	for _, sent := range disp.sent {
-		if derefStringPtr(sent.Meta.SrcIlk) != "ilk:person" || derefStringPtr(sent.Meta.Ich) != "ich:api:conv-3" || derefStringPtr(sent.Meta.ThreadID) != "conv-3" {
-			t.Fatalf("a send carries the person, on the instance's thread: %+v", sent.Meta)
+	ilks := func(msg sdk.Message) string {
+		return fmt.Sprintf("src_ilk=%q dst_ilk=%q ich=%q", derefString(msg.Meta.SrcIlk), derefString(msg.Meta.DstIlk), derefString(msg.Meta.Ich))
+	}
+	const carriesThePerson, namesThePerson, noPerson = `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="ilk:person" ich=""`, `src_ilk="" dst_ilk="" ich=""`
+	for _, c := range []struct{ target, subject, ilks, context string }{
+		{"AI.payments@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
+		{"WF.billing@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
+		{personsIO, "same", namesThePerson, `{"wf":{"subject":"same","trail":["WF.sales@motherbee"]}}`},
+		{"IO.slack.team@motherbee", "end", noPerson, `{"wf":{"subject":"end","trail":["WF.sales@motherbee"]}}`},
+	} {
+		sent := send(c.target, c.subject)
+		if ilks(sent) != c.ilks || derefString(sent.Meta.ThreadID) != "conv-3" || string(sent.Meta.Context) != c.context {
+			t.Fatalf("a send to %s: %s on %q, %s; want %s, %s", c.target, ilks(sent), derefString(sent.Meta.ThreadID), sent.Meta.Context, c.ilks, c.context)
 		}
 	}
-	if got := string(disp.sent[0].Meta.Context); got != `{"wf":{"trail":["WF.sales@motherbee"]}}` {
-		t.Fatalf("a send without a subject has none: %s", got)
+
+	// A forward carries the subject too, and the message's meta as received: to the team's IO node its
+	// ILKs as they came; to the person's IO node the person as its dst_ilk, where an agent's answer to
+	// a supervisor names the supervisor, whom it answered.
+	answer := from("AI.sales@motherbee", sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-answer"},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:agent"), DstIlk: strPtr("ilk:supervisor"), Ich: strPtr("ich:slack:team"), ThreadID: strPtr("conv-3")},
+		Payload: json.RawMessage(`{"type":"text","content":"approved"}`),
+	})
+	forward := func(target, subject string) sdk.Message {
+		t.Helper()
+		if err := execForward(context.Background(), ActionDefinition{Type: "forward", Target: target, Subject: subject}, inst, answer, actx); err != nil {
+			t.Fatal(err)
+		}
+		return disp.sent[len(disp.sent)-1]
 	}
-	if got := string(disp.sent[1].Meta.Context); got != `{"wf":{"subject":"end","trail":["WF.sales@motherbee"]}}` {
-		t.Fatalf("the subject goes in the WF's block: %s", got)
+	const asReceived = `src_ilk="ilk:agent" dst_ilk="ilk:supervisor" ich="ich:slack:team"`
+	if sent := forward("IO.slack.team@motherbee", "same"); ilks(sent) != asReceived ||
+		string(sent.Meta.Context) != `{"wf":{"subject":"same","trail":["AI.sales@motherbee","WF.sales@motherbee"]}}` {
+		t.Fatalf("a forward to the team: %s %s", ilks(sent), sent.Meta.Context)
+	}
+	if sent := forward(personsIO, ""); ilks(sent) != `src_ilk="ilk:agent" dst_ilk="ilk:person" ich="ich:slack:team"` {
+		t.Fatalf("a forward to the person's IO node: %s", ilks(sent))
+	}
+	if derefString(answer.Meta.DstIlk) != "ilk:supervisor" {
+		t.Fatalf("the forward changed the message it sent: %s", ilks(answer))
 	}
 
-	// A forward carries the subject too, and the message's own person, never the instance's.
-	forwarded := from("IO.api.sales@motherbee", sdk.Message{
-		Routing: sdk.Routing{TraceID: "trace-person"},
-		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:other"), ThreadID: strPtr("conv-3")},
-		Payload: json.RawMessage(`{"type":"text","content":"hi"}`),
-	})
-	if err := execForward(context.Background(), ActionDefinition{Type: "forward", Target: "IO.slack.team@motherbee", Subject: "same"}, inst, forwarded, actx); err != nil {
-		t.Fatal(err)
+	// Without a person (several people write on the thread): a forward to the person's IO node keeps
+	// its dst_ilk, and a send names nobody.
+	inst.PersonILK, inst.PersonICH = "", ""
+	if sent := forward(personsIO, ""); ilks(sent) != asReceived {
+		t.Fatalf("a forward without a person: %s", ilks(sent))
 	}
-	sent := disp.sent[2]
-	if derefStringPtr(sent.Meta.SrcIlk) != "ilk:other" || sent.Meta.Ich != nil || string(sent.Meta.Context) != `{"wf":{"subject":"same","trail":["IO.api.sales@motherbee","WF.sales@motherbee"]}}` {
-		t.Fatalf("the forward: %+v %s", sent.Meta, sent.Meta.Context)
+	for _, target := range []string{personsIO, "AI.payments@motherbee"} {
+		if sent := send(target, ""); ilks(sent) != noPerson {
+			t.Fatalf("a send to %s without a person: %s", target, ilks(sent))
+		}
 	}
 }

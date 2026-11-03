@@ -46,7 +46,9 @@ type WFInstanceRow struct {
 	TerminatedAtMS sql.NullInt64
 	// PersonILK and PersonICH are the instance's person: the src_ilk and ich of the message that
 	// started it, empty when it had none, or once a message from a start_from node carried another
-	// person. A send_message carries them (the rest of FINDINGS A-116).
+	// person. A send_message to a node that is no IO node (an agent, a WF) carries them (the rest of
+	// FINDINGS A-116), and what the WF sends the person's IO node names the person as its dst_ilk
+	// (A-139).
 	PersonILK string
 	PersonICH string
 }

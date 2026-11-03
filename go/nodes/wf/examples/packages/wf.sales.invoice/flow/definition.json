@@ -237,7 +237,7 @@
               },
               "payload": {
                 "type": "text",
-                "content": "No supervisor answered your question in 30 minutes. Tell the customer you could not confirm it yet, and that they can ask again."
+                "content": "No supervisor answered your question in time. Tell the customer you could not confirm it yet, and that they can ask again."
               }
             }
           ]
@@ -863,7 +863,7 @@
               },
               "payload": {
                 "type": "text",
-                "content": "Nobody of the team took the conversation in 15 minutes, and it is yours again. Tell the person, and help them as you can."
+                "content": "Nobody of the team took the conversation in time, and it is yours again. Tell the person, and help them as you can."
               }
             }
           ]
@@ -892,7 +892,7 @@
               },
               "payload": {
                 "type": "text",
-                "content": "The conversation with the team went quiet for 30 minutes, and it is yours again. Tell the person, and help them as you can."
+                "content": "The conversation with the team went quiet, and it is yours again. Tell the person, and help them as you can."
               }
             }
           ]

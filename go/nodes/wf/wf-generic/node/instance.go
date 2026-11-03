@@ -82,9 +82,11 @@ type WFInstance struct {
 	UpdatedAtMS    int64
 	TerminatedAtMS *int64
 	// PersonILK and PersonICH are the instance's person, the src_ilk and ich of the message that
-	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) carries them, so
-	// an agent files it under the person, as it does a forwarded one (the rest of FINDINGS A-116).
-	// Both go when a message from a start_from node carries another person (notePerson).
+	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) to a node that
+	// is no IO node carries them, so an agent files it under the person, as it does a forwarded one
+	// (the rest of FINDINGS A-116), and what the WF sends the person's IO node names the person as its
+	// dst_ilk (A-139, personsIO). Both go when a message from a start_from node carries another person
+	// (notePerson).
 	PersonILK string
 	PersonICH string
 	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit

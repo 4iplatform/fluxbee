@@ -416,7 +416,7 @@ The known options:
 | `decided` | The message decides the question: your reply tells the person the decision. | |
 | `wait` | The message decides nothing yet, such as a remark among supervisors: your reply is empty. | |
 | `answer_team` | The message asks you something: your reply goes to the team, not to the person. | |
-| `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: who the person is, what they want, what was done. |
+| `handover` | A person of the team must take the conversation. Your reply tells the person; the summary goes to the team. | `summary` (string): What the team needs to take over: the person by name, what they want, what was done. No internal ids. |
 | `handback` | Hand the conversation back to the agent. | `note` (string): What the agent must know: what was done and agreed. |
 | `done` | Your part is done: your reply goes to the person, and the conversation goes back to the agent that had it. | |
 <!-- known-options:end -->

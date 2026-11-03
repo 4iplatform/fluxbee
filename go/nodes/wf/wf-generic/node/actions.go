@@ -115,10 +115,14 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 
 // execSendMessage sends a message the WF writes: its msg and payload from the definition, on the
 // instance's thread (every message the instance sends carries it, so the agents keep one memory per
-// conversation and their answers come back here), with its meta.context and the WF's block. It carries
-// the instance's person as its src_ilk and ich, when the instance has one: an agent files it under the
-// person, as it does a forwarded message (wf-orchestration-v1 §5.4.3). An instance whose thread
-// several people write on has none (notePerson).
+// conversation and their answers come back here), with its meta.context and the WF's block. Its ILKs
+// are the WF's to say, since it routes (FINDINGS A-139), and come from the instance's person, when it
+// has one (an instance whose thread several people write on has none, notePerson):
+//   - to an IO node (IO.*) it names no sender, no src_ilk and no ich: the WF wrote it, not the person,
+//     and the router's stamp names the WF. Who said what travels in the facts (vars). To the person's
+//     own IO node (personsIO) it names the person as its dst_ilk;
+//   - to any other node, an agent above all, it carries the person as its src_ilk and ich: an agent
+//     files it under the person, as it does a forwarded message (wf-orchestration-v1 §5.4.3).
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("send_message: no dispatcher configured")
@@ -169,13 +173,27 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		},
 		Payload: raw,
 	}
-	if person := inst.PersonILK; person != "" {
-		msg.Meta.SrcIlk = &person
-	}
-	if ich := inst.PersonICH; ich != "" {
-		msg.Meta.Ich = &ich
+	person, ich := inst.PersonILK, inst.PersonICH
+	if wfcel.IsIO(action.Target) {
+		if person != "" && inst.personsIO(action.Target) {
+			msg.Meta.DstIlk = &person
+		}
+	} else {
+		if person != "" {
+			msg.Meta.SrcIlk = &person
+		}
+		if ich != "" {
+			msg.Meta.Ich = &ich
+		}
 	}
 	return sendWithRetry(ctx, actx, "send_message", msg)
+}
+
+// personsIO reports whether target is the person's IO node: an IO node (IO.*) of the definition's
+// start_from, whose messages carry the instance's person (notePerson). What the WF sends it names the
+// person as its dst_ilk (FINDINGS A-139).
+func (inst *WFInstance) personsIO(target string) bool {
+	return wfcel.IsIO(target) && inst.def.StartsFrom(target)
 }
 
 // execForward sends a message on as it was received (wf-orchestration-v1 §5.2.1, item 5): the
@@ -183,7 +201,9 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 // and its meta is the message's (type, msg, src_ilk, dst_ilk, ich, scope, priority and context)
 // without memory_package. What the WF changes is metadata: the destination (a target written in
 // the definition), the thread (the instance's), the context keys the action writes and the WF's
-// block, whose trail is the message's own (or its sender's name) and this node.
+// block, whose trail is the message's own (or its sender's name) and this node. To the person's IO
+// node (personsIO) its dst_ilk is the instance's person, when it has one (FINDINGS A-139): an agent
+// answers whoever spoke, so its answer to a supervisor names the supervisor.
 func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("forward: no dispatcher configured")
@@ -214,6 +234,9 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 	threadID := inst.ThreadID
 	meta.ThreadID = &threadID
 	meta.Context = contextRaw
+	if person := inst.PersonILK; person != "" && inst.personsIO(action.Target) {
+		meta.DstIlk = &person
+	}
 	msg := sdk.Message{
 		Routing: sdk.Routing{
 			Src:     actx.Dispatcher.NodeUUID(),
