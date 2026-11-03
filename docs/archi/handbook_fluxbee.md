@@ -233,9 +233,8 @@ operating one.
   the WF never hears from it.
 - **Where it runs:** where SY.wf-rules runs, on the motherbee or a worker. Never on an ingress or
   an egress hive.
-- **A complete example:** the seeds `wf_node_with_workflow` and `workflow_definition`. An agent
-  answers through a menu or consults the supervisors, and the catch acts on its answers wherever
-  they arrive. Handing the conversation to a person of the team is a pattern of §4.2.6.
+- **The atoms:** §4.2.6 has each mechanism as a small definition. The seeds `wf_node_with_workflow`
+  and `workflow_definition` hold atom 1, and §4.2.7 says how to check, deploy and operate a WF.
 
 #### 4.2.1 The definition
 
@@ -478,56 +477,397 @@ The known options:
     for its transitions or its catch.
   - The instance does not fail.
 
-#### 4.2.6 Patterns
+#### 4.2.6 The atoms
 
-- **Keep a conversation bounded:** an agent's `done` delivers its answer, then waits for the
-  person's next message. Never ask an agent again with the same message.
-- **Give control back to the first agent** in two ways, and recommend both: the agent hands back
-  (the known option `done`), or an inactivity timer fires.
-- **A consultation:**
-  1. The agent answers `consult`.
-  2. The WF forwards the agent's reply to the person, when it is not empty.
-  3. It writes the question (a `$ref` to the param) to the supervisors' io.slack, and waits with a
-     timer. Only io.slack maps a reply in the thread of its post back to the instance's thread.
-  4. Each supervisor's message in that thread reaches the instance. The WF forwards it to the agent
-     with a menu of three options: the message decides the question (`decided`), decides nothing
-     yet (`wait`), or asks the agent something (`answer_team`). Only a decision reaches the person.
-     An `answer_team` reply goes to the supervisors' io.slack with `subject: same`, into the
-     question's thread, and the consultation goes on.
-- **Handing the conversation to a person of the team:**
-  1. The agent answers `handover`. The WF forwards its reply to the person, when it is not empty.
-  2. A state for the team. Its entry actions:
-     - post the `summary` param to the team's io.slack with `subject: new`, a menu with `handback`,
-       and the person's facts in `vars`, each a `$ref` with a default, such as
-       `{"$ref": "state.io.sender.id", "default": ""}` (a missing field fails the instance);
-     - set `team_taken` to `false`, and the time in a variable;
-     - schedule "nobody took it".
+A solution is built from atoms. Each atom is one mechanism, written as the smallest definition that
+runs it, and each compiles as it stands: a test compiles every definition in this handbook.
 
-     Its exit actions cancel both timers.
-  3. A team message, a text (`!has(event.context.evaluation)`) from the team's io.slack, is
-     forwarded to the person, with the person's `io` context written in `meta.context.io`. The
-     first one sets `team_taken`, cancels "nobody took it" and schedules "quiet"; each later one
-     reschedules "quiet".
-  4. A person's message is kept and forwarded to the team with `subject: same`. Once the case is
-     taken, it reschedules "quiet" too.
-  5. A `handback` click from the team's io.slack, or either timer, ends it: `end` to the team, with a
-     fixed text, and the conversation back to the agent. Guard "nobody took it" with
-     `!state.team_taken`, since a fire may cross the first message.
-     - A click is forwarded to the agent with a menu with `answer`, so the note reaches it in the
-       team member's words.
-     - On a timer, the WF sends the agent a fixed text with that menu.
-     - `vars` say how it came back and since when the team had it.
-  6. The agent's answer goes to the person with the person's `io` context, and the agent holds the
-     conversation again.
+- **Combine them.** Take the states and transitions a mechanism needs, under the solution's names.
+- **Never copy a whole case.** A case combines atoms: Case 4's handover is atom 4 with a second
+  timer, "nobody took it".
+- **The names are examples:** `IO.api.shop@worker1` is the person's IO node, `AI.sales@worker1` an
+  agent, and `IO.slack.team@motherbee` the team's channel.
 
-  While the team has the conversation, an agent's late answer is not delivered: handle the agent's
-  answers in the team's state, so that the catch does not deliver them.
+**Idioms the atoms share:**
+- **A `start` state.** The message that starts an instance is the event of the initial state's entry
+  actions. A state that a timer can enter never forwards the event on entry: a forward of a
+  `TIMER_FIRED` is refused. So the first message is forwarded in `start`, which moves on with an
+  internal event, and later messages are forwarded in transitions.
+- **A reply may be empty.** Every forward of an agent's reply is guarded with
+  `event.context.evaluation.reply != ''`. An option that changes the state has two transitions: one
+  with a reply, one without.
+- **A send to an agent whose answer must reach the person** writes the person's `io` context, kept
+  in `state.io` from their first message.
+- **Every instance ends.** An `idle` timer closes a conversation nobody writes in.
+
+**Writing texts:**
+- A text never repeats a value the definition holds elsewhere. Say "a while", never "30 minutes":
+  the timer may change, and the text would not.
+- What goes to the team names the person by name, never by an internal id (an ILK, an ICH, a node's
+  name).
+
+**Atom 1, a person talks with an agent.** For one agent that serves the person.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.answer",
+  "description": "A person talks with one agent: each message of the person goes to AI.sales with a menu, and sales' reply goes to the person. A while with no message closes the conversation.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "talking",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "talking", "description": "The person's messages go to sales, and its replies to the person.",
+      "entry_actions": [
+        {"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}},
+        {"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}
+      ],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ]
+}
+```
+
+**Atom 2, the conversation goes to another agent and comes back.** For a part of the conversation
+that is another agent's trade. The agent that holds it gets every message of the person, with the
+facts it needs in `vars`. It gives the conversation back with `done`, and an `idle` timer gives it
+back too.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.redirect",
+  "description": "Sales holds the conversation and may hand it to invoice, which holds it until it says done or a while passes with no message. Then sales holds it again.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "start",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "start", "description": "The first message is kept and goes to sales.",
+      "entry_actions": [
+        {"type": "keep_message", "name": "person"},
+        {"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}, {"name": "invoice", "description": "They accepted a quote and ask for the invoice.", "params": {"order": {"type": "string", "description": "What they buy, how many, and at what price."}}}]}},
+        {"type": "emit_internal_event", "meta": {"msg": "STARTED"}}
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {"event_match": {"msg": "STARTED"}, "guard": "true", "target_state": "with_sales", "actions": []}
+      ]
+    },
+    {
+      "name": "with_sales", "description": "Sales holds the conversation. Its reply goes to the person; invoice hands the conversation to invoice, with the order and the person's last message.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "keep_message", "name": "person"}, {"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}, {"name": "invoice", "description": "They accepted a quote and ask for the invoice.", "params": {"order": {"type": "string", "description": "What they buy, how many, and at what price."}}}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'invoice' && event.context.evaluation.reply != ''", "target_state": "with_invoice", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}, {"type": "set_variable", "name": "order", "value": "event.context.evaluation.params.order"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'invoice'", "target_state": "with_invoice", "actions": [{"type": "set_variable", "name": "order", "value": "event.context.evaluation.params.order"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {
+      "name": "with_invoice", "description": "Invoice holds the conversation. Its reply goes to the person; done gives the conversation back to sales, and so does a while with no message.",
+      "entry_actions": [
+        {"type": "forward", "target": "AI.invoice@worker1", "message": "person", "vars": {"order": {"$ref": "state.order"}}, "menu": {"help": "You hold the person's conversation about the order in vars.order. Say done when their business with invoicing is.", "options": [{"name": "answer"}, {"name": "done"}]}},
+        {"type": "schedule_timer", "timer_key": "idle", "fire_in": "10m"}
+      ],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "keep_message", "name": "person"}, {"type": "forward", "target": "AI.invoice@worker1", "message": "person", "vars": {"order": {"$ref": "state.order"}}, "menu": {"help": "You hold the person's conversation about the order in vars.order. Say done when their business with invoicing is.", "options": [{"name": "answer"}, {"name": "done"}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "10m"}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.option == 'done' && event.context.evaluation.reply != ''", "target_state": "with_sales", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.option == 'done'", "target_state": "with_sales", "actions": []},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "with_sales", "actions": []}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ]
+}
+```
+
+**Atom 3, escalating a question.** For an agent that needs a person's decision, such as a
+supervisor's approval, before it answers. The agent stays the person's voice. Only io.slack maps a
+reply in its post's thread back to the instance's thread.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.consult",
+  "description": "Sales may consult the team before it answers: its question goes to the team's channel, and each message of the team in that thread goes to sales, which says whether it decides the question. Sales stays the person's voice. When no decision comes, sales hears it and tells the person.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "start",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "start", "description": "Keeps the person's io context; the first message goes to sales.",
+      "entry_actions": [
+        {"type": "set_variable", "name": "io", "value": "event.context.io"},
+        {"type": "forward", "target": "AI.sales@worker1", "menu": {"help": "A discount above 10% needs the team's approval.", "options": [{"name": "answer"}, {"name": "consult"}]}},
+        {"type": "emit_internal_event", "meta": {"msg": "STARTED"}}
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {"event_match": {"msg": "STARTED"}, "guard": "true", "target_state": "talking", "actions": []}
+      ]
+    },
+    {
+      "name": "talking", "description": "Sales holds the conversation. Its reply goes to the person; consult tells the person that sales will check, and writes sales' question to the team.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"help": "A discount above 10% needs the team's approval.", "options": [{"name": "answer"}, {"name": "consult"}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'consult' && event.context.evaluation.reply != ''", "target_state": "consulting", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}, {"type": "send_message", "target": "IO.slack.team@motherbee", "subject": "new", "meta": {"msg": "QUESTION"}, "payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}}}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'consult'", "target_state": "consulting", "actions": [{"type": "send_message", "target": "IO.slack.team@motherbee", "subject": "new", "meta": {"msg": "QUESTION"}, "payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.question"}}}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {
+      "name": "consulting", "description": "The team has sales' question. Each message of the team goes to sales: decided goes to the person and ends the consultation, wait waits on, answer_team goes to the team in the question's thread. The person's messages still go to sales.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "no_decision", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "no_decision"}],
+      "transitions": [
+        {"event_match": {"src": "IO.slack.team@motherbee"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "decided"}, {"name": "wait"}, {"name": "answer_team"}]}}]},
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'decided'", "target_state": "talking", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'wait'", "actions": []},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'answer_team'", "actions": [{"type": "forward", "target": "IO.slack.team@motherbee", "subject": "same"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'no_decision'", "target_state": "talking", "actions": [{"type": "send_message", "target": "AI.sales@worker1", "meta": {"msg": "NO_DECISION", "context": {"io": {"$ref": "state.io"}}}, "menu": {"options": [{"name": "answer"}]}, "payload": {"type": "text", "content": "Nobody of the team decided your question. Tell the person that you could not confirm it yet."}}]}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ]
+}
+```
+
+**Atom 4, escalating the conversation.** For a person of the team who must take the conversation.
+- The team's io.slack shows the menu as a button. A click comes back with
+  `event.context.evaluation`, and a text without it.
+- While the team holds the conversation, an agent's late answer is not delivered.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.escalate",
+  "description": "Sales may hand the conversation to the team: its summary opens a post in the team's channel with a handback button, and the team and the person talk through the WF until the team hands it back or it goes quiet. Then sales holds it again and tells the person.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "start",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "start", "description": "Keeps the person's io context; the first message goes to sales.",
+      "entry_actions": [
+        {"type": "set_variable", "name": "io", "value": "event.context.io"},
+        {"type": "forward", "target": "AI.sales@worker1", "menu": {"help": "A credit note needs a person of the team.", "options": [{"name": "answer"}, {"name": "handover"}]}},
+        {"type": "emit_internal_event", "meta": {"msg": "STARTED"}}
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {"event_match": {"msg": "STARTED"}, "guard": "true", "target_state": "talking", "actions": []}
+      ]
+    },
+    {
+      "name": "talking", "description": "Sales holds the conversation. Its reply goes to the person; handover tells the person, and hands the conversation to the team.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"help": "A credit note needs a person of the team.", "options": [{"name": "answer"}, {"name": "handover"}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'handover' && event.context.evaluation.reply != ''", "target_state": "with_team", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'handover'", "target_state": "with_team", "actions": []},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {
+      "name": "with_team", "description": "The team holds the conversation. Sales' summary opens a post with a handback button; the team's messages go to the person, and the person's to the post's thread. A handback, or a while with no message, gives the conversation back to sales, and sales' late answers are not delivered meanwhile.",
+      "entry_actions": [
+        {"type": "send_message", "target": "IO.slack.team@motherbee", "subject": "new", "meta": {"msg": "HANDOVER"}, "menu": {"help": "When you are done, hand the conversation back to sales with a note.", "options": [{"name": "handback"}]}, "payload": {"type": "text", "content": {"$ref": "event.context.evaluation.params.summary"}}},
+        {"type": "schedule_timer", "timer_key": "quiet", "fire_in": "30m"}
+      ],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "quiet"}],
+      "transitions": [
+        {"event_match": {"src": "IO.slack.team@motherbee"}, "guard": "!has(event.context.evaluation)", "actions": [{"type": "forward", "target": "IO.api.shop@worker1", "meta": {"context": {"io": {"$ref": "state.io"}}}}, {"type": "reschedule_timer", "timer_key": "quiet", "fire_in": "30m"}]},
+        {"event_match": {"src": "IO.slack.team@motherbee"}, "guard": "event.context.evaluation.option == 'handback'", "target_state": "talking", "actions": [{"type": "send_message", "target": "IO.slack.team@motherbee", "subject": "end", "meta": {"msg": "TEAM_END"}, "payload": {"type": "text", "content": "Handed back to the agent."}}, {"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"io": {"$ref": "state.io"}}}, "menu": {"help": "The team handed the conversation back to you, with this note. Tell the person what was done.", "options": [{"name": "answer"}]}}]},
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "IO.slack.team@motherbee", "subject": "same"}, {"type": "reschedule_timer", "timer_key": "quiet", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "true", "actions": []},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'quiet'", "target_state": "talking", "actions": [{"type": "send_message", "target": "IO.slack.team@motherbee", "subject": "end", "meta": {"msg": "TEAM_END"}, "payload": {"type": "text", "content": "The case went quiet; it went back to the agent."}}, {"type": "send_message", "target": "AI.sales@worker1", "meta": {"msg": "TEAM_QUIET", "context": {"io": {"$ref": "state.io"}}}, "menu": {"options": [{"name": "answer"}]}, "payload": {"type": "text", "content": "The conversation with the team went quiet, and it is yours again. Tell the person, and help them as you can."}}]}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ]
+}
+```
+
+**Atom 5, a timer whose time an agent's answer gives.** For a time that an answer sets, such as a due
+date or a reminder. Guard the time's shape before setting the timer. The minimum is 60 s.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.due_timer",
+  "description": "Invoice issues an invoice and says when it falls due; the WF sets a timer at that time, and when it fires, payments writes the person.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "start",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "start", "description": "Keeps the person's io context; the first message goes to invoice.",
+      "entry_actions": [
+        {"type": "set_variable", "name": "io", "value": "event.context.io"},
+        {"type": "forward", "target": "AI.invoice@worker1", "menu": {"options": [{"name": "answer"}, {"name": "issued", "description": "You issued the invoice.", "params": {"invoice_number": {"type": "string"}, "due_in": {"type": "string", "description": "When it falls due, such as 2m, 1h or 30d."}}}]}},
+        {"type": "emit_internal_event", "meta": {"msg": "STARTED"}}
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {"event_match": {"msg": "STARTED"}, "guard": "true", "target_state": "talking", "actions": []}
+      ]
+    },
+    {
+      "name": "talking", "description": "Invoice holds the conversation. An invoice issued with a due time goes to the person and sets the timer; its other replies go to the person.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.invoice@worker1", "menu": {"options": [{"name": "answer"}, {"name": "issued", "description": "You issued the invoice.", "params": {"invoice_number": {"type": "string"}, "due_in": {"type": "string", "description": "When it falls due, such as 2m, 1h or 30d."}}}]}}, {"type": "reschedule_timer", "timer_key": "idle", "fire_in": "30m"}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.option == 'issued' && event.context.evaluation.params.due_in.matches('^[1-9][0-9]*[mhd]$')", "target_state": "due_pending", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}, {"type": "set_variable", "name": "invoice_number", "value": "event.context.evaluation.params.invoice_number"}, {"type": "set_variable", "name": "due_in", "value": "event.context.evaluation.params.due_in"}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {
+      "name": "due_pending", "description": "The invoice is pending: the person's messages still go to invoice. When the timer fires, payments writes the person.",
+      "entry_actions": [
+        {"type": "schedule_timer", "timer_key": "payment_due", "fire_in": {"$ref": "state.due_in"}}
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.invoice@worker1", "menu": {"options": [{"name": "answer"}, {"name": "issued", "description": "You issued the invoice.", "params": {"invoice_number": {"type": "string"}, "due_in": {"type": "string", "description": "When it falls due, such as 2m, 1h or 30d."}}}]}}]},
+        {"event_match": {"src": "AI.invoice@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'payment_due'", "target_state": "notifying", "actions": [{"type": "send_message", "target": "AI.payments@worker1", "meta": {"msg": "PAYMENT_DUE", "context": {"io": {"$ref": "state.io"}}}, "vars": {"invoice_number": {"$ref": "state.invoice_number"}}, "menu": {"options": [{"name": "answer"}]}, "payload": {"type": "text", "content": "The invoice in vars.invoice_number fell due and was not paid. Tell the person."}}]}
+      ]
+    },
+    {
+      "name": "notifying", "description": "Payments' reply goes to the person, and the conversation ends.",
+      "entry_actions": [
+        {"type": "schedule_timer", "timer_key": "payments_timeout", "fire_in": "120s"}
+      ],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "payments_timeout"}],
+      "transitions": [
+        {"event_match": {"src": "AI.payments@worker1"}, "guard": "event.context.evaluation.reply != ''", "target_state": "closed", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.payments@worker1"}, "guard": "true", "target_state": "closed", "actions": []},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'payments_timeout'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ]
+}
+```
+
+**Atom 6, the catch.** For every definition with more than one state. It takes an agent's `none`,
+its errors, and the answers that arrive after their wait.
+
+```json
+{
+  "wf_schema_version": "1",
+  "workflow_type": "atom.catch",
+  "description": "The basic loop with a wait for sales' answer and a catch: an agent's none and any error are noted in last_error, and sales' answer that comes after its wait still reaches the person.",
+  "start_from": ["IO.api.shop@worker1"],
+  "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
+  "initial_state": "thinking",
+  "terminal_states": ["closed", "failed"],
+  "states": [
+    {
+      "name": "thinking", "description": "The person's message goes to sales, which has a while to answer.",
+      "entry_actions": [
+        {"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}},
+        {"type": "schedule_timer", "timer_key": "sales_timeout", "fire_in": "120s"}
+      ],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "sales_timeout"}],
+      "transitions": [
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'answer' && event.context.evaluation.reply != ''", "target_state": "listening", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}}]},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'sales_timeout'", "target_state": "listening", "actions": [{"type": "set_variable", "name": "last_error", "value": "'sales did not answer in time'"}]}
+      ]
+    },
+    {
+      "name": "listening", "description": "Waits for the person's next message.",
+      "entry_actions": [{"type": "schedule_timer", "timer_key": "idle", "fire_in": "30m"}],
+      "exit_actions": [{"type": "cancel_timer", "timer_key": "idle"}],
+      "transitions": [
+        {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "target_state": "thinking", "actions": []},
+        {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'idle'", "target_state": "closed", "actions": []}
+      ]
+    },
+    {"name": "closed", "description": "The conversation ended.", "entry_actions": [], "exit_actions": [], "transitions": []},
+    {"name": "failed", "description": "An action failed.", "entry_actions": [], "exit_actions": [], "transitions": []}
+  ],
+  "catch": [
+    {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'none'", "actions": [{"type": "set_variable", "name": "last_error", "value": "'sales answered none'"}]},
+    {"event_match": {}, "guard": "event.payload.type == 'error'", "actions": [{"type": "set_variable", "name": "last_error", "value": "'error: ' + event.payload.code"}]},
+    {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]}
+  ]
+}
+```
+
+**Rules across atoms:**
+- **Keep a conversation bounded:** `done` delivers the agent's answer, then waits for the person's
+  next message. Never ask an agent again with the same message.
 - **The catalog only grows:** a known option keeps its name and its params. A meaning that changes
   takes a new name.
 - **Answers in any state:** a person who writes twice gets two answers, and a decision may cross an
-  answer to the person. The catch acts on an agent's answers wherever they arrive.
-- **Late events:** handle a message where it can arrive. Use an internal transition when it must not
-  leave the state, and guard the catch with a state variable when it must not move the instance.
+  answer to the person. Handle an agent's answers wherever they can arrive, or in the catch.
+- **Late events:** handle a message where it can arrive. Use an internal transition when it must
+  not leave the state, and guard the catch with a state variable when it must not move the
+  instance.
+
+#### 4.2.7 Checking, deploying and operating a WF
+
+- **Check, show, deploy.** `wf_rules_check` validates a definition without staging or applying it,
+  and names each error's exact path.
+  - In chat, check every definition, show the operator what it does, and only then deploy.
+  - In the pipeline, the designer's workflows are checked before the plan, and a refusal comes back
+    to the designer.
+- **The manifest:** `desired_state.wf_deployments[i]` holds `hive`, `workflow_name`, `definition`
+  and `ownership`, and `tenant_id` for a workflow its hive does not have yet. The pipeline deploys a
+  new workflow with `auto_spawn` and that tenant.
+- **In chat,** a first deploy is `wf_rules_compile_apply` with `auto_spawn: true` and `tenant_id`.
+- **An update** is one `wf_rules_compile_apply`, and the WF node restarts once.
+  - A running instance keeps the definition it was born with, and a new conversation takes the new
+    one.
+  - `wf_rules_rollback` goes back to the version before.
+- **A removal** ends the conversations still running. The pipeline's plan says how many there are,
+  and the operator's confirmation removes the workflow with `force`. To let them finish, wait; to
+  end them one by one, cancel them.
+- **Operating instances** (the node is `WF.<workflow_name>`):
+  - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and since
+    when (`updated_at_ms`);
+  - `wf_get_instance` (`hive`, `node_name`, `instance_id`, `log_limit`): its input, its state
+    variables (`waiting_for` and `last_error`, when the definition keeps them), and its last log
+    entries;
+  - `wf_cancel_instance` (`hive`, `node_name`, `instance_id`, `reason`): it ends the instance. Ask
+    the operator first.
+
+  An instance that waits long in one state is stuck when no timer of that state can fire: read its
+  log.
 
 ### 4.3 IO nodes
 
@@ -745,7 +1085,8 @@ Rules:
 - do not invent actions outside compiler-class mappings
 - the args of `opa_compile_apply`, `wf_rules_compile_apply`, `wf_rules_delete`, `add_route`,
   `add_vpn` and a replace's `delete_route` / `delete_vpn` are pinned to the manifest afterwards:
-  write them exactly as the declared resource
+  write them exactly as the declared resource. A new workflow's `auto_spawn` and `tenant_id`, and a
+  removal's `force`, are pinned too
 
 ### 6.4 Archi
 
@@ -965,7 +1306,7 @@ PlanCompiler should map delta operations like this:
 | `ROUTE_DELETE` | `delete_route` |
 | `ROUTE_REPLACE` | `delete_route` -> `add_route` |
 | `WF_DEPLOY_APPLY` | `wf_rules_compile_apply` |
-| `WF_DEPLOY_RESTART` | `wf_rules_compile_apply` -> `restart_node` |
+| `WF_DEPLOY_RESTART` | `wf_rules_compile_apply` (it restarts the WF node itself) |
 | `WF_REMOVE` | `wf_rules_delete` |
 | `OPA_APPLY` | `opa_compile_apply` |
 | `OPA_REMOVE` | `opa_clear` |
