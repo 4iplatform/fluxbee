@@ -24,7 +24,7 @@ The operator never creates packages manually, never writes shell scripts, never 
 
 - **Message types:** system (NODE_STATUS_GET, CONFIG_GET, CONFIG_SET), command (compile_workflow, apply_workflow, rollback_workflow), query (get_workflow, get_status).
 - **State management:** three directories per workflow — `current/`, `staged/`, `backup/`. Always-latest with staged → current → backup rotation.
-- **Operations:** compile, compile_apply, apply, rollback — same semantics as OPA (with `check` accepted as a silent synonym for `compile`).
+- **Operations:** check, compile, compile_apply, apply, rollback — same semantics as OPA: `check` validates and writes nothing, as OPA's does (§5.3).
 - **Response shapes:** same envelope structure, same error codes pattern, same status reporting.
 
 The differences are structural, not stylistic:
@@ -174,7 +174,7 @@ query:
 
 **`rollback`** — Restore backup to current. Notify orchestrator.
 
-Note: if a request arrives with `operation: "check"`, it is treated as a synonym for `compile` silently. The documentation uses `compile` as the canonical name.
+**`check`** (CONFIG_SET only) — Validate the workflow definition exactly as `compile` does (the same load and limits, the same error codes, each error with its path) and write nothing: nothing staged, no package, no file of the state directories, no version taken. It takes no version (one in the request is ignored). A read, as SY.opa-rules' check is: a check between a compile and its apply leaves the staged definition and the current one as they were. Its `config` carries a `check_id`, which every answer to it echoes, with `operation: "check"` (§5.5). SY.admin's `wf_rules_check` sends it (wf-orchestration-v1 §5.5.1). Until WF Case 5 a `check` was a `compile` under another name: it staged the definition and took a version.
 
 ### 5.4 CONFIG_SET payload
 
@@ -202,10 +202,11 @@ A sketch (`...` stands for the parts of the definition):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `operation` | string | No (default: "compile") | One of: compile, compile_apply, apply, rollback |
+| `operation` | string | No (default: "compile") | One of: check, compile, compile_apply, apply, rollback |
+| `check_id` | string | With check | The check's id, which SY.admin makes: every answer to the check echoes it (`""` when the request had none), and SY.admin matches the answer by it. |
 | `workflow_name` | string | **Yes, always** | Name of the workflow. Determines node name `WF.<workflow_name>@<hive>`. Required for all operations including apply and rollback. |
 | `tenant_id` | string | Conditionally required | Required for the **first deploy** of a workflow when `auto_spawn=true` and the target `WF.<workflow_name>@<hive>` node does not exist yet. On rollout of an already-managed WF node, `sy.wf-rules` preserves the existing managed `tenant_id` and does not require the field again. |
-| `definition` | object | Yes for compile/compile_apply | The full workflow definition JSON per `spec-systemnode-wf-v1_1.md` §8 (§19.2 is a complete one). Its numbers are staged as written (`3` stays `3`, `1.0` stays `1.0`). |
+| `definition` | object | Yes for check/compile/compile_apply | The full workflow definition JSON per `spec-systemnode-wf-v1_1.md` §8 (§19.2 is a complete one). Its numbers are staged as written (`3` stays `3`, `1.0` stays `1.0`). |
 | `auto_spawn` | bool | No (default: false) | If true and the WF node doesn't exist yet, ask orchestrator to spawn it after apply. |
 | `version` | uint64 | No | If provided, used for idempotency check. If 0, auto-increment. |
 
@@ -299,6 +300,21 @@ Note that `ok: true` in this case reflects that sy.wf-rules successfully persist
   }
 }
 ```
+
+**Success (check):** the counts a compile would stage, with no version and no `effective_config`:
+```json
+{
+  "ok": true,
+  "node_name": "SY.wf-rules@motherbee",
+  "operation": "check",
+  "check_id": "0d6c7f52-6a7e-4f0e-9d3c-2b8a1f4e5c90",
+  "workflow_name": "invoice",
+  "guard_count": 12,
+  "state_count": 7
+}
+```
+
+A check that fails answers a compile's error, as above, with the request's `schema_version` and `config_version`, plus `"operation": "check"` and its `check_id`. Every answer to a check carries both: a refusal, an `UNAUTHORIZED`, and the error reply that replaces an answer too large to send.
 
 ### 5.6 Command messages
 
@@ -447,7 +463,7 @@ Response:
 
 ## 6. Validation (the "compile" step)
 
-When `SY.wf-rules` receives a workflow definition for compile or compile_apply, it validates it with the WF engine's own validator (`go/pkg/wfcel`), so it runs the checks of [spec-systemnode-wf-v1_1.md](spec-systemnode-wf-v1_1.md) §8.5, the one list of them: a definition SY.wf-rules stages is one the WF node loads.
+When `SY.wf-rules` receives a workflow definition for check, compile or compile_apply, it validates it with the WF engine's own validator (`go/pkg/wfcel`), so it runs the checks of [spec-systemnode-wf-v1_1.md](spec-systemnode-wf-v1_1.md) §8.5, the one list of them: a definition SY.wf-rules stages is one the WF node loads. A check and a compile validate with the same code (`loadWorkflow`, `go/sy-wf-rules/node/compile.go`); only the compile stages.
 
 For the guards (CEL compilation), `SY.wf-rules` includes `cel-go` as a dependency and compiles guards in-process. The compiled programs are NOT persisted — they serve only to validate. The WF node (`wf-generic`) recompiles CEL from the JSON at boot. This avoids cross-binary compatibility issues.
 
@@ -605,6 +621,7 @@ This is a destructive operation. Active instances are lost if `force: true`. The
 
 | Admin action | HTTP | Maps to | Purpose |
 |---|---|---|---|
+| `wf_rules_check` | `POST /hives/{hive}/wf-rules/check` | CONFIG_SET with operation=check and a fresh check_id | Validate only: stage nothing |
 | `wf_rules_compile` | `POST /hives/{hive}/wf-rules/compile` | CONFIG_SET with operation=compile | Validate + stage |
 | `wf_rules_compile_apply` | `POST /hives/{hive}/wf-rules` | CONFIG_SET with operation=compile_apply | Validate + stage + apply + restart |
 | `wf_rules_apply` | `POST /hives/{hive}/wf-rules/apply` | CONFIG_SET with operation=apply | Promote staged |
