@@ -193,16 +193,16 @@ func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 // sends are its facts, from the instance's person, the src_ilk and ich of the message that started
 // it. A send to an agent, or to a WF, carries the person as its src_ilk and ich, so an agent files
 // the WF's own message under the person (the rest of FINDINGS A-116). A send to an IO node names no
-// sender, since the WF wrote it: to the person's IO node (the definition's start_from) it names the
-// person as its dst_ilk and the person's channel as its ich, and to the team's IO node no person and
-// no channel. A send to an IO node carries the action's subject in the WF's block, which the IO node
+// sender, since the WF wrote it: to the person's IO node (the one whose message started the
+// instance) it names the person as its dst_ilk and the person's channel as its ich, and to the team's
+// IO node no person and no channel, nor to another IO node of start_from. A send to an IO node carries the action's subject in the WF's block, which the IO node
 // places it by.
 func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.sales@motherbee", uuid: "wf-uuid-person"}
 	actx := makeActx(t, disp, &mockTimerSender{})
 	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-3", "conv-3", "invoice", map[string]any{}, fixedClock)
-	inst.PersonILK, inst.PersonICH = "ilk:person", "ich:api:conv-3"
-	const personsIO = "IO.api.billing@motherbee" // the definition's start_from
+	const personsIO = "IO.api.billing@motherbee" // the definition's start_from, the person's
+	inst.PersonILK, inst.PersonICH, inst.PersonIO = "ilk:person", "ich:api:conv-3", personsIO
 	send := func(target, subject string) sdk.Message {
 		t.Helper()
 		action := ActionDefinition{Type: "send_message", Target: target, Subject: subject, Meta: &ActionMeta{Msg: "NOTE"}, Payload: map[string]any{"type": "text", "content": "hi"}}
@@ -254,6 +254,17 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	if ilks(answer) != asReceived {
 		t.Fatalf("the forward changed the message it sent: %s", ilks(answer))
 	}
+
+	// An IO node of start_from the person did not write from is not the person's: when the person
+	// started the instance on another one, what goes to it names no person, and a forward keeps its own.
+	inst.PersonIO = "IO.api.shop@motherbee"
+	if sent := send(personsIO, ""); ilks(sent) != noPerson {
+		t.Fatalf("a send to an IO node of start_from the person did not write from: %s", ilks(sent))
+	}
+	if sent := forward(personsIO, ""); ilks(sent) != asReceived {
+		t.Fatalf("a forward to an IO node of start_from the person did not write from: %s", ilks(sent))
+	}
+	inst.PersonIO = personsIO
 
 	// A person whose message had no ich: what goes to the person's IO node names no channel, never the
 	// supervisors'.

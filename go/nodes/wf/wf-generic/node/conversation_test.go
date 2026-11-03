@@ -784,7 +784,7 @@ func TestAReplayedCreationThatStartsNothingIsAnswered(t *testing.T) {
 const personWorkflowJSON = `{
   "wf_schema_version": "1",
   "workflow_type": "person",
-  "start_from": ["IO.channel@motherbee"],
+  "start_from": ["IO.channel@motherbee", "IO.team@motherbee"],
   "input_schema": {"type": "object"},
   "initial_state": "noting",
   "terminal_states": ["done"],
@@ -805,13 +805,13 @@ const personWorkflowJSON = `{
   ]
 }`
 
-// The instance's person is the src_ilk its start_from nodes' messages share (wf-orchestration-v1
-// §5.4.3): a send_message carries it, whoever else writes on the thread (the team's IO node, an
-// agent), and a message of theirs with no src_ilk changes nothing. A message from a start_from node
-// with another person, as on a Slack channel's top level, where io.slack gives everyone one thread,
-// leaves the instance with no single person: its own messages carry none from then on, after a
-// restart too, and the node's log says so once. Before, they carried the first writer's identity, and
-// an agent bound per-person state to it for everyone.
+// The instance's person is the src_ilk the messages of the person's IO node share (wf-orchestration-v1
+// §5.4.3, §5.5.1): a send_message carries it, whoever else writes on the thread (the team's IO node,
+// though start_from names it too, or an agent), and a message of theirs with no src_ilk changes
+// nothing. A message from the person's IO node with another person, as on a Slack channel's top
+// level, where io.slack gives everyone one thread, leaves the instance with no single person: its own
+// messages carry none from then on, after a restart too, and the node's log says so once. Before, they
+// carried the first writer's identity, and an agent bound per-person state to it for everyone.
 func TestAThreadSeveralPeopleWriteOnLeavesTheInstanceNoPerson(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wf.db")
 	rt, disp := newTestRuntime(t, path, personWorkflowJSON, nil)

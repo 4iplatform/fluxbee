@@ -530,14 +530,14 @@ Every message a WF sends is a `user` message: there is no `meta.type` (before 0.
 
 Every message an instance sends, a `send_message` or a `forward` (§10.7), carries the instance's thread (§14.3): the thread of the message that started it, the conversation's (a message without one starts no instance). An agent keeps one memory per conversation, and its answer comes back on that thread, to the instance. `thread_id_ref`, which replaced the thread with one taken from data, left the language in 0.1.91, and is refused, by its path.
 
-The instance's person is the `src_ilk` and `ich` of the message that started it, when it had them, for as long as the messages from the definition's `start_from` nodes share it. The WF routes, so it says the ILKs of what it sends, from the person (FINDINGS A-139):
+The instance's person is the `src_ilk` and `ich` of the message that started it, when it had them, for as long as the messages from the person's IO node share it. The person's IO node is the node whose message started the instance (`person_io`, §12), not any node of `start_from`: when two channels open conversations, the person writes on one, and the other may be the team's. The WF routes, so it says the ILKs of what it sends, from the person (FINDINGS A-139):
 
 - **To a node that is no `IO.*` node** (an agent, a WF), a `send_message` carries the person as its `src_ilk` and `ich`: an agent files it under the person, as it does a message the WF forwards.
 - **To an `IO.*` node**, a `send_message` names no sender, no `src_ilk`: the WF wrote it, not the person, and the router's stamp names the WF. Who said what goes in the facts, `vars` (§10.9).
-  - To the person's IO node, an `IO.*` node of `start_from`, it names the person: its `dst_ilk` is the person's `src_ilk`, and its `ich` the person's (none when the person's message had none). A `forward` to it names the person the same way (§10.7).
-  - To any other `IO.*` node (the team's, say) it names no person and no channel: no `dst_ilk` and no `ich`.
+  - To the person's IO node, the one whose message started the instance, it names the person: its `dst_ilk` is the person's `src_ilk`, and its `ich` the person's (none when the person's message had none). A `forward` to it names the person the same way (§10.7).
+  - To any other `IO.*` node (the team's, say, even when `start_from` names it too) it names no person and no channel: no `dst_ilk` and no `ich`.
 
-On a thread several people write on (io.slack gives a Slack channel's top level one thread for everyone), a message from a `start_from` node with another `src_ilk` leaves the instance with no person: the store drops it, the node's log says so once, and from then on the instance's sends carry no person and a `forward` keeps the message's own, since an agent binds per-person state to a message's `src_ilk`. A message from another node (the team's IO node, an agent) never counts.
+On a thread several people write on (io.slack gives a Slack channel's top level one thread for everyone), a message from the person's IO node with another `src_ilk` leaves the instance with no person: the store drops it, the node's log says so once, and from then on the instance's sends carry no person and a `forward` keeps the message's own, since an agent binds per-person state to a message's `src_ilk`. A message from another node never counts: an agent, or the team's IO node, even one of `start_from`.
 
 **Payload substitution rules.**
 
@@ -771,7 +771,7 @@ What goes out:
 
 - **The payload, byte for byte**, never decoded: its text, its attachments, the order of its keys and its numbers as they came (`1.10` stays `1.10`, `<b>` stays `<b>`).
 - **The meta is the message's**: every field of it but `memory_package` (its type, `msg`, `src_ilk`, `dst_ilk`, `ich`, `scope`, `priority`, `context` and any other), and the WF sets the thread and the context. The sender's `src_ilk` travels intact: a person's message forwarded to an agent keeps the person, for the agent's memory.
-- **To the person's IO node** (an `IO.*` node of `start_from`) the WF names the person too, when the instance has one (§10.1, FINDINGS A-139): `dst_ilk` is the person's `src_ilk` and `ich` the person's (none when the person's message had none). An agent answers whoever spoke, on the channel they spoke from, so its answer to a supervisor names the supervisor and the supervisors' channel; forwarded to the person, it names the person and the person's channel. Without a person both stay the message's.
+- **To the person's IO node** (the one whose message started the instance) the WF names the person too, when the instance has one (§10.1, FINDINGS A-139): `dst_ilk` is the person's `src_ilk` and `ich` the person's (none when the person's message had none). An agent answers whoever spoke, on the channel they spoke from, so its answer to a supervisor names the supervisor and the supervisors' channel; forwarded to the person, it names the person and the person's channel. Without a person both stay the message's.
 - **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; the WF's block, whose trail is the message's own and this node; and, to the person's IO node, `dst_ilk` and `ich`.
 
 A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` where the event may be no node's message, a `TIMER_FIRED` or an internal event (§8.5, 8d).
@@ -981,12 +981,13 @@ CREATE TABLE wf_instances (
     definition_hash   TEXT NOT NULL DEFAULT '',
     thread_id         TEXT NOT NULL DEFAULT '',
     person_ilk        TEXT NOT NULL DEFAULT '',
-    person_ich        TEXT NOT NULL DEFAULT ''
+    person_ich        TEXT NOT NULL DEFAULT '',
+    person_io         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_wfi_thread ON wf_instances(thread_id);
 ```
 
-`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance. `person_ilk` and `person_ich` are the instance's person, the `src_ilk` and `ich` of the message that started it, which a `send_message` carries (§10.1); both are emptied when a message from a `start_from` node carries another person.
+`state_json` is a serialized JSON object of all workflow variables. `input_json` is the original trigger event's payload. A double keeps its decimal point in both (`7.0`), so a value has the same type after a restart. `thread_id` is the instance's thread (§14.3), indexed: a message on it reaches the instance. `person_ilk` and `person_ich` are the instance's person, the `src_ilk` and `ich` of the message that started it, which a `send_message` carries (§10.1); both are emptied when a message from the person's IO node carries another person. `person_io` is the person's IO node, the router-stamped name of the node whose message started the instance (schema v6, 0.1.95), empty for an instance of before, which then names its person to no IO node.
 
 **`wf_instance_log`** — flat FIFO log of what the runtime did per instance: one entry per action, transition and unhandled event (`action_type`, `summary`, `ok`, `error_detail`). A transition of the catch starts its summary with `catch[<i>]:`, and a send past the cap on agent calls is an action entry that is not ok, its `error_detail` starting with `agent_call_cap` (§9.6). A failure the engine causes on its own starts its `error_detail` with the cause: `transition_panic`, `internal_event_cap`, `definition_unavailable`, `state_not_in_definition`, `replay_exhausted`.
 

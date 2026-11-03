@@ -221,7 +221,7 @@ func TestStoreLoadRunningInstances(t *testing.T) {
 		r.ThreadID = "conv-" + tc.id
 		r.Status = tc.status
 		r.CurrentState = "s"
-		r.PersonILK, r.PersonICH = "ilk:"+tc.id, "ich:api:"+tc.id
+		r.PersonILK, r.PersonICH, r.PersonIO = "ilk:"+tc.id, "ich:api:"+tc.id, "IO.api.sales@motherbee"
 		if err := s.CreateInstance(ctx, r); err != nil {
 			t.Fatalf("CreateInstance %s: %v", tc.id, err)
 		}
@@ -234,8 +234,8 @@ func TestStoreLoadRunningInstances(t *testing.T) {
 	if len(running) != 2 || running[0].InstanceID != "wfi:r1" || running[1].InstanceID != "wfi:r4" {
 		t.Fatalf("expected the 2 running instances, got %+v", running)
 	}
-	if r := running[1]; r.PersonILK != "ilk:wfi:r4" || r.PersonICH != "ich:api:wfi:r4" || r.ThreadID != "conv-wfi:r4" {
-		t.Fatalf("an instance's person and thread: %+v", r)
+	if r := running[1]; r.PersonILK != "ilk:wfi:r4" || r.PersonICH != "ich:api:wfi:r4" || r.PersonIO != "IO.api.sales@motherbee" || r.ThreadID != "conv-wfi:r4" {
+		t.Fatalf("an instance's person, its IO node and its thread: %+v", r)
 	}
 
 	cancelling := base

@@ -188,11 +188,12 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 	return sendWithRetry(ctx, actx, "send_message", msg)
 }
 
-// personsIO reports whether target is the person's IO node: an IO node (IO.*) of the definition's
-// start_from, whose messages carry the instance's person (notePerson). What the WF sends it names the
-// person (toPerson).
+// personsIO reports whether target is the person's IO node: the IO node (IO.*) whose message started
+// the instance (PersonIO), whose messages carry the instance's person (notePerson). What the WF sends
+// it names the person (toPerson). Another IO node of start_from is not the person's: when two
+// channels open conversations, the person writes on one, and the other may be the team's.
 func (inst *WFInstance) personsIO(target string) bool {
-	return wfcel.IsIO(target) && inst.def.StartsFrom(target)
+	return wfcel.IsIO(target) && inst.PersonIO != "" && target == inst.PersonIO
 }
 
 // toPerson names the instance's person on meta, a message to the person's IO node (FINDINGS A-139):

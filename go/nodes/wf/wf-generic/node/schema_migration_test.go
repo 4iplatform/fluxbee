@@ -518,6 +518,57 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', 1, 1, 'hash-ask
 	}
 }
 
+// Case 5 (schema v6, wf-orchestration-v1 §5.5.1): each instance of a v5 store keeps the IO node its
+// person wrote from, empty for an instance of before, and what the v5 store held stays as it was.
+func TestEnsureWFSchemaMigratesV5ToPersonIO(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "wf-v5.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE wf_instances (
+    instance_id TEXT PRIMARY KEY, workflow_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','cancelled','failed')),
+    current_state TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+    current_trace_id TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+    terminated_at_ms INTEGER, definition_hash TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '',
+    person_ilk TEXT NOT NULL DEFAULT '', person_ich TEXT NOT NULL DEFAULT '');`,
+		`INSERT INTO wf_instances (instance_id, workflow_type, status, current_state, created_at_ms, updated_at_ms, definition_hash, thread_id, person_ilk, person_ich)
+VALUES ('wfi:running', 'asking', 'running', 'asking', 1, 2, 'hash-asking', 'conv-1', 'ilk:person', 'ich:api:1');`,
+		`PRAGMA user_version=5;`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("v5 fixture: %v\n%s", err, stmt)
+		}
+	}
+
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("ensureWFSchema: %v", err)
+	}
+	store := &Store{db: db}
+	ctx := context.Background()
+	row, err := store.GetInstance(ctx, "wfi:running")
+	if err != nil || row.Status != "running" || row.ThreadID != "conv-1" || row.PersonILK != "ilk:person" || row.PersonICH != "ich:api:1" || row.PersonIO != "" {
+		t.Fatalf("a v5 instance keeps its person, with no IO node: %+v %v", row, err)
+	}
+	row.PersonIO = "IO.api.sales@motherbee"
+	if err := store.CommitInstanceMutation(ctx, row, InstanceCommitMutation{}); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := store.GetInstance(ctx, "wfi:running"); err != nil || again.PersonIO != "IO.api.sales@motherbee" {
+		t.Fatalf("the migrated store keeps an instance's person's IO node: %+v %v", again, err)
+	}
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != 6 {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	if err := ensureWFSchema(db); err != nil {
+		t.Fatalf("a second run is a no-op: %v", err)
+	}
+}
+
 // Case 4 (schema v5, wf-orchestration-v1 §5.4.10): each instance of a v4 store keeps its person,
 // empty for an instance of before, and the status loses cancelling (FINDINGS A-132): an instance an
 // older engine left cancelling ends cancelled. The table is built again, with its indexes, and what
@@ -567,7 +618,7 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', '', 1, 2, NULL,
 	ctx := context.Background()
 	running, err := store.GetInstance(ctx, "wfi:running")
 	if err != nil || running.Status != "running" || running.StateJSON != `{"n":1}` || running.ThreadID != "conv-1" || running.DefinitionHash != "hash-asking" ||
-		running.UpdatedAtMS != 2 || running.TerminatedAtMS.Valid || running.PersonILK != "" || running.PersonICH != "" {
+		running.UpdatedAtMS != 2 || running.TerminatedAtMS.Valid || running.PersonILK != "" || running.PersonICH != "" || running.PersonIO != "" {
 		t.Fatalf("a running instance stays as it was, with no person: %+v %v", running, err)
 	}
 	if ended, err := store.GetInstance(ctx, "wfi:cancelling"); err != nil || ended.Status != "cancelled" || ended.TerminatedAtMS.Int64 != 3 || ended.CurrentTraceID != "" {
@@ -594,17 +645,17 @@ VALUES ('wfi:running', 'asking', 'running', 'asking', '{"n":1}', '', 1, 2, NULL,
 		t.Fatal("the store refuses a cancelling instance")
 	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 5 {
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&version); err != nil || version != wfSchemaVersion || wfSchemaVersion != 6 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 
 	// The migrated store keeps a new instance's person.
 	person := WFInstanceRow{InstanceID: "wfi:new", ThreadID: "conv-4", WorkflowType: "asking", Status: "running", CurrentState: "asking",
-		InputJSON: `{}`, StateJSON: `{}`, CreatedAtMS: 5, UpdatedAtMS: 5, PersonILK: "ilk:person", PersonICH: "ich:api:4"}
+		InputJSON: `{}`, StateJSON: `{}`, CreatedAtMS: 5, UpdatedAtMS: 5, PersonILK: "ilk:person", PersonICH: "ich:api:4", PersonIO: "IO.api.sales@motherbee"}
 	if err := store.CommitInstanceMutation(ctx, person, InstanceCommitMutation{}); err != nil {
 		t.Fatal(err)
 	}
-	if row, err := store.GetInstance(ctx, "wfi:new"); err != nil || row.PersonILK != "ilk:person" || row.PersonICH != "ich:api:4" {
+	if row, err := store.GetInstance(ctx, "wfi:new"); err != nil || row.PersonILK != "ilk:person" || row.PersonICH != "ich:api:4" || row.PersonIO != "IO.api.sales@motherbee" {
 		t.Fatalf("a new instance's person: %+v %v", row, err)
 	}
 	if err := ensureWFSchema(db); err != nil {

@@ -324,12 +324,14 @@ func creationInput(def *WorkflowDefinition, msg sdk.Message) (map[string]any, er
 // entry_actions. One commit writes the instance, enqueues its internal events and consumes the
 // journaled creation: a crash before it leaves the creation for recovery, which runs it again under
 // the same instance_id (and the same trace_id), so no instance is ever half-started. The instance's
-// thread is msg's, which its callers checked it has, and its person msg's src_ilk and ich.
+// thread is msg's, which its callers checked it has, its person msg's src_ilk and ich, and its
+// person's IO node msg's sender.
 func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanceID string, input map[string]any, inboundID int64) error {
 	def := rt.Def
 	inst := NewInstance(def, instanceID, derefStringPtr(msg.Meta.ThreadID), def.WorkflowType, input, rt.ActCtx.Clock)
 	inst.PersonILK = derefStringPtr(msg.Meta.SrcIlk)
 	inst.PersonICH = derefStringPtr(msg.Meta.Ich)
+	inst.PersonIO = msg.SourceL2Name()
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
 	log.Printf(

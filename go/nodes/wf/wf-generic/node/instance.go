@@ -85,10 +85,12 @@ type WFInstance struct {
 	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) to a node that
 	// is no IO node carries them, so an agent files it under the person, as it does a forwarded one
 	// (the rest of FINDINGS A-116), and what the WF sends the person's IO node names the person as its
-	// dst_ilk and the person's channel as its ich (A-139, toPerson). Both go when a message from a
-	// start_from node carries another person (notePerson).
+	// dst_ilk and the person's channel as its ich (A-139, toPerson). Both go when a message from the
+	// person's IO node carries another person (notePerson). PersonIO is the person's IO node, the
+	// router-stamped name of the node whose message started the instance (personsIO).
 	PersonILK string
 	PersonICH string
+	PersonIO  string
 	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit
 	// writes: kept since the last commit that went through.
 	kept      map[string]keptMessage
@@ -170,6 +172,7 @@ func FromRow(row WFInstanceRow, def *WorkflowDefinition, kept []KeptMessageRow) 
 		UpdatedAtMS:    row.UpdatedAtMS,
 		PersonILK:      row.PersonILK,
 		PersonICH:      row.PersonICH,
+		PersonIO:       row.PersonIO,
 	}
 	if row.TerminatedAtMS.Valid {
 		v := row.TerminatedAtMS.Int64
@@ -213,6 +216,7 @@ func (inst *WFInstance) ToRow(clock ClockFunc) (WFInstanceRow, error) {
 		UpdatedAtMS:    nowMS(clock),
 		PersonILK:      inst.PersonILK,
 		PersonICH:      inst.PersonICH,
+		PersonIO:       inst.PersonIO,
 	}
 	if inst.TerminatedAtMS != nil {
 		row.TerminatedAtMS = newNullInt64(*inst.TerminatedAtMS)
@@ -371,19 +375,19 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	return nil
 }
 
-// notePerson keeps the instance's person only while the messages from its start_from nodes share it.
-// A message from one of them with another, non-empty src_ilk means several people write on the
-// instance's thread (io.slack gives a Slack channel's top level one thread for everyone): the
-// instance has no single person, and its person goes, the node's log says so once, and the event's
-// commit writes it. The WF's own messages carry none from then on: an agent binds per-person state to
-// a message's src_ilk, and the first writer's would mix with the others'. A message from any other
-// node (the team's IO node, an agent) never counts.
+// notePerson keeps the instance's person only while the messages from the person's IO node share it.
+// A message from it with another, non-empty src_ilk means several people write on the instance's
+// thread (io.slack gives a Slack channel's top level one thread for everyone): the instance has no
+// single person, and its person goes, the node's log says so once, and the event's commit writes it.
+// The WF's own messages carry none from then on: an agent binds per-person state to a message's
+// src_ilk, and the first writer's would mix with the others'. A message from any other node never
+// counts: an agent, or the team's IO node, even when start_from names it too.
 func (inst *WFInstance) notePerson(event sdk.Message) {
 	if inst.PersonILK == "" && inst.PersonICH == "" {
 		return
 	}
 	writer := derefStringPtr(event.Meta.SrcIlk)
-	if writer == "" || writer == inst.PersonILK || !inst.def.StartsFrom(event.SourceL2Name()) {
+	if writer == "" || writer == inst.PersonILK || event.SourceL2Name() != inst.PersonIO {
 		return
 	}
 	log.Printf("instance %s: more than one person writes on thread %s (%s, now %s): the instance has no single person, and its own messages carry none from now on",

@@ -15,13 +15,14 @@ import (
 )
 
 const (
-	// wfSchemaVersion 5 (Case 4, wf-orchestration-v1 §5.4.10): an instance keeps its person, the
-	// src_ilk and ich of the message that started it, and an instance's status is no longer
-	// cancelling, which nothing set (FINDINGS A-132). Version 4 (0.1.91): an instance keeps its thread,
+	// wfSchemaVersion 6 (Case 5, wf-orchestration-v1 §5.5.1): an instance keeps its person's IO node,
+	// the node whose message started it (FINDINGS A-139). Version 5 (Case 4, §5.4.10): an instance
+	// keeps its person, the src_ilk and ich of the message that started it, and an instance's status
+	// is no longer cancelling, which nothing set (FINDINGS A-132). Version 4 (0.1.91): an instance keeps its thread,
 	// the conversation's (indexed), and the messages keep_message kept (§5.2.1). Version 3 (0.1.90): a
 	// definition is kept by its hash for as long as a running instance uses it, each instance records
 	// the hash it was born with, and an inbound event is journaled until its transition commits (§5.1).
-	wfSchemaVersion = 5
+	wfSchemaVersion = 6
 	maxLogEntries   = 100
 )
 
@@ -45,12 +46,14 @@ type WFInstanceRow struct {
 	UpdatedAtMS    int64
 	TerminatedAtMS sql.NullInt64
 	// PersonILK and PersonICH are the instance's person: the src_ilk and ich of the message that
-	// started it, empty when it had none, or once a message from a start_from node carried another
+	// started it, empty when it had none, or once a message from the person's IO node carried another
 	// person. A send_message to a node that is no IO node (an agent, a WF) carries them (the rest of
 	// FINDINGS A-116), and what the WF sends the person's IO node names the person as its dst_ilk and
-	// the person's channel as its ich (A-139).
+	// the person's channel as its ich (A-139). PersonIO is the person's IO node: the router-stamped
+	// name of the node whose message started the instance, empty for an instance of before v6.
 	PersonILK string
 	PersonICH string
+	PersonIO  string
 }
 
 // WFLogEntry is a single entry in the per-instance audit log.
@@ -183,7 +186,8 @@ var wfSchemaStatements = []string{
     definition_hash   TEXT NOT NULL DEFAULT '',
     thread_id         TEXT NOT NULL DEFAULT '',
     person_ilk        TEXT NOT NULL DEFAULT '',
-    person_ich        TEXT NOT NULL DEFAULT ''
+    person_ich        TEXT NOT NULL DEFAULT '',
+    person_io         TEXT NOT NULL DEFAULT ''
 );`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_status ON wf_instances(status);`,
 	`CREATE INDEX IF NOT EXISTS idx_wfi_created ON wf_instances(created_at_ms);`,
@@ -262,6 +266,11 @@ func ensureWFSchema(db *sql.DB) error {
 			return fmt.Errorf("migrate wf schema to v5: %w", err)
 		}
 	}
+	if userVersion >= 1 && userVersion < 6 {
+		if err := migrateToPersonIO(tx); err != nil {
+			return fmt.Errorf("migrate wf schema to v6: %w", err)
+		}
+	}
 	for _, stmt := range wfSchemaStatements {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("create wf schema: %w", err)
@@ -326,6 +335,14 @@ func migrateToThreads(tx *sql.Tx) error {
 		}
 	}
 	return nil
+}
+
+// migrateToPersonIO takes a v5 store (or an older one, once at v5) to v6: each instance keeps its
+// person's IO node, the node whose message started it, empty for an instance of before, which then
+// names its person to no IO node.
+func migrateToPersonIO(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE wf_instances ADD COLUMN person_io TEXT NOT NULL DEFAULT '';`)
+	return err
 }
 
 // migrateToPersons takes a v4 store (or an older one, once at v4) to v5. Each instance keeps its
@@ -430,13 +447,13 @@ WHERE hash != ? AND hash NOT IN (
 var errInstanceNotFound = errors.New("not found")
 
 const instanceColumns = `instance_id, thread_id, workflow_type, definition_hash, status, current_state, input_json,
-       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, person_ilk, person_ich`
+       state_json, current_trace_id, created_at_ms, updated_at_ms, terminated_at_ms, person_ilk, person_ich, person_io`
 
 // CreateInstance inserts a new workflow instance row.
 func (s *Store) CreateInstance(ctx context.Context, inst WFInstanceRow) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`, instanceValues(inst)...)
 	return err
 }
 
@@ -444,7 +461,7 @@ func instanceValues(inst WFInstanceRow) []any {
 	return []any{
 		inst.InstanceID, inst.ThreadID, inst.WorkflowType, inst.DefinitionHash, inst.Status, inst.CurrentState,
 		inst.InputJSON, inst.StateJSON, inst.CurrentTraceID,
-		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS, inst.PersonILK, inst.PersonICH,
+		inst.CreatedAtMS, inst.UpdatedAtMS, inst.TerminatedAtMS, inst.PersonILK, inst.PersonICH, inst.PersonIO,
 	}
 }
 
@@ -482,7 +499,7 @@ func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, 
 
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO wf_instances (`+instanceColumns+`)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(instance_id) DO UPDATE SET
     status           = excluded.status,
     current_state    = excluded.current_state,
@@ -491,7 +508,8 @@ ON CONFLICT(instance_id) DO UPDATE SET
     updated_at_ms    = excluded.updated_at_ms,
     terminated_at_ms = excluded.terminated_at_ms,
     person_ilk       = excluded.person_ilk,
-    person_ich       = excluded.person_ich;`, instanceValues(inst)...); err != nil {
+    person_ich       = excluded.person_ich,
+    person_io        = excluded.person_io;`, instanceValues(inst)...); err != nil {
 		return err
 	}
 
@@ -645,7 +663,7 @@ func scanInstances(rows *sql.Rows) ([]WFInstanceRow, error) {
 		if err := rows.Scan(
 			&r.InstanceID, &r.ThreadID, &r.WorkflowType, &r.DefinitionHash, &r.Status, &r.CurrentState,
 			&r.InputJSON, &r.StateJSON, &r.CurrentTraceID,
-			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS, &r.PersonILK, &r.PersonICH,
+			&r.CreatedAtMS, &r.UpdatedAtMS, &r.TerminatedAtMS, &r.PersonILK, &r.PersonICH, &r.PersonIO,
 		); err != nil {
 			return nil, err
 		}
