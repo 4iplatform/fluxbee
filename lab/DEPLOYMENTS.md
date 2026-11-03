@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ⏳ live, gate running | snap `pre-gatefix-0-1-96` (all 4 VMs) · `apt install fluxbee=0.1.95` + core-update of the spokes |
+| **0.1.97** | 2026-11-03 | `b91260a5` | motherbee + spokes (core): SY.admin's executor dispatches a fixed step through the tool's own dispatch (A-144) | ✅ replaced by 0.1.98 (gate in course) | snap `pre-dispatchfix-0-1-97` (deleted 2026-11-03) · `apt install fluxbee=0.1.96` + core-update of the spokes |
+| **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ✅ replaced by 0.1.97 (gate in course) | snap `pre-gatefix-0-1-96` (deleted 2026-11-03) · `apt install fluxbee=0.1.95` + core-update of the spokes |
 | **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ✅ replaced by 0.1.96 (gate in course) | snap `pre-wfcase5-0-1-95` (deleted 2026-11-03) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
 | **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory`; later the motherbee's AI on `claude-opus-5-5` (Archi) | ✅ replaced by 0.1.95 | snap `pre-wfcase4-0-1-94` (deleted 2026-11-03) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
 | **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
@@ -105,6 +106,28 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.97 — From WF Case 5's gate: SY.admin's executor dispatches a fixed step the way the model's tool does (A-144)
+
+- **Date:** 2026-11-03 (ART) · **Previous version:** 0.1.96 · **Commit:** `b91260a5`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** on 0.1.96 the workflow's deploy failed again, `UNKNOWN_ACTION` for
+  `wf_rules_compile_apply`. Archi's chat now said so, as it should. The direct dispatch had reused
+  the executor's fallback, which goes through `handle_admin_command_with_origin`. That routes the
+  command actions and no wf-rules one, a latent bug of the fallback.
+- **What changed:** the fallback dispatches through `dispatch_internal_admin_command`, as the model's
+  tool does. It is boxed, since that dispatch runs the executor itself. A test sends a fixed deploy
+  step to a fake SY.wf-rules.
+- **Checks before the release:** fmt, clippy `-D warnings`, SY.admin's tests (299), the catalog's
+  parity.
+- **Deploy:** build of `b91260a5` in 11 min, publish in 13 s, and 0.1.97 on all 4 in 183 s
+  (manifest `7875ea85500bfd4b`). Health was clean; the web route answered `no_answer` at first,
+  then `acknowledged`, `ready`.
+- **Seen live on 0.1.97:**
+  - Archi's removal of the broken `ventas-gate0195` went through the direct dispatch:
+    `wf_rules_delete`, "Execution completed successfully";
+  - the deploy itself found A-145.
+- **Rollback:** `apt install fluxbee=0.1.96` on the motherbee, then a core-update of the spokes.
 
 ## 0.1.96 — Two fixes from WF Case 5's gate: SY.admin's executor dispatches a plan's fixed steps without its model, identity writes go to the primary; Archi's chat CONFIRM verifies the run (A-144, A-143)
 

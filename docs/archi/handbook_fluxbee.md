@@ -868,7 +868,10 @@ its errors, and the answers that arrive after their wait.
 - **A deploy whose node does not run the definition is refused,** `WF_NODE_NOT_DEPLOYED`: its
   `wf_node` says why (a spawn or a restart that failed, a tenant that does not exist). The
   definition is current anyway: fix the cause, and deploy again.
-- **An update** is one `wf_rules_compile_apply`, and the WF node restarts once.
+- **An update** starts from the deployed definition: read it with `GET
+  /hives/{hive}/wf-rules?workflow_name=<name>` (`wf_rules_get_workflow`: its definition, version and
+  hash), change only what the operator asked, and check it. Never rebuild it from memory. The
+  update is one `wf_rules_compile_apply`, and the WF node restarts once.
   - A running instance keeps the definition it was born with, and a new conversation takes the new
     one.
   - `wf_rules_rollback` goes back to the version before.

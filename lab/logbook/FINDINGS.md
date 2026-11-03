@@ -1078,6 +1078,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-146 🟡 OPEN, low (found 2026-11-03, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
+
+- **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
+  none on 2026-11-01. It fires on every connect of a node that is not `SY.*` or `RT.*`: the gate's
+  clients, agents restarting, an upgrade.
+- **Why:** `assign_vpn` (src/router/mod.rs) warns when the config snapshot holds no VPN rule. No
+  rule is what a hive without VPNs has.
+- **What it breaks:** nothing. It is noise at WARN in every journal sweep, which hides a real one.
+- **Fix:** log it at debug, or not at all.
+
 ### A-145 🟡 FIX BUILT, for 0.1.98 (found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
 
 - **Seen on 8.x (0.1.97):** Archi deployed the gate's workflow as `ventas-gate0195`. The check
