@@ -23,7 +23,9 @@
   tema hasta terminar este"*.
 - **Case 4 (§5.4)** hands the conversation to a person of the team. It was decided with the
   operator from 2026-10-31 to 2026-11-02, released in 0.1.94, and validated on 8.x the same day
-  (§5.4.12; ledger 0.1.94). Case 5 (Archi writes and operates WFs) is next.
+  (§5.4.12; ledger 0.1.94).
+- **Case 5 (§5.5)**, Archi writes and operates WFs, is being decided with the operator from
+  2026-11-02. With it go the ILK fix (A-139) and the bugs this test brought.
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -307,13 +309,13 @@ This is the single place for the track. The cases are worked here one at a time.
 - **Case 4, handing the conversation to a person of the team (§5.4, decided 2026-11-02).** The WF
   bridges the person's IO node and the team's until the conversation comes back. With it come the
   subject marks, the menu for people, "not taken", and the catalog of known options.
-- **Case 5, Archi writes and operates WFs:**
+- **Case 5, Archi writes and operates WFs (§5.5, from 2026-11-02):**
   - a check before deploy, with `COMPILE_ERROR` back to the designer. Today's `check` is a
     compile, and it stages the definition (FINDINGS A-128);
   - instances visible through SY.admin;
   - the pipeline's problems of §4.7.
 
-  Archi's guide to writing WFs moved into Case 3.
+  Archi's guide to writing WFs moved into Case 3; in Case 5 it becomes atomized cases.
 - **Later, in the IO family:** writing first to a person who never wrote (FINDINGS A-114).
 
 ### 5.1 Case 0 (0.1.90): what is broken today. Decided by the operator, 2026-10-28
@@ -1622,6 +1624,58 @@ side.
   - **for io.slack's revamp (A-130):**
     - an empty fact shows as "person:" (the gate's client sends no sender);
     - Slack's own formatting reaches the person as typed (`_Hola…_`).
+
+### 5.5 Case 5: Archi writes and operates WFs. Being decided with the operator, from 2026-11-02
+
+- **The operator's frame (2026-11-02):**
+  - *"enfocate en terminar el WF y usar Archi lo más simple posible, el handbook con los casos
+    atomizados"*.
+  - Archi needs general cases: not a whole case to copy, but the mechanisms it puts together
+    itself (*"no es pasarle todo el caso... sino los mecanismos para que él lo arme"*).
+  - **Out of Case 5, a chapter of its own:** where the solutions Archi deploys are kept, ids for
+    their nodes, debugging them (*"un montón de temas"*).
+- **The topics, outside in.** The operator agreed to all four; each is decided in turn.
+  1. **Archi writes a WF** from atomized cases in its handbook (§4.2): one mechanism each, which
+     Archi combines. A-140's rule goes with it: a text never repeats a value the definition holds
+     elsewhere.
+  2. **A check before deploy** that stages nothing (A-128), with `COMPILE_ERROR` back to the
+     designer (§4.7).
+  3. **Deploying and updating without breaking what runs.** Each instance keeps its definition
+     (§5.1, item 3). §4.7's pipeline problems are read again in the code first.
+  4. **Operating instances through SY.admin** (§4.8): the engine's verbs exist, and nothing exposes
+     them.
+
+  The gate's deployment is mine to choose (the operator): Archi deploys a WF, its agents too, or
+  io.slack as well.
+- **The ILKs (A-139), decided 2026-11-02, built with Case 5.** The WF routes, so it owns the fact:
+  - everything the WF sends to the person's IO node names the person as its `dst_ilk`;
+  - a message the WF writes to an IO node does not name the person as its sender (`src_ilk`,
+    `ich`). Who said what travels in the facts (`vars`), and later in the trace (A-138);
+  - to an agent nothing changes: it gets the person, as A-116 decided.
+- **The test's details go with Case 5 as bugs; their mechanisms wait.** The operator: io.slack's
+  mechanism is partial, and its socket and token rotation are reviewed in its revamp, *"pero si
+  podés sacar bugs, mejor"*; the same for cognition and the rest.
+  - **io.slack** (proposed 2026-11-02):
+    - a reply also sent to the channel, and a reply with a file, reach the mesh (A-130);
+    - a reply with an HTML file goes out (A-108);
+    - a mention that arrives as two events is relayed once (A-130);
+    - a message with no text posts nothing, with a log line, instead of the Spanish fallback
+      (A-130);
+    - a post with only files is recorded (A-130);
+    - an empty fact is left out of the facts line (A-130, the gate);
+    - an event of another channel that a node drops is logged above `debug`, and the doc says that
+      each node needs its own Slack app (A-129).
+  - **For io.slack's revamp:** Socket Mode, and one node per channel or per workspace (A-129);
+    token rotation; the text's format across channels (Slack's `_Hola…_`, A-130); where a message
+    in a channel belongs (A-136).
+  - **Cognition: no bug.** Every node's journal on worker1 and the motherbee during the gate
+    (2026-11-02, 18:45 to 20:40 UTC) holds only the upgrade's restarts, and SY.cognition logged no
+    warning. Its open point is a mechanism, which conversations it follows (A-137): a topic of its
+    own, like the trace (A-138).
+  - **A-140,** the example's texts and the handover summary, goes with topic 1.
+  - **Case 5's own:** A-126 and A-127 (Archi and SY.admin around the agents), and A-128.
+- **Next:** topics 1 to 4, one at a time; then the build's design, its review and the gate. A run
+  from zero closes the track, with the flow fresh in mind (the operator).
 
 ## 6. Docs that drift from the code
 

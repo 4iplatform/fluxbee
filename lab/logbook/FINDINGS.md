@@ -1095,7 +1095,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the summary's description: the person by name, with no internal ids. The catalog pins names and
     params, not descriptions (`TestTheKnownOptionsOnlyGrow`), so it may change.
 
-### A-139 🟡 OPEN, to fix as soon as possible (found 2026-11-02, WF Case 4's gate) — The ILKs on a WF's messages to IO nodes: a forwarded answer keeps the `dst_ilk` of whoever the agent answered, and a WF's own message names the person as its sender
+### A-139 🟡 OPEN, fix decided 2026-11-02, built with WF Case 5 (found 2026-11-02, WF Case 4's gate) — The ILKs on a WF's messages to IO nodes: a forwarded answer keeps the `dst_ilk` of whoever the agent answered, and a WF's own message names the person as its sender
 
 - **What happens:**
   - `forward` sends the message's meta as it came (go/nodes/wf/wf-generic/node/actions.go,
@@ -1125,9 +1125,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator (2026-11-02):** important, to fix as soon as possible, together with the details
   this whole test brought (the first run of Fluxbee as an AI system), and then the flow is tested
   again while it is fresh.
-- **Fix (to decide):** with A-138. Or a forward to a `start_from` node names the instance's person as
-  `dst_ilk` when it has one, and a `send_message` to an IO node does not name the person as its
-  sender.
+- **Fix, decided by the operator (2026-11-02),** with WF Case 5's build
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5). The WF routes, so it owns the
+  fact:
+  - everything the WF sends to the person's IO node names the person as its `dst_ilk`;
+  - a message the WF writes to an IO node does not name the person as its sender;
+  - an agent still gets the person (A-116).
 
 ### A-138 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
@@ -1445,6 +1448,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Slack's formatting reaches the person as typed.** The operator's message in italics reached
     the person's IO node as `_Hola, soy Juan…_`: the text goes out in Slack's own markup, which
     another channel does not read.
+- **The operator (2026-11-02): the bugs go now, with WF Case 5's build; the mechanism waits**
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5). With Case 5: the
+  `thread_broadcast` and the `file_share`, the deduplication by message, no fallback for an empty
+  message, the files-only post recorded, and no empty fact. The text's format across channels
+  stays for the revamp.
 
 ### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
 
@@ -1469,6 +1477,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - or one node that serves several bindings.
 
   Either way, the doc says it, and a dropped event is logged above `debug`.
+- **The operator (2026-11-02):** the log line and the doc go with WF Case 5's build; the mechanism
+  stays for the revamp ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5).
 - **Planned into WF Case 4 on 2026-10-31, and taken out on 2026-11-02.** The plan was a relay: the
   node that gets another channel's event hands it to the node bound there, as a mesh message.
   - The operator: it looks like a workaround, and not the way the system must end up. *"si sirve
@@ -2055,6 +2065,8 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   io.wapp sends the text only and drops every attachment, an older deferral.
 - **Planned into WF Case 4 on 2026-10-31, and taken out on 2026-11-02:** to io.slack's revamp (A-129
   has the operator's definition).
+- **The operator (2026-11-02):** io.slack's bugs go now, with WF Case 5's build
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5).
 
 ### A-107 🔵 PENDING by the operator's choice (2026-10-27) — A published page cannot be updated under the same link
 
