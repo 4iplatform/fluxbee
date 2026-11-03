@@ -858,6 +858,9 @@ its errors, and the answers that arrive after their wait.
   - In chat, check every definition, show the operator what it does, and only then deploy.
   - In the pipeline, the designer's workflows are checked before the plan, and a refusal comes back
     to the designer.
+- **A workflow's name** is lowercase letters and digits, in parts joined by dots, the first
+  starting with a letter: `sales`, `sales.gate0195`, never `sales-gate`. Its runtime is
+  `wf.<workflow_name>`, and the runtime naming policy has no hyphen; the check refuses one.
 - **The manifest:** `desired_state.wf_deployments[i]` holds `hive`, `workflow_name`, `definition`
   and `ownership`, and `tenant_id` for a workflow its hive does not have yet. The pipeline deploys
   with `auto_spawn` and that tenant, so a node that does not exist is spawned.

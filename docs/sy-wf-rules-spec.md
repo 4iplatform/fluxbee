@@ -698,7 +698,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `INSTANCES_UNKNOWN` | Delete refused because WF node did not respond to instance count query within timeout (and force=false). Cannot confirm zero instances. |
 | `PACKAGE_PUBLISH_FAILED` | sy.wf-rules could not materialize/install the workflow package in dist. |
 | `ORCHESTRATOR_ERROR` | A node action through SY.admin failed (the code is kept for compatibility of callers). |
-| `INVALID_WORKFLOW_NAME` | workflow_name does not match naming regex. |
+| `INVALID_WORKFLOW_NAME` | workflow_name does not match `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`, the runtime naming policy, since its runtime is `wf.<workflow_name>`: no hyphens (since 0.1.98; a hyphen passed the check and the package's publish refused it). |
 | `INVALID_CONFIG_SET` | CONFIG_SET payload malformed. |
 | `UNSUPPORTED_OPERATION` | Unknown operation string. |
 | `UNSUPPORTED_APPLY_MODE` | A CONFIG_SET whose `apply_mode` is not `replace`. |

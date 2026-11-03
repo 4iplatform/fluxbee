@@ -1078,6 +1078,26 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-145 🟡 FIX BUILT, for 0.1.98 (found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
+
+- **Seen on 8.x (0.1.97):** Archi deployed the gate's workflow as `ventas-gate0195`. The check
+  passed, and so did the compile. The publish then refused the runtime:
+  `PACKAGE_PUBLISH_FAILED`, "name='wf.ventas-gate0195' does not match runtime naming policy
+  (lowercase + dots)".
+  - The definition was current already, version 1, with no package and no node. Archi removed it
+    on the operator's word (`wf_rules_delete`, through the executor's direct dispatch, 0.1.97).
+- **Why:** three rules for one name.
+  - SY.wf-rules' `workflowNamePattern` allowed hyphens: `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`.
+  - Archi's `valid_workflow_name` and SY.admin's catalog note copied that rule.
+  - The runtime naming policy, `runtime_name_regex` in src/runtime_package.rs,
+    `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`, has none. A workflow's runtime is `wf.<workflow_name>`.
+- **Built (0.1.98):**
+  - SY.wf-rules, Archi and SY.admin's note follow the runtime policy;
+  - SY.wf-rules' refusal says the rule (`invalidWorkflowName`), so the check refuses the name
+    before anything rotates;
+  - the handbook says it (§4.2.7);
+  - a test refuses hyphens at compile and at check (`TestCompileWorkflowRejectsInvalidWorkflowName`).
+
 ### A-144 🟡 FIX BUILT, for 0.1.97 (found 2026-11-03, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
 
 - **Seen on 8.x:** Archi's plan deployed the gate's workflow with `wf_rules_compile_apply`. The
