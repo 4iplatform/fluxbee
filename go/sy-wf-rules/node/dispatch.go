@@ -311,14 +311,27 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 		})
 		return
 	}
-	operation := strings.TrimSpace(strings.ToLower(stringValueFromMap(configMap, "operation")))
-	if operation == "" {
-		operation = "compile"
-	}
-	if operation == "check" {
-		operation = "compile"
-	}
-	switch operation {
+	switch operation := configOperation(configMap); operation {
+	case "check":
+		// A read (CheckWorkflow): it stages nothing and takes no version. Every answer to it carries
+		// its operation and check_id (sendNodeConfigResponse).
+		checkReq, err := configCompileRequest(msg)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		check, err := s.CheckWorkflow(checkReq)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":            true,
+			"node_name":     s.nodeName(),
+			"workflow_name": check.WorkflowName,
+			"guard_count":   check.GuardCount,
+			"state_count":   check.StateCount,
+		})
 	case "compile":
 		compileReq, err := configCompileRequest(msg)
 		if err != nil {
@@ -460,8 +473,39 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 	}
 }
 
+// configOperation is the operation a CONFIG_SET's config asks for: compile when it names none.
+func configOperation(config map[string]any) string {
+	operation := strings.TrimSpace(strings.ToLower(stringValueFromMap(config, "operation")))
+	if operation == "" {
+		return "compile"
+	}
+	return operation
+}
+
+// requestedCheck is the check_id of a CONFIG_SET whose config asks for a check, and whether it does.
+func requestedCheck(msg fluxbeesdk.Message) (string, bool) {
+	if stringValue(msg.Meta.Msg) != fluxbeesdk.MSGConfigSet {
+		return "", false
+	}
+	var request struct {
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(msg.Payload, &request); err != nil || configOperation(request.Config) != "check" {
+		return "", false
+	}
+	return stringValueFromMap(request.Config, "check_id"), true
+}
+
+// sendNodeConfigResponse answers a CONFIG_GET or a CONFIG_SET with a CONFIG_RESPONSE. Every answer to
+// a check, a refusal or an error reply included, carries operation check and echoes its check_id,
+// which SY.admin matches it by, as SY.opa-rules' answers to its checks do.
 func (s *Service) sendNodeConfigResponse(request fluxbeesdk.Message, payload map[string]any) {
+	checkID, isCheck := requestedCheck(request)
 	s.sendReply(request, fluxbeesdk.MSGConfigResponse, payload, func(payload map[string]any) (fluxbeesdk.Message, error) {
+		if isCheck {
+			payload["operation"] = "check"
+			payload["check_id"] = checkID
+		}
 		return fluxbeesdk.BuildNodeConfigResponseMessage(&request, s.sender.UUID(), payload)
 	}, func(err error) map[string]any {
 		return map[string]any{

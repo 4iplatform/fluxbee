@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -379,5 +381,174 @@ func TestADefinitionIsStagedWithItsNumbersAsWritten(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// wfRulesCheck is SY.admin's check of a definition (wf-orchestration-v1 §5.5.1), from sender: a
+// CONFIG_SET whose config is a compile request's fields, with operation check and a check_id.
+func wfRulesCheck(t *testing.T, sender, checkID, workflow string, definition any) fluxbeesdk.Message {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"node_name": "SY.wf-rules@motherbee", "schema_version": 1, "config_version": 0, "apply_mode": "replace",
+		"config": map[string]any{"operation": "check", "check_id": checkID, "workflow_name": workflow, "definition": definition},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configSet := fluxbeesdk.MSGConfigSet
+	return fluxbeesdk.Message{
+		Routing: fluxbeesdk.Routing{Src: "admin-uuid", SrcL2Name: &sender, TraceID: "trace-" + checkID},
+		Meta:    fluxbeesdk.Meta{MsgType: fluxbeesdk.SYSTEMKind, Msg: &configSet},
+		Payload: payload,
+	}
+}
+
+// snapshotTree maps each directory and file under roots to what it holds: a file its content, a
+// directory "(dir)".
+func snapshotTree(t *testing.T, roots ...string) map[string]string {
+	t.Helper()
+	tree := map[string]string{}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				tree[path] = "(dir)"
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			tree[path] = string(data)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tree
+}
+
+// A check is a read (wf-orchestration-v1 §5.5.1), as SY.opa-rules' is: SY.admin's CONFIG_SET with
+// operation check validates the definition as a compile does, with a compile's codes and the exact
+// paths of its errors, and is answered at once, echoing its check_id, whatever the outcome. Between a
+// compile and its apply it changes nothing: no file under the state dir or the dist, no package
+// published, no version taken. The apply that follows applies what was compiled before the checks,
+// at its version.
+func TestACheckIsAReadThatEchoesItsCheckID(t *testing.T) {
+	svc := newTestService(t)
+	admin := svc.admin.(*fakeAdminClient)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+		t.Fatal(err)
+	}
+	second := validWorkflowDefinition()
+	second["description"] = "issues invoice, its second version"
+	staged, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, published := snapshotTree(t, svc.store.Root(), svc.cfg.DistRuntimeRoot), admin.publishCalls
+
+	checked := validWorkflowDefinition()
+	checked["description"] = "a definition that is only checked"
+	badGuard := validWorkflowDefinition()
+	badGuard["states"].([]any)[0].(map[string]any)["transitions"].([]any)[0].(map[string]any)["guard"] = "event.payload.complete =="
+	knownOptionWhole := validWorkflowDefinition()
+	state := knownOptionWhole["states"].([]any)[0].(map[string]any)
+	state["entry_actions"] = append(state["entry_actions"].([]any), map[string]any{
+		"type": "send_message", "target": "AI.billing@motherbee", "meta": map[string]any{"msg": "ASK"},
+		"menu":    map[string]any{"options": []any{map[string]any{"name": "answer", "description": "You answer."}}},
+		"payload": map[string]any{"text": "ready?"},
+	})
+	cases := []struct {
+		name, sender, workflow string
+		definition             any
+		code, path             string // a refusal's code, and the path its detail starts with
+	}{
+		{name: "a valid definition", workflow: "invoice", definition: checked},
+		{name: "a workflow the store does not have", workflow: "billing", definition: checked},
+		{name: "a guard that does not compile", workflow: "invoice", definition: badGuard, code: "COMPILE_ERROR", path: "states[0].transitions[0].guard: "},
+		{name: "a known option written whole", workflow: "invoice", definition: knownOptionWhole, code: "COMPILE_ERROR",
+			path: "states[0].entry_actions[1].menu.options[0]: answer is a known option: write it by its name alone"},
+		{name: "an invalid workflow name", workflow: "Invoice", definition: checked, code: "INVALID_WORKFLOW_NAME"},
+		{name: "no definition", workflow: "invoice", code: "INVALID_CONFIG_SET"},
+		{name: "not from the admin", sender: "AI.rogue@motherbee", workflow: "invoice", definition: checked, code: "UNAUTHORIZED"},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &recordingSender{}
+			svc.sender = sender
+			from := tc.sender
+			if from == "" {
+				from = fluxbeesdk.PrimaryAdminNode
+			}
+			checkID := fmt.Sprintf("check-%d", i)
+			svc.handleMessage(wfRulesCheck(t, from, checkID, tc.workflow, tc.definition))
+			if len(sender.sent) != 1 {
+				t.Fatalf("sent %d answers, want 1", len(sender.sent))
+			}
+			reply := sender.sent[0]
+			if stringValue(reply.Meta.Msg) != fluxbeesdk.MSGConfigResponse || reply.Routing.Dst.Value() != "admin-uuid" || reply.Routing.TraceID != "trace-"+checkID {
+				t.Fatalf("a CONFIG_RESPONSE to the requester, on its trace: %s to %s on %s", stringValue(reply.Meta.Msg), reply.Routing.Dst.Value(), reply.Routing.TraceID)
+			}
+			var answer map[string]any
+			if err := json.Unmarshal(reply.Payload, &answer); err != nil {
+				t.Fatal(err)
+			}
+			if answer["operation"] != "check" || answer["check_id"] != checkID || answer["node_name"] != "SY.wf-rules@motherbee" {
+				t.Fatalf("an answer to a check names it and echoes its check_id: %v", answer)
+			}
+			if tc.code == "" {
+				keys := make([]string, 0, len(answer))
+				for key := range answer {
+					keys = append(keys, key)
+				}
+				sort.Strings(keys)
+				if strings.Join(keys, ",") != "check_id,guard_count,node_name,ok,operation,state_count,workflow_name" || answer["ok"] != true ||
+					answer["workflow_name"] != tc.workflow || answer["guard_count"] != float64(1) || answer["state_count"] != float64(2) {
+					t.Fatalf("a definition that loads: %v", answer)
+				}
+			} else {
+				refusal, _ := answer["error"].(map[string]any)
+				detail, _ := refusal["detail"].(string)
+				if answer["ok"] != false || answer["state"] != "error" || refusal["code"] != tc.code || !strings.HasPrefix(detail, tc.path) {
+					t.Fatalf("want %s at %q, got %v", tc.code, tc.path, answer)
+				}
+				// From the admin, the refusal is the one a compile of the same request answers, with the
+				// request's config_version.
+				if tc.sender == "" {
+					_, err := newTestService(t).CompileWorkflow(CompileRequest{WorkflowName: tc.workflow, Definition: tc.definition})
+					compiled, ok := err.(WfRulesError)
+					if !ok || compiled.Code != tc.code || compiled.Detail != detail || answer["config_version"] != float64(0) {
+						t.Fatalf("a compile answers %v, the check %v", err, answer)
+					}
+				}
+			}
+			if after := snapshotTree(t, svc.store.Root(), svc.cfg.DistRuntimeRoot); !reflect.DeepEqual(after, before) || admin.publishCalls != published {
+				t.Fatalf("a check changed the store or the dist (%d publishes):\nbefore %v\nafter  %v", admin.publishCalls-published, before, after)
+			}
+		})
+	}
+
+	// An answer refused as over the frame limit is replaced by the error reply, which echoes the
+	// check_id too.
+	sender := &recordingSender{refuse: 1}
+	svc.sender = sender
+	svc.handleMessage(wfRulesCheck(t, fluxbeesdk.PrimaryAdminNode, "check-refused", "invoice", checked))
+	if len(sender.sent) != 1 || !strings.Contains(string(sender.sent[0].Payload), `"check_id":"check-refused"`) ||
+		!strings.Contains(string(sender.sent[0].Payload), `"WFRULES_ERROR"`) {
+		t.Fatalf("the error reply to a check: %+v", sender.sent)
+	}
+
+	// The apply after the checks applies what was staged before them, at its version, and the next
+	// compile takes the version after it.
+	result, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice", Version: staged.Version})
+	if err != nil || result.Current.Version != 2 || result.Current.Hash != staged.Hash {
+		t.Fatalf("the apply after the checks: %+v %v", result, err)
+	}
+	if next := svc.store.NextVersion("invoice"); next != 3 || svc.store.WorkflowExists("billing") {
+		t.Fatalf("the checks took a version (next %d) or wrote a workflow", next)
 	}
 }

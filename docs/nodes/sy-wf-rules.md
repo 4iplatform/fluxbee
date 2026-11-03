@@ -71,6 +71,32 @@ request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
 option stays written by its name alone, and the WF node's load writes the catalog's words in.
 Nothing is published or deployed.
 
+### Check
+
+`CheckWorkflow` (`node/compile.go`) validates a definition exactly as a compile does, with the
+same code (`loadWorkflow`): the same name check, the same load and limits, the same error codes,
+each error with its path. It is a read: it writes nothing (no staged definition, no package, no
+file of the store) and takes no version (one in the request is ignored), so a check between a
+compile and its apply leaves the staged and the current definitions as they were. SY.admin's
+`wf_rules_check` sends it, as `opa_check` sends SY.opa-rules' check (wf-orchestration-v1 §5.5.1).
+
+- **The request:** a `CONFIG_SET` whose `config` is a compile's fields with `operation: check` and a
+  `check_id`:
+
+  ```text
+  {"operation": "check", "check_id": "<uuid>", "workflow_name": "invoice", "definition": {...}}
+  ```
+
+- **The answer:** a `CONFIG_RESPONSE`. Every answer to a check carries `operation: check` and echoes
+  its `check_id`, which SY.admin matches it by (`sendNodeConfigResponse`):
+  - a definition that loads: `ok: true`, `node_name`, `operation: check`, `check_id`,
+    `workflow_name`, `guard_count` and `state_count`, with no `config_version`;
+  - a refusal: a compile's error (`ok: false`, `state: error`, the request's `schema_version` and
+    `config_version`, `error: {code, detail}`), with `operation` and `check_id`. The code is
+    `INVALID_WORKFLOW_NAME`, `INVALID_CONFIG_SET` (no definition) or `COMPILE_ERROR`, whose detail
+    names each error's path (`states[0].transitions[0].guard: ...`), the errors joined by
+    semicolons.
+
 ### Apply and rollback (the deploy)
 
 `ApplyWorkflowAndDeploy` / `RollbackWorkflowAndDeploy` (`node/deploy.go`):
@@ -147,7 +173,7 @@ waits 75 s for the answer (`wf_rules_request_timeout`, overridable with
 
 | Message | Content | Who may send |
 | --- | --- | --- |
-| `CONFIG_SET` (`SYSTEM`) | `config.operation`: `compile` (also `check`), `apply`, `rollback`, `compile_apply`, with `workflow_name`, `definition`, `version`, `auto_spawn`, `tenant_id`, `launched_by` | `SY.admin@motherbee` only |
+| `CONFIG_SET` (`SYSTEM`) | `config.operation`: `compile`, `apply`, `rollback`, `compile_apply`, with `workflow_name`, `definition`, `version`, `auto_spawn`, `tenant_id`, `launched_by`; or `check`, read-only, with `check_id`, `workflow_name` and `definition` (see Check) | `SY.admin@motherbee` only |
 | `CONFIG_GET` (`SYSTEM`) | returns `hive_id`, `state_dir`, the supported operations | `SY.admin@motherbee` only |
 | `command` `delete_workflow` | `{workflow_name, force}` | `SY.admin@motherbee` only |
 | `command` `compile_workflow`, `apply_workflow`, `rollback_workflow` | as the operations above | `SY.admin@motherbee` only |
@@ -182,11 +208,13 @@ only through SY.admin.
 On the motherbee (`127.0.0.1:8080`). The admin sends the four write operations as a
 `CONFIG_SET` with `operation` and `launched_by: operator`, delete as the `delete_workflow`
 command, and reads as queries, all to `SY.wf-rules@<hive in the URL>`
-(`handle_wf_rules_http`, `handle_wf_rules_query`).
+(`handle_wf_rules_http`, `handle_wf_rules_query`). It sends the check (`wf_rules_check`) as a
+`CONFIG_SET` with `operation: check` and a fresh `check_id`, and waits for that answer only.
 
 | Route | Admin action |
 | --- | --- |
 | `POST /hives/{hive}/wf-rules` body `{workflow_name, definition, auto_spawn, tenant_id}` | `wf_rules_compile_apply` |
+| `POST /hives/{hive}/wf-rules/check` body `{workflow_name, definition}` | `wf_rules_check` |
 | `POST /hives/{hive}/wf-rules/compile` | `wf_rules_compile` |
 | `POST /hives/{hive}/wf-rules/apply` body `{workflow_name, version?, auto_spawn?, tenant_id?}` | `wf_rules_apply` |
 | `POST /hives/{hive}/wf-rules/rollback` | `wf_rules_rollback` |

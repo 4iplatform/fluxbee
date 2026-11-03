@@ -11,43 +11,87 @@ import (
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 )
 
+// CompileWorkflow validates a definition (loadWorkflow) and stages it as written, under the version
+// the request gives or else the next one.
 func (s *Service) CompileWorkflow(req CompileRequest) (*WfRulesMetadata, error) {
-	workflowName := strings.TrimSpace(req.WorkflowName)
-	if !workflowNamePattern.MatchString(workflowName) {
-		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
-	}
-	if req.Definition == nil {
-		return nil, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: "definition is required"}
-	}
-
-	definitionBytes, err := normalizeDefinitionBytes(req.Definition)
+	loaded, err := s.loadWorkflow(req)
 	if err != nil {
-		return nil, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}
+		return nil, err
 	}
-	def, err := wfcel.LoadDefinitionBytes(definitionBytes, "", s.clock)
-	if err != nil {
-		return nil, WfRulesError{Code: "COMPILE_ERROR", Detail: err.Error()}
-	}
-
 	version := req.Version
 	if version == 0 {
-		version = s.store.NextVersion(workflowName)
+		version = s.store.NextVersion(loaded.name)
 	}
 	meta := WfRulesMetadata{
 		Version:         version,
-		Hash:            HashDefinition(definitionBytes),
-		WorkflowName:    workflowName,
-		WorkflowType:    def.WorkflowType,
-		WFSchemaVersion: def.WFSchemaVersion,
+		Hash:            HashDefinition(loaded.definitionBytes),
+		WorkflowName:    loaded.name,
+		WorkflowType:    loaded.def.WorkflowType,
+		WFSchemaVersion: loaded.def.WFSchemaVersion,
 		CompiledAt:      s.clock().UTC().Format(timeRFC3339),
-		GuardCount:      countGuards(def),
-		StateCount:      len(def.States),
-		ActionCount:     countActions(def),
+		GuardCount:      countGuards(loaded.def),
+		StateCount:      len(loaded.def.States),
+		ActionCount:     countActions(loaded.def),
 	}
-	if err := s.store.WriteStaged(workflowName, definitionBytes, meta); err != nil {
+	if err := s.store.WriteStaged(loaded.name, loaded.definitionBytes, meta); err != nil {
 		return nil, err
 	}
 	return &meta, nil
+}
+
+// WorkflowCheck is what a check answers of a definition that loads: its workflow, and the counts a
+// compile would stage.
+type WorkflowCheck struct {
+	WorkflowName string
+	GuardCount   int
+	StateCount   int
+}
+
+// CheckWorkflow validates a definition as CompileWorkflow does (loadWorkflow: the same load, the
+// same limits, the same errors with their paths) and writes nothing (wf-orchestration-v1 §5.5.1):
+// no staged definition, no package, no file of the store. It takes no version, and takes up none.
+// A check is a read, as SY.opa-rules' is, so one between a compile and its apply leaves the staged
+// definition and the current one as they were.
+func (s *Service) CheckWorkflow(req CompileRequest) (*WorkflowCheck, error) {
+	loaded, err := s.loadWorkflow(req)
+	if err != nil {
+		return nil, err
+	}
+	return &WorkflowCheck{
+		WorkflowName: loaded.name,
+		GuardCount:   countGuards(loaded.def),
+		StateCount:   len(loaded.def.States),
+	}, nil
+}
+
+// loadedWorkflow is a compile request whose definition loads: the workflow's name, the definition's
+// bytes as a compile stages them, and the definition the WF node loads from them.
+type loadedWorkflow struct {
+	name            string
+	definitionBytes []byte
+	def             *wfcel.WorkflowDefinition
+}
+
+// loadWorkflow validates what a compile and a check are given: the workflow's name
+// (INVALID_WORKFLOW_NAME), a definition (INVALID_CONFIG_SET without one), and the definition loaded
+// as the WF node loads it, with wfcel.LoadDefinitionBytes (COMPILE_ERROR, naming each path).
+func (s *Service) loadWorkflow(req CompileRequest) (loadedWorkflow, error) {
+	workflowName := strings.TrimSpace(req.WorkflowName)
+	if !workflowNamePattern.MatchString(workflowName) {
+		return loadedWorkflow{}, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+	}
+	if req.Definition == nil {
+		return loadedWorkflow{}, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: "definition is required"}
+	}
+	definitionBytes, err := normalizeDefinitionBytes(req.Definition)
+	if err != nil {
+		return loadedWorkflow{}, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}
+	}
+	def, err := wfcel.LoadDefinitionBytes(definitionBytes, "", s.clock)
+	if err != nil {
+		return loadedWorkflow{}, WfRulesError{Code: "COMPILE_ERROR", Detail: err.Error()}
+	}
+	return loadedWorkflow{name: workflowName, definitionBytes: definitionBytes, def: def}, nil
 }
 
 // checkSlotLoads loads the definition of a slot as the WF node will, before an apply publishes the
