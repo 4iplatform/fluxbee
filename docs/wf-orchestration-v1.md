@@ -1667,8 +1667,13 @@ side.
          and leaves the staged and the current definitions alone. A check id ties the answer to
          its request, and each error names its exact path.
        - **Archi checks every definition before showing it to the operator.** In the pipeline, a
-         failed check goes back to the role that wrote the definition as an audit finding (3
-         attempts, `MAX_ARTIFACT_ATTEMPTS`). In chat, the handbook's order is check, show, deploy.
+         failed check goes back to the role that wrote the definition, the designer, as design
+         feedback (3 iterations, `MAX_DESIGN_ITERATIONS`). In chat, the handbook's order is check,
+         show, deploy.
+       - *Corrected 2026-11-03, while building:* a workflow's definition is the designer's, in the
+         manifest's `wf_deployments`. The programmer builds only runtime packages
+         (`artifact_bundle_from_real_programmer_submission`). So the check belongs to the design
+         stage, not to the artifact loop.
        - **A deploy that fails anyway** goes back to that role too, and `restart_from_design`
          carries the error.
   3. **Deploying and updating without breaking what runs.** Each instance keeps its definition
@@ -1821,12 +1826,12 @@ Six pieces. Each one's tests come with it, and every behavior below is a contrac
 
 **Piece 4, SY.architect** (src/bin/sy_architect.rs and src/bin/sy_architect/):
 - **Topic 2, the check:**
-  - **In the artifact loop,** after the shape audit, a `workflow_definition` artifact goes to
-    `wf_rules_check` on its hive. Each error is an audit finding (`INVALID_WF_DEFINITION`, with its
-    path), so the programmer gets it in its repair packet (`RetryArtifact`, up to
-    `MAX_ARTIFACT_ATTEMPTS`). A check that cannot run is a blocking finding, never a pass.
-  - **A deploy's `COMPILE_ERROR`** is `ArtifactContractInvalid`, with the error as the finding:
-    back to the programmer.
+  - **At the design stage,** once the designer's manifest passes `validate_manifest_v2`, each
+    `wf_deployments[i]` goes to `wf_rules_check` on its hive. Each refusal is a design finding that
+    names the workflow and the error's path, so the designer gets it as feedback (`RetryDesign`,
+    up to `MAX_DESIGN_ITERATIONS`). A check that cannot run is a blocking finding, never a pass.
+  - **A deploy's `COMPILE_ERROR`** goes back to the designer too, as a design failure that carries
+    the error.
   - **`restart_from_design`** gives the new run's design the blocked run's last error.
   - **In chat,** Archi's prompt and the handbook say: check, show, deploy.
 - **Topic 3, the deploy:**
