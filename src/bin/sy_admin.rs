@@ -3096,16 +3096,50 @@ fn build_executor_step_events_from_result(
     (events, action_called, failure)
 }
 
+/// Whether the model has nothing to add to `step`: no `executor_fill`, or one that allows no field.
+fn executor_step_has_nothing_to_fill(step: &AdminExecutorPlanStep) -> bool {
+    step.executor_fill
+        .as_ref()
+        .is_none_or(|fill| fill.allowed.is_empty())
+}
+
+/// Why the executor dispatches a step itself, as the plan wrote it: the plan left the model
+/// nothing to fill (`executor_step_has_nothing_to_fill`), or the model did not call the step's
+/// action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorDirectDispatch {
+    AsPlanned,
+    ModelDidNotCall,
+}
+
+impl ExecutorDirectDispatch {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AsPlanned => "as planned",
+            Self::ModelDidNotCall => "fallback dispatch",
+        }
+    }
+
+    /// The code of a step that cannot be dispatched (an unknown action, args that do not fit).
+    fn invalid_code(self) -> &'static str {
+        match self {
+            Self::AsPlanned => "EXECUTOR_STEP_INVALID",
+            Self::ModelDidNotCall => "EXECUTOR_NO_ACTION_CALL",
+        }
+    }
+}
+
 async fn execute_admin_executor_step_fallback(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     execution_id: &str,
     step_index: usize,
     step: &AdminExecutorPlanStep,
+    how: ExecutorDirectDispatch,
 ) -> (AdminExecutorStepEvent, Option<AdminExecutorFailure>) {
     let timestamp = now_epoch_ms();
     let failure_from_detail = |detail: String, source: &str| AdminExecutorFailure {
-        code: "EXECUTOR_NO_ACTION_CALL".to_string(),
+        code: how.invalid_code().to_string(),
         detail,
         source: source.to_string(),
         step_id: Some(step.id.clone()),
@@ -3235,7 +3269,7 @@ async fn execute_admin_executor_step_fallback(
             detail: internal
                 .get("error_detail")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("executor fallback dispatch failed")
+                .unwrap_or("the step's dispatch failed")
                 .to_string(),
             source: "admin_action_failure".to_string(),
             step_id: Some(step.id.clone()),
@@ -3249,7 +3283,7 @@ async fn execute_admin_executor_step_fallback(
                 step_action: step.action.clone(),
                 status: "failed".to_string(),
                 timestamp,
-                summary: format!("{} -> failed (fallback dispatch)", step.action),
+                summary: format!("{} -> failed ({})", step.action, how.label()),
                 tool_name: Some(step.action.clone()),
                 tool_args_preview: Some(step.args.clone()),
                 result_preview: Some(internal),
@@ -3268,7 +3302,7 @@ async fn execute_admin_executor_step_fallback(
                 step_action: step.action.clone(),
                 status: "done".to_string(),
                 timestamp,
-                summary: format!("{} -> done (fallback dispatch)", step.action),
+                summary: format!("{} -> done ({})", step.action, how.label()),
                 tool_name: Some(step.action.clone()),
                 tool_args_preview: Some(step.args.clone()),
                 result_preview: Some(internal),
@@ -3529,78 +3563,101 @@ async fn execute_admin_executor_plan(
         validate_executor_plan_step_semantics(&resolved_step, &format!("execution.steps[{index}]"))
             .map_err(|detail| -> AdminError { detail.into() })?;
 
-        let step_spec = resolve_internal_action_spec(&resolved_step.action)
-            .map_err(|detail| -> AdminError { format!("step '{}': {detail}", step.id).into() })?;
-        let mut tools = FunctionToolRegistry::new();
-        tools
-            .register(Arc::new(AdminExecutorStepTool {
-                ctx: ctx.clone(),
-                client: client.clone(),
-                step: resolved_step.clone(),
-                definition: build_admin_executor_function_definition(step_spec),
-            }))
-            .map_err(|err| -> AdminError {
-                format!("executor tool registration failed: {err}").into()
-            })?;
-        if request.plan.execution.allow_help_lookup {
-            let help_spec = resolve_internal_action_spec("get_admin_action_help")
-                .map_err(|detail| -> AdminError { detail.into() })?;
-            tools
-                .register(Arc::new(AdminExecutorHelpTool {
-                    ctx: ctx.clone(),
-                    client: client.clone(),
-                    step: resolved_step.clone(),
-                    definition: build_admin_executor_function_definition(help_spec),
-                }))
-                .map_err(|err| -> AdminError {
-                    format!("executor help tool registration failed: {err}").into()
-                })?;
-        }
-
-        let model = create_function_calling_model(
-            runtime.provider,
-            runtime.api_key.clone(),
-            None,
-            runtime.model.clone(),
-            Some(admin_executor_prompt(&resolved_step, &request.plan)),
-            runtime.model_settings.clone(),
-            account.clone(),
-        );
-        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-        let result = runner
-            .run_with_input(
-                model.as_ref(),
-                &tools,
-                FunctionRunInput {
-                    current_user_message: format!(
-                        "Execute step '{}' ({}) using the provided plan and tool contract.",
-                        resolved_step.id, resolved_step.action
-                    ),
-                    current_user_parts: None,
-                    immediate_memory: None,
-                },
-            )
-            .await
-            .map_err(|err| -> AdminError { format!("executor model run failed: {err}").into() })?;
-
-        let (mut step_events, action_called, mut failure) = build_executor_step_events_from_result(
-            &request.execution_id,
-            index,
-            &resolved_step,
-            &result,
-        );
-        if !action_called && failure.is_none() {
-            let (fallback_event, fallback_failure) = execute_admin_executor_step_fallback(
+        // A step with nothing for the model to fill (no executor_fill) goes as the plan wrote it,
+        // its references resolved: the model can only repeat its args, a change is refused
+        // (merge_executor_step_arguments), and repeating a long one, a workflow's definition,
+        // outgrew the model's answer (WF Case 5's gate). The model runs only for what it fills.
+        let (mut step_events, mut failure) = if executor_step_has_nothing_to_fill(&resolved_step) {
+            let (event, failure) = execute_admin_executor_step_fallback(
                 ctx,
                 client,
                 &request.execution_id,
                 index,
                 &resolved_step,
+                ExecutorDirectDispatch::AsPlanned,
             )
             .await;
-            step_events.push(fallback_event);
-            failure = fallback_failure;
-        }
+            (vec![event], failure)
+        } else {
+            let step_spec = resolve_internal_action_spec(&resolved_step.action).map_err(
+                |detail| -> AdminError { format!("step '{}': {detail}", step.id).into() },
+            )?;
+            let mut tools = FunctionToolRegistry::new();
+            tools
+                .register(Arc::new(AdminExecutorStepTool {
+                    ctx: ctx.clone(),
+                    client: client.clone(),
+                    step: resolved_step.clone(),
+                    definition: build_admin_executor_function_definition(step_spec),
+                }))
+                .map_err(|err| -> AdminError {
+                    format!("executor tool registration failed: {err}").into()
+                })?;
+            if request.plan.execution.allow_help_lookup {
+                let help_spec = resolve_internal_action_spec("get_admin_action_help")
+                    .map_err(|detail| -> AdminError { detail.into() })?;
+                tools
+                    .register(Arc::new(AdminExecutorHelpTool {
+                        ctx: ctx.clone(),
+                        client: client.clone(),
+                        step: resolved_step.clone(),
+                        definition: build_admin_executor_function_definition(help_spec),
+                    }))
+                    .map_err(|err| -> AdminError {
+                        format!("executor help tool registration failed: {err}").into()
+                    })?;
+            }
+
+            let model = create_function_calling_model(
+                runtime.provider,
+                runtime.api_key.clone(),
+                None,
+                runtime.model.clone(),
+                Some(admin_executor_prompt(&resolved_step, &request.plan)),
+                runtime.model_settings.clone(),
+                account.clone(),
+            );
+            let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+            let result = runner
+                .run_with_input(
+                    model.as_ref(),
+                    &tools,
+                    FunctionRunInput {
+                        current_user_message: format!(
+                            "Execute step '{}' ({}) using the provided plan and tool contract.",
+                            resolved_step.id, resolved_step.action
+                        ),
+                        current_user_parts: None,
+                        immediate_memory: None,
+                    },
+                )
+                .await
+                .map_err(|err| -> AdminError {
+                    format!("executor model run failed: {err}").into()
+                })?;
+
+            let (mut step_events, action_called, mut failure) =
+                build_executor_step_events_from_result(
+                    &request.execution_id,
+                    index,
+                    &resolved_step,
+                    &result,
+                );
+            if !action_called && failure.is_none() {
+                let (fallback_event, fallback_failure) = execute_admin_executor_step_fallback(
+                    ctx,
+                    client,
+                    &request.execution_id,
+                    index,
+                    &resolved_step,
+                    ExecutorDirectDispatch::ModelDidNotCall,
+                )
+                .await;
+                step_events.push(fallback_event);
+                failure = fallback_failure;
+            }
+            (step_events, failure)
+        };
         if failure.is_none() && resolved_step.action == "add_hive" {
             if let Some(answer) =
                 successful_step_output(&step_events, "add_hive").filter(|answer| {
@@ -17073,6 +17130,17 @@ async fn purge_tenant_vault_block(
     }
 }
 
+/// The hive whose SY.identity takes an identity command: a read (`get_ilk`, `get_tenant`) goes to
+/// the path's hive, whose replica answers it; anything else writes, and only the primary, this
+/// hive's, writes an ILK or a tenant (A-143). A spoke's replica refuses SY.admin of another hive
+/// (F-07), so a write there failed with UNAUTHORIZED_REGISTRAR, naming no cause.
+fn identity_command_hive(admin_hive: &str, action: &str, path_hive: Option<String>) -> String {
+    match path_hive {
+        Some(hive) if matches!(action, "get_ilk" | "get_tenant") => hive,
+        _ => admin_hive.to_string(),
+    }
+}
+
 async fn handle_identity_command(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -17080,7 +17148,7 @@ async fn handle_identity_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let target_hive = identity_command_hive(&ctx.hive_id, action, hive);
     if action == "purge_tenant" {
         if let Some(blocked) = purge_tenant_vault_block(client, &target_hive, &payload).await {
             return Ok(blocked);
@@ -22619,6 +22687,71 @@ mod tests {
     #[test]
     fn http_status_line_supports_accepted() {
         assert_eq!(http_status_line(202), "HTTP/1.1 202 Accepted");
+    }
+
+    /// Only the primary, SY.admin's own hive, writes an ILK or a tenant: a write that names a
+    /// spoke goes there anyway, and a read goes to the replica the path names (A-143, WF Case 5's
+    /// gate: Archi assigned a worker's agents their roles with `hive: worker1`).
+    #[test]
+    fn identity_writes_go_to_the_primary_whatever_hive_the_path_names() {
+        for write in [
+            "set_ilk_definition",
+            "delete_ilk",
+            "set_ilk_tenant",
+            "purge_tenant",
+            "create_tenant",
+        ] {
+            assert_eq!(
+                identity_command_hive("motherbee", write, Some("worker1".to_string())),
+                "motherbee",
+                "{write}"
+            );
+            assert_eq!(
+                identity_command_hive("motherbee", write, None),
+                "motherbee",
+                "{write}"
+            );
+        }
+        for read in ["get_ilk", "get_tenant"] {
+            assert_eq!(
+                identity_command_hive("motherbee", read, Some("worker1".to_string())),
+                "worker1",
+                "{read}"
+            );
+            assert_eq!(
+                identity_command_hive("motherbee", read, None),
+                "motherbee",
+                "{read}"
+            );
+        }
+    }
+
+    /// A step the plan left nothing to fill is dispatched as planned, without the model; one with
+    /// fields to fill still goes to the model (WF Case 5's gate: a workflow's definition outgrew
+    /// the model's answer when it had to repeat it).
+    #[test]
+    fn a_step_with_nothing_to_fill_skips_the_executor_model() {
+        let step = |executor_fill: Option<AdminExecutorFill>| AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "wf_rules_compile_apply".to_string(),
+            args: serde_json::json!({ "hive": "worker1", "workflow_name": "sales" }),
+            executor_fill,
+        };
+        assert!(executor_step_has_nothing_to_fill(&step(None)));
+        assert!(executor_step_has_nothing_to_fill(&step(Some(
+            AdminExecutorFill::default()
+        ))));
+        assert!(!executor_step_has_nothing_to_fill(&step(Some(
+            AdminExecutorFill {
+                allowed: vec!["version".to_string()],
+                notes: vec![],
+            }
+        ))));
+        assert_eq!(ExecutorDirectDispatch::AsPlanned.label(), "as planned");
+        assert_eq!(
+            ExecutorDirectDispatch::ModelDidNotCall.invalid_code(),
+            "EXECUTOR_NO_ACTION_CALL"
+        );
     }
 
     #[test]

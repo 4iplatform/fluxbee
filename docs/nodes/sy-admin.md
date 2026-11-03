@@ -235,7 +235,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | node lifecycle, node config/state/status, a node's self-description (`node_help`), hives, versions, runtimes, deployments, drift alerts, storage path, `core_rollback` (`action_routes_via_local_orchestrator`) | `SY.orchestrator@motherbee`, with `payload.target` = the hive; `node_name@hive` overrides `target` (`normalize_admin_payload`) | `msg_type: admin`, `meta.action` |
 | routes, VPNs, taps | `SY.config.routes@<hive>` | `msg_type: admin` (`build_admin_request`) |
 | `inventory` | `SY.orchestrator@motherbee` | `INVENTORY_REQUEST` (`handle_inventory_http`) |
-| identity actions | `SY.identity@<hive>` | `ILK_*`, `TNT_*` (`handle_identity_command`, `handle_identity_query`) |
+| identity actions | writes: `SY.identity@motherbee`, the primary, whatever hive the path names (A-143; a spoke's replica refuses SY.admin of another hive, F-07); reads (`get_ilk`, `get_tenant`, the lists): `SY.identity@<hive>` | `ILK_*`, `TNT_*` (`handle_identity_command`, `identity_command_hive`, `handle_identity_query`) |
 | vault actions | `SY.vault@motherbee`; another hive is refused with `400 INVALID_REQUEST` ("SY.vault runs only on the motherbee") | `VAULT_*` (`handle_vault_command`) |
 | `teardown_node` | `SY.identity@motherbee`, then `SY.vault@motherbee`, then SY.identity again | `ILK_GET`, `VAULT_LIST`, `VAULT_DELETE`, `ILK_DELETE`, `ILK_PURGE` ([Node teardown](#node-teardown)) |
 | `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core or vendor; default runtime), `SYSTEM_SYNC_HINT` |
@@ -459,12 +459,18 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   every action in the registry and not mesh-only, args valid against the action's function
   schema, no `<placeholder>` strings. `executor_validate_plan` also runs an LLM review of each
   step against its help (`semantic_review_executor_plan`); issues give `PLAN_REVIEW_FAILED`.
-- **Execution** (`execute_admin_executor_plan`): for each step, an LLM run whose only tools are
-  that step's action (and `get_admin_action_help` if `allow_help_lookup`). The prompt tells it to
-  call the action with exactly the step's args (`admin_executor_prompt`). If the model calls no
-  tool, SY.admin runs the step directly (`execute_admin_executor_step_fallback`). Later steps can
-  use earlier results with `$steps.<step_id>.<path>`. With `stop_on_error` the run stops at the
-  first failure. `dry_run` validates only.
+- **Execution** (`execute_admin_executor_plan`): each step's `$steps.<step_id>.<path>`
+  references are resolved first, from the earlier steps' results.
+  - **A step with nothing to fill**, with no `executor_fill` (or one that allows no field), is
+    dispatched as the plan wrote it, with no model (`executor_step_has_nothing_to_fill`, since
+    0.1.95). The model could only repeat its args, since a change is refused. Repeating a long one,
+    a workflow's definition, outgrew the model's answer at WF Case 5's gate. Its events say "as
+    planned".
+  - **A step with fields to fill** gets an LLM run, whose only tools are that step's action (and
+    `get_admin_action_help` if `allow_help_lookup`). The prompt tells it to call the action with
+    exactly the step's args (`admin_executor_prompt`). If the model calls no tool, SY.admin runs
+    the step directly (`execute_admin_executor_step_fallback`, "fallback dispatch").
+  - With `stop_on_error` the run stops at the first failure. `dry_run` validates only.
 - **add_hive**: the orchestrator answers `accepted` and joins in the background (PB-7), so before
   the next step the executor follows the join (`follow_add_hive_join`). Every 5 s it reads the
   hive as `GET /hives/{hive}` answers it, without an audit entry per read, until the entry's
