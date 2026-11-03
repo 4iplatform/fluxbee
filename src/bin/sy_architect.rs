@@ -10063,11 +10063,29 @@ async fn handle_chat_message(
                                 "budget": trace.token_budget,
                             });
                         }
-                        if let Some(entry) = prog_pending.cookbook_entry {
-                            append_plan_compile_cookbook_entry(&state.state_dir, entry);
+                        // As the pipeline does: a run is done once its report verifies, a failed
+                        // step and a deployed WF node that does not run included, and only then
+                        // does the plan teach the cookbook.
+                        let verdict = verify_execution_result(&output);
+                        if verdict.eligible_for_cookbook {
+                            if let Some(entry) = prog_pending.cookbook_entry {
+                                append_plan_compile_cookbook_entry(&state.state_dir, entry);
+                            }
                         }
+                        let status = if verdict.verified_success {
+                            "ok"
+                        } else {
+                            if executor_output_is_successful(&output) {
+                                output["message"] = json!(format!(
+                                    "The plan ran, but it is not done: {}",
+                                    verdict.reason
+                                ));
+                            }
+                            "error"
+                        };
+                        output["verification_verdict"] = json!(verdict);
                         ChatResponse {
-                            status: "ok".to_string(),
+                            status: status.to_string(),
                             mode: "executor".to_string(),
                             output,
                             session_id: Some(resolved_session_id.clone()),
@@ -12605,6 +12623,34 @@ fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
 /// in sy_admin.rs), and a margin.
 const EXECUTOR_HIVE_JOIN_WAIT_SECS: u64 = 35 * 60;
 
+/// What Archi waits for SY.admin's executor per workflow deploy or removal of a plan: SY.admin
+/// waits up to 75 s for SY.wf-rules (`wf_rules_request_timeout`), as Archi's own wf-rules call
+/// does, with a margin.
+const EXECUTOR_WF_RULES_WAIT_SECS: u64 = 90;
+
+/// The steps of an executor plan that deploy or remove a workflow.
+fn plan_wf_rules_writes(plan: Option<&Value>) -> u64 {
+    plan.and_then(|plan| plan.pointer("/execution/steps"))
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| {
+                    matches!(
+                        step.get("action").and_then(Value::as_str),
+                        Some(
+                            "wf_rules_compile_apply"
+                                | "wf_rules_apply"
+                                | "wf_rules_rollback"
+                                | "wf_rules_delete"
+                        )
+                    )
+                })
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
 /// The add_hive steps of an executor plan: each one joins a hive.
 fn plan_hive_joins(plan: Option<&Value>) -> u64 {
     plan.and_then(|plan| plan.pointer("/execution/steps"))
@@ -12649,7 +12695,9 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
     match action {
         "executor_validate_plan" => Duration::from_secs(executor_secs()),
         "executor_execute_plan" => Duration::from_secs(
-            executor_secs() + plan_hive_joins(params.get("plan")) * EXECUTOR_HIVE_JOIN_WAIT_SECS,
+            executor_secs()
+                + plan_hive_joins(params.get("plan")) * EXECUTOR_HIVE_JOIN_WAIT_SECS
+                + plan_wf_rules_writes(params.get("plan")) * EXECUTOR_WF_RULES_WAIT_SECS,
         ),
         "add_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
@@ -14041,19 +14089,37 @@ async fn execute_executor_plan_with_context(
         "executor.run",
     )
     .await?;
+    // A run that answered no summary (the executor failed before its steps) says why, never that
+    // the plan finished.
+    let status = execute_output
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let message = execute_output
+        .get("payload")
+        .and_then(|payload| payload.get("summary"))
+        .and_then(|summary| summary.get("final_message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if status.eq_ignore_ascii_case("ok") {
+                "Executor plan finished".to_string()
+            } else {
+                format!(
+                    "Executor plan failed: {}",
+                    response_detail_text(&execute_output)
+                        .unwrap_or_else(|| "the executor gave no detail".to_string())
+                )
+            }
+        });
     Ok(json!({
-        "status": execute_output.get("status").cloned().unwrap_or_else(|| json!("error")),
+        "status": status,
         "action": "executor_execute_plan",
         "payload": execute_output.get("payload").cloned().unwrap_or(Value::Null),
         "validation": validate_output.get("payload").cloned().unwrap_or(Value::Null),
         "error_code": execute_output.get("error_code").cloned().unwrap_or(Value::Null),
         "error_detail": execute_output.get("error_detail").cloned().unwrap_or(Value::Null),
-        "message": execute_output
-            .get("payload")
-            .and_then(|payload| payload.get("summary"))
-            .and_then(|summary| summary.get("final_message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Executor plan finished"),
+        "message": message,
     }))
 }
 
@@ -28369,6 +28435,11 @@ mod tests {
         assert_eq!(
             execute(&["add_hive", "add_hive", "run_node"]),
             base + Duration::from_secs(70 * 60)
+        );
+        // Each workflow deploy or removal waits for SY.wf-rules, up to 75 s in SY.admin.
+        assert_eq!(
+            execute(&["run_node", "wf_rules_compile_apply", "wf_rules_delete"]),
+            base + Duration::from_secs(2 * 90)
         );
 
         let mut confirmation = json!({ "stage": "confirm2" });
