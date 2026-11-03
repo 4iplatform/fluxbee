@@ -1766,6 +1766,156 @@ side.
 - **Next:** topics 1 to 4, one at a time; then the build's design, its review and the gate. A run
   from zero closes the track, with the flow fresh in mind (the operator).
 
+#### 5.5.1 The build design and the gate (2026-11-03)
+
+Six pieces. Each one's tests come with it, and every behavior below is a contract the review checks.
+
+**Piece 1, the WF engine and the language** (go/nodes/wf/wf-generic, go/pkg/wfcel, the example):
+- **A-139, the ILKs** (actions.go):
+  - a `send_message` or a `forward` to an `IO.*` node of the definition's `start_from` names the
+    instance's person as `dst_ilk`, when the instance has one. Without a person, a forward keeps its
+    `dst_ilk`, and a send has none;
+  - a `send_message` to an `IO.*` node carries no `src_ilk` and no `ich`. The router's stamp names
+    the WF as its sender, and the facts (`vars`) say who said what;
+  - to an `AI.*` or a `WF.*` node nothing changes: a send carries the person (A-116).
+- **A-140:**
+  - the example's texts (go/nodes/wf/examples/packages/wf.sales.invoice) name no duration;
+  - the catalog's `handover` `summary` reads "What the team needs to take over: the person by name,
+    what they want, what was done. No internal ids." The handbook's table follows
+    (`TestTheHandbookListsTheKnownOptions`).
+- **Tests:**
+  - an agent's answer to a supervisor reaches the person's IO node with the person's `dst_ilk`;
+  - a `HANDOVER` post carries no person;
+  - an agent still gets the person.
+
+**Piece 2, SY.wf-rules' check** (go/sy-wf-rules):
+- **`check` is an operation of its own,** no longer `compile` under another name (dispatch.go). As
+  go/sy-opa-rules' check:
+  - it validates the definition as a compile does, with the same limits;
+  - it writes nothing: no staged definition, no package, no store row. It takes no version;
+  - it answers `ok`, the `check_id` of its request (echoed from `config.check_id`), and on a
+    refusal the error with its exact path.
+- **Tests:** a check between a compile and its apply leaves the staged definition and the current
+  one as they were; a refused definition answers its path; the check id comes back.
+
+**Piece 3, SY.admin and SY.frontdesk.gov** (src/bin/sy_admin.rs, nodes/gov/ai-frontdesk-gov):
+- **`wf_rules_check`:** `POST /hives/{hive}/wf-rules/check`, `{workflow_name, definition}`, "Validate
+  a workflow definition without staging or applying it."
+  - It goes to `SY.wf-rules@<hive>` with a fresh `check_id`, and waits for that answer only, as
+    `send_opa_check` does.
+  - It is in every list `opa_check` is: the catalog, the help, the args, the examples, and the
+    parity script.
+- **The instances** (topic 4), each sent to the WF node, answering the engine's payload as it is:
+  - `wf_list_instances`: `GET /hives/{hive}/nodes/{node}/wf/instances?status=&limit=`
+    (`WF_LIST_INSTANCES`). The limit is 50 by default, and at most 200;
+  - `wf_get_instance`: `GET /hives/{hive}/nodes/{node}/wf/instances/{instance_id}?log_limit=`
+    (`WF_GET_INSTANCE`);
+  - `wf_cancel_instance`: `POST /hives/{hive}/nodes/{node}/wf/instances/{instance_id}/cancel`, with
+    `{reason}` (`WF_CANCEL_INSTANCE`).
+
+  A bare node name takes the path's hive, and a name that is not `WF.*` is refused.
+- **A-127:** `control/config-get`, `control/config-set` and `messages` qualify a bare name with the
+  path's hive. `messages` refuses a qualified name of another hive, as the control routes do.
+- **A-141:** SY.admin's executor key and SY.frontdesk.gov's key are read at boot with
+  `resolve_resource_awaiting_vault` and `VAULT_BOOT_WAIT`, as their peers do (A-26).
+
+**Piece 4, SY.architect** (src/bin/sy_architect.rs and src/bin/sy_architect/):
+- **Topic 2, the check:**
+  - **In the artifact loop,** after the shape audit, a `workflow_definition` artifact goes to
+    `wf_rules_check` on its hive. Each error is an audit finding (`INVALID_WF_DEFINITION`, with its
+    path), so the programmer gets it in its repair packet (`RetryArtifact`, up to
+    `MAX_ARTIFACT_ATTEMPTS`). A check that cannot run is a blocking finding, never a pass.
+  - **A deploy's `COMPILE_ERROR`** is `ArtifactContractInvalid`, with the error as the finding:
+    back to the programmer.
+  - **`restart_from_design`** gives the new run's design the blocked run's last error.
+  - **In chat,** Archi's prompt and the handbook say: check, show, deploy.
+- **Topic 3, the deploy:**
+  - **`DesiredWfDeployment.tenant_id`:** the designer declares it, and it is required for a
+    workflow the snapshot does not have. The pipeline pins `auto_spawn: true` and that tenant on the
+    create's `wf_rules_compile_apply` (`pin_wf_plan_steps`). The plan compiler is no longer told to
+    add them.
+  - **`WfDeployRestart`** plans `wf_rules_compile_apply` alone.
+  - **A removal (`WfRemove`):**
+    - its delta operation notes the workflow's running instances, from the snapshot's
+      `active_instances`: a number, or "unknown";
+    - the confirmation shows them;
+    - the pinned `wf_rules_delete` carries `force: true`.
+- **Topic 4:** Archi reaches `wf_list_instances` and `wf_get_instance` as reads, and
+  `wf_cancel_instance` as a change that it asks the operator first, in the same lists and with the
+  same timeouts as the other admin actions.
+- **Archi's own model.** `CONFIG_SET` on SY.architect takes `ai.model`:
+  - a model of the hive's provider, by ai.generic's check (A-104), kept with Archi's config;
+  - without it, the hive's model;
+  - `CONFIG_GET` shows the model and whose it is;
+  - the AI runtime is rebuilt with no restart, and the contract's notes say so.
+- **The limits:**
+  - every call of Archi's asks for up to 32,000 tokens;
+  - `TASK_AGENT_TOKEN_BUDGET` is 1,000,000;
+  - a call of Archi's may take 600 s, with no shorter limit under it (the HTTP client's included).
+    The SDK's `MODEL_CALL_TIMEOUT` stays 300 s for every other node.
+- **A-126:** `DELETE /api/agent-assets?hash=` and `delete_agent_asset` refuse while an ILK definition
+  names the hash, and list those ILKs. With `force`, the asset is deleted anyway.
+- **The cookbook:** the two WF seeds give way to one small seed, the basic loop, at `seed_version` 6.
+
+**Piece 5, io.slack's bugs** (nodes/io/io-slack; A-130, A-108, A-129):
+- **Replies that reach the mesh now:**
+  - a `thread_broadcast` is relayed as the plain message it is;
+  - a `file_share` is relayed with its files, after the checks a plain message gets.
+- **Deduplication** is by the message (channel and `ts`) as well as by the event.
+- **A message with no text, no blocks and no files** posts nothing, and logs it.
+- **A post with only files, on a new place:** a first text post names the files and is recorded,
+  and the files go under it.
+- **An empty fact** is left out of the facts line.
+- **Files:**
+  - an HTML file goes out;
+  - a file Slack refuses no longer fails the rest: the text and the other files go, and the text
+    names what was left out.
+- **A dropped event of another channel** is logged at `info`.
+- **docs/io/io-slack.md** says that each node needs its own Slack app.
+
+**Piece 6, mine, the handbook and the docs:**
+- **Handbook §4.2, the atoms.** One small case per mechanism, each a definition that compiles alone,
+  and the docs test compiles them:
+  1. a person talks with an agent;
+  2. the conversation goes to another agent, and comes back by `done` or by inactivity;
+  3. escalating a question: the agent consults the supervisors, and stays the person's voice;
+  4. escalating the conversation: people take it, and give it back by an option or a timer;
+  5. a timer whose time an agent's answer gives;
+  6. the catch: answers in any state, late events, `none` and errors.
+
+  Case 4's handover is a combination of 4 and 5, never a pattern of its own.
+- **Rules:**
+  - A-140's two rules;
+  - check, show, deploy;
+  - operating instances;
+  - a removal with conversations running.
+- **The docs:** docs/nodes/sy-wf-rules.md (the check), the admin actions, docs/io/io-slack.md, and
+  §4.7 and §4.8 marked as resolved here.
+
+**The release (0.1.95), beyond the deploy:**
+- **Archi's model:** `ai.model` set to `claude-opus-5-5` on SY.architect, through SY.admin.
+- **The motherbee's `hive.yaml`** goes back to `claude-sonnet-5-5`, with its four AI nodes
+  restarted. Only Archi stays on Opus (the operator).
+
+**The gate, mine, from zero:**
+1. **The old gate goes:** WF `gate0192`, its node, its three agents and their roles. These stay:
+   - the test tools (the tenant `pruebas`, its keys, `AI.pruebas@worker1`);
+   - `IO.slack.gate0192`, for io.slack's own checks.
+2. **I ask Archi for a solution** in the operator's words: sales serves a person; invoicing takes
+   the conversation and gives it back; sales escalates a question and the conversation to a team; a
+   timer. The person and the team are gate clients on worker1. Archi works from the atoms: it
+   checks, shows, and deploys.
+3. **The person and the team talk to it,** and each atom's behavior is checked, with the ILKs of
+   A-139 in the messages that arrive.
+4. **Archi operates it:** it lists the instances, shows one, and cancels one after asking.
+5. **Archi changes a text.** The node restarts once, and a running instance keeps its definition.
+6. **Archi removes the workflow with a conversation running.** Its plan says so, and the removal
+   goes ahead on the confirmation.
+7. **Everything Archi deployed goes,** so the next case starts from zero.
+
+On io.slack, whatever needs no person writing in Slack is checked live: an HTML file, an empty
+fact, a files-only post. The rest is checked by tests.
+
 ## 6. Docs that drift from the code
 
 **Fixed in 0.1.90,** every item below and more that the review found. A test now validates every
