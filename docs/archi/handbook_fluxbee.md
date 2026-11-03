@@ -234,7 +234,8 @@ operating one.
 - **Where it runs:** where SY.wf-rules runs, on the motherbee or a worker. Never on an ingress or
   an egress hive.
 - **The atoms:** §4.2.6 has each mechanism as a small definition. The seeds `wf_node_with_workflow`
-  and `workflow_definition` hold atom 1, and §4.2.7 says how to check, deploy and operate a WF.
+  and `workflow_definition` hold the basic loop, atom 1 with a catch, and §4.2.7 says how to check,
+  deploy and operate a WF.
 
 #### 4.2.1 The definition
 

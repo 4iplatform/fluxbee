@@ -207,12 +207,18 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   by SY.admin, run after the operator's `CONFIRM`, then checked. The plan compiler is given the
   declared user policy, workflow definitions, routes and VPN rules, and the plan's steps are
   pinned to the manifest afterwards (`pin_plan_steps`): `opa_compile_apply` carries exactly the
-  declared rego, `wf_rules_compile_apply` exactly the declared hive, name and definition (the plan
-  compiler adds only `auto_spawn` and `tenant_id`), the `restart_node` after it that workflow's
-  node, `wf_rules_delete` exactly the workflow its operation names, without `force`, `add_route`
-  and `add_vpn` exactly the declared route or VPN rule, and the `delete_route` / `delete_vpn` of a
-  replace exactly its prefix or pattern. A pinned step loses its `executor_fill`, so SY.admin's
-  executor cannot add a field back.
+  declared rego; `wf_rules_compile_apply` exactly the declared hive, name and definition, and on a
+  first deploy `auto_spawn: true` and the workflow's declared `tenant_id`; an update is that one
+  step, since SY.wf-rules restarts the node itself; `wf_rules_delete` exactly the workflow its
+  operation names, with `force: true`, after the operator confirmed a plan that says how many of
+  its instances run; `add_route` and `add_vpn` exactly the declared route or VPN rule, and the
+  `delete_route` / `delete_vpn` of a replace exactly its prefix or pattern. A pinned step loses its
+  `executor_fill`, so SY.admin's executor cannot add a field back.
+- **The workflow check** (WF Case 5): once the designer's manifest passes validation, each
+  declared workflow goes to `wf_rules_check` on its hive (`check_declared_workflows`). A refusal
+  goes back to the designer as feedback, with the error's path; a check that cannot run blocks.
+  A deploy's `COMPILE_ERROR` goes back to the designer too (`redesign_after_failed_deploy`), and
+  `restart_from_design` gives the new run the blocked run's last error.
 - Failures are classified first by rules, then by an LLM if no rule matched
   (`failure_classifier.rs`), and either retried or escalated.
 
@@ -262,13 +268,20 @@ skills, handbooks and a personality.
 
 ## LLM, key and usage records
 
-- **Provider and model**: the hive.yaml `ai` section (`ai.default_provider`,
-  `ai.providers.<provider>.model`); with no section, `openai` and `gpt-5.5`
+- **Provider**: the hive.yaml `ai` section's `ai.default_provider`; with no section, `openai`
   (`HiveAiConfig::fallback`).
-- **Key**: from SY.vault, the root tenant's secret of the provider's resource type, read as
-  Archi. `VAULT_SECRET_CHANGED` for that type, or for `postgres`, rebuilds the AI runtime or the
-  messages connection. `CONFIG_SET` refuses `ai`, `ai_providers`, `api_key`, `api_key_ref` and
-  the messages URL fields (`reject_architect_secret_fields`).
+- **Model**: Archi's own, `config.ai.model`, set by `CONFIG_SET` and kept in its node directory's
+  `config.json`; `null` goes back to the hive's, `ai.providers.<provider>.model`. The AI runtime
+  is rebuilt at once, with no restart. `CONFIG_GET` shows the model and its source (`ai.model` or
+  `hive`).
+- **Limits**: every model call asks for up to 32,000 output tokens and may take 600 s
+  (`ARCHITECT_MODEL_CALL_TIMEOUT`); a pipeline task's budget is 1,000,000 tokens
+  (`TASK_AGENT_TOKEN_BUDGET`).
+- **Key**: from SY.vault, read as Archi, in the root tenant: the key Archi owns, else one assigned
+  to it, else the tenant's general one (8.x holds `anthropic_architect`, Archi's own).
+  `VAULT_SECRET_CHANGED` for that type, or for `postgres`, rebuilds the AI runtime or the messages
+  connection. `CONFIG_SET` refuses `ai_providers`, `api_key`, `api_key_ref`, the messages URL
+  fields (`reject_architect_secret_fields`), and any key under `ai` but `model`.
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, source
   `root`) with work `{session_id, pipeline_run_id, solution_id, stage}` (`usage_account`). The
   stage is `chat`, `designer`, `design_auditor`, `programmer`, `plan_compiler` or
