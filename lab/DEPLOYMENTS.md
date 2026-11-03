@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory`; later the motherbee's AI on `claude-opus-5-5` (Archi) | ✅ live, gate passed | snap `pre-wfcase4-0-1-94` (all 4 VMs) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
+| **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ⏳ live, gate running | snap `pre-wfcase5-0-1-95` (all 4 VMs) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
+| **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory`; later the motherbee's AI on `claude-opus-5-5` (Archi) | ✅ replaced by 0.1.95 | snap `pre-wfcase4-0-1-94` (deleted 2026-11-03) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
 | **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
 | **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
 | **0.1.91** | 2026-10-30 | `75a6786` | motherbee + spokes (core) | ✅ replaced by 0.1.92 | snap `pre-wfcase1-0-1-91` (deleted 2026-10-30) · `apt install fluxbee=0.1.90` + core-update of the spokes |
@@ -103,6 +104,85 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.95 — The WF track, Case 5: Archi writes and operates WFs; the handbook's atoms, the workflow check, deploys that create, update and remove as decided, a WF's instances, Archi's own model (wf-orchestration-v1 §5.5; A-139, A-140, A-126, A-127, A-128, A-141, A-130, A-108, A-129)
+
+- **Date:** 2026-11-03 (ART) · **Previous version:** 0.1.94 · **Commit:** `a864b0aa`.
+- **Scope:** motherbee and the three spokes (core update). Then two config steps of the release
+  (§5.5.1): Archi's own model, and the motherbee's `hive.yaml` back on Sonnet.
+- **Design:** decided with the operator on 2026-11-02 and 2026-11-03 (wf-orchestration-v1 §5.5,
+  topics 1 to 4, Archi's model, key and limits). The build design is §5.5.1. Four agents built it,
+  each in its own worktree; I merged their work. One review round followed, with five reviewers
+  (§5.5.2), and its fixes went in before the release.
+- **What changed:**
+  - **The WF engine:**
+    - a WF's send to an IO node names no sender;
+    - what goes to the person's IO node names the person as its `dst_ilk` and the person's channel
+      as its `ich` (A-139);
+    - the person's IO node is the one whose message started the instance (store v6,
+      `person_io`).
+  - **SY.wf-rules:**
+    - `check`, a read-only operation of its own, with its `check_id` (A-128);
+    - a deploy whose WF node does not run the definition is refused, `WF_NODE_NOT_DEPLOYED`.
+  - **SY.admin:**
+    - `wf_rules_check`;
+    - `wf_list_instances`, `wf_get_instance` and `wf_cancel_instance`, the last one confirmed;
+    - a bare node name on the node routes takes the path's hive (A-127);
+    - the executor's AI key waits for the vault at boot (A-141).
+  - **SY.frontdesk.gov:** waits for the vault at boot (A-141).
+  - **SY.architect:**
+    - each declared workflow is checked at design;
+    - a deploy's compile error goes back to the designer;
+    - the deploy's steps are pinned: `auto_spawn`, the tenant, and `force` on a confirmed removal;
+    - a run whose WF node does not run fails its verification, and the next run deploys it again;
+    - it reads and cancels a WF's instances;
+    - its own model (`ai.model`), its limits (32,000 tokens, 600 s, 1,000,000 per task), and its
+      own key (A-126).
+  - **io.slack:**
+    - a reply also sent to the channel, and a file share, reach the mesh, once each;
+    - a message with nothing to post posts nothing;
+    - files that cannot be sent are named, and the rest still go;
+    - HTML files are accepted;
+    - empty facts are left out;
+    - the bot token goes only to Slack's file store (A-130, A-108, A-129).
+  - **The handbook:** §4.2.6, the atoms; §4.2.7, check, deploy and operate.
+- **Checks before the release:** the full local CI, before and after the review's fixes. It covers:
+  - Rust fmt, clippy `-D warnings` and tests in both workspaces;
+  - Go gofmt, vet and race tests in six modules;
+  - the admin catalog's parity, the doc links, the loopback binds, the router dispatcher guards,
+    Syncthing's single writer and the .deb's seed runtimes (28 of 28).
+- **Deploy:**
+  - build of `a864b0aa` in 21 min; publish in 11 s (the repo keeps 0.1.86 to 0.1.95, `dist/`
+    dropped 0.1.94's .deb);
+  - no base runtime published by hand (A-122);
+  - snapshots `pre-wfcase5-0-1-95` on the 4 VMs (`pre-wfcase4-0-1-94` was deleted);
+  - 0.1.95 on all 4 in 221 s (core manifest `5c2107906890bb95`), with health clean: `failed=0`
+    and `denials=0` on all 4, and the edge's certificate and io.web as before;
+  - `wf.engine`, `ai.generic` and `io.slack` `current` are 0.1.95 on the motherbee and worker1;
+    the gate's nodes came up HEALTHY;
+  - **A-141, live:** at the restart frontdesk found no vault, waited ("vault not reachable yet;
+    retrying", budget 60 s) and started its AI a second later. SY.admin's executor runtime was
+    built at boot, `configured=true`.
+- **Config, 2026-11-03 at 06:01 ART: Archi's own model.** SY.architect's CONFIG_SET through
+  SY.admin, `{"ai":{"model":"claude-opus-5-5"}}` (`config_version` 1). CONFIG_GET shows
+  `claude-opus-5-5`, source `ai.model`.
+- **Config, 2026-11-03 at 06:02 ART: the motherbee back on Sonnet.**
+  - `/etc/fluxbee/hive.yaml` names `claude-sonnet-5-5` again, and is identical to its backup
+    `hive.yaml.pre-opus-0-1-94`.
+  - SY.admin, SY.architect, SY.cognition and SY.frontdesk.gov were restarted, all active.
+  - Archi stays on Opus from its own config; frontdesk is `CONFIGURED`, and cognition
+    `ready_semantic_ai`.
+  - Only Archi runs on Opus now, as the operator decided.
+- **The old gate removed** (step 1 of the gate, from zero):
+  - WF gate0192 deleted with `force`, and its node with it;
+  - AI.gate0192sales, AI.gate0192invoice and AI.gate0192payments killed and purged;
+  - their three roles (agent assets) deleted;
+  - kept: the test tools (tenant `pruebas`, its keys, `AI.pruebas@worker1`), and
+    `IO.slack.gate0192@motherbee`.
+- **Rollback:**
+  - `apt install fluxbee=0.1.94` on the motherbee, then a core-update of the spokes;
+  - SY.architect's model back with a CONFIG_SET of `{"ai":{"model":null}}`;
+  - a WF store already at v6 keeps working under 0.1.94: the extra column is ignored.
 
 ## 0.1.94 — The WF track, Case 4: handing the conversation to a person of the team; the subject mark, a menu for people, NOT_TAKEN, the catalog of known options (wf-orchestration-v1 §5.4; A-135, A-116, A-132, A-133)
 

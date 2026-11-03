@@ -1078,6 +1078,51 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-144 🟡 FIX BUILT, for 0.1.96 (found 2026-11-03, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
+
+- **Seen on 8.x:** Archi's plan deployed the gate's workflow with `wf_rules_compile_apply`. The
+  executor's model, on the hive's Sonnet with its default 4,096 output tokens, had to repeat the
+  whole definition as the call's args (8 states, 39 guards). Its answer was cut:
+  `EXECUTOR_UNAVAILABLE`, "anthropic response truncated: hit max_tokens". Nothing was deployed.
+- **Archi's chat answered `status: ok`, "Executor plan finished".** The message fell back to that
+  when the run had no summary, and the chat's CONFIRM never read the run's outcome. It also taught
+  the cookbook the failed plan.
+- **Why the model was there:** each step's args are the plan's. The model may add only what
+  `executor_fill` allows, and a change is refused (`merge_executor_step_arguments`), so for a step
+  with nothing to fill it could only repeat them. A step that names references
+  (`$steps.<id>.<path>`) has them resolved before the model.
+- **Built (0.1.96):**
+  - a step with nothing to fill is dispatched as the plan wrote it, with no model
+    (`executor_step_has_nothing_to_fill`, the direct dispatch the executor already had for a model
+    that called no tool). The model runs only for a step with fields to fill;
+  - Archi's chat CONFIRM verifies the run as the pipeline does (`verify_execution_result`): a
+    failed step, a failed run or a deployed WF node that does not run answers `error`, says why,
+    and teaches the cookbook nothing;
+  - Archi waits 90 s more for each workflow deploy or removal in a plan.
+- **The gate went on:** the agents and their roles were in place. The workflow's deploy waited for
+  0.1.96.
+
+### A-143 🟡 FIX BUILT, for 0.1.96 (found 2026-11-03, WF Case 5's gate) — An identity write through SY.admin works only when its path names the motherbee, and the refusal does not say why
+
+- **Seen on 8.x:** Archi's plan assigned the new agents' roles with `set_ilk_definition` and
+  `hive: worker1`, the agents' hive. The step failed: `UNAUTHORIZED_REGISTRAR`, "source not
+  authorized for action". Steps 1 to 9 had run (the three agents created and configured).
+- **Why:**
+  - SY.admin sends every identity command to `SY.identity@<the path's hive>`
+    (`handle_identity_command`, src/bin/sy_admin.rs).
+  - A spoke's SY.identity is a replica. It admits privileged SY roles of its own hive only (F-07,
+    `is_authorized`, src/bin/sy_identity.rs), so `SY.admin@motherbee` is refused there.
+  - An ILK is one for the whole system, and only the primary writes it. The catalog's example
+    names the motherbee, but nothing says that another hive cannot work.
+- **What it breaks:** any identity write Archi or an operator sends with the hive of the node it
+  concerns, and the error names no cause.
+- **Fix:** SY.admin sends identity writes to the primary, the motherbee, whatever hive the path
+  names. Reads may still go to a hive's replica.
+- **The gate went on:** the operator told Archi to send them to the motherbee.
+- **Built (0.1.96):** `identity_command_hive` sends every identity write to SY.admin's own hive,
+  the primary. A read still goes to the path's hive. A test covers both
+  (`identity_writes_go_to_the_primary_whatever_hive_the_path_names`).
+
 ### A-142 🟡 OPEN (found 2026-11-03, building WF Case 5; for io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
 
 - **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
