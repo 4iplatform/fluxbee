@@ -603,6 +603,17 @@ fn running_instances_note(active_instances: Option<u64>) -> String {
     }
 }
 
+/// Whether `hive`'s node of `workflow_name`, `WF.<workflow_name>@<hive>`, exists (`node_exists`);
+/// None when the snapshot holds no list of the hive's nodes.
+fn wf_node_exists(snapshot: &ActualStateSnapshot, hive: &str, workflow_name: &str) -> Option<bool> {
+    let nodes = snapshot.resources.get(hive)?.nodes.as_ref()?;
+    let name = format!("WF.{workflow_name}@{hive}");
+    Some(listed_nodes(Some(nodes)).iter().any(|item| {
+        item.get("node_name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+            && node_exists(item)
+    }))
+}
+
 pub fn reconcile_wf(
     desired_wf: &[serde_json::Value],
     snapshot: &ActualStateSnapshot,
@@ -659,6 +670,26 @@ pub fn reconcile_wf(
                         blocking: false,
                         payload_ref: None,
                         notes: vec!["workflow definition changed".to_string()],
+                    });
+                } else if wf_node_exists(snapshot, &wf.hive, &wf.workflow_name) == Some(false) {
+                    // Its definition is current on SY.wf-rules, and its node is gone: a deploy
+                    // whose spawn failed (SY.wf-rules answers it ok, with its wf_node), or a node
+                    // killed by hand. The deploy applies it again and spawns the node.
+                    ops.push(DeltaOperation {
+                        op_id: new_op_id(),
+                        resource_type: "wf_deployment".to_string(),
+                        resource_id: key.clone(),
+                        change_type: ChangeType::Create,
+                        ownership: wf.ownership.clone(),
+                        compiler_class: CompilerClass::WfDeployApply,
+                        desired_ref: Some(format!("desired_state.wf_deployments[{idx}]")),
+                        actual_ref: Some(format!("snapshot.wf.{key}")),
+                        blocking: false,
+                        payload_ref: None,
+                        notes: vec![
+                            "its definition is deployed, and its WF node does not exist: the deploy spawns it"
+                                .to_string(),
+                        ],
                     });
                 }
             }
@@ -1502,6 +1533,35 @@ mod tests {
             snapshot_with_workflows(vec![listed_workflow("support-router", &definition)]);
         let ops = reconcile_wf(&[desired_wf(&definition)], &snapshot, "sol-a");
         assert!(ops.is_empty(), "{ops:?}");
+    }
+
+    /// A workflow whose definition is current and whose node is gone (a deploy whose spawn failed,
+    /// which SY.wf-rules answers ok) is deployed again, which spawns its node (the review of WF
+    /// Case 5). Its node, running or not, leaves it alone; so does a snapshot with no node list.
+    #[test]
+    fn a_deployed_workflow_whose_node_is_gone_is_deployed_again() {
+        let definition = wf_definition(&["start", "done"]);
+        let with_nodes = |nodes: serde_json::Value| {
+            let mut snapshot =
+                snapshot_with_workflows(vec![listed_workflow("support-router", &definition)]);
+            snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(nodes);
+            snapshot
+        };
+        let ops = reconcile_wf(
+            &[desired_wf(&definition)],
+            &with_nodes(json!({ "nodes": [] })),
+            "sol-a",
+        );
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployApply);
+        assert_eq!(ops[0].change_type, ChangeType::Create);
+        assert_eq!(ops[0].resource_id, "motherbee:support-router");
+
+        let its_node = json!({ "nodes": [{ "node_name": "WF.support-router@motherbee",
+                                           "managed": true, "config": { "exists": true } }] });
+        assert!(
+            reconcile_wf(&[desired_wf(&definition)], &with_nodes(its_node), "sol-a").is_empty()
+        );
     }
 
     #[test]

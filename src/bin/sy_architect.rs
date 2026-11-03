@@ -153,7 +153,7 @@ Every AI agent loads the same base tools: beyond answering, an agent can do only
 
 1. Check every workflow definition before you show it: `fluxbee_system_get` with POST `/hives/{hive}/wf-rules/check` and the body `{"workflow_name": ..., "definition": {...}}`. The hive's SY.wf-rules compiles it as a deploy would and only answers: nothing is staged or deployed. Each error names its exact path: fix the definition there and check it again.
 2. Show the operator the checked definition.
-3. Deploy it with `fluxbee_plan_compiler` (`wf_rules_compile_apply`; a first deploy carries `auto_spawn=true` and the `tenant_id` its node runs in; an update is that one step, which restarts the node). The operator confirms the plan.
+3. Deploy it with `fluxbee_plan_compiler` (`wf_rules_compile_apply`, with `auto_spawn=true` and the `tenant_id` its node runs in: the node is spawned when it does not exist, and an update is that one step, which restarts the node). The operator confirms the plan.
 
 A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs: tell the operator how many run before you stage `wf_rules_delete`, which removes a workflow with running instances only with `force: true`.
 
@@ -2462,7 +2462,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 
 - `wf.engine` is the WF base runtime. It is not the runtime to use when creating a `WF.*` managed workflow node.
 - A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
-- To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: a first deploy carries `auto_spawn=true` and `tenant_id`, or no node is created; on an existing node it restarts it, so never add a `restart_node` after it.
+- To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: with `auto_spawn=true` and `tenant_id` it spawns the node when it does not exist, and without them no node is created; on an existing node it restarts it, so never add a `restart_node` after it. A deploy whose node does not run the definition is refused (`WF_NODE_NOT_DEPLOYED`, its `wf_node` says why): the definition is current, and the deploy is not done.
 - The definition was checked before it reached you (`wf_rules_check`, a read that stages nothing): `wf_rules_check` is never an executor step.
 - `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE, or INSTANCES_UNKNOWN when they cannot be counted); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them.
 - `wf_cancel_instance` cancels one instance of a WF node (hive, node_name `WF.<workflow_name>`, instance_id, reason): its cancel transition runs.
@@ -6612,10 +6612,8 @@ fn save_architect_node_config(
     path: &Path,
     config: &ArchitectNodeConfig,
 ) -> Result<(), ArchitectError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    // Whole or not at all: a write cut short never leaves a config a CONFIG_SET cannot read.
+    write_cookbook_atomically(path, &serde_json::to_vec_pretty(config)?)?;
     Ok(())
 }
 
@@ -12113,7 +12111,11 @@ async fn handle_architect_local_config_set(
     // by the runtime rebuilt below, with no restart.
     let hive = load_hive(&state.config_dir)?;
     let config_path = architect_config_path(&state.hive_id);
-    let current = load_architect_node_config(&config_path)?;
+    // An unreadable config is replaced, never a reason to refuse the set that fixes it.
+    let current = load_architect_node_config(&config_path).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "sy.architect config unreadable; the CONFIG_SET replaces it");
+        ArchitectNodeConfig::default()
+    });
     let config = architect_config_after_set(&current, &body)?;
     let (ai_provider, ai_model) = architect_ai_in_effect(&hive, &config)?;
     if config != current {
@@ -22193,52 +22195,7 @@ async fn apply_pipeline_action_with_context(
             }))
         }
         "restart_from_design" => {
-            let task = run_state
-                .get("task")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| -> ArchitectError {
-                    format!("blocked pipeline run '{run_id}' has no original task to restart from")
-                        .into()
-                })?;
-            let solution_id = run.solution_id.clone();
-            // The new run designs the same task, with the same context, and knows what blocked
-            // this one.
-            let operator_context = run_state
-                .get("operator_context")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let last_error = blocked_run_error(&run_state);
-            advance_pipeline_run_with_context(
-                context,
-                &run_id,
-                PipelineStage::Failed,
-                Some(json!({
-                    "discarded_by_operator": true,
-                    "discarded_for_restart": true,
-                    "discarded_at_ms": now_epoch_ms(),
-                })),
-            )
-            .await?;
-            let restart = execute_pipeline_start_with_context(
-                context,
-                session_id,
-                &task,
-                solution_id.as_deref(),
-                &operator_context,
-                last_error.as_deref(),
-            )
-            .await?;
-            Ok(json!({
-                "status": "ok",
-                "action": "restart_from_design",
-                "previous_pipeline_run_id": run_id,
-                "restart_payload": restart,
-                "message": format!(
-                    "Previous pipeline {run_id} closed; new pipeline started from Design."
-                ),
-            }))
+            restart_pipeline_run_from_design(context, session_id, &run, true).await
         }
         "retry" => {
             let target_stage = retry_target_stage_for(pre_block_stage.as_ref())
@@ -22276,6 +22233,61 @@ async fn apply_pipeline_action_with_context(
         )
         .into()),
     }
+}
+
+/// Closes the blocked `run` and starts a new run that designs the same task, with the same
+/// context, and knows what blocked it. `by_operator` says who asked: the operator's
+/// `restart_from_design`, or the pipeline itself after a deploy SY.wf-rules refused
+/// (`redesign_after_failed_deploy`); the closed run records which.
+async fn restart_pipeline_run_from_design(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    run: &PipelineRunRecord,
+    by_operator: bool,
+) -> Result<Value, ArchitectError> {
+    let run_id = run.pipeline_run_id.clone();
+    let run_state = pipeline_state_from_run(run);
+    let task = run_state
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| -> ArchitectError {
+            format!("blocked pipeline run '{run_id}' has no original task to restart from").into()
+        })?;
+    let solution_id = run.solution_id.clone();
+    let operator_context = run_state
+        .get("operator_context")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let last_error = blocked_run_error(&run_state);
+    let mut closed = json!({
+        "discarded_for_restart": true,
+        "discarded_at_ms": now_epoch_ms(),
+    });
+    if by_operator {
+        closed["discarded_by_operator"] = json!(true);
+    } else {
+        closed["redesigned_after_failure"] = json!(true);
+    }
+    advance_pipeline_run_with_context(context, &run_id, PipelineStage::Failed, Some(closed))
+        .await?;
+    let restart = execute_pipeline_start_with_context(
+        context,
+        session_id,
+        &task,
+        solution_id.as_deref(),
+        &operator_context,
+        last_error.as_deref(),
+    )
+    .await?;
+    Ok(json!({
+        "status": "ok",
+        "action": "restart_from_design",
+        "previous_pipeline_run_id": run_id,
+        "restart_payload": restart,
+        "message": format!("Previous pipeline {run_id} closed; new pipeline started from Design."),
+    }))
 }
 
 /// On startup: mark any in_progress runs as interrupted so they surface for recovery.
@@ -22517,8 +22529,9 @@ fn pin_routing_plan_steps(
 
 /// Pins the plan's workflow steps, so the model writes none of their args:
 /// - a `wf_rules_compile_apply` step carries exactly the declared hive, workflow_name and
-///   definition. A first deploy (`WfDeployApply`) also carries `auto_spawn: true` and the declared
-///   `tenant_id`: SY.wf-rules creates the node only then, so a first deploy without a tenant is
+///   definition, `auto_spawn: true`, and the declared `tenant_id`: SY.wf-rules reads those two only
+///   when the node does not exist, and spawns it then. A deploy that needs the node spawned
+///   (`WfDeployApply`: a workflow new on its hive, or whose node is gone) without a tenant is
 ///   refused here. An update (`WfDeployRestart`) is that one step: SY.wf-rules restarts the node;
 /// - a `wf_rules_delete` step removes exactly the workflow its operation names, with `force: true`:
 ///   the operator confirmed the plan, whose removal says how many conversations it ends (its
@@ -22561,15 +22574,19 @@ fn pin_wf_plan_steps(
                     "workflow_name": workflow.workflow_name,
                     "definition": workflow.definition,
                 });
-                if op.compiler_class == pipeline_types::CompilerClass::WfDeployApply {
-                    let tenant_id = workflow.tenant_id.as_deref().ok_or_else(|| {
-                        format!(
-                            "workflow '{}' is new on its hive, and the manifest names no tenant_id for its node (desired_state.wf_deployments)",
+                // Every deploy spawns the WF node when it does not exist: SY.wf-rules reads
+                // auto_spawn and tenant_id only then. A workflow new on its hive, or whose node is
+                // gone, needs the manifest's tenant_id; an update names it when the manifest does.
+                args["auto_spawn"] = json!(true);
+                match workflow.tenant_id.as_deref() {
+                    Some(tenant_id) => args["tenant_id"] = json!(tenant_id),
+                    None if op.compiler_class == pipeline_types::CompilerClass::WfDeployApply => {
+                        return Err(format!(
+                            "workflow '{}' needs its node spawned (new on its hive, or its node is gone), and the manifest names no tenant_id for it (desired_state.wf_deployments)",
                             op.resource_id
-                        )
-                    })?;
-                    args["auto_spawn"] = json!(true);
-                    args["tenant_id"] = json!(tenant_id);
+                        ));
+                    }
+                    None => {}
                 }
                 for step in window {
                     if step.get("action").and_then(Value::as_str) == Some("wf_rules_compile_apply")
@@ -22982,6 +22999,56 @@ fn executor_failure_code(output: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The workflows an executor run deployed whose node does not run. SY.wf-rules applies a definition
+/// and answers ok even when its node step fails or does not run: its `wf_node` says so (`status:
+/// ok` only once the node was restarted or spawned), beside a `warning`. A deploy Archi made is done
+/// only once its WF node runs. Each `wf_rules_compile_apply` step's last answer in the run's events
+/// is read (`payload.events[*].result_preview`, SY.admin's answer); one with no `wf_node` counts as
+/// a node that does not run.
+fn wf_deploys_left_not_running(execution_report: &Value) -> Vec<String> {
+    let Some(events) = execution_report
+        .pointer("/payload/events")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut answers: BTreeMap<&str, &Value> = BTreeMap::new();
+    for event in events {
+        let field = |key: &str| event.get(key).and_then(Value::as_str);
+        if field("step_action") == Some("wf_rules_compile_apply")
+            && field("tool_name") == Some("wf_rules_compile_apply")
+            && field("status").is_some_and(|status| status.eq_ignore_ascii_case("done"))
+        {
+            if let (Some(step), Some(answer)) = (field("step_id"), event.get("result_preview")) {
+                answers.insert(step, answer);
+            }
+        }
+    }
+    let text = |value: Option<&Value>, key: &str| -> Option<String> {
+        value
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    answers
+        .into_values()
+        .filter_map(|answer| {
+            let node = answer.pointer("/payload/wf_node");
+            if text(node, "status").as_deref() == Some("ok") {
+                return None;
+            }
+            let name = text(node, "node_name").unwrap_or_else(|| "a workflow's node".to_string());
+            let why = text(node, "error")
+                .or_else(|| text(node, "reason"))
+                .or_else(|| text(answer.get("payload"), "warning"))
+                .unwrap_or_else(|| "SY.wf-rules reported no node step".to_string());
+            Some(format!("{name} does not run ({why})"))
+        })
+        .collect()
+}
+
 fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     let summary = execution_report
         .get("payload")
@@ -23000,11 +23067,18 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
         .and_then(|value| value.get("total_steps"))
         .and_then(Value::as_u64);
 
-    let verified_success = matches!(status, Some("done")) && !failed_step_present;
+    let not_running = wf_deploys_left_not_running(execution_report);
+    let verified_success =
+        matches!(status, Some("done")) && !failed_step_present && not_running.is_empty();
     let eligible_for_cookbook = verified_success
         && matches!((completed_steps, total_steps), (Some(completed), Some(total)) if completed == total);
 
-    let reason = if !verified_success {
+    let reason = if !not_running.is_empty() {
+        format!(
+            "the plan ran, but a workflow it deployed has no node running: {}",
+            not_running.join("; ")
+        )
+    } else if !verified_success {
         match status {
             Some(value) if !value.is_empty() => {
                 format!("execution report is not verified successful: summary.status={value}")
@@ -25377,13 +25451,13 @@ async fn redesign_after_failed_deploy(
     failure_text: &str,
 ) -> ChatResponse {
     let failed = format!("Pipeline execution failed: {failure_text}");
-    let restarted = apply_pipeline_action_with_context(
-        context,
-        &session.session_id,
-        Some(run_id),
-        "restart_from_design",
-    )
-    .await;
+    let restarted =
+        match resolve_blocked_pipeline_run(context, &session.session_id, Some(run_id)).await {
+            Ok(run) => {
+                restart_pipeline_run_from_design(context, &session.session_id, &run, false).await
+            }
+            Err(err) => Err(err),
+        };
     let (status, output) = match restarted {
         Ok(restart) => {
             let mut output = restart
@@ -25483,12 +25557,18 @@ async fn handle_pipeline_confirm2(
                     },
                 )
                 .unwrap_or(FailureClass::ExecutionActionFailed);
-                let route = route_failure(
+                // At execution only a design's failure goes back on its own, to the designer.
+                // Nothing retries a step here, so any other failure is the operator's call, with
+                // its options.
+                let route = match route_failure(
                     &failure_class,
                     pipeline_run.current_loop as usize,
                     0,
                     pipeline_run.current_attempt,
-                );
+                ) {
+                    FailureRoutingDecision::RetryDesign => FailureRoutingDecision::RetryDesign,
+                    _ => FailureRoutingDecision::EscalateToOperator,
+                };
                 let _ = block_pipeline_run(
                     state,
                     &pipeline_run.pipeline_run_id,
@@ -27492,7 +27572,10 @@ mod tests {
         pin_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
         assert_eq!(
             plan["execution"]["steps"][0]["args"],
-            json!({ "hive": "worker1", "workflow_name": "invoice", "definition": definition })
+            json!({
+                "hive": "worker1", "workflow_name": "invoice", "definition": definition,
+                "auto_spawn": true
+            })
         );
         // SY.admin's executor would let its model add `version` back.
         assert!(plan["execution"]["steps"][0].get("executor_fill").is_none());
@@ -27506,6 +27589,21 @@ mod tests {
             { "id": "s1", "action": "wf_rules_compile_apply", "args": { "workflow_name": "billing" } }
         ] } });
         let mut delta = opa_delta(&[pipeline_types::CompilerClass::WfDeployApply]);
+        delta.operations[0].resource_id = "worker1:billing".to_string();
+        pin_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
+        assert_eq!(
+            plan["execution"]["steps"][0]["args"],
+            json!({
+                "hive": "worker1", "workflow_name": "billing", "definition": definition,
+                "auto_spawn": true, "tenant_id": tenant
+            })
+        );
+
+        // An update names the declared tenant too: a node that is gone is spawned again in it.
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "wf_rules_compile_apply", "args": { "workflow_name": "billing" } }
+        ] } });
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::WfDeployRestart]);
         delta.operations[0].resource_id = "worker1:billing".to_string();
         pin_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
         assert_eq!(
@@ -29049,6 +29147,8 @@ mod tests {
         );
         save_architect_node_config(&path, &set).expect("saved");
         assert_eq!(load_architect_node_config(&path).expect("read back"), set);
+        // Written whole: no temporary file is left beside it.
+        assert!(!path.with_extension("tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29790,6 +29890,64 @@ mod tests {
         assert!(verdict.eligible_for_cookbook);
     }
 
+    /// SY.wf-rules answers a deploy ok when its node step fails or does not run, and says so in
+    /// `wf_node` (the review of WF Case 5): a run is verified only once each deploy's node runs.
+    #[test]
+    fn a_workflow_deploy_whose_node_does_not_run_is_not_verified() {
+        let deploy = |step: &str, wf_node: Value| {
+            json!({
+                "step_id": step, "step_action": "wf_rules_compile_apply",
+                "tool_name": "wf_rules_compile_apply", "status": "done",
+                "result_preview": { "status": "ok", "action": "compile_apply",
+                    "payload": { "ok": true, "wf_node": wf_node,
+                        "warning": "Package published, but the first deploy spawn failed." } }
+            })
+        };
+        let report = |events: Vec<Value>| {
+            json!({ "status": "ok", "payload": {
+                "events": events,
+                "summary": { "status": "done", "failed_step_id": null,
+                             "completed_steps": 2, "total_steps": 2 }
+            } })
+        };
+        let running =
+            json!({ "node_name": "WF.invoice@worker1", "action": "restarted", "status": "ok" });
+        let verdict = verify_execution_result(&report(vec![deploy("s1", running.clone())]));
+        assert!(verdict.verified_success && verdict.eligible_for_cookbook);
+
+        for (wf_node, why) in [
+            (
+                json!({ "node_name": "WF.billing@worker1", "action": "restart_failed",
+                     "error": "tenant not found" }),
+                "tenant not found",
+            ),
+            (
+                json!({ "node_name": "WF.billing@worker1", "action": "none",
+                     "reason": "auto_spawn disabled" }),
+                "auto_spawn disabled",
+            ),
+            (Value::Null, "the first deploy spawn failed"),
+        ] {
+            let verdict = verify_execution_result(&report(vec![
+                deploy("s1", running.clone()),
+                deploy("s2", wf_node),
+            ]));
+            assert!(!verdict.verified_success && !verdict.eligible_for_cookbook);
+            assert!(
+                verdict.reason.contains("does not run"),
+                "{}",
+                verdict.reason
+            );
+            assert!(verdict.reason.contains(why), "{}", verdict.reason);
+        }
+
+        // A step's last answer counts: a deploy the executor ran again, and whose node then ran.
+        let failed = json!({ "node_name": "WF.billing@worker1", "action": "none", "reason": "x" });
+        let verdict =
+            verify_execution_result(&report(vec![deploy("s2", failed), deploy("s2", running)]));
+        assert!(verdict.verified_success, "{}", verdict.reason);
+    }
+
     #[test]
     fn verify_execution_result_rejects_incomplete_or_unverified_reports() {
         let partial = json!({
@@ -30405,13 +30563,13 @@ mod tests {
         );
 
         let list = translate(
-            "curl -X GET /hives/worker1/nodes/WF.sales/wf/instances?status=waiting&limit=20",
+            "curl -X GET /hives/worker1/nodes/WF.sales/wf/instances?status=running&limit=20",
         );
         assert_eq!(list.action, "wf_list_instances");
         assert_eq!(list.target_hive, "worker1");
         assert_eq!(
             list.params,
-            json!({ "hive": "worker1", "node_name": "WF.sales", "status": "waiting", "limit": 20 })
+            json!({ "hive": "worker1", "node_name": "WF.sales", "status": "running", "limit": 20 })
         );
         assert_eq!(
             translate("curl -X GET /hives/worker1/nodes/WF.sales@worker1/wf/instances").params,

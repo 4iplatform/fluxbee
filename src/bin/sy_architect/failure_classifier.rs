@@ -41,6 +41,12 @@ pub fn classify_failure_deterministic(
     if ctx.stage == PipelineStage::Execute && code == "COMPILE_ERROR" {
         return Some(FailureClass::DesignIncomplete);
     }
+    // A deploy whose WF node does not run the definition (SY.wf-rules: the spawn or the restart
+    // failed). Its cause may be the design's (a tenant that does not exist) or the hive's (a
+    // package that did not reach it in time): the operator decides, with the detail.
+    if ctx.stage == PipelineStage::Execute && code == "WF_NODE_NOT_DEPLOYED" {
+        return Some(FailureClass::ExecutionActionFailed);
+    }
 
     // ── Execution failures ───────────────────────────────────────────────────
     if text.contains("runtime not materialized")
@@ -352,6 +358,30 @@ mod tests {
                 &ctx_code(PipelineStage::PlanValidation, "COMPILE_ERROR"),
             ),
             None
+        );
+    }
+
+    /// A deploy whose WF node does not run the definition is the operator's to decide, whatever its
+    /// detail says (the review of WF Case 5): a timeout in it is no reason to wait for a retry.
+    #[test]
+    fn a_deploy_whose_node_does_not_run_goes_to_the_operator() {
+        for detail in [
+            "Package published, but the first deploy spawn failed: tenant tnt:x not found",
+            "Package published, but the first deploy spawn failed: timeout waiting response",
+        ] {
+            let result = classify_failure_deterministic(
+                &format!("wf_rules_compile_apply failed: WF_NODE_NOT_DEPLOYED: {detail}"),
+                &ctx_code(PipelineStage::Execute, "WF_NODE_NOT_DEPLOYED"),
+            );
+            assert_eq!(
+                result,
+                Some(FailureClass::ExecutionActionFailed),
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            route_failure(&FailureClass::ExecutionActionFailed, 1, 0, 0),
+            FailureRoutingDecision::EscalateToOperator
         );
     }
 

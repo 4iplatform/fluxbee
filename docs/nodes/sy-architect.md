@@ -207,9 +207,10 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   by SY.admin, run after the operator's `CONFIRM`, then checked. The plan compiler is given the
   declared user policy, workflow definitions, routes and VPN rules, and the plan's steps are
   pinned to the manifest afterwards (`pin_plan_steps`): `opa_compile_apply` carries exactly the
-  declared rego; `wf_rules_compile_apply` exactly the declared hive, name and definition, and on a
-  first deploy `auto_spawn: true` and the workflow's declared `tenant_id`; an update is that one
-  step, since SY.wf-rules restarts the node itself; `wf_rules_delete` exactly the workflow its
+  declared rego; `wf_rules_compile_apply` exactly the declared hive, name and definition, with
+  `auto_spawn: true` and the workflow's declared `tenant_id`, which SY.wf-rules reads only to spawn
+  a node that does not exist (a deploy that must spawn one without a tenant is refused); an update
+  is that one step, since SY.wf-rules restarts the node itself; `wf_rules_delete` exactly the workflow its
   operation names, with `force: true`, after the operator confirmed a plan that says how many of
   its instances run; `add_route` and `add_vpn` exactly the declared route or VPN rule, and the
   `delete_route` / `delete_vpn` of a replace exactly its prefix or pattern. A pinned step loses its
@@ -219,8 +220,15 @@ one (`discard`, `restart_from_design`, `retry`). Stages (`PipelineStage` in
   goes back to the designer as feedback, with the error's path; a check that cannot run blocks.
   A deploy's `COMPILE_ERROR` goes back to the designer too (`redesign_after_failed_deploy`), and
   `restart_from_design` gives the new run the blocked run's last error.
+- **The verification** reads each deploy's node step too: SY.wf-rules answers a deploy ok when
+  its node step fails or does not run, and says so in `wf_node`, so a run whose WF node does not
+  run fails its verification, naming the node and why (`wf_deploys_left_not_running`). The next
+  run deploys it again: a workflow whose definition is current and whose node is gone gets a
+  deploy that spawns it (`reconcile_wf`).
 - Failures are classified first by rules, then by an LLM if no rule matched
-  (`failure_classifier.rs`), and either retried or escalated.
+  (`failure_classifier.rs`), and either retried or escalated. At execution, only a design's
+  failure goes back on its own (to the designer); any other is the operator's, with the options
+  `retry`, `restart_from_design` and `discard`, since nothing retries a step there.
 
 Runs are stored in the `pipeline_runs` table; a restart marks unfinished ones `interrupted`, and
 the session's recovery route resumes or discards them.
