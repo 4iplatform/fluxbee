@@ -8,7 +8,9 @@ mod messages_db;
 mod pipeline_types;
 #[path = "sy_architect/reconciler.rs"]
 mod reconciler;
-use failure_classifier::{classify_failure_deterministic, route_failure, FailureContext};
+use failure_classifier::{
+    classify_failure_deterministic, route_failure, FailureContext, FailureRoutingDecision,
+};
 use pipeline_types::{
     compiler_class_admin_steps, compiler_class_risk, cookbook_paths,
     desired_state_unknown_sections, is_valid_ownership_label, manifest_path, ActualOpaPolicy,
@@ -41,12 +43,13 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
-    build_model_user_content_parts, create_function_calling_model, extract_text,
+    build_model_user_content_parts, create_function_calling_model_with_call_timeout, extract_text,
     resolve_model_input_from_payload_with_options, AiAccount, AiProvider, ConversationSummary,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
-    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
-    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings, UsageRecorder, UsageWork,
+    FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner, FunctionLoopItem,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory, ImmediateInteraction,
+    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
+    UsageRecorder, UsageWork,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
@@ -60,8 +63,8 @@ use fluxbee_sdk::rpc::{
 };
 use fluxbee_sdk::{
     build_node_config_response_message, list_ich_options_from_hive_id,
-    try_handle_default_node_status, IdentityIchOption, NodeConfig, RouteMatch, RouteTarget,
-    RpcCommandReceiver, NODE_SECRET_REDACTION_TOKEN,
+    try_handle_default_node_status, IdentityIchOption, IdentityIlkOption, NodeConfig, RouteMatch,
+    RouteTarget, RpcCommandReceiver, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -146,6 +149,14 @@ For `ai.generic` agents, use the handbook and tool schemas as the operational so
 
 Every AI agent loads the same base tools: beyond answering, an agent can do only what those tools do. Before you design a role or a skill, read their catalog: `GET /hives/motherbee/runtimes/ai.generic` (`get_runtime`) answers it as `tool_catalog`, with no AI node running. For a running AI node, `GET /hives/{hive}/nodes/{node_name}/help` (`node_help`) answers the same cards. Never write a role, skill or handbook that promises a tool the catalog does not list, and keep roles reusable: a role names no channel and no tool.
 
+## Workflows: check, show, deploy
+
+1. Check every workflow definition before you show it: `fluxbee_system_get` with POST `/hives/{hive}/wf-rules/check` and the body `{"workflow_name": ..., "definition": {...}}`. The hive's SY.wf-rules compiles it as a deploy would and only answers: nothing is staged or deployed. Each error names its exact path: fix the definition there and check it again.
+2. Show the operator the checked definition.
+3. Deploy it with `fluxbee_plan_compiler` (`wf_rules_compile_apply`; a first deploy carries `auto_spawn=true` and the `tenant_id` its node runs in; an update is that one step, which restarts the node). The operator confirms the plan.
+
+A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances?status=&limit=` lists them, and `GET /hives/{hive}/nodes/WF.<workflow_name>/wf/instances/{instance_id}` shows one (its state, input, variables and last log entries). Cancelling one ends its conversation: stage `wf_cancel_instance` (hive, node_name, instance_id, reason) with `fluxbee_plan_compiler`, and the operator confirms it. Removing a workflow ends the conversations it still runs: tell the operator how many run before you stage `wf_rules_delete`, which removes a workflow with running instances only with `force: true`.
+
 ## Pipeline confirmation rules
 
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
@@ -159,7 +170,7 @@ Every AI agent loads the same base tools: beyond answering, an agent can do only
 If `fluxbee_start_pipeline` returns `status: "blocked_run_pending"`, the session has a previous pipeline stuck in `Blocked` state. Do NOT just retry `fluxbee_start_pipeline` — it will keep returning the same status. Instead, present the three options to the operator and call `fluxbee_pipeline_action` with their choice:
 
 - `discard` — drop the blocked run, then call `fluxbee_start_pipeline` again for the new task.
-- `restart_from_design` — close the blocked run and re-run the same task from Design (returns a fresh Confirm1 payload).
+- `restart_from_design` — close the blocked run and re-run the same task from Design, whose designer gets the blocked run's last error (returns a fresh Confirm1 payload).
 - `retry` — return the blocked run to its last CONFIRM checkpoint so the operator can re-engage execution with a CONFIRM message.
 
 If the operator's intent is clearly a different task than the blocked one, default to `discard` then start the new pipeline. Ask only when the choice is genuinely ambiguous.
@@ -229,6 +240,36 @@ struct ArchitectAiRuntime {
     api_key: String,
 }
 
+/// The longest answer any of Archi's calls asks for (the chat's and every pipeline role's),
+/// thinking included: a workflow definition alone runs to thousands of tokens (WF Case 5).
+const ARCHITECT_MAX_OUTPUT_TOKENS: u32 = 32_000;
+
+/// The longest one call of Archi's may take, end to end: a pipeline role writing a long answer
+/// rightly takes minutes. Every other node keeps the SDK's `MODEL_CALL_TIMEOUT`.
+const ARCHITECT_MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+impl ArchitectAiRuntime {
+    /// The tool-loop model one of Archi's roles calls (the chat or a pipeline stage), with
+    /// Archi's limits: answers of up to `ARCHITECT_MAX_OUTPUT_TOKENS` (its model settings) and
+    /// calls of up to `ARCHITECT_MODEL_CALL_TIMEOUT`.
+    fn function_model(
+        &self,
+        system: Option<String>,
+        account: AiAccount,
+    ) -> Arc<dyn FunctionCallingModel> {
+        create_function_calling_model_with_call_timeout(
+            self.provider,
+            self.api_key.clone(),
+            None,
+            self.model.clone(),
+            system,
+            self.model_settings.clone(),
+            account,
+            ARCHITECT_MODEL_CALL_TIMEOUT,
+        )
+    }
+}
+
 #[derive(Clone)]
 struct ArchitectAdminToolContext {
     hive_id: String,
@@ -269,7 +310,7 @@ struct AdminActionsCache {
 }
 
 const ADMIN_ACTIONS_CACHE_TTL_MS: u64 = 300_000; // 5 minutes
-const TASK_AGENT_TOKEN_BUDGET: u32 = 250_000;
+const TASK_AGENT_TOKEN_BUDGET: u32 = 1_000_000;
 
 #[derive(Debug, Clone)]
 struct TaskTokenBudget {
@@ -961,7 +1002,7 @@ impl FunctionTool for ArchitectSystemGetTool {
             // parameter's, whose description does not count.
             description: format!(
                 "Read live Fluxbee system state through SY.admin for hive {hive}. Read-only. \
-                Supports GET and the POST reads that change nothing: a node's live CONFIG_GET, an OPA policy check (POST /opa/policy/check) and the timer's conversions; every change goes through fluxbee_plan_compiler. \
+                Supports GET and the POST reads that change nothing: a node's live CONFIG_GET, an OPA policy check (POST /opa/policy/check), a workflow check (POST /hives/{{hive}}/wf-rules/check) and the timer's conversions; every change goes through fluxbee_plan_compiler. \
                 The key paths are listed in the path parameter. What an AI agent can do: tool_catalog of /hives/motherbee/runtimes/ai.generic, with no AI node running; a running AI node answers the same cards at /hives/{{hive}}/nodes/{{name}}/help. \
                 Never execute paths with literal {{placeholders}}. \
                 For admin action schemas, read /admin/actions/{{action}} and prefer its example_scmd over guessing. \
@@ -979,11 +1020,11 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions. Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions. Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object for the POST reads: /hives/{hive}/nodes/{node_name}/control/config-get, /opa/policy/check ({\"rego\": ..., \"entrypoint\": ...}) or /hives/{hive}/timer/now-in|convert|parse|format"
+                        "description": "Optional JSON object for the POST reads: /hives/{hive}/nodes/{node_name}/control/config-get, /opa/policy/check ({\"rego\": ..., \"entrypoint\": ...}), /hives/{hive}/wf-rules/check ({\"workflow_name\": ..., \"definition\": {...}}) or /hives/{hive}/timer/now-in|convert|parse|format"
                     }
                 },
                 "required": ["path"]
@@ -1196,7 +1237,7 @@ impl FunctionTool for DeleteAgentAssetTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "delete_agent_asset".to_string(),
-            description: "Delete one local cognitive asset from blob://agent-assets/<hash>.json by 64-hex hash. Use only when the operator explicitly asks. Does not mutate existing ILK definitions; agents still referencing the deleted hash can become partial.".to_string(),
+            description: "Delete one local cognitive asset from blob://agent-assets/<hash>.json by 64-hex hash. Use only when the operator explicitly asks. Refused (AGENT_ASSET_IN_USE) while an ILK definition names the hash: the answer lists those ILKs. Take the hash out of their definitions first (set_ilk_definition); an agent that still names it keeps running and loses the asset at its next start. force deletes it anyway: only when the operator accepts that.".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1204,7 +1245,11 @@ impl FunctionTool for DeleteAgentAssetTool {
                 "properties": {
                     "hash": {
                         "type": "string",
-                        "description": "64-hex content hash of the role, skill, or handbook asset to delete."
+                        "description": "64-hex content hash of the role, skill, handbook or personality asset to delete."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Delete it even while ILK definitions name it, or while they cannot be read. Defaults to false."
                     }
                 }
             }),
@@ -1222,7 +1267,11 @@ impl FunctionTool for DeleteAgentAssetTool {
                     "delete_agent_asset requires a non-empty 'hash'".to_string(),
                 )
             })?;
-        delete_agent_asset_and_update_catalog(&self.context, hash)
+        let force = arguments
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        delete_agent_asset_and_update_catalog(&self.context, hash, force)
             .await
             .map_err(fluxbee_tool_protocol_err)
     }
@@ -2155,13 +2204,8 @@ async fn classify_failure_with_ai(
         Error: {error_text}"
     );
 
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
+    let model = runtime.function_model(
         None,
-        runtime.model.clone(),
-        None,
-        runtime.model_settings.clone(),
         tool_ctx.usage_account("failure_classifier", None).await,
     );
     let tools = FunctionToolRegistry::new();
@@ -2418,7 +2462,10 @@ Use these facts only to select and validate planning intent. Do not treat them a
 
 - `wf.engine` is the WF base runtime. It is not the runtime to use when creating a `WF.*` managed workflow node.
 - A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
-- To create or update a workflow node from a workflow definition, prefer `wf_rules_compile_apply` with `auto_spawn=true` and `tenant_id` for the first deploy.
+- To create or update a workflow node from a workflow definition, use `wf_rules_compile_apply`: a first deploy carries `auto_spawn=true` and `tenant_id`, or no node is created; on an existing node it restarts it, so never add a `restart_node` after it.
+- The definition was checked before it reached you (`wf_rules_check`, a read that stages nothing): `wf_rules_check` is never an executor step.
+- `wf_rules_delete` refuses a workflow that still runs instances (INSTANCES_ACTIVE, or INSTANCES_UNKNOWN when they cannot be counted); `force: true` removes it anyway and ends them. Add `force` only when the task says the operator accepts ending them.
+- `wf_cancel_instance` cancels one instance of a WF node (hive, node_name `WF.<workflow_name>`, instance_id, reason): its cancel transition runs.
 - Only use `run_node` for `WF.*` when the concrete `wf.<workflow_name>` workflow package runtime already exists in the runtime manifest.
 
 ### Config selection
@@ -2595,6 +2642,12 @@ Every resource you declare must include an `ownership` field:
 
 - `desired_state.topology.vpns` are SY.config.routes VPN rules: `{"hive": "<hive>", "pattern": "<node name pattern>", "match_kind": "PREFIX", "vpn_id": <number>, "ownership": "solution"}`. `match_kind` is EXACT, PREFIX or GLOB (PREFIX when omitted); an optional `priority` defaults to 100. A rule is identified by its hive and pattern: one rule per pattern on a hive.
 - A rule puts the nodes of its hive whose names match the pattern into VPN `vpn_id`, and nodes reach only nodes of their own VPN (system nodes excepted). Declare VPN rules only when the request asks to isolate nodes, and give every node of the group the same `vpn_id` on each hive where it runs.
+
+## Workflow rules
+
+- `desired_state.wf_deployments` are the solution's workflows: `{"hive": "<hive>", "workflow_name": "<name>", "definition": {...}, "tenant_id": "tnt:<uuid>", "ownership": "solution"}`. SY.wf-rules packages each one and creates and runs its node, `WF.<workflow_name>@<hive>`.
+- `tenant_id` is the tenant the workflow's node runs in, required for a workflow its hive does not run yet: the pipeline deploys it with `auto_spawn`, and no node is created without one. Never invent it: read it with `query_hive(list_tenants)`, or take the tenant of the nodes the workflow serves.
+- Before the operator sees the design, the pipeline checks each definition on its hive with SY.wf-rules (`wf_rules_check`: it compiles the definition and only answers). A definition it refuses comes back to you with the error, which names its exact path: fix the definition there. You may check one yourself first: `query_hive(wf_rules_check)` with `{workflow_name, definition}`.
 
 ## OPA rules
 
@@ -2893,6 +2946,7 @@ async fn execute_pipeline_start_with_context_after_auto_discard(
         task,
         solution_id,
         operator_context,
+        None,
     )
     .await?;
     if let Some(obj) = result.as_object_mut() {
@@ -3345,6 +3399,7 @@ impl FunctionTool for StartPipelineTool {
             task,
             solution_id.as_deref(),
             &operator_context,
+            None,
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))
@@ -3366,7 +3421,7 @@ impl FunctionTool for PipelineActionTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "fluxbee_pipeline_action".to_string(),
-            description: "Resolve a blocked pipeline run in the current session. Use after fluxbee_start_pipeline reports a blocked_run_pending, or whenever the operator wants to act on a stuck pipeline. Three actions: 'discard' closes the blocked run and frees the session; 'restart_from_design' closes it and starts a new pipeline with the same task from scratch; 'retry' returns the run to the last confirmation checkpoint (Confirm1 or Confirm2) so the operator can re-engage it with a CONFIRM message.".to_string(),
+            description: "Resolve a blocked pipeline run in the current session. Use after fluxbee_start_pipeline reports a blocked_run_pending, or whenever the operator wants to act on a stuck pipeline. Three actions: 'discard' closes the blocked run and frees the session; 'restart_from_design' closes it and starts a new pipeline with the same task from scratch, whose designer gets the blocked run's last error; 'retry' returns the run to the last confirmation checkpoint (Confirm1 or Confirm2) so the operator can re-engage it with a CONFIRM message.".to_string(),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -3410,12 +3465,16 @@ impl FunctionTool for PipelineActionTool {
     }
 }
 
+/// Starts a pipeline run for `task` and runs its design. `previous_error` is the last error of the
+/// blocked run it replaces (`restart_from_design`), which its designer gets with the operator's
+/// context (`designer_context_for_run`).
 async fn execute_pipeline_start_with_context(
     context: &ArchitectAdminToolContext,
     session_id: &str,
     task: &str,
     solution_id: Option<&str>,
     operator_context: &str,
+    previous_error: Option<&str>,
 ) -> Result<Value, ArchitectError> {
     if let Some(existing) = latest_nonterminal_pipeline_run_for_session(context, session_id).await?
     {
@@ -3427,14 +3486,15 @@ async fn execute_pipeline_start_with_context(
     }
 
     let pipeline_run =
-        start_pipeline_run_with_context(context, session_id, solution_id, task).await?;
+        start_pipeline_run_with_context(context, session_id, solution_id, task, operator_context)
+            .await?;
 
     let loop_output = match run_design_loop(
         context,
         &pipeline_run,
         task,
         solution_id,
-        operator_context,
+        &designer_context_for_run(operator_context, previous_error),
         0,
     )
     .await
@@ -3706,13 +3766,8 @@ async fn run_designer_with_context(
     let cookbook = read_design_cookbook(&context.state_dir);
     let handbook = read_handbook_text();
     let system_prompt = build_designer_prompt(&cookbook, handbook.as_deref());
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
-        None,
-        runtime.model.clone(),
+    let model = runtime.function_model(
         Some(system_prompt),
-        runtime.model_settings.clone(),
         context.usage_account("designer", solution_id).await,
     );
 
@@ -3865,20 +3920,26 @@ async fn run_designer_with_context(
         }
     };
     // A workflow on a hive the registry knows as ingress or egress is refused too, so the designer
-    // moves it.
-    let live_roles = if manifest
+    // moves it; and a workflow its hive does not run yet needs the tenant of its node.
+    let declares_workflows = manifest
         .desired_state
         .wf_deployments
         .as_ref()
-        .is_some_and(|items| !items.is_empty())
-    {
-        registry_roles(live_hive_registry(context, "designer.hive_roles").await)
+        .is_some_and(|items| !items.is_empty());
+    let registry = if declares_workflows {
+        live_hive_registry(context, "designer.hive_roles").await
     } else {
-        HashMap::new()
+        None
     };
-    if let Err(err) = validate_manifest_v2(&manifest)
-        .and_then(|()| refuse_workflows_on_dmz_hives(&manifest, &live_roles))
-    {
+    let live_roles = registry_roles(registry.clone());
+    let mut validation = validate_manifest_v2(&manifest)
+        .and_then(|()| refuse_workflows_on_dmz_hives(&manifest, &live_roles));
+    if validation.is_ok() && declares_workflows {
+        let deployed =
+            deployed_workflows_of_untenanted(context, &manifest, registry.as_ref()).await;
+        validation = require_tenant_for_new_workflows(&manifest, &deployed);
+    }
+    if let Err(err) = validation {
         let error = format!("designer returned invalid manifest: {err}");
         return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
             feedback: designer_schema_feedback(&error),
@@ -3946,13 +4007,8 @@ async fn run_design_auditor_with_context(
         })?;
     let handbook = read_handbook_text();
     let system_prompt = build_design_auditor_prompt(handbook.as_deref());
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
-        None,
-        runtime.model.clone(),
+    let model = runtime.function_model(
         Some(system_prompt),
-        runtime.model_settings.clone(),
         context.usage_account("design_auditor", None).await,
     );
 
@@ -4085,13 +4141,8 @@ async fn run_real_programmer_with_context(
     let cookbook = read_artifact_cookbook(&context.state_dir);
     let handbook = read_handbook_text();
     let system_prompt = build_real_programmer_prompt(&cookbook, handbook.as_deref());
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
-        None,
-        runtime.model.clone(),
+    let model = runtime.function_model(
         Some(system_prompt),
-        runtime.model_settings.clone(),
         context.usage_account("programmer", None).await,
     );
 
@@ -4205,6 +4256,179 @@ fn inject_blocked_layer_findings_into_verdict(
                 severity: AuditSeverity::Error,
             });
         }
+    }
+}
+
+/// A declared workflow whose definition SY.wf-rules refused (`wf_rules_check`).
+const WF_DEFINITION_REFUSED: &str = "INVALID_WF_DEFINITION";
+/// A declared workflow no SY.wf-rules could check: it never passes unchecked.
+const WF_CHECK_UNAVAILABLE: &str = "WF_CHECK_UNAVAILABLE";
+
+/// Checks each workflow the manifest declares where it would run: its hive's SY.wf-rules compiles
+/// the definition as a deploy would and only answers (`wf_rules_check`: no version, nothing staged;
+/// A-128). A hive the registry does not list yet (the manifest adds it) has no SY.wf-rules: its
+/// workflows are checked on the motherbee's, which compiles a definition as any hive's does. What
+/// SY.wf-rules refuses, and what could not be checked, are the design's findings
+/// (`wf_check_finding`).
+async fn check_declared_workflows(
+    context: &ArchitectAdminToolContext,
+    manifest: &SolutionManifestV2,
+) -> Vec<DesignFinding> {
+    let declared: Vec<&Value> = manifest
+        .desired_state
+        .wf_deployments
+        .iter()
+        .flatten()
+        .collect();
+    if declared.is_empty() {
+        return Vec::new();
+    }
+    let registry = live_hive_registry(context, "design.wf_check_hives").await;
+    let mut findings = Vec::new();
+    for (idx, item) in declared.into_iter().enumerate() {
+        // validate_manifest_v2 passed: each one is a deployment.
+        let Ok(workflow) = serde_json::from_value::<DesiredWfDeployment>(item.clone()) else {
+            continue;
+        };
+        let hive = match &registry {
+            Some(hives) if !hives.contains_key(&workflow.hive) => PRIMARY_HIVE_ID,
+            _ => workflow.hive.as_str(),
+        };
+        // There is one SY.admin, on the motherbee; the hive is the target (FINDINGS A-24).
+        let answer = execute_admin_action_with_context(
+            context,
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            "wf_rules_check",
+            Some(hive),
+            json!({
+                "hive": hive,
+                "workflow_name": workflow.workflow_name,
+                "definition": workflow.definition,
+            }),
+            "design.wf_check",
+        )
+        .await
+        .map_err(|err| err.to_string());
+        findings.extend(wf_check_finding(idx, &workflow, hive, answer));
+    }
+    findings
+}
+
+/// The finding the `wf_rules_check` answer of `hive`'s SY.wf-rules makes of the workflow at
+/// `desired_state.wf_deployments[idx]`:
+/// - none when SY.wf-rules accepted the definition: `{status: ok, payload: {ok: true, operation:
+///   check, check_id, ...}}`;
+/// - `WF_DEFINITION_REFUSED` when it refused it: `{status: error, error_code, error_detail,
+///   payload: {ok: false, operation: check, check_id, error: {code, detail}}}`, its error with
+///   the exact path the detail names;
+/// - `WF_CHECK_UNAVAILABLE` for any other answer, or none (a timeout, the transport, no
+///   SY.wf-rules): a definition nobody checked never passes.
+fn wf_check_finding(
+    idx: usize,
+    workflow: &DesiredWfDeployment,
+    hive: &str,
+    answer: Result<Value, String>,
+) -> Option<DesignFinding> {
+    let section = format!("desired_state.wf_deployments[{idx}]");
+    let unavailable = |reason: String| {
+        Some(DesignFinding {
+            code: WF_CHECK_UNAVAILABLE.to_string(),
+            section: section.clone(),
+            message: format!(
+                "workflow '{}' could not be checked on hive '{hive}' ({reason}); a definition SY.wf-rules did not check never passes",
+                workflow.workflow_name
+            ),
+            severity: AuditSeverity::Error,
+        })
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => return unavailable(err),
+    };
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let payload = answer.get("payload");
+    let checked = payload
+        .and_then(|payload| payload.get("operation"))
+        .and_then(Value::as_str)
+        == Some("check");
+    let accepted = payload
+        .and_then(|payload| payload.get("ok"))
+        .and_then(Value::as_bool);
+    match (text(answer.get("status")).as_deref(), checked, accepted) {
+        (Some("ok"), true, Some(true)) => None,
+        (Some("error"), true, Some(false)) => {
+            let error = payload.and_then(|payload| payload.get("error"));
+            let code = text(answer.get("error_code"))
+                .or_else(|| text(error.and_then(|error| error.get("code"))))
+                .unwrap_or_else(|| "COMPILE_ERROR".to_string());
+            let detail = text(answer.get("error_detail"))
+                .or_else(|| text(error.and_then(|error| error.get("detail"))))
+                .unwrap_or_else(|| "no detail".to_string());
+            Some(DesignFinding {
+                code: WF_DEFINITION_REFUSED.to_string(),
+                section,
+                message: format!(
+                    "SY.wf-rules on hive '{hive}' refused workflow '{}': {code}: {detail}",
+                    workflow.workflow_name
+                ),
+                severity: AuditSeverity::Error,
+            })
+        }
+        (status, _, _) => {
+            let reason = match (
+                text(answer.get("error_code")),
+                text(answer.get("error_detail")),
+            ) {
+                (Some(code), Some(detail)) => format!("{code}: {detail}"),
+                (Some(reason), None) | (None, Some(reason)) => reason,
+                (None, None) => format!(
+                    "SY.admin answered status {} without a check",
+                    status.unwrap_or("none")
+                ),
+            };
+            unavailable(reason)
+        }
+    }
+}
+
+/// The designer's feedback when SY.wf-rules refused declared workflows, or could not check them.
+fn design_feedback_from_workflow_check(findings: &[DesignFinding]) -> String {
+    let mut lines = vec![
+        "SY.wf-rules checked each workflow of desired_state.wf_deployments, compiling its definition as a deploy would. Fix each definition at the path its error names, keep the rest of the manifest, and submit it again (a workflow that could not be checked is checked again when you do):".to_string(),
+    ];
+    lines.extend(findings.iter().map(|finding| {
+        format!(
+            "  - {} [{}] {}",
+            finding.code, finding.section, finding.message
+        )
+    }));
+    lines.join("\n")
+}
+
+/// On the last design iteration, the workflow check's findings go into the auditor's verdict as
+/// blocking issues: a definition SY.wf-rules refused, or did not check, never passes the design.
+fn inject_workflow_check_findings_into_verdict(
+    verdict: &mut DesignAuditVerdict,
+    findings: &[DesignFinding],
+) {
+    if findings.is_empty() {
+        return;
+    }
+    if matches!(verdict.status, DesignAuditStatus::Pass) {
+        verdict.status = DesignAuditStatus::Revise;
+    }
+    for finding in findings {
+        let issue_key = format!("{}:{}", finding.code, finding.section);
+        if !verdict.blocking_issues.contains(&issue_key) {
+            verdict.blocking_issues.push(issue_key);
+        }
+        verdict.findings.push(finding.clone());
     }
 }
 
@@ -4403,6 +4627,43 @@ async fn run_design_loop(
             continue;
         }
 
+        // Each declared workflow is checked on its hive before anyone sees the design (WF Case 5,
+        // topic 2). What SY.wf-rules refuses goes back to the designer, as audit feedback does,
+        // while design iterations remain; on the last one it blocks the verdict.
+        let workflow_findings = check_declared_workflows(context, &designer_output.manifest).await;
+        if !workflow_findings.is_empty()
+            && route_failure(&FailureClass::DesignIncomplete, iteration, 0, 0)
+                == FailureRoutingDecision::RetryDesign
+        {
+            let check_feedback = design_feedback_from_workflow_check(&workflow_findings);
+            trace.push(DesignLoopTraceEvent {
+                iteration: iteration_u32,
+                stage: "design_wf_check".to_string(),
+                score: None,
+                status: None,
+                blocking_issue_count: workflow_findings.len(),
+                stopped_reason: None,
+            });
+            save_pipeline_run_with_context(
+                context,
+                &pipeline_run_with_state_update(
+                    pipeline_run,
+                    PipelineStage::Design,
+                    Some(json!({
+                        "design_feedback": check_feedback,
+                        "design_iterations_used": iteration_u32,
+                        "designer_traces": designer_traces,
+                        "design_loop_trace": trace,
+                        "design_tokens_used": tokens_accumulated,
+                    })),
+                    Some(iteration_u32),
+                )?,
+            )
+            .await?;
+            feedback = check_feedback;
+            continue;
+        }
+
         let manifest_path = save_manifest_from_context(
             context,
             &designer_output.solution_id,
@@ -4428,6 +4689,8 @@ async fn run_design_loop(
         // findings into the auditor verdict so the operator sees the
         // specific blocker per layer and plan compile can refuse.
         inject_blocked_layer_findings_into_verdict(&mut verdict, &blocked_layers);
+        // So do the workflows SY.wf-rules refused or could not check.
+        inject_workflow_check_findings_into_verdict(&mut verdict, &workflow_findings);
         tokens_accumulated = tokens_accumulated.saturating_add(auditor_tokens);
         token_budget.add("design.auditor", auditor_tokens)?;
         let verdict_path = save_design_audit_verdict(
@@ -5501,13 +5764,8 @@ async fn run_plan_compiler_with_context(
         }
     });
 
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
-        None,
-        runtime.model.clone(),
+    let model = runtime.function_model(
         Some(system_prompt),
-        runtime.model_settings.clone(),
         context.usage_account("plan_compiler", None).await,
     );
 
@@ -5906,6 +6164,9 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "wf_rules_list_workflows",
     "wf_rules_get_workflow",
     "wf_rules_get_status",
+    "wf_rules_check",
+    "wf_list_instances",
+    "wf_get_instance",
     "hive_status",
     "list_versions",
     "get_versions",
@@ -6106,12 +6367,14 @@ async fn main() -> Result<(), ArchitectError> {
     // On an upgrade the whole hive restarts at once and the vault may not answer yet. Pull until
     // it does (the SDK's `resolve_resource_awaiting_vault`, as SY.storage and SY.identity do;
     // FINDINGS A-26), both secrets at once; VAULT_SECRET_CHANGED still covers later changes.
+    let own_model = architect_own_model(&hive.hive_id);
     let (ai_runtime, initial_messages_db_url) = tokio::join!(
         build_architect_ai_runtime(
             Arc::clone(&rpc),
             &node_name,
             &self_ilk_id,
             &hive,
+            own_model.as_deref(),
             VaultWait::UntilReachable,
         ),
         resolve_messages_db_url_from_vault(
@@ -6305,16 +6568,143 @@ async fn resolve_architect_vault_resource(
     }
 }
 
+/// SY.architect's own config, set by CONFIG_SET and kept in its node directory
+/// (`architect_config_path`): today only its model. The provider is always the hive's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ArchitectNodeConfig {
+    #[serde(default)]
+    config_version: u64,
+    #[serde(default, skip_serializing_if = "ArchitectAiConfig::is_empty")]
+    ai: ArchitectAiConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct ArchitectAiConfig {
+    /// Archi's own model, one of the hive's provider; without it, the hive's model for that
+    /// provider (`architect_ai_engine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+impl ArchitectAiConfig {
+    fn is_empty(&self) -> bool {
+        self.model.is_none()
+    }
+}
+
+fn architect_config_path(hive_id: &str) -> PathBuf {
+    architect_node_dir(hive_id).join("config.json")
+}
+
+/// Archi's own config; the empty one when it has none.
+fn load_architect_node_config(path: &Path) -> Result<ArchitectNodeConfig, ArchitectError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)
+            .map_err(|err| format!("invalid {}: {err}", path.display()))?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ArchitectNodeConfig::default())
+        }
+        Err(err) => Err(format!("cannot read {}: {err}", path.display()).into()),
+    }
+}
+
+fn save_architect_node_config(
+    path: &Path,
+    config: &ArchitectNodeConfig,
+) -> Result<(), ArchitectError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    Ok(())
+}
+
+/// Archi's model at start and on a refresh: its own, or none (the hive's) when its config cannot
+/// be read, which is logged.
+fn architect_own_model(hive_id: &str) -> Option<String> {
+    match load_architect_node_config(&architect_config_path(hive_id)) {
+        Ok(config) => config.ai.model,
+        Err(err) => {
+            tracing::warn!(error = %err, "sy.architect config unreadable; running on the hive's model");
+            None
+        }
+    }
+}
+
+/// The config a CONFIG_SET leaves (its `config`, or the body itself): `ai.model` sets Archi's own
+/// model, and `null` gives it back the hive's. As ai.generic takes `behavior.model` (FINDINGS
+/// A-104), a model is a name that is not empty, and its provider is the hive's (hive.yaml
+/// `ai.default_provider`): `ai` takes nothing else. A CONFIG_SET without `ai` changes nothing.
+fn architect_config_after_set(
+    current: &ArchitectNodeConfig,
+    body: &Value,
+) -> Result<ArchitectNodeConfig, String> {
+    let config_root = body.get("config").unwrap_or(body);
+    let Some(ai) = config_root.get("ai") else {
+        return Ok(current.clone());
+    };
+    let ai = ai
+        .as_object()
+        .ok_or("config.ai must be an object: {\"model\": \"<a model of the hive's provider>\"}")?;
+    if let Some(other) = ai.keys().find(|key| key.as_str() != "model") {
+        return Err(format!(
+            "config.ai.{other} is not SY.architect's: it takes only ai.model, and its provider is \
+             the hive's (hive.yaml ai.default_provider)"
+        ));
+    }
+    const MODEL: &str = "a model of the hive's provider, or null for the hive's model";
+    let model = match ai.get("model") {
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.trim().to_string()),
+        Some(Value::Null) => None,
+        Some(Value::String(_)) => return Err("config.ai.model must not be empty".to_string()),
+        Some(_) => return Err(format!("config.ai.model must be {MODEL}")),
+        None => return Err(format!("config.ai takes model: {MODEL}")),
+    };
+    Ok(ArchitectNodeConfig {
+        config_version: body
+            .get("config_version")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| current.config_version.saturating_add(1)),
+        ai: ArchitectAiConfig { model },
+    })
+}
+
+/// What Archi's calls run on: the hive's provider (`ai.default_provider`; OpenAI without an `ai`
+/// section, as for every SY node), and Archi's own model, or else the hive's model for that
+/// provider; with where the model comes from ("ai.model" or "hive").
+fn architect_ai_engine(
+    hive_ai: Option<&HiveAiConfig>,
+    own_model: Option<&str>,
+) -> Result<(fluxbee_ai_sdk::EffectiveAiEngine, &'static str), String> {
+    let provider = hive_ai.map_or(HiveAiConfig::fallback().provider, |ai| ai.default_provider);
+    match own_model.map(str::trim).filter(|model| !model.is_empty()) {
+        Some(model) => Ok((
+            fluxbee_ai_sdk::EffectiveAiEngine {
+                provider,
+                model: model.to_string(),
+            },
+            "ai.model",
+        )),
+        None => match hive_ai {
+            Some(ai) => ai
+                .effective()
+                .map(|engine| (engine, "hive"))
+                .map_err(|err| err.to_string()),
+            None => Ok((HiveAiConfig::fallback(), "hive")),
+        },
+    }
+}
+
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     node_name: &str,
     self_ilk_id: &str,
     hive: &HiveFile,
+    own_model: Option<&str>,
     wait: VaultWait,
 ) -> Option<ArchitectAiRuntime> {
-    let engine = match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
-        Ok(Some(engine)) => engine,
-        Ok(None) => HiveAiConfig::fallback(),
+    let engine = match architect_ai_engine(hive.ai.as_ref(), own_model) {
+        Ok((engine, _)) => engine,
         Err(err) => {
             tracing::error!(error = %err, "invalid hive ai configuration");
             return None;
@@ -6345,9 +6735,17 @@ async fn build_architect_ai_runtime(
         provider: engine.provider,
         model: engine.model,
         instructions: build_archi_prompt(read_handbook_text().as_deref()),
-        model_settings: ModelSettings::default(),
+        model_settings: architect_model_settings(),
         api_key,
     })
+}
+
+/// Every call of Archi's asks for answers of up to `ARCHITECT_MAX_OUTPUT_TOKENS`.
+fn architect_model_settings() -> ModelSettings {
+    ModelSettings {
+        max_output_tokens: Some(ARCHITECT_MAX_OUTPUT_TOKENS),
+        ..ModelSettings::default()
+    }
 }
 
 async fn resolve_architect_ai_api_key_from_vault(
@@ -6402,11 +6800,13 @@ fn vault_response_openai_api_key(value: &Value) -> Option<String> {
 
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
+    let own_model = architect_own_model(&state.hive_id);
     let runtime = build_architect_ai_runtime(
         Arc::clone(&state.rpc),
         &state.node_name,
         &state.self_ilk_id,
         &hive,
+        own_model.as_deref(),
         VaultWait::Once,
     )
     .await;
@@ -7800,16 +8200,125 @@ fn agent_asset_delete_response(
     previous_entry: Option<AgentAssetCatalogEntry>,
     catalog_entry: Option<AgentAssetCatalogEntry>,
     deleted: bool,
+    named_by: &Result<Vec<Value>, String>,
 ) -> Value {
-    json!({
+    let mut response = json!({
         "status": "ok",
         "deleted": deleted,
         "hash": hash,
         "blob_uri": format!("blob://agent-assets/{hash}.json"),
         "path": path.display().to_string(),
         "asset": previous_entry.or(catalog_entry),
-        "definition_warning": "This only deletes the local asset file and catalog entry. Existing ILK definitions are not mutated; agents that reference the deleted hash can become partial until the definition is updated.",
-    })
+    });
+    // Deleted with force: the agents that name it lose it at their next start.
+    match named_by {
+        Ok(ilks) if !ilks.is_empty() => {
+            response["named_by"] = json!(ilks);
+            response["definition_warning"] = json!("Deleted with force while these ILK definitions name it: each agent keeps what it composed while it runs, and loses the asset at its next start. Take the hash out of their definitions (set_ilk_definition).");
+        }
+        Err(reason) => {
+            response["definition_warning"] = json!(format!("Deleted with force without knowing which ILK definitions name it ({reason}): an agent that names it loses it at its next start."));
+        }
+        Ok(_) => {}
+    }
+    response
+}
+
+/// The ILKs whose definition names the agent asset `hash` (as its role, a skill, a handbook or its
+/// personality), from the identity SHM's active ILKs.
+fn ilks_naming_agent_asset(ilks: &[IdentityIlkOption], hash: &str) -> Vec<Value> {
+    ilks.iter()
+        .filter_map(|ilk| {
+            let named_as: Vec<&str> = [
+                ("role", ilk.role_hash.as_deref() == Some(hash)),
+                ("skill", ilk.skill_hashes.iter().any(|named| named == hash)),
+                (
+                    "handbook",
+                    ilk.handbook_hashes.iter().any(|named| named == hash),
+                ),
+                ("personality", ilk.personality_hash.as_deref() == Some(hash)),
+            ]
+            .into_iter()
+            .filter_map(|(part, names)| names.then_some(part))
+            .collect();
+            (!named_as.is_empty()).then(|| {
+                json!({
+                    "ilk_id": ilk.ilk_id,
+                    "display_name": ilk.display_name,
+                    "node_name": ilk.handler_node,
+                    "named_as": named_as,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Why deleting the agent asset `hash` is refused (FINDINGS A-126): an ILK definition names it, or
+/// which ones do cannot be read. Deleted, it reaches the workers (Syncthing), and an agent that
+/// names it keeps what it composed while it runs, and loses the asset at its next start, far from
+/// the delete. None when nothing names it, or with `force`.
+fn agent_asset_delete_refusal(
+    hash: &str,
+    named_by: &Result<Vec<Value>, String>,
+    force: bool,
+) -> Option<Value> {
+    if force {
+        return None;
+    }
+    let (error_code, message, ilks) = match named_by {
+        Ok(ilks) if ilks.is_empty() => return None,
+        Ok(ilks) => (
+            "AGENT_ASSET_IN_USE",
+            format!(
+                "Not deleted: {} ILK definition(s) name this asset. Take the hash out of their definitions first (set_ilk_definition), or delete with force: each agent loses the asset at its next start.",
+                ilks.len()
+            ),
+            json!(ilks),
+        ),
+        Err(reason) => (
+            "AGENT_ASSET_USERS_UNKNOWN",
+            format!(
+                "Not deleted: the ILK definitions that may name this asset could not be read ({reason}). Delete with force to delete it anyway."
+            ),
+            Value::Null,
+        ),
+    };
+    Some(json!({
+        "status": "error",
+        "error_code": error_code,
+        "deleted": false,
+        "hash": hash,
+        "blob_uri": format!("blob://agent-assets/{hash}.json"),
+        "named_by": ilks,
+        "message": message,
+    }))
+}
+
+/// Deletes the agent asset `hash` and its catalog entry, unless an ILK definition names it and
+/// `force` is not given (`agent_asset_delete_refusal`).
+async fn delete_agent_asset_checked(
+    config_dir: &Path,
+    catalog: &RwLock<BTreeMap<String, AgentAssetCatalogEntry>>,
+    hash: &str,
+    force: bool,
+) -> Result<Value, ArchitectError> {
+    let hash = normalize_agent_asset_hash(hash)?;
+    let named_by = fluxbee_sdk::identity::list_ilks_from_hive_config(config_dir)
+        .map(|snapshot| ilks_naming_agent_asset(&snapshot.ilks, &hash))
+        .map_err(|err| err.to_string());
+    if let Some(refusal) = agent_asset_delete_refusal(&hash, &named_by, force) {
+        return Ok(refusal);
+    }
+    let (hash, path, previous_entry, deleted) = delete_agent_asset_from_disk(config_dir, &hash)?;
+    let catalog_entry = catalog.write().await.remove(&hash);
+    Ok(agent_asset_delete_response(
+        hash,
+        path,
+        previous_entry,
+        catalog_entry,
+        deleted,
+        &named_by,
+    ))
 }
 
 async fn create_agent_asset_for_state(
@@ -7887,17 +8396,9 @@ async fn get_agent_asset_for_state(
 async fn delete_agent_asset_for_state(
     state: &ArchitectState,
     hash: &str,
+    force: bool,
 ) -> Result<Value, ArchitectError> {
-    let (hash, path, previous_entry, deleted) =
-        delete_agent_asset_from_disk(&state.config_dir, hash)?;
-    let catalog_entry = state.agent_asset_catalog.write().await.remove(&hash);
-    Ok(agent_asset_delete_response(
-        hash,
-        path,
-        previous_entry,
-        catalog_entry,
-        deleted,
-    ))
+    delete_agent_asset_checked(&state.config_dir, &state.agent_asset_catalog, hash, force).await
 }
 
 async fn handle_agent_asset_request(
@@ -7928,8 +8429,8 @@ async fn handle_agent_asset_request(
         }
         Method::DELETE => {
             let query = uri.query().unwrap_or("");
-            let hash = if let Some(hash) = query_param(query, "hash") {
-                hash
+            let (hash, force) = if let Some(hash) = query_param(query, "hash") {
+                (hash, query_bool_param(query, "force").unwrap_or(false))
             } else {
                 let body = axum::body::to_bytes(request.into_body(), 4096)
                     .await
@@ -7941,13 +8442,15 @@ async fn handle_agent_asset_request(
                 }
                 let value: Value =
                     serde_json::from_slice(&body).map_err(|err| format!("invalid json: {err}"))?;
-                value
+                let hash = value
                     .get("hash")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .ok_or_else(|| "DELETE /api/agent-assets requires field 'hash'".to_string())?
+                    .ok_or_else(|| "DELETE /api/agent-assets requires field 'hash'".to_string())?;
+                let force = value.get("force").and_then(Value::as_bool).unwrap_or(false);
+                (hash, force)
             };
-            delete_agent_asset_for_state(state, &hash).await
+            delete_agent_asset_for_state(state, &hash, force).await
         }
         _ => Err("unsupported method for /api/agent-assets".into()),
     }
@@ -8304,17 +8807,15 @@ async fn get_agent_asset_and_update_catalog(
 async fn delete_agent_asset_and_update_catalog(
     context: &ArchitectAdminToolContext,
     hash: &str,
+    force: bool,
 ) -> Result<Value, ArchitectError> {
-    let (hash, path, previous_entry, deleted) =
-        delete_agent_asset_from_disk(&context.config_dir, hash)?;
-    let catalog_entry = context.agent_asset_catalog.write().await.remove(&hash);
-    Ok(agent_asset_delete_response(
+    delete_agent_asset_checked(
+        &context.config_dir,
+        &context.agent_asset_catalog,
         hash,
-        path,
-        previous_entry,
-        catalog_entry,
-        deleted,
-    ))
+        force,
+    )
+    .await
 }
 
 fn fluxbee_tool_protocol_err(err: ArchitectError) -> fluxbee_ai_sdk::AiSdkError {
@@ -9476,6 +9977,10 @@ async fn dynamic_handler(
             if is_agent_assets_path(path) =>
         {
             match handle_agent_asset_request(&state, request_method, &uri, request).await {
+                // A delete refused while ILK definitions name the asset (A-126).
+                Ok(response) if response.get("status").and_then(Value::as_str) == Some("error") => {
+                    (StatusCode::CONFLICT, Json(response)).into_response()
+                }
                 Ok(response) => Json(response).into_response(),
                 Err(err) => (
                     StatusCode::BAD_REQUEST,
@@ -10408,15 +10913,7 @@ async fn handle_ai_chat(
         })?;
     let memory = build_session_immediate_memory(state, session).await?;
 
-    let model = create_function_calling_model(
-        runtime.provider,
-        runtime.api_key.clone(),
-        None,
-        runtime.model.clone(),
-        Some(runtime.instructions.clone()),
-        runtime.model_settings.clone(),
-        account,
-    );
+    let model = runtime.function_model(Some(runtime.instructions.clone()), account);
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let current_user_parts =
         if attachments.is_empty() {
@@ -11495,7 +11992,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.sales@motherbee\",\"runtime\":\"ai.generic\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
-                "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml."
+                "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml; SY.architect's own model, of that provider: SCMD: curl -X POST /architect/control/config-set -d '{\"config\":{\"ai\":{\"model\":\"<model>\"}}}' (null for the hive's)."
             ]
         }
     }))
@@ -11531,18 +12028,13 @@ async fn handle_architect_local_config_get(
     state: &ArchitectState,
 ) -> Result<Value, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
-    let engine = hive
-        .ai
-        .as_ref()
-        .map(HiveAiConfig::effective)
-        .transpose()
-        .map_err(|err| -> ArchitectError { err.into() })?
-        .unwrap_or_else(HiveAiConfig::fallback);
+    let own = load_architect_node_config(&architect_config_path(&state.hive_id))?;
+    let (ai_provider, ai_model) = architect_ai_in_effect(&hive, &own)?;
     let configured = state.ai_configured.load(Ordering::Relaxed);
     let messages_db_configured = state.messages_db_configured.load(Ordering::Relaxed);
     let resources = json!([
         {
-            "resource_type": engine.provider.to_string(),
+            "resource_type": ai_provider["name"],
             "required": true,
             "configured": configured,
             "scope": "pool (tenant or root)"
@@ -11562,30 +12054,42 @@ async fn handle_architect_local_config_get(
         "payload": {
             "ok": true,
             "node_name": state.node_name,
-            "config_version": 1,
+            "config_version": own.config_version,
             "state": if configured { "configured" } else { "missing_secret" },
             "messages_db_state": if messages_db_configured { "configured" } else { "missing_secret" },
-            "config": {
-                "ai": {
-                    "default_provider": engine.provider.to_string(),
-                    "model": engine.model
-                }
-            },
+            "config": { "ai": { "model": own.ai.model } },
+            "ai_provider": ai_provider,
+            "ai_model": ai_model,
             "contract": {
                 "node_family": "SY",
                 "node_kind": "SY.architect",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [],
-                "optional_fields": [],
+                "optional_fields": ["ai.model"],
                 "resources": resources,
                 "notes": [
-                    "The AI provider/model are hive-wide and configured only in hive.yaml; CONFIG_SET does not override them.",
+                    "The AI provider is hive-wide: hive.yaml ai.default_provider. CONFIG_SET does not change it.",
+                    "ai.model is SY.architect's own model, a model of the hive's provider, kept in its own config; without it (or after ai.model null) SY.architect runs on the hive's model for that provider (hive.yaml ai.providers.<provider>.model). ai_model shows the model in effect and its source: ai.model or hive.",
+                    "A CONFIG_SET with ai.model rebuilds SY.architect's AI runtime at once, with no restart.",
                     "CONFIG_SET on SY.architect takes no secret-bearing fields (api_key/api_key_ref/messages_db_url/messages_db_url_ref are rejected).",
                     "The postgres resource is optional; if present, architect enables the messages log viewer against ARCHITECT_MESSAGES_DB_NAME on the resolved cluster."
                 ]
             }
         }
     }))
+}
+
+/// CONFIG_GET's and CONFIG_SET's `ai_provider` and `ai_model`: what Archi's calls run on, each
+/// `{name, source}` (`architect_ai_engine`).
+fn architect_ai_in_effect(
+    hive: &HiveFile,
+    own: &ArchitectNodeConfig,
+) -> Result<(Value, Value), ArchitectError> {
+    let (engine, model_source) = architect_ai_engine(hive.ai.as_ref(), own.ai.model.as_deref())?;
+    Ok((
+        json!({ "name": engine.provider.to_string(), "source": "hive" }),
+        json!({ "name": engine.model, "source": model_source }),
+    ))
 }
 
 async fn handle_architect_local_config_set(
@@ -11605,6 +12109,16 @@ async fn handle_architect_local_config_set(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // Archi's own model: refused unless the hive's provider can be read now, then kept, and taken
+    // by the runtime rebuilt below, with no restart.
+    let hive = load_hive(&state.config_dir)?;
+    let config_path = architect_config_path(&state.hive_id);
+    let current = load_architect_node_config(&config_path)?;
+    let config = architect_config_after_set(&current, &body)?;
+    let (ai_provider, ai_model) = architect_ai_in_effect(&hive, &config)?;
+    if config != current {
+        save_architect_node_config(&config_path, &config)?;
+    }
     let ai_configured = refresh_architect_ai_runtime(state).await?;
     let (messages_db_url_set, messages_db_connected, messages_db_connect_error) =
         refresh_architect_messages_db_url(state).await;
@@ -11617,22 +12131,27 @@ async fn handle_architect_local_config_set(
             "node_name": state.node_name,
             "state": if ai_configured { "configured" } else { "missing_secret" },
             "trace_id": trace_id,
+            "config_version": config.config_version,
+            "config": { "ai": { "model": config.ai.model } },
+            "ai_provider": ai_provider,
+            "ai_model": ai_model,
             "ai_configured": ai_configured,
             "messages_db_configured": messages_db_url_set,
             "messages_db_connected": messages_db_connected,
             "messages_db_connect_error": messages_db_connect_error,
-            "message": "Model D': architect refreshed its vault-resolved resources (openai + postgres). No secret-bearing fields persisted (vault is the source of truth)."
+            "message": "SY.architect rebuilt its AI runtime on the model in effect (ai_model) and refreshed its vault-resolved resources (the provider's key, postgres). No secret-bearing fields persisted (vault is the source of truth)."
         }
     }))
 }
 
 /// Model D' — reject any secret-bearing field on the architect CONFIG_SET
-/// surface. OpenAI + messages-db credentials live entirely in SY.vault.
+/// surface. OpenAI + messages-db credentials live entirely in SY.vault. The provider is
+/// hive-wide: `ai` takes only Archi's own model (`architect_config_after_set`).
 fn reject_architect_secret_fields(body: &Value) -> Result<(), ArchitectError> {
     let config_root = body.get("config").unwrap_or(body);
-    if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
+    if config_root.get("ai_providers").is_some() {
         return Err(
-            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+            "the AI provider is hive-wide; configure the ai section in hive.yaml (SY.architect takes only ai.model)".into(),
         );
     }
     let storage = config_root.get("storage");
@@ -11710,6 +12229,8 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "wf_rules_apply"
             | "wf_rules_rollback"
             | "wf_rules_delete"
+            // its cancel transition runs: the conversation ends
+            | "wf_cancel_instance"
     )
 }
 
@@ -11875,9 +12396,9 @@ fn chat_status_from_command_output(output: &Value) -> String {
 
 /// What `fluxbee_system_get` may run (FINDINGS A-73): a read. A GET is one unless it names a change;
 /// a POST only when it changes nothing: a node's live CONFIG_GET, an OPA policy check (the
-/// motherbee compiles the rego in a scratch directory and only answers: no version, nothing staged)
-/// or a timer conversion. Every change goes through the plan compiler and the operator's
-/// confirmation.
+/// motherbee compiles the rego in a scratch directory and only answers: no version, nothing staged),
+/// a workflow check (the hive's SY.wf-rules compiles the definition and only answers, A-128) or a
+/// timer conversion. Every change goes through the plan compiler and the operator's confirmation.
 fn system_get_may_run(method: &str, action: &str) -> bool {
     if is_mutating_admin_action(action) {
         return false;
@@ -11888,6 +12409,7 @@ fn system_get_may_run(method: &str, action: &str) -> bool {
             action,
             "node_control_config_get"
                 | "opa_check"
+                | "wf_rules_check"
                 | "timer_now_in"
                 | "timer_convert"
                 | "timer_parse"
@@ -12007,6 +12529,32 @@ fn scmd_usage_params(raw_query: Option<&str>) -> Value {
     Value::Object(params)
 }
 
+/// The params of a WF instance read: `base` (the hive and the node, the instance), and from the
+/// query its `texts` as they came and its `numbers` as numbers; SY.admin checks them, so a number
+/// that is not one goes as it came.
+fn scmd_wf_instance_params(
+    raw_query: Option<&str>,
+    base: Value,
+    texts: &[&str],
+    numbers: &[&str],
+) -> Value {
+    let mut params = base;
+    for (key, value) in scmd_query_params(raw_query) {
+        let Value::String(text) = value else {
+            continue;
+        };
+        let text = percent_decode_simple(&text);
+        if numbers.contains(&key.as_str()) {
+            params[key] = text
+                .parse::<u64>()
+                .map_or_else(|_| json!(text), |number| json!(number));
+        } else if texts.contains(&key.as_str()) {
+            params[key] = json!(text);
+        }
+    }
+    params
+}
+
 fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
     let mut filter = serde_json::Map::new();
     let Some(query) = raw_query else {
@@ -12122,6 +12670,7 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
         // admin waits 75 s for it: wait longer than both, or a deploy that succeeded is reported
         // as a timeout (A-68).
         "wf_rules_compile_apply"
+        | "wf_rules_check"
         | "wf_rules_compile"
         | "wf_rules_apply"
         | "wf_rules_rollback"
@@ -12760,6 +13309,65 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "wf_rules_compile".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        // A read: the hive's SY.wf-rules compiles the definition and only answers (A-128).
+        ("POST", ["hives", hive_id, "wf-rules", "check"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules check must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_check".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        // A WF node's instances (SY.admin asks the node: WF_LIST_INSTANCES, WF_GET_INSTANCE,
+        // WF_CANCEL_INSTANCE); a bare node name takes the path's hive.
+        ("GET", ["hives", hive_id, "nodes", node_name, "wf", "instances"]) => {
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_list_instances".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: scmd_wf_instance_params(
+                    raw_query,
+                    json!({ "hive": hive_id, "node_name": node_name }),
+                    &["status"],
+                    &["limit"],
+                ),
+            })
+        }
+        ("GET", ["hives", hive_id, "nodes", node_name, "wf", "instances", instance_id]) => {
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_get_instance".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params: scmd_wf_instance_params(
+                    raw_query,
+                    json!({ "hive": hive_id, "node_name": node_name, "instance_id": instance_id }),
+                    &[],
+                    &["log_limit"],
+                ),
+            })
+        }
+        (
+            "POST",
+            ["hives", hive_id, "nodes", node_name, "wf", "instances", instance_id, "cancel"],
+        ) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_cancel_instance must be a JSON object".into());
+            }
+            params["hive"] = json!(hive_id);
+            params["node_name"] = json!(node_name);
+            params["instance_id"] = json!(instance_id);
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_cancel_instance".to_string(),
                 target_hive: (*hive_id).to_string(),
                 params,
             })
@@ -20269,6 +20877,82 @@ fn refuse_workflows_on_dmz_hives(
     Ok(())
 }
 
+/// A workflow its hive does not run yet is deployed with its node, which runs in a tenant: the
+/// manifest names it (`tenant_id`), and the pipeline creates the node with it
+/// (`pin_wf_plan_steps`). `deployed` holds the workflows each hive runs, for the hives that
+/// answered (`deployed_workflows_of_untenanted`): a workflow on a hive that did not is not judged
+/// here, and its plan refuses a first deploy without a tenant.
+fn require_tenant_for_new_workflows(
+    manifest: &SolutionManifestV2,
+    deployed: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let declared = manifest.desired_state.wf_deployments.iter().flatten();
+    for (idx, item) in declared.enumerate() {
+        let Ok(workflow) = serde_json::from_value::<DesiredWfDeployment>(item.clone()) else {
+            continue;
+        };
+        if workflow.tenant_id.is_some() {
+            continue;
+        }
+        let Some(running) = deployed.get(&workflow.hive) else {
+            continue;
+        };
+        if !running.contains(&workflow.workflow_name) {
+            return Err(format!(
+                "desired_state.wf_deployments[{idx}] is workflow '{name}', new on hive '{hive}': declare its tenant_id, the tenant its node WF.{name}@{hive} runs in (query_hive list_tenants); without one no node is created",
+                name = workflow.workflow_name,
+                hive = workflow.hive
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The workflows each hive runs (`wf_rules_list_workflows`), for the hives of the manifest's
+/// workflows that name no tenant, and only those that answered. A hive the registry does not list
+/// yet (the manifest adds it) runs none.
+async fn deployed_workflows_of_untenanted(
+    context: &ArchitectAdminToolContext,
+    manifest: &SolutionManifestV2,
+    registry: Option<&HashMap<String, Option<String>>>,
+) -> HashMap<String, Vec<String>> {
+    let hives: std::collections::BTreeSet<String> = manifest
+        .desired_state
+        .wf_deployments
+        .iter()
+        .flatten()
+        .filter_map(|item| serde_json::from_value::<DesiredWfDeployment>(item.clone()).ok())
+        .filter(|workflow| workflow.tenant_id.is_none())
+        .map(|workflow| workflow.hive)
+        .collect();
+    let mut deployed = HashMap::new();
+    for hive in hives {
+        if registry.is_some_and(|registry| !registry.contains_key(&hive)) {
+            deployed.insert(hive, Vec::new());
+            continue;
+        }
+        if let Ok(answer) = execute_admin_action_with_context(
+            context,
+            &format!("SY.admin@{PRIMARY_HIVE_ID}"),
+            "wf_rules_list_workflows",
+            Some(&hive),
+            json!({}),
+            "designer.workflows",
+        )
+        .await
+        {
+            if answer.get("status").and_then(Value::as_str) == Some("ok") {
+                let names = reconciler::deployed_workflows(answer.get("payload"))
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                deployed.insert(hive, names);
+            }
+        }
+    }
+    deployed
+}
+
 fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
     if manifest.manifest_version.trim().is_empty() {
         return Err("manifest_version must not be empty".to_string());
@@ -20486,6 +21170,16 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                 return Err(format!(
                     "desired_state.wf_deployments[{idx}].ownership must be one of solution/system/external"
                 ));
+            }
+            if let Some(tenant_id) = wf.tenant_id.as_deref() {
+                if tenant_id
+                    .strip_prefix("tnt:")
+                    .is_none_or(|id| id.trim().is_empty())
+                {
+                    return Err(format!(
+                        "desired_state.wf_deployments[{idx}].tenant_id '{tenant_id}' is not a tenant id (tnt:<uuid>)"
+                    ));
+                }
             }
         }
         refuse_workflows_on_dmz_hives(manifest, &HashMap::new())?;
@@ -21171,11 +21865,14 @@ async fn start_pipeline_run_with_context(
     session_id: &str,
     solution_id: Option<&str>,
     task_description: &str,
+    operator_context: &str,
 ) -> Result<PipelineRunRecord, ArchitectError> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let now = now_epoch_ms();
     let initial_state = serde_json::json!({
         "task": task_description,
+        // A restart designs the same task with the same context (`restart_from_design`).
+        "operator_context": operator_context,
         "solution_id": solution_id,
         "manifest_ref": null,
         "snapshot_ref": null,
@@ -21420,6 +22117,45 @@ fn retry_target_stage_for(
     }
 }
 
+/// What a blocked run's replacement must know (`restart_from_design`): the reason it was blocked
+/// (`blocked_reason`, its last error), or, for a design the audit did not pass, the verdict's
+/// blocking issues and findings. None when the run recorded neither.
+fn blocked_run_error(run_state: &Value) -> Option<String> {
+    let reason = run_state
+        .get("blocked_reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    if let Some(reason) = reason {
+        return Some(reason.to_string());
+    }
+    run_state
+        .get("design_audit_verdict")
+        .and_then(|verdict| serde_json::from_value::<DesignAuditVerdict>(verdict.clone()).ok())
+        .map(|verdict| design_feedback_from_verdict(&verdict))
+        .filter(|feedback| !feedback.trim().is_empty())
+}
+
+/// The designer's context for a run: the operator's, and when the run replaces a blocked one
+/// (`restart_from_design`), that run's last error.
+fn designer_context_for_run(operator_context: &str, previous_error: Option<&str>) -> String {
+    let operator_context = operator_context.trim();
+    let Some(error) = previous_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    else {
+        return operator_context.to_string();
+    };
+    let blocked = format!(
+        "The previous run of this task was blocked, and this run designs it again. Fix the cause of its last error in this design:\n{error}"
+    );
+    if operator_context.is_empty() {
+        blocked
+    } else {
+        format!("{operator_context}\n\n{blocked}")
+    }
+}
+
 /// Apply one of the operator-options actions to a blocked pipeline run.
 /// `action` must be one of: "discard", "restart_from_design", "retry".
 async fn apply_pipeline_action_with_context(
@@ -21466,6 +22202,14 @@ async fn apply_pipeline_action_with_context(
                         .into()
                 })?;
             let solution_id = run.solution_id.clone();
+            // The new run designs the same task, with the same context, and knows what blocked
+            // this one.
+            let operator_context = run_state
+                .get("operator_context")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let last_error = blocked_run_error(&run_state);
             advance_pipeline_run_with_context(
                 context,
                 &run_id,
@@ -21482,7 +22226,8 @@ async fn apply_pipeline_action_with_context(
                 session_id,
                 &task,
                 solution_id.as_deref(),
-                "",
+                &operator_context,
+                last_error.as_deref(),
             )
             .await?;
             Ok(json!({
@@ -21613,7 +22358,7 @@ fn pipeline_plan_compiler_context(run_state: &Value) -> String {
             })
             .collect();
         context.push(format!(
-            "desired_state.wf_deployments are the declared workflows. A wf_rules_compile_apply step takes one of them exactly as its hive, workflow_name and definition (add auto_spawn and tenant_id for a first deploy); the restart_node after it restarts WF.<workflow_name>@<hive>; a wf_rules_delete step takes the hive and workflow_name of its operation (resource_id <hive>:<workflow_name>) and no force: {}",
+            "desired_state.wf_deployments are the declared workflows. A wf_rules_compile_apply step takes one of them exactly as its hive, workflow_name and definition; a wf_rules_delete step takes the hive and workflow_name of its operation (resource_id <hive>:<workflow_name>). The pipeline pins both steps' args afterwards, with what a first deploy and a removal need: {}",
             Value::Array(declared)
         ));
     }
@@ -21683,7 +22428,7 @@ fn add_vpn_args(vpn: &DesiredVpn) -> Value {
 }
 
 /// A pinned step carries exactly `args`, and no `executor_fill`: SY.admin's executor would let its
-/// model add a field listed there back (`force` on a `wf_rules_delete`, say).
+/// model add a field listed there back (a `version` on a `wf_rules_compile_apply`, say).
 fn pin_step_args(step: &mut Value, args: Value) {
     step["args"] = args;
     if let Some(step) = step.as_object_mut() {
@@ -21770,10 +22515,15 @@ fn pin_routing_plan_steps(
     Ok(())
 }
 
-/// Pins the plan's workflow steps: a `wf_rules_compile_apply` step carries exactly the declared
-/// hive, workflow_name and definition (only `auto_spawn` and `tenant_id`, which the manifest does
-/// not declare, stay the plan compiler's); the `restart_node` after it restarts that workflow's node;
-/// a `wf_rules_delete` step removes exactly the workflow its operation names, without `force`.
+/// Pins the plan's workflow steps, so the model writes none of their args:
+/// - a `wf_rules_compile_apply` step carries exactly the declared hive, workflow_name and
+///   definition. A first deploy (`WfDeployApply`) also carries `auto_spawn: true` and the declared
+///   `tenant_id`: SY.wf-rules creates the node only then, so a first deploy without a tenant is
+///   refused here. An update (`WfDeployRestart`) is that one step: SY.wf-rules restarts the node;
+/// - a `wf_rules_delete` step removes exactly the workflow its operation names, with `force: true`:
+///   the operator confirmed the plan, whose removal says how many conversations it ends (its
+///   operation's notes, from the snapshot).
+///
 /// Steps follow the delta's operations in order (validate_plan_against_delta).
 fn pin_wf_plan_steps(
     plan: &mut Value,
@@ -21806,30 +22556,25 @@ fn pin_wf_plan_steps(
                             op.resource_id
                         )
                     })?;
+                let mut args = json!({
+                    "hive": workflow.hive,
+                    "workflow_name": workflow.workflow_name,
+                    "definition": workflow.definition,
+                });
+                if op.compiler_class == pipeline_types::CompilerClass::WfDeployApply {
+                    let tenant_id = workflow.tenant_id.as_deref().ok_or_else(|| {
+                        format!(
+                            "workflow '{}' is new on its hive, and the manifest names no tenant_id for its node (desired_state.wf_deployments)",
+                            op.resource_id
+                        )
+                    })?;
+                    args["auto_spawn"] = json!(true);
+                    args["tenant_id"] = json!(tenant_id);
+                }
                 for step in window {
-                    match step.get("action").and_then(Value::as_str) {
-                        Some("wf_rules_compile_apply") => {
-                            let mut args = serde_json::Map::new();
-                            for key in ["auto_spawn", "tenant_id"] {
-                                if let Some(value) = step.get("args").and_then(|args| args.get(key))
-                                {
-                                    args.insert(key.to_string(), value.clone());
-                                }
-                            }
-                            args.insert("hive".to_string(), json!(workflow.hive));
-                            args.insert("workflow_name".to_string(), json!(workflow.workflow_name));
-                            args.insert("definition".to_string(), workflow.definition.clone());
-                            pin_step_args(step, Value::Object(args));
-                        }
-                        Some("restart_node") => {
-                            let node_name =
-                                format!("WF.{}@{}", workflow.workflow_name, workflow.hive);
-                            pin_step_args(
-                                step,
-                                json!({ "hive": workflow.hive, "node_name": node_name }),
-                            );
-                        }
-                        _ => {}
+                    if step.get("action").and_then(Value::as_str) == Some("wf_rules_compile_apply")
+                    {
+                        pin_step_args(step, args.clone());
                     }
                 }
             }
@@ -21841,7 +22586,7 @@ fn pin_wf_plan_steps(
                     if step.get("action").and_then(Value::as_str) == Some("wf_rules_delete") {
                         pin_step_args(
                             step,
-                            json!({ "hive": hive, "workflow_name": workflow_name }),
+                            json!({ "hive": hive, "workflow_name": workflow_name, "force": true }),
                         );
                     }
                 }
@@ -22136,8 +22881,29 @@ fn build_confirm2_payload(
         .iter()
         .find(|op| op.resource_type == reconciler::OPA_POLICY_RESOURCE_TYPE)
         .map(|op| json!({ "change_type": op.change_type, "notes": op.notes }));
+    // A workflow's removal ends the conversations it still runs, with `force`: the confirmation
+    // says how many (its operation's notes, from the snapshot).
+    let removals: Vec<&pipeline_types::DeltaOperation> = delta_report
+        .operations
+        .iter()
+        .filter(|op| op.compiler_class == pipeline_types::CompilerClass::WfRemove)
+        .collect();
+    let mut message = "Plan compiled and validated.".to_string();
+    for op in &removals {
+        message.push_str(&format!(
+            " Removing workflow {}: {}.",
+            op.resource_id,
+            op.notes.join("; ")
+        ));
+    }
+    message.push_str(" Reply CONFIRM to execute or CANCEL to discard.");
+    let workflow_removals: Vec<Value> = removals
+        .iter()
+        .map(|op| json!({ "workflow": op.resource_id, "notes": op.notes }))
+        .collect();
     json!({
-        "message": "Plan compiled and validated. Reply CONFIRM to execute or CANCEL to discard.",
+        "message": message,
+        "workflow_removals": workflow_removals,
         "pipeline_run_id": pipeline_run_id,
         "stage": "confirm2",
         "human_summary": human_summary,
@@ -22173,8 +22939,47 @@ fn executor_output_is_successful(output: &Value) -> bool {
     )
 }
 
+/// The step an executor run failed on, as SY.admin's executor reports it in its run
+/// (`payload.summary.failure`: `{code, detail, source, step_id, step_action}`). The answer's own
+/// `error_detail` only names the step ("Execution stopped at step 's1'").
+fn executor_step_failure(output: &Value) -> Option<&Value> {
+    output
+        .pointer("/payload/summary/failure")
+        .filter(|failure| failure.is_object())
+}
+
+/// What an executor run failed on: its failed step's action, error code and whole detail (a
+/// COMPILE_ERROR's names the definition's exact path), else the answer's own detail.
 fn executor_failure_text(output: &Value) -> String {
+    let field = |failure: &Value, key: &str| {
+        failure
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(failure) = executor_step_failure(output) {
+        if let Some(detail) = field(failure, "detail") {
+            let step = field(failure, "step_action")
+                .or_else(|| field(failure, "step_id"))
+                .unwrap_or_else(|| "a step".to_string());
+            return match field(failure, "code") {
+                Some(code) => format!("{step} failed: {code}: {detail}"),
+                None => format!("{step} failed: {detail}"),
+            };
+        }
+    }
     response_detail_text(output).unwrap_or_else(|| "executor plan failed".to_string())
+}
+
+/// The error code of an executor run's failure: its failed step's, else the answer's own.
+fn executor_failure_code(output: &Value) -> Option<String> {
+    executor_step_failure(output)
+        .and_then(|failure| failure.get("code"))
+        .or_else(|| output.get("error_code"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
@@ -24561,6 +25366,66 @@ async fn handle_pipeline_confirm1(
     }
 }
 
+/// A deploy that failed for its design (`RetryDesign` at Execute: a workflow definition or a policy
+/// that does not compile) goes back to the designer: the blocked run closes, and a new one designs
+/// the task again with the error (`restart_from_design`). The operator gets what failed, then the
+/// new run's answer: its confirmation, or its blocker.
+async fn redesign_after_failed_deploy(
+    context: &ArchitectAdminToolContext,
+    session: &ChatSessionRecord,
+    run_id: &str,
+    failure_text: &str,
+) -> ChatResponse {
+    let failed = format!("Pipeline execution failed: {failure_text}");
+    let restarted = apply_pipeline_action_with_context(
+        context,
+        &session.session_id,
+        Some(run_id),
+        "restart_from_design",
+    )
+    .await;
+    let (status, output) = match restarted {
+        Ok(restart) => {
+            let mut output = restart
+                .get("restart_payload")
+                .cloned()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            let next = output
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            output["message"] = json!(format!(
+                "{failed}\nThe error went back to the designer, and the task was designed again.\n\n{next}"
+            ));
+            output["previous_pipeline_run_id"] = json!(run_id);
+            let status = output
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("ok")
+                .to_string();
+            (status, output)
+        }
+        Err(err) => (
+            "blocked".to_string(),
+            json!({
+                "message": format!("{failed}\nIt could not go back to the designer: {err}"),
+                "previous_pipeline_run_id": run_id,
+                "stage": "blocked",
+                "operator_options": ["retry", "restart_from_design", "discard"],
+            }),
+        ),
+    };
+    ChatResponse {
+        status,
+        mode: "pipeline".to_string(),
+        output,
+        session_id: Some(session.session_id.clone()),
+        session_title: Some(session.title.clone()),
+    }
+}
+
 async fn handle_pipeline_confirm2(
     state: &ArchitectState,
     session: &ChatSessionRecord,
@@ -24614,10 +25479,7 @@ async fn handle_pipeline_confirm2(
                     &failure_text,
                     &FailureContext {
                         stage: PipelineStage::Execute,
-                        error_code: output
-                            .get("error_code")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                        error_code: executor_failure_code(&output),
                     },
                 )
                 .unwrap_or(FailureClass::ExecutionActionFailed);
@@ -24647,6 +25509,17 @@ async fn handle_pipeline_confirm2(
                     })),
                 )
                 .await;
+                // A deploy the design made fail (a definition that does not compile) goes back to
+                // the designer, with the error: the run starts again from Design.
+                if route == FailureRoutingDecision::RetryDesign {
+                    return redesign_after_failed_deploy(
+                        &tool_ctx,
+                        session,
+                        &pipeline_run.pipeline_run_id,
+                        &failure_text,
+                    )
+                    .await;
+                }
                 return ChatResponse {
                     status: "blocked".to_string(),
                     mode: "pipeline".to_string(),
@@ -25801,6 +26674,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }
 
+    /// A-126: an asset an ILK definition names is not deleted; the answer lists those ILKs, and
+    /// `force` deletes it anyway.
+    #[test]
+    fn an_agent_asset_an_ilk_names_is_kept_unless_forced() {
+        let hash = "ab".repeat(32);
+        let ilk =
+            |ilk_id: &str, node: &str, role: Option<&str>, skills: &[&str]| IdentityIlkOption {
+                ilk_id: ilk_id.to_string(),
+                tenant_id: "tnt:43d576a3-d712-4d91-9245-5d5463dd693e".to_string(),
+                display_name: Some(node.to_string()),
+                handler_node: Some(node.to_string()),
+                registration_status: "complete".to_string(),
+                ilk_type: "agent".to_string(),
+                role_hash: role.map(str::to_string),
+                skill_hashes: skills.iter().map(|skill| skill.to_string()).collect(),
+                handbook_hashes: vec![],
+                personality_hash: None,
+            };
+        let other = "cd".repeat(32);
+        let ilks = [
+            ilk("ilk:1", "AI.sales@worker1", Some(&hash), &[]),
+            ilk(
+                "ilk:2",
+                "AI.billing@worker1",
+                Some(&other),
+                &[&hash, &other],
+            ),
+            ilk("ilk:3", "AI.support@worker1", Some(&other), &[]),
+        ];
+        let named_by = ilks_naming_agent_asset(&ilks, &hash);
+        assert_eq!(
+            named_by,
+            [
+                json!({ "ilk_id": "ilk:1", "display_name": "AI.sales@worker1",
+                    "node_name": "AI.sales@worker1", "named_as": ["role"] }),
+                json!({ "ilk_id": "ilk:2", "display_name": "AI.billing@worker1",
+                    "node_name": "AI.billing@worker1", "named_as": ["skill"] }),
+            ]
+        );
+
+        let refusal = agent_asset_delete_refusal(&hash, &Ok(named_by.clone()), false)
+            .expect("refused while named");
+        assert_eq!(refusal["error_code"], "AGENT_ASSET_IN_USE");
+        assert_eq!(refusal["deleted"], false);
+        assert_eq!(refusal["named_by"], json!(named_by));
+        assert!(agent_asset_delete_refusal(&hash, &Ok(named_by.clone()), true).is_none());
+        assert!(agent_asset_delete_refusal(&hash, &Ok(vec![]), false).is_none());
+        // Who names it cannot be known: refused too, unless forced.
+        let unknown = Err("identity SHM not found".to_string());
+        assert_eq!(
+            agent_asset_delete_refusal(&hash, &unknown, false).expect("refused")["error_code"],
+            "AGENT_ASSET_USERS_UNKNOWN"
+        );
+        assert!(agent_asset_delete_refusal(&hash, &unknown, true).is_none());
+
+        // Deleted with force, the answer still names who loses it.
+        let deleted = agent_asset_delete_response(
+            hash.clone(),
+            PathBuf::from("/x"),
+            None,
+            None,
+            true,
+            &Ok(named_by.clone()),
+        );
+        assert_eq!(deleted["named_by"], json!(named_by));
+        assert!(deleted["definition_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("next start")));
+        let plain = agent_asset_delete_response(
+            hash.clone(),
+            PathBuf::from("/x"),
+            None,
+            None,
+            true,
+            &Ok(vec![]),
+        );
+        assert!(plain.get("definition_warning").is_none());
+    }
+
+    /// A-126, through the delete path: with no identity to read (no SHM for this hive), the asset is
+    /// kept, and `force` deletes it.
+    #[tokio::test]
+    async fn an_agent_asset_delete_needs_to_know_who_names_it() {
+        let (config_dir, blob_root) = test_config_dir_with_blob_root("agent-asset-in-use");
+        std::fs::write(
+            config_dir.join("hive.yaml"),
+            format!(
+                "hive_id: test-a126-nohive\nblob:\n  path: {}\n",
+                blob_root.display()
+            ),
+        )
+        .expect("hive config");
+        let asset = build_skill_asset_value(&json!({
+            "name": "pricing",
+            "instructions": ["Quote the list price."]
+        }))
+        .expect("skill asset");
+        let (entry, _) = persist_agent_asset(&config_dir, asset).expect("persist asset");
+        let path = blob_root
+            .join("agent-assets")
+            .join(format!("{}.json", entry.hash));
+        let catalog = RwLock::new(BTreeMap::from([(entry.hash.clone(), entry.clone())]));
+
+        let kept = delete_agent_asset_checked(&config_dir, &catalog, &entry.hash, false)
+            .await
+            .expect("an answer");
+        assert_eq!(kept["error_code"], "AGENT_ASSET_USERS_UNKNOWN");
+        assert!(path.exists());
+        assert!(catalog.read().await.contains_key(&entry.hash));
+
+        let deleted = delete_agent_asset_checked(&config_dir, &catalog, &entry.hash, true)
+            .await
+            .expect("deleted");
+        assert_eq!(deleted["deleted"], true);
+        assert!(!path.exists());
+        assert!(catalog.read().await.is_empty());
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
+    }
+
     #[test]
     fn resolve_runtime_name_from_binary_filename_defaults_ai_to_generic_and_wf_common() {
         assert_eq!(
@@ -26466,48 +27458,69 @@ mod tests {
         assert!(pipeline_plan_compiler_context(&json!({})).is_empty());
     }
 
+    /// The pipeline writes the workflow steps' args, not the model (WF Case 5, topic 3): a first
+    /// deploy creates the node (`auto_spawn` and the declared tenant), an update is one
+    /// compile_apply (SY.wf-rules restarts the node), and a removal goes with `force`, which the
+    /// operator confirmed.
     #[test]
     fn workflow_steps_carry_exactly_the_declared_definition() {
+        let tenant = "tnt:43d576a3-d712-4d91-9245-5d5463dd693e";
         let definition = json!({
             "wf_schema_version": "1", "initial_state": "a", "states": [{ "name": "a" }]
         });
         let run_state = json!({ "desired_wf": [
-            { "hive": "worker1", "workflow_name": "invoice", "definition": definition }
+            { "hive": "worker1", "workflow_name": "invoice", "definition": definition },
+            { "hive": "worker1", "workflow_name": "billing", "definition": definition, "tenant_id": tenant }
         ] });
+
+        // An update and a removal: what the model wrote gives way to what the manifest declares.
         let mut plan = json!({ "execution": { "steps": [
             { "id": "s1", "action": "wf_rules_compile_apply", "args": {
                 "hive": "motherbee", "target": "worker2", "workflow_name": "invoice",
                 "definition": { "initial_state": "rewritten" }, "version": 9,
-                "auto_spawn": true, "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
-            } },
-            { "id": "s2", "action": "restart_node", "args": { "hive": "worker1", "node_name": "WF.other@worker1" } },
-            { "id": "s3", "action": "wf_rules_delete", "args": { "hive": "motherbee", "workflow_name": "old" },
-              "executor_fill": { "allowed": ["force"] } }
+                "auto_spawn": false, "tenant_id": "tnt:00000000-0000-0000-0000-000000000001"
+            }, "executor_fill": { "allowed": ["version"] } },
+            { "id": "s2", "action": "wf_rules_delete", "args": { "hive": "motherbee", "workflow_name": "old" } }
         ] } });
         let mut delta = opa_delta(&[
             pipeline_types::CompilerClass::WfDeployRestart,
             pipeline_types::CompilerClass::WfRemove,
         ]);
         delta.operations[0].resource_id = "worker1:invoice".to_string();
-        delta.operations[1].resource_id = "worker1:billing".to_string();
+        delta.operations[1].resource_id = "worker1:old".to_string();
+        validate_plan_against_delta(&plan, &delta).expect("one step per operation");
+        pin_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
+        assert_eq!(
+            plan["execution"]["steps"][0]["args"],
+            json!({ "hive": "worker1", "workflow_name": "invoice", "definition": definition })
+        );
+        // SY.admin's executor would let its model add `version` back.
+        assert!(plan["execution"]["steps"][0].get("executor_fill").is_none());
+        assert_eq!(
+            plan["execution"]["steps"][1]["args"],
+            json!({ "hive": "worker1", "workflow_name": "old", "force": true })
+        );
+
+        // A first deploy creates the node, in the declared tenant.
+        let mut plan = json!({ "execution": { "steps": [
+            { "id": "s1", "action": "wf_rules_compile_apply", "args": { "workflow_name": "billing" } }
+        ] } });
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::WfDeployApply]);
+        delta.operations[0].resource_id = "worker1:billing".to_string();
         pin_plan_steps(&mut plan, &delta, &run_state).expect("pinned");
         assert_eq!(
             plan["execution"]["steps"][0]["args"],
             json!({
-                "hive": "worker1", "workflow_name": "invoice", "definition": definition,
-                "auto_spawn": true, "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
+                "hive": "worker1", "workflow_name": "billing", "definition": definition,
+                "auto_spawn": true, "tenant_id": tenant
             })
         );
-        assert_eq!(
-            plan["execution"]["steps"][1]["args"],
-            json!({ "hive": "worker1", "node_name": "WF.invoice@worker1" })
-        );
-        assert_eq!(
-            plan["execution"]["steps"][2]["args"],
-            json!({ "hive": "worker1", "workflow_name": "billing" })
-        );
-        // SY.admin's executor would let its model add `force` back.
-        assert!(plan["execution"]["steps"][2].get("executor_fill").is_none());
+
+        // A first deploy without a declared tenant would create no node: refused.
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::WfDeployApply]);
+        delta.operations[0].resource_id = "worker1:invoice".to_string();
+        let err = pin_plan_steps(&mut plan, &delta, &run_state).expect_err("no tenant");
+        assert!(err.contains("tenant_id"), "{err}");
 
         // A deploy of a workflow the manifest does not declare is refused.
         let mut plan = json!({ "execution": { "steps": [
@@ -26517,7 +27530,8 @@ mod tests {
         delta.operations[0].resource_id = "worker1:other".to_string();
         assert!(pin_plan_steps(&mut plan, &delta, &run_state).is_err());
 
-        // The plan compiler is given the declared definitions.
+        // The plan compiler is given the declared definitions, and is no longer told to add
+        // auto_spawn, a tenant or force itself.
         let context = pipeline_plan_compiler_context(&run_state);
         assert!(context.contains("wf_rules_compile_apply"), "{context}");
         assert!(
@@ -26525,6 +27539,438 @@ mod tests {
             "{context}"
         );
         assert!(context.contains("\"initial_state\":\"a\""), "{context}");
+        for told in ["add auto_spawn", "restart_node", "no force"] {
+            assert!(!context.contains(told), "{told}: {context}");
+        }
+    }
+
+    /// SY.admin's answer to an admin command Archi sent, as its router delivers it.
+    fn admin_answer(outgoing: &Message, answer: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "admin-uuid".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(outgoing.routing.src.clone()),
+                ttl: 16,
+                trace_id: outgoing.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: "admin".to_string(),
+                msg: Some(MSG_ADMIN_COMMAND_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload: answer,
+        }
+    }
+
+    fn manifest_with_workflows(workflows: Value) -> SolutionManifestV2 {
+        serde_json::from_value(json!({
+            "manifest_version": "2.0",
+            "solution": {},
+            "desired_state": { "wf_deployments": workflows },
+            "advisory": {}
+        }))
+        .expect("manifest")
+    }
+
+    /// WF Case 5, topic 2: each declared workflow goes to `wf_rules_check` on its hive, or on the
+    /// motherbee for a hive the manifest adds (the registry does not list it yet). A refusal is a
+    /// finding with SY.wf-rules' error and its path; an answer that is no check (an SY.admin that
+    /// does not know the action, say) is a blocking finding, never a pass.
+    #[tokio::test]
+    async fn each_declared_workflow_is_checked_on_its_hive() {
+        let (context, mut router) = harness_tool_context();
+        let definition = json!({ "wf_schema_version": "1", "workflow_type": "sales" });
+        let manifest = manifest_with_workflows(json!([
+            { "hive": "worker1", "workflow_name": "sales", "definition": definition },
+            { "hive": "motherbee", "workflow_name": "billing", "definition": definition },
+            { "hive": "worker2", "workflow_name": "support", "definition": definition }
+        ]));
+        let check = tokio::spawn({
+            let context = context.clone();
+            async move { check_declared_workflows(&context, &manifest).await }
+        });
+        let registry = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the registry's question");
+        assert_eq!(registry.payload["action"], "list_hives");
+        router
+            .inject(admin_answer(
+                &registry,
+                json!({ "status": "ok", "action": "list_hives", "payload": { "hives": [
+                    { "hive_id": "motherbee", "role": "motherbee" },
+                    { "hive_id": "worker1", "role": "worker" }
+                ] } }),
+            ))
+            .await
+            .expect("answer");
+        let detail = "states[1].transitions[0].guard: undeclared reference to 'evnt'";
+        let answers = [
+            json!({
+                "status": "error", "action": "wf_rules_check",
+                "error_code": "COMPILE_ERROR", "error_detail": detail,
+                "payload": { "ok": false, "operation": "check", "check_id": "c-1",
+                    "error": { "code": "COMPILE_ERROR", "detail": detail } }
+            }),
+            json!({
+                "status": "ok", "action": "wf_rules_check",
+                "payload": { "ok": true, "operation": "check", "check_id": "c-2",
+                    "workflow_name": "billing", "guard_count": 3, "state_count": 2 }
+            }),
+            json!({
+                "status": "error", "action": "wf_rules_check",
+                "error_code": "INVALID_REQUEST", "error_detail": "unknown action 'wf_rules_check'",
+                "payload": null
+            }),
+        ];
+        // worker2 is not registered yet: its workflow is checked on the motherbee.
+        for (answer, (hive, name)) in answers.into_iter().zip([
+            ("worker1", "sales"),
+            ("motherbee", "billing"),
+            ("motherbee", "support"),
+        ]) {
+            let sent = router
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("an admin command");
+            assert_eq!(sent.payload["action"], "wf_rules_check");
+            assert_eq!(sent.payload["target"], hive);
+            assert_eq!(
+                sent.payload["params"],
+                json!({ "hive": hive, "workflow_name": name, "definition": definition })
+            );
+            router
+                .inject(admin_answer(&sent, answer))
+                .await
+                .expect("answer");
+        }
+        let findings = check.await.expect("the check");
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert_eq!(findings[0].code, WF_DEFINITION_REFUSED);
+        assert_eq!(findings[0].section, "desired_state.wf_deployments[0]");
+        assert!(
+            findings[0].message.contains("COMPILE_ERROR"),
+            "{findings:?}"
+        );
+        assert!(findings[0].message.contains(detail), "{findings:?}");
+        assert!(
+            findings[0].message.contains("on hive 'worker1'"),
+            "{findings:?}"
+        );
+        assert_eq!(findings[1].code, WF_CHECK_UNAVAILABLE);
+        assert_eq!(findings[1].section, "desired_state.wf_deployments[2]");
+        assert!(
+            findings[1].message.contains("on hive 'motherbee'"),
+            "{findings:?}"
+        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity == AuditSeverity::Error));
+    }
+
+    /// What the designer's tenant rule reads: the workflows a registered hive runs, from its
+    /// SY.wf-rules, and none on a hive the manifest adds.
+    #[tokio::test]
+    async fn the_workflows_a_hive_runs_are_read_for_the_tenant_rule() {
+        let (context, mut router) = harness_tool_context();
+        let manifest = manifest_with_workflows(json!([
+            { "hive": "worker1", "workflow_name": "sales", "definition": {} },
+            { "hive": "worker2", "workflow_name": "billing", "definition": {} },
+            { "hive": "motherbee", "workflow_name": "support", "definition": {},
+              "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" }
+        ]));
+        let registry = HashMap::from([
+            ("motherbee".to_string(), Some("motherbee".to_string())),
+            ("worker1".to_string(), Some("worker".to_string())),
+        ]);
+        let read = tokio::spawn({
+            let context = context.clone();
+            let manifest = manifest.clone();
+            async move { deployed_workflows_of_untenanted(&context, &manifest, Some(&registry)).await }
+        });
+        let sent = router
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("an admin command");
+        assert_eq!(sent.payload["action"], "wf_rules_list_workflows");
+        assert_eq!(sent.payload["target"], "worker1");
+        router
+            .inject(admin_answer(
+                &sent,
+                json!({ "status": "ok", "action": "wf_rules_list_workflows", "payload": {
+                    "status": "ok", "hive": "worker1", "workflows": [
+                        { "workflow_name": "sales", "current_hash": "sha256:x", "active_instances": 2 }
+                    ] } }),
+            ))
+            .await
+            .expect("answer");
+        let deployed = read.await.expect("the read");
+        assert_eq!(
+            deployed,
+            HashMap::from([
+                ("worker1".to_string(), vec!["sales".to_string()]),
+                ("worker2".to_string(), vec![]),
+            ])
+        );
+        let err = require_tenant_for_new_workflows(&manifest, &deployed).expect_err("billing");
+        assert!(
+            err.contains("desired_state.wf_deployments[1]") && err.contains("worker2"),
+            "{err}"
+        );
+    }
+
+    /// A check that cannot run never passes: no answer, or an answer that is not SY.wf-rules'.
+    #[test]
+    fn a_workflow_check_that_cannot_run_is_a_finding() {
+        let workflow: DesiredWfDeployment = serde_json::from_value(json!({
+            "hive": "worker1", "workflow_name": "sales", "definition": {}
+        }))
+        .expect("workflow");
+        for answer in [
+            Err("transport unreachable: reason=NODE_NOT_FOUND".to_string()),
+            Ok(json!({ "status": "ok", "payload": {} })),
+            Ok(json!({ "status": "ok", "payload": { "ok": true, "operation": "compile" } })),
+            Ok(json!({ "status": "error", "error_code": "TIMEOUT" })),
+        ] {
+            let finding =
+                wf_check_finding(4, &workflow, "worker1", answer.clone()).expect("a finding");
+            assert_eq!(finding.code, WF_CHECK_UNAVAILABLE, "{answer:?}");
+            assert_eq!(finding.section, "desired_state.wf_deployments[4]");
+            assert!(finding.message.contains("never passes"), "{answer:?}");
+        }
+        // The refusal's error is the payload's when the envelope carries none.
+        let refused = wf_check_finding(
+            0,
+            &workflow,
+            "worker1",
+            Ok(json!({ "status": "error", "payload": { "ok": false, "operation": "check",
+                "error": { "code": "INVALID_WORKFLOW_NAME", "detail": "invalid workflow_name \"Sales\"" } } })),
+        )
+        .expect("a finding");
+        assert_eq!(refused.code, WF_DEFINITION_REFUSED);
+        assert!(refused
+            .message
+            .contains("INVALID_WORKFLOW_NAME: invalid workflow_name"));
+    }
+
+    /// While design iterations remain, the designer gets the check's findings as its feedback; on
+    /// the last one, they block the auditor's verdict.
+    #[test]
+    fn the_workflow_check_goes_back_to_the_designer_and_blocks_the_last_verdict() {
+        let finding = DesignFinding {
+            code: WF_DEFINITION_REFUSED.to_string(),
+            section: "desired_state.wf_deployments[0]".to_string(),
+            message: "SY.wf-rules on hive 'worker1' refused workflow 'sales': COMPILE_ERROR: states[1].transitions[0].guard: undeclared reference to 'evnt'".to_string(),
+            severity: AuditSeverity::Error,
+        };
+        let feedback = design_feedback_from_workflow_check(std::slice::from_ref(&finding));
+        assert!(
+            feedback.contains("states[1].transitions[0].guard"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("desired_state.wf_deployments[0]"),
+            "{feedback}"
+        );
+        for iteration in 1..MAX_DESIGN_ITERATIONS {
+            assert_eq!(
+                route_failure(&FailureClass::DesignIncomplete, iteration, 0, 0),
+                FailureRoutingDecision::RetryDesign
+            );
+        }
+        assert_eq!(
+            route_failure(&FailureClass::DesignIncomplete, MAX_DESIGN_ITERATIONS, 0, 0),
+            FailureRoutingDecision::EscalateToOperator
+        );
+
+        let mut verdict = DesignAuditVerdict {
+            verdict_id: "v1".to_string(),
+            manifest_version: "2.0".to_string(),
+            status: DesignAuditStatus::Pass,
+            score: 9,
+            blocking_issues: vec![],
+            findings: vec![],
+            summary: "Looks complete.".to_string(),
+            produced_at_ms: 0,
+        };
+        inject_workflow_check_findings_into_verdict(&mut verdict, std::slice::from_ref(&finding));
+        assert_eq!(verdict.status, DesignAuditStatus::Revise);
+        assert_eq!(
+            verdict.blocking_issues,
+            ["INVALID_WF_DEFINITION:desired_state.wf_deployments[0]"]
+        );
+        assert_eq!(verdict.findings, [finding]);
+        // No finding, no change.
+        let mut passed = DesignAuditVerdict {
+            status: DesignAuditStatus::Pass,
+            blocking_issues: vec![],
+            findings: vec![],
+            ..verdict
+        };
+        inject_workflow_check_findings_into_verdict(&mut passed, &[]);
+        assert_eq!(passed.status, DesignAuditStatus::Pass);
+    }
+
+    /// WF Case 5, topic 3: a workflow its hive does not run yet declares the tenant its node runs
+    /// in; one the hive runs, or on a hive that did not answer, is not refused for it.
+    #[test]
+    fn a_new_workflow_declares_its_tenant() {
+        let manifest = manifest_with_workflows(json!([
+            { "hive": "worker1", "workflow_name": "sales", "definition": {} },
+            { "hive": "worker2", "workflow_name": "billing", "definition": {} }
+        ]));
+        let deployed = |names: &[&str]| {
+            HashMap::from([(
+                "worker1".to_string(),
+                names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>(),
+            )])
+        };
+        let err = require_tenant_for_new_workflows(&manifest, &deployed(&[]))
+            .expect_err("a new workflow without a tenant");
+        assert!(err.contains("desired_state.wf_deployments[0]"), "{err}");
+        assert!(err.contains("tenant_id"), "{err}");
+        assert!(require_tenant_for_new_workflows(&manifest, &deployed(&["sales"])).is_ok());
+        assert!(require_tenant_for_new_workflows(&manifest, &HashMap::new()).is_ok());
+        let with_tenant = manifest_with_workflows(json!([
+            { "hive": "worker1", "workflow_name": "sales", "definition": {},
+              "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" }
+        ]));
+        assert!(require_tenant_for_new_workflows(&with_tenant, &deployed(&[])).is_ok());
+        assert!(validate_manifest_v2(&with_tenant).is_ok());
+        for tenant in ["sales", "tnt:", " "] {
+            let err = validate_manifest_v2(&manifest_with_workflows(json!([
+                { "hive": "worker1", "workflow_name": "sales", "definition": {}, "tenant_id": tenant }
+            ])))
+            .expect_err(tenant);
+            assert!(err.contains("is not a tenant id"), "{err}");
+        }
+    }
+
+    /// WF Case 5, topic 2: a deploy's COMPILE_ERROR reaches the pipeline with its step and its
+    /// whole detail (the answer's own error_detail names only the step), and goes back to the
+    /// designer.
+    #[test]
+    fn a_failed_deploy_names_its_error_and_goes_back_to_the_designer() {
+        let detail = "states[2].entry_actions[0].menu.options[1]: unknown option 'aswer'";
+        let output = json!({
+            "status": "error",
+            "action": "executor_execute_plan",
+            "error_code": "EXECUTION_FAILED",
+            "error_detail": "Execution stopped at step 's2'",
+            "payload": { "status": "failed", "summary": {
+                "status": "failed", "failed_step_id": "s2",
+                "failed_step_action": "wf_rules_compile_apply",
+                "failure": { "code": "COMPILE_ERROR", "detail": detail,
+                    "source": "admin_action_failure", "step_id": "s2",
+                    "step_action": "wf_rules_compile_apply" }
+            } }
+        });
+        assert!(!executor_output_is_successful(&output));
+        let text = executor_failure_text(&output);
+        assert_eq!(
+            text,
+            format!("wf_rules_compile_apply failed: COMPILE_ERROR: {detail}")
+        );
+        assert_eq!(
+            executor_failure_code(&output).as_deref(),
+            Some("COMPILE_ERROR")
+        );
+        let class = classify_failure_deterministic(
+            &text,
+            &FailureContext {
+                stage: PipelineStage::Execute,
+                error_code: executor_failure_code(&output),
+            },
+        );
+        assert_eq!(class, Some(FailureClass::DesignIncomplete));
+        assert_eq!(
+            route_failure(&FailureClass::DesignIncomplete, 1, 0, 0),
+            FailureRoutingDecision::RetryDesign
+        );
+        // Without the failed step, the answer's own detail.
+        let bare =
+            json!({ "status": "error", "error_code": "TIMEOUT", "error_detail": "no answer" });
+        assert_eq!(executor_failure_text(&bare), "no answer");
+        assert_eq!(executor_failure_code(&bare).as_deref(), Some("TIMEOUT"));
+    }
+
+    /// `restart_from_design` designs the same task with the same context, and with the blocked
+    /// run's last error.
+    #[test]
+    fn a_restart_from_design_carries_the_blocked_runs_error() {
+        let blocked = json!({
+            "task": "deploy sales",
+            "operator_context": "The person writes in Slack.",
+            "blocked_reason": "executor plan failed: wf_rules_compile_apply failed: COMPILE_ERROR: states[1]: bad guard",
+        });
+        let error = blocked_run_error(&blocked).expect("its error");
+        assert!(error.contains("states[1]: bad guard"), "{error}");
+        let context = designer_context_for_run("The person writes in Slack.", Some(&error));
+        assert!(
+            context.starts_with("The person writes in Slack."),
+            "{context}"
+        );
+        assert!(context.contains("states[1]: bad guard"), "{context}");
+        assert_eq!(designer_context_for_run(" Just this. ", None), "Just this.");
+        assert!(designer_context_for_run("", Some(&error)).starts_with("The previous run"));
+
+        // A design the audit did not pass: its verdict's blocking issues and findings.
+        let design_blocked = json!({ "design_audit_verdict": {
+            "verdict_id": "v", "manifest_version": "2.0", "status": "revise", "score": 4,
+            "blocking_issues": ["INVALID_WF_DEFINITION:desired_state.wf_deployments[0]"],
+            "findings": [{ "code": "INVALID_WF_DEFINITION", "section": "desired_state.wf_deployments[0]",
+                "message": "COMPILE_ERROR: states[0].name", "severity": "error" }],
+            "summary": "", "produced_at_ms": 0
+        } });
+        let error = blocked_run_error(&design_blocked).expect("its verdict");
+        assert!(error.contains("COMPILE_ERROR: states[0].name"), "{error}");
+        assert_eq!(blocked_run_error(&json!({ "task": "x" })), None);
+    }
+
+    /// WF Case 5, topic 3: the confirmation of a plan that removes a workflow says how many
+    /// conversations it ends.
+    #[test]
+    fn the_confirmation_of_a_removal_shows_its_running_instances() {
+        let mut delta = opa_delta(&[pipeline_types::CompilerClass::WfRemove]);
+        delta.operations[0].resource_id = "worker1:sales".to_string();
+        delta.operations[0].notes = vec![
+            "this solution deployed this workflow and no longer declares it".to_string(),
+            "running instances: 3; removing the workflow ends them".to_string(),
+        ];
+        let trace = PlanCompileTrace {
+            task: "remove".to_string(),
+            hive: "worker1".to_string(),
+            steps: vec![],
+            step_count: 1,
+            blocked_reason: None,
+            blocked_code: None,
+            missing_fields: vec![],
+            operator_hint: None,
+            help_lookup_actions: vec!["wf_rules_delete".to_string()],
+            help_lookup_calls: 1,
+            query_hive_calls: 0,
+            validation: "ok".to_string(),
+            first_validation_error: None,
+            tokens_used: 1_000,
+            token_budget: TASK_AGENT_TOKEN_BUDGET,
+        };
+        let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
+        let message = payload["message"].as_str().expect("message");
+        assert!(
+            message.contains("worker1:sales")
+                && message.contains("running instances: 3; removing the workflow ends them"),
+            "{message}"
+        );
+        assert!(message.ends_with("Reply CONFIRM to execute or CANCEL to discard."));
+        assert_eq!(payload["workflow_removals"][0]["workflow"], "worker1:sales");
+        assert_eq!(
+            payload["destructive_actions"][0]["notes"][1],
+            "running instances: 3; removing the workflow ends them"
+        );
     }
 
     #[test]
@@ -26763,7 +28209,44 @@ mod tests {
             .expect("manifest");
             validate_manifest_v2(&manifest)
                 .unwrap_or_else(|err| panic!("{}: {err}", entry.pattern_key));
+            // A seed's workflow is new on its hive: it declares the tenant of its node.
+            let new_everywhere: HashMap<String, Vec<String>> = manifest
+                .desired_state
+                .wf_deployments
+                .iter()
+                .flatten()
+                .filter_map(|item| item.get("hive").and_then(Value::as_str))
+                .map(|hive| (hive.to_string(), Vec::new()))
+                .collect();
+            require_tenant_for_new_workflows(&manifest, &new_everywhere)
+                .unwrap_or_else(|err| panic!("{}: {err}", entry.pattern_key));
         }
+    }
+
+    /// WF Case 5: the seeds' workflow is the basic loop, small: the person's messages go to one
+    /// agent with the menu `answer`, and its answers back; no consultation (the handbook's atoms
+    /// hold the other mechanisms).
+    #[test]
+    fn the_workflow_seed_is_the_basic_loop() {
+        let (_, seed) = COOKBOOK_SEEDS[0];
+        let entries: Vec<CookbookEntryV2> = serde_json::from_str(seed).expect("design seed");
+        let deployment = entries
+            .iter()
+            .find_map(|entry| {
+                entry
+                    .successful_shape
+                    .pointer("/desired_state/wf_deployments/0")
+            })
+            .expect("the design seed deploys a workflow");
+        let definition = deployment["definition"].to_string();
+        assert!(definition.len() < 4_000, "{} bytes", definition.len());
+        assert!(definition.contains("{\"name\":\"answer\"}"), "{definition}");
+        for consultation in ["consult", "decided", "answer_team", "supervisor"] {
+            assert!(!definition.contains(consultation), "{consultation}");
+        }
+        assert!(deployment["tenant_id"]
+            .as_str()
+            .is_some_and(|tenant| tenant.starts_with("tnt:")));
     }
 
     /// SY.admin's executor follows each add_hive's join (up to 30 min) before the next step: Archi
@@ -27376,13 +28859,13 @@ mod tests {
         const PINS: [(&str, u64, &str); 4] = [
             (
                 cookbook_paths::DESIGN,
-                5,
-                "faf1ae6ca08711c2dbcde3974f7bc359888cbc221a93e54b7ddede08d3b250f2",
+                6,
+                "cd38be12a3c4d57cc60e86fd19d69dc0b8217a1e0656111142af2b4bba71665b",
             ),
             (
                 cookbook_paths::ARTIFACT,
-                5,
-                "6d1eb815d96492880580dbbd11f868952e8e9c0ac01f5dff6e03024e50c95ffb",
+                6,
+                "70f4452fad5341516c9270b77ca2704b0324a363f88948ef3e627cb6f3c2d887",
             ),
             (
                 cookbook_paths::PLAN_COMPILE,
@@ -27465,16 +28948,133 @@ mod tests {
         assert!(prompt.contains("promises a tool the catalog does not list"));
     }
 
+    /// WF Case 5, topic 2: in chat, a workflow definition is checked, shown, then deployed.
+    #[test]
+    fn build_archi_prompt_checks_shows_then_deploys_a_workflow() {
+        let prompt = build_archi_prompt(None);
+        let check = prompt
+            .find("POST `/hives/{hive}/wf-rules/check`")
+            .expect("the check");
+        let show = prompt
+            .find("Show the operator the checked definition")
+            .expect("the showing");
+        let deploy = prompt
+            .find("Deploy it with `fluxbee_plan_compiler`")
+            .expect("the deploy");
+        assert!(check < show && show < deploy, "check, show, deploy");
+        assert!(prompt.contains("`wf_cancel_instance`"));
+        let facts = build_plan_compiler_prompt(&[], &[], None);
+        assert!(facts.contains("`wf_rules_check` is never an executor step"));
+        assert!(facts.contains("never add a `restart_node` after it"));
+    }
+
+    /// WF Case 5: Archi's own model, set through CONFIG_SET as `ai.model`, of the hive's provider;
+    /// without it, the hive's model.
+    #[test]
+    fn archis_model_is_its_own_or_the_hives() {
+        let hive_ai: HiveAiConfig = serde_yaml::from_str(
+            "default_provider: anthropic\nproviders:\n  anthropic:\n    model: claude-sonnet-5-5\n",
+        )
+        .expect("hive ai");
+        let (engine, source) = architect_ai_engine(Some(&hive_ai), None).expect("hive's");
+        assert_eq!(
+            (engine.provider, engine.model.as_str(), source),
+            (AiProvider::Anthropic, "claude-sonnet-5-5", "hive")
+        );
+        let (engine, source) =
+            architect_ai_engine(Some(&hive_ai), Some("claude-opus-5-5")).expect("its own");
+        assert_eq!(
+            (engine.provider, engine.model.as_str(), source),
+            (AiProvider::Anthropic, "claude-opus-5-5", "ai.model")
+        );
+        // Without an ai section, the SY nodes' fallback provider.
+        let (engine, source) = architect_ai_engine(None, Some("gpt-5.5-pro")).expect("its own");
+        assert_eq!(
+            (engine.provider, engine.model.as_str(), source),
+            (AiProvider::OpenAi, "gpt-5.5-pro", "ai.model")
+        );
+        // A hive whose provider has no model still runs Archi on its own.
+        let no_model: HiveAiConfig =
+            serde_yaml::from_str("default_provider: anthropic\n").expect("hive ai");
+        assert!(architect_ai_engine(Some(&no_model), None).is_err());
+        assert!(architect_ai_engine(Some(&no_model), Some("claude-opus-5-5")).is_ok());
+
+        // CONFIG_SET takes ai.model, and null gives back the hive's.
+        let none = ArchitectNodeConfig::default();
+        let set = architect_config_after_set(
+            &none,
+            &json!({ "config": { "ai": { "model": " claude-opus-5-5 " } } }),
+        )
+        .expect("set");
+        assert_eq!(set.ai.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(set.config_version, 1);
+        let cleared = architect_config_after_set(
+            &set,
+            &json!({ "config_version": 7, "config": { "ai": { "model": null } } }),
+        )
+        .expect("cleared");
+        assert_eq!(cleared.ai.model, None);
+        assert_eq!(cleared.config_version, 7);
+        // A CONFIG_SET without ai changes nothing (it refreshes the vault resources).
+        assert_eq!(
+            architect_config_after_set(&set, &json!({ "config": {} })).expect("unchanged"),
+            set
+        );
+        for refused in [
+            json!({ "config": { "ai": { "model": "" } } }),
+            json!({ "config": { "ai": { "model": 5 } } }),
+            json!({ "config": { "ai": {} } }),
+            json!({ "config": { "ai": { "model": "claude-opus-5-5", "provider": "openai" } } }),
+            json!({ "config": { "ai": "claude-opus-5-5" } }),
+        ] {
+            assert!(
+                architect_config_after_set(&none, &refused).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(reject_architect_secret_fields(
+            &json!({ "config": { "ai": { "model": "claude-opus-5-5" } } })
+        )
+        .is_ok());
+        assert!(
+            reject_architect_secret_fields(&json!({ "config": { "ai_providers": {} } })).is_err()
+        );
+
+        // Kept in Archi's own config; none when it has none.
+        let dir = test_temp_dir("architect-config");
+        let path = dir.join("SY.architect@motherbee").join("config.json");
+        assert_eq!(
+            load_architect_node_config(&path).expect("none yet"),
+            ArchitectNodeConfig::default()
+        );
+        save_architect_node_config(&path, &set).expect("saved");
+        assert_eq!(load_architect_node_config(&path).expect("read back"), set);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WF Case 5: Archi's calls ask for up to 32,000 tokens and may take 600 s; a task's budget
+    /// is 1,000,000 tokens. Every other node keeps the SDK's call limit.
+    #[test]
+    fn archis_limits_fit_a_definition_it_writes() {
+        assert_eq!(architect_model_settings().max_output_tokens, Some(32_000));
+        assert_eq!(ARCHITECT_MODEL_CALL_TIMEOUT, Duration::from_secs(600));
+        assert_eq!(fluxbee_ai_sdk::MODEL_CALL_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(TASK_AGENT_TOKEN_BUDGET, 1_000_000);
+        assert_eq!(TaskTokenBudget::new(0).budget, 1_000_000);
+    }
+
     /// The longest function description a model API takes: OpenAI refuses a longer one. A byte
     /// count bounds every way of counting it. What does not fit goes in the parameters'
     /// descriptions, which do not count.
     const MODEL_TOOL_DESCRIPTION_MAX: usize = 1024;
 
-    /// Every tool Archi offers a model, whichever agent gets it (the chat, the designer, the
-    /// auditor, the programmer, the plan compiler), has a description a model API takes.
-    #[tokio::test]
-    async fn every_archi_tool_description_fits_a_model_api() {
-        let (rpc, _router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+    /// A tool context on the motherbee whose router is the test's: what Archi sends comes out of
+    /// the harness, and the harness injects the answers.
+    fn harness_tool_context() -> (
+        ArchitectAdminToolContext,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+    ) {
+        let (rpc, router) = fluxbee_sdk::RouterDispatcherTestHarness::new(
             "SY.architect@motherbee",
             build_architect_rpc_profile().expect("architect rpc profile"),
         );
@@ -27493,6 +29093,14 @@ mod tests {
             active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
             agent_asset_catalog: Arc::new(RwLock::new(BTreeMap::new())),
         };
+        (context, router)
+    }
+
+    /// Every tool Archi offers a model, whichever agent gets it (the chat, the designer, the
+    /// auditor, the programmer, the plan compiler), has a description a model API takes.
+    #[tokio::test]
+    async fn every_archi_tool_description_fits_a_model_api() {
+        let (context, _router) = harness_tool_context();
         let mut chat = FunctionToolRegistry::new();
         ArchitectAdminReadToolsProvider::new(context.clone())
             .register_tools(&mut chat)
@@ -28749,6 +30357,7 @@ mod tests {
             "curl -X POST /opa/policy/rollback -d '{}'",
             "curl -X POST /opa/policy/clear -d '{}'",
             "curl -X POST /admin/runtime-packages/publish -d '{}'",
+            "curl -X POST /hives/worker1/nodes/WF.sales/wf/instances/inst-1/cancel -d '{\"reason\":\"x\"}'",
         ];
         for raw in refused {
             let translated = translate_scmd("motherbee", parse(raw)).expect(raw);
@@ -28763,6 +30372,8 @@ mod tests {
             "curl -X POST /hives/motherbee/timer/now-in -d '{}'",
             // A check compiles in a scratch directory and only answers: no version, nothing staged.
             "curl -X POST /opa/policy/check -d '{\"rego\":\"package router\"}'",
+            // So does SY.wf-rules' check (A-128).
+            "curl -X POST /hives/worker1/wf-rules/check -d '{\"workflow_name\":\"sales\",\"definition\":{}}'",
         ];
         for raw in allowed {
             let translated = translate_scmd("motherbee", parse(raw)).expect(raw);
@@ -28774,6 +30385,73 @@ mod tests {
         }
         assert!(system_get_may_run("GET", "inventory"));
         assert!(!system_get_may_run("GET", "run_node"));
+    }
+
+    /// WF Case 5, topics 2 and 4: Archi reaches SY.admin's workflow check and a WF's instances as
+    /// it reaches every admin action: reads through the read tool and the planning roles' live
+    /// queries, a cancel only through a plan the operator confirms.
+    #[test]
+    fn archi_reaches_the_workflow_check_and_a_workflows_instances() {
+        let translate = |raw: &str| translate_scmd("motherbee", parse(raw)).expect(raw);
+
+        let check = translate(
+            r#"curl -X POST /hives/worker1/wf-rules/check -d '{"workflow_name":"sales","definition":{"wf_schema_version":"1"}}'"#,
+        );
+        assert_eq!(check.action, "wf_rules_check");
+        assert_eq!(check.target_hive, "worker1");
+        assert_eq!(
+            check.params,
+            json!({ "workflow_name": "sales", "definition": { "wf_schema_version": "1" } })
+        );
+
+        let list = translate(
+            "curl -X GET /hives/worker1/nodes/WF.sales/wf/instances?status=waiting&limit=20",
+        );
+        assert_eq!(list.action, "wf_list_instances");
+        assert_eq!(list.target_hive, "worker1");
+        assert_eq!(
+            list.params,
+            json!({ "hive": "worker1", "node_name": "WF.sales", "status": "waiting", "limit": 20 })
+        );
+        assert_eq!(
+            translate("curl -X GET /hives/worker1/nodes/WF.sales@worker1/wf/instances").params,
+            json!({ "hive": "worker1", "node_name": "WF.sales@worker1" })
+        );
+
+        let one =
+            translate("curl -X GET /hives/worker1/nodes/WF.sales/wf/instances/inst-7?log_limit=5");
+        assert_eq!(one.action, "wf_get_instance");
+        assert_eq!(
+            one.params,
+            json!({ "hive": "worker1", "node_name": "WF.sales", "instance_id": "inst-7", "log_limit": 5 })
+        );
+
+        let cancel = translate(
+            r#"curl -X POST /hives/worker1/nodes/WF.sales/wf/instances/inst-7/cancel -d '{"reason":"stuck since Monday"}'"#,
+        );
+        assert_eq!(cancel.action, "wf_cancel_instance");
+        assert_eq!(
+            cancel.params,
+            json!({ "hive": "worker1", "node_name": "WF.sales", "instance_id": "inst-7",
+                "reason": "stuck since Monday" })
+        );
+
+        // The reads are reads; the cancel changes something: the operator confirms it.
+        for read in ["wf_rules_check", "wf_list_instances", "wf_get_instance"] {
+            assert!(!is_mutating_admin_action(read), "{read}");
+            assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&read), "{read}");
+        }
+        assert!(system_get_may_run("GET", "wf_list_instances"));
+        assert!(system_get_may_run("GET", "wf_get_instance"));
+        assert!(admin_action_allows_ai_write("wf_cancel_instance"));
+        assert!(!PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_cancel_instance"));
+        assert!(!system_get_may_run("POST", "wf_cancel_instance"));
+
+        // A check waits as long as the other SY.wf-rules actions.
+        assert_eq!(
+            architect_admin_action_timeout("wf_rules_check", &json!({})),
+            architect_admin_action_timeout("wf_rules_compile", &json!({}))
+        );
     }
 
     #[test]

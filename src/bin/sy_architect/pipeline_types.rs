@@ -322,7 +322,8 @@ pub fn compiler_class_admin_steps(class: &CompilerClass) -> Option<Vec<&'static 
         CompilerClass::RouteDelete => Some(vec!["delete_route"]),
         CompilerClass::RouteReplace => Some(vec!["delete_route", "add_route"]),
         CompilerClass::WfDeployApply => Some(vec!["wf_rules_compile_apply"]),
-        CompilerClass::WfDeployRestart => Some(vec!["wf_rules_compile_apply", "restart_node"]),
+        // SY.wf-rules' compile_apply restarts the workflow's node itself: one step, one restart.
+        CompilerClass::WfDeployRestart => Some(vec!["wf_rules_compile_apply"]),
         CompilerClass::WfRemove => Some(vec!["wf_rules_delete"]),
         CompilerClass::OpaApply => Some(vec!["opa_compile_apply"]),
         CompilerClass::OpaRemove => Some(vec!["opa_clear"]),
@@ -662,6 +663,11 @@ pub struct DesiredWfDeployment {
     pub hive: String,
     pub workflow_name: String,
     pub definition: serde_json::Value,
+    /// The tenant the workflow's node runs in. Required for a workflow its hive does not run yet:
+    /// its first deploy creates the node (`pin_wf_plan_steps` pins it, with `auto_spawn`), and
+    /// SY.wf-rules creates none without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     /// External when omitted, as the designer is told: only a workflow declared `solution` is the
     /// solution's to remove.
     #[serde(default = "default_external_ownership")]

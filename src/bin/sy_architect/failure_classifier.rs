@@ -35,6 +35,13 @@ pub fn classify_failure_deterministic(
         return Some(FailureClass::SnapshotSectionUnsupported);
     }
 
+    // ── Deploy failures of the design ────────────────────────────────────────
+    // A workflow definition or a user policy that does not compile at its deploy (COMPILE_ERROR from
+    // SY.wf-rules or SY.opa-rules) is the manifest's: it goes back to the designer, with the error.
+    if ctx.stage == PipelineStage::Execute && code == "COMPILE_ERROR" {
+        return Some(FailureClass::DesignIncomplete);
+    }
+
     // ── Execution failures ───────────────────────────────────────────────────
     if text.contains("runtime not materialized")
         || text.contains("runtime is not materialized")
@@ -150,7 +157,7 @@ impl FailureRoutingDecision {
             FailureRoutingDecision::RetryDesign => format!(
                 "The design phase will be retried automatically. \
                 Failure class: {class_label}. \
-                The designer will receive the audit feedback and produce a revised manifest."
+                The designer will receive the error and produce a revised manifest."
             ),
             FailureRoutingDecision::RetryArtifact => format!(
                 "Artifact generation will be retried with a repair packet. \
@@ -323,6 +330,29 @@ mod tests {
             &ctx(PipelineStage::Execute),
         );
         assert_eq!(result, Some(FailureClass::ExecutionTimeout));
+    }
+
+    /// A deploy's COMPILE_ERROR is the design's: the designer gets it back while design iterations
+    /// remain (WF Case 5).
+    #[test]
+    fn a_deploy_compile_error_goes_back_to_the_designer() {
+        let result = classify_failure_deterministic(
+            "wf_rules_compile_apply failed: COMPILE_ERROR: states[1].transitions[0].guard: undeclared reference to 'evnt'",
+            &ctx_code(PipelineStage::Execute, "COMPILE_ERROR"),
+        );
+        assert_eq!(result, Some(FailureClass::DesignIncomplete));
+        assert_eq!(
+            route_failure(&FailureClass::DesignIncomplete, 1, 0, 0),
+            FailureRoutingDecision::RetryDesign
+        );
+        // Another stage's error with that code is not a deploy's.
+        assert_eq!(
+            classify_failure_deterministic(
+                "some completely unknown error XYZ",
+                &ctx_code(PipelineStage::PlanValidation, "COMPILE_ERROR"),
+            ),
+            None
+        );
     }
 
     #[test]

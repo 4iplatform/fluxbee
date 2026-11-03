@@ -576,6 +576,33 @@ pub fn deployed_workflows(wf_state: Option<&serde_json::Value>) -> Vec<(String, 
         .collect()
 }
 
+/// A workflow's running instances in one hive's `list_workflows` answer (`active_instances`): None
+/// when SY.wf-rules could not count them (null: its node did not answer, or answered an error).
+pub fn workflow_active_instances(
+    wf_state: Option<&serde_json::Value>,
+    workflow_name: &str,
+) -> Option<u64> {
+    listed(wf_state, "/workflows")
+        .iter()
+        .find(|item| {
+            item.get("workflow_name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.trim() == workflow_name)
+        })
+        .and_then(|item| item.get("active_instances"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// The note a removal carries for the operator's confirmation: the workflow's running instances,
+/// the conversations its removal ends (it is removed with `force`).
+fn running_instances_note(active_instances: Option<u64>) -> String {
+    match active_instances {
+        Some(0) => "running instances: 0".to_string(),
+        Some(count) => format!("running instances: {count}; removing the workflow ends them"),
+        None => "running instances: unknown (SY.wf-rules could not count them); removing the workflow ends any that run".to_string(),
+    }
+}
+
 pub fn reconcile_wf(
     desired_wf: &[serde_json::Value],
     snapshot: &ActualStateSnapshot,
@@ -588,12 +615,14 @@ pub fn reconcile_wf(
         .filter_map(|item| serde_json::from_value::<DesiredWfDeployment>(item.clone()).ok())
         .collect();
 
-    // "<hive>:<workflow_name>" -> (current_hash, the solution that declared it)
-    let mut running: BTreeMap<String, (String, Option<&str>)> = BTreeMap::new();
+    // "<hive>:<workflow_name>" -> (current_hash, the solution that declared it, its running
+    // instances)
+    let mut running: BTreeMap<String, (String, Option<&str>, Option<u64>)> = BTreeMap::new();
     for (hive_id, hive_res) in &snapshot.resources {
         for (name, hash) in deployed_workflows(hive_res.wf_state.as_ref()) {
             let declared_by = hive_res.wf_declared_by.get(&name).map(String::as_str);
-            running.insert(format!("{hive_id}:{name}"), (hash, declared_by));
+            let instances = workflow_active_instances(hive_res.wf_state.as_ref(), &name);
+            running.insert(format!("{hive_id}:{name}"), (hash, declared_by, instances));
         }
     }
 
@@ -615,7 +644,7 @@ pub fn reconcile_wf(
                     notes: vec![],
                 });
             }
-            Some((current_hash, _)) => {
+            Some((current_hash, _, _)) => {
                 if *current_hash != wf.definition_hash() {
                     // WF.* nodes require restart on definition change (CFZ-12)
                     ops.push(DeltaOperation {
@@ -640,7 +669,7 @@ pub fn reconcile_wf(
         .iter()
         .map(|wf| format!("{}:{}", wf.hive, wf.workflow_name))
         .collect();
-    for (key, (_, declared_by)) in &running {
+    for (key, (_, declared_by, instances)) in &running {
         if desired_wf_keys.contains(key) || *declared_by != Some(solution_id) {
             continue;
         }
@@ -657,6 +686,7 @@ pub fn reconcile_wf(
             payload_ref: None,
             notes: vec![
                 "this solution deployed this workflow and no longer declares it".to_string(),
+                running_instances_note(*instances),
             ],
         });
     }
@@ -1483,6 +1513,51 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployRestart);
         assert_eq!(ops[0].change_type, ChangeType::Update);
+        // SY.wf-rules' compile_apply restarts the node: an update is that one step, one restart.
+        assert_eq!(
+            compiler_class_admin_steps(&CompilerClass::WfDeployRestart),
+            Some(vec!["wf_rules_compile_apply"])
+        );
+    }
+
+    /// A removal says how many conversations it ends: the snapshot's `active_instances`, or
+    /// "unknown" when SY.wf-rules could not count them (null).
+    #[test]
+    fn a_removal_notes_the_workflows_running_instances() {
+        let removal_notes = |active_instances: serde_json::Value| {
+            let mut workflow = listed_workflow("support-router", &wf_definition(&["a", "b"]));
+            workflow["active_instances"] = active_instances;
+            let mut snapshot = snapshot_with_workflows(vec![workflow]);
+            snapshot
+                .resources
+                .get_mut("motherbee")
+                .unwrap()
+                .wf_declared_by
+                .insert("support-router".to_string(), "sol-a".to_string());
+            let ops = reconcile_wf(&[], &snapshot, "sol-a");
+            assert_eq!(ops.len(), 1, "{ops:?}");
+            assert_eq!(ops[0].compiler_class, CompilerClass::WfRemove);
+            ops[0].notes.clone()
+        };
+        let notes = removal_notes(json!(3));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note == "running instances: 3; removing the workflow ends them"),
+            "{notes:?}"
+        );
+        let notes = removal_notes(json!(null));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("running instances: unknown")),
+            "{notes:?}"
+        );
+        let notes = removal_notes(json!(0));
+        assert!(
+            notes.iter().any(|note| note == "running instances: 0"),
+            "{notes:?}"
+        );
     }
 
     #[test]
