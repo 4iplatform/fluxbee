@@ -296,7 +296,7 @@ fn audit_workflow_definition(
             code: "INVALID_WORKFLOW_NAME".to_string(),
             field: Some("workflow_name".to_string()),
             message: format!(
-                "workflow_name '{name}' is not one SY.wf-rules accepts: dot-separated parts of lowercase letters, digits and '-', each starting with a letter"
+                "workflow_name '{name}' is not one SY.wf-rules accepts: lowercase letters and digits, in parts joined by dots, the first starting with a letter, no hyphens (its runtime is wf.<workflow_name>)"
             ),
             severity: AuditSeverity::Error,
         }),
@@ -669,19 +669,19 @@ mod tests {
         let mut bundle = valid_runtime_bundle();
         bundle.artifact_kind = "workflow_definition".to_string();
         for (artifact, code) in [
-            (json!({ "workflow_name": "test-wf" }), "MISSING_WF_FIELD"),
+            (json!({ "workflow_name": "test.wf" }), "MISSING_WF_FIELD"),
             (
                 json!({ "workflow_name": "test_wf", "definition": {} }),
                 "INVALID_WORKFLOW_NAME",
             ),
             // The made-up shape the seed used to show.
             (
-                json!({ "workflow_name": "test-wf", "definition": { "steps": [{ "id": "s1" }] } }),
+                json!({ "workflow_name": "test.wf", "definition": { "steps": [{ "id": "s1" }] } }),
                 "INVALID_WF_DEFINITION",
             ),
             // No start_from: no node would start an instance (0.1.91).
             (
-                json!({ "workflow_name": "test-wf", "definition": {
+                json!({ "workflow_name": "test.wf", "definition": {
                     "wf_schema_version": "1", "workflow_type": "test", "input_schema": { "type": "object" },
                     "initial_state": "a", "terminal_states": ["a"], "states": [{ "name": "a" }]
                 } }),

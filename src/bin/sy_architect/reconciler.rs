@@ -1462,7 +1462,7 @@ mod tests {
     fn desired_wf(definition: &serde_json::Value) -> serde_json::Value {
         json!({
             "hive": "motherbee",
-            "workflow_name": "support-router",
+            "workflow_name": "support.router",
             "definition": definition,
             "ownership": "solution"
         })
@@ -1517,12 +1517,12 @@ mod tests {
     #[test]
     fn missing_wf_deployment_emits_wf_deploy_apply() {
         let desired = vec![desired_wf(&wf_definition(&["start", "done"]))];
-        for workflows in [vec![], vec![staged_only_workflow("support-router")]] {
+        for workflows in [vec![], vec![staged_only_workflow("support.router")]] {
             let ops = reconcile_wf(&desired, &snapshot_with_workflows(workflows), "sol-a");
             assert_eq!(ops.len(), 1);
             assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployApply);
             assert_eq!(ops[0].change_type, ChangeType::Create);
-            assert_eq!(ops[0].resource_id, "motherbee:support-router");
+            assert_eq!(ops[0].resource_id, "motherbee:support.router");
         }
     }
 
@@ -1530,7 +1530,7 @@ mod tests {
     fn a_workflow_deployed_with_the_declared_definition_is_left_alone() {
         let definition = wf_definition(&["start", "done"]);
         let snapshot =
-            snapshot_with_workflows(vec![listed_workflow("support-router", &definition)]);
+            snapshot_with_workflows(vec![listed_workflow("support.router", &definition)]);
         let ops = reconcile_wf(&[desired_wf(&definition)], &snapshot, "sol-a");
         assert!(ops.is_empty(), "{ops:?}");
     }
@@ -1543,7 +1543,7 @@ mod tests {
         let definition = wf_definition(&["start", "done"]);
         let with_nodes = |nodes: serde_json::Value| {
             let mut snapshot =
-                snapshot_with_workflows(vec![listed_workflow("support-router", &definition)]);
+                snapshot_with_workflows(vec![listed_workflow("support.router", &definition)]);
             snapshot.resources.get_mut("motherbee").unwrap().nodes = Some(nodes);
             snapshot
         };
@@ -1555,9 +1555,9 @@ mod tests {
         assert_eq!(ops.len(), 1, "{ops:?}");
         assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployApply);
         assert_eq!(ops[0].change_type, ChangeType::Create);
-        assert_eq!(ops[0].resource_id, "motherbee:support-router");
+        assert_eq!(ops[0].resource_id, "motherbee:support.router");
 
-        let its_node = json!({ "nodes": [{ "node_name": "WF.support-router@motherbee",
+        let its_node = json!({ "nodes": [{ "node_name": "WF.support.router@motherbee",
                                            "managed": true, "config": { "exists": true } }] });
         assert!(
             reconcile_wf(&[desired_wf(&definition)], &with_nodes(its_node), "sol-a").is_empty()
@@ -1568,7 +1568,7 @@ mod tests {
     fn wf_definition_change_emits_wf_deploy_restart() {
         let running = wf_definition(&["start", "done"]);
         let desired = vec![desired_wf(&wf_definition(&["start", "review", "done"]))];
-        let snapshot = snapshot_with_workflows(vec![listed_workflow("support-router", &running)]);
+        let snapshot = snapshot_with_workflows(vec![listed_workflow("support.router", &running)]);
         let ops = reconcile_wf(&desired, &snapshot, "sol-a");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].compiler_class, CompilerClass::WfDeployRestart);
@@ -1585,7 +1585,7 @@ mod tests {
     #[test]
     fn a_removal_notes_the_workflows_running_instances() {
         let removal_notes = |active_instances: serde_json::Value| {
-            let mut workflow = listed_workflow("support-router", &wf_definition(&["a", "b"]));
+            let mut workflow = listed_workflow("support.router", &wf_definition(&["a", "b"]));
             workflow["active_instances"] = active_instances;
             let mut snapshot = snapshot_with_workflows(vec![workflow]);
             snapshot
@@ -1593,7 +1593,7 @@ mod tests {
                 .get_mut("motherbee")
                 .unwrap()
                 .wf_declared_by
-                .insert("support-router".to_string(), "sol-a".to_string());
+                .insert("support.router".to_string(), "sol-a".to_string());
             let ops = reconcile_wf(&[], &snapshot, "sol-a");
             assert_eq!(ops.len(), 1, "{ops:?}");
             assert_eq!(ops[0].compiler_class, CompilerClass::WfRemove);
@@ -1623,12 +1623,12 @@ mod tests {
     #[test]
     fn a_workflow_this_solution_deployed_and_no_longer_declares_is_removed() {
         let mut snapshot = snapshot_with_workflows(vec![
-            listed_workflow("support-router", &wf_definition(&["start", "done"])),
+            listed_workflow("support.router", &wf_definition(&["start", "done"])),
             listed_workflow("by-hand", &wf_definition(&["a", "b"])),
             staged_only_workflow("draft"),
         ]);
         let motherbee = snapshot.resources.get_mut("motherbee").unwrap();
-        for name in ["support-router", "draft"] {
+        for name in ["support.router", "draft"] {
             motherbee
                 .wf_declared_by
                 .insert(name.to_string(), "sol-a".to_string());
@@ -1638,7 +1638,7 @@ mod tests {
         assert_eq!(ops.len(), 1, "{ops:?}");
         assert_eq!(ops[0].compiler_class, CompilerClass::WfRemove);
         assert_eq!(ops[0].change_type, ChangeType::Delete);
-        assert_eq!(ops[0].resource_id, "motherbee:support-router");
+        assert_eq!(ops[0].resource_id, "motherbee:support.router");
         assert!(!ops[0].blocking);
 
         // Another solution's workflow, and one nobody declared ("by-hand"), are left alone.

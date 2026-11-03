@@ -75,11 +75,24 @@ func TestCompileWorkflowAutoIncrementsVersion(t *testing.T) {
 	}
 }
 
+// A workflow name follows the runtime naming policy, since its runtime is wf.<workflow_name>: a
+// hyphen, which the package's publish refused after the slots rotated (WF Case 5's gate), is refused
+// at compile and at check, with the rule in the detail.
 func TestCompileWorkflowRejectsInvalidWorkflowName(t *testing.T) {
 	svc := newTestService(t)
-	_, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "Invoice", Definition: validWorkflowDefinition()})
-	if err == nil || !strings.Contains(err.Error(), "INVALID_WORKFLOW_NAME") {
-		t.Fatalf("expected invalid name error, got %v", err)
+	for _, name := range []string{"Invoice", "ventas-gate0195", "sales.gate-1", "9sales", "sales..gate", "sales."} {
+		_, err := svc.CompileWorkflow(CompileRequest{WorkflowName: name, Definition: validWorkflowDefinition()})
+		if err == nil || !strings.Contains(err.Error(), "INVALID_WORKFLOW_NAME") || !strings.Contains(err.Error(), "no hyphens") {
+			t.Fatalf("%q: expected invalid name error, got %v", name, err)
+		}
+		if _, err := svc.CheckWorkflow(CompileRequest{WorkflowName: name, Definition: validWorkflowDefinition()}); err == nil {
+			t.Fatalf("%q: the check passed a name the publish refuses", name)
+		}
+	}
+	for _, name := range []string{"invoice", "ventas.gate0195", "sales.2026", "ventasgate0195"} {
+		if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: name, Definition: validWorkflowDefinition()}); err != nil {
+			t.Fatalf("%q: %v", name, err)
+		}
 	}
 }
 

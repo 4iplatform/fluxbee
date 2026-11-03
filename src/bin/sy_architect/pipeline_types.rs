@@ -686,12 +686,16 @@ impl DesiredWfDeployment {
 }
 
 /// SY.wf-rules' workflow name rule (`workflowNamePattern` in go/sy-wf-rules/node/types.go,
-/// `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`).
+/// `^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`), the runtime naming policy, since a workflow's runtime is
+/// `wf.<workflow_name>`: lowercase letters and digits, in parts joined by dots, the first starting
+/// with a letter, no hyphens (0.1.98; a hyphen passed the check and failed the package's publish).
 pub fn valid_workflow_name(name: &str) -> bool {
-    name.split('.').all(|part| {
+    name.split('.').enumerate().all(|(idx, part)| {
         let mut chars = part.chars();
-        chars.next().is_some_and(|first| first.is_ascii_lowercase())
-            && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || (idx > 0 && first.is_ascii_digit()))
+            && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
     })
 }
 

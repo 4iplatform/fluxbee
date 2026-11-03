@@ -21230,7 +21230,7 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
             }
             if !pipeline_types::valid_workflow_name(&wf.workflow_name) {
                 return Err(format!(
-                    "desired_state.wf_deployments[{idx}].workflow_name '{}' is not one SY.wf-rules accepts: dot-separated parts of lowercase letters, digits and '-', each starting with a letter",
+                    "desired_state.wf_deployments[{idx}].workflow_name '{}' is not one SY.wf-rules accepts: lowercase letters and digits, in parts joined by dots, the first starting with a letter, no hyphens (its runtime is wf.<workflow_name>)",
                     wf.workflow_name
                 ));
             }
@@ -28457,10 +28457,20 @@ mod tests {
 
     #[test]
     fn a_workflow_name_must_be_one_sy_wf_rules_accepts() {
-        for name in ["invoice", "invoice-approval", "billing.v2", "a1-b.c2"] {
+        for name in [
+            "invoice",
+            "invoicing",
+            "billing.v2",
+            "a1b.c2",
+            "billing.2v",
+            "sales.2026",
+        ] {
             assert!(pipeline_types::valid_workflow_name(name), "{name}");
         }
         for name in [
+            // The runtime naming policy has no hyphen (wf.<workflow_name>, WF Case 5's gate).
+            "invoice-approval",
+            "a1-b.c2",
             "invoice_approval",
             "Invoice",
             "1invoice",
@@ -28469,7 +28479,6 @@ mod tests {
             "in voice",
             "",
             "billing..v2",
-            "billing.2v",
         ] {
             assert!(!pipeline_types::valid_workflow_name(name), "{name}");
         }

@@ -30,7 +30,7 @@ func (s *Service) ApplyWorkflow(req ApplyRequest) (*ApplyResult, error) {
 func (s *Service) applyWorkflow(ctx context.Context, req ApplyRequest) (*ApplyResult, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
-		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+		return nil, invalidWorkflowName(workflowName)
 	}
 	stagedMeta, err := s.store.ReadStagedMetadata(workflowName)
 	if err != nil {

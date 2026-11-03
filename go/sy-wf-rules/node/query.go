@@ -15,7 +15,7 @@ type WorkflowView struct {
 func (s *Service) GetWorkflow(req GetWorkflowRequest) (*WorkflowView, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
-		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+		return nil, invalidWorkflowName(workflowName)
 	}
 	meta, err := s.store.ReadCurrentMetadata(workflowName)
 	if err != nil {

@@ -7,7 +7,17 @@ import (
 	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
 )
 
-var workflowNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`)
+// workflowNamePattern is the runtime naming policy (runtime_name_regex, src/runtime_package.rs),
+// since a workflow's runtime is wf.<workflow_name>: lowercase letters and digits, in parts joined by
+// dots, the first starting with a letter. It allowed hyphens before 0.1.98, which every check and
+// compile passed and the package's publish refused (PACKAGE_PUBLISH_FAILED), after the slots had
+// rotated (WF Case 5's gate).
+var workflowNamePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z0-9]+)*$`)
+
+// invalidWorkflowName refuses a workflow name, saying the rule.
+func invalidWorkflowName(name string) WfRulesError {
+	return WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q: lowercase letters and digits, in parts joined by dots, the first starting with a letter, no hyphens (its runtime is wf.<workflow_name>)", name)}
+}
 
 type ClockFunc = wfcel.ClockFunc
 

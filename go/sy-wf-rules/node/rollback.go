@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 )
@@ -29,7 +28,7 @@ func (s *Service) RollbackWorkflow(req RollbackRequest) (*RollbackResult, error)
 func (s *Service) rollbackWorkflow(ctx context.Context, req RollbackRequest) (*RollbackResult, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
-		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+		return nil, invalidWorkflowName(workflowName)
 	}
 	backupMeta, err := s.store.ReadBackupMetadata(workflowName)
 	if err != nil {

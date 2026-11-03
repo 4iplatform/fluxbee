@@ -13,7 +13,7 @@ type DeleteWorkflowResult struct {
 func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResult, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
-		return nil, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+		return nil, invalidWorkflowName(workflowName)
 	}
 	if !s.store.WorkflowExists(workflowName) {
 		return nil, WfRulesError{Code: "WORKFLOW_NOT_FOUND", Detail: fmt.Sprintf("workflow %q not found", workflowName)}

@@ -78,7 +78,7 @@ type loadedWorkflow struct {
 func (s *Service) loadWorkflow(req CompileRequest) (loadedWorkflow, error) {
 	workflowName := strings.TrimSpace(req.WorkflowName)
 	if !workflowNamePattern.MatchString(workflowName) {
-		return loadedWorkflow{}, WfRulesError{Code: "INVALID_WORKFLOW_NAME", Detail: fmt.Sprintf("invalid workflow_name %q", workflowName)}
+		return loadedWorkflow{}, invalidWorkflowName(workflowName)
 	}
 	if req.Definition == nil {
 		return loadedWorkflow{}, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: "definition is required"}

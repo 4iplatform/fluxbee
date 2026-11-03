@@ -14284,7 +14284,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
 }
 
 /// What the actions that take a workflow definition say of its name and of the definition.
-const WF_RULES_WORKFLOW_NAME_NOTE: &str = "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.";
+const WF_RULES_WORKFLOW_NAME_NOTE: &str = "workflow_name must match ^[a-z][a-z0-9]*(\\.[a-z0-9]+)*$, the runtime naming policy, since its runtime is wf.<workflow_name>: lowercase letters and digits, in parts joined by dots, the first starting with a letter. No hyphens and no underscores.";
 const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.";
 
 /// What the node routes that send to the node itself say of its name (`node_name_on_hive`).
