@@ -1148,7 +1148,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, decided by the operator (2026-11-02),** with WF Case 5's build
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5). The WF routes, so it owns the
   fact:
-  - everything the WF sends to the person's IO node names the person as its `dst_ilk`;
+  - everything the WF sends to the person's IO node names the person as its `dst_ilk`, and the
+    person's channel as its `ich` (added while building, 2026-11-03);
   - a message the WF writes to an IO node does not name the person as its sender;
   - an agent still gets the person (A-116).
 

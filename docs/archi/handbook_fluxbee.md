@@ -318,9 +318,12 @@ Common guards:
   - `target` is a node name written in the definition, never a `SY.*` or `RT.*` node. To choose
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
-  - A message the WF writes carries the instance's person: the `src_ilk` and `ich` that the
-    messages of its `start_from` nodes share. On a thread several people write on, it carries
-    none.
+  - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
+    `ich` that the messages of its `start_from` nodes share. On a thread several people write on,
+    it carries none.
+  - A message the WF writes to an IO node never names the person as its sender: the router's stamp
+    names the WF. To the person's own IO node (one of `start_from`), it names the person as
+    `dst_ilk`, and the person's channel as `ich`.
   - It carries no `io` context: when an agent's answer to it must reach a person, write the
     person's `io` context, kept in `state` from their message, in `meta.context.io`.
 - **`forward`** sends the event's message, or the one kept under `message`, as it was received. Its
@@ -328,7 +331,9 @@ Common guards:
   - The payload goes byte for byte. The meta goes too, the person's ILK included, but not
     `memory_package`.
   - The WF changes only the destination, the thread, the `meta.context` keys it writes, and its
-    own block.
+    own block. To the person's own IO node it names the person too, as `dst_ilk` and `ich`,
+    whoever the message answered: an agent's answer to a supervisor reaches the person as the
+    person's.
   - A forward has no `meta.msg` and no `payload`. It fails when there is no message: a
     `TIMER_FIRED`, an internal event, or a name not kept yet.
 - **`keep_message`** (`name`) keeps the event's message, whole, for a later forward. A later keep

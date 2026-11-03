@@ -1779,7 +1779,9 @@ Six pieces. Each one's tests come with it, and every behavior below is a contrac
 - **A-139, the ILKs** (actions.go):
   - a `send_message` or a `forward` to an `IO.*` node of the definition's `start_from` names the
     instance's person as `dst_ilk`, when the instance has one. Without a person, a forward keeps its
-    `dst_ilk`, and a send has none;
+    `dst_ilk`, and a send has none. *Added while building (2026-11-03):* the person's channel too,
+    as `ich`, on the same condition. A forward of an agent's answer to a supervisor otherwise
+    carries the supervisors' channel;
   - a `send_message` to an `IO.*` node carries no `src_ilk` and no `ich`. The router's stamp names
     the WF as its sender, and the facts (`vars`) say who said what;
   - to an `AI.*` or a `WF.*` node nothing changes: a send carries the person (A-116).
