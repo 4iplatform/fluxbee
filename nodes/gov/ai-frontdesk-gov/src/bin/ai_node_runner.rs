@@ -146,6 +146,16 @@ impl OpenAiApiKeySource {
     }
 }
 
+/// Whether a vault lookup waits out a vault that is not reachable yet, as SY.architect,
+/// SY.storage, SY.identity and SY.cognition do (FINDINGS A-26, A-141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// After boot (a turn, a VAULT_SECRET_CHANGED, a CONFIG_SET): the vault is up, ask once.
+    Once,
+}
+
 fn frontdesk_default_instructions() -> String {
     FRONTDESK_DEFAULT_SYSTEM_PROMPT.trim().to_string()
 }
@@ -1828,7 +1838,9 @@ impl GenericAiNode {
     }
 
     async fn resolve_ai_api_key(&self, provider: AiProvider) -> Option<String> {
-        self.resolve_ai_api_key_with_source(provider).await.0
+        self.resolve_ai_api_key_with_source(provider, VaultWait::Once)
+            .await
+            .0
     }
 
     async fn configured_ai_provider(&self) -> AiProvider {
@@ -1846,10 +1858,12 @@ impl GenericAiNode {
     /// Model D' — same contract as ai-generic: resolve via
     /// `resolve_resource(Openai)`. SY.frontdesk.gov is a system node so its
     /// tenant is `DEFAULT_ROOT_TENANT_ID` (it doesn't get
-    /// FLUXBEE_NODE_TENANT_ID like AI.* / IO.* dynamic spawns).
+    /// FLUXBEE_NODE_TENANT_ID like AI.* / IO.* dynamic spawns). At boot the lookup waits for a
+    /// vault that does not answer yet (`wait`).
     async fn resolve_ai_api_key_with_source(
         &self,
         provider: AiProvider,
+        wait: VaultWait,
     ) -> (Option<String>, OpenAiApiKeySource) {
         let Some(vault) = self.vault.as_ref() else {
             tracing::warn!(
@@ -1858,13 +1872,26 @@ impl GenericAiNode {
             );
             return (None, OpenAiApiKeySource::Missing);
         };
-        let result = vault
-            .resolve_resource(
-                provider.resource_type(),
-                fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-                Duration::from_secs(5),
-            )
-            .await;
+        let tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+        let timeout = Duration::from_secs(5);
+        let result = match wait {
+            VaultWait::UntilReachable => {
+                vault
+                    .resolve_resource_awaiting_vault(
+                        provider.resource_type(),
+                        tenant,
+                        timeout,
+                        fluxbee_sdk::VAULT_BOOT_WAIT,
+                        &self.node_name,
+                    )
+                    .await
+            }
+            VaultWait::Once => {
+                vault
+                    .resolve_resource(provider.resource_type(), tenant, timeout)
+                    .await
+            }
+        };
         match result {
             Ok(Some(value)) => {
                 let api_key = extract_openai_api_key_from_value(&value);
@@ -1896,13 +1923,18 @@ impl GenericAiNode {
     /// Configured when the token resolves, Unconfigured when it does not; returns whether it resolved.
     /// A no-behavior FAILED_CONFIG node (broken hive.yaml) is left untouched — a token cannot help it.
     /// This is the frontdesk analog of `refresh_architect_ai_runtime`: the ONE resolve+set-state seam
-    /// used at boot, on VAULT_SECRET_CHANGED, and on the CONFIG_SET refresh knob.
-    async fn refresh_ai_gate(&self) -> bool {
+    /// used at boot (waiting for the vault, FINDINGS A-141), on VAULT_SECRET_CHANGED, and on the
+    /// CONFIG_SET refresh knob.
+    async fn refresh_ai_gate(&self, wait: VaultWait) -> bool {
         if self.behavior.read().await.is_none() {
             return false;
         }
         let provider = self.configured_ai_provider().await;
-        let resolved = self.resolve_ai_api_key(provider).await.is_some();
+        let resolved = self
+            .resolve_ai_api_key_with_source(provider, wait)
+            .await
+            .0
+            .is_some();
         let mut state = self.control_plane.write().await;
         if resolved {
             state.current_state = NodeLifecycleState::Configured;
@@ -1921,7 +1953,9 @@ impl GenericAiNode {
             return;
         }
         let provider = self.configured_ai_provider().await;
-        if self.refresh_ai_gate().await {
+        // On an upgrade the whole hive restarts at once and the vault may not answer yet: the read
+        // waits for it (VAULT_BOOT_WAIT), or the LLM path would stay off until a vault notice.
+        if self.refresh_ai_gate(VaultWait::UntilReachable).await {
             tracing::info!(
                 node_name = %self.node_name,
                 provider = %provider,
@@ -1999,7 +2033,7 @@ impl GenericAiNode {
 
         // Autonomous refresh (cf. refresh_architect_ai_runtime): ACT on the broadcast — re-resolve the
         // token and flip the LLM gate live via the shared seam.
-        if self.refresh_ai_gate().await {
+        if self.refresh_ai_gate(VaultWait::Once).await {
             tracing::info!(
                 node_name = %self.node_name,
                 trace_id = %msg.routing.trace_id,
@@ -2213,7 +2247,7 @@ impl GenericAiNode {
                 self.control_plane.read().await.current_state.as_str(),
             );
         }
-        let resolved = self.refresh_ai_gate().await;
+        let resolved = self.refresh_ai_gate(VaultWait::Once).await;
         tracing::info!(
             node_name = %self.node_name,
             resolved,
@@ -2291,7 +2325,10 @@ impl GenericAiNode {
         // Some (baked), so the truthful diagnostic is whether the node is Configured (token live).
         let configured = state_name == NodeLifecycleState::Configured.as_str();
         let provider = self.configured_ai_provider().await;
-        let api_key_source = self.resolve_ai_api_key_with_source(provider).await.1;
+        let api_key_source = self
+            .resolve_ai_api_key_with_source(provider, VaultWait::Once)
+            .await
+            .1;
         // Baked engine (hive-wide provider/model from hive.yaml) — reported for diagnostics, mirroring
         // architect's config.ai block.
         let (engine_provider, engine_model) = match self.behavior.read().await.as_ref() {
@@ -2788,7 +2825,8 @@ async fn run_unconfigured_bootstrap(
         control_plane: Arc::new(RwLock::new(state)),
         usage,
     };
-    // Now that the dispatcher/vault exist, resolve the AI token from SY.vault and flip to Configured
+    // Now that the dispatcher/vault exist, resolve the AI token from SY.vault, waiting for a vault
+    // that does not answer yet (up to VAULT_BOOT_WAIT, FINDINGS A-141), and flip to Configured
     // when present (autonomous SY.* pattern, cf. build_architect_ai_runtime). No token => stay
     // Unconfigured (degraded — the deterministic handoff still works).
     ai_node.boot_self_configure().await;
@@ -3931,7 +3969,7 @@ mod tests {
 
         // No key in SY.vault: the gate stays closed (test_node has no vault client).
         *node.behavior.write().await = Some(NodeBehavior::Echo);
-        assert!(!node.refresh_ai_gate().await);
+        assert!(!node.refresh_ai_gate(VaultWait::Once).await);
         let no_key = status(
             node.handle_control_plane(sample_request())
                 .await
@@ -3968,6 +4006,123 @@ mod tests {
         assert_eq!(configured["health_state"], json!("HEALTHY"));
         assert_eq!(configured["lifecycle_state"], json!("CONFIGURED"));
         assert!(configured.get("last_error").is_none());
+    }
+
+    /// The vault's answer to `request`, on the request's trace.
+    fn vault_reply(request: &Message, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "vault-test-uuid".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// What the router answers for a vault that is not up yet.
+    fn vault_unreachable(request: &Message) -> Message {
+        let reason = json!({ "reason": "NODE_NOT_FOUND", "original_dst": "SY.vault@motherbee" });
+        vault_reply(request, MSG_UNREACHABLE, reason)
+    }
+
+    /// A-141: at boot the AI key lookup waits for a vault that does not answer yet (an upgrade
+    /// restarts the whole hive at once), and the LLM path opens when it does. After boot a lookup
+    /// asks once, and a vault that does not answer leaves the gate closed.
+    #[tokio::test]
+    async fn the_boot_lookup_waits_for_the_vault() {
+        let profile = build_frontdesk_gov_rpc_profile().expect("rpc profile");
+        let (dispatcher, mut harness) =
+            fluxbee_sdk::RouterDispatcherTestHarness::new("SY.frontdesk.gov@motherbee", profile);
+        let mut node = test_node();
+        // No ILK of its own here: only the tenant's general secret is listed.
+        node.vault = Some(VaultClient::for_primary(
+            dispatcher,
+            VaultCallerOwned::new("", "SY.frontdesk.gov@motherbee"),
+        ));
+        *node.behavior.write().await = Some(NodeBehavior::Echo);
+
+        let vault = async {
+            let wait = Duration::from_secs(5);
+            let list = harness.next_outgoing_within(wait).await.expect("the list");
+            assert_eq!(list.meta.msg.as_deref(), Some(fluxbee_sdk::MSG_VAULT_LIST));
+            harness.inject(vault_unreachable(&list)).await.unwrap();
+            // The lookup asks again, once the vault may be up.
+            let list = harness
+                .next_outgoing_within(wait)
+                .await
+                .expect("the list again");
+            assert_eq!(list.meta.msg.as_deref(), Some(fluxbee_sdk::MSG_VAULT_LIST));
+            let secrets = json!({
+                "status": "ok",
+                "count": 1,
+                "secrets": [{
+                    "key": "openai:frontdesk",
+                    "metadata": {
+                        "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                        "resource_type": "openai",
+                    },
+                    "version": 1,
+                    "access_count": 0,
+                }],
+            });
+            harness
+                .inject(vault_reply(
+                    &list,
+                    fluxbee_sdk::MSG_VAULT_LIST_RESPONSE,
+                    secrets,
+                ))
+                .await
+                .unwrap();
+            let get = harness.next_outgoing_within(wait).await.expect("the get");
+            assert_eq!(get.meta.msg.as_deref(), Some(fluxbee_sdk::MSG_VAULT_GET));
+            let value = json!({
+                "status": "ok",
+                "key": "openai:frontdesk",
+                "value": { "api_key": "sk-test" },
+            });
+            harness
+                .inject(vault_reply(
+                    &get,
+                    fluxbee_sdk::MSG_VAULT_GET_RESPONSE,
+                    value,
+                ))
+                .await
+                .unwrap();
+        };
+        tokio::join!(node.boot_self_configure(), vault);
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Configured
+        );
+
+        let vault = async {
+            let list = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the list");
+            harness.inject(vault_unreachable(&list)).await.unwrap();
+        };
+        let (resolved, ()) = tokio::join!(node.refresh_ai_gate(VaultWait::Once), vault);
+        assert!(!resolved);
+        assert_eq!(
+            node.control_plane.read().await.current_state,
+            NodeLifecycleState::Unconfigured
+        );
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(1_500))
+                .await
+                .is_none(),
+            "after boot the vault is asked once"
+        );
     }
 
     async fn control_answer(node: &GenericAiNode, msg: Message) -> Message {

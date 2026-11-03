@@ -74,6 +74,7 @@ wf_rules_http_map = {
     "Apply": "wf_rules_apply",
     "Rollback": "wf_rules_rollback",
     "Delete": "wf_rules_delete",
+    "Check": "wf_rules_check",
 }
 for variant, action in wf_rules_http_map.items():
     # The call also names who asked for the deploy (A-68): match the variant, not the paren.

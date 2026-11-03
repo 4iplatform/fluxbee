@@ -629,16 +629,16 @@ async fn main() -> Result<(), AdminError> {
         self_ilk_id = %self_ilk_id,
         "self system ILK computed deterministically"
     );
-    let initial_executor_runtime = build_admin_executor_ai_runtime(
-        Arc::clone(&router_client),
-        &hive.hive_id,
-        &node_name,
-        &self_ilk_id,
-        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-    )
-    .await?;
-    let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
-    let executor_runtime = Arc::new(Mutex::new(initial_executor_runtime));
+    // An invalid `ai` section stops the start. The executor's key itself is read in a task of its
+    // own, next to the loops below, so the admin serves while it waits for the vault
+    // (`boot_admin_executor_ai_runtime`).
+    hive.ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> AdminError { err.into() })?;
+    let executor_configured = Arc::new(AtomicBool::new(false));
+    let executor_runtime = Arc::new(Mutex::new(None));
     let public_edge_node = std::env::var("SY_ADMIN_PUBLIC_EDGE_NODE")
         .ok()
         .map(|value| value.trim().to_string())
@@ -729,6 +729,10 @@ async fn main() -> Result<(), AdminError> {
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
     let sweep_ctx = http_ctx.clone();
+    let executor_ctx = http_ctx.clone();
+    tokio::spawn(async move {
+        boot_admin_executor_ai_runtime(&executor_ctx).await;
+    });
     let http_client = router_client.clone();
     tokio::spawn(async move {
         if let Err(err) = run_http_server(&admin_listen, http_ctx, http_client).await {
@@ -1665,21 +1669,76 @@ fn save_admin_executor_node_config(
     Ok(path)
 }
 
-/// Build the admin executor AI runtime by discovering the `openai` resource
+/// Whether a vault lookup waits out a vault that is not reachable yet, as SY.architect, SY.storage,
+/// SY.identity and SY.cognition do (FINDINGS A-26, A-141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultWait {
+    /// At boot: retry transport failures for up to `VAULT_BOOT_WAIT`.
+    UntilReachable,
+    /// On a refresh (a VAULT_SECRET_CHANGED or a CONFIG_SET): the vault is up, ask once.
+    Once,
+}
+
+/// The executor's AI key: the secret of `resource` in SY.vault that this node uses (one it owns,
+/// else one assigned to it, else its tenant's general one). `None` when there is none, when its
+/// value carries no `api_key`, or when the vault fails (logged): the executor then runs degraded.
+async fn resolve_admin_executor_api_key(
+    vault_client: &fluxbee_sdk::VaultClient,
+    resource: fluxbee_sdk::ResourceType,
+    my_tenant: &str,
+    node_name: &str,
+    wait: VaultWait,
+) -> Result<Option<String>, AdminError> {
+    let resource_label = resource.as_str().to_string();
+    let timeout = Duration::from_secs(5);
+    let value = match wait {
+        VaultWait::UntilReachable => {
+            vault_client
+                .resolve_resource_awaiting_vault(
+                    resource,
+                    my_tenant,
+                    timeout,
+                    fluxbee_sdk::VAULT_BOOT_WAIT,
+                    node_name,
+                )
+                .await
+        }
+        VaultWait::Once => {
+            vault_client
+                .resolve_resource(resource, my_tenant, timeout)
+                .await
+        }
+    };
+    match value {
+        Ok(Some(value)) => admin_executor_extract_openai_api_key(&value),
+        Ok(None) => Ok(None),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                resource = %resource_label,
+                "SY.admin executor AI vault resource lookup failed; running degraded"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Build the admin executor AI runtime by discovering the hive provider's resource
 /// in SY.vault (owned → assigned → its tenant's general secret; admin's tenant is the root one).
 /// Returns `Ok(None)` (degraded) on any of:
-/// - vault has no openai secret reachable from our (ilk, tenant) match;
-/// - vault unreachable or denies access;
+/// - vault has no secret of the provider reachable from our (ilk, tenant) match;
+/// - vault unreachable or denies access (at boot, after waiting for it: `wait`);
 /// - the secret value doesn't carry a non-empty `api_key`.
 ///
-/// Async because vault is a router round-trip. Caller (`refresh_*` or main
-/// boot) decides whether to retry/log.
+/// Async because vault is a router round-trip. Caller (`refresh_*`, which the boot runs too)
+/// logs the outcome.
 async fn build_admin_executor_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
     my_tenant: &str,
+    wait: VaultWait,
 ) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
     let hive_raw = fs::read_to_string(json_router::paths::config_dir().join("hive.yaml"))?;
     let hive: HiveFile = serde_yaml::from_str(&hive_raw)?;
@@ -1695,25 +1754,14 @@ async fn build_admin_executor_ai_runtime(
         hive_id.to_string(),
         fluxbee_sdk::VaultCallerOwned::new(self_ilk_id.to_string(), node_name.to_string()),
     );
-    let value = vault_client
-        .resolve_resource(
-            engine.provider.resource_type(),
-            my_tenant,
-            Duration::from_secs(5),
-        )
-        .await;
-    let api_key = match value {
-        Ok(Some(value)) => admin_executor_extract_openai_api_key(&value)?,
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                provider = %engine.provider,
-                "SY.admin executor AI vault resource lookup failed; running degraded"
-            );
-            return Ok(None);
-        }
-    };
+    let api_key = resolve_admin_executor_api_key(
+        &vault_client,
+        engine.provider.resource_type(),
+        my_tenant,
+        node_name,
+        wait,
+    )
+    .await?;
     let Some(api_key) = api_key else {
         return Ok(None);
     };
@@ -1744,19 +1792,42 @@ fn admin_executor_extract_openai_api_key(
     Ok(None)
 }
 
-async fn refresh_admin_executor_ai_runtime(ctx: &AdminContext) -> Result<bool, AdminError> {
+async fn refresh_admin_executor_ai_runtime(
+    ctx: &AdminContext,
+    wait: VaultWait,
+) -> Result<bool, AdminError> {
     let runtime = build_admin_executor_ai_runtime(
         Arc::clone(&ctx.rpc),
         &ctx.hive_id,
         &ctx.node_name,
         &ctx.self_ilk_id,
         fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        wait,
     )
     .await?;
     ctx.executor_configured
         .store(runtime.is_some(), Ordering::Relaxed);
     *ctx.executor_runtime.lock().await = runtime;
     Ok(ctx.executor_configured.load(Ordering::Relaxed))
+}
+
+/// The executor's key at boot, in a task of its own (FINDINGS A-141). On an upgrade the whole hive
+/// restarts at once and the vault may not answer yet, so the read waits for it, up to
+/// `VAULT_BOOT_WAIT`, as its peers' do; the admin serves meanwhile, with the executor unavailable.
+/// A VAULT_SECRET_CHANGED or a CONFIG_SET reads the key again later.
+async fn boot_admin_executor_ai_runtime(ctx: &AdminContext) {
+    match refresh_admin_executor_ai_runtime(ctx, VaultWait::UntilReachable).await {
+        Ok(configured) => tracing::info!(
+            node_name = %ctx.node_name,
+            configured = configured,
+            "admin executor runtime built at boot"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            node_name = %ctx.node_name,
+            "admin executor runtime could not be built at boot"
+        ),
+    }
 }
 
 fn admin_executor_catalog_mode(config: Option<&AdminExecutorNodeConfigFile>) -> String {
@@ -3800,7 +3871,7 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
         provider = %provider,
         "VAULT_SECRET_CHANGED matches AI provider interest; refreshing executor runtime"
     );
-    match refresh_admin_executor_ai_runtime(ctx).await {
+    match refresh_admin_executor_ai_runtime(ctx, VaultWait::Once).await {
         Ok(configured) => {
             tracing::info!(
                 node_name = %ctx.node_name,
@@ -4058,7 +4129,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "17";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "18";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4611,6 +4682,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "wf_rules_check",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::Check),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "wf_rules_get_workflow",
         route: InternalActionRoute::WfRulesQuery("get_workflow"),
         requires_target: false,
@@ -4626,6 +4703,25 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         action: "wf_rules_list_workflows",
         route: InternalActionRoute::WfRulesQuery("list_workflows"),
         requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    // A WF node's instances, through the engine's own verbs (`handle_wf_instance_command`).
+    InternalActionSpec {
+        action: "wf_list_instances",
+        route: InternalActionRoute::Command("wf_list_instances"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_get_instance",
+        route: InternalActionRoute::Command("wf_get_instance"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_cancel_instance",
+        route: InternalActionRoute::Command("wf_cancel_instance"),
+        requires_target: true,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -4830,9 +4926,15 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         | "wf_rules_apply"
         | "wf_rules_rollback"
         | "wf_rules_delete"
+        | "wf_rules_check"
         | "wf_rules_get_workflow"
         | "wf_rules_get_status"
         | "wf_rules_list_workflows"
+        // A WF node's instances: the operator's, through Archi. SY.wf-rules asks its WF nodes
+        // directly (the engine answers it too), never through the admin.
+        | "wf_list_instances"
+        | "wf_get_instance"
+        | "wf_cancel_instance"
         | "timer_help"
         | "timer_get"
         | "timer_list"
@@ -8208,6 +8310,8 @@ enum WfRulesAction {
     Apply,
     Rollback,
     Delete,
+    /// Validate a definition as a compile does, staging nothing (`send_wf_rules_check`).
+    Check,
 }
 
 impl WfRulesAction {
@@ -8217,6 +8321,7 @@ impl WfRulesAction {
             WfRulesAction::CompileApply => Some("compile_apply"),
             WfRulesAction::Apply => Some("apply"),
             WfRulesAction::Rollback => Some("rollback"),
+            WfRulesAction::Check => Some("check"),
             WfRulesAction::Delete => None,
         }
     }
@@ -8235,7 +8340,12 @@ impl WfRulesAction {
             WfRulesAction::Apply => "apply",
             WfRulesAction::Rollback => "rollback",
             WfRulesAction::Delete => "delete_workflow",
+            WfRulesAction::Check => "check",
         }
+    }
+
+    fn check_only(&self) -> bool {
+        matches!(self, WfRulesAction::Check)
     }
 }
 
@@ -9066,6 +9176,12 @@ async fn handle_http(
                 handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             respond_json(stream, status, &resp).await?;
         }
+        ("POST", "/wf-rules/check") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Check, "operator").await?;
+            respond_json(stream, status, &resp).await?;
+        }
         ("GET", "/wf-rules") => {
             let req = wf_rules_request_from_query(query, Some(ctx.hive_id.clone()));
             let action = if req.payload.contains_key("workflow_name") {
@@ -9487,6 +9603,58 @@ async fn handle_hive_paths(
             });
             let (status, resp) =
                 handle_admin_command(ctx, client, "node_help", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes", name, "wf", "instances"]) => {
+            let mut payload = serde_json::json!({
+                "node_name": decode_percent(name),
+            });
+            if let Some(status) = query.get("status").filter(|value| !value.is_empty()) {
+                payload["status"] = serde_json::json!(status);
+            }
+            if let Some(limit) = query.get("limit").filter(|value| !value.is_empty()) {
+                payload["limit"] = query_number(limit);
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "wf_list_instances", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["nodes", name, "wf", "instances", instance_id]) => {
+            let mut payload = serde_json::json!({
+                "node_name": decode_percent(name),
+                "instance_id": decode_percent(instance_id),
+            });
+            if let Some(log_limit) = query.get("log_limit").filter(|value| !value.is_empty()) {
+                payload["log_limit"] = query_number(log_limit);
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "wf_get_instance", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "wf", "instances", instance_id, "cancel"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "wf_cancel_instance",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            payload["instance_id"] = serde_json::Value::String(decode_percent(instance_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "wf_cancel_instance", payload, Some(hive))
+                    .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes", name, "messages"]) => {
@@ -10101,6 +10269,14 @@ async fn handle_hive_paths(
                 handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete, "operator").await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["wf-rules", "check"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Check, "operator").await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["wf-rules"]) => {
             let req = wf_rules_request_from_query(query.clone(), Some(hive));
             let action = if req.payload.contains_key("workflow_name") {
@@ -10629,6 +10805,11 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
         "WORKFLOW_NOT_FOUND" => 404,
+        // A WF engine's refusals of its instance verbs (`wf_instance_answer`): an instance it does
+        // not have, one already ended, and its store failing.
+        "INSTANCE_NOT_FOUND" => 404,
+        "INSTANCE_ALREADY_TERMINATED" => 409,
+        "STORE_ERROR" => 502,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
@@ -11055,6 +11236,82 @@ fn wf_rules_operation_config(
     serde_json::Value::Object(payload)
 }
 
+/// The config of a check (`send_wf_rules_check`): the request, the operation and the check's id.
+/// It takes no version, and no `launched_by`: a check launches nothing.
+fn wf_rules_check_config(
+    mut payload: serde_json::Map<String, serde_json::Value>,
+    check_id: &str,
+) -> serde_json::Value {
+    payload.remove("version");
+    payload.remove("launched_by");
+    payload.insert("operation".to_string(), serde_json::json!("check"));
+    payload.insert("check_id".to_string(), serde_json::json!(check_id));
+    serde_json::Value::Object(payload)
+}
+
+/// SY.wf-rules' answer to the check `check_id`, and to no other: it echoes the id it checked, in a
+/// pass and in a refusal. An answer without it ran no check (an SY.wf-rules that knows no check
+/// compiles and stages instead), so it is an error, never a pass.
+fn wf_rules_check_answer(
+    target_node: &str,
+    check_id: &str,
+    answer: serde_json::Value,
+) -> Result<serde_json::Value, AdminError> {
+    match answer.get("check_id").and_then(serde_json::Value::as_str) {
+        Some(echoed) if echoed == check_id => Ok(answer),
+        echoed => Err(format!(
+            "invalid response for check {check_id}: {target_node} answered check_id {}, so it ran no check",
+            echoed.unwrap_or("none")
+        )
+        .into()),
+    }
+}
+
+/// A check is a read (docs/wf-orchestration-v1.md §5.5.1): the hive's SY.wf-rules validates the
+/// definition as a compile does and only answers. It takes no version and writes nothing (no
+/// staged definition, no package, no store row), so a check between a compile and its apply leaves
+/// the staged and the current definitions alone. A fresh `check_id`, echoed in the answer, ties the
+/// two together, as `send_opa_check` does.
+async fn send_wf_rules_check(
+    client: &RouterDispatcher,
+    target_node: &str,
+    payload: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, AdminError> {
+    let check_id = Uuid::new_v4().to_string();
+    let config = wf_rules_check_config(payload, &check_id);
+    let answer = send_wf_rules_config_set(client, target_node, config).await?;
+    wf_rules_check_answer(target_node, &check_id, answer)
+}
+
+/// An operation of SY.wf-rules, as the node `CONFIG_SET` contract carries it.
+async fn send_wf_rules_config_set(
+    client: &RouterDispatcher,
+    target_node: &str,
+    config: serde_json::Value,
+) -> Result<serde_json::Value, AdminError> {
+    send_system_request_with_meta(
+        client,
+        target_node,
+        "CONFIG_SET",
+        "CONFIG_RESPONSE",
+        serde_json::json!({
+            "node_name": target_node,
+            "schema_version": 1,
+            "config_version": 0,
+            "apply_mode": "replace",
+            "config": config,
+        }),
+        16,
+        None,
+        None,
+        Some(target_node.to_string()),
+        Some("CONFIG_SET".to_string()),
+        None,
+        wf_rules_request_timeout(),
+    )
+    .await
+}
+
 /// `launched_by`: who asked (`operator` on the HTTP API; launched_by_for_caller over the mesh).
 async fn handle_wf_rules_http(
     ctx: &AdminContext,
@@ -11065,29 +11322,11 @@ async fn handle_wf_rules_http(
 ) -> Result<(u16, String), AdminError> {
     let target_hive = normalize_wf_rules_target(req.hive.clone(), &ctx.hive_id);
     let target_node = format!("SY.wf-rules@{}", target_hive);
-    let response = if let Some(operation) = action.operation() {
+    let response = if action.check_only() {
+        send_wf_rules_check(client, &target_node, req.payload).await
+    } else if let Some(operation) = action.operation() {
         let config = wf_rules_operation_config(req.payload, operation, launched_by);
-        send_system_request_with_meta(
-            client,
-            &target_node,
-            "CONFIG_SET",
-            "CONFIG_RESPONSE",
-            serde_json::json!({
-                "node_name": target_node,
-                "schema_version": 1,
-                "config_version": 0,
-                "apply_mode": "replace",
-                "config": config,
-            }),
-            16,
-            None,
-            None,
-            Some(target_node.clone()),
-            Some("CONFIG_SET".to_string()),
-            None,
-            wf_rules_request_timeout(),
-        )
-        .await
+        send_wf_rules_config_set(client, &target_node, config).await
     } else if let Some(command) = action.command() {
         send_l2_action_request(
             client,
@@ -11780,7 +12019,7 @@ async fn apply_admin_executor_config_set(
 
     let _ = save_admin_executor_node_config(&ctx.hive_id, &merged_config)?;
 
-    let configured = refresh_admin_executor_ai_runtime(ctx).await?;
+    let configured = refresh_admin_executor_ai_runtime(ctx, VaultWait::Once).await?;
     Ok(serde_json::json!({
         "ok": true,
         "node_name": ctx.node_name,
@@ -11956,6 +12195,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "wf_rules_apply"
             | "wf_rules_rollback"
             | "wf_rules_delete"
+            | "wf_cancel_instance"
             | "acme_renew"
             | "acme_test"
             | "acme_reload"
@@ -12002,6 +12242,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "opa_apply"
             | "opa_rollback"
             | "opa_clear"
+            // It ends a conversation that is running: the operator says so first.
+            | "wf_cancel_instance"
             | "acme_renew"
             | "acme_test"
     )
@@ -12149,6 +12391,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "wf_rules_apply" => "Apply the staged workflow definition.",
         "wf_rules_rollback" => "Rollback to the backup workflow definition.",
         "wf_rules_delete" => "Delete a managed workflow through SY.wf-rules.",
+        "wf_rules_check" => "Validate a workflow definition without staging or applying it.",
+        "wf_list_instances" => "List the instances of one WF node, newest first, all or those of one status: each with its thread, its state and status, and when it was created, last changed and ended.",
+        "wf_get_instance" => "Read one instance of a WF node: its thread, state and status, its input, its state variables and its most recent log entries.",
+        "wf_cancel_instance" => "Cancel one running instance of a WF node: its cancel transition runs, and the conversation it carries ends. Nothing it already did is undone.",
         "acme_status" => "Read the ACME client of the public edge's certificate: its configuration (and why it is off), the terms URL, the accounts, the edge's live status, the order in flight, the last attempt and test, the next check and renewal point, the last issued certificates and the open certificate conditions.",
         "acme_renew" => "Order the public edge's certificate now (forced: no backoff, no cap). Replaces a hand-seeded or foreign certificate, certifies a new name, and lifts an install_refused hold. Answers 202; progress in GET /acme/status.",
         "acme_test" => "Run a test order against the staging directory with the real names: issued and checked, never stored or installed. Answers 202; result in GET /acme/status (last_test).",
@@ -12381,6 +12627,14 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
         "wf_rules_rollback" => vec!["POST /hives/{hive}/wf-rules/rollback"],
         "wf_rules_delete" => vec!["POST /hives/{hive}/wf-rules/delete"],
+        "wf_rules_check" => vec!["POST /hives/{hive}/wf-rules/check"],
+        "wf_list_instances" => vec!["GET /hives/{hive}/nodes/{node_name}/wf/instances"],
+        "wf_get_instance" => {
+            vec!["GET /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}"]
+        }
+        "wf_cancel_instance" => {
+            vec!["POST /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}/cancel"]
+        }
         "acme_status" => vec!["GET /acme/status"],
         "acme_renew" => vec!["POST /acme/renew"],
         "acme_test" => vec!["POST /acme/test"],
@@ -12476,7 +12730,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
         | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
         | "sync_hint" | "wf_rules_compile_apply" | "wf_rules_compile"
-        | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" => vec![
+        | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" | "wf_rules_check" => vec![
             admin_action_path_param(
             "hive",
             "string",
@@ -12514,6 +12768,27 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "node_name",
                 "string",
                 "Fully-qualified node name, for example SY.admin@motherbee.",
+            ),
+        ],
+        "wf_list_instances" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "The WF node, for example WF.invoice@worker1; a bare WF.invoice is a node of the path's hive.",
+            ),
+        ],
+        "wf_get_instance" | "wf_cancel_instance" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "The WF node, for example WF.invoice@worker1; a bare WF.invoice is a node of the path's hive.",
+            ),
+            admin_action_path_param(
+                "instance_id",
+                "string",
+                "The instance, wfi:<uuid>, as wf_list_instances lists it.",
             ),
         ],
         "get_runtime" => vec![
@@ -12647,6 +12922,8 @@ fn admin_action_body_required(action: &str) -> bool {
             | "wf_rules_apply"
             | "wf_rules_rollback"
             | "wf_rules_delete"
+            | "wf_rules_check"
+            | "wf_cancel_instance"
             | "opa_check"
             | "timer_now_in"
             | "timer_convert"
@@ -12779,10 +13056,15 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "string",
             "OPA rego source text.",
         )],
-        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+        "wf_rules_compile_apply" | "wf_rules_compile" | "wf_rules_check" => vec![
             admin_action_body_field("workflow_name", "string", "Workflow logical name."),
             admin_action_body_field("definition", "object", "Workflow definition JSON."),
         ],
+        "wf_cancel_instance" => vec![admin_action_body_field(
+            "reason",
+            "string",
+            "Why the instance is cancelled, in a few words: the instance's log keeps it.",
+        )],
         "wf_rules_apply"
         | "wf_rules_rollback"
         | "wf_rules_get_workflow"
@@ -13353,13 +13635,35 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional explicit hive override for SY.wf-rules target.",
             ),
         ],
-        "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
+        "wf_rules_check"
+        | "wf_rules_get_workflow"
+        | "wf_rules_get_status"
+        | "wf_rules_list_workflows" => vec![admin_action_body_field(
+            "hive",
+            "string",
+            "Optional explicit hive override for SY.wf-rules target.",
+        )],
+        "wf_list_instances" => vec![
             admin_action_body_field(
-                "hive",
-                "string",
-                "Optional explicit hive override for SY.wf-rules target.",
+                "status",
+                "enum(running|completed|cancelled|failed)",
+                "Only the instances of this status; without it, all of them.",
+            ),
+            admin_action_body_field(
+                "limit",
+                "u32",
+                &format!(
+                    "How many instances, newest first: 1 to {WF_INSTANCES_MAX_LIMIT}, {WF_INSTANCES_DEFAULT_LIMIT} without it."
+                ),
             ),
         ],
+        "wf_get_instance" => vec![admin_action_body_field(
+            "log_limit",
+            "u32",
+            &format!(
+                "How many of the instance's log entries, newest first: 1 to {WF_INSTANCES_MAX_LIMIT}; without it the engine answers its last 20."
+            ),
+        )],
         "remove_runtime_version" => vec![admin_action_body_field(
             "test_hold_ms",
             "u64",
@@ -13552,9 +13856,19 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "auto_spawn": true,
             "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
-        "wf_rules_compile" => serde_json::json!({
+        "wf_rules_compile" | "wf_rules_check" => serde_json::json!({
             "workflow_name": "invoice",
             "definition": wf_rules_example_definition()
+        }),
+        "wf_list_instances" => serde_json::json!({
+            "status": "running",
+            "limit": WF_INSTANCES_DEFAULT_LIMIT
+        }),
+        "wf_get_instance" => serde_json::json!({
+            "log_limit": 20
+        }),
+        "wf_cancel_instance" => serde_json::json!({
+            "reason": "the operator ended the conversation"
         }),
         "wf_rules_apply" => serde_json::json!({
             "workflow_name": "invoice",
@@ -13894,16 +14208,25 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             "curl -X GET '/hives/motherbee/wf-rules/status?workflow_name=invoice'"
         }
         "wf_rules_list_workflows" => "curl -X GET /hives/motherbee/wf-rules",
-        "wf_rules_compile_apply" | "wf_rules_compile" => {
-            let path = if action == "wf_rules_compile" {
-                "/hives/motherbee/wf-rules/compile"
-            } else {
-                "/hives/motherbee/wf-rules"
+        "wf_rules_compile_apply" | "wf_rules_compile" | "wf_rules_check" => {
+            let path = match action {
+                "wf_rules_compile" => "/hives/motherbee/wf-rules/compile",
+                "wf_rules_check" => "/hives/motherbee/wf-rules/check",
+                _ => "/hives/motherbee/wf-rules",
             };
             return Some(format!(
                 "curl -X POST {path} -d '{}'",
                 admin_action_example_payload(action)
             ));
+        }
+        "wf_list_instances" => {
+            "curl -X GET '/hives/worker1/nodes/WF.invoice@worker1/wf/instances?status=running&limit=50'"
+        }
+        "wf_get_instance" => {
+            "curl -X GET '/hives/worker1/nodes/WF.invoice@worker1/wf/instances/wfi:550e8400-e29b-41d4-a716-446655440000?log_limit=20'"
+        }
+        "wf_cancel_instance" => {
+            r#"curl -X POST /hives/worker1/nodes/WF.invoice@worker1/wf/instances/wfi:550e8400-e29b-41d4-a716-446655440000/cancel -d '{"reason":"the operator ended the conversation"}'"#
         }
         "wf_rules_apply" => {
             r#"curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"invoice","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
@@ -13923,6 +14246,18 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
     };
     Some(text.to_string())
 }
+
+/// What the actions that take a workflow definition say of its name and of the definition.
+const WF_RULES_WORKFLOW_NAME_NOTE: &str = "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.";
+const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.";
+
+/// What the node routes that send to the node itself say of its name (`node_name_on_hive`).
+const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a bare name is qualified with it (AI.sales on /hives/worker1 is AI.sales@worker1), and a name of another hive is refused with INVALID_REQUEST.";
+
+/// What the instance actions say of the node they act on, and of the engine's refusals
+/// (`wf_instance_answer`).
+const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
+const WF_INSTANCE_ERRORS_NOTE: &str = "The engine answers its instance verbs only to SY.admin@motherbee and to its hive's SY.wf-rules. A refusal, {ok: false, error, detail}, keeps that payload and gives error_code and error_detail: INVALID_REQUEST 400, node_not_configured 409 (a WF node without its definition in use), STORE_ERROR 502. A node that does not answer is TIMEOUT or TRANSPORT_ERROR (the detail says NODE_NOT_FOUND when the router knows no such node).";
 
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
@@ -14013,9 +14348,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "status ok only when every step was done; otherwise TEARDOWN_INCOMPLETE with the same payload. When a secret cannot be deleted the ILK is left in place, so a retry can still tie the remaining secrets to the node.",
             "SY.* and RT.* nodes are never torn down: run_node does not launch them.",
         ],
-        "remove_node_instance" | "send_node_message" => vec![
+        "remove_node_instance" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
+        ],
+        "send_node_message" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            NODE_ON_PATH_HIVE_NOTE,
+            "A body node_name wins over the path's. The message goes out at once, and no answer is awaited.",
         ],
         "set_node_config" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -14041,7 +14381,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
-            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            NODE_ON_PATH_HIVE_NOTE,
             "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
@@ -14054,7 +14394,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
-            "The node_name path segment should be a fully-qualified Fluxbee node name.",
+            NODE_ON_PATH_HIVE_NOTE,
             "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
@@ -14260,17 +14600,26 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "wf_rules_compile_apply" => vec![
             "workflow_name and definition are required.",
-            "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
+            WF_RULES_WORKFLOW_NAME_NOTE,
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
-            "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.",
+            WF_RULES_DEFINITION_NOTE,
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
-            "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
+            WF_RULES_WORKFLOW_NAME_NOTE,
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
-            "A definition requires start_from: the nodes whose messages start an instance (IO nodes or WFs, never an AI.*, SY.* or RT.* node). Every message a WF sends is a user message, to a node name written in the definition, on the instance's thread: an action with meta.type, target_ref or thread_id_ref is refused. A timer's key is event.timer_key; an agent's error answer is a payload of type error, its msg <msg>.error only when the request had a msg.",
+            WF_RULES_DEFINITION_NOTE,
+        ],
+        "wf_rules_check" => vec![
+            "workflow_name and definition are required.",
+            WF_RULES_WORKFLOW_NAME_NOTE,
+            "A check is a read: the hive's SY.wf-rules validates the definition as a compile does, with the same limits, and only answers. It takes no version and stages, publishes and stores nothing, so a definition compiled and waiting for its apply, and the current one, stay as they are.",
+            "SY.admin sends it to SY.wf-rules@<hive> as a CONFIG_SET with operation check and a fresh check_id, and takes only the answer that echoes that check_id: any other answer is TRANSPORT_ERROR, never a pass.",
+            "A valid definition answers ok, with payload {ok: true, node_name, operation: \"check\", check_id, workflow_name, guard_count, state_count}. A refused one answers as wf_rules_compile does: status error, error_code and error_detail from SY.wf-rules' error (a COMPILE_ERROR names the exact path in the definition), and the payload as SY.wf-rules sent it.",
+            "Check a definition before showing it and before deploying it: one that passes compiles in wf_rules_compile_apply.",
+            WF_RULES_DEFINITION_NOTE,
         ],
         "wf_rules_apply" | "wf_rules_rollback" => vec![
             "workflow_name is required.",
@@ -14284,6 +14633,27 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
             "These are direct query operations against SY.wf-rules.",
             "GET /hives/{hive}/wf-rules without workflow_name lists workflows; with workflow_name it returns the current definition.",
+        ],
+        "wf_list_instances" => vec![
+            WF_INSTANCE_NODE_NOTE,
+            "status and limit are query parameters in HTTP (?status=running&limit=50). status is running, completed, cancelled or failed; without it, every instance. limit is 1 to 200, 50 without it. Any other value is refused (INVALID_REQUEST), never cut.",
+            "SY.admin sends WF_LIST_INSTANCES {status, limit} to the node and answers its WF_LIST_INSTANCES_RESPONSE as it is: payload {ok: true, count, instances: [{instance_id, thread_id, workflow_type, definition_hash, status, current_state, created_at_ms, updated_at_ms, terminated_at_ms}]}, newest first. An instance that waits is in current_state; updated_at_ms is its last change.",
+            WF_INSTANCE_ERRORS_NOTE,
+        ],
+        "wf_get_instance" => vec![
+            WF_INSTANCE_NODE_NOTE,
+            "instance_id is the instance, wfi:<uuid>, as wf_list_instances lists it. log_limit is a query parameter in HTTP (?log_limit=20), 1 to 200; without it the engine answers its last 20 log entries.",
+            "SY.admin sends WF_GET_INSTANCE {instance_id, log_limit} to the node and answers its WF_GET_INSTANCE_RESPONSE as it is: payload {ok: true, instance: {instance_id, thread_id, workflow_type, definition_hash, status, current_state, created_at_ms, updated_at_ms, terminated_at_ms, input, state_variables, recent_log: [{logged_at_ms, action_type, summary, ok, error_detail}]}}, the log newest first.",
+            "An instance the node does not have answers 404 INSTANCE_NOT_FOUND.",
+            WF_INSTANCE_ERRORS_NOTE,
+        ],
+        "wf_cancel_instance" => vec![
+            "It ends a conversation that is running: confirm with the operator first.",
+            WF_INSTANCE_NODE_NOTE,
+            "Body {reason}, required: the instance's log keeps \"cancel requested: <reason>\".",
+            "SY.admin sends WF_CANCEL_INSTANCE {instance_id, reason} to the node. When the definition has a cancelled state, the engine runs the exit actions of the instance's state and then the entry actions of cancelled; either way it cancels the instance's timers and ends it cancelled. Nothing the instance already did or sent is undone.",
+            "The answer is the engine's WF_CANCEL_INSTANCE_RESPONSE as it is: payload {ok: true, instance_id, status: \"cancelled\"}. An instance already ended answers 409 INSTANCE_ALREADY_TERMINATED; one the node does not have, 404 INSTANCE_NOT_FOUND.",
+            WF_INSTANCE_ERRORS_NOTE,
         ],
         "set_storage" => vec![
             "This persists the local storage path in hive.yaml on the target hive.",
@@ -16012,6 +16382,9 @@ async fn handle_admin_command_inner(
     ) {
         return handle_node_control_command(ctx, client, action, payload, hive).await;
     }
+    if wf_instance_verb(action).is_some() {
+        return handle_wf_instance_command(ctx, client, action, payload, hive).await;
+    }
     if matches!(
         action,
         "get_ilk"
@@ -16072,6 +16445,20 @@ async fn handle_admin_command_inner(
     Ok(build_admin_http_response(action, response))
 }
 
+/// The node a node route sends to (FINDINGS A-127): a bare name is a node of the path's hive, as on
+/// the routes that go through the orchestrator, since the router knows no bare name; a qualified
+/// one must name that hive.
+fn node_name_on_hive(node_name: &str, hive: &str) -> Result<String, String> {
+    match node_name.rsplit_once('@') {
+        None => Ok(qualified_node_name(node_name, hive)),
+        Some((local, node_hive)) if node_hive.trim() == hive => Ok(format!("{local}@{hive}")),
+        Some((_, node_hive)) => Err(format!(
+            "node_name hive '{}' does not match path hive '{hive}'",
+            node_hive.trim()
+        )),
+    }
+}
+
 async fn handle_send_node_message(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -16081,32 +16468,29 @@ async fn handle_send_node_message(
     let sender = client.sender_snapshot();
     let req: DebugNodeMessageRequest = serde_json::from_value(payload)?;
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let invalid = |detail: &str| {
+        Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "send_node_message",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
     let node_name = req.node_name.trim().to_string();
-    if node_name.trim().is_empty() {
-        return Ok((
-            400,
-            serde_json::json!({
-                "status": "error",
-                "action": "send_node_message",
-                "payload": serde_json::Value::Null,
-                "error_code": "INVALID_REQUEST",
-                "error_detail": "node_name is required",
-            })
-            .to_string(),
-        ));
+    if node_name.is_empty() {
+        return invalid("node_name is required");
     }
+    let node_name = match node_name_on_hive(&node_name, &target_hive) {
+        Ok(node_name) => node_name,
+        Err(detail) => return invalid(&detail),
+    };
     if req.msg_type.trim().is_empty() {
-        return Ok((
-            400,
-            serde_json::json!({
-                "status": "error",
-                "action": "send_node_message",
-                "payload": serde_json::Value::Null,
-                "error_code": "INVALID_REQUEST",
-                "error_detail": "msg_type is required",
-            })
-            .to_string(),
-        ));
+        return invalid("msg_type is required");
     }
     let ttl = req.ttl.unwrap_or(16).max(1);
     let trace_id = Uuid::new_v4().to_string();
@@ -16233,11 +16617,9 @@ async fn handle_node_control_command(
             .to_string(),
         ));
     };
-    if let Some(node_hive) = node_name
-        .rsplit_once('@')
-        .map(|(_, hive_id)| hive_id.trim())
-    {
-        if !node_hive.is_empty() && node_hive != target_hive {
+    let node_name = match node_name_on_hive(&node_name, &target_hive) {
+        Ok(node_name) => node_name,
+        Err(detail) => {
             return Ok((
                 400,
                 serde_json::json!({
@@ -16245,15 +16627,18 @@ async fn handle_node_control_command(
                     "action": action,
                     "payload": serde_json::Value::Null,
                     "error_code": "INVALID_REQUEST",
-                    "error_detail": format!(
-                        "node_name hive '{}' does not match path hive '{}'",
-                        node_hive, target_hive
-                    ),
+                    "error_detail": detail,
                 })
                 .to_string(),
             ));
         }
-    }
+    };
+    // The request carries the name too, and a node may check it against its own (the WF engine
+    // and this admin's executor do).
+    payload_map.insert(
+        "node_name".to_string(),
+        serde_json::Value::String(node_name.clone()),
+    );
 
     let ttl = payload_map
         .remove("ttl")
@@ -16375,6 +16760,198 @@ async fn handle_node_control_command(
     }
 }
 
+/// How many instances `wf_list_instances` asks a WF node for when the caller names no limit, and
+/// the most a caller may ask for, of instances or of log entries. The engine takes a limit of 0 as
+/// every instance, which the admin never sends.
+const WF_INSTANCES_DEFAULT_LIMIT: u64 = 50;
+const WF_INSTANCES_MAX_LIMIT: u64 = 200;
+/// The statuses a WF engine gives an instance (go/nodes/wf/wf-generic/node/instance.go).
+const WF_INSTANCE_STATUSES: [&str; 4] = ["running", "completed", "cancelled", "failed"];
+
+/// The WF engine's verb for an instance action, and the answer it sends
+/// (go/nodes/wf/wf-generic/node/dispatch.go).
+fn wf_instance_verb(action: &str) -> Option<(&'static str, &'static str)> {
+    match action {
+        "wf_list_instances" => Some(("WF_LIST_INSTANCES", "WF_LIST_INSTANCES_RESPONSE")),
+        "wf_get_instance" => Some(("WF_GET_INSTANCE", "WF_GET_INSTANCE_RESPONSE")),
+        "wf_cancel_instance" => Some(("WF_CANCEL_INSTANCE", "WF_CANCEL_INSTANCE_RESPONSE")),
+        _ => None,
+    }
+}
+
+/// An instance action ready to go: the WF node, the engine's verb, its answer and its payload.
+#[derive(Debug, PartialEq)]
+struct WfInstanceRequest {
+    node_name: String,
+    verb: &'static str,
+    answer: &'static str,
+    payload: serde_json::Value,
+}
+
+/// What an instance action sends, or why it is refused before anything is sent. A field that is
+/// null is absent (the executor sends null for an optional field the plan does not set).
+fn wf_instance_request(
+    action: &str,
+    params: &serde_json::Value,
+    hive: &str,
+) -> Result<WfInstanceRequest, String> {
+    let (verb, answer) =
+        wf_instance_verb(action).ok_or_else(|| format!("'{action}' is no WF instance action"))?;
+    let field = |name: &str| params.get(name).filter(|value| !value.is_null());
+    let text = |name: &str| match field(name) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => {
+            Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+        }
+        Some(other) => Err(format!("{name} must be a string, not {other}")),
+    };
+    let bounded = |name: &str| match field(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|number| (1..=WF_INSTANCES_MAX_LIMIT).contains(number))
+            .map(Some)
+            .ok_or_else(|| {
+                format!("{name} must be a number from 1 to {WF_INSTANCES_MAX_LIMIT}, not {value}")
+            }),
+    };
+    let node_name = text("node_name")?.ok_or("node_name is required")?;
+    let node_name = node_name_on_hive(&node_name, hive)?;
+    let workflow_node = node_name
+        .rsplit_once('@')
+        .is_some_and(|(local, _)| node_of_family(local, "WF"));
+    if !workflow_node {
+        return Err(format!(
+            "{action} acts on a WF node, WF.<workflow>@<hive>, not '{node_name}'"
+        ));
+    }
+    let mut payload = serde_json::Map::new();
+    if action == "wf_list_instances" {
+        if let Some(status) = text("status")? {
+            if !WF_INSTANCE_STATUSES.contains(&status.as_str()) {
+                return Err(format!(
+                    "status must be one of {}, not '{status}'",
+                    WF_INSTANCE_STATUSES.join(", ")
+                ));
+            }
+            payload.insert("status".to_string(), serde_json::json!(status));
+        }
+        let limit = bounded("limit")?.unwrap_or(WF_INSTANCES_DEFAULT_LIMIT);
+        payload.insert("limit".to_string(), serde_json::json!(limit));
+    } else {
+        let instance_id = text("instance_id")?.ok_or("instance_id is required")?;
+        payload.insert("instance_id".to_string(), serde_json::json!(instance_id));
+        if action == "wf_get_instance" {
+            if let Some(log_limit) = bounded("log_limit")? {
+                payload.insert("log_limit".to_string(), serde_json::json!(log_limit));
+            }
+        } else {
+            let reason = text("reason")?
+                .ok_or("reason is required: the instance's log keeps why it was cancelled")?;
+            payload.insert("reason".to_string(), serde_json::json!(reason));
+        }
+    }
+    Ok(WfInstanceRequest {
+        node_name,
+        verb,
+        answer,
+        payload: serde_json::Value::Object(payload),
+    })
+}
+
+/// The engine's answer in the admin's envelope, its payload as it is: `ok: true` is a success, and
+/// a refusal, `{ok: false, error: <code>, detail}`, gives the envelope's error_code and
+/// error_detail.
+fn wf_instance_answer(
+    action: &str,
+    response: Result<serde_json::Value, AdminError>,
+) -> (u16, String) {
+    let answer = match response {
+        Ok(answer) => answer,
+        Err(err) => return build_admin_http_response(action, Err(err)),
+    };
+    if answer.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return (
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": answer,
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+            })
+            .to_string(),
+        );
+    }
+    let error_code = answer
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| !code.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| payload_error_code(&answer))
+        .unwrap_or_else(|| "SERVICE_FAILED".to_string());
+    let error_detail = answer
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| payload_error_detail(&answer));
+    (
+        error_code_to_http_status(&error_code),
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": answer,
+            "error_code": error_code,
+            "error_detail": error_detail,
+        })
+        .to_string(),
+    )
+}
+
+/// `wf_list_instances`, `wf_get_instance` and `wf_cancel_instance` (docs/wf-orchestration-v1.md
+/// §5.5, topic 4): the WF engine's own verb, sent to the WF node, and its answer as it is. The
+/// engine answers these verbs only to SY.admin@motherbee and to its hive's SY.wf-rules
+/// (`controlCallerAuthorized` in go/nodes/wf/wf-generic/node/dispatch.go).
+async fn handle_wf_instance_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let request = match wf_instance_request(action, &payload, &hive) {
+        Ok(request) => request,
+        Err(detail) => {
+            return Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "action": action,
+                    "payload": serde_json::Value::Null,
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": detail,
+                })
+                .to_string(),
+            ));
+        }
+    };
+    // Answered before the caller's own wait for the admin ends, as the node control routes are.
+    let timeout_window = admin_action_timeout(action)
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(|| Duration::from_secs(25));
+    let response = send_system_request(
+        client,
+        &request.node_name,
+        request.verb,
+        request.answer,
+        request.payload,
+        timeout_window,
+    )
+    .await;
+    Ok(wf_instance_answer(action, response))
+}
+
 async fn handle_identity_query(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -16412,6 +16989,15 @@ fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// A number of a query string as the action's payload takes it. Anything else stays text, for the
+/// action to refuse by its value.
+fn query_number(raw: &str) -> serde_json::Value {
+    raw.trim()
+        .parse::<u64>()
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }
 
 /// purge_tenant is refused while SY.vault still holds secrets of that tenant (operator
@@ -18161,6 +18747,9 @@ fn is_node_scoped_action(action: &str) -> bool {
             | "node_help"
             | "send_node_message"
             | "teardown_node"
+            | "wf_list_instances"
+            | "wf_get_instance"
+            | "wf_cancel_instance"
     )
 }
 
@@ -21851,6 +22440,7 @@ mod tests {
         for (action, path) in [
             ("wf_rules_compile_apply", "/hives/motherbee/wf-rules"),
             ("wf_rules_compile", "/hives/motherbee/wf-rules/compile"),
+            ("wf_rules_check", "/hives/motherbee/wf-rules/check"),
         ] {
             let payload = admin_action_example_payload(action);
             assert_eq!(payload["definition"], fixture, "{action}");
@@ -25971,7 +26561,930 @@ mod tests {
         }
         // Over both waits of the node's way: 3 s at its hive, 7 s for the motherbee's forward.
         assert_eq!(admin_action_timeout("node_help"), Duration::from_secs(10));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "17");
+    }
+
+    // --- wf_rules_check (docs/wf-orchestration-v1.md §5.5.1, piece 3) ------------------------
+
+    /// SY.wf-rules@worker1's answer to `sent`, as the check's contract shapes it: a pass, or a
+    /// refusal with the error a compile gives; with `check_id` echoed when given.
+    fn wf_rules_answer(sent: &Message, check_id: Option<&str>, refusal: Option<&str>) -> Message {
+        let mut payload = match refusal {
+            None => json!({
+                "ok": true,
+                "node_name": "SY.wf-rules@worker1",
+                "operation": "check",
+                "workflow_name": "invoice",
+                "guard_count": 2,
+                "state_count": 3,
+            }),
+            Some(detail) => json!({
+                "ok": false,
+                "node_name": "SY.wf-rules@worker1",
+                "state": "error",
+                "operation": "check",
+                "schema_version": 1,
+                "config_version": 0,
+                "error": { "code": "COMPILE_ERROR", "detail": detail },
+            }),
+        };
+        if let Some(check_id) = check_id {
+            payload["check_id"] = json!(check_id);
+        }
+        reply_to(sent, "CONFIG_RESPONSE", payload)
+    }
+
+    fn wf_rules_check_request() -> WfRulesRequest {
+        WfRulesRequest {
+            payload: json!({
+                "workflow_name": "invoice",
+                "definition": wf_rules_example_definition(),
+            })
+            .as_object()
+            .cloned()
+            .expect("object"),
+            hive: Some("worker1".to_string()),
+        }
+    }
+
+    /// A check carries the request, operation check and its own id; never a version or a
+    /// launched_by, and an operation or a check_id the request names is the admin's own.
+    #[test]
+    fn a_wf_rules_check_config_carries_the_request_and_its_check_id_and_no_version() {
+        let request = json!({
+            "workflow_name": "invoice",
+            "definition": { "states": [] },
+            "version": 4,
+            "launched_by": "cloud",
+            "operation": "compile",
+            "check_id": "forged",
+        });
+        assert_eq!(
+            wf_rules_check_config(request.as_object().cloned().expect("object"), "check-1"),
+            json!({
+                "workflow_name": "invoice",
+                "definition": { "states": [] },
+                "operation": "check",
+                "check_id": "check-1",
+            })
+        );
+    }
+
+    /// POST /hives/{hive}/wf-rules/check asks that hive's SY.wf-rules with a CONFIG_SET, operation
+    /// check and a fresh check_id, and answers its pass as it is.
+    #[tokio::test]
+    async fn a_wf_rules_check_asks_the_hives_wf_rules_with_its_own_check_id() {
+        let (ctx, mut harness) = opa_test_admin("wf-rules-check");
+        let body = json!({
+            "workflow_name": "invoice",
+            "definition": wf_rules_example_definition(),
+            "version": 7,
+        })
+        .to_string();
+        let query = HashMap::new();
+        let check = handle_hive_paths(
+            "POST",
+            "/hives/worker1/wf-rules/check",
+            &query,
+            body.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        );
+        let wf_rules = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the check");
+            assert_eq!(sent.meta.msg.as_deref(), Some("CONFIG_SET"));
+            assert_eq!(dst_of(&sent), json!("SY.wf-rules@worker1"));
+            assert_eq!(sent.payload["apply_mode"], json!("replace"));
+            let config = &sent.payload["config"];
+            assert_eq!(config["operation"], json!("check"));
+            assert_eq!(config["workflow_name"], json!("invoice"));
+            assert_eq!(config["definition"], wf_rules_example_definition());
+            assert!(config.get("version").is_none(), "{config}");
+            assert!(config.get("launched_by").is_none(), "{config}");
+            let check_id = config["check_id"].as_str().expect("check_id").to_string();
+            assert!(Uuid::parse_str(&check_id).is_ok(), "{check_id}");
+            harness
+                .inject(wf_rules_answer(&sent, Some(&check_id), None))
+                .await
+                .unwrap();
+            check_id
+        };
+        let (result, check_id) = tokio::join!(check, wf_rules);
+        let (status, body) = result.expect("route").expect("served");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["action"], json!("check"));
+        assert_eq!(body["payload"]["check_id"], json!(check_id));
+        assert_eq!(body["payload"]["guard_count"], json!(2));
+        assert_eq!(body["payload"]["state_count"], json!(3));
+        assert!(body["error_code"].is_null(), "{body}");
+    }
+
+    /// A refused check maps to the envelope exactly as a refused compile does (its status,
+    /// error_code and error_detail, and SY.wf-rules' payload kept): Archi reads both the same way.
+    #[tokio::test]
+    async fn a_refused_wf_rules_check_answers_as_a_refused_compile() {
+        let (ctx, mut harness) = opa_test_admin("wf-rules-check-refused");
+        let detail = "states[0].transitions[1].guard: undeclared reference to 'evnt'";
+        let mut envelopes = Vec::new();
+        for action in [WfRulesAction::Check, WfRulesAction::Compile] {
+            let run =
+                handle_wf_rules_http(&ctx, &ctx.rpc, wf_rules_check_request(), action, "operator");
+            let wf_rules = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("the request");
+                // A compile carries no check id, and its answer none.
+                let check_id = sent.payload["config"]["check_id"].as_str();
+                let mut answer = wf_rules_answer(&sent, check_id, Some(detail));
+                answer.payload["operation"] = sent.payload["config"]["operation"].clone();
+                harness.inject(answer).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(run, wf_rules);
+            let (status, body) = result.expect("answered");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, 422, "{body}");
+            assert_eq!(body["status"], json!("error"), "{body}");
+            assert_eq!(body["error_code"], json!("COMPILE_ERROR"), "{body}");
+            assert_eq!(body["error_detail"], json!(detail), "{body}");
+            assert_eq!(body["payload"]["error"]["code"], json!("COMPILE_ERROR"));
+            envelopes.push((
+                status,
+                body["status"].clone(),
+                body["error_code"].clone(),
+                body["error_detail"].clone(),
+            ));
+        }
+        assert_eq!(envelopes[0], envelopes[1]);
+    }
+
+    /// Only the answer that echoes the check's id counts: one without it, or with another's, ran
+    /// no check (an SY.wf-rules that knows no check compiles and stages instead), so it is an
+    /// error, never a pass.
+    #[tokio::test]
+    async fn a_wf_rules_answer_without_the_checks_id_is_never_a_pass() {
+        let (ctx, mut harness) = opa_test_admin("wf-rules-check-id");
+        for echoed in [None, Some("another-check")] {
+            let run = handle_wf_rules_http(
+                &ctx,
+                &ctx.rpc,
+                wf_rules_check_request(),
+                WfRulesAction::Check,
+                "operator",
+            );
+            let wf_rules = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("the check");
+                harness
+                    .inject(wf_rules_answer(&sent, echoed, None))
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(run, wf_rules);
+            let (status, body) = result.expect("answered");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, 502, "{body}");
+            assert_eq!(body["status"], json!("error"), "{body}");
+            assert_eq!(body["error_code"], json!("TRANSPORT_ERROR"), "{body}");
+            assert!(
+                body["error_detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("ran no check")),
+                "{body}"
+            );
+        }
+    }
+
+    /// wf_rules_check is everywhere opa_check is: the catalog (a read, no confirmation), its route,
+    /// help, args and example, and over the mesh Archi alone asks for it.
+    #[test]
+    fn the_wf_rules_check_action_is_registered_as_opa_check_is() {
+        let spec = resolve_internal_action_spec("wf_rules_check").expect("wf_rules_check");
+        assert!(matches!(
+            spec.route,
+            InternalActionRoute::WfRulesHttp(WfRulesAction::Check)
+        ));
+        assert!(!spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["handler"], json!("wf_rules_http"));
+        assert_eq!(doc["read_only"], json!(true));
+        assert_eq!(doc["confirmation_required"], json!(false));
+        assert_eq!(
+            doc["summary"],
+            json!("Validate a workflow definition without staging or applying it.")
+        );
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["POST /hives/{hive}/wf-rules/check"])
+        );
+        let compile = build_admin_action_doc(
+            resolve_internal_action_spec("wf_rules_compile").expect("wf_rules_compile"),
+        );
+        assert_eq!(
+            doc["request_contract"]["body"]["required_fields"],
+            compile["request_contract"]["body"]["required_fields"]
+        );
+        assert_eq!(
+            doc["executor_contract"]["function_schema"]["required"],
+            compile["executor_contract"]["function_schema"]["required"]
+        );
+        assert!(admin_action_request_notes("wf_rules_check")
+            .iter()
+            .any(|note| note.contains("check_id")));
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/worker1/wf-rules/check"),
+            vec!["POST"]
+        );
+        assert_eq!(mesh_access("wf_rules_check"), Some(MeshAccess::Archi));
+        assert_eq!(mesh_access("wf_rules_check"), mesh_access("opa_check"));
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"wf_rules_check"));
+        assert!(admin_action_executor_available("wf_rules_check"));
+    }
+
+    // --- A WF node's instances (docs/wf-orchestration-v1.md §5.5, topic 4) --------------------
+
+    const INSTANCE: &str = "wfi:550e8400-e29b-41d4-a716-446655440000";
+
+    /// Each action sends its engine verb to the WF node, a bare name of the path's hive; the list
+    /// asks for 50 without a limit (the engine takes none as every instance), and a null is no
+    /// value (the executor sends one for an optional field its plan does not set).
+    #[test]
+    fn a_wf_instance_action_sends_the_engines_verb_to_the_wf_node() {
+        let list = wf_instance_request(
+            "wf_list_instances",
+            &json!({ "node_name": "WF.invoice" }),
+            "worker1",
+        )
+        .expect("list");
+        assert_eq!(
+            list,
+            WfInstanceRequest {
+                node_name: "WF.invoice@worker1".to_string(),
+                verb: "WF_LIST_INSTANCES",
+                answer: "WF_LIST_INSTANCES_RESPONSE",
+                payload: json!({ "limit": 50 }),
+            }
+        );
+        let nulls = json!({ "node_name": "WF.invoice@worker1", "status": null, "limit": null });
+        assert_eq!(
+            wf_instance_request("wf_list_instances", &nulls, "worker1")
+                .expect("nulls")
+                .payload,
+            json!({ "limit": 50 })
+        );
+        let filtered = json!({ "node_name": "WF.invoice", "status": "running", "limit": 200 });
+        assert_eq!(
+            wf_instance_request("wf_list_instances", &filtered, "worker1")
+                .expect("filtered")
+                .payload,
+            json!({ "status": "running", "limit": 200 })
+        );
+
+        let get = wf_instance_request(
+            "wf_get_instance",
+            &json!({ "node_name": "WF.invoice", "instance_id": INSTANCE, "log_limit": 5 }),
+            "worker1",
+        )
+        .expect("get");
+        assert_eq!(
+            (get.node_name.as_str(), get.verb, get.answer),
+            (
+                "WF.invoice@worker1",
+                "WF_GET_INSTANCE",
+                "WF_GET_INSTANCE_RESPONSE"
+            )
+        );
+        assert_eq!(
+            get.payload,
+            json!({ "instance_id": INSTANCE, "log_limit": 5 })
+        );
+        let without_log_limit = json!({ "node_name": "WF.invoice", "instance_id": INSTANCE });
+        assert_eq!(
+            wf_instance_request("wf_get_instance", &without_log_limit, "worker1")
+                .expect("get")
+                .payload,
+            json!({ "instance_id": INSTANCE })
+        );
+
+        let cancel = wf_instance_request(
+            "wf_cancel_instance",
+            &json!({ "node_name": "WF.invoice", "instance_id": INSTANCE, "reason": " left " }),
+            "worker1",
+        )
+        .expect("cancel");
+        assert_eq!(
+            (cancel.verb, cancel.answer),
+            ("WF_CANCEL_INSTANCE", "WF_CANCEL_INSTANCE_RESPONSE")
+        );
+        assert_eq!(
+            cancel.payload,
+            json!({ "instance_id": INSTANCE, "reason": "left" })
+        );
+    }
+
+    /// What the engine cannot take is refused before anything is sent, saying why: a node that is
+    /// no WF node or is of another hive, a status the engine does not give, a limit out of range
+    /// (never cut), a missing instance or reason.
+    #[test]
+    fn a_wf_instance_action_refuses_what_the_engine_cannot_take() {
+        let with = |extra: Value| {
+            let mut params = json!({ "node_name": "WF.invoice", "instance_id": INSTANCE });
+            for (key, value) in extra.as_object().expect("object") {
+                params[key] = value.clone();
+            }
+            params
+        };
+        for (action, params, refusal) in [
+            ("wf_list_instances", json!({}), "node_name is required"),
+            (
+                "wf_list_instances",
+                json!({ "node_name": "AI.sales" }),
+                "acts on a WF node",
+            ),
+            (
+                "wf_list_instances",
+                json!({ "node_name": "WF." }),
+                "acts on a WF node",
+            ),
+            (
+                "wf_list_instances",
+                json!({ "node_name": "WF.invoice@worker2" }),
+                "does not match path hive 'worker1'",
+            ),
+            (
+                "wf_list_instances",
+                with(json!({ "status": "active" })),
+                "status must be one of running, completed, cancelled, failed",
+            ),
+            (
+                "wf_list_instances",
+                with(json!({ "limit": 0 })),
+                "limit must be a number from 1 to 200",
+            ),
+            (
+                "wf_list_instances",
+                with(json!({ "limit": 201 })),
+                "limit must be a number from 1 to 200",
+            ),
+            (
+                "wf_list_instances",
+                with(json!({ "limit": "ten" })),
+                "limit must be a number from 1 to 200",
+            ),
+            (
+                "wf_get_instance",
+                json!({ "node_name": "WF.invoice" }),
+                "instance_id is required",
+            ),
+            (
+                "wf_get_instance",
+                with(json!({ "log_limit": 500 })),
+                "log_limit must be a number from 1 to 200",
+            ),
+            ("wf_cancel_instance", with(json!({})), "reason is required"),
+            (
+                "wf_cancel_instance",
+                with(json!({ "reason": "  " })),
+                "reason is required",
+            ),
+        ] {
+            let refused = wf_instance_request(action, &params, "worker1")
+                .expect_err(&format!("{action} {params}"));
+            assert!(refused.contains(refusal), "{action} {params}: {refused}");
+        }
+    }
+
+    /// One instance route served with the WF node answering `answer`: what the admin sent the
+    /// node, and the admin's answer.
+    async fn wf_instance_route(
+        ctx: &AdminContext,
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        (method, path): (&str, &str),
+        query: &[(&str, &str)],
+        body: &[u8],
+        answer: Value,
+    ) -> (Message, u16, Value) {
+        let query: HashMap<String, String> = query
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let route = handle_hive_paths(method, path, &query, body, ctx, &ctx.rpc);
+        let node = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the engine's verb");
+            let verb = sent.meta.msg.clone().expect("verb");
+            harness
+                .inject(reply_to(&sent, &format!("{verb}_RESPONSE"), answer))
+                .await
+                .unwrap();
+            sent
+        };
+        let (result, sent) = tokio::join!(route, node);
+        let (status, body) = result.expect("route").expect("served");
+        (sent, status, serde_json::from_str(&body).expect("body"))
+    }
+
+    /// GET .../wf/instances sends WF_LIST_INSTANCES {status, limit} to the WF node of the path's
+    /// hive and answers the engine's payload as it is; a limit out of range sends nothing.
+    #[tokio::test]
+    async fn wf_list_instances_asks_the_wf_node_and_answers_its_payload() {
+        let (ctx, mut harness) = opa_test_admin("wf-list-instances");
+        let listed = json!({
+            "ok": true,
+            "count": 1,
+            "instances": [{
+                "instance_id": INSTANCE,
+                "thread_id": "conv-7c1e",
+                "workflow_type": "invoice",
+                "definition_hash": "4f1c9a0e7d2b",
+                "status": "running",
+                "current_state": "waiting_team",
+                "created_at_ms": 1775577000000i64,
+                "updated_at_ms": 1775578000000i64,
+                "terminated_at_ms": null,
+            }],
+        });
+        let (sent, status, body) = wf_instance_route(
+            &ctx,
+            &mut harness,
+            ("GET", "/hives/worker1/nodes/WF.invoice/wf/instances"),
+            &[("status", "running"), ("limit", "10")],
+            &[],
+            listed.clone(),
+        )
+        .await;
+        assert_eq!(sent.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(sent.meta.msg.as_deref(), Some("WF_LIST_INSTANCES"));
+        assert_eq!(dst_of(&sent), json!("WF.invoice@worker1"));
+        assert_eq!(sent.payload, json!({ "status": "running", "limit": 10 }));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["action"], json!("wf_list_instances"));
+        assert_eq!(body["payload"], listed);
+        assert!(body["error_code"].is_null(), "{body}");
+
+        let (sent, status, _) = wf_instance_route(
+            &ctx,
+            &mut harness,
+            (
+                "GET",
+                "/hives/worker1/nodes/WF.invoice@worker1/wf/instances",
+            ),
+            &[],
+            &[],
+            json!({ "ok": true, "count": 0, "instances": [] }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(sent.payload, json!({ "limit": 50 }));
+
+        let query: HashMap<String, String> = [("limit".to_string(), "500".to_string())].into();
+        let (status, body) = handle_hive_paths(
+            "GET",
+            "/hives/worker1/nodes/WF.invoice/wf/instances",
+            &query,
+            &[],
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// Archi asks over the mesh as for every node action (the hive its target, the node bare); the
+    /// engine's refusal gives the envelope's error_code and error_detail, its payload kept.
+    #[tokio::test]
+    async fn wf_get_instance_over_the_mesh_answers_the_engines_refusal() {
+        let (ctx, mut harness) = opa_test_admin("wf-get-instance");
+        let get = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "wf_get_instance",
+            Some("worker1"),
+            json!({ "node_name": "WF.invoice", "instance_id": INSTANCE, "log_limit": 5 }),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        );
+        let refusal = json!({
+            "ok": false,
+            "error": "INSTANCE_NOT_FOUND",
+            "detail": "sql: no rows in result set",
+        });
+        let node = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("WF_GET_INSTANCE");
+            assert_eq!(sent.meta.msg.as_deref(), Some("WF_GET_INSTANCE"));
+            assert_eq!(dst_of(&sent), json!("WF.invoice@worker1"));
+            assert_eq!(
+                sent.payload,
+                json!({ "instance_id": INSTANCE, "log_limit": 5 })
+            );
+            harness
+                .inject(reply_to(&sent, "WF_GET_INSTANCE_RESPONSE", refusal.clone()))
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(get, node);
+        let result = result.expect("answered");
+        assert_eq!(result.http_status, 404, "{}", result.envelope);
+        assert_eq!(result.envelope["status"], json!("error"));
+        assert_eq!(result.envelope["action"], json!("wf_get_instance"));
+        assert_eq!(result.envelope["error_code"], json!("INSTANCE_NOT_FOUND"));
+        assert_eq!(
+            result.envelope["error_detail"],
+            json!("sql: no rows in result set")
+        );
+        assert_eq!(result.envelope["payload"], refusal);
+    }
+
+    /// POST .../cancel sends WF_CANCEL_INSTANCE {instance_id, reason}; an instance already ended is
+    /// a conflict, and a cancel without its reason is refused before anything is sent.
+    #[tokio::test]
+    async fn wf_cancel_instance_sends_the_reason_and_answers_the_engine() {
+        let (ctx, mut harness) = opa_test_admin("wf-cancel-instance");
+        let path = format!("/hives/worker1/nodes/WF.invoice/wf/instances/{INSTANCE}/cancel");
+        let cancelled = json!({ "ok": true, "instance_id": INSTANCE, "status": "cancelled" });
+        let (sent, status, body) = wf_instance_route(
+            &ctx,
+            &mut harness,
+            ("POST", &path),
+            &[],
+            br#"{"reason":"the person left"}"#,
+            cancelled.clone(),
+        )
+        .await;
+        assert_eq!(sent.meta.msg.as_deref(), Some("WF_CANCEL_INSTANCE"));
+        assert_eq!(dst_of(&sent), json!("WF.invoice@worker1"));
+        assert_eq!(
+            sent.payload,
+            json!({ "instance_id": INSTANCE, "reason": "the person left" })
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["action"], json!("wf_cancel_instance"));
+        assert_eq!(body["payload"], cancelled);
+
+        let ended = json!({
+            "ok": false,
+            "error": "INSTANCE_ALREADY_TERMINATED",
+            "detail": format!("instance \"{INSTANCE}\" is already completed"),
+        });
+        let (_, status, body) = wf_instance_route(
+            &ctx,
+            &mut harness,
+            ("POST", &path),
+            &[],
+            br#"{"reason":"the person left"}"#,
+            ended,
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("INSTANCE_ALREADY_TERMINATED"));
+
+        let (status, body) =
+            handle_hive_paths("POST", &path, &HashMap::new(), b"{}", &ctx, &ctx.rpc)
+                .await
+                .expect("route")
+                .expect("served");
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("reason is required"), "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The instance actions are in the catalog as every node action is: a route, help, args and
+    /// an example each; reads but the cancel, which waits for the operator's word; over the mesh
+    /// Archi alone asks for them.
+    #[test]
+    fn the_wf_instance_actions_are_registered_with_their_contract() {
+        let instance_path =
+            format!("/hives/worker1/nodes/WF.invoice@worker1/wf/instances/{INSTANCE}");
+        for (action, pattern, read_only, path) in [
+            (
+                "wf_list_instances",
+                "GET /hives/{hive}/nodes/{node_name}/wf/instances",
+                true,
+                "/hives/worker1/nodes/WF.invoice@worker1/wf/instances".to_string(),
+            ),
+            (
+                "wf_get_instance",
+                "GET /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}",
+                true,
+                instance_path.clone(),
+            ),
+            (
+                "wf_cancel_instance",
+                "POST /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}/cancel",
+                false,
+                format!("{instance_path}/cancel"),
+            ),
+        ] {
+            let spec = resolve_internal_action_spec(action).expect(action);
+            assert!(
+                matches!(spec.route, InternalActionRoute::Command(canonical) if canonical == action),
+                "{action}"
+            );
+            assert!(spec.requires_target, "{action}");
+            let doc = build_admin_action_doc(spec);
+            assert_eq!(doc["read_only"], json!(read_only), "{action}");
+            assert_eq!(doc["confirmation_required"], json!(!read_only), "{action}");
+            assert_eq!(doc["path_patterns"], json!([pattern]), "{action}");
+            assert_ne!(doc["summary"], json!("Admin action."), "{action}");
+            assert!(admin_action_request_notes(action).len() >= 4, "{action}");
+            assert!(admin_action_example_scmd(action).is_some(), "{action}");
+            let method = pattern.split_whitespace().next().expect("method");
+            assert_eq!(
+                admin_methods_allowed_for_path(&path),
+                vec![method],
+                "{action}"
+            );
+            let required = &doc["executor_contract"]["function_schema"]["required"];
+            for field in ["hive", "node_name"] {
+                assert!(
+                    required
+                        .as_array()
+                        .expect("required")
+                        .contains(&json!(field)),
+                    "{action}: {field}"
+                );
+            }
+            // A node_name@hive wins over the target, as for every node action.
+            assert!(is_node_scoped_action(action), "{action}");
+            assert_eq!(
+                resolve_internal_action_hive(
+                    action,
+                    Some("motherbee"),
+                    &json!({ "node_name": "WF.invoice@worker1" })
+                ),
+                Some("worker1".to_string()),
+                "{action}"
+            );
+            assert_eq!(mesh_access(action), Some(MeshAccess::Archi), "{action}");
+            assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&action), "{action}");
+            let params = json!({ "node_name": "WF.invoice@worker1" });
+            assert_eq!(
+                mesh_admits("SY.architect@motherbee", action, Some("worker1"), &params),
+                Ok(MeshAdmission::Admitted),
+                "{action}"
+            );
+            for caller in [
+                "SY.wf-rules@worker1",
+                "WF.invoice@worker1",
+                "AI.sales@worker1",
+                "IO.cloud@motherbee",
+            ] {
+                assert!(
+                    mesh_admits(caller, action, Some("worker1"), &params).is_err(),
+                    "{action}: {caller}"
+                );
+            }
+        }
+        let schema = |action: &str| {
+            build_admin_executor_function_definition(
+                resolve_internal_action_spec(action).expect(action),
+            )
+            .parameters_json_schema
+        };
+        assert_eq!(
+            schema("wf_list_instances")["properties"]["status"]["enum"],
+            json!(["running", "completed", "cancelled", "failed"])
+        );
+        assert_eq!(
+            schema("wf_cancel_instance")["required"],
+            json!(["hive", "node_name", "instance_id", "reason"])
+        );
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "18");
+    }
+
+    // --- A-127: a bare node name is a node of the path's hive ----------------------------------
+
+    #[test]
+    fn a_bare_node_name_is_a_node_of_the_paths_hive() {
+        assert_eq!(
+            node_name_on_hive("AI.sales", "worker1"),
+            Ok("AI.sales@worker1".to_string())
+        );
+        assert_eq!(
+            node_name_on_hive("AI.sales@worker1", "worker1"),
+            Ok("AI.sales@worker1".to_string())
+        );
+        assert_eq!(
+            node_name_on_hive("AI.sales@worker2", "worker1"),
+            Err("node_name hive 'worker2' does not match path hive 'worker1'".to_string())
+        );
+    }
+
+    /// The control routes send to the node of the path's hive, and the request names it so: the
+    /// router knows no bare name (the gate's AI.gate0191sales answered NODE_NOT_FOUND).
+    #[tokio::test]
+    async fn the_control_routes_qualify_a_bare_node_name() {
+        let (ctx, mut harness) = opa_test_admin("control-bare-name");
+        let query = HashMap::new();
+        for (route, verb) in [("config-get", "CONFIG_GET"), ("config-set", "CONFIG_SET")] {
+            let path = format!("/hives/worker1/nodes/AI.sales/control/{route}");
+            let call = handle_hive_paths("POST", &path, &query, b"{}", &ctx, &ctx.rpc);
+            let node = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect(verb);
+                assert_eq!(sent.meta.msg.as_deref(), Some(verb));
+                assert_eq!(dst_of(&sent), json!("AI.sales@worker1"));
+                assert_eq!(sent.payload["node_name"], json!("AI.sales@worker1"));
+                let answer = json!({ "ok": true, "node_name": "AI.sales@worker1" });
+                harness
+                    .inject(reply_to(&sent, "CONFIG_RESPONSE", answer))
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::join!(call, node);
+            let (status, body) = result.expect("route").expect("served");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["payload"]["node_name"], json!("AI.sales@worker1"));
+        }
+        let (status, body) = handle_hive_paths(
+            "POST",
+            "/hives/worker1/nodes/AI.sales@worker2/control/config-get",
+            &HashMap::new(),
+            b"{}",
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        assert_eq!(status, 400, "{body}");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The message route sends to the node of the path's hive too, and refuses a name of another
+    /// hive, as the control routes do; before, it sent any name as given.
+    #[tokio::test]
+    async fn the_message_route_qualifies_a_bare_node_name_and_refuses_another_hive() {
+        let (ctx, mut harness) = opa_test_admin("message-bare-name");
+        let message = json!({ "msg_type": "user", "payload": { "text": "hola" } }).to_string();
+        let (status, answer) = handle_hive_paths(
+            "POST",
+            "/hives/worker1/nodes/AI.sales/messages",
+            &HashMap::new(),
+            message.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        let answer: Value = serde_json::from_str(&answer).expect("answer");
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["payload"]["node_name"], json!("AI.sales@worker1"));
+        let sent = harness
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("the message");
+        assert_eq!(dst_of(&sent), json!("AI.sales@worker1"));
+
+        let elsewhere =
+            json!({ "node_name": "AI.sales@worker2", "msg_type": "user", "payload": {} })
+                .to_string();
+        let (status, answer) = handle_hive_paths(
+            "POST",
+            "/hives/worker1/nodes/AI.sales/messages",
+            &HashMap::new(),
+            elsewhere.as_bytes(),
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        assert_eq!(status, 400, "{answer}");
+        assert!(
+            answer.contains("does not match path hive 'worker1'"),
+            "{answer}"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    // --- A-141: the executor's key at boot waits for the vault --------------------------------
+
+    /// What the router answers for a vault that is not up yet.
+    fn vault_unreachable(request: &Message) -> Message {
+        let reason = json!({ "reason": "NODE_NOT_FOUND", "original_dst": "SY.vault@motherbee" });
+        reply_to(request, MSG_UNREACHABLE, reason)
+    }
+
+    /// A vault that comes up late, as the executor's lookup with no ILK of its own sees it (only
+    /// the tenant's general secret is listed): the first list is unreachable, the next one finds a
+    /// secret, and its value has the key.
+    async fn answer_executor_key_lookup(harness: &mut fluxbee_sdk::RouterDispatcherTestHarness) {
+        let wait = Duration::from_secs(5);
+        let list = harness.next_outgoing_within(wait).await.expect("the list");
+        assert_eq!(list.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+        harness.inject(vault_unreachable(&list)).await.unwrap();
+        // The lookup asks again, once the vault may be up.
+        let list = harness
+            .next_outgoing_within(wait)
+            .await
+            .expect("the list again");
+        assert_eq!(list.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+        let secrets = json!({
+            "status": "ok",
+            "count": 1,
+            "secrets": [{
+                "key": "anthropic:admin",
+                "metadata": {
+                    "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                    "resource_type": "anthropic",
+                },
+                "version": 1,
+                "access_count": 0,
+            }],
+        });
+        harness
+            .inject(reply_to(&list, MSG_VAULT_LIST_RESPONSE, secrets))
+            .await
+            .unwrap();
+        let get = harness.next_outgoing_within(wait).await.expect("the get");
+        assert_eq!(get.meta.msg.as_deref(), Some(MSG_VAULT_GET));
+        assert_eq!(get.payload["key"], json!("anthropic:admin"));
+        let value = json!({
+            "status": "ok",
+            "key": "anthropic:admin",
+            "value": { "api_key": "sk-ant-test" },
+        });
+        harness
+            .inject(reply_to(&get, MSG_VAULT_GET_RESPONSE, value))
+            .await
+            .unwrap();
+    }
+
+    /// At boot the executor's key waits for a vault that does not answer yet (an upgrade restarts
+    /// the whole hive at once), and is read when it does; after boot a lookup asks once, and a
+    /// vault that does not answer is no key (FINDINGS A-141).
+    #[tokio::test]
+    async fn the_executors_key_at_boot_waits_for_the_vault() {
+        let (ctx, mut harness) = opa_test_admin("executor-key-boot");
+        let vault = fluxbee_sdk::VaultClient::new(
+            Arc::clone(&ctx.rpc),
+            PRIMARY_HIVE_ID,
+            fluxbee_sdk::VaultCallerOwned::new("", "SY.admin@motherbee"),
+        );
+        let boot = resolve_admin_executor_api_key(
+            &vault,
+            fluxbee_sdk::ResourceType::Anthropic,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            "SY.admin@motherbee",
+            VaultWait::UntilReachable,
+        );
+        let (key, ()) = tokio::join!(boot, answer_executor_key_lookup(&mut harness));
+        assert_eq!(key.expect("lookup").as_deref(), Some("sk-ant-test"));
+
+        let once = resolve_admin_executor_api_key(
+            &vault,
+            fluxbee_sdk::ResourceType::Anthropic,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            "SY.admin@motherbee",
+            VaultWait::Once,
+        );
+        let unreachable = async {
+            let list = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the list");
+            harness.inject(vault_unreachable(&list)).await.unwrap();
+        };
+        let (key, ()) = tokio::join!(once, unreachable);
+        assert_eq!(key.expect("lookup"), None);
+        assert!(
+            harness
+                .next_outgoing_within(Duration::from_millis(1_500))
+                .await
+                .is_none(),
+            "after boot the vault is asked once"
+        );
     }
 
     // --- A-81: a producer's blob reaches the motherbee before its curate -------------------
