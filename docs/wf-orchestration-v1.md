@@ -1673,11 +1673,53 @@ side.
          carries the error.
   3. **Deploying and updating without breaking what runs.** Each instance keeps its definition
      (§5.1, item 3). §4.7's pipeline problems are read again in the code first.
+     - **Verified (2026-11-03),** §4.7's three problems hold:
+       - **A first deploy without `auto_spawn`** publishes the workflow and makes it current, but
+         creates no node, and answers ok (go/sy-wf-rules/node/deploy.go, "auto_spawn disabled").
+         The pipeline leaves `auto_spawn` and the tenant to the plan compiler, a model
+         (`pin_wf_plan_steps`).
+       - **An update restarts the node twice:** `WfDeployRestart` plans `wf_rules_compile_apply`
+         and `restart_node`, and the compile_apply already restarts it.
+       - **A removal never removes a workflow with running instances:** the pipeline deletes
+         without `force`, and SY.wf-rules refuses (`INSTANCES_ACTIVE`, or `INSTANCES_UNKNOWN`
+         when it cannot count them). The run stops.
+     - **Decided (2026-11-03),** the operator, on the three:
+       - **A first deploy always creates the node:** the pipeline pins `auto_spawn` and the
+         solution's tenant, not the model;
+       - **an update is one compile_apply,** so one restart;
+       - **a removal's plan says how many conversations are running** (the snapshot counts
+         them). The operator's confirmation removes it with `force`, and those conversations end;
+         otherwise the operator waits, or cancels them (topic 4).
   4. **Operating instances through SY.admin** (§4.8): the engine's verbs exist, and nothing exposes
      them.
+     - **Verified (2026-11-03):**
+       - The engine answers `WF_LIST_INSTANCES` (a status, a limit, a time), `WF_GET_INSTANCE`
+         (the instance, its input, its state variables and its last log entries) and
+         `WF_CANCEL_INSTANCE` (an id and a reason; the cancel transition runs).
+       - Only SY.admin@motherbee and the hive's SY.wf-rules may ask them (A-119).
+       - Neither SY.admin nor Archi names them.
+     - **Decided (2026-11-03), mine,** under the operator's word: *"primero miralo vos.. si explota
+       lo charlamos"*. SY.admin gets three actions on a WF node, and Archi reaches them as it
+       reaches every admin action:
+       - `wf_list_instances`;
+       - `wf_get_instance`;
+       - `wf_cancel_instance`, which changes something, so Archi asks the operator first.
+
+       An instance that waits shows its state and how long it has been there. Nothing new is built
+       in the engine.
 
   The gate's deployment is mine to choose (the operator): Archi deploys a WF, its agents too, or
   io.slack as well.
+- **Solution development, a chapter of its own** (the operator, 2026-11-03). What Archi needs as
+  the creator of solutions was not planned well, and must not be born half-built:
+  - a document on developing solutions;
+  - a handbook of good development practices;
+  - for each solution, a place on disk, a minimal manifest, and how to deploy it.
+
+  For now, *"si es necesario borrar todo y sobre cada caso iniciar de cero el entorno, tal vez es
+  preferible ahora"*. So Case 5's gate starts from zero, and so does each case after it.
+- **The gate is mine to run** (the operator, 2026-11-03): *"no me esperes a mí para esta prueba,
+  confío en que si el bug no sale ahora, explota mañana"*.
 - **Archi's model (the operator, 2026-11-02):** Claude Opus 5.5, *"así programa la solución ese
   modelo"*. Done the same night as a config change of the motherbee (ledger 0.1.94).
   - **Later, Opus for Archi alone** (the operator, 2026-11-03). The build gives Archi a model of

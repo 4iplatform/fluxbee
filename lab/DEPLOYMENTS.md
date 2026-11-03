@@ -206,6 +206,15 @@
     communication.
   - SY.frontdesk.gov came up configured. It had booted without its AI at the upgrade (A-141).
   - **Back:** the backup, and the same four restarts.
+- **Config, 2026-11-03 at 00:28 ART: Archi's own Anthropic key.** The operator made it for Archi,
+  so that its costs show apart at Anthropic, and handed it over by a file's path.
+  - The vault holds it as `anthropic_architect`: resource `anthropic`, the root tenant, owned by
+    SY.architect (`ilk:ba06dcf6-…`, its system ILK). A node takes the key it owns before its
+    tenant's general one (`resolve_resource`), so no code changed. The others keep
+    `anthropic_root_pool`.
+  - Archi refreshed its runtime on the vault's notice, and was restarted to be sure. It answered
+    on `claude-opus-5-5` with it, and the check's session was deleted.
+  - **Back:** delete `anthropic_architect` from the vault, and Archi goes back to the root key.
 - **Rollback:**
   - snapshot `pre-wfcase4-0-1-94`;
   - or `apt install fluxbee=0.1.93` plus the core update of the spokes. Then the gate's WF needs
