@@ -41,7 +41,8 @@ func lastSent(t *testing.T, disp *mockDispatcher) (sdk.Message, map[string]any) 
 // ".error" for an error, when the request had one) and thread, and the request's context without
 // its thread_id, src_ilk, response_envelope, wf and evaluation (sanitize_reply_context); an answer
 // to a menu carries its evaluation, {reply, option, params}, in meta.context.evaluation. It goes to
-// whoever spoke: its dst_ilk is the request's src_ilk (build_reply_meta).
+// whoever spoke, on the channel they spoke from: its dst_ilk is the request's src_ilk, and its ich
+// the request's (build_reply_meta answers on a copy of the request's meta).
 func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string, evaluation map[string]any) sdk.Message {
 	t.Helper()
 	answerContext := map[string]any{}
@@ -67,7 +68,7 @@ func agentAnswer(t *testing.T, agent string, request sdk.Message, payload string
 	}
 	return from(agent, sdk.Message{
 		Routing: sdk.Routing{Src: "agent-uuid", TraceID: request.Routing.TraceID},
-		Meta:    sdk.Meta{MsgType: "user", Msg: msgName, DstIlk: request.Meta.SrcIlk, ThreadID: request.Meta.ThreadID, Context: rawContext},
+		Meta:    sdk.Meta{MsgType: "user", Msg: msgName, DstIlk: request.Meta.SrcIlk, Ich: request.Meta.Ich, ThreadID: request.Meta.ThreadID, Context: rawContext},
 		Payload: json.RawMessage(payload),
 	})
 }
@@ -305,11 +306,13 @@ const (
 	salesIOContext = `{"io":{"channel":"api","sender":{"kind":"api_subject","id":"ana@acme.example"},"conversation":{"kind":"api_conversation","id":"conv-7"},"reply_target":{"address":"conv-7","kind":"api"}}}`
 	personILK      = "ilk:00000000-0000-4000-8000-0000000000aa"
 	personICH      = "ich:api:conv-7"
-	// supervisorsIO is the supervisors' Slack channel, and supervisorsIOContext the context.io of a
-	// supervisor's answer there; supervisorILK is the supervisor who writes, and teamMemberILK the
-	// person of the team who clicks a menu's button.
+	// supervisorsIO is the supervisors' Slack channel, supervisorsIOContext the context.io of a
+	// supervisor's answer there, and supervisorsICH the channel's ich, which io.slack puts on every
+	// message from it; supervisorILK is the supervisor who writes, and teamMemberILK the person of the
+	// team who clicks a menu's button.
 	supervisorsIO        = "IO.slack.supervisores@motherbee"
 	supervisorsIOContext = `{"io":{"reply_target":{"address":"C0SUPERVISORS","kind":"slack_post","params":{"thread_ts":"1730289000.000100"}}}}`
+	supervisorsICH       = "slack://T0WORKSPACE:C0SUPERVISORS"
 	supervisorILK        = "ilk:00000000-0000-4000-8000-0000000000cc"
 	teamMemberILK        = "ilk:00000000-0000-4000-8000-0000000000bb"
 )
@@ -376,14 +379,14 @@ func (c *salesConversation) fail(agent string, request sdk.Message) {
 
 // supervisor answers in Slack, in the thread of the WF's post: IO.slack.supervisores gives the answer
 // the thread it recorded for that post, the conversation's (wf-orchestration-v1 §5.3.4), the
-// supervisor as its src_ilk, and the context.io of its own channel.
+// supervisor as its src_ilk, and the ich and the context.io of its own channel.
 func (c *salesConversation) supervisor(text string) sdk.Message {
 	c.t.Helper()
 	c.turn++
-	thread, ilk := salesThread, supervisorILK
+	thread, ilk, ich := salesThread, supervisorILK, supervisorsICH
 	msg := from(supervisorsIO, sdk.Message{
 		Routing: sdk.Routing{Src: "slack-uuid", TraceID: fmt.Sprintf("trace-supervisor-%d", c.turn)},
-		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, ThreadID: &thread, Context: json.RawMessage(supervisorsIOContext)},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, Ich: &ich, ThreadID: &thread, Context: json.RawMessage(supervisorsIOContext)},
 		Payload: json.RawMessage(fmt.Sprintf(`{"type":"text","content":%q}`, text)),
 	})
 	c.dispatch(msg)
@@ -391,13 +394,13 @@ func (c *salesConversation) supervisor(text string) sdk.Message {
 }
 
 // click is a person of the team's click on the menu of the WF's post, in Slack: io.slack sends it on
-// the conversation's thread, as the person who clicked, with meta.context.evaluation {option, params}
-// and a text of the option's name, then each param as name: value, one per line
-// (wf-orchestration-v1 §5.4.4).
+// the conversation's thread, as the person who clicked, from the channel's ich, with
+// meta.context.evaluation {option, params} and a text of the option's name, then each param as
+// name: value, one per line (wf-orchestration-v1 §5.4.4).
 func (c *salesConversation) click(option string, params map[string]any) sdk.Message {
 	c.t.Helper()
 	c.turn++
-	thread, ilk := salesThread, teamMemberILK
+	thread, ilk, ich := salesThread, teamMemberILK, supervisorsICH
 	text := option
 	for _, name := range sortedParams(params) {
 		text += fmt.Sprintf("\n%s: %v", name, params[name])
@@ -411,7 +414,7 @@ func (c *salesConversation) click(option string, params map[string]any) sdk.Mess
 	}
 	msg := from(supervisorsIO, sdk.Message{
 		Routing: sdk.Routing{Src: "slack-uuid", TraceID: fmt.Sprintf("trace-click-%d", c.turn)},
-		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, ThreadID: &thread, Context: metaContext},
+		Meta:    sdk.Meta{MsgType: "user", SrcIlk: &ilk, Ich: &ich, ThreadID: &thread, Context: metaContext},
 		Payload: json.RawMessage(fmt.Sprintf(`{"type":"text","content":%q}`, text)),
 	})
 	c.dispatch(msg)
@@ -555,13 +558,15 @@ func (c *salesConversation) options(msg sdk.Message) string {
 }
 
 // delivered checks the last message the person got: reply, from agent through the WF, with the
-// person's context.io, and the person as its dst_ilk, whoever the agent answered (FINDINGS A-139).
+// person's context.io, the person as its dst_ilk and the person's channel as its ich, whoever the
+// agent answered (FINDINGS A-139).
 func (c *salesConversation) delivered(reply, agent string) {
 	c.t.Helper()
 	msg := c.sentTo(salesIO)
 	if string(msg.Payload) != fmt.Sprintf(`{"type":"text","content":%q}`, reply) || c.trail(msg) != "["+agent+" "+salesWFNode+"]" ||
-		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread || derefString(msg.Meta.DstIlk) != personILK {
-		c.t.Fatalf("the person gets %q from %s, with its trail, context.io and dst_ilk: %+v %s %s", reply, agent, msg.Meta, msg.Payload, msg.Meta.Context)
+		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread || derefString(msg.Meta.DstIlk) != personILK ||
+		derefString(msg.Meta.Ich) != personICH {
+		c.t.Fatalf("the person gets %q from %s, with its trail, context.io, dst_ilk and ich: %+v %s %s", reply, agent, msg.Meta, msg.Payload, msg.Meta.Context)
 	}
 }
 
@@ -880,7 +885,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	toTeam := c.sentTo(supervisorsIO)
 	if c.count(supervisorsIO) != questions+1 || string(toTeam.Payload) != `{"type":"text","content":"Daría 15%: el cliente compra seguido."}` ||
 		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.trail(toTeam) != "["+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent ||
-		derefString(toTeam.Meta.DstIlk) != supervisorILK {
+		derefString(toTeam.Meta.DstIlk) != supervisorILK || derefString(toTeam.Meta.Ich) != supervisorsICH {
 		t.Fatalf("sales' answer goes to the team, in the question's thread: %+v %s %s", toTeam.Meta, toTeam.Payload, toTeam.Meta.Context)
 	}
 
@@ -899,12 +904,12 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 
 	// 5. Sales tells the person: its decided, to a message from the supervisors' channel, goes to the
 	// person with the person's context.io, and sales holds the conversation. Sales answered the
-	// supervisor, and its answer names the supervisor as its dst_ilk; the WF names the person, whom it
-	// goes to (FINDINGS A-139).
+	// supervisor, and its answer names the supervisor as its dst_ilk and the supervisors' channel as
+	// its ich; the WF names the person and the person's channel, where it goes (FINDINGS A-139).
 	decided := agentAnswer(t, salesAgent, toSales, `{"type":"text","content":"Te puedo hacer 15% de descuento."}`,
 		map[string]any{"reply": "Te puedo hacer 15% de descuento.", "option": "decided", "params": map[string]any{}})
-	if derefString(decided.Meta.DstIlk) != supervisorILK {
-		t.Fatalf("sales answers the supervisor: %+v", decided.Meta)
+	if derefString(decided.Meta.DstIlk) != supervisorILK || derefString(decided.Meta.Ich) != supervisorsICH {
+		t.Fatalf("sales answers the supervisor, on the supervisors' channel: %+v", decided.Meta)
 	}
 	c.dispatch(decided)
 	c.delivered("Te puedo hacer 15% de descuento.", salesAgent)
@@ -1093,11 +1098,12 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 		t.Fatal("quiet counts once the case is taken")
 	}
 
-	// 4. Juan answers in the post's thread: the person gets it, as Juan's, with their own context.io
-	// and as its dst_ilk, and the case is taken: "nobody took it" goes, and "quiet" counts.
+	// 4. Juan answers in the post's thread: the person gets it, as Juan's, with their own context.io,
+	// as its dst_ilk and on their own channel, and the case is taken: "nobody took it" goes, and
+	// "quiet" counts.
 	c.supervisor("Hola Ana, soy Juan. Ya veo la factura F-0001, dame un minuto.")
 	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.trail(msg) != "["+supervisorsIO+" "+salesWFNode+"]" ||
-		derefString(msg.Meta.SrcIlk) != supervisorILK || derefString(msg.Meta.DstIlk) != personILK {
+		derefString(msg.Meta.SrcIlk) != supervisorILK || derefString(msg.Meta.DstIlk) != personILK || derefString(msg.Meta.Ich) != personICH {
 		t.Fatalf("the team's message goes to the person: %+v %s %s", msg.Meta, msg.Payload, msg.Meta.Context)
 	}
 	if _, untaken := c.pending("team_untaken"); untaken || c.state()["team_taken"] != true {

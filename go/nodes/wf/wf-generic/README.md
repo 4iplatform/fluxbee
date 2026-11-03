@@ -15,12 +15,13 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   node) carries the instance's person too, the `src_ilk` and `ich` of the message that started it,
   while the messages of its `start_from` nodes share it: once one carries another person (a thread
   several people write on, as a Slack channel's top level), the instance has no person, and its
-  sends carry none. To an `IO.*` node a `send_message` names no sender, no `src_ilk` and no `ich`
-  (the router's stamp names the WF), and a `send_message` or a `forward` to an `IO.*` node of
-  `start_from`, the person's, names the person as its `dst_ilk` (FINDINGS A-139). A definition
-  names in `start_from` the nodes whose messages start an instance, and only the nodes it names
-  (`start_from`, `event_match.src`, the targets of its sends) drive one; anyone else is dropped,
-  never answered (FINDINGS A-123).
+  sends carry none. To an `IO.*` node a `send_message` names no sender, no `src_ilk` (the router's
+  stamp names the WF), and a `send_message` or a `forward` to an `IO.*` node of `start_from`, the
+  person's, names the person: its `dst_ilk` is the person's `src_ilk` and its `ich` the person's
+  (FINDINGS A-139). To another `IO.*` node a `send_message` carries no `ich` either, and without a
+  person a `forward` keeps its own. A definition names in `start_from` the nodes whose messages
+  start an instance, and only the nodes it names (`start_from`, `event_match.src`, the targets of
+  its sends) drive one; anyone else is dropped, never answered (FINDINGS A-123).
   `start_from` names IO nodes and WFs, never an agent or a `SY.*`/`RT.*` node. `thread_id_ref` left
   the language.
 - **The upgrade to 0.1.91.** A definition written before it has no `start_from` and no longer

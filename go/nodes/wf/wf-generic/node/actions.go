@@ -118,9 +118,10 @@ func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.
 // conversation and their answers come back here), with its meta.context and the WF's block. Its ILKs
 // are the WF's to say, since it routes (FINDINGS A-139), and come from the instance's person, when it
 // has one (an instance whose thread several people write on has none, notePerson):
-//   - to an IO node (IO.*) it names no sender, no src_ilk and no ich: the WF wrote it, not the person,
-//     and the router's stamp names the WF. Who said what travels in the facts (vars). To the person's
-//     own IO node (personsIO) it names the person as its dst_ilk;
+//   - to an IO node (IO.*) it names no sender (no src_ilk): the WF wrote it, not the person, and the
+//     router's stamp names the WF. Who said what travels in the facts (vars). To the person's own IO
+//     node (personsIO) it names the person as its dst_ilk and the person's channel as its ich
+//     (toPerson); to any other IO node, no person and no ich;
 //   - to any other node, an agent above all, it carries the person as its src_ilk and ich: an agent
 //     files it under the person, as it does a forwarded message (wf-orchestration-v1 §5.4.3).
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
@@ -173,16 +174,14 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		},
 		Payload: raw,
 	}
-	person, ich := inst.PersonILK, inst.PersonICH
-	if wfcel.IsIO(action.Target) {
-		if person != "" && inst.personsIO(action.Target) {
-			msg.Meta.DstIlk = &person
-		}
-	} else {
-		if person != "" {
+	switch {
+	case inst.personsIO(action.Target):
+		inst.toPerson(&msg.Meta)
+	case !wfcel.IsIO(action.Target):
+		if person := inst.PersonILK; person != "" {
 			msg.Meta.SrcIlk = &person
 		}
-		if ich != "" {
+		if ich := inst.PersonICH; ich != "" {
 			msg.Meta.Ich = &ich
 		}
 	}
@@ -191,9 +190,24 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 // personsIO reports whether target is the person's IO node: an IO node (IO.*) of the definition's
 // start_from, whose messages carry the instance's person (notePerson). What the WF sends it names the
-// person as its dst_ilk (FINDINGS A-139).
+// person (toPerson).
 func (inst *WFInstance) personsIO(target string) bool {
 	return wfcel.IsIO(target) && inst.def.StartsFrom(target)
+}
+
+// toPerson names the instance's person on meta, a message to the person's IO node (FINDINGS A-139):
+// the person as its dst_ilk, and the person's channel as its ich, none when the person's message had
+// none. A forwarded message loses those of whoever it answered: an agent answers whoever spoke, on the
+// channel they spoke from. Without a person it changes nothing.
+func (inst *WFInstance) toPerson(meta *sdk.Meta) {
+	person, ich := inst.PersonILK, inst.PersonICH
+	if person == "" {
+		return
+	}
+	meta.DstIlk, meta.Ich = &person, nil
+	if ich != "" {
+		meta.Ich = &ich
+	}
 }
 
 // execForward sends a message on as it was received (wf-orchestration-v1 §5.2.1, item 5): the
@@ -202,8 +216,9 @@ func (inst *WFInstance) personsIO(target string) bool {
 // without memory_package. What the WF changes is metadata: the destination (a target written in
 // the definition), the thread (the instance's), the context keys the action writes and the WF's
 // block, whose trail is the message's own (or its sender's name) and this node. To the person's IO
-// node (personsIO) its dst_ilk is the instance's person, when it has one (FINDINGS A-139): an agent
-// answers whoever spoke, so its answer to a supervisor names the supervisor.
+// node (personsIO) its dst_ilk and ich are the instance's person and the person's channel, when it
+// has a person (toPerson, FINDINGS A-139): an agent answers whoever spoke, on the channel they spoke
+// from, so its answer to a supervisor names the supervisor and the supervisors' channel.
 func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Dispatcher == nil {
 		return fmt.Errorf("forward: no dispatcher configured")
@@ -234,8 +249,8 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 	threadID := inst.ThreadID
 	meta.ThreadID = &threadID
 	meta.Context = contextRaw
-	if person := inst.PersonILK; person != "" && inst.personsIO(action.Target) {
-		meta.DstIlk = &person
+	if inst.personsIO(action.Target) {
+		inst.toPerson(&meta)
 	}
 	msg := sdk.Message{
 		Routing: sdk.Routing{

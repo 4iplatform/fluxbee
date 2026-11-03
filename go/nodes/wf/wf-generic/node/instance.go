@@ -85,8 +85,8 @@ type WFInstance struct {
 	// started it (wf-orchestration-v1 §5.4.3): a message the WF writes (send_message) to a node that
 	// is no IO node carries them, so an agent files it under the person, as it does a forwarded one
 	// (the rest of FINDINGS A-116), and what the WF sends the person's IO node names the person as its
-	// dst_ilk (A-139, personsIO). Both go when a message from a start_from node carries another person
-	// (notePerson).
+	// dst_ilk and the person's channel as its ich (A-139, toPerson). Both go when a message from a
+	// start_from node carries another person (notePerson).
 	PersonILK string
 	PersonICH string
 	// kept holds the messages keep_message kept, by name, and keptSince names those its next commit

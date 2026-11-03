@@ -194,8 +194,9 @@ func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 // it. A send to an agent, or to a WF, carries the person as its src_ilk and ich, so an agent files
 // the WF's own message under the person (the rest of FINDINGS A-116). A send to an IO node names no
 // sender, since the WF wrote it: to the person's IO node (the definition's start_from) it names the
-// person as its dst_ilk, and to the team's IO node no person at all. A send to an IO node carries the
-// action's subject in the WF's block, which the IO node places it by.
+// person as its dst_ilk and the person's channel as its ich, and to the team's IO node no person and
+// no channel. A send to an IO node carries the action's subject in the WF's block, which the IO node
+// places it by.
 func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.sales@motherbee", uuid: "wf-uuid-person"}
 	actx := makeActx(t, disp, &mockTimerSender{})
@@ -213,7 +214,7 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	ilks := func(msg sdk.Message) string {
 		return fmt.Sprintf("src_ilk=%q dst_ilk=%q ich=%q", derefString(msg.Meta.SrcIlk), derefString(msg.Meta.DstIlk), derefString(msg.Meta.Ich))
 	}
-	const carriesThePerson, namesThePerson, noPerson = `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="ilk:person" ich=""`, `src_ilk="" dst_ilk="" ich=""`
+	const carriesThePerson, namesThePerson, noPerson = `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="ilk:person" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="" ich=""`
 	for _, c := range []struct{ target, subject, ilks, context string }{
 		{"AI.payments@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
 		{"WF.billing@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
@@ -227,8 +228,9 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	}
 
 	// A forward carries the subject too, and the message's meta as received: to the team's IO node its
-	// ILKs as they came; to the person's IO node the person as its dst_ilk, where an agent's answer to
-	// a supervisor names the supervisor, whom it answered.
+	// ILKs as they came; to the person's IO node the person as its dst_ilk and the person's channel as
+	// its ich, where an agent's answer to a supervisor names the supervisor, whom it answered, and the
+	// supervisors' channel, where the supervisor wrote.
 	answer := from("AI.sales@motherbee", sdk.Message{
 		Routing: sdk.Routing{TraceID: "trace-answer"},
 		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:agent"), DstIlk: strPtr("ilk:supervisor"), Ich: strPtr("ich:slack:team"), ThreadID: strPtr("conv-3")},
@@ -246,15 +248,25 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		string(sent.Meta.Context) != `{"wf":{"subject":"same","trail":["AI.sales@motherbee","WF.sales@motherbee"]}}` {
 		t.Fatalf("a forward to the team: %s %s", ilks(sent), sent.Meta.Context)
 	}
-	if sent := forward(personsIO, ""); ilks(sent) != `src_ilk="ilk:agent" dst_ilk="ilk:person" ich="ich:slack:team"` {
+	if sent := forward(personsIO, ""); ilks(sent) != `src_ilk="ilk:agent" dst_ilk="ilk:person" ich="ich:api:conv-3"` {
 		t.Fatalf("a forward to the person's IO node: %s", ilks(sent))
 	}
-	if derefString(answer.Meta.DstIlk) != "ilk:supervisor" {
+	if ilks(answer) != asReceived {
 		t.Fatalf("the forward changed the message it sent: %s", ilks(answer))
 	}
 
+	// A person whose message had no ich: what goes to the person's IO node names no channel, never the
+	// supervisors'.
+	inst.PersonICH = ""
+	if sent := forward(personsIO, ""); ilks(sent) != `src_ilk="ilk:agent" dst_ilk="ilk:person" ich=""` {
+		t.Fatalf("a forward to a person with no channel: %s", ilks(sent))
+	}
+	if sent := send(personsIO, ""); ilks(sent) != `src_ilk="" dst_ilk="ilk:person" ich=""` {
+		t.Fatalf("a send to a person with no channel: %s", ilks(sent))
+	}
+
 	// Without a person (several people write on the thread): a forward to the person's IO node keeps
-	// its dst_ilk, and a send names nobody.
+	// its dst_ilk and its ich, and a send names nobody.
 	inst.PersonILK, inst.PersonICH = "", ""
 	if sent := forward(personsIO, ""); ilks(sent) != asReceived {
 		t.Fatalf("a forward without a person: %s", ilks(sent))
