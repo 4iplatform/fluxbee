@@ -5,7 +5,7 @@
 //!   its router stamps (`routing.src_l2_name`). Any other sender's is ignored, with a log line.
 //! - **The facts:** a message's `meta.context.wf.vars`, when it is a non-empty object, is a context
 //!   line under its text: `key: value` pairs, escaped, each value cut at 200 characters, 10 keys at
-//!   most. Facts alone make no post.
+//!   most. A key with an empty value is left out. Facts alone make no post.
 //! - **The menu**, `meta.context.wf.menu`, is the same for an agent and a person: an agent answers
 //!   it with an object, and here it is buttons. The post gets an actions block, one button per
 //!   option, labeled with its name (`_` as a space, the first letter capitalized), and the menu's
@@ -421,22 +421,10 @@ impl WfPost {
     }
 
     /// Whether the message ends its subject with nothing to post, `payload` having no text, no
-    /// `content_ref`, no files and no blocks: it only closes the subject's menu, and posts nothing
-    /// (docs/wf-orchestration-v1.md §5.4.2), not even the fallback a message with nothing gets.
+    /// `content_ref`, no files and no blocks (`crate::payload_has_nothing`): it only closes the
+    /// subject's menu, and posts nothing (docs/wf-orchestration-v1.md §5.4.2).
     pub(crate) fn only_closes(&self, payload: &Value) -> bool {
-        let empty = |key: &str| match payload.get(key) {
-            None | Some(Value::Null) => true,
-            Some(Value::String(text)) => text.trim().is_empty(),
-            Some(Value::Array(items)) => items.is_empty(),
-            Some(Value::Object(fields)) => fields.is_empty(),
-            Some(_) => false,
-        };
-        let nothing = payload.is_null()
-            || (payload.is_object()
-                && ["content", "content_ref", "attachments", "blocks"]
-                    .into_iter()
-                    .all(empty));
-        self.subject == Subject::End && nothing
+        self.subject == Subject::End && crate::payload_has_nothing(payload)
     }
 
     /// The blocks of the post of a message whose text is `text`, with `own` its payload's `blocks`.
@@ -666,12 +654,15 @@ fn text_sections(text: &str) -> Vec<Value> {
     sections
 }
 
-/// The facts line of a WF's `vars`, when they are a non-empty object: one `key: value` element per
-/// key, 10 keys at most, each value on one line and cut at 200 characters.
+/// The facts line of a WF's `vars`, when they are an object with a fact: one `key: value` element
+/// per key, 10 keys at most, each value on one line and cut at 200 characters. An empty value
+/// (`crate::is_blank`: a WF's var the person's context had no field for is `""`) is no fact, and
+/// its key is left out.
 fn facts_line(vars: &Value) -> Option<Value> {
-    let vars = vars.as_object().filter(|vars| !vars.is_empty())?;
     let elements = vars
+        .as_object()?
         .iter()
+        .filter(|(_, value)| !crate::is_blank(value))
         .take(FACTS_MAX_KEYS)
         .map(|(key, value)| {
             let value = match value {
@@ -685,7 +676,7 @@ fn facts_line(vars: &Value) -> Option<Value> {
             ))
         })
         .collect::<Vec<_>>();
-    Some(json!({"type": "context", "elements": elements}))
+    (!elements.is_empty()).then(|| json!({"type": "context", "elements": elements}))
 }
 
 /// A name as a person reads it: `_` as a space, the first letter capitalized.
@@ -1236,13 +1227,16 @@ impl Interactions {
             }
         };
         if team_id != binding.workspace_id || channel_id != binding.conversation_id {
-            tracing::debug!(
+            // At info, as an event's (FINDINGS A-129): a Slack app splits its clicks between the
+            // sockets of the nodes that share it, as it splits its events.
+            tracing::info!(
                 node_name = %self.config.node_name,
                 configured_workspace_id = %binding.workspace_id,
                 configured_conversation_id = %binding.conversation_id,
                 click_workspace_id = %team_id,
                 click_conversation_id = %channel_id,
-                "dropping a click outside configured binding"
+                "dropping a click outside configured binding; if this node shares its Slack app \
+                 with another io.slack node, that node never gets it"
             );
             return None;
         }
@@ -1794,6 +1788,52 @@ mod tests {
         assert_eq!(facts_line(&json!({})), None);
         assert_eq!(facts_line(&json!(["a"])), None);
         assert_eq!(facts_line(&json!("a")), None);
+    }
+
+    /// An empty fact is no fact (FINDINGS A-130): a key whose value is empty, `""` as a WF's var
+    /// the person's context had no field for, a blank text, `null`, `[]` or `{}`, is left out, and
+    /// the 10 keys are the others. Vars with no fact make no line, and a post as without them.
+    #[test]
+    fn an_empty_fact_is_left_out_of_the_facts_line() {
+        let texts = |line: Option<Value>| {
+            line.expect("a line")["elements"]
+                .as_array()
+                .expect("elements")
+                .iter()
+                .map(|element| element["text"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        let vars = json!({
+            "blank": " \n ", "channel": "api", "list": [], "no": false, "none": null,
+            "object": {}, "person": "", "phone": "+54 11 5555-0000", "zero": 0
+        });
+        assert_eq!(
+            texts(facts_line(&vars)),
+            vec![
+                "channel: api",
+                "no: false",
+                "phone: +54 11 5555-0000",
+                "zero: 0"
+            ]
+        );
+
+        let mut vars = Map::new();
+        vars.insert("a_person".to_string(), json!(""));
+        for key in 0..12 {
+            vars.insert(format!("k{key:02}"), json!(key));
+        }
+        let line = texts(facts_line(&Value::Object(vars)));
+        assert_eq!(line.len(), FACTS_MAX_KEYS);
+        assert_eq!(line[0], "k00: 0");
+
+        assert_eq!(facts_line(&json!({"person": "", "channel": null})), None);
+        let post = WfPost::read(
+            Some(&wf_context(json!({"vars": {"person": ""}}))),
+            Some(CASE_THREAD),
+            true,
+        );
+        assert!(post.facts.is_none());
+        assert_eq!(post.blocks("Hola", None), None);
     }
 
     /// Without facts or a menu, a post is as before the WF's block: its payload's blocks as they

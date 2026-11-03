@@ -43,9 +43,10 @@ use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
     RelayPolicy,
 };
+use io_common::reliability::{dedup_key, DedupCache};
 use io_common::text_v1_blob::{
-    resolve_text_v1_for_outbound, InboundAttachmentInput, IoBlobContractError, IoBlobRuntimeConfig,
-    IoTextBlobConfig,
+    resolve_text_v1_text_only_for_outbound, InboundAttachmentInput, IoBlobContractError,
+    IoBlobRuntimeConfig, IoTextBlobConfig,
 };
 use not_taken::RelayedMessages;
 use regex::Regex;
@@ -638,6 +639,7 @@ fn default_slack_allowed_mimes() -> Vec<String> {
         "application/pdf".to_string(),
         "text/plain".to_string(),
         "text/markdown".to_string(),
+        "text/html".to_string(),
         "application/json".to_string(),
         "text/csv".to_string(),
         "application/msword".to_string(),
@@ -822,6 +824,11 @@ async fn resolve_slack_credentials_from_vault(
     }
 }
 
+/// The subtypes of a `message` that are a person's plain message all the same: a reply also sent
+/// to the channel ("Also send to #channel"), and a message that shares files, relayed with them.
+/// Any other subtype is no person's message: a bot's post, a join, an edit, a deletion...
+const PLAIN_MESSAGE_SUBTYPES: [&str; 2] = ["thread_broadcast", "file_share"];
+
 /// Why an inbound Slack event is not relayed to the mesh, or `Ok(())` to relay it.
 ///
 /// Pure on purpose: the anti-echo guards are the part that cannot be wrong, and inline in the
@@ -834,8 +841,9 @@ fn classify_slack_inbound(
     match event_type {
         "app_mention" => Ok(()),
         "message" => {
-            if event.get("subtype").and_then(|v| v.as_str()).is_some() {
-                // bot_message, channel_join, message_changed, message_deleted, thread_broadcast...
+            let subtype = event.get("subtype").and_then(|v| v.as_str());
+            if subtype.is_some_and(|subtype| !PLAIN_MESSAGE_SUBTYPES.contains(&subtype)) {
+                // bot_message, channel_join, message_changed, message_deleted...
                 return Err("not a plain user message (has a subtype)");
             }
             if event.get("bot_id").is_some() {
@@ -1805,6 +1813,12 @@ async fn run_slack_event_worker(
     sender: NodeSender,
     mention_re: Regex,
 ) {
+    // The messages taken lately, by their channel and `ts` (`message_seen`), for as long and as
+    // many as the inbound processor keeps their events' ids.
+    let mut seen_messages = DedupCache::new(
+        Duration::from_millis(config.dedup_ttl_ms),
+        config.dedup_max_entries,
+    );
     while let Some(payload) = events.recv().await {
         // Parse Slack event callback payload (only what we need).
         let payload_type = payload.get("type").and_then(|v| v.as_str());
@@ -1838,13 +1852,16 @@ async fn run_slack_event_worker(
             None => continue,
         };
         if team_id != binding.workspace_id || channel != binding.conversation_id {
-            tracing::debug!(
+            // At info: two nodes on one Slack app split its events between their sockets, and each
+            // drops the other's share here (FINDINGS A-129). Each node needs an app of its own.
+            tracing::info!(
                 node_name = %config.node_name,
                 configured_workspace_id = %binding.workspace_id,
                 configured_conversation_id = %binding.conversation_id,
                 event_workspace_id = %team_id,
                 event_conversation_id = %channel,
-                "dropping inbound Slack event outside configured binding"
+                "dropping inbound Slack event outside configured binding; if this node shares its \
+                 Slack app with another io.slack node, that node never gets it"
             );
             continue;
         }
@@ -1884,7 +1901,9 @@ async fn run_slack_event_worker(
         // and whatever it answers gets posted again — an echo loop inside a customer's Slack.
         // Three independent guards, because one bad frame is a live incident:
         //   * `subtype` present  -> not a plain human message (bot_message, joins, edits,
-        //                           deletions, thread broadcasts...).
+        //                           deletions...), but for a reply also sent to the channel
+        //                           and a file share (`PLAIN_MESSAGE_SUBTYPES`), which the
+        //                           other two still check.
         //   * `bot_id` present   -> posted by some bot, ours included.
         //   * author == us       -> the airtight one; see `bot_user_id`.
         // The third FAILS CLOSED: if we cannot establish who we are, we do not relay.
@@ -1910,6 +1929,15 @@ async fn run_slack_event_worker(
             Some(v) => v.to_string(),
             None => continue,
         };
+        if message_seen(&mut seen_messages, &channel, &event) {
+            tracing::debug!(
+                node_name = %config.node_name,
+                event_type = %event_type,
+                message_id = %message_id,
+                "dropping inbound Slack event: its message came already"
+            );
+            continue;
+        }
         // A blank thread_ts is the channel's top level, like a missing one.
         let thread_ts = event
             .get("thread_ts")
@@ -2073,6 +2101,23 @@ async fn run_slack_event_worker(
         dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound", &relayed).await;
     }
     tracing::warn!("the inbound event queue closed; the event worker stops");
+}
+
+/// Whether an event's message came already, as another event: Slack may deliver one message that
+/// mentions the bot as an `app_mention` and as a `message`, each with an `event_id` of its own,
+/// which the inbound processor's dedup by event id lets through (FINDINGS A-130). By the message's
+/// channel and `ts`, within `seen`'s window and bound; a new one is marked. An event with no `ts`
+/// is never taken for another's, and its event id still deduplicates it.
+fn message_seen(seen: &mut DedupCache, channel: &str, event: &Value) -> bool {
+    let Some(ts) = event
+        .get("ts")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|ts| !ts.is_empty())
+    else {
+        return false;
+    };
+    seen.is_duplicate_and_mark(&dedup_key("slack", channel, ts))
 }
 
 fn build_slack_inbound_payload_from_parts(
@@ -2782,213 +2827,390 @@ async fn run_outbound_loop(
                 continue;
             }
         };
-        // Where in the bound channel the message goes is the thread records' call: its thread id's
-        // place when a person opened it; when the node opened its places, the thread of its post
-        // for a message that continues or ends the post's subject (its mark, `same` or `end`), else
-        // a new post at the top level, since each of its posts serves one message; else its
-        // reply_target when that is this channel; else a new post at the top level, recorded.
-        // Another channel's reply_target is never read: an agent's answer carries the one of the
-        // message it answers, which can be another node's.
-        let reply_target = msg
-            .meta
-            .context
-            .as_ref()
-            .and_then(extract_slack_post_target);
-        // The WF's block: the message's mark, the facts under its text and a menu for people, read
-        // only from a WF node (see slack_menu).
-        let wf_post = WfPost::of_message(&msg, thread_records.is_some());
-        // A message that ends its subject with nothing to post (no text, no blocks, no files) only
-        // closes it: it posts nothing, and no fallback (docs/wf-orchestration-v1.md §5.4.2).
-        if wf_post.only_closes(&msg.payload) {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                "an end mark with nothing to post: the subject only closes"
-            );
-            close_subject_menu(
-                &slack,
-                thread_records.as_deref(),
-                msg.meta.thread_id.as_deref(),
-                &binding.conversation_id,
-            )
-            .await;
-            continue;
-        }
-        // The span puts the message's trace_id on the resolution's log lines.
-        let mut thread = tracing::debug_span!("slack_outbound", trace_id = %msg.routing.trace_id)
-            .in_scope(|| {
-                OutboundThread::resolve(
-                    thread_records.as_deref(),
-                    &binding.workspace_id,
-                    &binding.conversation_id,
-                    msg.meta.thread_id.as_deref(),
-                    reply_target.as_ref(),
-                    wf_post.subject,
-                    now_epoch_ms(),
-                )
-            });
-
-        let mut sent_any = false;
-        match resolve_text_v1_for_outbound(
+        post_outbound(
+            &slack,
             blob_toolkit.as_ref(),
             &blob_payload_cfg,
-            &msg.payload,
-            true,
+            config.blob_runtime.resolve_retry,
+            thread_records.as_deref(),
+            &binding,
+            &msg,
         )
-        .await
-        {
-            Ok(resolved) => {
-                // M4: a Block Kit message legitimately carries its content in `blocks` with an empty
-                // top-level `text` (text is only the notification fallback). Post when EITHER is
-                // present, else a blocks-only reply was silently dropped into the "sin contenido"
-                // fallback below. The WF's facts and menu make the blocks (see slack_menu).
-                let blocks = wf_post.blocks(&resolved.text, msg.payload.get("blocks"));
-                let has_text = !resolved.text.trim().is_empty();
-                let has_blocks = blocks
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .is_some_and(|arr| !arr.is_empty());
-                if has_text || has_blocks {
-                    tracing::debug!(
-                        slack_channel = binding.conversation_id,
-                        slack_thread_ts = thread.thread_ts().unwrap_or(""),
-                        text_len = resolved.text.len(),
-                        has_blocks,
-                        text_preview = %truncate(&resolved.text, 120),
-                        "sending slack message"
-                    );
-                    let post_thread_ts = thread.thread_ts().map(str::to_string);
-                    let posted = slack
-                        .post_message(
-                            &binding.conversation_id,
-                            &resolved.text,
-                            thread.thread_ts(),
-                            blocks.clone(),
-                        )
-                        .await;
-                    match posted {
-                        Ok(ts) => {
-                            sent_any = true;
-                            thread.posted(ts.as_deref(), now_epoch_ms());
-                            tracing::debug!("slack message sent");
-                            if let (Some(ts), Some(blocks)) = (ts.as_deref(), blocks.as_ref()) {
-                                wf_post
-                                    .menu_posted(
-                                        &slack,
-                                        thread_records.as_deref(),
-                                        &binding.conversation_id,
-                                        ts,
-                                        post_thread_ts.as_deref(),
-                                        blocks,
-                                    )
-                                    .await;
-                            }
-                        }
-                        Err(e) => tracing::warn!(error=?e, "failed to send slack message"),
-                    }
-                }
+        .await;
+    }
+}
 
-                for attachment in resolved.attachments {
-                    let filename = if attachment.blob_ref.filename_original.trim().is_empty() {
-                        attachment.blob_ref.blob_name.as_str()
-                    } else {
-                        attachment.blob_ref.filename_original.as_str()
-                    };
-                    match blob_toolkit.read_blob_async(&attachment.blob_ref).await {
-                        Ok(bytes) => {
-                            let uploaded = slack
-                                .upload_file(
-                                    &binding.conversation_id,
-                                    thread.thread_ts(),
-                                    filename,
-                                    &attachment.blob_ref.mime,
-                                    bytes,
-                                )
-                                .await;
-                            match uploaded {
-                                Ok(()) => {
-                                    sent_any = true;
-                                    thread.posted(None, now_epoch_ms());
-                                    tracing::debug!(
-                                        blob_name = %attachment.blob_ref.blob_name,
-                                        filename = %filename,
-                                        "slack attachment uploaded"
-                                    );
-                                }
-                                Err(error) => tracing::warn!(
-                                    error = ?error,
-                                    blob_name = %attachment.blob_ref.blob_name,
-                                    "failed to upload attachment to Slack"
-                                ),
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                blob_name = %attachment.blob_ref.blob_name,
-                                "failed to read the attachment blob"
-                            );
-                        }
-                    }
-                }
-            }
-            Err(err) => {
+/// Posts an outbound message in the bound channel: its text, with the WF's facts and menu
+/// (slack_menu), then its files.
+///
+/// - A message that ends its subject with nothing to post only closes the subject's menu.
+/// - A message with nothing to post, no text, no blocks and no files, posts nothing, with a log
+///   line: no fallback.
+/// - A message with only files, on a new place, posts a first text that names them, whose `ts`
+///   the records keep for its thread id, and the files go under it: an upload answers no `ts`.
+/// - A file the node cannot send is left out alone (`outbound_content`): the text and the other
+///   files go, and the text names it. One Slack refuses once the text went is named by a post
+///   after the files (FINDINGS A-108).
+async fn post_outbound(
+    slack: &SlackClients,
+    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
+    blob_payload_cfg: &IoTextBlobConfig,
+    resolve_retry: fluxbee_sdk::blob::ResolveRetryConfig,
+    thread_records: Option<&SlackThreadRecords>,
+    binding: &SlackBindingConfig,
+    msg: &WireMessage,
+) {
+    let channel = binding.conversation_id.as_str();
+    // Where in the bound channel the message goes is the thread records' call: its thread id's
+    // place when a person opened it; when the node opened its places, the thread of its post
+    // for a message that continues or ends the post's subject (its mark, `same` or `end`), else
+    // a new post at the top level, since each of its posts serves one message; else its
+    // reply_target when that is this channel; else a new post at the top level, recorded.
+    // Another channel's reply_target is never read: an agent's answer carries the one of the
+    // message it answers, which can be another node's.
+    let reply_target = msg
+        .meta
+        .context
+        .as_ref()
+        .and_then(extract_slack_post_target);
+    // The WF's block: the message's mark, the facts under its text and a menu for people, read
+    // only from a WF node (see slack_menu).
+    let wf_post = WfPost::of_message(msg, thread_records.is_some());
+    // A message that ends its subject with nothing to post (no text, no blocks, no files) only
+    // closes it: it posts nothing, and no fallback (docs/wf-orchestration-v1.md §5.4.2).
+    if wf_post.only_closes(&msg.payload) {
+        tracing::debug!(
+            trace_id = %msg.routing.trace_id,
+            "an end mark with nothing to post: the subject only closes"
+        );
+        close_subject_menu(
+            slack,
+            thread_records,
+            msg.meta.thread_id.as_deref(),
+            channel,
+        )
+        .await;
+        return;
+    }
+    // The span puts the message's trace_id on the resolution's log lines.
+    let mut thread = tracing::debug_span!("slack_outbound", trace_id = %msg.routing.trace_id)
+        .in_scope(|| {
+            OutboundThread::resolve(
+                thread_records,
+                &binding.workspace_id,
+                channel,
+                msg.meta.thread_id.as_deref(),
+                reply_target.as_ref(),
+                wf_post.subject,
+                now_epoch_ms(),
+            )
+        });
+
+    // A payload with nothing in it has nothing to resolve; a WF's menu may still make a post.
+    let content = if payload_has_nothing(&msg.payload) {
+        Ok(OutboundContent::default())
+    } else {
+        outbound_content(blob_toolkit, blob_payload_cfg, resolve_retry, &msg.payload).await
+    };
+    match content {
+        Ok(content) => {
+            for (filename, why) in &content.left_out {
                 tracing::warn!(
-                    code = err.canonical_code(),
-                    error = %err,
                     trace_id = %msg.routing.trace_id,
-                    "failed to resolve outbound text/v1 payload"
+                    filename = %filename,
+                    code = why.canonical_code(),
+                    error = %why,
+                    "an outbound file is left out: the text names it, and the rest goes"
                 );
-                let fallback = format!(
-                    "Error ({}) al procesar contenido/adjuntos.",
-                    err.canonical_code()
+            }
+            let own_blocks = msg.payload.get("blocks");
+            let mut text = content.text;
+            // Only files, on a new place: a first post names them, which records the place, and
+            // they go under it. An upload answers no `ts`, so each file would be a post of its own
+            // at the top level, and the thread id's next message would open yet another.
+            if text.trim().is_empty()
+                && !content.files.is_empty()
+                && thread.opens_a_place()
+                && !has_blocks(wf_post.blocks("", own_blocks).as_ref())
+            {
+                let names = content.files.iter().map(|file| file.name.clone());
+                text = files_line(&names.collect::<Vec<_>>());
+            }
+            if !content.left_out.is_empty() {
+                let names = content
+                    .left_out
+                    .iter()
+                    .map(|(filename, _)| filename.clone());
+                text = with_line(text, &not_sent_line(&names.collect::<Vec<_>>()));
+            }
+            // M4: a Block Kit message legitimately carries its content in `blocks` with an empty
+            // top-level `text` (text is only the notification fallback). Post when EITHER is
+            // present. The WF's facts and menu make the blocks (see slack_menu).
+            let blocks = wf_post.blocks(&text, own_blocks);
+            let has_text = !text.trim().is_empty();
+            let has_blocks = has_blocks(blocks.as_ref());
+            if !has_text && !has_blocks && content.files.is_empty() {
+                tracing::info!(
+                    trace_id = %msg.routing.trace_id,
+                    "an outbound message with no text, no blocks and no files: nothing is posted"
                 );
+            }
+            if has_text || has_blocks {
+                tracing::debug!(
+                    slack_channel = channel,
+                    slack_thread_ts = thread.thread_ts().unwrap_or(""),
+                    text_len = text.len(),
+                    has_blocks,
+                    text_preview = %truncate(&text, 120),
+                    "sending slack message"
+                );
+                let post_thread_ts = thread.thread_ts().map(str::to_string);
                 let posted = slack
-                    .post_message(
-                        &binding.conversation_id,
-                        &fallback,
-                        thread.thread_ts(),
-                        None,
-                    )
+                    .post_message(channel, &text, thread.thread_ts(), blocks.clone())
                     .await;
                 match posted {
                     Ok(ts) => {
-                        sent_any = true;
                         thread.posted(ts.as_deref(), now_epoch_ms());
+                        tracing::debug!("slack message sent");
+                        if let (Some(ts), Some(blocks)) = (ts.as_deref(), blocks.as_ref()) {
+                            wf_post
+                                .menu_posted(
+                                    slack,
+                                    thread_records,
+                                    channel,
+                                    ts,
+                                    post_thread_ts.as_deref(),
+                                    blocks,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error=?e, "failed to send slack message"),
+                }
+            }
+
+            let mut refused = Vec::new();
+            for file in content.files {
+                let uploaded = slack
+                    .upload_file(
+                        channel,
+                        thread.thread_ts(),
+                        &file.name,
+                        &file.mime,
+                        file.bytes,
+                    )
+                    .await;
+                match uploaded {
+                    Ok(()) => {
+                        thread.posted(None, now_epoch_ms());
+                        tracing::debug!(
+                            blob_name = %file.blob_name,
+                            filename = %file.name,
+                            "slack attachment uploaded"
+                        );
                     }
                     Err(error) => {
-                        tracing::warn!(error=?error, "failed to send outbound fallback message")
+                        tracing::warn!(
+                            error = ?error,
+                            blob_name = %file.blob_name,
+                            "failed to upload attachment to Slack; a post after the files names it"
+                        );
+                        refused.push(file.name);
                     }
                 }
             }
+            // The text went before Slack refused a file: a post of its own names it.
+            if !refused.is_empty() {
+                let posted = slack
+                    .post_message(channel, &not_sent_line(&refused), thread.thread_ts(), None)
+                    .await;
+                match posted {
+                    Ok(ts) => thread.posted(ts.as_deref(), now_epoch_ms()),
+                    Err(error) => tracing::warn!(
+                        error = ?error,
+                        "failed to post the names of the files Slack refused"
+                    ),
+                }
+            }
         }
-
-        if !sent_any {
-            let fallback = "No pude entregar el mensaje en Slack (sin contenido util).";
+        Err(err) => {
+            tracing::warn!(
+                code = err.canonical_code(),
+                error = %err,
+                trace_id = %msg.routing.trace_id,
+                "failed to resolve outbound text/v1 payload"
+            );
+            let fallback = format!(
+                "Error ({}) al procesar contenido/adjuntos.",
+                err.canonical_code()
+            );
             let posted = slack
-                .post_message(&binding.conversation_id, fallback, thread.thread_ts(), None)
+                .post_message(channel, &fallback, thread.thread_ts(), None)
                 .await;
             match posted {
                 Ok(ts) => thread.posted(ts.as_deref(), now_epoch_ms()),
                 Err(error) => {
-                    tracing::warn!(error=?error, "failed to send final outbound fallback")
+                    tracing::warn!(error=?error, "failed to send outbound fallback message")
                 }
             }
         }
+    }
 
-        // A new post forgets the node's older posts on its thread id, and their open menus close
-        // with them (see thread_records), after the message's posts.
-        close_forgotten_menus(&slack, thread.take_forgotten_menus()).await;
+    // A new post forgets the node's older posts on its thread id, and their open menus close
+    // with them (see thread_records), after the message's posts.
+    close_forgotten_menus(slack, thread.take_forgotten_menus()).await;
 
-        // `end` ends the subject: its open menu closes, after the message's posts.
-        if wf_post.subject == Subject::End {
-            close_subject_menu(
-                &slack,
-                thread_records.as_deref(),
-                msg.meta.thread_id.as_deref(),
-                &binding.conversation_id,
-            )
-            .await;
+    // `end` ends the subject: its open menu closes, after the message's posts.
+    if wf_post.subject == Subject::End {
+        close_subject_menu(
+            slack,
+            thread_records,
+            msg.meta.thread_id.as_deref(),
+            channel,
+        )
+        .await;
+    }
+}
+
+/// Whether a value says nothing: `null`, a blank text, an empty list or an empty object.
+pub(crate) fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Whether an outbound payload has nothing to post: no text, no `content_ref`, no files and no
+/// blocks, or no payload at all.
+pub(crate) fn payload_has_nothing(payload: &Value) -> bool {
+    payload.is_null()
+        || (payload.is_object()
+            && ["content", "content_ref", "attachments", "blocks"]
+                .into_iter()
+                .all(|key| payload.get(key).is_none_or(is_blank)))
+}
+
+/// Whether a post's blocks are any.
+fn has_blocks(blocks: Option<&Value>) -> bool {
+    blocks
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| !blocks.is_empty())
+}
+
+/// What an outbound message gives the node to post: its text, the files it can send, read from
+/// their blobs, and the names of those it cannot, each with why.
+#[derive(Default)]
+struct OutboundContent {
+    text: String,
+    files: Vec<OutboundFile>,
+    left_out: Vec<(String, IoBlobContractError)>,
+}
+
+/// A file of an outbound message, read: its name, its type, its blob and its bytes.
+struct OutboundFile {
+    name: String,
+    mime: String,
+    blob_name: String,
+    bytes: Vec<u8>,
+}
+
+/// The content of an outbound `text/v1` payload. Its text, inline or its `content_ref`'s, fails the
+/// whole when it does not resolve, as an invalid payload does. Its files are each read from their
+/// blob, waiting `retry` for one that has not arrived; one the node cannot send is left out alone:
+/// past the first `max_attachments`, of a type outside the allowed list, past the size of a file
+/// or of them all, or a blob that is not there or does not read. The text and the other files
+/// still go (FINDINGS A-108).
+async fn outbound_content(
+    blob_toolkit: &fluxbee_sdk::blob::BlobToolkit,
+    cfg: &IoTextBlobConfig,
+    retry: fluxbee_sdk::blob::ResolveRetryConfig,
+    payload: &Value,
+) -> Result<OutboundContent, IoBlobContractError> {
+    let text = resolve_text_v1_text_only_for_outbound(blob_toolkit, payload, true)
+        .await?
+        .text;
+    let attachments = fluxbee_sdk::payload::TextV1Payload::from_value(payload)?.attachments;
+    let allowed_mimes = cfg
+        .allowed_mimes
+        .iter()
+        .map(|mime| normalize_mime(mime))
+        .collect::<HashSet<_>>();
+    let count = attachments.len();
+    let mut content = OutboundContent {
+        text,
+        ..OutboundContent::default()
+    };
+    let mut total_size: u64 = 0;
+    for (index, blob_ref) in attachments.into_iter().enumerate() {
+        let name = if blob_ref.filename_original.trim().is_empty() {
+            blob_ref.blob_name.clone()
+        } else {
+            blob_ref.filename_original.clone()
+        };
+        let refused = if index >= cfg.max_attachments {
+            Some(IoBlobContractError::TooManyAttachments {
+                actual: count,
+                max: cfg.max_attachments,
+            })
+        } else if !allowed_mimes.contains(&normalize_mime(&blob_ref.mime)) {
+            Some(IoBlobContractError::UnsupportedMime {
+                mime: blob_ref.mime.clone(),
+            })
+        } else if blob_ref.size > cfg.max_attachment_bytes {
+            Some(IoBlobContractError::BlobTooLarge {
+                actual: blob_ref.size,
+                max: cfg.max_attachment_bytes,
+            })
+        } else if total_size.saturating_add(blob_ref.size) > cfg.max_total_attachment_bytes {
+            Some(IoBlobContractError::BlobTooLarge {
+                actual: total_size.saturating_add(blob_ref.size),
+                max: cfg.max_total_attachment_bytes,
+            })
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            content.left_out.push((name, why));
+            continue;
         }
+        match blob_toolkit.read_blob_with_retry(&blob_ref, retry).await {
+            Ok(bytes) => {
+                total_size = total_size.saturating_add(blob_ref.size);
+                content.files.push(OutboundFile {
+                    name,
+                    mime: blob_ref.mime,
+                    blob_name: blob_ref.blob_name,
+                    bytes,
+                });
+            }
+            Err(error) => content
+                .left_out
+                .push((name, IoBlobContractError::Blob(error))),
+        }
+    }
+    Ok(content)
+}
+
+/// The first post of a message with only files, on a new place: their names.
+fn files_line(names: &[String]) -> String {
+    let label = if names.len() == 1 { "File" } else { "Files" };
+    format!("{label}: {}", names.join(", "))
+}
+
+/// The line that names the files of a message that do not go.
+fn not_sent_line(names: &[String]) -> String {
+    format!("Not sent: {}", names.join(", "))
+}
+
+/// `text`, then `line` after a blank line; `line` alone under a blank text.
+fn with_line(text: String, line: &str) -> String {
+    if text.trim().is_empty() {
+        line.to_string()
+    } else {
+        format!("{}\n\n{line}", text.trim_end())
     }
 }
 
@@ -3517,8 +3739,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// A fake Slack Web API, for the tests: an HTTP server on the loopback that answers each method
-/// with `{"ok": true}`, or the answer its test gives, and keeps each call, in the order they came.
-/// A client of it (`FakeWebApi::client`) has credentials, and no call of it reaches Slack.
+/// with `{"ok": true}`, or the answers its test gives, and keeps each call, in the order they came.
+/// A client of it (`FakeWebApi::client`) has credentials, and no call of it reaches Slack. A file's
+/// bytes go to it too: `files.getUploadURLExternal` answers its own URL `upload`, unless the test
+/// gives that method's answers.
 #[cfg(test)]
 mod fake_web_api {
     use super::SlackClients;
@@ -3529,8 +3753,10 @@ mod fake_web_api {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    /// The calls so far: each method, and its JSON body.
+    /// The calls so far: each method, and its JSON body (`null` for a body that is no JSON).
     type Calls = Arc<Mutex<Vec<(String, Value)>>>;
+    /// The answers of each method a test gives, in the order its calls get them.
+    type Answers = Arc<HashMap<String, Vec<Value>>>;
 
     pub(crate) struct FakeWebApi {
         base: String,
@@ -3538,18 +3764,31 @@ mod fake_web_api {
     }
 
     impl FakeWebApi {
-        /// Starts the server: `answers` gives the answer of a method, in place of `{"ok": true}`.
+        /// Starts the server: `answers` gives the answer of a method, in place of `{"ok": true}`. A
+        /// method given more than once answers its calls in that order, and its last answer from
+        /// then on.
         pub(crate) async fn start(answers: &[(&str, Value)]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("a loopback port");
             let base = format!("http://{}/api", listener.local_addr().expect("its address"));
-            let answers: Arc<HashMap<String, Value>> = Arc::new(
-                answers
-                    .iter()
-                    .map(|(api, answer)| (api.to_string(), answer.clone()))
-                    .collect(),
-            );
+            let mut by_api = HashMap::<String, Vec<Value>>::new();
+            for (api, answer) in answers {
+                by_api
+                    .entry(api.to_string())
+                    .or_default()
+                    .push(answer.clone());
+            }
+            by_api
+                .entry("files.getUploadURLExternal".to_string())
+                .or_insert_with(|| {
+                    vec![json!({
+                        "ok": true,
+                        "upload_url": format!("{base}/upload"),
+                        "file_id": "F0FILE"
+                    })]
+                });
+            let answers: Answers = Arc::new(by_api);
             let calls = Calls::default();
             let kept = calls.clone();
             tokio::spawn(async move {
@@ -3572,6 +3811,12 @@ mod fake_web_api {
                 .reload_credentials("test-app-token".to_string(), "test-bot-token".to_string())
                 .await;
             slack
+        }
+
+        /// The URL of `path` on this server, which answers it as the method its last segment
+        /// names: a file's download, say.
+        pub(crate) fn url(&self, path: &str) -> String {
+            format!("{}/{path}", self.base)
         }
 
         /// The calls so far, each method and its body, in the order they came.
@@ -3603,7 +3848,7 @@ mod fake_web_api {
     }
 
     /// Reads one request, keeps its call, answers it, and closes the connection.
-    async fn answer(mut stream: TcpStream, answers: Arc<HashMap<String, Value>>, calls: Calls) {
+    async fn answer(mut stream: TcpStream, answers: Answers, calls: Calls) {
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut body_at = None;
@@ -3635,9 +3880,15 @@ mod fake_web_api {
             .unwrap_or_default()
             .to_string();
         let body = serde_json::from_slice(&request[body_at..]).unwrap_or(Value::Null);
-        calls.lock().expect("calls").push((api.clone(), body));
+        let earlier = {
+            let mut calls = calls.lock().expect("calls");
+            let earlier = calls.iter().filter(|(called, _)| *called == api).count();
+            calls.push((api.clone(), body));
+            earlier
+        };
         let answer = answers
             .get(&api)
+            .and_then(|given| given.get(earlier).or(given.last()))
             .cloned()
             .unwrap_or_else(|| json!({"ok": true}))
             .to_string();
@@ -3654,14 +3905,256 @@ mod fake_web_api {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_slack_inbound_payload_from_parts, build_system_reply, classify_slack_inbound,
-        decode_slack_text, default_slack_allowed_mimes, extract_runtime_relay_config,
-        extract_slack_tokens_from_vault_value, is_control_plane_msg_type, parse_retry_after,
-        post_ephemeral_body, post_message_body, slack_relay_policy_from_config, slack_vault_key,
-        vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState, SocketEnvelope,
-        ENVELOPE_EVENTS_API, ENVELOPE_INTERACTIVE,
+        build_io_slack_rpc_profile, build_slack_inbound_payload_from_parts, build_system_reply,
+        classify_slack_inbound, decode_slack_text, default_slack_allowed_mimes,
+        extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
+        is_control_plane_msg_type, message_seen, now_epoch_ms, outbound_content, parse_retry_after,
+        post_ephemeral_body, post_message_body, post_outbound, run_slack_event_worker,
+        slack_inbound_config, slack_relay_policy_from_config, slack_vault_key,
+        vault_change_is_slack, Config, SlackBindingConfig, SlackClients, SlackRelayConfig,
+        SlackRuntimeState, SocketEnvelope, ENVELOPE_EVENTS_API, ENVELOPE_INTERACTIVE,
     };
+    use crate::fake_web_api::FakeWebApi;
+    use crate::not_taken::RelayedMessages;
+    use crate::thread_records::{map_inbound_thread, SlackThreadRecords};
+    use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
+    use fluxbee_sdk::RouterDispatcherTestHarness;
+    use io_common::identity::{DisabledIdentityProvisioner, MockIdentityResolver};
+    use io_common::inbound::InboundProcessor;
+    use io_common::io_context::{slack_binding_id, slack_inbound_io_context};
+    use io_common::io_control_plane::IoControlPlaneState;
+    use io_common::provision::IdentityProvisionConfig;
+    use io_common::relay::{InMemoryRelayStore, RelayBuffer};
+    use io_common::reliability::DedupCache;
+    use io_common::router_message::{build_user_message, DEFAULT_TTL};
+    use io_common::text_v1_blob::{IoBlobRuntimeConfig, IoTextBlobConfig};
+    use regex::Regex;
+    use serde_json::Value;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex, RwLock};
+
+    const WORKSPACE: &str = "T0WORKSPACE";
+    const CHANNEL: &str = "C0SALES";
+    /// The sales io.slack node, and the WF it relays to (its `io.dst_node`).
+    const NODE: &str = "IO.slack.sales@motherbee";
+    const WF: &str = "WF.sales.invoice@motherbee";
+    /// An agent that answers through the node, as any sender that is no WF.
+    const AGENT: &str = "AI.sales@worker1";
+    /// The thread id of a conversation the node has no place for yet.
+    const CASE_THREAD: &str = "thread:sha256:ana-conversation";
+    /// The `ts` Slack answers for the node's posts.
+    const POST_TS: &str = "1793000000.000100";
+
+    /// A blob store in a directory of its own, removed with it.
+    struct BlobStore {
+        blobs: BlobToolkit,
+        root: PathBuf,
+    }
+
+    impl Drop for BlobStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn blob_store(label: &str) -> BlobStore {
+        let root = std::env::temp_dir().join(format!(
+            "io-slack-blobs-{label}-{}-{}",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let blobs = BlobToolkit::new(BlobConfig {
+            blob_root: root.clone(),
+            name_max_chars: fluxbee_sdk::blob::BLOB_NAME_MAX_CHARS,
+            max_blob_bytes: None,
+        })
+        .expect("blob store");
+        BlobStore { blobs, root }
+    }
+
+    impl BlobStore {
+        /// A file in the store, as a message's attachment refers to it.
+        fn put(&self, bytes: &[u8], name: &str, mime: &str) -> BlobRef {
+            let blob_ref = self.blobs.put_bytes(bytes, name, mime).expect("put");
+            self.blobs.promote(&blob_ref).expect("promote");
+            blob_ref
+        }
+
+        /// A file that never comes: its blob is staged, never promoted.
+        fn never_comes(&self, bytes: &[u8], name: &str, mime: &str) -> BlobRef {
+            self.blobs.put_bytes(bytes, name, mime).expect("put")
+        }
+    }
+
+    /// The limits of the node's files: Slack's types (`default_slack_allowed_mimes`).
+    fn slack_files() -> IoTextBlobConfig {
+        IoTextBlobConfig {
+            allowed_mimes: default_slack_allowed_mimes(),
+            ..IoTextBlobConfig::default()
+        }
+    }
+
+    /// How long a test waits for a blob that never comes.
+    fn short_wait() -> ResolveRetryConfig {
+        ResolveRetryConfig {
+            max_wait_ms: 50,
+            initial_delay_ms: 10,
+            backoff_factor: 2.0,
+        }
+    }
+
+    /// A message the node takes to post, from `from` (by its router's stamp), on `thread_id`.
+    fn outbound(from: &str, thread_id: &str, context: Value, payload: Value) -> WireMessage {
+        let mut msg = build_user_message(
+            "sender-uuid",
+            None,
+            DEFAULT_TTL,
+            "trace-out".to_string(),
+            None,
+            None,
+            context,
+            payload,
+        );
+        msg.routing.src_l2_name = Some(from.to_string());
+        msg.meta.thread_id = Some(thread_id.to_string());
+        msg
+    }
+
+    /// Posts `msg` as the node bound to `CHANNEL` does, with Slack's types for its files.
+    async fn post(
+        slack: &SlackClients,
+        store: &BlobStore,
+        records: Option<&SlackThreadRecords>,
+        msg: &WireMessage,
+    ) {
+        let binding = SlackBindingConfig {
+            workspace_id: WORKSPACE.to_string(),
+            conversation_id: CHANNEL.to_string(),
+        };
+        post_outbound(
+            slack,
+            &store.blobs,
+            &slack_files(),
+            short_wait(),
+            records,
+            &binding,
+            msg,
+        )
+        .await;
+    }
+
+    /// The node `NODE`, bound to `CHANNEL` of `WORKSPACE` with its own ICH ensured and `WF` as its
+    /// `io.dst_node`, as its event worker sees it.
+    fn node_config() -> Config {
+        Config {
+            workspace_id: None,
+            conversation_id: None,
+            node_name: NODE.to_string(),
+            island_id: "motherbee".to_string(),
+            node_version: "0.1".to_string(),
+            router_socket: PathBuf::new(),
+            uuid_persistence_dir: PathBuf::new(),
+            config_dir: PathBuf::new(),
+            dev_mode: false,
+            ttl: DEFAULT_TTL,
+            dedup_ttl_ms: 60_000,
+            dedup_max_entries: 100,
+            dst_node: None,
+            identity_target: "SY.identity@motherbee".to_string(),
+            identity_timeout_ms: 1_000,
+            relay: SlackRelayConfig::default(),
+            blob_runtime: IoBlobRuntimeConfig::default(),
+        }
+    }
+
+    /// Runs the event worker of `node_config` on `events`, each the payload of an `events_api`
+    /// envelope, until it took them all, with `api` as Slack and `store` for the files. What it
+    /// relayed is at the router that comes back.
+    async fn run_events(
+        api: &FakeWebApi,
+        store: &BlobStore,
+        events: Vec<Value>,
+    ) -> RouterDispatcherTestHarness {
+        let (dispatcher, router) =
+            RouterDispatcherTestHarness::new(NODE, build_io_slack_rpc_profile().expect("profile"));
+        let config = node_config();
+        let mut inbound = InboundProcessor::new(
+            dispatcher.sender_snapshot().uuid().to_string(),
+            slack_inbound_config(&config, Some("tnt:sales".to_string())),
+        );
+        inbound.set_dst_node(Some(WF.to_string()));
+        let relay = RelayBuffer::new(
+            slack_relay_policy_from_config(&SlackRelayConfig::default()).expect("policy"),
+            InMemoryRelayStore::new(),
+        )
+        .expect("relay");
+        let control_plane = IoControlPlaneState {
+            effective_config: Some(json!({"io": {
+                "workspace_id": WORKSPACE,
+                "conversation_id": CHANNEL,
+                "dst_node": WF
+            }})),
+            ..IoControlPlaneState::default()
+        };
+        let (queue, queued) = mpsc::channel(events.len().max(1));
+        for event in events {
+            queue.try_send(event).expect("queued");
+        }
+        drop(queue);
+        run_slack_event_worker(
+            queued,
+            config,
+            dispatcher.clone(),
+            IdentityProvisionConfig {
+                target: "SY.identity@motherbee".to_string(),
+                timeout: Duration::from_secs(1),
+            },
+            Arc::new(RwLock::new(control_plane)),
+            Some("ilk:io-slack-sales".to_string()),
+            Some("tnt:sales".to_string()),
+            Arc::new(api.client().await),
+            Arc::new(MockIdentityResolver::new()),
+            Arc::new(DisabledIdentityProvisioner::new()),
+            Arc::new(Mutex::new(inbound)),
+            Arc::new(Mutex::new(relay)),
+            Arc::new(Mutex::new(HashSet::from([slack_binding_id(
+                WORKSPACE, CHANNEL,
+            )]))),
+            Arc::new(store.blobs.clone()),
+            slack_files(),
+            Some(Arc::new(SlackThreadRecords::in_memory().expect("records"))),
+            Arc::new(RelayedMessages::new()),
+            dispatcher.sender_snapshot(),
+            Regex::new(r"^<@[^>]+>\s*").expect("mention"),
+        )
+        .await;
+        router
+    }
+
+    /// An `events_api` envelope's payload: `event`, in `WORKSPACE`, as the event `event_id`.
+    fn event_callback(event_id: &str, event: Value) -> Value {
+        json!({
+            "type": "event_callback",
+            "team_id": WORKSPACE,
+            "event_id": event_id,
+            "event": event
+        })
+    }
+
+    /// What the router got, in the order it came.
+    async fn relayed(router: &mut RouterDispatcherTestHarness) -> Vec<WireMessage> {
+        let mut messages = Vec::new();
+        while let Some(msg) = router
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+        {
+            messages.push(msg);
+        }
+        messages
+    }
 
     #[test]
     fn vault_change_is_slack_matches_only_the_slack_resource() {
@@ -4155,5 +4648,452 @@ mod tests {
         let bare: SocketEnvelope =
             serde_json::from_value(json!({"envelope_id": "e3"})).expect("envelope");
         assert_eq!(bare.kind, "");
+    }
+
+    /// A reply also sent to the channel (`thread_broadcast`) and a message that shares files
+    /// (`file_share`) are a person's plain messages, with the checks a plain message gets: the
+    /// node's own, by its `bot_id` or by its author, is never relayed, and none is while the node
+    /// cannot tell its own. Every other subtype stays dropped.
+    #[test]
+    fn a_reply_sent_to_the_channel_and_a_file_share_are_plain_messages() {
+        let me = "U0BOT";
+        for subtype in ["thread_broadcast", "file_share"] {
+            let person = json!({"type": "message", "subtype": subtype, "user": "U0ANA"});
+            assert_eq!(
+                classify_slack_inbound(&person, "message", Some(me)),
+                Ok(()),
+                "{subtype}"
+            );
+            assert!(
+                classify_slack_inbound(&person, "message", None).is_err(),
+                "{subtype}"
+            );
+            let own = json!({"type": "message", "subtype": subtype, "user": me});
+            assert!(
+                classify_slack_inbound(&own, "message", Some(me)).is_err(),
+                "{subtype}"
+            );
+            let a_bots = json!({"type": "message", "subtype": subtype, "user": "U0ANA",
+                                "bot_id": "B0BOT"});
+            assert!(
+                classify_slack_inbound(&a_bots, "message", Some(me)).is_err(),
+                "{subtype}"
+            );
+        }
+        for subtype in [
+            "bot_message",
+            "message_changed",
+            "message_deleted",
+            "channel_join",
+        ] {
+            let event = json!({"type": "message", "subtype": subtype, "user": "U0ANA"});
+            assert!(
+                classify_slack_inbound(&event, "message", Some(me)).is_err(),
+                "{subtype}"
+            );
+        }
+    }
+
+    /// One message that mentions the bot may come as an `app_mention` and as a `message`, each with
+    /// an event id of its own: the second is its message again, by its channel and `ts`. Another
+    /// `ts`, or the same `ts` in another channel, is another message. The memory is bounded: past
+    /// its entries the oldest go. An event with no `ts` is never taken for another's.
+    #[test]
+    fn a_message_that_comes_as_two_events_is_seen_once() {
+        let mut seen = DedupCache::new(Duration::from_secs(60), 2);
+        let mention = json!({"type": "app_mention", "user": "U0ANA", "text": "<@U0BOT> hola",
+                             "ts": POST_TS});
+        let message = json!({"type": "message", "user": "U0ANA", "text": "<@U0BOT> hola",
+                             "ts": POST_TS});
+        assert!(!message_seen(&mut seen, CHANNEL, &mention));
+        assert!(message_seen(&mut seen, CHANNEL, &message));
+        assert!(!message_seen(&mut seen, "C0OTHER", &message));
+        let next = json!({"type": "message", "user": "U0ANA", "ts": "1793000000.000200"});
+        assert!(!message_seen(&mut seen, CHANNEL, &next));
+        assert!(
+            !message_seen(&mut seen, CHANNEL, &mention),
+            "two entries at most: the first went"
+        );
+        for no_ts in [
+            json!({"type": "message"}),
+            json!({"type": "message", "ts": " "}),
+        ] {
+            assert!(!message_seen(&mut seen, CHANNEL, &no_ts));
+            assert!(!message_seen(&mut seen, CHANNEL, &no_ts));
+        }
+    }
+
+    /// A person's messages reach the mesh as the plain messages they are, once each (FINDINGS
+    /// A-130): a reply also sent to the channel, on its Slack thread's id; a message that shares a
+    /// file, with the file; and a message that mentions the bot, which Slack sends as an
+    /// `app_mention` and as a `message`. The node's own file shares, an edit and another channel's
+    /// message never do, and the node's own files are never downloaded.
+    #[tokio::test]
+    async fn a_persons_messages_reach_the_mesh_once_each_and_the_nodes_own_never() {
+        let api =
+            FakeWebApi::start(&[("auth.test", json!({"ok": true, "user_id": "U0BOT"}))]).await;
+        let store = blob_store("events");
+        let invoice = json!([{
+            "id": "F0INVOICE",
+            "name": "invoice.pdf",
+            "mimetype": "application/pdf",
+            "url_private_download": api.url("files/F0INVOICE")
+        }]);
+        let own_file = json!([{
+            "id": "F0OWN",
+            "name": "quote.pdf",
+            "mimetype": "application/pdf",
+            "url_private_download": api.url("files/F0OWN")
+        }]);
+        let in_channel = |event: Value| {
+            let mut event = event;
+            event["channel"] = json!(CHANNEL);
+            event
+        };
+        let mut router = run_events(
+            &api,
+            &store,
+            vec![
+                event_callback(
+                    "Ev01",
+                    in_channel(json!({"type": "message", "subtype": "thread_broadcast",
+                        "user": "U0ANA", "text": "For everyone too", "ts": "1793000000.000200",
+                        "thread_ts": POST_TS})),
+                ),
+                event_callback(
+                    "Ev02",
+                    in_channel(json!({"type": "message", "subtype": "file_share",
+                        "user": "U0ANA", "text": "The invoice", "ts": "1793000000.000300",
+                        "files": invoice})),
+                ),
+                event_callback(
+                    "Ev03",
+                    in_channel(json!({"type": "app_mention", "user": "U0ANA",
+                        "text": "<@U0BOT> hola", "ts": "1793000000.000400"})),
+                ),
+                event_callback(
+                    "Ev04",
+                    in_channel(json!({"type": "message", "user": "U0ANA",
+                        "text": "<@U0BOT> hola", "ts": "1793000000.000400"})),
+                ),
+                event_callback(
+                    "Ev05",
+                    in_channel(json!({"type": "message", "subtype": "file_share",
+                        "user": "U0BOT", "bot_id": "B0BOT", "text": "", "ts": "1793000000.000500",
+                        "files": own_file.clone()})),
+                ),
+                event_callback(
+                    "Ev06",
+                    in_channel(json!({"type": "message", "subtype": "file_share",
+                        "user": "U0BOT", "text": "", "ts": "1793000000.000600",
+                        "files": own_file})),
+                ),
+                event_callback(
+                    "Ev07",
+                    in_channel(json!({"type": "message", "subtype": "message_changed",
+                        "user": "U0ANA", "ts": "1793000000.000700"})),
+                ),
+                event_callback(
+                    "Ev08",
+                    json!({"type": "message", "user": "U0ANA", "text": "elsewhere",
+                        "ts": "1793000000.000800", "channel": "C0OTHER"}),
+                ),
+            ],
+        )
+        .await;
+
+        let messages = relayed(&mut router).await;
+        let ids = messages
+            .iter()
+            .map(|msg| msg.meta.context.as_ref().expect("context")["io"]["message"]["id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![json!("Ev01"), json!("Ev02"), json!("Ev03")]);
+        for msg in &messages {
+            assert!(
+                matches!(&msg.routing.dst, Destination::Unicast(node) if node == WF),
+                "{:?}",
+                msg.routing.dst
+            );
+        }
+
+        let broadcast = &messages[0];
+        assert_eq!(broadcast.payload["content"], "For everyone too");
+        let thread = slack_inbound_io_context(WORKSPACE, "U0ANA", CHANNEL, Some(POST_TS), "Ev01")
+            .conversation
+            .thread_id;
+        assert_eq!(broadcast.meta.thread_id, thread);
+
+        let shared = &messages[1];
+        assert_eq!(shared.payload["content"], "The invoice");
+        let attachments = shared.payload["attachments"].as_array().expect("a file");
+        assert_eq!(attachments.len(), 1);
+        let file: BlobRef = serde_json::from_value(attachments[0].clone()).expect("a blob ref");
+        assert_eq!(file.filename_original, "invoice.pdf");
+        assert_eq!(file.mime, "application/pdf");
+        // The fake's download answers its own `{"ok":true}`.
+        assert_eq!(
+            store.blobs.read_blob(&file).expect("the file's blob"),
+            br#"{"ok":true}"#
+        );
+
+        assert_eq!(messages[2].payload["content"], "hola");
+        let downloads = |id: &str| api.calls().iter().filter(|(api, _)| api == id).count();
+        assert_eq!(downloads("F0INVOICE"), 1);
+        assert_eq!(downloads("F0OWN"), 0);
+    }
+
+    /// A message with no text, no blocks and no files posts nothing, whatever its payload's shape,
+    /// where it posted a fallback before (FINDINGS A-130). A WF's facts alone make no post; its
+    /// menu alone does, as buttons.
+    #[tokio::test]
+    async fn a_message_with_nothing_to_post_posts_nothing() {
+        let api = FakeWebApi::start(&[]).await;
+        let slack = api.client().await;
+        let records = SlackThreadRecords::in_memory().expect("records");
+        let store = blob_store("nothing");
+        for payload in [
+            json!({"type": "text", "content": ""}),
+            json!({"type": "text", "content": " \n ", "attachments": [], "blocks": []}),
+            json!({"type": "text"}),
+            json!({}),
+            json!(null),
+        ] {
+            let plain = outbound(AGENT, CASE_THREAD, json!({}), payload.clone());
+            post(&slack, &store, Some(&records), &plain).await;
+            let facts = outbound(
+                WF,
+                CASE_THREAD,
+                json!({"wf": {"vars": {"person": "Ana"}}}),
+                payload,
+            );
+            post(&slack, &store, Some(&records), &facts).await;
+        }
+        assert_eq!(api.calls(), vec![]);
+
+        let menu = json!({"wf": {"menu": {"options": [
+            {"name": "handback", "description": "Hand the conversation back."}
+        ]}}});
+        post(
+            &slack,
+            &store,
+            Some(&records),
+            &outbound(WF, CASE_THREAD, menu, json!(null)),
+        )
+        .await;
+        let posts = api.bodies("chat.postMessage");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["text"], "");
+        assert_eq!(posts[0]["blocks"][0]["block_id"], "fluxbee_wf_menu");
+    }
+
+    /// A message with only files, on a thread id with no place, posts their names first: its `ts`
+    /// is recorded for the thread id, and the files go into its thread (FINDINGS A-130). A reply
+    /// there keeps the thread id, and so does the WF's next message on the subject. On a place the
+    /// node knows, the files go there, with no names; without the records, as before them.
+    #[tokio::test]
+    async fn a_message_with_only_files_on_a_new_place_names_them_first() {
+        let api =
+            FakeWebApi::start(&[("chat.postMessage", json!({"ok": true, "ts": POST_TS}))]).await;
+        let slack = api.client().await;
+        let records = SlackThreadRecords::in_memory().expect("records");
+        let store = blob_store("files-only");
+        let report = store.put(b"%PDF-1.7", "report.pdf", "application/pdf");
+        let chart = store.put(b"\x89PNG", "chart.png", "image/png");
+        let files_only = json!({"type": "text", "content": "", "attachments": [report, chart]});
+        post(
+            &slack,
+            &store,
+            Some(&records),
+            &outbound(AGENT, CASE_THREAD, json!({}), files_only.clone()),
+        )
+        .await;
+
+        let shared_in = |thread_ts: Option<&str>, title: &str| {
+            let mut body = json!({"files": [{"id": "F0FILE", "title": title}],
+                                  "channel_id": CHANNEL});
+            if let Some(thread_ts) = thread_ts {
+                body["thread_ts"] = json!(thread_ts);
+            }
+            body
+        };
+        assert_eq!(
+            api.bodies("chat.postMessage"),
+            vec![json!({"channel": CHANNEL, "text": "Files: report.pdf, chart.png"})]
+        );
+        assert_eq!(
+            api.bodies("files.completeUploadExternal"),
+            vec![
+                shared_in(Some(POST_TS), "report.pdf"),
+                shared_in(Some(POST_TS), "chart.png")
+            ]
+        );
+        let mut reply =
+            slack_inbound_io_context(WORKSPACE, "U0SUPERVISOR", CHANNEL, Some(POST_TS), "Ev10");
+        map_inbound_thread(Some(&records), &mut reply, Some(POST_TS), now_epoch_ms());
+        assert_eq!(reply.conversation.thread_id.as_deref(), Some(CASE_THREAD));
+        let same = outbound(
+            WF,
+            CASE_THREAD,
+            json!({"wf": {"subject": "same"}}),
+            json!({"type": "text", "content": "And the total."}),
+        );
+        post(&slack, &store, Some(&records), &same).await;
+        assert_eq!(
+            api.bodies("chat.postMessage")[1],
+            json!({"channel": CHANNEL, "text": "And the total.", "thread_ts": POST_TS})
+        );
+
+        // A place a person opened: the files go there, with no names.
+        let person_ts = "1793000000.000900";
+        let mut person =
+            slack_inbound_io_context(WORKSPACE, "U0ANA", CHANNEL, Some(person_ts), "Ev11");
+        map_inbound_thread(Some(&records), &mut person, Some(person_ts), now_epoch_ms());
+        let person_thread = person.conversation.thread_id.expect("a thread id");
+        let one_file = json!({"type": "text", "content": "", "attachments": [report]});
+        post(
+            &slack,
+            &store,
+            Some(&records),
+            &outbound(AGENT, &person_thread, json!({}), one_file.clone()),
+        )
+        .await;
+        // Without the records, as before them: at the top level, with no names.
+        post(
+            &slack,
+            &store,
+            None,
+            &outbound(AGENT, CASE_THREAD, json!({}), one_file),
+        )
+        .await;
+        assert_eq!(api.bodies("chat.postMessage").len(), 2);
+        assert_eq!(
+            api.bodies("files.completeUploadExternal")[2..].to_vec(),
+            vec![
+                shared_in(Some(person_ts), "report.pdf"),
+                shared_in(None, "report.pdf")
+            ]
+        );
+    }
+
+    /// A file the node cannot send no longer fails the message (FINDINGS A-108): an HTML page
+    /// goes; a type the node does not take and a blob that never came are left out, and the text
+    /// names them; the other files go. A file Slack refuses, once the text went, is named by a post
+    /// after the files.
+    #[tokio::test]
+    async fn a_file_left_out_is_named_and_the_rest_goes() {
+        let api = FakeWebApi::start(&[
+            ("chat.postMessage", json!({"ok": true, "ts": POST_TS})),
+            ("files.completeUploadExternal", json!({"ok": true})),
+            (
+                "files.completeUploadExternal",
+                json!({"ok": false, "error": "file_uploads_except_images_disabled"}),
+            ),
+        ])
+        .await;
+        let slack = api.client().await;
+        let records = SlackThreadRecords::in_memory().expect("records");
+        let store = blob_store("left-out");
+        let page = store.put(b"<p>The quote</p>", "quote.html", "text/html");
+        let setup = store.put(b"MZ", "setup.exe", "application/x-msdownload");
+        let gone = store.never_comes(b"%PDF-1.7", "terms.pdf", "application/pdf");
+        let totals = store.put(b"plan,total\npro,1200", "totals.csv", "text/csv");
+        let payload = json!({"type": "text", "content": "Here is the quote.\n",
+                             "attachments": [page, setup, gone, totals]});
+        post(
+            &slack,
+            &store,
+            Some(&records),
+            &outbound(AGENT, CASE_THREAD, json!({}), payload),
+        )
+        .await;
+
+        let calls = api.calls();
+        let order = calls
+            .iter()
+            .map(|(api, _)| api.as_str())
+            .filter(|api| !api.starts_with("files.getUploadURL") && *api != "upload")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                "chat.postMessage",
+                "files.completeUploadExternal",
+                "files.completeUploadExternal",
+                "chat.postMessage"
+            ]
+        );
+        let posts = api.bodies("chat.postMessage");
+        assert_eq!(
+            posts[0],
+            json!({"channel": CHANNEL,
+                   "text": "Here is the quote.\n\nNot sent: setup.exe, terms.pdf"})
+        );
+        let shared = api.bodies("files.completeUploadExternal");
+        assert_eq!(shared[0]["files"][0]["title"], "quote.html");
+        assert_eq!(shared[1]["files"][0]["title"], "totals.csv");
+        assert_eq!(shared[1]["thread_ts"], POST_TS);
+        assert_eq!(
+            posts[1],
+            json!({"channel": CHANNEL, "text": "Not sent: totals.csv", "thread_ts": POST_TS})
+        );
+    }
+
+    /// Each file is checked alone: past the first `max_attachments`, past a file's size or all of
+    /// theirs, or of a type the node does not take, a file is left out with why, and the others
+    /// are read. A payload that is no `text/v1` fails the whole.
+    #[tokio::test]
+    async fn each_outbound_file_is_checked_alone() {
+        let store = blob_store("limits");
+        let cfg = IoTextBlobConfig {
+            max_attachments: 5,
+            max_attachment_bytes: 8,
+            max_total_attachment_bytes: 12,
+            ..slack_files()
+        };
+        let attachments = [
+            store.put(b"12345678", "a.txt", "text/plain"),
+            store.put(b"123456789", "big.txt", "text/plain"),
+            store.put(b"PK", "archive.zip", "application/zip"),
+            store.put(b"12345", "b.txt", "text/plain"),
+            store.put(b"1234", "c.txt", "text/plain"),
+            store.put(b"1", "sixth.txt", "text/plain"),
+        ];
+        let payload = json!({"type": "text", "content": "Hi.", "attachments": attachments});
+        let content = outbound_content(&store.blobs, &cfg, short_wait(), &payload)
+            .await
+            .expect("content");
+        assert_eq!(content.text, "Hi.");
+        assert_eq!(
+            content
+                .files
+                .iter()
+                .map(|file| (file.name.as_str(), file.bytes.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a.txt", b"12345678".as_slice()),
+                ("c.txt", b"1234".as_slice())
+            ]
+        );
+        assert_eq!(
+            content
+                .left_out
+                .iter()
+                .map(|(name, why)| (name.as_str(), why.canonical_code()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("big.txt", "BLOB_TOO_LARGE"),
+                ("archive.zip", "unsupported_attachment_mime"),
+                ("b.txt", "BLOB_TOO_LARGE"),
+                ("sixth.txt", "too_many_attachments"),
+            ]
+        );
+        assert!(outbound_content(
+            &store.blobs,
+            &cfg,
+            short_wait(),
+            &json!({"type": "card", "content": "Hi."})
+        )
+        .await
+        .is_err());
     }
 }

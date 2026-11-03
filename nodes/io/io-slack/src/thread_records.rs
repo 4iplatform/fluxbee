@@ -14,7 +14,8 @@
 //!   `reply_target`, and once that post goes out the node forgets its older posts on the thread id.
 //!   An unrecorded thread id whose `reply_target` is the node's own channel is posted there, as
 //!   before, and recorded. Any other is posted at the top level of the channel, and the post's `ts`
-//!   is recorded for its thread id.
+//!   is recorded for its thread id. A file upload answers no `ts`, so a message with only files
+//!   posts a text first there, which names them (`OutboundThread::opens_a_place`).
 //!
 //! - **The marks** (docs/wf-orchestration-v1.md §5.4.2, built as §5.4.10 piece 4): a WF marks each
 //!   message it sends an IO node with `meta.context.wf.subject` (`Subject`). On a thread id with a
@@ -756,6 +757,14 @@ impl<'a> OutboundThread<'a> {
         }
     }
 
+    /// Whether the message's next post opens a new place for its thread id: a new post at the top
+    /// level, which `posted` records by its `ts`. A file upload answers none, so a message with
+    /// only files posts a text first, which names them (the outbound loop), and the files go into
+    /// its thread.
+    pub(crate) fn opens_a_place(&self) -> bool {
+        self.place == OutboundPlace::NewPost && self.records.is_some() && self.record_as.is_some()
+    }
+
     /// The thread the message's next post goes to; `None` is the channel's top level.
     pub(crate) fn thread_ts(&self) -> Option<&str> {
         match &self.place {
@@ -1168,6 +1177,35 @@ mod tests {
         no_thread.posted(Some("1793000000.000501"), NOW);
         assert_eq!(no_thread.thread_ts(), None);
         assert_eq!(rows(&records).len(), 1);
+    }
+
+    /// A message's next post opens a place when it is a new post at the top level that the records
+    /// keep for its thread id: on an unrecorded thread id with no target here, or a new subject on
+    /// a thread id the node posted on. A file upload answers no `ts`, so the place stays to open
+    /// until a post answers one. A place a person opened, a target here, `same` on the node's post,
+    /// no thread id and no records open none.
+    #[test]
+    fn a_new_post_at_the_top_level_opens_a_place() {
+        let records = records();
+        let mut thread = resolve(Some(&records), Some(WF_THREAD), None);
+        assert!(thread.opens_a_place());
+        thread.posted(None, NOW);
+        assert!(thread.opens_a_place());
+        thread.posted(Some("1793000000.002400"), NOW);
+        assert!(!thread.opens_a_place());
+
+        assert!(resolve(Some(&records), Some(WF_THREAD), None).opens_a_place());
+        assert!(
+            !resolve_marked(Some(&records), Some(WF_THREAD), None, Subject::Same).opens_a_place()
+        );
+        let here = target(CHANNEL, Some("1793000000.002401"));
+        assert!(!resolve(Some(&records), Some("thread:sha256:agent"), Some(&here)).opens_a_place());
+        records
+            .record(PERSON_THREAD, CHANNEL, "1793000000.002402", NOW)
+            .expect("record");
+        assert!(!resolve(Some(&records), Some(PERSON_THREAD), None).opens_a_place());
+        assert!(!resolve(Some(&records), None, None).opens_a_place());
+        assert!(!resolve(None, Some(WF_THREAD), None).opens_a_place());
     }
 
     /// An unrecorded thread id whose reply target is this channel is posted there, as before the
