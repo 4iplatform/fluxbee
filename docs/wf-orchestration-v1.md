@@ -29,6 +29,9 @@
   It was validated on 8.x on 2026-11-03, in two runs, the second from zero (§5.5.3; ledger 0.1.95
   to 0.1.98). With it went the ILK fix (A-139) and the bugs of Case 4's test. **The track is
   complete.**
+- **After the track (the operator, 2026-11-03):** the atoms (handbook §4.2.6) become a document of
+  their own, a reservoir Archi reads to develop solutions. They move with the solutions chapter,
+  where a solution lives; until then they stay in the handbook.
 
 This is the single place for the track. The cases are worked here one at a time.
 

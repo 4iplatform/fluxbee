@@ -1078,7 +1078,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-147 🟡 OPEN, for Archi's chapter (found 2026-11-03, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
+### A-147 🟡 OPEN, for the next release (the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
 
 - **Seen on 8.x:** the operator asked in one message for the running conversations, with their state
   and since when, and for one of them to be cancelled. Archi staged the cancel. Its answer was only
@@ -1089,9 +1089,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   model's own final text, `raw_message`, is not shown (src/bin/sy_architect.rs).
 - **What it breaks:** the operator does not see the answer, nor what the plan will do, besides its
   steps in the page.
-- **Fix:** show the model's text with the staged message. Archi's chapter.
+- **Fix:** show the model's text with the staged message. The operator (2026-11-03): in the next
+  release, since the test found it and it is small.
 
-### A-146 🟡 OPEN, low (found 2026-11-03, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
+### A-146 🟡 OPEN, low, for the next release (the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
 
 - **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
   none on 2026-11-01. It fires on every connect of a node that is not `SY.*` or `RT.*`: the gate's
@@ -1099,7 +1100,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Why:** `assign_vpn` (src/router/mod.rs) warns when the config snapshot holds no VPN rule. No
   rule is what a hive without VPNs has.
 - **What it breaks:** nothing. It is noise at WARN in every journal sweep, which hides a real one.
-- **Fix:** log it at debug, or not at all.
+- **Fix:** log it at debug, or not at all. The operator (2026-11-03): in the next release.
 
 ### A-145 ✅ RESOLVED (0.1.98; by tests, and the second run named its workflow right; found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
 
@@ -1175,7 +1176,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the primary. A read still goes to the path's hive. A test covers both
   (`identity_writes_go_to_the_primary_whatever_hive_the_path_names`).
 
-### A-142 🟡 OPEN (found 2026-11-03, building WF Case 5; for io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
+### A-142 🟡 OPEN, for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
 
 - **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
   (`handle_chat_message`, src/bin/sy_architect.rs). A turn can last minutes: since 0.1.95 each
@@ -1186,9 +1187,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the operator reaches Archi on the motherbee's own port.
 - **What it would break:** once stage 2 proxies Archi through the edge, any chat turn longer than
   30 s answers 502 to the operator while it still runs in Archi.
-- **Fix, with stage 2:** either the edge's wait for Archi's routes covers a turn, or Archi's chat
-  answers at once and the page follows the turn by its session (the page already refreshes
-  sessions and streams messages). Decide in the stage 2 design, not here.
+- **Fix, in Archi's chapter (the operator, 2026-11-03), before stage 2 proxies Archi:** either the
+  edge's wait for Archi's routes covers a turn, or Archi's chat answers at once and the page follows
+  the turn by its session (the page already refreshes sessions and streams messages).
 
 ### A-141 ✅ VALIDATED ON 8.x (0.1.95, 2026-11-03: at the upgrade frontdesk waited for the vault and started its AI; found 2026-11-02, sweeping the journals of WF Case 4's gate) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
 
