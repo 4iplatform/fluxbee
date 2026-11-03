@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ⏳ live, gate running | snap `pre-wfcase5-0-1-95` (all 4 VMs) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
+| **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ⏳ live, gate running | snap `pre-gatefix-0-1-96` (all 4 VMs) · `apt install fluxbee=0.1.95` + core-update of the spokes |
+| **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ✅ replaced by 0.1.96 (gate in course) | snap `pre-wfcase5-0-1-95` (deleted 2026-11-03) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
 | **0.1.94** | 2026-11-02 | `9ee729a6` | motherbee + spokes (core); the gate's WF redeployed; `AI.pruebas@worker1`'s config set again without `runtime.immediate_memory`; later the motherbee's AI on `claude-opus-5-5` (Archi) | ✅ replaced by 0.1.95 | snap `pre-wfcase4-0-1-94` (deleted 2026-11-03) · `apt install fluxbee=0.1.93` + core-update of the spokes, then the gate's WF and AI.pruebas back on their 0.1.93 definition and config |
 | **0.1.93** | 2026-10-30 | `c70ad89` | motherbee + spokes (core) | ✅ replaced by 0.1.94 | snap `pre-cogturns-0-1-93` (deleted 2026-11-02) · `apt install fluxbee=0.1.92` + core-update of the spokes |
 | **0.1.92** | 2026-10-30 | `4e20b88` | motherbee + spokes (core) + the gate's `IO.slack.gate0192@motherbee` and its vault secret (tenant `pruebas`) | ✅ replaced by 0.1.93 | snap `pre-wfcase3-0-1-92` (deleted 2026-10-30) · `apt install fluxbee=0.1.91` + core-update of the spokes |
@@ -104,6 +105,42 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.96 — Two fixes from WF Case 5's gate: SY.admin's executor dispatches a plan's fixed steps without its model, identity writes go to the primary; Archi's chat CONFIRM verifies the run (A-144, A-143)
+
+- **Date:** 2026-11-03 (ART) · **Previous version:** 0.1.95 · **Commit:** `3726dca1`.
+- **Scope:** motherbee and the three spokes (core update). It came out of WF Case 5's gate, run on
+  0.1.95 (wf-orchestration-v1 §5.5.3).
+  - Archi's plan stopped at the roles of the agents it created. It named the agents' hive for
+    `set_ilk_definition`, and a spoke's SY.identity refuses SY.admin (A-143).
+  - Once the operator told it the primary, the workflow's deploy failed in SY.admin's executor. Its
+    model had to repeat the whole definition and its answer was cut. Archi's chat said the plan
+    "finished" (A-144).
+- **What changed:**
+  - **SY.admin:**
+    - a plan step with nothing for the model to fill is dispatched as the plan wrote it, with no
+      model;
+    - every identity write goes to the primary, whatever hive the path names, and a read goes to
+      the path's replica.
+  - **SY.architect:**
+    - the chat's CONFIRM verifies the run as the pipeline does, so a failed run, step or WF node
+      answers `error` and says why;
+    - Archi waits 90 s more for each workflow deploy or removal in a plan.
+- **Checks before the release:**
+  - Rust fmt and clippy `-D warnings` on the workspace;
+  - SY.admin's tests (298) and SY.architect's (238), two of them new;
+  - the admin catalog's parity and the doc links.
+  - The rest of the code was unchanged since 0.1.95's full CI.
+- **Deploy:**
+  - build of `3726dca1` in 11 min; publish in 14 s (the repo keeps 0.1.87 to 0.1.96);
+  - snapshots `pre-gatefix-0-1-96` on the 4 VMs (`pre-wfcase5-0-1-95` was deleted);
+  - 0.1.96 on all 4 in 185 s (core manifest `42e73f5e773208e1`), with health clean: `failed=0`
+    and `denials=0` on all 4;
+  - the web's route answered `no_answer` right after the deploy, and `acknowledged`, `ready` a
+    minute later;
+  - Archi came back on its own `claude-opus-5-5` (`ai.model`, from its `config.json`);
+  - the gate's clients were started again, since the core update closed their sockets.
+- **Rollback:** `apt install fluxbee=0.1.95` on the motherbee, then a core-update of the spokes.
 
 ## 0.1.95 — The WF track, Case 5: Archi writes and operates WFs; the handbook's atoms, the workflow check, deploys that create, update and remove as decided, a WF's instances, Archi's own model (wf-orchestration-v1 §5.5; A-139, A-140, A-126, A-127, A-128, A-141, A-130, A-108, A-129)
 

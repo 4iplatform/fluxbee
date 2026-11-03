@@ -1078,7 +1078,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-144 🟡 FIX BUILT, for 0.1.96 (found 2026-11-03, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
+### A-144 🟡 FIX BUILT, for 0.1.97 (found 2026-11-03, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
 
 - **Seen on 8.x:** Archi's plan deployed the gate's workflow with `wf_rules_compile_apply`. The
   executor's model, on the hive's Sonnet with its default 4,096 output tokens, had to repeat the
@@ -1101,6 +1101,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - Archi waits 90 s more for each workflow deploy or removal in a plan.
 - **The gate went on:** the agents and their roles were in place. The workflow's deploy waited for
   0.1.96.
+- **0.1.96, live:** the chat answered `error`, "Execution stopped at step 's1'", as it should. But
+  the step failed: `UNKNOWN_ACTION`, "Unsupported admin action 'wf_rules_compile_apply'".
+  - The direct dispatch reused the executor's fallback for a model that called no tool, and that
+    went through `handle_admin_command_with_origin`. It routes only the command actions, never the
+    wf-rules ones. That was a latent bug of the fallback.
+- **Built (0.1.97):** the direct dispatch is the one the model's tool makes,
+  `dispatch_internal_admin_command`, boxed since that dispatch runs the executor itself.
+  - A test sends a fixed `wf_rules_compile_apply` step through it to a fake SY.wf-rules
+    (`a_fixed_workflow_deploy_step_reaches_wf_rules_as_planned`).
 
 ### A-143 🟡 FIX BUILT, for 0.1.96 (found 2026-11-03, WF Case 5's gate) — An identity write through SY.admin works only when its path names the motherbee, and the refusal does not say why
 
