@@ -394,6 +394,8 @@ Operational note:
 
 In the current `IO.slack` -> `io-common` -> router path, inbound attachments are only normalized to `attachments[]` when their MIME type is in the current `io-common` allowlist.
 
+A shared file is downloaded with the bot token only from Slack's file store, `https://files.slack.com` (0.1.95, the review of WF Case 5). A file shared from elsewhere names its own host: an external file, such as a Google Drive one, or one an app added with `files.remote.add`. Such a file is left out with a `warn` line and never downloaded, since its download would hand that host the token.
+
 Current effective allowlist of `IO.slack`:
 
 - `image/jpeg`

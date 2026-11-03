@@ -967,6 +967,19 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 
 /// Slack's Web API, the base of every method's URL.
 const SLACK_WEB_API: &str = "https://slack.com/api";
+/// Slack's file store, the only origin a shared file is downloaded from with the bot token. A file
+/// shared from elsewhere (an external file, a Google Drive one, or one an app added with
+/// `files.remote.add`) names its own host in `url_private`, and its download would hand that host
+/// the token.
+const SLACK_FILE_STORE: &str = "https://files.slack.com";
+
+/// Whether `url` has `store`'s origin: its scheme, its host and its port.
+fn same_origin(url: &str, store: &str) -> bool {
+    match (Url::parse(url), Url::parse(store)) {
+        (Ok(url), Ok(store)) => url.origin() == store.origin(),
+        _ => false,
+    }
+}
 
 #[derive(Clone)]
 struct SlackClients {
@@ -974,6 +987,9 @@ struct SlackClients {
     runtime: Arc<RwLock<SlackRuntimeState>>,
     /// The base of the Web API's method URLs: `SLACK_WEB_API`, or a test's fake (`fake_web_api`).
     web_api: String,
+    /// The origin a shared file is downloaded from with the bot token: `SLACK_FILE_STORE`, or a
+    /// test's fake. A file anywhere else is refused before any request (`download_private_file`).
+    file_store: String,
 }
 
 #[derive(Clone)]
@@ -1022,6 +1038,7 @@ impl SlackClients {
                 bot_user_id: None,
             })),
             web_api: SLACK_WEB_API.to_string(),
+            file_store: SLACK_FILE_STORE.to_string(),
         })
     }
 
@@ -1310,6 +1327,12 @@ impl SlackClients {
     }
 
     async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
+        if !same_origin(url, &self.file_store) {
+            return Err(anyhow::anyhow!(
+                "the file is not on Slack's file store ({}), and the bot token goes nowhere else",
+                self.file_store
+            ));
+        }
         let slack_bot_token = self.slack_bot_token().await?;
         let response = self
             .http
@@ -3807,6 +3830,7 @@ mod fake_web_api {
                 .build()
                 .expect("http client");
             slack.web_api = self.base.clone();
+            slack.file_store = self.base.clone();
             slack
                 .reload_credentials("test-app-token".to_string(), "test-bot-token".to_string())
                 .await;
@@ -3909,7 +3933,7 @@ mod tests {
         classify_slack_inbound, decode_slack_text, default_slack_allowed_mimes,
         extract_runtime_relay_config, extract_slack_tokens_from_vault_value,
         is_control_plane_msg_type, message_seen, now_epoch_ms, outbound_content, parse_retry_after,
-        post_ephemeral_body, post_message_body, post_outbound, run_slack_event_worker,
+        post_ephemeral_body, post_message_body, post_outbound, run_slack_event_worker, same_origin,
         slack_inbound_config, slack_relay_policy_from_config, slack_vault_key,
         vault_change_is_slack, Config, SlackBindingConfig, SlackClients, SlackRelayConfig,
         SlackRuntimeState, SocketEnvelope, ENVELOPE_EVENTS_API, ENVELOPE_INTERACTIVE,
@@ -4721,6 +4745,41 @@ mod tests {
             assert!(!message_seen(&mut seen, CHANNEL, &no_ts));
             assert!(!message_seen(&mut seen, CHANNEL, &no_ts));
         }
+    }
+
+    /// The bot token goes only to Slack's file store: a file shared from elsewhere names its own
+    /// host, and its download is refused before any request, its token never read (the review of
+    /// WF Case 5: since a file share in the channel reaches the mesh, anyone there could share one).
+    #[tokio::test]
+    async fn the_bot_token_goes_only_to_slacks_file_store() {
+        let store = "https://files.slack.com";
+        for slacks in [
+            "https://files.slack.com/files-pri/T0-F0/download/invoice.pdf",
+            "https://files.slack.com:443/files-pri/T0-F0/invoice.pdf",
+        ] {
+            assert!(same_origin(slacks, store), "{slacks}");
+        }
+        for foreign in [
+            "http://files.slack.com/files-pri/T0-F0/invoice.pdf",
+            "https://files.slack.com:8443/files-pri/T0-F0/invoice.pdf",
+            "https://files.slack.com.example.com/invoice.pdf",
+            "https://files.slack.com@example.com/invoice.pdf",
+            "https://drive.google.com/file/d/F0/view",
+            "https://example.com/?files.slack.com",
+            "not a url",
+            "",
+        ] {
+            assert!(!same_origin(foreign, store), "{foreign}");
+        }
+        let slack = SlackClients::new().expect("client");
+        let refused = slack
+            .download_private_file("https://drive.google.com/file/d/F0/view")
+            .await
+            .expect_err("a file elsewhere is refused");
+        assert!(
+            refused.to_string().contains("not on Slack's file store"),
+            "{refused}"
+        );
     }
 
     /// A person's messages reach the mesh as the plain messages they are, once each (FINDINGS
