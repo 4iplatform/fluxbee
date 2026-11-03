@@ -1078,6 +1078,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-147 🟡 OPEN, for Archi's chapter (found 2026-11-03, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
+
+- **Seen on 8.x:** the operator asked in one message for the running conversations, with their state
+  and since when, and for one of them to be cancelled. Archi staged the cancel. Its answer was only
+  "A compiled executor plan is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
+  The list never reached the operator. Asked alone, in the first run, the list came.
+- **Why:** when a turn stages a confirmation, the chat's message is the staged one
+  (`latest_staged_confirmation_message`, else `PendingConfirmationFlow::staged_message`), and the
+  model's own final text, `raw_message`, is not shown (src/bin/sy_architect.rs).
+- **What it breaks:** the operator does not see the answer, nor what the plan will do, besides its
+  steps in the page.
+- **Fix:** show the model's text with the staged message. Archi's chapter.
+
 ### A-146 🟡 OPEN, low (found 2026-11-03, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
 
 - **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
@@ -1088,7 +1101,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **What it breaks:** nothing. It is noise at WARN in every journal sweep, which hides a real one.
 - **Fix:** log it at debug, or not at all.
 
-### A-145 🟡 FIX BUILT, for 0.1.98 (found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
+### A-145 ✅ RESOLVED (0.1.98; by tests, and the second run named its workflow right; found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
 
 - **Seen on 8.x (0.1.97):** Archi deployed the gate's workflow as `ventas-gate0195`. The check
   passed, and so did the compile. The publish then refused the runtime:
@@ -1108,7 +1121,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the handbook says it (§4.2.7);
   - a test refuses hyphens at compile and at check (`TestCompileWorkflowRejectsInvalidWorkflowName`).
 
-### A-144 🟡 FIX BUILT, for 0.1.97 (found 2026-11-03, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
+### A-144 ✅ VALIDATED ON 8.x (0.1.97 and 0.1.98, 2026-11-03: every deploy, removal, cancel and kill went as planned, and the chat said a failure; found the same day, WF Case 5's gate) — SY.admin's executor had its model repeat every step's args, and a workflow's definition outgrew its answer; Archi's chat then said the plan finished
 
 - **Seen on 8.x:** Archi's plan deployed the gate's workflow with `wf_rules_compile_apply`. The
   executor's model, on the hive's Sonnet with its default 4,096 output tokens, had to repeat the
@@ -1141,7 +1154,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - A test sends a fixed `wf_rules_compile_apply` step through it to a fake SY.wf-rules
     (`a_fixed_workflow_deploy_step_reaches_wf_rules_as_planned`).
 
-### A-143 🟡 FIX BUILT, for 0.1.96 (found 2026-11-03, WF Case 5's gate) — An identity write through SY.admin works only when its path names the motherbee, and the refusal does not say why
+### A-143 ✅ VALIDATED ON 8.x (0.1.98, 2026-11-03: the second run set its agents' roles with `hive: worker1`, and they went to the primary; found the same day, WF Case 5's gate) — An identity write through SY.admin works only when its path names the motherbee, and the refusal does not say why
 
 - **Seen on 8.x:** Archi's plan assigned the new agents' roles with `set_ilk_definition` and
   `hive: worker1`, the agents' hive. The step failed: `UNAUTHORIZED_REGISTRAR`, "source not
@@ -1177,7 +1190,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   answers at once and the page follows the turn by its session (the page already refreshes
   sessions and streams messages). Decide in the stage 2 design, not here.
 
-### A-141 🟡 OPEN (found 2026-11-02, sweeping the journals of WF Case 4's gate; with Case 5's bugs) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
+### A-141 ✅ VALIDATED ON 8.x (0.1.95, 2026-11-03: at the upgrade frontdesk waited for the vault and started its AI; found 2026-11-02, sweeping the journals of WF Case 4's gate) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
 
 - **Seen on 8.x:**
   - At the 0.1.94 upgrade (2026-11-02, 18:52 UTC), the vault did not answer SY.frontdesk.gov's
@@ -1197,7 +1210,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** both boot reads wait for the vault, as their peers do (A-26). It goes with WF Case 5's
   bugs ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5).
 
-### A-140 🟡 OPEN (found 2026-11-02, WF Case 4's gate; for Case 5) — A definition's texts can say what is no longer true, and the handover summary invites internal ids
+### A-140 ✅ VALIDATED ON 8.x (0.1.95 to 0.1.98, 2026-11-03: every handover summary named the person and no internal id; found 2026-11-02, WF Case 4's gate) — A definition's texts can say what is no longer true, and the handover summary invites internal ids
 
 - **A text that repeats a timer's duration.** The example's texts to sales say "in 15 minutes" and
   "for 30 minutes", the values of `team_untaken` and `team_quiet`
@@ -1214,7 +1227,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the summary's description: the person by name, with no internal ids. The catalog pins names and
     params, not descriptions (`TestTheKnownOptionsOnlyGrow`), so it may change.
 
-### A-139 🟡 OPEN, fix decided 2026-11-02, built with WF Case 5 (found 2026-11-02, WF Case 4's gate) — The ILKs on a WF's messages to IO nodes: a forwarded answer keeps the `dst_ilk` of whoever the agent answered, and a WF's own message names the person as its sender
+### A-139 ✅ VALIDATED ON 8.x (0.1.98, 2026-11-03, two runs: what reached the person named the person and the person's channel, whoever wrote it; the WF's posts to the team named no one; found 2026-11-02, WF Case 4's gate) — The ILKs on a WF's messages to IO nodes: a forwarded answer keeps the `dst_ilk` of whoever the agent answered, and a WF's own message names the person as its sender
 
 - **What happens:**
   - `forward` sends the message's meta as it came (go/nodes/wf/wf-generic/node/actions.go,
@@ -1517,7 +1530,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`leading_json_value`), so a fence or braces after it are the model's, and a fence in the
   object's own text stays in it. Without a whole value, the old cuts apply.
 
-### A-130 🟡 OPEN (found 2026-10-30, building WF Case 3) — io.slack: "send to channel" and file replies are dropped, a mention may arrive twice, an empty message posts a fallback, and a files-only post is not recorded
+### A-130 ✅ RESOLVED (0.1.95, WF Case 5; by tests, its mechanisms for io.slack's revamp; found 2026-10-30, building WF Case 3) — io.slack: "send to channel" and file replies are dropped, a mention may arrive twice, an empty message posts a fallback, and a files-only post is not recorded
 
 - **A reply with "Also send to #channel" never reaches the mesh.**
   - Slack gives it the subtype `thread_broadcast`, and the echo guard drops every message with a
@@ -1574,7 +1587,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   message, the files-only post recorded, and no empty fact. The text's format across channels
   stays for the revamp.
 
-### A-129 🟡 OPEN (found 2026-10-30, preparing WF Case 3's gate) — Two io.slack nodes on one Slack app lose messages without a trace
+### A-129 ✅ RESOLVED (0.1.95, WF Case 5: an event of another channel is dropped at info, and the doc says each node needs its own Slack app; one node per channel or per workspace is io.slack's revamp; found 2026-10-30) — Two io.slack nodes on one Slack app lose messages without a trace
 
 - **What happens:**
   - **Slack:** in Socket Mode, "when multiple connections are active, each payload may be sent to
@@ -1621,7 +1634,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     and each node takes its own channel. That is io.wapp's decided model for Meta's single webhook.
 - **Fix:** io.slack's revamp, in the IO track.
 
-### A-128 🔴 OPEN (found 2026-10-30, the 0.1.91 gate; for WF Case 5) — A wf-rules `check` stages the definition it checks
+### A-128 ✅ VALIDATED ON 8.x (0.1.95 to 0.1.98, 2026-11-03: Archi checked every definition with `wf_rules_check`, a read that stages nothing; found 2026-10-30, the 0.1.91 gate) — A wf-rules `check` stages the definition it checks
 
 - **What happens** (go/sy-wf-rules/node/dispatch.go): `check` is `compile` under another name, and
   a compile writes the definition to `staged` ([sy-wf-rules](../../docs/nodes/sy-wf-rules.md),
@@ -1636,7 +1649,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §4.7). It should be a read-only check,
   as OPA's `opa_check` is.
 
-### A-127 🔴 OPEN (found 2026-10-30, the 0.1.91 gate) — SY.admin's node control and message routes send a bare node name as is
+### A-127 ✅ RESOLVED (0.1.95, WF Case 5; by tests; found 2026-10-30, the 0.1.91 gate) — SY.admin's node control and message routes send a bare node name as is
 
 - **What happens** (src/bin/sy_admin.rs):
   - **Control:** `POST /hives/{hive}/nodes/{name}/control/config-get` and `/control/config-set`
@@ -1658,7 +1671,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** both handlers qualify a bare name with the path's hive. `messages` also refuses a
   qualified name of another hive, as the control handler does.
 
-### A-126 🔴 OPEN (found 2026-10-30, the 0.1.91 gate) — Archi deletes an agent asset that an agent's definition still names
+### A-126 ✅ VALIDATED ON 8.x (0.1.98, 2026-11-03: Archi deleted its roles once no ILK named them, with no force, both runs; found 2026-10-30, the 0.1.91 gate) — Archi deletes an agent asset that an agent's definition still names
 
 - **What happens:**
   - **The delete checks nothing.** `DELETE /api/agent-assets?hash=` and Archi's `delete_agent_asset`
@@ -2171,7 +2184,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - a node pinned to 0.1.88 stayed;
   - a same-version republish relaunched nothing.
 
-### A-108 🔴 OPEN (found 2026-10-27) — io.slack fails a whole reply that carries an HTML file
+### A-108 ✅ RESOLVED (0.1.95, WF Case 5; by tests; found 2026-10-27) — io.slack fails a whole reply that carries an HTML file
 
 - **What happens:** io.slack's MIME list has no `text/html`. A reply with a
   `generate_html_artifact` file is refused whole, the text and every other file, and Slack shows

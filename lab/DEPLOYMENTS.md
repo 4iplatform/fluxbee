@@ -21,6 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
+| **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ live, gate passed (two runs, the second from zero) | snap `pre-namefix-0-1-98` (all 4 VMs) · `apt install fluxbee=0.1.97` + core-update of the spokes |
 | **0.1.97** | 2026-11-03 | `b91260a5` | motherbee + spokes (core): SY.admin's executor dispatches a fixed step through the tool's own dispatch (A-144) | ✅ replaced by 0.1.98 (gate in course) | snap `pre-dispatchfix-0-1-97` (deleted 2026-11-03) · `apt install fluxbee=0.1.96` + core-update of the spokes |
 | **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ✅ replaced by 0.1.97 (gate in course) | snap `pre-gatefix-0-1-96` (deleted 2026-11-03) · `apt install fluxbee=0.1.95` + core-update of the spokes |
 | **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ✅ replaced by 0.1.96 (gate in course) | snap `pre-wfcase5-0-1-95` (deleted 2026-11-03) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
@@ -106,6 +107,30 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.98 — From WF Case 5's gate: a workflow's name follows the runtime naming policy (A-145); the gate passed
+
+- **Date:** 2026-11-03 (ART) · **Previous version:** 0.1.97 · **Commit:** `b8f41f1c`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** on 0.1.97 the workflow deployed as `ventas-gate0195`. The check and the compile passed
+  the hyphen, and the package's publish refused it (`PACKAGE_PUBLISH_FAILED`), with the definition
+  already current.
+- **What changed:** SY.wf-rules, Archi and SY.admin's note follow the runtime naming policy:
+  lowercase letters and digits in dot-joined parts, no hyphens. The refusal says the rule, so the
+  check refuses the name before anything rotates.
+- **Checks before the release:**
+  - SY.wf-rules' Go tests, a new one included;
+  - SY.architect's tests (238), SY.admin's (299);
+  - clippy, the catalog's parity and the doc links.
+- **Deploy:**
+  - build of `b8f41f1c` in 12 min, publish in 19 s;
+  - 0.1.98 on all 4 in 189 s (manifest `eb6fdfc13c294b88`), health clean;
+  - the web route answered `acknowledged`, `ready` a minute after.
+- **The gate on 0.1.98** (wf-orchestration-v1 §5.5.3) passed:
+  - the first run, from the redeploy as `ventas.gate0195` on;
+  - a second run from zero, with a new session and the same request: Archi designed, checked and
+    deployed in one plan.
+- **Rollback:** `apt install fluxbee=0.1.97` on the motherbee, then a core-update of the spokes.
 
 ## 0.1.97 — From WF Case 5's gate: SY.admin's executor dispatches a fixed step the way the model's tool does (A-144)
 

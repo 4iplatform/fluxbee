@@ -24,8 +24,11 @@
 - **Case 4 (§5.4)** hands the conversation to a person of the team. It was decided with the
   operator from 2026-10-31 to 2026-11-02, released in 0.1.94, and validated on 8.x the same day
   (§5.4.12; ledger 0.1.94).
-- **Case 5 (§5.5)**, Archi writes and operates WFs, is being decided with the operator from
-  2026-11-02. With it go the ILK fix (A-139) and the bugs this test brought.
+- **Case 5 (§5.5)**, Archi writes and operates WFs. It was decided with the operator on 2026-11-02
+  and 2026-11-03, and released in 0.1.95. Its gate surfaced four bugs, fixed in 0.1.96 to 0.1.98.
+  It was validated on 8.x on 2026-11-03, in two runs, the second from zero (§5.5.3; ledger 0.1.95
+  to 0.1.98). With it went the ILK fix (A-139) and the bugs of Case 4's test. **The track is
+  complete.**
 
 This is the single place for the track. The cases are worked here one at a time.
 
@@ -309,7 +312,7 @@ This is the single place for the track. The cases are worked here one at a time.
 - **Case 4, handing the conversation to a person of the team (§5.4, decided 2026-11-02).** The WF
   bridges the person's IO node and the team's until the conversation comes back. With it come the
   subject marks, the menu for people, "not taken", and the catalog of known options.
-- **Case 5, Archi writes and operates WFs (§5.5, from 2026-11-02):**
+- **Case 5, Archi writes and operates WFs (§5.5, done 2026-11-03):**
   - a check before deploy, with `COMPILE_ERROR` back to the designer. Today's `check` is a
     compile, and it stages the definition (FINDINGS A-128);
   - instances visible through SY.admin;
@@ -1625,7 +1628,7 @@ side.
     - an empty fact shows as "person:" (the gate's client sends no sender);
     - Slack's own formatting reaches the person as typed (`_Hola…_`).
 
-### 5.5 Case 5: Archi writes and operates WFs. Being decided with the operator, from 2026-11-02
+### 5.5 Case 5: Archi writes and operates WFs. Decided with the operator on 2026-11-02 and 2026-11-03, validated on 8.x on 2026-11-03
 
 - **The operator's frame (2026-11-02):**
   - *"enfocate en terminar el WF y usar Archi lo más simple posible, el handbook con los casos
@@ -1981,6 +1984,111 @@ Not fixed:
   `check`, which the operator chose.
 - **Archi's chat answers only when its turn ends, and the edge waits 30 s** (A-142, new). It is not
   live: io.web proxies no Archi before its stage 2, and is recorded for that stage.
+
+#### 5.5.3 The gate (0.1.95 to 0.1.98 on 8.x, 2026-11-03)
+
+**The setup, from zero:**
+- the old gate removed (WF gate0192, its three agents and their roles);
+- a team member registered through Cloud;
+- the person and the team as clients on worker1's router (`IO.gate0195@worker1`,
+  `IO.gate0195team@worker1`), each sending its ILK and its ICH;
+- Archi on its own Opus, the rest of the motherbee on Sonnet.
+
+**The first run** asked for the solution in the operator's words: sales, invoicing and its return,
+a discount the team decides in 3 minutes, a credit note to the team with 5 minutes of quiet, and a
+due invoice for collections.
+
+**What Archi did:**
+- created three roles and a skill, and wrote the workflow from the atoms;
+- checked it with `wf_rules_check` before every plan;
+- stopped to ask when it could not read the two IO nodes' config to point them at the workflow.
+
+The workflow it wrote:
+- `start` keeps the person's `io` and message;
+- sales talks, with an idle timer;
+- invoicing gets the kept message, and `issued` sets the due timer from its answer;
+- `consulting` asks the team, with a 3-minute timer, and forwards the decision with the person's
+  `io`;
+- `with_team` posts the handover with `handback`, with a 5-minute quiet timer;
+- the catch takes the due timer and late answers.
+
+**What the run surfaced, each fixed at the source and released before the run went on:**
+- **A-143:** Archi set its agents' roles with `hive: worker1`, and the replica refused SY.admin.
+  - 0.1.96 sends identity writes to the primary.
+- **A-144:** the workflow's deploy outgrew SY.admin's executor model, which had to repeat the whole
+  definition, and Archi's chat said "finished".
+  - 0.1.96 dispatches a step with nothing to fill as planned, and the chat verifies the run. The
+    chat then said `error`, as it should, for the next failure.
+  - 0.1.97: the direct dispatch had reused a fallback that routes no wf-rules action, and now
+    dispatches the way the model's tool does.
+- **A-145:** the name `ventas-gate0195` passed the check, and the package's publish refused it.
+  - 0.1.98 gives SY.wf-rules, Archi and SY.admin the runtime naming policy. Archi removed the broken
+    workflow (`wf_rules_delete`) and deployed it as `ventas.gate0195`.
+- **Seen, not fixed:**
+  - Archi does not keep a definition across chat turns. It asked for the JSON once, and later
+    rebuilt it from the conversation. The deployed one can be read (`wf_rules_get_workflow`, the
+    handbook now says so). Where a solution lives is the chapter decided apart.
+  - A-146, the router's warning at every connect.
+
+**What passed, live:**
+- **The ILKs (A-139):**
+  - everything the person received named the person as `dst_ilk` and the person's channel as
+    `ich`, whoever wrote it (sales, invoicing, collections, a team member);
+  - the WF's own posts to the team named no one;
+  - a forward kept its own sender.
+- **The atoms:**
+  - talk (every thread);
+  - redirect: invoicing issued the invoice and gave the conversation back with `done`;
+  - consult: a decision reached the person through sales; no decision in 3 minutes made sales tell
+    the person; sales also consulted the team for a price it did not have;
+  - escalate: the team talked with the person both ways and handed back with a note; 5 minutes of
+    quiet gave the conversation back;
+  - the due timer: collections told the person 3 minutes after the invoice;
+  - the catch.
+- **Operating:**
+  - Archi listed the instances with the time each entered its state (from the log, not
+    `updated_at_ms`) and showed one in detail;
+  - it cancelled one after the operator's confirmation.
+- **An update:**
+  - Archi changed a text with one `compile_apply`, and the node restarted once;
+  - the recovery loaded 5 instances on 2 definitions;
+  - a conversation born before the update ended with the old text, and one born after with the
+    new.
+- **The removal:** Archi listed the 6 running conversations with their definitions, offered to
+  remove now, wait, or cancel them, and removed with `force` on the operator's OK.
+- **The cleanup:** Archi killed its three agents and deleted their roles and skill. A-126's check
+  found no ILK naming them, so no `force`.
+- **Journals:** the WF node logged no warning; the agents logged only the upgrades' restarts.
+
+**The run from zero** (0.1.98): a new Archi session, the same request, and one line the operator
+would know, that the IO nodes are clients with no config.
+- **The design:** Archi created three roles, wrote the workflow `gate0195`, a name the policy
+  admits, and checked it. It then staged one plan of 13 steps:
+  - the three agents `AI.gate0195.*`, each with its config and its role;
+  - the roles set with `hive: worker1`, which now went to the primary (A-143);
+  - the workflow, with `auto_spawn`.
+
+  The plan ran in 46 s, and its verification passed: the WF node runs.
+- **The same five conversations,** on new threads, passed as before:
+  - the ILKs and the ICH;
+  - the consulted discount decided and undecided;
+  - the handover handed back and gone quiet;
+  - the invoice and its return with `done`;
+  - collections at the due time.
+- **Operating:** Archi listed the instances and cancelled one on confirmation. It answered the two
+  in one plan, and the plan's message hid its listing (A-147, new).
+- **The update:** Archi read the deployed definition (`wf_rules_get_workflow`) and changed one text.
+  The node restarted once and recovered 5 instances on 2 definitions. A conversation born before
+  ended with the old text, one born after with the new.
+- **The removal:** Archi listed 6 running conversations and staged `wf_rules_delete` with `force`.
+  The plan's task said they end; the operator confirmed.
+- **The cleanup:** the three agents killed and their roles deleted. Nothing of the solution is
+  left, and the test tools stay.
+- **Archi on Opus:** its first run cost about 15 dollars, over 110 calls, with the retries the
+  bugs caused.
+
+**Not checked live:** io.slack's fixes (A-130, A-108, A-129), which need a person in Slack or a
+file in the blob store. Its 79 tests cover them; io.slack's revamp will exercise them.
 
 ## 6. Docs that drift from the code
 
