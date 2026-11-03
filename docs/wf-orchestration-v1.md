@@ -1652,6 +1652,25 @@ side.
        example's definition alone is 13 KB. Case 5 sizes both for a definition Archi writes.
   2. **A check before deploy** that stages nothing (A-128), with `COMPILE_ERROR` back to the
      designer (§4.7).
+     - **Verified (2026-11-03):**
+       - Archi checks only a definition's shape before deploy (`workflow_definition_shape_error`).
+         The real check, CEL, menus and node names, runs only at the deploy, after the operator
+         said yes.
+       - A deploy's error is `ExecutionActionFailed`: the run stops and asks the operator
+         (`retry`, `restart_from_design`, `discard`), and the role that wrote the definition never
+         sees it.
+       - `restart_from_design` runs the task again with no context, so the error is lost
+         (`execute_pipeline_start_with_context(…, "")`).
+     - **Decided (2026-11-03),** the operator: as OPA's.
+       - **`wf_rules_check`** (`POST /hives/{hive}/wf-rules/check`), as `opa_check` is. The hive's
+         SY.wf-rules compiles the definition and only answers. It takes no version, writes nothing,
+         and leaves the staged and the current definitions alone. A check id ties the answer to
+         its request, and each error names its exact path.
+       - **Archi checks every definition before showing it to the operator.** In the pipeline, a
+         failed check goes back to the role that wrote the definition as an audit finding (3
+         attempts, `MAX_ARTIFACT_ATTEMPTS`). In chat, the handbook's order is check, show, deploy.
+       - **A deploy that fails anyway** goes back to that role too, and `restart_from_design`
+         carries the error.
   3. **Deploying and updating without breaking what runs.** Each instance keeps its definition
      (§5.1, item 3). §4.7's pipeline problems are read again in the code first.
   4. **Operating instances through SY.admin** (§4.8): the engine's verbs exist, and nothing exposes
