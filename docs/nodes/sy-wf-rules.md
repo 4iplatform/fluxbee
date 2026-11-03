@@ -206,10 +206,11 @@ only through SY.admin.
 ## SY.admin HTTP routes
 
 On the motherbee (`127.0.0.1:8080`). The admin sends the four write operations as a
-`CONFIG_SET` with `operation` and `launched_by: operator`, delete as the `delete_workflow`
+`CONFIG_SET` with `operation` and `launched_by: operator`, the check as a `CONFIG_SET` with
+`operation: check` and a fresh `check_id` (and no version), delete as the `delete_workflow`
 command, and reads as queries, all to `SY.wf-rules@<hive in the URL>`
-(`handle_wf_rules_http`, `handle_wf_rules_query`). It sends the check (`wf_rules_check`) as a
-`CONFIG_SET` with `operation: check` and a fresh `check_id`, and waits for that answer only.
+(`handle_wf_rules_http`, `send_wf_rules_check`, `handle_wf_rules_query`). Of a check's answers it
+takes only the one that echoes its `check_id` ([SY.admin](sy-admin.md#checking-a-definition)).
 
 | Route | Admin action |
 | --- | --- |
@@ -219,6 +220,7 @@ command, and reads as queries, all to `SY.wf-rules@<hive in the URL>`
 | `POST /hives/{hive}/wf-rules/apply` body `{workflow_name, version?, auto_spawn?, tenant_id?}` | `wf_rules_apply` |
 | `POST /hives/{hive}/wf-rules/rollback` | `wf_rules_rollback` |
 | `POST /hives/{hive}/wf-rules/delete` body `{workflow_name, force?}` | `wf_rules_delete` |
+| `POST /hives/{hive}/wf-rules/check` body `{workflow_name, definition}` | `wf_rules_check` |
 | `GET /hives/{hive}/wf-rules` (`?workflow_name=` for one) | `wf_rules_list_workflows` / `wf_rules_get_workflow` |
 | `GET /hives/{hive}/wf-rules/status?workflow_name=` | `wf_rules_get_status` |
 

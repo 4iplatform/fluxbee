@@ -587,11 +587,15 @@ agent calls (§4.2.5), and patterns (§4.2.6). This guide covers deploying and o
 
 | Method | Path | Action |
 |---|---|---|
+| `POST` | `/hives/{hive}/wf-rules/check` | Validate only: nothing staged |
 | `POST` | `/hives/{hive}/wf-rules/compile` | Validate and stage |
 | `POST` | `/hives/{hive}/wf-rules/apply` | Promote staged → current, restart/spawn |
 | `POST` | `/hives/{hive}/wf-rules` | Compile + apply in one step |
 | `POST` | `/hives/{hive}/wf-rules/rollback` | Restore the previous version |
 | `POST` | `/hives/{hive}/wf-rules/delete` | Delete a workflow |
+| `GET` | `/hives/{hive}/nodes/WF.<name>/wf/instances` | List the instances (`?status=&limit=`) |
+| `GET` | `/hives/{hive}/nodes/WF.<name>/wf/instances/{instance_id}` | Read one instance (`?log_limit=`) |
+| `POST` | `/hives/{hive}/nodes/WF.<name>/wf/instances/{instance_id}/cancel` | Cancel one instance, body `{reason}` |
 | `GET` | `/hives/{hive}/wf-rules?workflow_name=X` | See the current definition |
 | `GET` | `/hives/{hive}/wf-rules/status?workflow_name=X` | See the state + node info |
 | `GET` | `/hives/{hive}/wf-rules` | List all workflows |
@@ -622,14 +626,18 @@ agent calls (§4.2.5), and patterns (§4.2.6). This guide covers deploying and o
 
 **Response correlation:** every message an instance sends carries the instance's thread in `meta.thread_id`: the thread of the message that started it. The nodes that answer must copy that `thread_id` into their response so the WF correlates it with the right instance.
 
-**Cancel an in-flight instance:** the WF node's instance verbs (`WF_CANCEL_INSTANCE`,
+**Operate the instances:** the WF node's instance verbs (`WF_CANCEL_INSTANCE`,
 `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_GET_CODE`, `WF_HELP`) answer only `SY.admin@motherbee`
-and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED`. SY.admin has no instance
-actions yet, so a cancel goes as a message from SY.admin, whose answer is not shown:
+and `SY.wf-rules` of the WF's hive; anyone else gets `UNAUTHORIZED`. SY.admin's instance actions
+send the first three and answer what the engine says (`docs/nodes/sy-admin.md`, "Operating
+instances"): list the instances (a `status` of `running`, `completed`, `cancelled` or `failed`;
+a `limit` of 1 to 200, 50 without one), read one with its last log entries, and cancel one with a
+reason, which its log keeps:
 ```bash
-curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice@$HIVE/messages" \
-  -H "Content-Type: application/json" \
-  -d '{"msg_type": "system", "msg": "WF_CANCEL_INSTANCE", "payload": {"instance_id": "wfi:...", "reason": "operator"}}'
+curl -sS "$BASE/hives/$HIVE/nodes/WF.invoice/wf/instances?status=running&limit=50" | jq .payload.instances
+curl -sS "$BASE/hives/$HIVE/nodes/WF.invoice/wf/instances/wfi:...?log_limit=20" | jq .payload.instance
+curl -sS -X POST "$BASE/hives/$HIVE/nodes/WF.invoice/wf/instances/wfi:.../cancel" \
+  -H "Content-Type: application/json" -d '{"reason": "operator"}'
 ```
 The node's journal logs the instance id (`wfi:...`) and its thread when the instance starts:
 ```bash

@@ -344,7 +344,9 @@ Admin-facing wrappers (BUILT — live routes in `src/bin/sy_admin.rs`):
 Behavior:
 
 - admin wraps the request in the common L2 envelope
-- admin sends it as unicast to the target node
+- admin sends it as unicast to the target node: a bare `node_name` is a node of the path's hive,
+  in the request too, and a name of another hive is refused with `INVALID_REQUEST` (FINDINGS
+  A-127; the `messages` route does the same)
 - admin returns the node's `CONFIG_RESPONSE`
 
 This keeps `archi` off the raw transport details while preserving node-defined config schemas.

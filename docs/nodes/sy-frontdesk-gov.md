@@ -47,8 +47,11 @@ Source: `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (the whole node),
    `UNCONFIGURED`.
 4. Connects to the router (`RouterDispatcher::connect_with_retry`, every 1 s); every message goes
    to the AI runtime channel (`build_frontdesk_gov_rpc_profile`).
-5. Asks SY.vault for the AI key (`boot_self_configure`). Found: `CONFIGURED`. Not found: stays
-   `UNCONFIGURED`, and the log says the deterministic handoff still works.
+5. Asks SY.vault for the AI key (`boot_self_configure`). On an upgrade the whole hive restarts at
+   once, so this read waits for a vault that does not answer yet, up to 60 s
+   (`resolve_resource_awaiting_vault`, `VAULT_BOOT_WAIT`; FINDINGS A-141), as SY.architect's
+   does; every later read asks once. Found: `CONFIGURED`. Not found: stays `UNCONFIGURED`, and the
+   log says the deterministic handoff still works.
 6. Runs the AI node runtime (`NodeRuntime::run_with_config`) with its own ILK on its replies.
 
 ## Who reaches it

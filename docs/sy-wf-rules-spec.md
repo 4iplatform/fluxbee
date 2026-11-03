@@ -627,6 +627,7 @@ This is a destructive operation. Active instances are lost if `force: true`. The
 | `wf_rules_apply` | `POST /hives/{hive}/wf-rules/apply` | CONFIG_SET with operation=apply | Promote staged |
 | `wf_rules_rollback` | `POST /hives/{hive}/wf-rules/rollback` | CONFIG_SET with operation=rollback | Restore backup |
 | `wf_rules_delete` | `POST /hives/{hive}/wf-rules/delete` | command delete_workflow | Remove workflow |
+| `wf_rules_check` | `POST /hives/{hive}/wf-rules/check` | CONFIG_SET with operation=check and a check_id | Validate only: nothing staged |
 | `wf_rules_get_workflow` | `GET /hives/{hive}/wf-rules?workflow_name=X` | query get_workflow | Get current definition |
 | `wf_rules_get_status` | `GET /hives/{hive}/wf-rules/status?workflow_name=X` | query get_status | Get status + WF node info |
 | `wf_rules_list_workflows` | `GET /hives/{hive}/wf-rules` | query list_workflows | List all workflows |

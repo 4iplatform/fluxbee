@@ -52,9 +52,12 @@ fails with `missing_ai_api_key`.
    1 s), with a persistent UUID under `/var/lib/fluxbee/state/nodes`.
 6. Computes its ILK from its L2 name (`deterministic_system_ilk_id`), without waiting for the
    identity SHM.
-7. Builds the executor's AI runtime (`build_admin_executor_ai_runtime`, see
-   [The executor](#the-executor)). No key in the vault: the executor stays unavailable. An invalid
-   `ai` section in hive.yaml: `main` returns the error and the process exits.
+7. Checks the `ai` section of hive.yaml: an invalid one makes `main` return the error, and the
+   process exits. The executor's AI key is read in a task of its own, started with the loops of
+   step 9 (`boot_admin_executor_ai_runtime`, see [The executor](#the-executor)): on an upgrade the
+   whole hive restarts at once, so the read waits for a vault that does not answer yet, up to 60 s
+   (`resolve_resource_awaiting_vault`, `VAULT_BOOT_WAIT`; FINDINGS A-141), and the admin serves
+   meanwhile. Until the key is read, and with no key in the vault, the executor is unavailable.
 8. Reads the `web:` section (`WebConfig::from_hive`) and logs the web hosts it declares, then the
    `acme:` section and the certified names (`AcmeConfig::from_hive`): the main name, then those
    hosts. A section that cannot work declares nothing (`web:`) or turns ACME off (`acme:`) with a
@@ -238,11 +241,13 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `update`, `sync_hint` | `SY.orchestrator@<hive>` | `SYSTEM_UPDATE` (`category` runtime, core or vendor; default runtime), `SYSTEM_SYNC_HINT` |
 | `opa_*` writes | `SY.opa.rules@motherbee`, then waits for every hive's answer | `CONFIG_CHANGED`, subsystem `opa` (`send_opa_config_changed`) |
 | `opa_check` | `SY.opa.rules@motherbee` only; nothing is announced | `CONFIG_CHANGED`, action `check`, `version: 0` (a check takes no number from the counter); the answer is matched on the `config.check_id` it echoes (`send_opa_check`) |
-| `wf_rules_*` | `SY.wf-rules@<hive>` | `command` / `query` messages (`send_l2_action_request`) |
+| `wf_rules_*` | `SY.wf-rules@<hive>` | the writes as `CONFIG_SET` with `operation` (`send_wf_rules_config_set`); `delete_workflow` and the reads as `command` / `query` messages (`send_l2_action_request`) |
+| `wf_rules_check` | `SY.wf-rules@<hive>` only; it stages nothing | `CONFIG_SET`, `operation: check`, a fresh `check_id` and no version; only the answer that echoes that `check_id` counts (`send_wf_rules_check`) |
+| `wf_list_instances`, `wf_get_instance`, `wf_cancel_instance` | the WF node, `WF.<workflow>@<hive>` | `WF_LIST_INSTANCES`, `WF_GET_INSTANCE`, `WF_CANCEL_INSTANCE` → `WF_*_RESPONSE` (`handle_wf_instance_command`) |
 | `timer_*` | `SY.timer@<hive>` | `TIMER_*` → `TIMER_RESPONSE` (`handle_timer_rpc`) |
 | `list_streams` | every `RT.<router>.stream@<hive>` in the LSA | `STREAM_STATUS` (`handle_list_streams`) |
 | `get_llm_usage`, `GET /config/storage/metrics` | `SY.storage@motherbee` | `USAGE_QUERY`, `STORAGE_METRICS_GET` |
-| `node_control_config_get/set` | the node | `CONFIG_GET`, `CONFIG_SET` |
+| `node_control_config_get/set`, `send_node_message` | the node; a bare name is a node of the path's hive, and a name of another hive is refused (`node_name_on_hive`, FINDINGS A-127) | `CONFIG_GET`, `CONFIG_SET`; the message as given, with no answer awaited |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
 | `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
 | `unpublish_artifact` | the publication's edge, then `IO.blob@motherbee` | `EDGE_UNPUBLISH_BLOB`, `BLOB_RELEASE` ([Publications](#publications-and-the-audit-log)) |
@@ -258,7 +263,10 @@ Timeouts (`admin_action_timeout`; seconds, with environment overrides): `add_hiv
 orchestrator gives `teardown_node` 120 s, and the motherbee gives a spoke's purge 150 s),
 catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEOUT_SECS`; for
 `web_status`, its read of the orchestrator's view of io.web), everything else 30
-(`JSR_ADMIN_ORCH_TIMEOUT_SECS`).
+(`JSR_ADMIN_ORCH_TIMEOUT_SECS`). The `wf_rules_*` actions, the check included, wait 75 for
+SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`, `wf_rules_request_timeout`). The routes that ask a
+node itself (`node_control_config_get/set` and the instance actions) wait 5 less than their action,
+25, so they answer before a caller that waits 30.
 
 ### ORCHESTRATOR_BOOTING
 
@@ -346,6 +354,85 @@ Archi, and over the mesh only Archi may ask for it (`mesh_access`).
 
 SY.timer describes itself with `timer_help` (`TIMER_HELP`) and may answer `NODE_HELP` later.
 
+## Workflows: the check and the instances
+
+What Archi needs to write and operate a WF ([wf-orchestration-v1](../wf-orchestration-v1.md)
+§5.5, topics 2 and 4). Over the mesh only Archi asks for these (`mesh_access`).
+
+### Checking a definition
+
+`POST /hives/{hive}/wf-rules/check` (`wf_rules_check`), body `{workflow_name, definition}`, is to
+a workflow what `opa_check` is to a policy: a read. The hive's SY.wf-rules validates the definition
+as a compile does, with the same limits, and only answers: it takes no version and stages,
+publishes and stores nothing, so the staged and the current definitions stay as they are.
+
+- **The request** (`send_wf_rules_check`): a `CONFIG_SET` to `SY.wf-rules@<hive>` whose `config`
+  is the request's fields with `operation: "check"` and a fresh `check_id` (a UUID), without a
+  `version` or a `launched_by` (`wf_rules_check_config`).
+- **The answer:** only the one that echoes the `check_id` counts. An answer without it, or with
+  another, ran no check (an SY.wf-rules that knows no check compiles and stages instead), so it
+  is `502 TRANSPORT_ERROR`, never a pass (`wf_rules_check_answer`).
+  - A pass: `200`, payload `{ok: true, node_name, operation: "check", check_id, workflow_name,
+    guard_count, state_count}`.
+  - A refusal answers as a refused `wf_rules_compile` does: `status: error`, `error_code` and
+    `error_detail` from SY.wf-rules' `error` (`COMPILE_ERROR`, 422, names the exact path), and
+    SY.wf-rules' payload kept.
+
+```json
+{
+  "status": "error", "action": "check",
+  "payload": { "ok": false, "state": "error", "operation": "check", "check_id": "…",
+               "error": { "code": "COMPILE_ERROR", "detail": "states[0].transitions[1].guard: …" } },
+  "error_code": "COMPILE_ERROR", "error_detail": "states[0].transitions[1].guard: …"
+}
+```
+
+### Operating instances
+
+Three actions on a WF node, each the engine's own verb sent to the node and its answer as it is
+(`handle_wf_instance_command`). The engine answers these verbs only to `SY.admin@motherbee` and
+to its hive's SY.wf-rules (`controlCallerAuthorized`, go/nodes/wf/wf-generic/node/dispatch.go).
+
+| Action | Route | Sends |
+| --- | --- | --- |
+| `wf_list_instances` | `GET /hives/{hive}/nodes/{node_name}/wf/instances?status=&limit=` | `WF_LIST_INSTANCES {status, limit}` |
+| `wf_get_instance` | `GET /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}?log_limit=` | `WF_GET_INSTANCE {instance_id, log_limit}` |
+| `wf_cancel_instance` | `POST /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}/cancel`, body `{reason}` | `WF_CANCEL_INSTANCE {instance_id, reason}` |
+
+- **The node:** a bare `WF.<workflow>` is a node of the path's hive (over the mesh, of the
+  target, or a `node_name@hive` wins). A name of another hive, or of a node that is not `WF.*`, is
+  refused with `400 INVALID_REQUEST` before anything is sent (`wf_instance_request`).
+- **The fields**, checked before anything is sent:
+  - `status`: `running`, `completed`, `cancelled` or `failed`; without it, every instance;
+  - `limit`: 1 to 200, 50 without it (the engine would take none as every instance);
+    `log_limit`: 1 to 200, the engine's 20 without it. A value out of range is refused, never
+    cut;
+  - `reason` is required for a cancel: the instance's log keeps it.
+- **The answer** is the engine's payload as it is. `wf_list_instances` answers `{ok: true, count,
+  instances: [{instance_id, thread_id, workflow_type, definition_hash, status, current_state,
+  created_at_ms, updated_at_ms, terminated_at_ms}]}`, newest first; `wf_get_instance` answers
+  `{ok: true, instance: {…, input, state_variables, recent_log}}`; `wf_cancel_instance` answers
+  `{ok: true, instance_id, status: "cancelled"}`.
+- **A refusal**, `{ok: false, error: <code>, detail}`, keeps that payload and gives `error_code`
+  and `error_detail` (`wf_instance_answer`): `INSTANCE_NOT_FOUND` 404,
+  `INSTANCE_ALREADY_TERMINATED` and `node_not_configured` 409, `INVALID_REQUEST` 400,
+  `STORE_ERROR` 502. A node that does not answer is `TIMEOUT` or `TRANSPORT_ERROR`.
+- **The cancel** changes a running conversation: it is the one mutating action of the three, with
+  `confirmation_required`, so Archi asks the operator first. The engine runs the cancel transition
+  (the instance's exit actions and the `cancelled` state's entry actions when the definition has
+  one), cancels its timers and ends it `cancelled`. Nothing it already did is undone.
+
+```json
+{
+  "status": "ok", "action": "wf_list_instances",
+  "payload": { "ok": true, "count": 1, "instances": [ { "instance_id": "wfi:…", "thread_id": "…",
+    "workflow_type": "invoice", "definition_hash": "…", "status": "running",
+    "current_state": "waiting_team", "created_at_ms": 1775577000000,
+    "updated_at_ms": 1775578000000, "terminated_at_ms": null } ] },
+  "error_code": null, "error_detail": null
+}
+```
+
 ## The executor
 
 The executor runs an `executor_plan`: a list of admin actions with their arguments, written by
@@ -392,9 +479,10 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`.
 - **Model and key**: provider and model from the hive.yaml `ai` section (fallback provider when
   it is absent); the key from SY.vault, resource type = the provider, root tenant
-  (`build_admin_executor_ai_runtime`). Without a key `executor_execute_plan` answers
-  `EXECUTOR_UNAVAILABLE`. A `VAULT_SECRET_CHANGED` for that provider rebuilds the runtime
-  in place (`handle_vault_secret_changed_admin`).
+  (`build_admin_executor_ai_runtime`). At boot the read waits for the vault, up to 60 s, in a task
+  of its own (`boot_admin_executor_ai_runtime`); a later read asks once. Without a key
+  `executor_execute_plan` answers `EXECUTOR_UNAVAILABLE`. A `VAULT_SECRET_CHANGED` for that
+  provider rebuilds the runtime in place (`handle_vault_secret_changed_admin`).
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, tenant
   source `root`), with work `{execution_id, caller, stage}` where stage is `executor` or
   `executor_review` (`executor_usage_account`). The record goes to the node's router stream
@@ -762,7 +850,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 17, 107 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 18, 111 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -859,9 +947,13 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `wf_rules_apply` | `POST /hives/{hive}/wf-rules/apply` | Apply the staged workflow definition. |
 | `wf_rules_rollback` | `POST /hives/{hive}/wf-rules/rollback` | Rollback to the backup workflow definition. |
 | `wf_rules_delete` | `POST /hives/{hive}/wf-rules/delete` | Delete a managed workflow through SY.wf-rules. |
+| `wf_rules_check` | `POST /hives/{hive}/wf-rules/check` | Validate a workflow definition without staging or applying it. |
 | `wf_rules_get_workflow` | `GET /hives/{hive}/wf-rules` (with `?workflow_name=`) | Read the current workflow definition managed by SY.wf-rules for a hive. |
 | `wf_rules_get_status` | `GET /hives/{hive}/wf-rules/status` | Read workflow status from SY.wf-rules for a hive. |
 | `wf_rules_list_workflows` | `GET /hives/{hive}/wf-rules` | List workflows managed by SY.wf-rules for a hive. |
+| `wf_list_instances` | `GET /hives/{hive}/nodes/{node_name}/wf/instances` | List the instances of one WF node, newest first, all or those of one status: each with its thread, its state and status, and when it was created, last changed and ended. |
+| `wf_get_instance` | `GET /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}` | Read one instance of a WF node: its thread, state and status, its input, its state variables and its most recent log entries. |
+| `wf_cancel_instance` | `POST /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}/cancel` | Cancel one running instance of a WF node: its cancel transition runs, and the conversation it carries ends. |
 | `timer_help` | `GET /hives/{hive}/timer/help` | Read the self-described SY.timer capability catalog for a hive. |
 | `timer_get` | `GET /hives/{hive}/timer/timers/{timer_uuid}` | Read one timer by uuid from SY.timer for a hive. |
 | `timer_list` | `GET /hives/{hive}/timer/timers` | List timers from SY.timer for a hive, optionally filtered by owner. |
@@ -890,7 +982,7 @@ Served by `handle_http`, `handle_hive_paths` and `handle_modules_paths` but not 
 | `GET /inventory/nodes` | Global inventory, nodes |
 | `GET /versions?hive=`, `GET /deployments?hive=`, `GET /drift-alerts?hive=` | The per-hive form of the global route |
 | `GET /opa/policy?hive=`, `GET /opa/status?hive=` | Hive-less forms of the OPA reads |
-| `POST /wf-rules`, `POST /wf-rules/{compile,apply,rollback,delete}`, `GET /wf-rules`, `GET /wf-rules/status` | Hive-less forms of the wf-rules actions (hive from the body or query) |
+| `POST /wf-rules`, `POST /wf-rules/{compile,apply,rollback,delete,check}`, `GET /wf-rules`, `GET /wf-rules/status` | Hive-less forms of the wf-rules actions (hive from the body or query) |
 | `GET /modules`, `GET /modules/{name}`, `GET /modules/{name}/{version}`, `POST /modules/{name}/{version}` | The module store: list, versions, download (tar or file), upload a tar |
 
 ## Links

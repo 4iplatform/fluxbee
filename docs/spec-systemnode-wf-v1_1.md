@@ -187,7 +187,7 @@ WF nodes are not private components of specific flows. They are infrastructure: 
 
 At any moment, the hive has a catalog of capabilities available. This catalog is the aggregation of all `HELP` responses from all active nodes, including all WF nodes. `SY.admin` provides this catalog on demand — there is no separate registry.
 
-When an AI node wants to know "what workflows are available right now?", it asks `SY.admin`, which fans out `HELP` queries to all WF nodes (or uses a short cache), aggregates, and returns. The AI uses this as its toolbox: it sees what WFs exist, what tasks they offer, and what input schemas they expect. Archi does the same when designing new flows. **Not built for WF nodes:** SY.admin has no WF action yet (§16), so neither an AI node nor Archi reads a WF's `WF_HELP` today.
+When an AI node wants to know "what workflows are available right now?", it asks `SY.admin`, which fans out `HELP` queries to all WF nodes (or uses a short cache), aggregates, and returns. The AI uses this as its toolbox: it sees what WFs exist, what tasks they offer, and what input schemas they expect. Archi does the same when designing new flows. **Not built for WF nodes:** SY.admin has no action that asks a WF for its `WF_HELP` (§16), so neither an AI node nor Archi reads it today.
 
 This is self-description by pull, not registration by push. Each node is the authoritative source on what it can do. If a new WF is deployed, it becomes visible to the rest of the system the next time someone queries the catalog.
 
@@ -909,7 +909,7 @@ WF v1 supports soft abort of an instance. A soft abort means: "stop processing n
 
 ### 12.1 Triggering abort
 
-`SY.admin@motherbee` or `SY.wf-rules` of the WF's hive sends a system message to the WF (the WF answers its control verbs to those two only, since 0.1.90; anyone else gets `UNAUTHORIZED`):
+`SY.admin@motherbee` or `SY.wf-rules` of the WF's hive sends a system message to the WF (the WF answers its control verbs to those two only, since 0.1.90; anyone else gets `UNAUTHORIZED`). The operator, and Archi for the operator, cancel through SY.admin's `wf_cancel_instance` (§16):
 
 ```json
 {
@@ -1208,20 +1208,17 @@ Archi does not read `WF_HELP` today (§19.5).
 
 # Part III — Operational Surface
 
-## 16. SY.admin read-only surface
+## 16. SY.admin surface
 
-**Not built.** SY.admin has none of the actions below yet: exposing instances through SY.admin is a later case (`docs/wf-orchestration-v1.md` §4.8, Case 4). Today the WF node answers its `WF_*` verbs to `SY.admin@motherbee` and `SY.wf-rules` of its hive only; an operator can send one through SY.admin's `send_node_message`, whose answer is not shown. The design follows.
+SY.admin exposes a WF node's instances (`docs/wf-orchestration-v1.md` §5.5, topic 4): each action sends the engine's own verb to the WF node and answers the engine's payload as it is, a refusal's `error` and `detail` as the envelope's `error_code` and `error_detail` (`docs/nodes/sy-admin.md`, "Operating instances"). The WF node answers its `WF_*` verbs to `SY.admin@motherbee` and `SY.wf-rules` of its hive only; the operator, and Archi for the operator, reach them through SY.admin, as every admin action.
 
-Consistent with the pattern established by SY.timer, `SY.admin` would expose read-only operations for WF nodes:
+| Admin action | Route | Maps to | Purpose |
+|---|---|---|---|
+| `wf_list_instances` | `GET /hives/{hive}/nodes/{node_name}/wf/instances?status=&limit=` | `WF_LIST_INSTANCES` | List instances, newest first: all or those of one status; a limit of 1 to 200, 50 without one |
+| `wf_get_instance` | `GET /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}?log_limit=` | `WF_GET_INSTANCE` | One instance in full |
+| `wf_cancel_instance` | `POST /hives/{hive}/nodes/{node_name}/wf/instances/{instance_id}/cancel`, body `{reason}` | `WF_CANCEL_INSTANCE` | Cancel one running instance (§12); a change, so Archi asks the operator first |
 
-| Admin action | Maps to | Purpose |
-|---|---|---|
-| `wf_help` | `WF_HELP` | Get workflow contract |
-| `wf_list_instances` | `WF_LIST_INSTANCES` | List instances with filters |
-| `wf_get_instance` | `WF_GET_INSTANCE` | Get one instance full detail |
-| `wf_get_code` | `WF_GET_CODE` | Get workflow definition code |
-
-No admin action mutates an instance in v1: there is **no** `wf_cancel_instance` in admin. A cancel is a `WF_CANCEL_INSTANCE` from `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive, the only senders a WF takes it from (§12.1); an operator sends it through SY.admin's `send_node_message` (`POST /hives/{hive}/nodes/{node}/messages`), whose answer is not shown.
+A bare `WF.<workflow>` is a node of the path's hive. `WF_HELP` and `WF_GET_CODE` have no admin action: the definition is read through SY.wf-rules (`wf_rules_get_workflow`), and checked without staging it with `wf_rules_check`.
 
 ### 16.1 Instance listing and retrieval
 
@@ -1777,7 +1774,7 @@ This list is intentional. Each item was considered and deferred:
 - **Hot reload of workflow definitions.** v1 only loads definitions at startup. Changing the definition requires restarting the node. New instances will use the new version; old instances complete with the version they were born with.
 - **Event sourcing with full replay.** Only current state is persisted. Future v2 may add an event log.
 - **Cross-instance queries.** "Give me all instances waiting on customer X" is not supported directly. Can be emulated by indexing state variables, but v1 does not provide this.
-- **Direct admin mutations.** No `wf_cancel_instance` or similar in admin. A cancel is a `WF_CANCEL_INSTANCE` from `SY.admin@motherbee` or `SY.wf-rules` of the WF's hive; an operator sends it through SY.admin's `send_node_message` (§16).
+- **Admin mutations beyond a cancel.** SY.admin cancels an instance (`wf_cancel_instance`, §16) and nothing else: no forced transition, no edit of an instance's state or variables.
 - **Scheduled starts.** An instance is started only by a message from a `start_from` node that is no reply, never a `system` one (§14.2, §14.5). A `TIMER_FIRED` reaches only the running instance whose timer it is, so a timer on SY.timer whose target is the WF node starts nothing; a time-based start is not built (`docs/wf-orchestration-v1.md` §4.4).
 
 ## 21. v1 limitations (explicit)
