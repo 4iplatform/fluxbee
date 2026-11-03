@@ -1078,6 +1078,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-142 🟡 OPEN (found 2026-11-03, building WF Case 5; for io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
+
+- **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
+  (`handle_chat_message`, src/bin/sy_architect.rs). A turn can last minutes: since 0.1.95 each
+  of Archi's model calls may take up to 600 s, and a turn makes several, besides admin actions.
+  - The edge gives io.web 30 s for its response head (`IO_WEB_HEAD_TIMEOUT`, src/bin/sy_edge.rs),
+    then answers `502 UPSTREAM_UNAVAILABLE`.
+- **Not live yet:** io.web serves no Archi today (stage 1 answers without reading a request), and
+  the operator reaches Archi on the motherbee's own port.
+- **What it would break:** once stage 2 proxies Archi through the edge, any chat turn longer than
+  30 s answers 502 to the operator while it still runs in Archi.
+- **Fix, with stage 2:** either the edge's wait for Archi's routes covers a turn, or Archi's chat
+  answers at once and the page follows the turn by its session (the page already refreshes
+  sessions and streams messages). Decide in the stage 2 design, not here.
+
 ### A-141 🟡 OPEN (found 2026-11-02, sweeping the journals of WF Case 4's gate; with Case 5's bugs) — SY.frontdesk.gov reads its AI key once at boot, so an upgrade can leave it without its AI until a vault notice
 
 - **Seen on 8.x:**

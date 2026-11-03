@@ -1777,8 +1777,10 @@ Six pieces. Each one's tests come with it, and every behavior below is a contrac
 
 **Piece 1, the WF engine and the language** (go/nodes/wf/wf-generic, go/pkg/wfcel, the example):
 - **A-139, the ILKs** (actions.go):
-  - a `send_message` or a `forward` to an `IO.*` node of the definition's `start_from` names the
-    instance's person as `dst_ilk`, when the instance has one. Without a person, a forward keeps its
+  - a `send_message` or a `forward` to the person's IO node names the instance's person as
+    `dst_ilk`, when the instance has one. *Changed in the review (2026-11-03, §5.5.2):* the
+    person's IO node is the node whose message started the instance (`person_io`, store v6), not any
+    `IO.*` node of `start_from`; only its messages can leave the instance with no person. Without a person, a forward keeps its
     `dst_ilk`, and a send has none. *Added while building (2026-11-03):* the person's channel too,
     as `ich`, on the same condition. A forward of an agent's answer to a supervisor otherwise
     carries the supervisors' channel;
@@ -1922,6 +1924,63 @@ Six pieces. Each one's tests come with it, and every behavior below is a contrac
 
 On io.slack, whatever needs no person writing in Slack is checked live: an HTML file, an empty
 fact, a files-only post. The rest is checked by tests.
+
+#### 5.5.2 The review round (2026-11-03)
+
+Five reviewers, each blind to the others' lens:
+- the engine with SY.wf-rules;
+- SY.admin with SY.frontdesk.gov;
+- SY.architect;
+- io.slack;
+- the seams between the components, with the handbook Archi follows. This one ran the atoms on a
+  copy of the engine.
+
+No high finding. Fixed before the release:
+- **A deploy whose WF node did not run was reported as done** (medium, found by two reviewers).
+  SY.wf-rules answered `ok` with the node's failure only in `wf_node`. SY.admin's executor and
+  Archi took that for a deploy that ran, in the pipeline and in chat. Examples: a spawn refused
+  over a tenant the designer copied from a seed, or a package that reached a worker late. A later
+  run found the definition current and did nothing. The fixes:
+  - SY.wf-rules refuses such a deploy, `WF_NODE_NOT_DEPLOYED` (SY.admin 502). The answer still says
+    what is current and what happened to the node. Only `auto_spawn` off, with no node, is no
+    failure;
+  - Archi's verification reads each deploy's node step too. That covers a spoke still on 0.1.94
+    during the upgrade;
+  - the reconciler deploys again a workflow whose definition is current and whose node is gone;
+  - every deploy pins `auto_spawn` and the declared tenant;
+  - Archi's classifier hands `WF_NODE_NOT_DEPLOYED` to the operator.
+- **Atom 3 sent sales' decision to the person with the team's `io` context** (medium, confirmed on
+  the engine's copy). An agent answers where it was asked, so an IO node that places a reply by its
+  `reply_target` (io.wapp) would drop the decision. The atom's two forwards to the person now write
+  `meta.context.io` from `state.io`, as the validated example does, and a line under the atom says
+  why.
+- **The person's IO node was any `IO.*` node of `start_from`** (low; the engine). A message from the
+  team's IO node, when `start_from` names it too, took the person away from the instance. Sends to
+  it also named the person. The person's IO node is now the one whose message started the instance
+  (`person_io`, store v6). Only its messages can leave the instance with no person.
+- **The bot token went to whatever host a shared file named** (low; io.slack). This became
+  reachable once every file share in the channel reaches the mesh: an external file, or one an app
+  added. The token now goes only to Slack's file store.
+- **A deploy step that timed out said "will be retried automatically", and nothing retried it**
+  (low; SY.architect). At execution, every failure but the design's now goes to the operator, with
+  the options `retry`, `restart_from_design` and `discard`.
+- **A torn `config.json` jammed Archi's CONFIG_GET and CONFIG_SET** (low). Archi now writes the
+  file through a temporary one, and a CONFIG_SET replaces a config it cannot read.
+- **The handbook said `updated_at_ms` is since when an instance is in its state** (low; the seams).
+  It is the instance's last change. The time it entered its state is its last `transition` entry in
+  the log.
+- **Mine, while merging:**
+  - an automatic redesign recorded its closed run as discarded by the operator: now
+    `redesigned_after_failure`;
+  - one of Archi's tests listed instances by a status the engine does not have.
+
+Not fixed:
+- **A check on a spoke's 0.1.94 SY.wf-rules writes its staged slot** (low; SY.admin). This only
+  happens during the upgrade, where the old SY.wf-rules takes `check` for `compile`. The release
+  uses Archi only once the spokes run 0.1.95. Renaming the operation would part it from OPA's
+  `check`, which the operator chose.
+- **Archi's chat answers only when its turn ends, and the edge waits 30 s** (A-142, new). It is not
+  live: io.web proxies no Archi before its stage 2, and is recorded for that stage.
 
 ## 6. Docs that drift from the code
 

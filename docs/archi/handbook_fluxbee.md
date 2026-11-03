@@ -320,10 +320,11 @@ Common guards:
     among destinations, write one transition per destination, each with its guard.
   - Every message a WF sends is a `user` message, and carries the instance's thread.
   - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
-    `ich` that the messages of its `start_from` nodes share. On a thread several people write on,
+    `ich` that the messages of the person's IO node share: the IO node the person wrote from. On a thread several people write on,
     it carries none.
   - A message the WF writes to an IO node never names the person as its sender: the router's stamp
-    names the WF. To the person's own IO node (one of `start_from`), it names the person as
+    names the WF. To the person's own IO node (the one whose message started the instance; another IO node of
+    `start_from`, the team's say, is not the person's), it names the person as
     `dst_ilk`, and the person's channel as `ich`.
   - It carries no `io` context: when an agent's answer to it must reach a person, write the
     person's `io` context, kept in `state` from their message, in `meta.context.io`.
@@ -649,10 +650,10 @@ reply in its post's thread back to the instance's thread.
       "transitions": [
         {"event_match": {"src": "IO.slack.team@motherbee"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "decided"}, {"name": "wait"}, {"name": "answer_team"}]}}]},
         {"event_match": {"src": "IO.api.shop@worker1"}, "guard": "true", "actions": [{"type": "forward", "target": "AI.sales@worker1", "menu": {"options": [{"name": "answer"}]}}]},
-        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'decided'", "target_state": "talking", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'decided'", "target_state": "talking", "actions": [{"type": "forward", "target": "IO.api.shop@worker1", "meta": {"context": {"io": {"$ref": "state.io"}}}}]},
         {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'wait'", "actions": []},
         {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'answer_team'", "actions": [{"type": "forward", "target": "IO.slack.team@motherbee", "subject": "same"}]},
-        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]},
+        {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1", "meta": {"context": {"io": {"$ref": "state.io"}}}}]},
         {"event_match": {"msg": "TIMER_FIRED"}, "guard": "event.timer_key == 'no_decision'", "target_state": "talking", "actions": [{"type": "send_message", "target": "AI.sales@worker1", "meta": {"msg": "NO_DECISION", "context": {"io": {"$ref": "state.io"}}}, "menu": {"options": [{"name": "answer"}]}, "payload": {"type": "text", "content": "Nobody of the team decided your question. Tell the person that you could not confirm it yet."}}]}
       ]
     },
@@ -661,6 +662,11 @@ reply in its post's thread back to the instance's thread.
   ]
 }
 ```
+
+- Sales' answer to the team's message carries the team's `io` context, since an agent answers
+  where it was asked. So everything that goes from sales to the person while the team is consulted
+  writes the person's, `meta.context.io` from `state.io`. Without it, an IO node that places a
+  reply by its `reply_target` (io.wapp) drops the decision.
 
 **Atom 4, escalating the conversation.** For a person of the team who must take the conversation.
 - The team's io.slack shows the menu as a button. A click comes back with
@@ -853,9 +859,12 @@ its errors, and the answers that arrive after their wait.
   - In the pipeline, the designer's workflows are checked before the plan, and a refusal comes back
     to the designer.
 - **The manifest:** `desired_state.wf_deployments[i]` holds `hive`, `workflow_name`, `definition`
-  and `ownership`, and `tenant_id` for a workflow its hive does not have yet. The pipeline deploys a
-  new workflow with `auto_spawn` and that tenant.
+  and `ownership`, and `tenant_id` for a workflow its hive does not have yet. The pipeline deploys
+  with `auto_spawn` and that tenant, so a node that does not exist is spawned.
 - **In chat,** a first deploy is `wf_rules_compile_apply` with `auto_spawn: true` and `tenant_id`.
+- **A deploy whose node does not run the definition is refused,** `WF_NODE_NOT_DEPLOYED`: its
+  `wf_node` says why (a spawn or a restart that failed, a tenant that does not exist). The
+  definition is current anyway: fix the cause, and deploy again.
 - **An update** is one `wf_rules_compile_apply`, and the WF node restarts once.
   - A running instance keeps the definition it was born with, and a new conversation takes the new
     one.
@@ -864,8 +873,9 @@ its errors, and the answers that arrive after their wait.
   and the operator's confirmation removes the workflow with `force`. To let them finish, wait; to
   end them one by one, cancel them.
 - **Operating instances** (the node is `WF.<workflow_name>`):
-  - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and since
-    when (`updated_at_ms`);
+  - `wf_list_instances` (`hive`, `node_name`, `status`, `limit`): each instance's state, and its
+    last change (`updated_at_ms`), which is not when it entered its state: that is its last
+    `transition <from> → <state>` entry in `wf_get_instance`'s log;
   - `wf_get_instance` (`hive`, `node_name`, `instance_id`, `log_limit`): its input, its state
     variables (`waiting_for` and `last_error`, when the definition keeps them), and its last log
     entries;
