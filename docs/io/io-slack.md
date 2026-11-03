@@ -9,9 +9,10 @@ The **Slack IO Node** is the adapter between Slack and the internal system (rout
 For the MVP, its goal is:
 
 - **Inbound:** receive the bot's mentions (`app_mention`) and the plain messages of the bound
-  channel (`message`), and the clicks on a WF's menu (§3.3).
+  channel (`message`), files included, and the clicks on a WF's menu (§3.3).
 - **Outbound:** send messages to Slack using the **Slack Web API** (`chat.postMessage`), with a WF's
-  facts and menu (§8.4), and show a WF's "not taken" to whoever wrote (§8.5).
+  facts and menu (§8.4), and their files (§8.6), and show a WF's "not taken" to whoever wrote
+  (§8.5).
 
 This document **extends** the base IO Nodes specification and defines only
 the **Slack-specific** decisions and needs.
@@ -21,6 +22,12 @@ the **Slack-specific** decisions and needs.
 ## 2. MVP assumptions
 
 - There is **a single active logical instance** of the Slack IO Node per `workspace_id + conversation_id` binding.
+- **Each node needs a Slack app of its own**, with its own `xapp-` and `xoxb-` tokens (FINDINGS
+  A-129). In Socket Mode, Slack sends each event, and each click, to one of an app's open
+  connections, not to all of them. Two io.slack nodes on one app split its events between them:
+  each drops the other's share as outside its binding, with an `info` line ("dropping inbound
+  Slack event outside configured binding", or "dropping a click outside configured binding"), and
+  the node bound there never gets it.
 - Downtime is accepted if the node goes down.
 - IO Nodes do **NOT** handle a database or Redis; therefore:
   - deduplication and sessionization are **in memory** (*best-effort*),
@@ -119,11 +126,13 @@ records are `slack_threads.db`, next to the node's `config.json`: one row per pl
   - `same`: on a thread id with the node's post, into that post's Slack thread, with no new post
     and nothing forgotten, so a case keeps one Slack thread. On an unrecorded thread id, as `new`.
   - `end`: where `same` puts it; then the subject's open menu closes (§8.4). With no text, no
-    blocks and no files, it posts nothing, not even the fallback, and only closes the menu.
+    blocks and no files, it posts nothing (§8.6), and only closes the menu.
   - A place a person opened takes every message, whatever its mark. A mark the node does not know
     is `new`, with a log line.
 - A message's first post decides its place; the rest of the message (its files) goes there, after
-  a new post into that post's thread.
+  a new post into that post's thread. A file upload answers no `ts`, so a message with only files,
+  on a new place, posts a first text that names them, which is recorded, and the files go into its
+  thread (§8.6): a reply there takes the thread id, and a `same` goes into that thread.
 - **The open menus** (§8.4): the same file's `slack_menus` holds one row per post that shows a WF's
   menu as buttons: `channel_id` and `ts`, `thread_ts` (the Slack thread the post is in, empty at
   the top level), `thread_id` (where a click goes), the menu and the post's blocks as JSON, and
@@ -152,6 +161,7 @@ The Slack IO Node **MUST** support one of the following modes:
 - WebSocket connection using the **App-Level Token** (`xapp-...`).
 - Required scope: `connections:write`.
 - It does not need a public HTTP endpoint.
+- One app per node (§2): Slack sends each event to one of an app's connections.
 
 #### Option B - Events API (HTTP)
 - Public HTTPS endpoint.
@@ -167,10 +177,14 @@ The choice of mode does **NOT affect** the IO's internal contract.
 The Slack IO Node relays, in the bound channel only:
 - `type = "app_mention"`;
 - `type = "message"` when it is a plain message from a person:
-  - it has no `subtype`, so no edits, deletions, joins, bot posts or thread broadcasts;
+  - it has no `subtype`, or one of two that are a person's plain message all the same (FINDINGS
+    A-130): `thread_broadcast`, a reply with "Also send to #channel", relayed as the reply it is,
+    in its Slack thread; and `file_share`, a message that shares files, relayed with them (§7.1.b).
+    Any other subtype is dropped: edits, deletions, joins, bot posts;
   - it has no `bot_id`;
   - it is not the node's own post. The node knows its bot user id from `auth.test`; while that id
-    is unknown, it relays no `message` (it fails closed).
+    is unknown, it relays no `message` (it fails closed). So a file the node uploads, which comes
+    back as the node's own `file_share`, is never relayed.
 
 Relevant fields of the Slack event:
 - `user`: ID of the user who wrote.
@@ -178,14 +192,15 @@ Relevant fields of the Slack event:
 - `text`: message content.
 - `ts`: message timestamp.
 - `thread_ts`: thread timestamp, when the message is in a Slack thread.
+- `files`: the files a message shares.
 - `event_id` / `event_ts`: event identifiers.
 
 Other events are ignored.
 
-- **A mention may arrive twice.** A Slack app subscribed to `message.channels` (or
-  `message.groups`) already receives the mentions, as messages. Subscribed to `app_mention` too, a
-  mention may arrive as two events with different `event_id`s, and the node deduplicates by
-  `event_id` (FINDINGS A-130). Subscribe to the messages only.
+- **One message, two events.** A Slack app subscribed to `message.channels` (or
+  `message.groups`) receives the mentions as messages too; subscribed to `app_mention` as well, it
+  may get a message that mentions the bot as two events, with different `event_id`s. The node
+  deduplicates by the message as well as by the event (§4), so it relays that message once.
 
 ### 3.3 Interactive envelopes: a click on a WF's menu
 
@@ -195,8 +210,8 @@ each in a task of its own (`nodes/io/io-slack/src/slack_menu.rs`):
 - `block_actions`: a click on a menu's button (§8.4). A click on any other block is ignored;
 - `view_submission`: the submission of an option's modal (§8.4). Any other modal is ignored.
 
-A click outside the bound channel, or the bound workspace, is dropped with a `debug` line, as an
-event is.
+A click outside the bound channel, or the bound workspace, is dropped with an `info` line, as an
+event is (§2).
 
 - **The read loop only reads, acks and hands off** (`hand_off_envelope`):
   - the `events_api` envelopes go to one event worker, through a queue of 1,024, which takes them
@@ -224,15 +239,21 @@ Slack may resend events if:
 - the ACK is slow,
 - or there are transient errors.
 
-### Recommended deduplication key (in order of preference)
-1. `event_id` (if present)
-2. `(workspace_id, conversation_id, ts)` as a stable surrogate
+Slack may also deliver one message as two events, with different `event_id`s: an `app_mention`
+and a `message` (§3.2).
+
+### Deduplication keys
+The node deduplicates by both (FINDINGS A-130):
+1. the event, `event_id` (or the message's `ts` when there is none): the inbound processor, and
+   the relay's fragments (§5);
+2. the message, its channel and `ts`, in the event worker: the second event of one message is
+   dropped with a `debug` line. An event with no `ts` is never taken for another's.
 
 ### Implementation (no DB/Redis)
-- In-memory cache with a TTL.
-- Size limit: `max_entries`/`max_bytes`.
-- Eviction (TTL-LRU or drop-oldest).
-- Metrics: dedup_hits, dedup_misses, evictions.
+- In-memory caches with a TTL and a size limit: `DEDUP_TTL_MS` (10 minutes) and
+  `DEDUP_MAX_ENTRIES` (50,000) each.
+- Eviction: drop-oldest past the size limit.
+- Metrics: dedup_hits, dedup_misses (the inbound processor's).
 
 ### Operational rule
 - The ACK to Slack **MUST** be sent as soon as possible, without waiting for a response from the router or from identity.
@@ -382,6 +403,7 @@ Current effective allowlist of `IO.slack`:
 - `application/pdf`
 - `text/plain`
 - `text/markdown`
+- `text/html`
 - `application/json`
 - `text/csv`
 - `application/msword`
@@ -408,12 +430,14 @@ Current operational consequence:
 - if an attachment is outside this effective list, it is dropped inbound with `unsupported_attachment_mime`
 - those files do not reach the router or `AI.*`
 - so if a file type is supported on the `AI` side but is not in this effective policy, the real E2E limit is still `IO.slack`
+- the same list governs outbound: a file outside it is left out of the message, and the text names it (§8.6)
 
 Current state:
 
 - `png/jpg/webp/gif`: arrive as attachments
 - `pdf`: arrives as an attachment
 - `text/plain`, `text/markdown`, `application/json`: arrive as attachments
+- `text/html`: goes out as a file (an agent's `generate_html_artifact` page, FINDINGS A-108), and arrives as an attachment
 - `csv`, `doc/docx`, `xls/xlsx`, `ppt/pptx`: accepted by the current effective policy of `IO.slack`
 
 What is still to settle per type:
@@ -460,7 +484,7 @@ it answers, which can be another node's.
 
 ✅ **Implemented today:**
 - If the inbound payload to `io-slack` carries a text `content_ref`, `io-slack` resolves the blob and sends it as text through `chat.postMessage`.
-- The payload's `attachments[]` are sent as files using the external Slack files API flow.
+- The payload's `attachments[]` are sent as files using the external Slack files API flow, each alone (§8.6).
 
 ⚠️ **Known limitation (today):**
 - For very long text, this behavior can hit the `chat.postMessage` limit (Slack truncates above 40,000 characters).
@@ -486,7 +510,8 @@ A WF's block, `meta.context.wf` ([wf-orchestration-v1](../wf-orchestration-v1.md
   a case's menu with `end`, or plant buttons whose clicks go on that thread id.
 - **The facts:** `vars`, when it is a non-empty object, is a context line under the text, of
   `key: value` pairs: escaped, each value on one line and cut at 200 characters, 10 keys at most.
-  Facts alone make no post.
+  A key whose value is empty (`""`, a blank text, `null`, `[]` or `{}`) is left out: a WF's var
+  the person's context has no field for is `""` (FINDINGS A-130). Facts alone make no post.
 - **The menu:** the same menu an agent answers with an object is, here, a row of buttons under the
   post, one per option, labeled with its name (`_` as a space, the first letter capitalized). The
   menu's `help`, when it has one, is a context line above them.
@@ -549,6 +574,31 @@ When a WF takes a message nowhere, it answers `NOT_TAKEN`
 - The text is fixed by the reason: the answer's `detail` is never posted. An answer is shown once,
   and one for a message not remembered is dropped with a log line.
 - Any other system message stays ignored, and never reaches the channel.
+
+### 8.6 Files, and a message with nothing to post
+
+A message's text goes first, then its files, each uploaded alone (`files.getUploadURLExternal`,
+then `files.completeUploadExternal` into the text's place).
+
+- **A file the node cannot send is left out alone** (FINDINGS A-108): the text and the other files
+  still go, and the text names it, after a blank line: "Not sent: setup.exe, terms.pdf". A file is
+  left out, with a `warn` line and its code, when it is past the first `max_attachments`, of a type
+  outside the list (§7.1.b), past `max_attachment_bytes`, past `max_total_attachment_bytes` with
+  the files before it, or when its blob does not come (`io.blob.resolve_retry`) or does not read.
+  The files are read before the text goes.
+- **A file Slack refuses**, once the text went, is named the same way by a post after the files, in
+  the same place.
+- **A payload that does not read** (no `text/v1`, or a `content_ref` that does not resolve) still
+  fails the whole message: an error line with its code is posted.
+- **Only files, on a new place** (FINDINGS A-130): a message with no text and no blocks, on a thread
+  id with no place (§2.4), posts a first text that names its files ("File: report.pdf", or "Files:
+  report.pdf, chart.png"), whose `ts` is recorded, and the files go into its thread. A file upload
+  answers no `ts`: without that post, each file would be a top-level post of its own, the place
+  would never be recorded, and a reply, or the thread id's next message, would get another place.
+  On a place the node knows, and without the records, the files go with no such post.
+- **Nothing to post** (FINDINGS A-130): a message with no text, no blocks and no files, such as an
+  agent's empty reply a WF forwards, posts nothing, with an `info` line. There is no fallback text.
+  A WF's facts alone make no post; its menu alone does, as buttons.
 
 ---
 
@@ -651,6 +701,8 @@ This definition replaces any legacy mode or ad-hoc identity logic in the Slack n
 
 ✅ **NORMATIVE (TODAY, Socket Mode)**:
 - General deduplication still uses a stable `message_id` (preferably `event_id`; fallback `ts`).
+- In addition, the event worker deduplicates by the message, its channel and `ts`, so one message
+  delivered as two events is relayed once (§4).
 - In addition, the common relay does best-effort deduplication by `fragment_id` within each open session.
 - There is no dependency on `X-Slack-Retry-*` headers (specific to the HTTP Events API), since the active mode is Socket Mode.
 
