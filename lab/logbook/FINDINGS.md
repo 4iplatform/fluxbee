@@ -14,6 +14,102 @@ no change required
 
 ---
 
+## The board: open items by track
+
+> **Since 2026-11-04 (the operator):** the work is organized by track: **WF**, **io.web**,
+> **Archi**, **IO** (the family; each IO node is a track of its own inside it) and **General**
+> (the system's bugs, and what fits no track). Section B is the infrastructure and the lab.
+> Each open item of section A carries its track in brackets after its id (`A-136 [IO/io.slack]`),
+> and a new finding gets one when it is written. An item leaves the board when it closes; the
+> sections below keep their order.
+
+### This sprint (2026-11-04)
+
+1. **Small, from the tests:**
+   1. A-146 [General/router]: the VPN warning at debug.
+   2. A-147 [Archi]: the model's text shown with a staged plan.
+   3. A-115 [General/SY.timer]: a fire retried while its owner is unreachable; a one-shot never
+      fired twice; after a reboot, an overdue fire waits for its owner; caps on the delay, the
+      count and the payload; listing and reading only for the owner and SY.admin; and the target
+      rule, the operator's call (proposed: a node schedules only for itself, a SY node for any).
+2. **The 🔴, simple and important:**
+   1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
+   2. A-84 [General/SY.admin]: `bundle_upload` with no symlinks, regular files only, caps and its
+      own modes.
+   3. A-85 [IO/io.slack]: the file fetch streamed under a byte cap, with timeouts and no redirects.
+   4. A-89 [io.web]: slots counted past the handshake, a handshake budget per source, a shorter
+      timeout.
+   5. A-90 [io.web]: a share of the edge's slots per client, connections to io.web reused or closed
+      by io.web, a deadline for a stalled body.
+3. **WF, design first, one topic at a time:**
+   1. A-138 [WF]: the conversation's trace in the message: design, build, gate.
+   2. A-137 [WF]: the chat on cognition across hands. It builds on A-138: the mark cognition would
+      read travels in the message.
+
+Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release, with a WF gate.
+
+### WF
+
+- A-138 🔵 A message carries only a WF's trail of node names, not its conversation's trace.
+  *Sprint.*
+- A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint.*
+- A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
+
+### io.web
+
+- Stage 2 ([io-web-v2](../../docs/io-web-v2.md)): sessions, Cloud's one-time code, Archi behind
+  io.web. It waits for the operator's definition of its security.
+- A-89 🔴 io.web's connection slots fill before any authentication. *Sprint.*
+- A-90 🔴 One client can exhaust the edge's way to io.web. *Sprint.*
+- A-142 (Archi) bites here once stage 2 proxies Archi.
+
+### Archi
+
+- A-147 🟡 A chat turn that stages a plan drops the model's own text. *Sprint.*
+- A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
+- A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
+- A-120 🟡 Archi cannot take a page down.
+- The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
+  §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
+  across chat turns; the atoms become a document of their own.
+
+### IO
+
+- A-149 🟡 The family has no written standard, and its nodes answer health and config each their
+  own way.
+- A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
+- A-91 🔵 io.blob and io.cloud boot UNCONFIGURED while they work.
+- **io.slack:**
+  - A-85 🔴 The file fetch has no timeout and buffers the whole body. *Sprint.*
+  - A-136 🟡 One interlocutor's conversation is split by where they write in Slack.
+  - A-148 🟡 What it lacks against the standard, starting with its revamp's architecture.
+- **io.blob:**
+  - A-106 🟡 The blob store has no tenant.
+  - A-107 🔵 A published page cannot be updated under the same link (pending by the operator's
+    choice).
+- **io.wapp, io.linkedhelper:** test-grade (the operator, 2026-10-15). Their tracks start from the
+  standard.
+
+### General
+
+- A-146 🟡 The router warns at every connect when no VPN rule exists. *Sprint.*
+- A-100 🔴 The router gates protected verbs only for `msg_type` system, in exact case. *Sprint.*
+- A-84 🔴 `bundle_upload` follows symlinks and extracts without caps. *Sprint.*
+- A-115 🟡 SY.timer: no retry, no caps, an open listing. *Sprint.*
+- A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
+- A-80 🟡 A restore is refused when another tenant holds the same email.
+- A-96 🔵 How the SY nodes' tokens are measured per message.
+- A-103 🔵 The tool cards restate constants by hand.
+- Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
+- [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
+  U-12): to check, then bring here or close.
+
+### Infrastructure and the lab (section B)
+
+- B-14 🟡 The PROD VMs boot slowly (lab only).
+
+---
+
 ## A. The fluxbee product — candidates for a code change
 
 ### A-1 ✅ VALIDATED ON 8.x (0.1.81, 2026-10-20) — The orchestrator does not configure secondary network cards
@@ -241,7 +337,7 @@ no change required
   (15 → 0 local changes); after that `WF.w1probe@worker1` became HEALTHY: the first WF running on
   a worker.
 
-### A-22 🟡 PARTIAL (0.1.44 + 0.1.83: sockets 0600 with a peer-uid check) · binding a name to its process (P-1) PARKED with A-60 — A local node could send messages as another node
+### A-22 [General/security] 🟡 PARTIAL (0.1.44 + 0.1.83: sockets 0600 with a peer-uid check) · binding a name to its process (P-1) PARKED with A-60 — A local node could send messages as another node
 
 - **What happened:** the router looked up a frame's sender by the `routing.src` the frame declared,
   and from there stamped its L2 name, which is what the gate uses to decide protected actions.
@@ -939,7 +1035,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     in design: round 3 found that, as it was written, it cut off every existing hive (§8 of the
     doc).
 
-### A-49 🟡 PARKED (waits for O9) — The apt repo is not signed (`[trusted=yes]`): whoever impersonates it is root on the motherbee
+### A-49 [General/security] 🟡 PARKED (waits for O9) — The apt repo is not signed (`[trusted=yes]`): whoever impersonates it is root on the motherbee
 
 - **What happens (DTAP panel 2026-10-05, P-14, verified):**
   - The motherbee installs from `http://10.10.10.50:8900` with `[trusted=yes]`, because the repo
@@ -989,7 +1085,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Status:** validated in 0.1.58 (2026-10-06): the first round removed egress1 from
   `fluxbee-blob`, and the pending offer disappeared from the egress.
 
-### A-51 🟡 FIXED ON THE MOTHERBEE (0.1.60) · the spokes PARKED with O9 (a signed manifest) — root wrote into the `fluxbee` user's directories following names that user controls
+### A-51 [General/security] 🟡 FIXED ON THE MOTHERBEE (0.1.60) · the spokes PARKED with O9 (a signed manifest) — root wrote into the `fluxbee` user's directories following names that user controls
 
 - **What happens (adversarial review of stage 2, 2026-10-06):**
   - `ensure_owned_tree` leaves all of `/var/lib/fluxbee/dist` owned by the Syncthing user
@@ -1078,7 +1174,72 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-147 🟡 OPEN, for the next release (the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
+### A-150 [WF] 🔵 TO EVALUATE (kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
+
+- **What happens:** a WF's response contract (`response_envelope`) reaches the provider as an
+  output schema it enforces only on a call without tools. With tools, the contract is an
+  instruction in the system prompt, and ai.generic checks the answer afterwards
+  ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.2.1, item 3).
+- **What it breaks:** an agent with tools can answer outside its contract. The answer is then
+  `invalid_structured_output`, and the WF's catch takes it.
+- **To evaluate:** whether the provider can enforce the schema inside the tool loop.
+
+### A-149 [IO] 🟡 OPEN (read 2026-10-16 in the A-68 analysis, checked again 2026-11-03; recorded at the WF close) — The IO family has no written standard, and its nodes answer health and config each their own way
+
+- **No written standard:** [io-nodes-spec](../../docs/io/io-nodes-spec.md) is imported (v1.16) and
+  old: its §5 still lets credentials live in the local config or travel inline. In practice the
+  reference is io.api, io.cloud and the SDK. io.wapp and io.linkedhelper are test-grade (the
+  operator, 2026-10-15).
+- **Health:**
+  - io.api and io.cloud answer `NODE_STATUS_GET` with the SDK's default
+    (`try_handle_default_node_status`, crates/fluxbee_sdk/src/status.rs), which says `HEALTHY`
+    whatever the config state, so a `FAILED_CONFIG` node reports healthy.
+  - io.web, ai.generic and the frontdesk report the lifecycle with `last_error`, through the SDK's
+    `build_node_status_response_payload` (crates/fluxbee_sdk/src/managed_control_plane.rs).
+  - io.slack does not answer it (A-148).
+- **Config (read 2026-10-16):** each node writes its own `CONFIG_SET` handling, and staleness and
+  failure codes differ across io.api, io.slack, io.wapp and ai.generic. The SDK's reply builders go
+  unused.
+- **The config file:** the SDK persists the effective config with the default mode
+  (`persist_effective_config_with_root`), 0644 under the usual umask, where the orchestrator writes
+  0600. No IO node keeps a secret there today: credentials are vault references.
+- **Boot states:** A-91.
+- **Fix:** the IO topic starts by writing the standard every IO node follows; then each node's
+  track brings it there.
+
+### A-148 [IO/io.slack] 🟡 OPEN (found 2026-11-03, the review at the WF close; read in the code) — io.slack against the IO standard: what it lacks besides its known findings
+
+io.slack works for what the WF uses: inbound, outbound, threads, menus, "not taken" and files were
+validated live in WF Cases 3 and 4. Against the standard it lacks:
+- **The architecture, its revamp:** each node needs a Slack app of its own (A-129). The operator's
+  definition (2026-11-02): one channel = one ICH = one node, over Slack's HTTP events through the
+  edge's fan-out (`fanout_family`, src/bin/sy_edge.rs, built for io.wapp); or one node per
+  workspace, multiplexing its channels. A design decision comes first.
+- **The socket** (`run_inbound_socket_mode`, nodes/io/io-slack/src/main.rs):
+  - one connection. On Slack's `disconnect` it closes it and opens another, with no overlap, and
+    logs it at warn;
+  - it acks each envelope before handing it to an in-memory queue (`SOCKET_EVENTS_QUEUE`, 1024).
+    A restart, a full queue or a lost router connection loses events Slack does not send again
+    (`hand_off_envelope`).
+- **The tokens:** they come from SY.vault and are swapped hot by the refresh loop. Slack's token
+  rotation (tokens that expire and renew with a refresh token) is not implemented, so the app must
+  keep rotation off.
+- **The control plane:** it answers `PING`, `STATUS`, `CONFIG_GET` and `CONFIG_SET`
+  (`handle_io_control_plane_message`), not `NODE_STATUS_GET`. The orchestrator waits out its
+  timeout and infers the health (A-149).
+- **The outbound:** only Slack's rate limit (429) is retried (`slack_send_with_retry`). The outbox
+  with states and the error rules of [io-slack](../../docs/io/io-slack.md) §9–§10 are not in the
+  code.
+- **The docs drifted:**
+  - [io-slack](../../docs/io/io-slack.md) §11, §12 and "Hot configuration" still describe tokens in
+    the config and the env, and an `exit 1` without credentials. Since 2026-07-24 the credentials
+    are a vault reference (`slack.auth`), and the node boots degraded without them.
+  - [io-slack-tasks](../../docs/io/io-slack-tasks.md) is a July task list, stale.
+- **Its other findings:** A-85 (the file fetch), A-136 (where a message's thread is), A-114
+  (writing first; the family's).
+- **Fix:** io.slack's track, inside the IO topic, starting with the architecture.
+
+### A-147 [Archi] 🟡 OPEN, for the next release (the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
 
 - **Seen on 8.x:** the operator asked in one message for the running conversations, with their state
   and since when, and for one of them to be cancelled. Archi staged the cancel. Its answer was only
@@ -1092,7 +1253,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** show the model's text with the staged message. The operator (2026-11-03): in the next
   release, since the test found it and it is small.
 
-### A-146 🟡 OPEN, low, for the next release (the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
+### A-146 [General/router] 🟡 OPEN, low, for the next release (the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
 
 - **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
   none on 2026-11-01. It fires on every connect of a node that is not `SY.*` or `RT.*`: the gate's
@@ -1176,7 +1337,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the primary. A read still goes to the path's hive. A test covers both
   (`identity_writes_go_to_the_primary_whatever_hive_the_path_names`).
 
-### A-142 🟡 OPEN, for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
+### A-142 [Archi] 🟡 OPEN, for Archi's chapter (the operator, 2026-11-03; found the same day, building WF Case 5; it bites with io.web's stage 2) — Archi's chat answers only when its turn ends, and the edge waits 30 s for io.web's response head
 
 - **What happens:** Archi's `POST /api/chat` holds the request until the whole turn ends
   (`handle_chat_message`, src/bin/sy_architect.rs). A turn can last minutes: since 0.1.95 each
@@ -1266,7 +1427,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - a message the WF writes to an IO node does not name the person as its sender;
   - an agent still gets the person (A-116).
 
-### A-138 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
+### A-138 [WF] 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
 - **The operator's direction (2026-10-31, put on the table as a topic 2026-11-02):** the facts
   travel in the message itself: the trace, the nodes it passed through, and the state. Each node
@@ -1300,8 +1461,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - how it relates to `trace_id` and to the router stream's log records.
 - **Status:** a topic of its own, after the WF track. Case 4 uses the WF's facts and its own marks,
   and builds no general trace.
+- **2026-11-04, the operator:** for the WF track, and important: in this sprint.
 
-### A-137 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
   - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
@@ -1358,8 +1520,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (say the history and the compaction, without the feeling), or none.
 - **Status:** a new topic of its own, *"para darle foco"* (the operator). It is decided with the
   operator before anything is built, and it is not part of WF Case 4.
+- **2026-11-04, the operator:** for the WF track, and important: its chat comes in this sprint,
+  after A-138.
 
-### A-136 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
+### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
 - **What happens:** the thread id comes from the message's place in Slack
   (nodes/io/common/src/io_context.rs, `slack_inbound_io_context`; nodes/io/io-slack/src/thread_records.rs).
@@ -1729,7 +1893,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built in 0.1.92** (`maxAgentCallsPerTrigger`, go/nodes/wf/wf-generic/node), with its tests in
   catch_test.go. The heading said OPEN until 2026-11-02.
 
-### A-124 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
+### A-124 [Archi] 🟡 OPEN (found 2026-10-29) — A Cloud token published through Archi reaches the AI provider and stays in Archi's history
 
 - **What happens:** `publish_cloud_endpoint` answers with the new bearer, once
   ([io-cloud-api](../../docs/io-cloud-api.md) §2 and §7). Through Archi, that answer goes further:
@@ -1782,7 +1946,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     nothing;
   - `AI.*` and `SY.*` in `start_from` got `COMPILE_ERROR`.
 
-### A-122 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
+### A-122 [General/upgrade] 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 
 - **What happens:**
   - The 0.1.88 gate published `ai.generic 0.1.88-gate1` with publish-ia-runtime.sh, which made it
@@ -1830,7 +1994,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Status:** the orchestrator's tests cover it. It was not exercised on 8.x, because that needs
   SY.timer down.
 
-### A-120 🟡 OPEN (found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
+### A-120 [Archi] 🟡 OPEN (found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
 
 - **What happens:** `unpublish_artifact` is reachable only:
   - by an AI node, on its own pages, over the mesh;
@@ -2015,7 +2179,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   (payments' `PAYMENT_DUE`, "nobody took it", "quiet") went to the person's ILK
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
-### A-115 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
+### A-115 [General/SY.timer] 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
 - **What happens:**
   - **A fire is sent once.** If its owner is down, SY.timer ignores the router's `UNREACHABLE`
@@ -2044,8 +2208,13 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - Whether SY.timer should refuse such a timer for a requester that is not a SY node is for the
     operator.
 - **Later:** delivery retries and caps in SY.timer.
+- **2026-11-04, the operator:** now, in this sprint: *"ese tipo de cosas se detectan con las
+  pruebas y son difíciles de recordar"*. Read in the code the same day: only the WF schedules, and
+  always for itself (`timerScheduleOptions`, go/nodes/wf/wf-generic/node/actions.go); ai.generic
+  only asks the time (`TIMER_NOW_IN`). So the target rule (a node schedules only for itself, a SY
+  node for any) breaks no caller. It is the operator's call.
 
-### A-114 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
+### A-114 [IO] 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
 
 - **What happens:**
   - **No IO node writes to a person first.** Each answers only inside the conversation it brought
@@ -2202,7 +2371,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **The operator (2026-11-02):** io.slack's bugs go now, with WF Case 5's build
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.5).
 
-### A-107 🔵 PENDING by the operator's choice (2026-10-27) — A published page cannot be updated under the same link
+### A-107 [IO/io.blob] 🔵 PENDING by the operator's choice (2026-10-27) — A published page cannot be updated under the same link
 
 - **What happens:** a link is content-addressed. IO.blob curates `public/<sha256>`, the edge binds
   the key to that sha256 and size, and it refuses to rebind a key to different facts. Updating a
@@ -2216,7 +2385,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
 - **The operator:** *"dejalo pendiente, al final creo que es lo correcto pero tampoco es demasiado
   importante ahora"*.
 
-### A-106 🟡 OPEN, interim decision (found 2026-10-27) — The blob store has no tenant; agents read the whole hive
+### A-106 [IO/io.blob] 🟡 OPEN, interim decision (found 2026-10-27) — The blob store has no tenant; agents read the whole hive
 
 - **What happens:** a `BlobRef` carries no tenant, and the store has no per-tenant directory. Since
   0.1.89 (live 2026-10-28), `read_blob` lets an agent read any text blob of its hive by reference.
@@ -2272,7 +2441,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   - the examples, Archi's prompts and its versioned cookbook seeds name neither provider nor model.
 - **Validated:** a `config-set` with neither was accepted, with `claude-sonnet-5-5` from the hive.
 
-### A-103 🔵 TO EVALUATE (found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
+### A-103 [General/agent tools] 🔵 TO EVALUATE (found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
 
 - **What happens:** the cards repeat values that live elsewhere in the code:
   - the 128-byte filename limit;
@@ -2307,7 +2476,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Validated:** after the deploy, and after the A-109 relaunch, `node_help`, the binary, the stamp
   and `_system` all agreed.
 
-### A-100 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
+### A-100 [General/router] 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
 
 - **What happens:** the router's delivery gate checks protected verbs only on `msg_type: system`,
   and only in exact case. A node that took `msg_type: admin`, or a verb in lower case, received a
@@ -2320,6 +2489,8 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Seen on 8.x (0.1.85, 2026-10-27):** an `AI.intruso` client on worker1 sent `config_get`, in
   lowercase, as `system`. The router let it through, and the agent answered its whole config.
   Since 0.1.86 the agent refuses it.
+- **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
+  sprint.
 
 ### A-99 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — When a file generator runs, the model's own text is dropped
 
@@ -2352,7 +2523,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Validated:** a 2-page Spanish PDF had every accent, ñ, ¿ and ¡ escaped, and no raw byte
   ≥ 0x80.
 
-### A-96 🔵 TO EVALUATE (noted 2026-10-26) — How the SY nodes' tokens are measured per message
+### A-96 [General/usage] 🔵 TO EVALUATE (noted 2026-10-26) — How the SY nodes' tokens are measured per message
 
 - **What happens:** the SY nodes that call a model (cognition, Archi, the frontdesk) keep the
   hive's single provider (agent-tools-v1 T8). How their tokens are measured per message is still
@@ -2446,7 +2617,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **One WARN line per failed proxied request:** now aggregated per interval. *Live:* one line,
   `failed=1`, with the request id of the 502 before io.web started.
 
-### A-91 🔵 TO EVALUATE (found 2026-10-24) — io.blob and io.cloud boot UNCONFIGURED while they work; io.web boots CONFIGURED
+### A-91 [IO] 🔵 TO EVALUATE (found 2026-10-24) — io.blob and io.cloud boot UNCONFIGURED while they work; io.web boots CONFIGURED
 
 - **What happens:**
   - The SDK's boilerplate rule reads a seed-only `config.json` as UNCONFIGURED. So io.blob and
@@ -2456,7 +2627,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **To decide** with the IO family's review: whether the siblings should materialize their
   defaults the same way, so that a node's state says whether it works.
 
-### A-90 🔴 OPEN (found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
+### A-90 [io.web] 🔴 OPEN (found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
 
 - **What happens:** the proxy opens a TCP and TLS connection to io.web for each request and closes
   it first. Each one leaves a TIME_WAIT on the ingress.
@@ -2472,8 +2643,10 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   - a small keep-alive pool to io.web, so connections and their handshakes are not per request,
     or at least io.web closing first (`Connection: close` upstream);
   - a deadline for a stalled io.web body (docs/nodes/sy-edge.md, "Not there yet").
+- **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
+  sprint.
 
-### A-89 🔴 OPEN (found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
+### A-89 [io.web] 🔴 OPEN (found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
 
 - **What happens:** io.web takes one of its 256 slots at accept, before the TLS handshake, which
   may take 10 s.
@@ -2486,6 +2659,8 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   - count against the 256 only connections past their handshake;
   - give connections still in their handshake a small budget per source address and a shorter
     timeout (2–3 s on the internal network).
+- **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
+  sprint.
 
 ### A-88 ✅ RESOLVED (0.1.84; covered by tests, the fixed bodies seen on 8.x) — An `/e/` error hands internal detail to the internet
 
@@ -2526,14 +2701,16 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **Fix:** a minimum rate, an idle deadline, a per-IP cap, and download slots kept apart from
   `/e/` (with the edge's work in [io-web-v2](../../docs/io-web-v2.md)).
 
-### A-85 🔴 OPEN (found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
+### A-85 [IO/io.slack] 🔴 OPEN (found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
 
 - **What happens:** `download_private_file` (nodes/io/io-slack/src/main.rs) uses a client with no
   timeout, reads the whole body into memory and checks the size only afterwards.
 - **Fix:** stream to staging under a byte cap, with a connect timeout, a total deadline and a
   minimum rate; HTTPS only, no redirects, no non-global addresses.
+- **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
+  sprint.
 
-### A-84 🔴 OPEN (found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
+### A-84 [General/SY.admin] 🔴 OPEN (found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
 
 - **What happens:** `runtime_package_safe_blob_rel_path` (src/bin/sy_admin.rs) refuses only
   absolute paths and `..`, and the file is opened following symlinks; Syncthing replicates symlinks
@@ -2541,6 +2718,8 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   and keeps the zip's mode bits.
 - **Fix:** `O_NOFOLLOW` at each step, regular files only, a path under a root-only directory, and
   an extraction with caps that sets its own modes.
+- **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
+  sprint.
 
 ### A-83 ✅ RESOLVED (0.1.84; covered by tests) — The edge answers an empty 200 when it cannot build a response
 
@@ -2580,7 +2759,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   on `fluxbee-blob` (`wait_for_idle: false`) and waits up to 30 s for the file in the motherbee's
   `active/`; IO.blob never waits in its message loop; any curate error releases what was curated.
 
-### A-80 🟡 OPEN (found 2026-10-22) — A restore is refused when another tenant holds the same email
+### A-80 [General/identity] 🟡 OPEN (found 2026-10-22) — A restore is refused when another tenant holds the same email
 
 - **What happens:** `check_ilk_restorable` (src/bin/sy_identity.rs) looks the person's vouched
   email up across every tenant, while emails are unique per tenant. Restoring a marked person is
@@ -3728,7 +3907,7 @@ router reviews.
   the HTTP `DELETE` with and without a tenant, Archi over the mesh), all PASS (ledger 0.1.64).
   Minor pending item: the admin's HTTP maps `TENANT_NOT_FOUND` to 500.
 
-### A-60 🟡 PARKED (to evaluate, 2026-10-07; no design yet) — The managed nodes run as root
+### A-60 [General/security] 🟡 PARKED (to evaluate, 2026-10-07; no design yet) — The managed nodes run as root
 
 - **What happens:** the orchestrator launches the nodes (IO, AI, WF) with `systemd-run` without
   `User=`, so they run as root on every host. Seen in PROD on 2026-10-06 (read-only): `io-blob`,
@@ -3990,7 +4169,7 @@ router reviews.
     it, as egress and ingress already did: without vendor it never gets Syncthing, and nothing
     repairs it.
 
-### A-55 🟡 PARKED BY DECISION (D31) · a switch since 0.1.83 (`egress.ssh_from_wan: false`) — The egress's SSH door
+### A-55 [General/security] 🟡 PARKED BY DECISION (D31) · a switch since 0.1.83 (`egress.ssh_from_wan: false`) — The egress's SSH door
 
 - **What it is:** the operator keeps SSH (tcp 22) open on `egress.wan_iface` for operation and
   maintenance during this development. In PROD it is 192.168.8.240, an internal network behind a
@@ -4422,6 +4601,7 @@ router reviews.
 
 1. During the deployment: **findings are added, not fixed**.
 2. At the end: section **A** is reviewed with the operator, and the **code-change plan** comes out
-   of it (what changes, why, in what order, and what stays as a design decision). That plan goes
-   to [`PENDING-BUGS.md`](PENDING-BUGS.md), which is where the state of each task is tracked.
+   of it (what changes, why, in what order, and what stays as a design decision). Since
+   2026-11-04 that plan is the board at the top, by track, with the sprint; each open item names
+   its track after its id. [`PENDING-BUGS.md`](PENDING-BUGS.md) keeps the plan of August.
 3. Section **B** feeds `HANDBOOK.md` (recipes) and, where it applies, the infra scripts.
