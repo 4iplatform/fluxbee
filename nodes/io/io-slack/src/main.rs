@@ -973,6 +973,36 @@ const SLACK_WEB_API: &str = "https://slack.com/api";
 /// the token.
 const SLACK_FILE_STORE: &str = "https://files.slack.com";
 
+/// How long a shared file's download may take to connect, and in all (FINDINGS A-85).
+const FILE_DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FILE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The client a shared file is downloaded with (FINDINGS A-85): a connect timeout, a deadline for
+/// the whole download, and a redirect followed only on the file's own origin, where the bot token
+/// goes, three at most.
+fn file_download_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(FILE_DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(FILE_DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.origin() == attempt.url().origin());
+            if same_origin && attempt.previous().len() <= 3 {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+}
+
+/// A shared file's download: its bytes, or the size that made it too large.
+enum Download {
+    Bytes(Vec<u8>),
+    TooLarge(u64),
+}
+
 /// Whether `url` has `store`'s origin: its scheme, its host and its port.
 fn same_origin(url: &str, store: &str) -> bool {
     match (Url::parse(url), Url::parse(store)) {
@@ -984,6 +1014,8 @@ fn same_origin(url: &str, store: &str) -> bool {
 #[derive(Clone)]
 struct SlackClients {
     http: reqwest::Client,
+    /// The client of shared files' downloads (`file_download_client`).
+    downloads: reqwest::Client,
     runtime: Arc<RwLock<SlackRuntimeState>>,
     /// The base of the Web API's method URLs: `SLACK_WEB_API`, or a test's fake (`fake_web_api`).
     web_api: String,
@@ -1029,6 +1061,7 @@ impl SlackClients {
     fn new() -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::new(),
+            downloads: file_download_client().build()?,
             runtime: Arc::new(RwLock::new(SlackRuntimeState {
                 // Credentials are resolved from SY.vault post-construction (boot resolution + refresh
                 // loop, family vault_ref pattern) — never seeded from config.
@@ -1326,7 +1359,10 @@ impl SlackClients {
         Ok(())
     }
 
-    async fn download_private_file(&self, url: &str) -> Result<Vec<u8>> {
+    /// Downloads a shared file from Slack's file store with the bot token, reading at most
+    /// `max_bytes` (FINDINGS A-85): a file announced bigger is not read, and one that grows past it
+    /// is dropped as it comes.
+    async fn download_private_file(&self, url: &str, max_bytes: u64) -> Result<Download> {
         if !same_origin(url, &self.file_store) {
             return Err(anyhow::anyhow!(
                 "the file is not on Slack's file store ({}), and the bot token goes nowhere else",
@@ -1334,8 +1370,8 @@ impl SlackClients {
             ));
         }
         let slack_bot_token = self.slack_bot_token().await?;
-        let response = self
-            .http
+        let mut response = self
+            .downloads
             .get(url)
             .bearer_auth(slack_bot_token)
             .send()
@@ -1346,7 +1382,21 @@ impl SlackClients {
                 "slack private download failed with status {status}"
             ));
         }
-        Ok(response.bytes().await?.to_vec())
+        if let Some(length) = response
+            .content_length()
+            .filter(|length| *length > max_bytes)
+        {
+            return Ok(Download::TooLarge(length));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            let reached = (bytes.len() + chunk.len()) as u64;
+            if reached > max_bytes {
+                return Ok(Download::TooLarge(reached));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Download::Bytes(bytes))
     }
 
     async fn upload_file(
@@ -2576,8 +2626,28 @@ async fn collect_slack_blob_attachments(
             continue;
         };
 
-        let bytes = match slack.download_private_file(download_url).await {
-            Ok(bytes) => bytes,
+        // What is left of the message's share, and never more than one file may take.
+        let max_bytes = blob_payload_cfg.max_attachment_bytes.min(
+            blob_payload_cfg
+                .max_total_attachment_bytes
+                .saturating_sub(total_size),
+        );
+        let bytes = match slack.download_private_file(download_url, max_bytes).await {
+            Ok(Download::Bytes(bytes)) => bytes,
+            Ok(Download::TooLarge(actual)) => {
+                let err = IoBlobContractError::BlobTooLarge {
+                    actual,
+                    max: max_bytes,
+                };
+                tracing::warn!(
+                    file_id = %file_id,
+                    filename = %filename,
+                    code = err.canonical_code(),
+                    error = %err,
+                    "attachment skipped"
+                );
+                continue;
+            }
             Err(error) => {
                 let err = IoBlobContractError::Blob(fluxbee_sdk::blob::BlobError::Io(format!(
                     "slack download failed: {error}"
@@ -2592,36 +2662,7 @@ async fn collect_slack_blob_attachments(
                 continue;
             }
         };
-
         let actual_size = bytes.len() as u64;
-        if actual_size > blob_payload_cfg.max_attachment_bytes {
-            let err = IoBlobContractError::BlobTooLarge {
-                actual: actual_size,
-                max: blob_payload_cfg.max_attachment_bytes,
-            };
-            tracing::warn!(
-                file_id = %file_id,
-                filename = %filename,
-                code = err.canonical_code(),
-                error = %err,
-                "attachment skipped"
-            );
-            continue;
-        }
-        if total_size.saturating_add(actual_size) > blob_payload_cfg.max_total_attachment_bytes {
-            let err = IoBlobContractError::BlobTooLarge {
-                actual: total_size.saturating_add(actual_size),
-                max: blob_payload_cfg.max_total_attachment_bytes,
-            };
-            tracing::warn!(
-                file_id = %file_id,
-                filename = %filename,
-                code = err.canonical_code(),
-                error = %err,
-                "attachment skipped"
-            );
-            continue;
-        }
 
         let blob_ref = match blob_toolkit.put_bytes(&bytes, filename, &mime) {
             Ok(blob_ref) => blob_ref,
@@ -3768,7 +3809,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// gives that method's answers.
 #[cfg(test)]
 mod fake_web_api {
-    use super::SlackClients;
+    use super::{file_download_client, SlackClients};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -3829,6 +3870,10 @@ mod fake_web_api {
                 .no_proxy()
                 .build()
                 .expect("http client");
+            slack.downloads = file_download_client()
+                .no_proxy()
+                .build()
+                .expect("download client");
             slack.web_api = self.base.clone();
             slack.file_store = self.base.clone();
             slack
@@ -3935,8 +3980,9 @@ mod tests {
         is_control_plane_msg_type, message_seen, now_epoch_ms, outbound_content, parse_retry_after,
         post_ephemeral_body, post_message_body, post_outbound, run_slack_event_worker, same_origin,
         slack_inbound_config, slack_relay_policy_from_config, slack_vault_key,
-        vault_change_is_slack, Config, SlackBindingConfig, SlackClients, SlackRelayConfig,
-        SlackRuntimeState, SocketEnvelope, ENVELOPE_EVENTS_API, ENVELOPE_INTERACTIVE,
+        vault_change_is_slack, Config, Download, SlackBindingConfig, SlackClients,
+        SlackRelayConfig, SlackRuntimeState, SocketEnvelope, ENVELOPE_EVENTS_API,
+        ENVELOPE_INTERACTIVE,
     };
     use crate::fake_web_api::FakeWebApi;
     use crate::not_taken::RelayedMessages;
@@ -4773,13 +4819,34 @@ mod tests {
         }
         let slack = SlackClients::new().expect("client");
         let refused = slack
-            .download_private_file("https://drive.google.com/file/d/F0/view")
+            .download_private_file("https://drive.google.com/file/d/F0/view", 1024)
             .await
-            .expect_err("a file elsewhere is refused");
+            .err()
+            .expect("a file elsewhere is refused");
         assert!(
             refused.to_string().contains("not on Slack's file store"),
             "{refused}"
         );
+    }
+
+    /// A-85: a shared file is read only within its share: one announced bigger is not read.
+    #[tokio::test]
+    async fn a_shared_file_is_downloaded_within_its_share() {
+        let body = json!("x".repeat(2000));
+        let api = FakeWebApi::start(&[("F0BIG", body.clone())]).await;
+        let slack = api.client().await;
+        let url = api.url("files/F0BIG");
+        let expected = body.to_string().into_bytes();
+        match slack.download_private_file(&url, 1000).await {
+            Ok(Download::TooLarge(size)) => assert_eq!(size, expected.len() as u64),
+            Ok(Download::Bytes(_)) => panic!("a file over its share must not be read"),
+            Err(err) => panic!("download: {err}"),
+        }
+        match slack.download_private_file(&url, 5000).await {
+            Ok(Download::Bytes(bytes)) => assert_eq!(bytes, expected),
+            Ok(Download::TooLarge(size)) => panic!("a file within its share refused at {size}"),
+            Err(err) => panic!("download: {err}"),
+        }
     }
 
     /// A person's messages reach the mesh as the plain messages they are, once each (FINDINGS

@@ -10996,16 +10996,16 @@ async fn handle_ai_chat(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let raw_message = result
+    let model_text = result
         .final_assistant_text
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| {
-            if tool_results.is_empty() {
-                "The AI run completed without a textual response.".to_string()
-            } else {
-                "I executed live system lookups, but the model returned no final text.".to_string()
-            }
-        });
+        .filter(|text| !text.trim().is_empty());
+    let raw_message = model_text.clone().unwrap_or_else(|| {
+        if tool_results.is_empty() {
+            "The AI run completed without a textual response.".to_string()
+        } else {
+            "I executed live system lookups, but the model returned no final text.".to_string()
+        }
+    });
     let blocked_pipeline_recovery_message =
         if !pending_confirmation_staged && text_suggests_pending_confirmation(&raw_message) {
             let context = admin_tool_context(state, Some(&session.session_id));
@@ -11018,12 +11018,13 @@ async fn handle_ai_chat(
             None
         };
     let message = if pending_confirmation_staged {
-        latest_staged_confirmation_message(&result.items).unwrap_or_else(|| {
+        let staged = latest_staged_confirmation_message(&result.items).unwrap_or_else(|| {
             pending_confirmation_state
                 .map(PendingConfirmationFlow::staged_message)
                 .unwrap_or(raw_message.as_str())
                 .to_string()
-        })
+        });
+        staged_turn_message(model_text.as_deref(), staged)
     } else if text_suggests_pending_confirmation(&raw_message) {
         if tool_results.iter().any(|result| {
             result
@@ -11284,6 +11285,15 @@ async fn persist_router_incoming_message(
     session.last_message_preview = preview_text(&content, 88);
     upsert_session_record(&sessions, &session).await?;
     Ok(())
+}
+
+/// The chat's answer to a turn that staged a confirmation: the model's own text, which carries what
+/// the operator asked alongside the action, then the staged message (FINDINGS A-147).
+fn staged_turn_message(model_text: Option<&str>, staged: String) -> String {
+    match model_text.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) if text != staged.trim() => format!("{text}\n\n{staged}"),
+        _ => staged,
+    }
 }
 
 fn latest_staged_confirmation_message(
@@ -28714,6 +28724,21 @@ mod tests {
         let delta = opa_delta(&[pipeline_types::CompilerClass::RouteAdd]);
         let payload = build_confirm2_payload("run-1", &delta, "summary", &trace);
         assert!(payload["user_policy"].is_null());
+    }
+
+    #[test]
+    fn a_turn_that_stages_a_plan_keeps_the_models_answer() {
+        let staged = PendingConfirmationFlow::PlanCompile
+            .staged_message()
+            .to_string();
+        let answer = "Two conversations are running: wfi:1 since 10:02 and wfi:2 since 10:15.";
+        let message = staged_turn_message(Some(answer), staged.clone());
+        assert!(message.starts_with(answer), "{message}");
+        assert!(message.ends_with(&staged), "{message}");
+
+        assert_eq!(staged_turn_message(None, staged.clone()), staged);
+        assert_eq!(staged_turn_message(Some("  "), staged.clone()), staged);
+        assert_eq!(staged_turn_message(Some(&staged), staged.clone()), staged);
     }
 
     #[test]

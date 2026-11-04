@@ -25,14 +25,14 @@ no change required
 
 ### This sprint (2026-11-04)
 
-1. **Small, from the tests:**
-   1. A-146 [General/router]: the VPN warning at debug.
+1. **Small, from the tests** (✅ in code for 0.1.99, to check on 8.x):
+   1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
-   3. A-115 [General/SY.timer]: a fire retried while its owner is unreachable; a one-shot never
+   3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
       fired twice; after a reboot, an overdue fire waits for its owner; caps on the delay, the
       count and the payload; listing and reading only for the owner and SY.admin; and the target
-      rule, the operator's call (proposed: a node schedules only for itself, a SY node for any).
-2. **The 🔴, simple and important:**
+      rule, the operator's call (2026-11-04: a node schedules only for itself, a SY node for any).
+2. **The 🔴, simple and important** (✅ in code for 0.1.99, to check on 8.x):
    1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
    2. A-84 [General/SY.admin]: `bundle_upload` with no symlinks, regular files only, caps and its
       own modes.
@@ -59,13 +59,15 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 
 - Stage 2 ([io-web-v2](../../docs/io-web-v2.md)): sessions, Cloud's one-time code, Archi behind
   io.web. It waits for the operator's definition of its security.
-- A-89 🔴 io.web's connection slots fill before any authentication. *Sprint.*
-- A-90 🔴 One client can exhaust the edge's way to io.web. *Sprint.*
+- A-89 ✅ io.web's connection slots fill before any authentication. *Sprint: in code, to check on
+  8.x.*
+- A-90 ✅ One client can exhaust the edge's way to io.web. *Sprint: in code, to check on 8.x.*
 - A-142 (Archi) bites here once stage 2 proxies Archi.
 
 ### Archi
 
-- A-147 🟡 A chat turn that stages a plan drops the model's own text. *Sprint.*
+- A-147 ✅ A chat turn that stages a plan drops the model's own text. *Sprint: in code, to check
+  on 8.x.*
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - A-120 🟡 Archi cannot take a page down.
@@ -80,7 +82,8 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 - A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
 - A-91 🔵 io.blob and io.cloud boot UNCONFIGURED while they work.
 - **io.slack:**
-  - A-85 🔴 The file fetch has no timeout and buffers the whole body. *Sprint.*
+  - A-85 ✅ The file fetch has no timeout and buffers the whole body. *Sprint: in code, to check
+    on 8.x.*
   - A-136 🟡 One interlocutor's conversation is split by where they write in Slack.
   - A-148 🟡 What it lacks against the standard, starting with its revamp's architecture.
 - **io.blob:**
@@ -92,10 +95,15 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 
 ### General
 
-- A-146 🟡 The router warns at every connect when no VPN rule exists. *Sprint.*
-- A-100 🔴 The router gates protected verbs only for `msg_type` system, in exact case. *Sprint.*
-- A-84 🔴 `bundle_upload` follows symlinks and extracts without caps. *Sprint.*
-- A-115 🟡 SY.timer: no retry, no caps, an open listing. *Sprint.*
+- A-146 ✅ The router warns at every connect when no VPN rule exists. *Sprint: in code, to check
+  on 8.x.*
+- A-100 ✅ The router gates protected verbs only for `msg_type` system, in exact case. *Sprint: in
+  code, to check on 8.x.*
+- A-84 ✅ `bundle_upload` follows symlinks and extracts without caps. *Sprint: in code, to check on
+  8.x.*
+- A-115 ✅ SY.timer: no retry, no caps, an open listing. *Sprint: in code, to check on 8.x.*
+- A-151 🟡 A `TIMER_LIST` longer than one frame fails: a WF with about 280 pending timers cannot
+  reconcile at its start.
 - A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
 - A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
@@ -1174,6 +1182,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-151 [General/SY.timer] 🟡 OPEN (found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
+
+- **What happens:** SY.timer answers a `TIMER_LIST` in one `TIMER_RESPONSE`, which must fit the
+  router's 128 KiB frame. A WF's timer takes about 450 bytes listed, so about 280 fit; a longer
+  list is answered `TIMER_INTERNAL` (`sendTimerResponse`, go/sy-timer/main.go).
+- **What it breaks:** a WF node lists its pending timers at start, up to 1000 (`listTimers`,
+  go/nodes/wf/wf-generic/node/recover.go). With about 280 or more it never gets the list: it runs
+  DEGRADED, asks again every 30 s and fails each time, and never reconciles its timers. SY.admin's
+  `timer_list` fails the same way for the operator. Nothing in PROD is near it today.
+- **Fix:** `TIMER_LIST` in pages. SY.timer answers what fits, with a cursor (`fire_at`, `uuid`) for
+  the next page, and both SDKs' `List` follow the pages up to the limit. For the operator: this
+  sprint, or later.
+
 ### A-150 [WF] 🔵 TO EVALUATE (kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
 
 - **What happens:** a WF's response contract (`response_envelope`) reaches the provider as an
@@ -1239,7 +1260,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   (writing first; the family's).
 - **Fix:** io.slack's track, inside the IO topic, starting with the architecture.
 
-### A-147 [Archi] 🟡 OPEN, for the next release (the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
+### A-147 [Archi] ✅ RESOLVED (0.1.99; by tests; for the next release by the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
 
 - **Seen on 8.x:** the operator asked in one message for the running conversations, with their state
   and since when, and for one of them to be cancelled. Archi staged the cancel. Its answer was only
@@ -1252,8 +1273,12 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   steps in the page.
 - **Fix:** show the model's text with the staged message. The operator (2026-11-03): in the next
   release, since the test found it and it is small.
+- **Fixed (0.1.99):** the chat answers the model's own text first, then the staged message
+  (`staged_turn_message`, src/bin/sy_architect.rs). A turn with no text of the model's, or one that
+  only repeats the staged message, shows the staged message alone. Test:
+  `a_turn_that_stages_a_plan_keeps_the_models_answer`.
 
-### A-146 [General/router] 🟡 OPEN, low, for the next release (the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
+### A-146 [General/router] ✅ RESOLVED (0.1.99; for the next release by the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
 
 - **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
   none on 2026-11-01. It fires on every connect of a node that is not `SY.*` or `RT.*`: the gate's
@@ -1262,6 +1287,8 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   rule is what a hive without VPNs has.
 - **What it breaks:** nothing. It is noise at WARN in every journal sweep, which hides a real one.
 - **Fix:** log it at debug, or not at all. The operator (2026-11-03): in the next release.
+- **Fixed (0.1.99):** the warning is gone: `assign_vpn`'s debug line before it already counts the
+  snapshot's VPN rules.
 
 ### A-145 ✅ RESOLVED (0.1.98; by tests, and the second run named its workflow right; found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
 
@@ -2179,7 +2206,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   (payments' `PAYMENT_DUE`, "nobody took it", "quiet") went to the person's ILK
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
-### A-115 [General/SY.timer] 🟡 OPEN (found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
+### A-115 [General/SY.timer] ✅ RESOLVED (0.1.99, SY.timer 1.2; by tests; found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
 - **What happens:**
   - **A fire is sent once.** If its owner is down, SY.timer ignores the router's `UNREACHABLE`
@@ -2213,6 +2240,27 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   always for itself (`timerScheduleOptions`, go/nodes/wf/wf-generic/node/actions.go); ai.generic
   only asks the time (`TIMER_NOW_IN`). So the target rule (a node schedules only for itself, a SY
   node for any) breaks no caller. It is the operator's call.
+- **The operator (2026-11-04):** *"avanza como propones"*: the target rule as proposed.
+- **Fixed (0.1.99, SY.timer 1.2; [sy-timer](../../docs/sy-timer.md) §7.8, §12.1, §19):**
+  - **Saved before it goes.** A one-shot is saved `fired`, and a recurring timer its next instance,
+    before the fire is sent: a stop between the two loses the fire and never sends it twice. A row
+    that cannot be saved sends nothing, and is tried again in 30 s.
+  - **Sent again while the target is down.** The router's `UNREACHABLE` for a fire's trace id
+    (`NODE_NOT_FOUND`, `PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`), or a failed
+    send, sends the same fire again after 5, 10, 20 and 40 s, then each minute. It stops an hour
+    after the first attempt; sooner for a `fire_if_within` one-shot (its window) and a recurring
+    timer (its next instance); a `drop` one-shot is not sent again. The retries live in memory: a
+    stop of SY.timer loses them, and a WF's reconcile at its start covers that.
+  - **After a reboot,** an overdue fire is queued, not sent before the node serves, and goes again
+    until its owner is relaunched.
+  - **Caps:** a one-shot at most 366 days ahead (`TIMER_ABOVE_MAXIMUM`); a payload and a metadata
+    at most 32 KiB each; 10,000 pending timers per owner and 100,000 per hive
+    (`TIMER_LIMIT_EXCEEDED`).
+  - **Reads:** a node reads and lists its own timers, `SY.admin@motherbee` any (`TIMER_NOT_OWNER`,
+    `TIMER_FORBIDDEN`).
+  - **The target:** a node schedules for itself; a SY node for any (`TIMER_FORBIDDEN`).
+  - Tests: go/sy-timer `delivery_linux_test.go`, `limits_linux_test.go`, and the read and list
+    tests. Found on the way: A-151.
 
 ### A-114 [IO] 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
 
@@ -2476,7 +2524,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Validated:** after the deploy, and after the A-109 relaunch, `node_help`, the binary, the stamp
   and `_system` all agreed.
 
-### A-100 [General/router] 🔴 OPEN (found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
+### A-100 [General/router] ✅ RESOLVED (0.1.99; by tests; found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
 
 - **What happens:** the router's delivery gate checks protected verbs only on `msg_type: system`,
   and only in exact case. A node that took `msg_type: admin`, or a verb in lower case, received a
@@ -2491,6 +2539,11 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   Since 0.1.86 the agent refuses it.
 - **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
   sprint.
+- **Fixed (0.1.99):** the delivery gate takes a protected verb whatever the `msg_type`, in any case
+  and with spaces around it, and asks the system policy by its canonical name
+  (`protected_system_action`, src/router/system_policy.rs; `prepare_local_delivery`). The
+  orchestrator's own guard (SO-05) reads it the same way. Test:
+  `a_protected_verb_is_gated_on_any_msg_type_and_in_any_case`.
 
 ### A-99 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — When a file generator runs, the model's own text is dropped
 
@@ -2627,7 +2680,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **To decide** with the IO family's review: whether the siblings should materialize their
   defaults the same way, so that a node's state says whether it works.
 
-### A-90 [io.web] 🔴 OPEN (found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
+### A-90 [io.web] ✅ RESOLVED (0.1.99; by tests; found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
 
 - **What happens:** the proxy opens a TCP and TLS connection to io.web for each request and closes
   it first. Each one leaves a TIME_WAIT on the ingress.
@@ -2645,8 +2698,16 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   - a deadline for a stalled io.web body (docs/nodes/sy-edge.md, "Not there yet").
 - **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
   sprint.
+- **Fixed (0.1.99):** one client address holds at most 16 of the proxy's 128 slots
+  (`web_max_inflight_per_ip`, `PeerSlots`, moved to the SDK for the edge and io.web), and past them
+  gets a quick `429 WEB_PEER_BUSY`. Every request to io.web carries `Connection: close`, so io.web
+  closes first and the TIME_WAIT is the motherbee's, never a port of the ingress. io.web sending
+  nothing of a body for 30 s, while the edge waits on it, ends the response (`IoWebBody`). No pool:
+  each request is still its own TCP and TLS connection. Tests:
+  `one_client_holds_at_most_its_share_of_the_proxy`,
+  `a_body_io_web_stalls_ends_and_gives_its_slots_back`.
 
-### A-89 [io.web] 🔴 OPEN (found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
+### A-89 [io.web] ✅ RESOLVED (0.1.99; by tests; found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
 
 - **What happens:** io.web takes one of its 256 slots at accept, before the TLS handshake, which
   may take 10 s.
@@ -2661,6 +2722,11 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
     timeout (2–3 s on the internal network).
 - **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
   sprint.
+- **Fixed (0.1.99):** a connection takes one of the 256 only once its handshake ends, and is
+  closed then if none is free. Handshakes have their own slots: 128 at once, 32 from one source
+  address (its IPv6 /64 as one, the SDK's `PeerSlots`), each for 3 s at most, down from 10 s
+  (nodes/io/io-web/src/web.rs). Tests: `past_its_handshake_cap_a_new_connection_is_closed_at_once`,
+  `silent_connections_hold_no_served_slot`.
 
 ### A-88 ✅ RESOLVED (0.1.84; covered by tests, the fixed bodies seen on 8.x) — An `/e/` error hands internal detail to the internet
 
@@ -2701,7 +2767,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **Fix:** a minimum rate, an idle deadline, a per-IP cap, and download slots kept apart from
   `/e/` (with the edge's work in [io-web-v2](../../docs/io-web-v2.md)).
 
-### A-85 [IO/io.slack] 🔴 OPEN (found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
+### A-85 [IO/io.slack] ✅ RESOLVED (0.1.99; by tests; found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
 
 - **What happens:** `download_private_file` (nodes/io/io-slack/src/main.rs) uses a client with no
   timeout, reads the whole body into memory and checks the size only afterwards.
@@ -2709,8 +2775,15 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   minimum rate; HTTPS only, no redirects, no non-global addresses.
 - **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
   sprint.
+- **Fixed (0.1.99):** the download has its own client (`file_download_client`): a 10 s connect
+  timeout, a 120 s deadline, a redirect followed only on the file's own origin, three at most. It
+  reads at most the file's share (`max_attachment_bytes`, or what `max_total_attachment_bytes`
+  leaves): a file announced bigger is not read, and one that grows past it is dropped as it comes.
+  HTTPS and the host hold through the origin check of 0.1.95 (`files.slack.com`). Left out, by
+  cost: a minimum rate (the 120 s deadline bounds a slow one) and a check of the address the name
+  resolves to (the origin is Slack's). Test: `a_shared_file_is_downloaded_within_its_share`.
 
-### A-84 [General/SY.admin] 🔴 OPEN (found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
+### A-84 [General/SY.admin] ✅ RESOLVED (0.1.99; by tests; found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
 
 - **What happens:** `runtime_package_safe_blob_rel_path` (src/bin/sy_admin.rs) refuses only
   absolute paths and `..`, and the file is opened following symlinks; Syncthing replicates symlinks
@@ -2720,6 +2793,14 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   an extraction with caps that sets its own modes.
 - **2026-11-04, the operator:** the 🔴 items close now, as simple and important topics: in this
   sprint.
+- **Fixed (0.1.99):** `BundleBlob` (src/bin/sy_admin.rs) opens the zip under the blob root without
+  following a symlink at any step (the SDK's `safe_fs`, as the blob tree's writers do), takes only a
+  regular file of at most 512 MiB, and removes it through the directory it opened it in. The
+  extraction, under SY.admin's own staging directory, takes at most 10 000 entries and 1 GiB
+  (counted as they stream), only files and directories, each file once, with its own modes: 0755
+  when the zip marks it executable, 0644 otherwise. Tests:
+  `publish_runtime_package_bundle_refuses_a_symlinked_blob`, `..._refuses_a_symlink_entry`,
+  `..._sets_its_own_modes`, `copy_capped_refuses_more_than_its_cap`.
 
 ### A-83 ✅ RESOLVED (0.1.84; covered by tests) — The edge answers an empty 200 when it cannot build a response
 

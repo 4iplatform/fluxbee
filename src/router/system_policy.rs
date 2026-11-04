@@ -87,10 +87,20 @@ pub const PRIMARY_HIVE_ID: &str = fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 /// rule (1) composes the same decision from role + PRIMARY_HIVE_ID.)
 pub const EDGE_CONTROL_AUTHORITY: &str = "SY.admin@motherbee";
 
-/// Whether `action` is a protected SYSTEM action subject to the system authority
-/// gate.
+/// The protected SYSTEM action `action` names, in any case and with any spaces around it: its
+/// canonical name, the one the system policy decides on. A node that took `config_get` for
+/// CONFIG_GET would otherwise run it from any sender (FINDINGS A-100).
+pub fn protected_system_action(action: &str) -> Option<&'static str> {
+    let action = action.trim();
+    PROTECTED_SYSTEM_ACTIONS
+        .iter()
+        .copied()
+        .find(|protected| protected.eq_ignore_ascii_case(action))
+}
+
+/// Whether `action` is a protected SYSTEM action subject to the system authority gate, in any case.
 pub fn is_protected_system_action(action: &str) -> bool {
-    PROTECTED_SYSTEM_ACTIONS.contains(&action)
+    protected_system_action(action).is_some()
 }
 
 /// Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): may the mTLS-

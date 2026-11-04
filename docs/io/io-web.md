@@ -129,10 +129,11 @@ renders under its own policy, which a test checks (`the_page_loads_nothing_and_n
 
 | Limit | Value | Why |
 | --- | --- | --- |
-| TLS handshake | 10 s | a client that stalls its handshake holds nothing longer |
+| TLS handshake | 3 s | one on the internal network takes milliseconds; a client that stalls its handshake holds its handshake slot no longer (A-89) |
 | Request head | 30 s, from the handshake or the previous answer | one byte, or an h2 preface, never holds a connection longer; it also closes a keep-alive connection idle that long (hyper's head timer, as on the edge's door, A-87) |
 | Head size | 128 KiB per connection buffer | twice the edge door's, so a head the door admitted fits with the headers the edge adds; a longer head gets 431 |
-| Connections | 256 at once, handshakes included | one more is closed at accept, with a warning at most every 10 s |
+| Handshakes | 128 at once, 32 from one source address (its IPv6 /64 as one) | one more is closed at accept, with a warning at most every 10 s. A host that opens connections and stays silent fills these, for 3 s each, never the connections served (A-89) |
+| Connections | 256 at once, past their handshake | one more is closed once its handshake ends, with a warning |
 
 The edge's own caps on proxied requests come first (io-web-v2 §11.2 item 2). A client that keeps
 idle keep-alive connections must close them before the 30 s head timer does, or it may write into a
@@ -212,7 +213,8 @@ io.web logs to its unit's journal: `journalctl -u fluxbee-node-IO.web-motherbee`
 | `mesh client refused in the handshake: ...` | warn | a refused hive, with its role (logged by `fluxbee_sdk::mesh`) |
 | `IO.web closed a connection after its handshake: its hive is not a connected ingress` | warn | the registry, read once more after the handshake, no longer admits the hive |
 | `IO.web cut a connection: its hive is no longer a connected ingress` | info | the registry demoted or removed the hive |
-| `IO.web at its connection cap; closing new connections` | warn | at most every 10 s, with the count |
+| `IO.web at its handshake cap; closing new connections` | warn | at most every 10 s, with the count |
+| `IO.web at its connection cap; closing a connection past its handshake` | warn | each one, with the peer |
 | `IO.web answered` | debug | each request: hive, method, path, status, the edge's `X-Request-Id` |
 
 **A request's path is logged without its query,** so no query string reaches the journal

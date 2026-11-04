@@ -3553,14 +3553,17 @@ async fn handle_system_message(
     // serialize_for_local_delivery regression — cannot execute a critical
     // mutation here on an unauthorized or unresolved origin. In the normal path
     // this is a no-op (the message already passed the identical router check).
-    if let Some(action) = msg.meta.msg.as_deref() {
-        if json_router::router::system_policy::is_protected_system_action(action)
-            && !json_router::router::system_policy::authorize_system(
-                action,
-                msg.routing.src_l2_name.as_deref(),
-                &state.hive_id,
-            )
-        {
+    if let Some(action) = msg
+        .meta
+        .msg
+        .as_deref()
+        .and_then(json_router::router::system_policy::protected_system_action)
+    {
+        if !json_router::router::system_policy::authorize_system(
+            action,
+            msg.routing.src_l2_name.as_deref(),
+            &state.hive_id,
+        ) {
             tracing::warn!(
                 action = action,
                 src_uuid = %msg.routing.src,

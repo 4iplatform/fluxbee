@@ -24,6 +24,7 @@ use fluxbee_sdk::mesh::{
     install_crypto_provider, peer_hive_from_cert, HiveRegistry, HiveRole, MeshTlsError,
     MeshTlsMaterial, IO_WEB_PORT, MESH_TLS_DIR,
 };
+use fluxbee_sdk::peer_slots::{PeerSlot, PeerSlots};
 use fluxbee_sdk::protocol::PRIMARY_HIVE_ID;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -58,7 +59,7 @@ const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// (docs/io-web-v2.md §11.2 item 2); these bound what any host of the internal network can hold.
 #[derive(Debug, Clone)]
 pub struct WebLimits {
-    /// A TLS handshake must finish within this.
+    /// A TLS handshake must finish within this: one on the internal network takes milliseconds.
     pub handshake_timeout: Duration,
     /// Every request head must arrive within this, timed from the handshake or from the previous
     /// answer: one byte, or an h2 preface, never holds a connection longer, and a keep-alive
@@ -67,18 +68,26 @@ pub struct WebLimits {
     /// How often each connection checks that its hive is still a connected ingress, and the port
     /// that the registry can be read.
     pub registry_recheck: Duration,
-    /// The most connections held at once, handshakes included; one more is closed at accept.
+    /// The most connections held at once past their handshake; one more is closed once its
+    /// handshake ends. A connection still in its handshake holds none (FINDINGS A-89).
     pub max_connections: usize,
+    /// The most handshakes under way at once, in all and from one source address; one more is
+    /// closed at accept. A host that opens connections and stays silent fills these, and only for
+    /// `handshake_timeout`, never the connections served (FINDINGS A-89).
+    pub max_handshakes: usize,
+    pub max_handshakes_per_source: usize,
     /// How long io.web waits before trying its material and its port again.
     pub retry: Duration,
 }
 
 /// io.web's limits. The registry is checked as often as the router's WAN checks it.
 pub const LIMITS: WebLimits = WebLimits {
-    handshake_timeout: Duration::from_secs(10),
+    handshake_timeout: Duration::from_secs(3),
     header_read_timeout: Duration::from_secs(30),
     registry_recheck: Duration::from_secs(10),
     max_connections: 256,
+    max_handshakes: 128,
+    max_handshakes_per_source: 32,
     retry: Duration::from_secs(30),
 };
 
@@ -244,10 +253,13 @@ fn registry_state(registry: &HiveRegistry) -> WebState {
     }
 }
 
-/// The accept loop: one task per connection, at most `max_connections` at once, and the
-/// registry checked every `registry_recheck` for the state (the first time at once).
+/// The accept loop: one task per connection, at most `max_handshakes` of them in their handshake
+/// (`max_handshakes_per_source` from one address) and `max_connections` past it, and the registry
+/// checked every `registry_recheck` for the state (the first time at once).
 async fn serve(listener: TcpListener, acceptor: TlsAcceptor, setup: &WebSetup, status: &WebStatus) {
     let connections = Arc::new(Semaphore::new(setup.limits.max_connections));
+    let handshakes = Arc::new(Semaphore::new(setup.limits.max_handshakes));
+    let handshakes_per_source = PeerSlots::new(setup.limits.max_handshakes_per_source);
     let mut registry_check = tokio::time::interval(setup.limits.registry_recheck);
     let mut refused = Refusals::default();
     loop {
@@ -264,14 +276,18 @@ async fn serve(listener: TcpListener, acceptor: TlsAcceptor, setup: &WebSetup, s
                         continue;
                     }
                 };
-                let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                let (Ok(handshake), Some(source)) = (
+                    Arc::clone(&handshakes).try_acquire_owned(),
+                    handshakes_per_source.try_take(peer.ip()),
+                ) else {
                     drop(tcp);
                     if let Some(count) = refused.note() {
                         tracing::warn!(
                             peer = %peer,
                             refused = count,
-                            max_connections = setup.limits.max_connections,
-                            "IO.web at its connection cap; closing new connections"
+                            max_handshakes = setup.limits.max_handshakes,
+                            max_handshakes_per_source = setup.limits.max_handshakes_per_source,
+                            "IO.web at its handshake cap; closing new connections"
                         );
                     }
                     continue;
@@ -282,7 +298,8 @@ async fn serve(listener: TcpListener, acceptor: TlsAcceptor, setup: &WebSetup, s
                     acceptor.clone(),
                     setup.registry.clone(),
                     setup.limits.clone(),
-                    permit,
+                    (handshake, source),
+                    Arc::clone(&connections),
                 ));
             }
         }
@@ -311,18 +328,21 @@ impl Refusals {
     }
 }
 
-/// One connection, holding its permit to the end: the handshake under its timeout, the registry
-/// once more, then HTTP, until the peer or the head timer ends it, or until its hive is no longer a
-/// connected ingress.
+/// One connection: the handshake under its timeout, holding its handshake slots; a connection slot
+/// from then on, to the end; the registry once more; then HTTP, until the peer or the head timer
+/// ends it, or until its hive is no longer a connected ingress.
 async fn connection(
     tcp: TcpStream,
     peer: SocketAddr,
     acceptor: TlsAcceptor,
     registry: HiveRegistry,
     limits: WebLimits,
-    _permit: OwnedSemaphorePermit,
+    handshake: (OwnedSemaphorePermit, PeerSlot),
+    connections: Arc<Semaphore>,
 ) {
-    let tls = match tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp)).await {
+    let handshaken = tokio::time::timeout(limits.handshake_timeout, acceptor.accept(tcp)).await;
+    drop(handshake);
+    let tls = match handshaken {
         Ok(Ok(tls)) => tls,
         Ok(Err(err)) => {
             // A refused hive is logged by the verifier itself (fluxbee_sdk::mesh), with its role.
@@ -333,6 +353,14 @@ async fn connection(
             tracing::debug!(peer = %peer, "IO.web TLS handshake timed out");
             return;
         }
+    };
+    let Ok(_permit) = connections.try_acquire_owned() else {
+        tracing::warn!(
+            peer = %peer,
+            max_connections = limits.max_connections,
+            "IO.web at its connection cap; closing a connection past its handshake"
+        );
+        return;
     };
     // The verifier admitted the certificate's hive; it names the connection from here on.
     let Some(hive) = tls
@@ -778,18 +806,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(registry.root());
     }
 
-    /// Past its cap a new connection is closed at accept, before any handshake.
+    /// A-89: past the handshakes one address may hold, its next connection is closed at accept,
+    /// before any handshake; a silent connection holds its slot only for the handshake timeout.
     #[tokio::test]
-    async fn past_its_cap_a_new_connection_is_closed_at_once() {
+    async fn past_its_handshake_cap_a_new_connection_is_closed_at_once() {
         let ca = MeshCa::generate().unwrap();
         let registry = registry();
         let limits = WebLimits {
-            max_connections: 1,
+            max_handshakes_per_source: 1,
+            handshake_timeout: Duration::from_millis(500),
             ..limits()
         };
         let (listen, _) = start(&ca, &registry, limits).await;
         // A connection that never starts its handshake holds the only slot.
-        let _held = TcpStream::connect(listen).await.unwrap();
+        let mut held = TcpStream::connect(listen).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut second = TcpStream::connect(listen).await.unwrap();
         let mut byte = [0u8; 1];
@@ -797,6 +827,42 @@ mod tests {
             .await
             .expect("closed at accept");
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        // The silent one is closed at its handshake timeout, and the slot comes back.
+        let read = timeout(Duration::from_secs(2), held.read(&mut byte))
+            .await
+            .expect("closed at its handshake timeout");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        let mut ingress = dial(listen, client(&ca, "ingress1")).await.unwrap();
+        let (code, _, _) = exchange(&mut ingress, "GET", "/healthz").await.unwrap();
+        assert_eq!(code, 200);
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// A-89: connections in their handshake do not hold the connections served: with every one of
+    /// those held, a silent connection still gets its handshake slot, and is closed only once its
+    /// handshake ends.
+    #[tokio::test]
+    async fn silent_connections_hold_no_served_slot() {
+        let ca = MeshCa::generate().unwrap();
+        let registry = registry();
+        let limits = WebLimits {
+            max_connections: 1,
+            ..limits()
+        };
+        let (listen, _) = start(&ca, &registry, limits).await;
+        let _silent = TcpStream::connect(listen).await.unwrap();
+        let _also_silent = TcpStream::connect(listen).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Two silent connections, and the edge is still served.
+        let mut ingress = dial(listen, client(&ca, "ingress1")).await.unwrap();
+        let (code, _, _) = exchange(&mut ingress, "GET", "/healthz").await.unwrap();
+        assert_eq!(code, 200);
+        // With the only served slot held, the next handshake ends and its connection is closed.
+        let mut next = dial(listen, client(&ca, "ingress1")).await.unwrap();
+        assert!(
+            exchange(&mut next, "GET", "/healthz").await.is_err(),
+            "past the served cap the connection is closed after its handshake"
+        );
         let _ = std::fs::remove_dir_all(registry.root());
     }
 

@@ -181,67 +181,61 @@ func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 	}
 }
 
-func TestRespondTimerGetAllowsReadingForeignTimer(t *testing.T) {
-	service, tx := newTestService(t)
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-1",
-		OwnerL2Name:  "AI.other@motherbee",
-		TargetL2Name: "AI.other@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-
-	msg := mustBuildSystemMessage(t, map[string]any{"timer_uuid": "timer-1"}, "TIMER_GET")
-	if err := service.respondTimerGet(msg); err != nil {
-		t.Fatalf("get timer: %v", err)
-	}
-	// TIMER_GET answers {ok, verb, timer}: decoded the way the SDK's TimerClient.Get decodes it.
-	var response struct {
-		OK    bool                  `json:"ok"`
-		Timer *fluxbeesdk.TimerInfo `json:"timer"`
-	}
-	if err := json.Unmarshal(mustReadResponsePayload(t, tx), &response); err != nil {
-		t.Fatalf("decode get response: %v", err)
-	}
-	if !response.OK || response.Timer == nil || response.Timer.UUID != "timer-1" {
-		t.Fatalf("unexpected get response: %+v", response)
-	}
-}
-
-func TestRespondTimerGetByUUIDAllowsMissingSourceL2Name(t *testing.T) {
-	service, tx := newTestService(t)
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-1",
-		OwnerL2Name:  "AI.other@motherbee",
-		TargetL2Name: "AI.other@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-	msg, err := fluxbeesdk.BuildSystemMessage(
-		"22222222-2222-2222-2222-222222222222",
-		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
-		16,
-		uuid.NewString(),
-		"TIMER_GET",
-		map[string]any{"timer_uuid": "timer-1"},
-	)
-	if err != nil {
-		t.Fatalf("build message: %v", err)
-	}
-	if err := service.respondTimerGet(msg); err != nil {
-		t.Fatalf("get timer by uuid without src_l2_name: %v", err)
-	}
-	response := mustReadTimerResponse(t, tx)
-	if !response.OK || response.Verb != "TIMER_GET" {
-		t.Fatalf("unexpected get response: %+v", response)
+// A timer is read by its owner and by SY.admin: another node's TIMER_GET, or one without the
+// router's stamp, is refused (A-115).
+func TestRespondTimerGetIsForTheOwnerAndSYAdmin(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requester string
+		ok        bool
+	}{
+		{name: "the owner", requester: "AI.other@motherbee", ok: true},
+		{name: "SY.admin", requester: fluxbeesdk.PrimaryAdminNode, ok: true},
+		{name: "another node", requester: "WF.demo@motherbee"},
+		{name: "a SY.admin not on the motherbee", requester: "SY.admin@worker1"},
+		{name: "no stamp"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			insertOwnedTimer(t, service.db, timerRow{
+				UUID:         "timer-1",
+				OwnerL2Name:  "AI.other@motherbee",
+				TargetL2Name: "AI.other@motherbee",
+				Kind:         "oneshot",
+				FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+				MissedPolicy: "fire",
+				Payload:      `{}`,
+				Status:       "pending",
+				CreatedAtUTC: time.Now().UTC().UnixMilli(),
+			})
+			msg := mustBuildSystemMessageAs(t, map[string]any{"timer_uuid": "timer-1"}, "TIMER_GET", tc.requester)
+			if tc.requester == "" {
+				msg.Routing.SrcL2Name = nil
+			}
+			if err := service.respondTimerGet(msg); err != nil {
+				t.Fatalf("get timer: %v", err)
+			}
+			// TIMER_GET answers {ok, verb, timer}: decoded the way the SDK's TimerClient.Get decodes it.
+			var response struct {
+				OK    bool                  `json:"ok"`
+				Timer *fluxbeesdk.TimerInfo `json:"timer"`
+				Error *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(mustReadResponsePayload(t, tx), &response); err != nil {
+				t.Fatalf("decode get response: %v", err)
+			}
+			if tc.ok != response.OK {
+				t.Fatalf("ok=%v, want %v: %+v", response.OK, tc.ok, response)
+			}
+			if tc.ok && (response.Timer == nil || response.Timer.UUID != "timer-1") {
+				t.Fatalf("unexpected timer: %+v", response.Timer)
+			}
+			if !tc.ok && (response.Error == nil || response.Error.Code != "TIMER_NOT_OWNER") {
+				t.Fatalf("unexpected refusal: %+v", response.Error)
+			}
+		})
 	}
 }
 
@@ -493,54 +487,69 @@ func TestRespondTimerRescheduleRejectsRecurringTimer(t *testing.T) {
 	}
 }
 
-func TestRespondTimerListReturnsAllTimersByDefault(t *testing.T) {
-	service, tx := newTestService(t)
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-owned",
-		OwnerL2Name:  "WF.demo@motherbee",
-		TargetL2Name: "WF.demo@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-other",
-		OwnerL2Name:  "AI.other@motherbee",
-		TargetL2Name: "AI.other@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-
-	msg := mustBuildSystemMessage(t, map[string]any{"status_filter": "pending", "limit": 10}, "TIMER_LIST")
-	if err := service.respondTimerList(msg); err != nil {
-		t.Fatalf("list timers: %v", err)
-	}
-	payloadData := mustReadResponsePayload(t, tx)
-	var response fluxbeesdk.TimerResponse
-	if err := json.Unmarshal(payloadData, &response); err != nil {
-		t.Fatalf("decode timer response: %v", err)
-	}
-	if !response.OK {
-		t.Fatalf("unexpected list response: %+v", response)
-	}
-	var payload struct {
-		OK     bool             `json:"ok"`
-		Verb   string           `json:"verb"`
-		Count  int              `json:"count"`
-		Timers []map[string]any `json:"timers"`
-	}
-	if err := json.Unmarshal(payloadData, &payload); err != nil {
-		t.Fatalf("decode list payload: %v", err)
-	}
-	if payload.Count != 2 {
-		t.Fatalf("unexpected list payload: %+v", payload)
+// A node lists its own timers, with or without owner_l2_name; another owner's are refused. SY.admin
+// lists every owner's, or one's (A-115).
+func TestRespondTimerListIsForTheOwnerAndSYAdmin(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requester string
+		owner     string
+		code      string
+		uuids     []string
+	}{
+		{name: "a node, its own by default", requester: "WF.demo@motherbee", uuids: []string{"timer-owned"}},
+		{name: "a node, its own by name", requester: "WF.demo@motherbee", owner: "WF.demo@motherbee", uuids: []string{"timer-owned"}},
+		{name: "a node, another owner's", requester: "WF.demo@motherbee", owner: "AI.other@motherbee", code: "TIMER_FORBIDDEN"},
+		{name: "SY.admin, every owner's", requester: fluxbeesdk.PrimaryAdminNode, uuids: []string{"timer-owned", "timer-other"}},
+		{name: "SY.admin, one owner's", requester: fluxbeesdk.PrimaryAdminNode, owner: "AI.other@motherbee", uuids: []string{"timer-other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, tx := newTestService(t)
+			for i, owner := range []string{"WF.demo@motherbee", "AI.other@motherbee"} {
+				insertOwnedTimer(t, service.db, timerRow{
+					UUID:         []string{"timer-owned", "timer-other"}[i],
+					OwnerL2Name:  owner,
+					TargetL2Name: owner,
+					Kind:         "oneshot",
+					FireAtUTC:    time.Now().UTC().Add(time.Duration(i+1) * time.Hour).UnixMilli(),
+					MissedPolicy: "fire",
+					Payload:      `{}`,
+					Status:       "pending",
+					CreatedAtUTC: time.Now().UTC().UnixMilli(),
+				})
+			}
+			request := map[string]any{"status_filter": "pending", "limit": 10}
+			if tc.owner != "" {
+				request["owner_l2_name"] = tc.owner
+			}
+			if err := service.respondTimerList(mustBuildSystemMessageAs(t, request, "TIMER_LIST", tc.requester)); err != nil {
+				t.Fatalf("list timers: %v", err)
+			}
+			var payload struct {
+				OK     bool             `json:"ok"`
+				Count  int              `json:"count"`
+				Timers []map[string]any `json:"timers"`
+				Error  *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(mustReadResponsePayload(t, tx), &payload); err != nil {
+				t.Fatalf("decode list payload: %v", err)
+			}
+			if tc.code != "" {
+				if payload.OK || payload.Error == nil || payload.Error.Code != tc.code {
+					t.Fatalf("want %s, got %+v", tc.code, payload)
+				}
+				return
+			}
+			var uuids []string
+			for _, timer := range payload.Timers {
+				uuids = append(uuids, timer["uuid"].(string))
+			}
+			if !payload.OK || payload.Count != len(tc.uuids) || strings.Join(uuids, ",") != strings.Join(tc.uuids, ",") {
+				t.Fatalf("want %v, got %+v", tc.uuids, payload)
+			}
+		})
 	}
 }
 
@@ -773,54 +782,6 @@ func TestConcurrentScheduleWithSameClientRefCreatesExactlyOneTimer(t *testing.T)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("expected exactly 1 pending timer after concurrent schedules, got %d", len(rows))
-	}
-}
-
-func TestRespondTimerListFiltersByOwnerWhenRequested(t *testing.T) {
-	service, tx := newTestService(t)
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-owned",
-		OwnerL2Name:  "WF.demo@motherbee",
-		TargetL2Name: "WF.demo@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-	insertOwnedTimer(t, service.db, timerRow{
-		UUID:         "timer-other",
-		OwnerL2Name:  "AI.other@motherbee",
-		TargetL2Name: "AI.other@motherbee",
-		Kind:         "oneshot",
-		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
-		MissedPolicy: "fire",
-		Payload:      `{}`,
-		Status:       "pending",
-		CreatedAtUTC: time.Now().UTC().UnixMilli(),
-	})
-
-	msg := mustBuildSystemMessage(t, map[string]any{
-		"owner_l2_name": "WF.demo@motherbee",
-		"status_filter": "pending",
-		"limit":         10,
-	}, "TIMER_LIST")
-	if err := service.respondTimerList(msg); err != nil {
-		t.Fatalf("list timers by owner: %v", err)
-	}
-	payloadData := mustReadResponsePayload(t, tx)
-	var payload struct {
-		OK     bool             `json:"ok"`
-		Verb   string           `json:"verb"`
-		Count  int              `json:"count"`
-		Timers []map[string]any `json:"timers"`
-	}
-	if err := json.Unmarshal(payloadData, &payload); err != nil {
-		t.Fatalf("decode list payload: %v", err)
-	}
-	if payload.Count != 1 || payload.Timers[0]["uuid"] != "timer-owned" {
-		t.Fatalf("unexpected filtered list payload: %+v", payload)
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-func TestReplayPendingFiresMissedOneShotWithFirePolicy(t *testing.T) {
+func TestReplayPendingQueuesMissedOneShotWithFirePolicy(t *testing.T) {
 	service, tx := newTestService(t)
 	now := time.Now().UTC()
 	insertOwnedTimer(t, service.db, timerRow{
@@ -31,6 +31,11 @@ func TestReplayPendingFiresMissedOneShotWithFirePolicy(t *testing.T) {
 	if err := scheduler.replayPending(context.Background(), now); err != nil {
 		t.Fatalf("replay pending: %v", err)
 	}
+	// The replay queues the fire: it goes when the scheduler runs, not before the node serves.
+	if len(tx) != 0 {
+		t.Fatalf("the replay sent the fire before the scheduler ran")
+	}
+	scheduler.processDue(context.Background(), now)
 
 	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message

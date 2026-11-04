@@ -22,6 +22,7 @@ use fluxbee_sdk::mesh::{
     install_crypto_provider, is_valid_hive_id, MeshTlsMaterial, IO_WEB_PORT, IO_WEB_SERVER_NAME,
     MESH_TLS_DIR,
 };
+use fluxbee_sdk::peer_slots::{PeerSlot, PeerSlots};
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
     MSG_EDGE_ACME_CHALLENGE, MSG_EDGE_ACME_CHALLENGE_RESPONSE, MSG_EDGE_CLOSE_URL,
@@ -141,6 +142,9 @@ const DEFAULT_PUBLIC_MAX_INFLIGHT_PER_IP: usize = 8;
 /// io-web-v2 §11.2: the requests the proxy holds at once to io.web, each with its own connection
 /// to the motherbee until its response ends (0: no cap). io.web serves a few operators.
 const DEFAULT_WEB_MAX_INFLIGHT: usize = 128;
+/// A-90: the proxied requests one client address may hold at once, of `web_max_inflight` (0: no
+/// cap).
+const DEFAULT_WEB_MAX_INFLIGHT_PER_IP: usize = 16;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -172,6 +176,8 @@ struct Config {
     public_ready_timeout_ms: u64,
     /// Proxied requests in flight to io.web at once (0: no cap).
     web_max_inflight: usize,
+    /// Proxied requests one client address may hold at once (0: no cap).
+    web_max_inflight_per_ip: usize,
     /// This hive's id, which names its mesh TLS material (`MESH_TLS_DIR/<hive_id>/`).
     hive_id: Option<String>,
     /// The motherbee's address as this hive's router dials it (`wan.uplinks[0].address`): its host
@@ -375,6 +381,7 @@ async fn main() -> Result<(), SyEdgeError> {
                 upstream = %client.authority,
                 server_name = IO_WEB_SERVER_NAME,
                 web_max_inflight = config.web_max_inflight,
+                web_max_inflight_per_ip = config.web_max_inflight_per_ip,
                 "sy-edge web proxy ready: web hosts go to io.web"
             ),
             Err(reason) => tracing::error!(
@@ -382,7 +389,11 @@ async fn main() -> Result<(), SyEdgeError> {
                 "sy-edge: the proxy to io.web has no upstream; every web host answers 502 until this is fixed and the edge restarts"
             ),
         }
-        let proxy = Arc::new(WebProxy::new(upstream, config.web_max_inflight));
+        let proxy = Arc::new(WebProxy::new(
+            upstream,
+            config.web_max_inflight,
+            config.web_max_inflight_per_ip,
+        ));
         web_proxy = Some(Arc::clone(&proxy));
         let door_web_routes = Arc::clone(&web_routes);
         let max_connections_per_ip = config.max_connections_per_ip;
@@ -1472,6 +1483,8 @@ struct EdgeSection {
     public_ready_timeout_ms: Option<u64>,
     #[serde(default)]
     web_max_inflight: Option<usize>,
+    #[serde(default)]
+    web_max_inflight_per_ip: Option<usize>,
     /// Public TLS cert chain (PEM) + private key (PEM) from DISK. When both are
     /// set the frontend serves HTTPS. Alternatively `tls_vault_key` pulls the same
     /// material from SY.vault (preferred — no cert on the DMZ box's config).
@@ -1634,6 +1647,10 @@ impl Config {
                 .and_then(|raw| raw.parse().ok())
                 .or_else(|| edge.as_ref().and_then(|e| e.web_max_inflight))
                 .unwrap_or(DEFAULT_WEB_MAX_INFLIGHT),
+            web_max_inflight_per_ip: env("SY_EDGE_WEB_MAX_INFLIGHT_PER_IP")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.web_max_inflight_per_ip))
+                .unwrap_or(DEFAULT_WEB_MAX_INFLIGHT_PER_IP),
             hive_id: hive
                 .hive_id
                 .as_deref()
@@ -2925,82 +2942,6 @@ impl DoorLimits {
     }
 }
 
-/// How many connections, or downloads, one peer address may hold at once (A-86). An IPv6 peer
-/// counts by its /64, the block one subscriber gets; an IPv4-mapped address as its IPv4.
-struct PeerSlots {
-    /// 0: no cap.
-    max: usize,
-    held: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
-}
-
-/// One slot of a `PeerSlots`, given back when dropped.
-struct PeerSlot {
-    slots: Arc<PeerSlots>,
-    /// `None` when there is no cap to count against.
-    key: Option<std::net::IpAddr>,
-}
-
-impl PeerSlots {
-    fn new(max: usize) -> Arc<Self> {
-        Arc::new(Self {
-            max,
-            held: std::sync::Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// A slot for `peer`, or `None` when it holds `max` already.
-    fn try_take(self: &Arc<Self>, peer: std::net::IpAddr) -> Option<PeerSlot> {
-        if self.max == 0 {
-            return Some(PeerSlot {
-                slots: Arc::clone(self),
-                key: None,
-            });
-        }
-        let key = match peer.to_canonical() {
-            std::net::IpAddr::V6(v6) => {
-                let [a, b, c, d, ..] = v6.segments();
-                std::net::IpAddr::V6(std::net::Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
-            }
-            v4 => v4,
-        };
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = held.entry(key).or_insert(0);
-        if *count >= self.max {
-            return None;
-        }
-        *count += 1;
-        Some(PeerSlot {
-            slots: Arc::clone(self),
-            key: Some(key),
-        })
-    }
-
-    #[cfg(test)]
-    fn held_by(&self, peer: std::net::IpAddr) -> usize {
-        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.get(&peer).copied().unwrap_or(0)
-    }
-}
-
-impl Drop for PeerSlot {
-    fn drop(&mut self) {
-        let Some(key) = self.key else {
-            return;
-        };
-        let mut held = self
-            .slots
-            .held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = held.get_mut(&key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                held.remove(&key);
-            }
-        }
-    }
-}
-
 /// Counts the connections refused at the cap and says when to log them: at most once per
 /// interval, with how many there were since the last line.
 #[derive(Debug, Default)]
@@ -3052,7 +2993,7 @@ async fn serve_door(
                 tracing::warn!(
                     peer = %peer.ip(),
                     refused = count,
-                    max_connections_per_ip = limits.peer_connections.max,
+                    max_connections_per_ip = limits.peer_connections.max(),
                     "sy-edge: a peer address at its connection cap; closing its new connections"
                 );
             }
@@ -4416,6 +4357,8 @@ struct WebProxy {
     /// (`IoWebBody`); `None` when `web_max_inflight` is 0.
     inflight: Option<Arc<Semaphore>>,
     max_inflight: usize,
+    /// A-90: the requests each client address holds, out of `inflight`, held as long.
+    peer_slots: Arc<PeerSlots>,
     /// Requests refused at the cap, logged at most once per interval.
     refused: std::sync::Mutex<RefusedConnections>,
     /// Requests io.web did not answer: the last one, for SY.admin (`upstream_status`), and the
@@ -4435,11 +4378,16 @@ struct ProxyFailures {
 }
 
 impl WebProxy {
-    fn new(upstream: Result<IoWebClient, String>, max_inflight: usize) -> Self {
+    fn new(
+        upstream: Result<IoWebClient, String>,
+        max_inflight: usize,
+        max_inflight_per_ip: usize,
+    ) -> Self {
         Self {
             upstream,
             inflight: (max_inflight > 0).then(|| Arc::new(Semaphore::new(max_inflight))),
             max_inflight,
+            peer_slots: PeerSlots::new(max_inflight_per_ip),
             refused: std::sync::Mutex::new(RefusedConnections::default()),
             failures: std::sync::Mutex::new(ProxyFailures::default()),
         }
@@ -4487,6 +4435,27 @@ impl WebProxy {
             );
             return refused;
         }
+        // A-90: one client holds at most its share of the slots, so it cannot hold them all.
+        let Some(peer_slot) = self.peer_slots.try_take(peer.ip()) else {
+            let refused = self
+                .refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note(Instant::now(), REFUSED_CONNECTIONS_LOG_INTERVAL);
+            if let Some(count) = refused {
+                tracing::warn!(
+                    peer = %peer,
+                    refused = count,
+                    max_per_ip = self.peer_slots.max(),
+                    "sy-edge: a client at its share of the proxy to io.web; refusing its new requests"
+                );
+            }
+            return http_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "WEB_PEER_BUSY",
+                "too many requests in flight from this address; retry shortly",
+            );
+        };
         let slot = match &self.inflight {
             None => None,
             Some(inflight) => match Arc::clone(inflight).try_acquire_owned() {
@@ -4542,7 +4511,11 @@ impl WebProxy {
                     peer = %peer,
                     "sy-edge proxied a request to io.web"
                 );
-                from_io_web(response, slot)
+                let idle_timeout = self
+                    .upstream
+                    .as_ref()
+                    .map_or(IO_WEB_BODY_IDLE_TIMEOUT, |client| client.body_idle_timeout);
+                from_io_web(response, (slot, peer_slot), idle_timeout)
             }
             Err(failure) => {
                 let due = {
@@ -4583,9 +4556,11 @@ struct IoWebClient {
     tls: tokio_rustls::TlsConnector,
     /// `IO_WEB_SERVER_NAME`, never the address dialled, which the certificate does not name.
     server_name: ServerName<'static>,
-    /// `IO_WEB_CONNECT_TIMEOUT`, `IO_WEB_HEAD_TIMEOUT`; shorter in the tests.
+    /// `IO_WEB_CONNECT_TIMEOUT`, `IO_WEB_HEAD_TIMEOUT`, `IO_WEB_BODY_IDLE_TIMEOUT`; shorter in the
+    /// tests.
     connect_timeout: Duration,
     head_timeout: Duration,
+    body_idle_timeout: Duration,
 }
 
 impl IoWebClient {
@@ -4600,6 +4575,7 @@ impl IoWebClient {
             server_name,
             connect_timeout: IO_WEB_CONNECT_TIMEOUT,
             head_timeout: IO_WEB_HEAD_TIMEOUT,
+            body_idle_timeout: IO_WEB_BODY_IDLE_TIMEOUT,
         })
     }
 
@@ -4811,7 +4787,9 @@ fn io_web_request(req: &Request, forwarding: &Forwarding<'_>) -> hyper::Request<
 /// The client's headers as io.web gets them: the hop-by-hop ones and those `Connection` names
 /// stripped first (`strip_hop_by_hop`), then `DROPPED_REQUEST_HEADERS` and every `X-Forwarded-*`;
 /// then the edge's own `Host` (the web host), `X-Forwarded-For`, `X-Forwarded-Proto`,
-/// `X-Forwarded-Host`, `Forwarded` (RFC 7239) and `X-Request-Id`, in place of any the client sent.
+/// `X-Forwarded-Host`, `Forwarded` (RFC 7239) and `X-Request-Id`, in place of any the client sent;
+/// and `Connection: close`, so io.web closes first and the closed connection's TIME_WAIT is io.web's,
+/// never a port of the ingress toward the motherbee (FINDINGS A-90).
 fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> HeaderMap {
     let mut headers = inbound.clone();
     strip_hop_by_hop(&mut headers);
@@ -4855,6 +4833,7 @@ fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> H
             header::HeaderName::from_static("x-request-id"),
             forwarding.request_id.to_string(),
         ),
+        (header::CONNECTION, "close".to_string()),
     ];
     for (name, value) in set {
         // Every value is a host the door validated, an address, a scheme or a UUID: all valid.
@@ -4898,7 +4877,8 @@ fn strip_io_web_response_headers(headers: &mut HeaderMap) {
 /// set (`with_security_headers`).
 fn from_io_web(
     response: hyper::Response<hyper::body::Incoming>,
-    slot: Option<OwnedSemaphorePermit>,
+    slots: (Option<OwnedSemaphorePermit>, PeerSlot),
+    idle_timeout: Duration,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
     strip_io_web_response_headers(&mut parts.headers);
@@ -4906,27 +4886,57 @@ fn from_io_web(
         parts,
         Body::new(IoWebBody {
             inner: body,
-            _slot: slot,
+            idle_timeout,
+            stalled: None,
+            _slots: slots,
         }),
     )
 }
 
-/// io.web's response body on its way to the client, holding the request's in-flight slot: given
-/// back with the last byte, or with the connection.
+/// io.web sending nothing for this long while the edge waits on its response body ends it, and
+/// gives its slots back (FINDINGS A-90).
+const IO_WEB_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// io.web's response body on its way to the client, holding the request's in-flight slots, the
+/// proxy's and its client's: given back with the last byte, with the connection, or once io.web
+/// stalls mid-body for `idle_timeout`, timed only while the edge waits on io.web, never while the
+/// client is slow to read.
 struct IoWebBody {
     inner: hyper::body::Incoming,
-    _slot: Option<OwnedSemaphorePermit>,
+    idle_timeout: Duration,
+    /// Armed when a wait on io.web starts; cleared by every frame.
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+    _slots: (Option<OwnedSemaphorePermit>, PeerSlot),
 }
 
 impl HttpBody for IoWebBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = axum::BoxError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
-        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, axum::BoxError>>> {
+        let body = self.get_mut();
+        match Pin::new(&mut body.inner).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                body.stalled = None;
+                Poll::Ready(frame.map(|frame| frame.map_err(Into::into)))
+            }
+            Poll::Pending => {
+                let idle_timeout = body.idle_timeout;
+                let stalled = body
+                    .stalled
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle_timeout)));
+                if std::future::Future::poll(stalled.as_mut(), cx).is_ready() {
+                    return Poll::Ready(Some(Err(format!(
+                        "io.web sent nothing of its body for {idle_timeout:?}"
+                    )
+                    .into())));
+                }
+                Poll::Pending
+            }
+        }
     }
 
     fn is_end_stream(&self) -> bool {
@@ -5031,7 +5041,7 @@ async fn serve_public_artifact(
                     tracing::warn!(
                         peer = %ip,
                         refused = count,
-                        max_per_ip = state.public_peer_slots.max,
+                        max_per_ip = state.public_peer_slots.max(),
                         "sy-edge: a peer address at its download cap; refusing its new downloads"
                     );
                 }
@@ -6960,7 +6970,11 @@ mod tests {
 
     /// A proxy with no way to io.web: every request it sends answers 502.
     fn no_proxy() -> Arc<WebProxy> {
-        Arc::new(WebProxy::new(Err("no io.web in this test".to_string()), 0))
+        Arc::new(WebProxy::new(
+            Err("no io.web in this test".to_string()),
+            0,
+            0,
+        ))
     }
 
     /// How long until the server closes `stream`: a read that ends (EOF or error) within
@@ -9297,45 +9311,6 @@ mod tests {
         trickle.abort();
     }
 
-    #[test]
-    fn peer_slots_count_an_address_its_ipv6_64_and_give_slots_back() {
-        let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
-        let slots = PeerSlots::new(2);
-        let first = slots.try_take(ip("198.51.100.4")).expect("first");
-        let _second = slots
-            .try_take(ip("::ffff:198.51.100.4"))
-            .expect("the same IPv4");
-        assert!(slots.try_take(ip("198.51.100.4")).is_none(), "at the cap");
-        assert!(
-            slots.try_take(ip("198.51.100.5")).is_some(),
-            "another address"
-        );
-        drop(first);
-        assert_eq!(slots.held_by(ip("198.51.100.4")), 1);
-        assert!(
-            slots.try_take(ip("198.51.100.4")).is_some(),
-            "the slot came back"
-        );
-
-        // One IPv6 subscriber holds a /64: its addresses count together.
-        let _a = slots.try_take(ip("2001:db8:1:2::1")).expect("a");
-        let _b = slots.try_take(ip("2001:db8:1:2:ffff::9")).expect("b");
-        assert!(slots.try_take(ip("2001:db8:1:2::77")).is_none());
-        assert!(
-            slots.try_take(ip("2001:db8:1:3::1")).is_some(),
-            "another /64"
-        );
-        assert_eq!(slots.held_by(ip("2001:db8:1:2::")), 2);
-
-        // 0: no cap, and nothing counted.
-        let open = PeerSlots::new(0);
-        let held: Vec<_> = (0..1000)
-            .map(|_| open.try_take(ip("198.51.100.4")).expect("no cap"))
-            .collect();
-        assert_eq!(held.len(), 1000);
-        assert_eq!(open.held_by(ip("198.51.100.4")), 0);
-    }
-
     /// E2: one address holds at most its share of the door's connections, counted at accept,
     /// before the handshake.
     #[tokio::test]
@@ -9857,6 +9832,8 @@ mod tests {
         Silent,
         /// Takes the request and closes the connection.
         HangUp,
+        /// Answers a head and the start of a body, then sends nothing more.
+        Stall,
     }
 
     /// A test io.web on a loopback port, under `tls`: its address, and for each connection the
@@ -9902,8 +9879,6 @@ mod tests {
                                     IoWebBehavior::Page => Ok(hyper::Response::builder()
                                         .header("content-type", "text/html; charset=utf-8")
                                         .header("content-security-policy", IO_WEB_CSP)
-                                        .header("connection", "x-io-web-hop")
-                                        .header("x-io-web-hop", "1")
                                         .header("keep-alive", "timeout=5")
                                         .header("x-io-web", "page")
                                         .body(Body::from(IO_WEB_PAGE))
@@ -9917,6 +9892,17 @@ mod tests {
                                     IoWebBehavior::HangUp => {
                                         Err(std::io::Error::other("io.web hangs up"))
                                     }
+                                    IoWebBehavior::Stall => Ok(hyper::Response::builder()
+                                        .header("content-type", "text/html; charset=utf-8")
+                                        .body(Body::from_stream(futures::StreamExt::chain(
+                                            futures::stream::once(async {
+                                                Ok::<_, std::io::Error>(Bytes::from_static(
+                                                    b"<html>",
+                                                ))
+                                            }),
+                                            futures::stream::pending(),
+                                        )))
+                                        .expect("stall")),
                                 }
                             }
                         },
@@ -10065,6 +10051,7 @@ mod tests {
             [
                 "accept",
                 "authorization",
+                "connection",
                 "cookie",
                 "forwarded",
                 "host",
@@ -10095,6 +10082,8 @@ mod tests {
         );
         assert_eq!(value(&headers, "x-request-id"), request_id);
         assert_eq!(value(&headers, "cookie"), "a=b");
+        // The edge's own, not the client's: io.web closes first (A-90).
+        assert_eq!(value(&headers, "connection"), "close");
 
         // An IPv6 peer: bare in X-Forwarded-For, bracketed and quoted in Forwarded; an
         // IPv4-mapped one as its IPv4.
@@ -10159,6 +10148,7 @@ mod tests {
         let door = proxied_door(WebProxy::new(
             Ok(io_web_client(&ca, "ingress1", &authority)),
             4,
+            0,
         ))
         .await;
 
@@ -10231,13 +10221,13 @@ mod tests {
         );
         assert_eq!(values("cookie"), ["a=b"]);
         assert_eq!(values("user-agent"), ["edge-test"]);
+        assert_eq!(values("connection"), ["close"]);
         for gone in [
             "x-real-ip",
             "true-client-ip",
             "x-original-url",
             "x-rewrite-url",
             "x-http-method-override",
-            "connection",
             "x-hop",
             "keep-alive",
             "te",
@@ -10250,7 +10240,9 @@ mod tests {
         }
 
         // io.web's answer: its own content policy wins; the door adds what io.web did not set;
-        // io.web's hop-by-hop headers, and the one its Connection names, stay behind.
+        // io.web's hop-by-hop headers stay behind. One its Connection names is the unit test's
+        // (`strip_io_web_response_headers`): each request asks io.web to close (A-90), and hyper's
+        // server then answers `Connection: close`, whatever else it named.
         assert_eq!(
             answer.header("content-security-policy").as_deref(),
             Some(IO_WEB_CSP)
@@ -10261,7 +10253,6 @@ mod tests {
             Some("nosniff")
         );
         assert_eq!(answer.header("x-io-web").as_deref(), Some("page"));
-        assert_eq!(answer.header("x-io-web-hop"), None);
         assert_eq!(answer.header("keep-alive"), None);
         all_slots_back(&door.proxy).await;
 
@@ -10341,7 +10332,7 @@ mod tests {
             ),
             "{refused}"
         );
-        let impostor_door = proxied_door(WebProxy::new(Ok(client), 4)).await;
+        let impostor_door = proxied_door(WebProxy::new(Ok(client), 4, 0)).await;
         let answer = exchange(&impostor_door, &web_request("GET", "/", "", "")).await;
         assert_eq!(answer.status, 502);
         assert_eq!(answer.json()["error_code"], "UPSTREAM_UNAVAILABLE");
@@ -10363,6 +10354,7 @@ mod tests {
         let door = proxied_door(WebProxy::new(
             Ok(io_web_client(&ca, "ingress1", &authority)),
             4,
+            0,
         ))
         .await;
 
@@ -10516,7 +10508,7 @@ mod tests {
             assert!(expected(&failure), "{case}: {failure}");
             assert_eq!(failure.kind(), kind, "{case}");
 
-            let door = proxied_door(WebProxy::new(Ok(client), 2)).await;
+            let door = proxied_door(WebProxy::new(Ok(client), 2, 0)).await;
             assert_eq!(
                 door.proxy.upstream_status(),
                 json!({"state": "ready", "reason": null, "last_failure": null}),
@@ -10544,7 +10536,7 @@ mod tests {
         // No upstream at all (no mesh material, no uplink): the same 502, never plaintext. The
         // answer says why, and the failures of one burst are one line: the first at once, the
         // others counted for the next.
-        let door = proxied_door(WebProxy::new(Err("no material".to_string()), 2)).await;
+        let door = proxied_door(WebProxy::new(Err("no material".to_string()), 2, 0)).await;
         for _ in 0..3 {
             let answer = exchange(&door, &web_request("GET", "/", "", "")).await;
             assert_unavailable("no upstream", &answer);
@@ -10627,7 +10619,7 @@ mod tests {
         .await;
         let mut client = io_web_client(&ca, "ingress1", &silent);
         client.head_timeout = Duration::from_millis(800);
-        let door = proxied_door(WebProxy::new(Ok(client), 1)).await;
+        let door = proxied_door(WebProxy::new(Ok(client), 1, 0)).await;
 
         let held = tokio::spawn({
             let door = door.clone();
@@ -10654,7 +10646,74 @@ mod tests {
 
         assert_eq!(held.await.expect("exchange").status, 502);
         all_slots_back(&door.proxy).await;
-        assert!(WebProxy::new(Err("none".to_string()), 0).inflight.is_none());
+        assert!(WebProxy::new(Err("none".to_string()), 0, 0)
+            .inflight
+            .is_none());
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// A-90: one client holds at most its share of the proxy's slots: past it the proxy answers a
+    /// quick 429, and io.web never sees the request.
+    #[tokio::test]
+    async fn one_client_holds_at_most_its_share_of_the_proxy() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let (silent, mut seen) = test_io_web(
+            io_web_tls(&ca, "motherbee", &registry),
+            IoWebBehavior::Silent,
+        )
+        .await;
+        let mut client = io_web_client(&ca, "ingress1", &silent);
+        client.head_timeout = Duration::from_millis(800);
+        let door = proxied_door(WebProxy::new(Ok(client), 4, 1)).await;
+
+        let held = tokio::spawn({
+            let door = door.clone();
+            async move { exchange(&door, &web_request("GET", "/slow", "", "")).await }
+        });
+        seen.recv()
+            .await
+            .expect("io.web holds the first request")
+            .expect("handshake");
+        let busy = exchange(&door, &web_request("GET", "/next", "", "")).await;
+        assert_eq!(busy.status, 429);
+        assert_eq!(busy.json()["error_code"], "WEB_PEER_BUSY");
+        assert!(
+            seen.try_recv().is_err(),
+            "the refused request never reached io.web"
+        );
+        assert_eq!(held.await.expect("exchange").status, 502);
+        all_slots_back(&door.proxy).await;
+        let peer = PEER.parse::<SocketAddr>().expect("peer").ip();
+        assert_eq!(door.proxy.peer_slots.held_by(peer), 0);
+        let _ = std::fs::remove_dir_all(registry.root());
+    }
+
+    /// A-90: io.web stalling in the middle of a body ends it: the client gets what came, and the
+    /// request's slots come back.
+    #[tokio::test]
+    async fn a_body_io_web_stalls_ends_and_gives_its_slots_back() {
+        install_crypto_provider();
+        let ca = MeshCa::generate().expect("ca");
+        let registry = mesh_registry();
+        let (stalling, _seen) = test_io_web(
+            io_web_tls(&ca, "motherbee", &registry),
+            IoWebBehavior::Stall,
+        )
+        .await;
+        let mut client = io_web_client(&ca, "ingress1", &stalling);
+        client.body_idle_timeout = Duration::from_millis(300);
+        let door = proxied_door(WebProxy::new(Ok(client), 2, 1)).await;
+        let answer = exchange(&door, &web_request("GET", "/stall", "", "")).await;
+        assert_eq!(answer.status, 200);
+        assert!(
+            String::from_utf8_lossy(&answer.body).contains("<html>"),
+            "what came reached the client"
+        );
+        all_slots_back(&door.proxy).await;
+        let peer = PEER.parse::<SocketAddr>().expect("peer").ip();
+        assert_eq!(door.proxy.peer_slots.held_by(peer), 0);
         let _ = std::fs::remove_dir_all(registry.root());
     }
 

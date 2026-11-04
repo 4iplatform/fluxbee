@@ -97,6 +97,7 @@ func TestReplayPendingFireIfWithinFiresInsideWindow(t *testing.T) {
 	if err := scheduler.replayPending(context.Background(), now); err != nil {
 		t.Fatalf("replay fire_if_within inside window: %v", err)
 	}
+	scheduler.processDue(context.Background(), now)
 
 	frame := mustReadSentFrame(t, tx)
 	var msg fluxbeesdk.Message

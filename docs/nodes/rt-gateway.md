@@ -129,8 +129,10 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 
 32 actions are protected (`PROTECTED_SYSTEM_ACTIONS` in `src/router/system_policy.rs`: node
 lifecycle, `CONFIG_GET`/`CONFIG_SET`/`CONFIG_CHANGED`, `SYSTEM_UPDATE`, edge commands, ...).
-At local delivery the router asks the baked `policy/system.wasm` whether the sender may perform
-the action (`authorize_system`); a denial drops the message with
+A message's `meta.msg` names one whatever its `msg_type`, in any case and with spaces around it
+(`protected_system_action`, FINDINGS A-100): `config_get` sent as `admin` is CONFIG_GET. At local
+delivery the router asks the baked `policy/system.wasm` whether the sender may perform the action,
+by its canonical name (`authorize_system`); a denial drops the message with
 `router dropped protected SYSTEM action from unauthorized origin`. The rules
 (`policy/system.rego`): edge commands and node control only from `SY.admin@motherbee`; the
 orchestrator's mutating actions only from `SY.orchestrator@motherbee` (`ADD_HIVE_FINALIZE` and

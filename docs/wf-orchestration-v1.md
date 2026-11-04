@@ -201,7 +201,9 @@ This is the single place for the track. The cases are worked here one at a time.
   - SY.timer's refusals go unseen, and the WF's index drifts.
   - Re-scheduling a pending key keeps SY.timer's old time.
   - A reschedule after a fire fails silently.
-- **Recovery runs only at start.** A fire lost while the WF is up waits for the next restart.
+- **Recovery runs only at start.** Since 0.1.99 SY.timer sends a fire again while the WF is not
+  connected, for up to an hour ([sy-timer](sy-timer.md) §7.8, A-115); a fire lost past that waits
+  for the WF's next restart.
 - **A timer carries no data:** its payload is fixed (`{instance_id, timer_key}`).
 
 ### 4.5 Functions (CEL)

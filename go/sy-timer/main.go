@@ -22,13 +22,28 @@ import (
 )
 
 const (
-	version             = "1.1"
+	version             = "1.2"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
 )
 
 var uuidPersistenceDir = "/var/lib/fluxbee/state/nodes"
+
+// Caps on what a node may ask of SY.timer (FINDINGS A-115).
+const (
+	// maxTimerDelay is how far ahead a one-shot may fire.
+	maxTimerDelay = 366 * 24 * time.Hour
+	// maxTimerDataBytes caps a timer's payload, and its metadata: a TIMER_FIRED with both fits in
+	// the router's 128 KiB frame.
+	maxTimerDataBytes = 32 * 1024
+)
+
+// maxPendingTimersPerOwner and maxPendingTimers cap the pending timers of one owner, and of the hive.
+var (
+	maxPendingTimersPerOwner = 10_000
+	maxPendingTimers         = 100_000
+)
 
 type messageSender interface {
 	Send(fluxbeesdk.Message) error
@@ -228,6 +243,15 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind {
 		return nil
 	}
+	if stringValue(msg.Meta.Msg) == fluxbeesdk.MSGUnreachable && s.scheduler != nil {
+		var notice struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.Unmarshal(msg.Payload, &notice)
+		if s.scheduler.undelivered(msg.Routing.TraceID, notice.Reason) {
+			return nil
+		}
+	}
 	if isInfrastructureMessage(msg) {
 		log.Printf("ignoring %s from %q (trace_id=%s): not a request", stringValue(msg.Meta.Msg), msg.SourceL2Name(), msg.Routing.TraceID)
 		return nil
@@ -402,10 +426,10 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 		version,
 		"System node providing persistent timers and authoritative time/timezone services.",
 		[]fluxbeesdk.HelpOperationDescriptor{
-			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
-			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
-			{Verb: "TIMER_GET", Description: "Read one timer by uuid, or read the caller's active timer by client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
-			{Verb: "TIMER_LIST", Description: "List timers in the local hive, optionally filtered by owner.", OptionalFields: []string{"owner_l2_name", "status_filter", "limit"}},
+			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer, 60 seconds to 366 days ahead. Its fire goes to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
+			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression. Its fires go to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
+			{Verb: "TIMER_GET", Description: "Read one of the caller's timers by uuid, or its active timer by client_ref. SY.admin reads any timer by uuid.", RequiredFields: []string{"timer_uuid OR client_ref"}},
+			{Verb: "TIMER_LIST", Description: "List the caller's timers. SY.admin lists every owner's, or one owner's with owner_l2_name.", OptionalFields: []string{"owner_l2_name", "status_filter", "limit"}},
 			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
 			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester, by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref", "new_fire_at_utc_ms OR new_fire_in_ms"}},
 			{Verb: "TIMER_PURGE_OWNER", Description: "Delete every timer owned by a node. Reserved to SY.orchestrator.", RequiredFields: []string{"owner_l2_name"}},
@@ -418,12 +442,14 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 		},
 		[]fluxbeesdk.HelpErrorDescriptor{
 			{Code: "TIMER_BELOW_MINIMUM", Description: "Requested timer duration is below the 60 second minimum."},
+			{Code: "TIMER_ABOVE_MAXIMUM", Description: "Requested one-shot fires more than 366 days ahead."},
+			{Code: "TIMER_LIMIT_EXCEEDED", Description: "A payload or metadata over 32 KiB, or the owner (10000) or the hive (100000) at its most pending timers."},
 			{Code: "TIMER_INVALID_PAYLOAD", Description: "Request payload is malformed or missing required fields."},
 			{Code: "TIMER_INVALID_CRON", Description: "Recurring cron expression is invalid."},
 			{Code: "TIMER_INVALID_TIMEZONE", Description: "Requested timezone is not a valid IANA timezone."},
-			{Code: "TIMER_FORBIDDEN", Description: "Requester is not authorized for the requested operation."},
+			{Code: "TIMER_FORBIDDEN", Description: "Requester is not authorized for the requested operation: another node's target, another owner's list, or the purge."},
 			{Code: "TIMER_NOT_FOUND", Description: "Requested timer does not exist."},
-			{Code: "TIMER_NOT_OWNER", Description: "Requester does not own the timer for mutation verbs such as cancel/reschedule."},
+			{Code: "TIMER_NOT_OWNER", Description: "Requester does not own the timer it reads, cancels or reschedules."},
 			{Code: "TIMER_ALREADY_FIRED", Description: "Timer already fired and can no longer be modified."},
 			{Code: "TIMER_RECURRING_NOT_RESCHEDULABLE", Description: "Recurring timers cannot be rescheduled in v1."},
 			{Code: "TIMER_INTERNAL", Description: "Verb is not implemented yet or an internal error occurred."},
@@ -452,6 +478,9 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if !isCanonicalL2Name(targetL2) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INVALID_PAYLOAD", "target_l2_name must be a canonical L2 name")
 	}
+	if err := checkTimerTarget(ownerL2, targetL2); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_FORBIDDEN", err.Error())
+	}
 	missedPolicy := "fire"
 	if req.MissedPolicy != nil && strings.TrimSpace(*req.MissedPolicy) != "" {
 		missedPolicy = strings.TrimSpace(*req.MissedPolicy)
@@ -467,6 +496,9 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if len(metadata) > 0 && !json.Valid(metadata) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INVALID_PAYLOAD", "metadata must be valid JSON")
 	}
+	if err := checkTimerData(payload, metadata); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_LIMIT_EXCEEDED", err.Error())
+	}
 	nowUTCMS := time.Now().UTC().UnixMilli()
 	clientRef, err := normalizeClientRef(req.ClientRef)
 	if err != nil {
@@ -480,6 +512,9 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 		if err == nil && existing != nil {
 			return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE", *existing, true)
 		}
+	}
+	if code, err := checkPendingLimits(context.Background(), s.db, ownerL2); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE", code, err.Error())
 	}
 	timerID := uuid.NewString()
 	row := timerRow{
@@ -553,6 +588,9 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if !isCanonicalL2Name(targetL2) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INVALID_PAYLOAD", "target_l2_name must be a canonical L2 name")
 	}
+	if err := checkTimerTarget(ownerL2, targetL2); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_FORBIDDEN", err.Error())
+	}
 	missedPolicy := "fire"
 	if req.MissedPolicy != nil && strings.TrimSpace(*req.MissedPolicy) != "" {
 		missedPolicy = strings.TrimSpace(*req.MissedPolicy)
@@ -571,6 +609,9 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if len(metadata) > 0 && !json.Valid(metadata) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INVALID_PAYLOAD", "metadata must be valid JSON")
 	}
+	if err := checkTimerData(payload, metadata); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_LIMIT_EXCEEDED", err.Error())
+	}
 	nowUTCMS := time.Now().UTC().UnixMilli()
 	clientRef, err := normalizeClientRef(req.ClientRef)
 	if err != nil {
@@ -584,6 +625,9 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 		if err == nil && existing != nil {
 			return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE_RECURRING", *existing, true)
 		}
+	}
+	if code, err := checkPendingLimits(context.Background(), s.db, ownerL2); err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", code, err.Error())
 	}
 	timerID := uuid.NewString()
 	row := timerRow{
@@ -656,6 +700,9 @@ func (s *Service) respondTimerGet(incoming fluxbeesdk.Message) error {
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	if !mayRead(incoming, row.OwnerL2Name) {
+		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_NOT_OWNER", "a timer is read by its owner and by SY.admin only")
+	}
 	info, err := timerRowToInfo(*row)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_INTERNAL", err.Error())
@@ -684,6 +731,14 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 	ownerFilter := strings.TrimSpace(req.OwnerL2Name)
 	if ownerFilter != "" && !isCanonicalL2Name(ownerFilter) {
 		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INVALID_PAYLOAD", "owner_l2_name must be a canonical L2 name")
+	}
+	if incoming.SourceL2Name() != fluxbeesdk.PrimaryAdminNode {
+		if ownerFilter == "" {
+			ownerFilter = incoming.SourceL2Name()
+		}
+		if !mayRead(incoming, ownerFilter) {
+			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_FORBIDDEN", "a node lists its own timers; another owner's are listed by SY.admin only")
+		}
 	}
 	rows, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit)
 	if err != nil {
@@ -931,6 +986,53 @@ func (s *Service) resolveSourceL2NameFromMsg(incoming fluxbeesdk.Message) (strin
 	return "", fmt.Errorf("routing.src_l2_name missing from incoming message (src=%s)", incoming.Routing.Src)
 }
 
+// mayRead reports whether the sender of incoming may read the timers of owner: a node reads its own,
+// and SY.admin every one (FINDINGS A-115).
+func mayRead(incoming fluxbeesdk.Message, owner string) bool {
+	requester := incoming.SourceL2Name()
+	return requester != "" && (requester == owner || requester == fluxbeesdk.PrimaryAdminNode)
+}
+
+// checkTimerTarget refuses a timer whose fires go to another node than its owner, unless the owner is
+// a SY node: a node schedules for itself (FINDINGS A-115).
+func checkTimerTarget(ownerL2, targetL2 string) error {
+	if targetL2 == ownerL2 || strings.HasPrefix(ownerL2, "SY.") {
+		return nil
+	}
+	return fmt.Errorf("a node schedules timers for itself only: target_l2_name %q is not %q", targetL2, ownerL2)
+}
+
+// checkTimerData refuses a payload or metadata over maxTimerDataBytes.
+func checkTimerData(payload, metadata json.RawMessage) error {
+	if len(payload) > maxTimerDataBytes {
+		return fmt.Errorf("payload is %d bytes, at most %d", len(payload), maxTimerDataBytes)
+	}
+	if len(metadata) > maxTimerDataBytes {
+		return fmt.Errorf("metadata is %d bytes, at most %d", len(metadata), maxTimerDataBytes)
+	}
+	return nil
+}
+
+// checkPendingLimits refuses a new timer once its owner, or the hive, has as many pending timers as
+// SY.timer keeps (TIMER_LIMIT_EXCEEDED); the code is TIMER_STORAGE_ERROR when it cannot count.
+func checkPendingLimits(ctx context.Context, db *sql.DB, ownerL2 string) (string, error) {
+	owned, err := countPendingTimersByOwner(ctx, db, ownerL2)
+	if err != nil {
+		return "TIMER_STORAGE_ERROR", err
+	}
+	if owned >= int64(maxPendingTimersPerOwner) {
+		return "TIMER_LIMIT_EXCEEDED", fmt.Errorf("%s has %d pending timers, the most one owner may have", ownerL2, owned)
+	}
+	total, err := countPendingTimers(ctx, db)
+	if err != nil {
+		return "TIMER_STORAGE_ERROR", err
+	}
+	if total >= int64(maxPendingTimers) {
+		return "TIMER_LIMIT_EXCEEDED", fmt.Errorf("the hive has %d pending timers, the most SY.timer keeps", total)
+	}
+	return "", nil
+}
+
 func (s *Service) localOrchestratorL2Name() string {
 	_, hive, _ := strings.Cut(s.nodeName, "@")
 	return fmt.Sprintf("SY.orchestrator@%s", hive)
@@ -1028,22 +1130,32 @@ func timerStorageOrInternalCode(err error) string {
 }
 
 func scheduleFireAt(req timerScheduleRequest) (int64, error) {
-	hasAbsolute := req.FireAtUTCMS != nil
-	hasRelative := req.FireInMS != nil
-	if hasAbsolute == hasRelative {
-		return 0, fmt.Errorf("exactly one of fire_at_utc_ms or fire_in_ms must be set")
+	return oneShotFireAt(req.FireAtUTCMS, req.FireInMS, "fire_at_utc_ms", "fire_in_ms")
+}
+
+// oneShotFireAt is the instant a one-shot fires, from exactly one of an absolute instant or a delay:
+// at least MinTimerDuration ahead, and at most maxTimerDelay.
+func oneShotFireAt(atUTCMS, inMS *int64, atField, inField string) (int64, error) {
+	if (atUTCMS != nil) == (inMS != nil) {
+		return 0, fmt.Errorf("exactly one of %s or %s must be set", atField, inField)
 	}
-	if hasAbsolute {
-		fireAt := *req.FireAtUTCMS
-		if fireAt-time.Now().UTC().UnixMilli() < int64(fluxbeesdk.MinTimerDuration/time.Millisecond) {
-			return 0, errBelowMinimum()
+	nowUTCMS := time.Now().UTC().UnixMilli()
+	fireAt := nowUTCMS
+	if atUTCMS != nil {
+		fireAt = *atUTCMS
+	} else {
+		if *inMS > maxTimerDelay.Milliseconds() {
+			return 0, errAboveMaximum()
 		}
-		return fireAt, nil
+		fireAt += *inMS
 	}
-	if *req.FireInMS < int64(fluxbeesdk.MinTimerDuration/time.Millisecond) {
+	switch ahead := fireAt - nowUTCMS; {
+	case ahead < fluxbeesdk.MinTimerDuration.Milliseconds():
 		return 0, errBelowMinimum()
+	case ahead > maxTimerDelay.Milliseconds():
+		return 0, errAboveMaximum()
 	}
-	return time.Now().UTC().Add(time.Duration(*req.FireInMS) * time.Millisecond).UnixMilli(), nil
+	return fireAt, nil
 }
 
 func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, error) {
@@ -1077,22 +1189,7 @@ func scheduleRecurringFireAt(req timerScheduleRecurringRequest) (int64, string, 
 }
 
 func rescheduleFireAt(req timerRescheduleRequest) (int64, error) {
-	hasAbsolute := req.NewFireAtUTCMS != nil
-	hasRelative := req.NewFireInMS != nil
-	if hasAbsolute == hasRelative {
-		return 0, fmt.Errorf("exactly one of new_fire_at_utc_ms or new_fire_in_ms must be set")
-	}
-	if hasAbsolute {
-		fireAt := *req.NewFireAtUTCMS
-		if fireAt-time.Now().UTC().UnixMilli() < int64(fluxbeesdk.MinTimerDuration/time.Millisecond) {
-			return 0, errBelowMinimum()
-		}
-		return fireAt, nil
-	}
-	if *req.NewFireInMS < int64(fluxbeesdk.MinTimerDuration/time.Millisecond) {
-		return 0, errBelowMinimum()
-	}
-	return time.Now().UTC().Add(time.Duration(*req.NewFireInMS) * time.Millisecond).UnixMilli(), nil
+	return oneShotFireAt(req.NewFireAtUTCMS, req.NewFireInMS, "new_fire_at_utc_ms", "new_fire_in_ms")
 }
 
 func validateMissedPolicyRaw(policy string, withinMS *int64) error {
@@ -1125,12 +1222,19 @@ func errBelowMinimum() error {
 	return fmt.Errorf("minimum timer duration is %d seconds", int(fluxbeesdk.MinTimerDuration.Seconds()))
 }
 
+func errAboveMaximum() error {
+	return fmt.Errorf("maximum timer delay is %d days", int(maxTimerDelay.Hours()/24))
+}
+
 func timerErrorCode(err error) string {
 	if err == nil {
 		return "TIMER_INTERNAL"
 	}
 	if strings.Contains(err.Error(), "minimum timer duration") {
 		return "TIMER_BELOW_MINIMUM"
+	}
+	if strings.Contains(err.Error(), "maximum timer delay") {
+		return "TIMER_ABOVE_MAXIMUM"
 	}
 	if strings.Contains(err.Error(), "invalid timezone") {
 		return "TIMER_INVALID_TIMEZONE"

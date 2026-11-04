@@ -11,6 +11,7 @@ pub mod node_client;
 pub mod node_config;
 pub mod node_secret;
 pub mod payload;
+pub mod peer_slots;
 pub mod policy;
 pub mod prelude;
 pub mod protocol;

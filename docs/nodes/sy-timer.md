@@ -61,9 +61,15 @@ Rules enforced in `main.go`:
   (`UNREACHABLE`, `TTL_EXCEEDED`): it gets no answer, only a log line (`isInfrastructureMessage`).
 - **Names.** `target_l2_name` and `owner_l2_name` filters must be canonical L2 names:
   `<kind>.<name>@<hive>`, with a dot before the `@` (`isCanonicalL2Name`).
+- **Target.** A node schedules for itself: a `target_l2_name` that names another node is
+  `TIMER_FORBIDDEN`, unless the owner is a SY node (`checkTimerTarget`; FINDINGS A-115).
 - **Minimum duration: 60 s** (`MinTimerDuration` in `go/fluxbee-go-sdk/timer_schedule.go`). A
   one-shot must fire at least 60 s from now; a recurring cron must not fire twice within 60 s.
   Otherwise `TIMER_BELOW_MINIMUM`.
+- **Caps** (FINDINGS A-115). A one-shot fires at most 366 days ahead, scheduled or rescheduled
+  (`maxTimerDelay`, `TIMER_ABOVE_MAXIMUM`). A `payload` and a `metadata` are at most 32 KiB each
+  (`checkTimerData`), and a new timer is refused once its owner has 10,000 pending timers or the
+  hive 100,000 (`checkPendingLimits`): both `TIMER_LIMIT_EXCEEDED`.
 - **Cron.** Five fields (minute, hour, day of month, month, day of week), parsed with
   `robfig/cron`; `cron_tz` is an IANA zone and defaults to `UTC` (`scheduleRecurringFireAt`).
   The binary embeds the timezone database (`time/tzdata` import).
@@ -84,11 +90,22 @@ due, `fireTimerByUUID` re-reads it, skips it unless still `pending`, and sends:
   `fire_count`, `is_last_fire` (true for one-shots), `user_payload` (the scheduled `payload`), and
   `client_ref` and `metadata` when set (`emitTimerFired`).
 
-Delivery is fire-and-forget. A send error is logged (`timer_fire_emit_failed`) and the timer is
-still recorded as fired. A one-shot then becomes `fired`; a recurring timer gets its next fire
-time from the cron and goes back on the heap. Nothing retries: the router's `UNREACHABLE` for a
-target that is down is ignored like any notice. A one-shot is saved `fired` after its send, so one
-whose save a stop interrupted fires again at the next start.
+A fire is saved before it is sent (FINDINGS A-115): a one-shot becomes `fired`, a recurring timer
+gets its next fire time from the cron and goes back on the heap. A stop between the two loses that
+fire instead of sending it twice. A row that cannot be saved sends nothing, and the fire is tried
+again in 30 s (`timer_fire_persist_failed`).
+
+Each attempt goes under a new trace id, and is kept 30 s for the router's answer (`deliver`). An
+`UNREACHABLE` with that trace id, for a target that is not connected (`NODE_NOT_FOUND`,
+`PEER_UNAVAILABLE`, `WAN_UNAVAILABLE`, `GATEWAY_UNAVAILABLE`), or a send that fails, sends the same
+fire again after 5, 10, 20 and 40 s, then each minute (`undelivered`, `retryLater`). The retries stop
+an hour after the first attempt, sooner for a `fire_if_within` one-shot (its window from its
+scheduled time) and a recurring timer (its next instance), and a `drop` one-shot gets none
+(`deliveryDeadline`); then the fire is lost (`timer_fire_lost`). A fire the router refuses for
+another reason (`VPN_BLOCKED`, `OPA_*`) is not sent again (`timer_fire_refused`), nor one over the
+frame. A retry whose timer was purged or canceled since is dropped. The retries live in memory: a
+fire being retried when SY.timer stops is lost, and its owner covers it (a WF reconciles its timers
+when it starts).
 
 ### After a restart
 
@@ -96,8 +113,10 @@ whose save a stop interrupted fires again at the next start.
 
 - a pending one-shot still in the future is re-queued;
 - a pending one-shot whose time passed while the node was down follows its missed policy
-  (`handleMissedTimer`): `fire` fires it now; `drop` cancels it; `fire_if_within` fires it only
-  if it is late by at most `missed_within_ms`, otherwise cancels it; an unknown policy cancels it;
+  (`handleMissedTimer`): `fire` queues it, due at once; `drop` cancels it; `fire_if_within` queues
+  it only if it is late by at most `missed_within_ms`, otherwise cancels it; an unknown policy
+  cancels it. A queued one goes when the scheduler starts and, after a hive reboot, is sent again
+  until its owner is relaunched;
 - a recurring timer is moved to its next future occurrence; missed occurrences are not fired.
 
 ## Messages
@@ -108,10 +127,10 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 
 | Verb | Payload | Who may send |
 | --- | --- | --- |
-| `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner |
-| `TIMER_SCHEDULE_RECURRING` | `cron_spec`, optional `cron_tz` and the same optional fields | any node; it becomes the owner |
-| `TIMER_GET` | `timer_uuid`, or `client_ref` (the caller's own pending timer) | any node; a lookup by `timer_uuid` does not check the owner |
-| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000) | any node; lists the whole local hive, ordered by fire time |
+| `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner, and the target unless it is a SY node |
+| `TIMER_SCHEDULE_RECURRING` | `cron_spec`, optional `cron_tz` and the same optional fields | any node; it becomes the owner, and the target unless it is a SY node |
+| `TIMER_GET` | `timer_uuid`, or `client_ref` (the caller's own pending timer) | the owner, and `SY.admin@motherbee` for any timer by `timer_uuid` (`TIMER_NOT_OWNER` otherwise) |
+| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000) | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time. A response over the 128 KiB frame, about 280 timers, is `TIMER_INTERNAL` (FINDINGS A-151) |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
 | `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status |
@@ -127,7 +146,8 @@ Any other verb gets `TIMER_INTERNAL` ("verb not implemented in current build"). 
 not gate `TIMER_*` verbs: they are not in `PROTECTED_SYSTEM_ACTIONS`
 (`src/router/system_policy.rs`).
 
-Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON`,
+Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED`,
+`TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON`,
 `TIMER_INVALID_TIMEZONE`, `TIMER_FORBIDDEN`, `TIMER_NOT_FOUND`, `TIMER_NOT_OWNER`,
 `TIMER_ALREADY_FIRED`, `TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_STORAGE_ERROR`,
 `TIMER_INTERNAL`.
@@ -146,8 +166,8 @@ again (FINDINGS A-121).
 ## SY.admin HTTP routes
 
 Read-only; SY.admin forwards to `SY.timer@<hive in the URL>` (`handle_timer_rpc` in
-`src/bin/sy_admin.rs`). Scheduling and cancelling are not exposed: a timer belongs to the node
-that created it.
+`src/bin/sy_admin.rs`), which answers `SY.admin@motherbee` for every owner. Scheduling and
+cancelling are not exposed: a timer belongs to the node that created it.
 
 | Route | Verb |
 | --- | --- |
@@ -172,16 +192,18 @@ secret.
   or replayed: the process exits and systemd restarts it every 5 s.
 - If the router channel closes, the run loop ends (`sy.timer incoming channel closed`).
 - A handler error is logged as a JSON event `timer_handler_error` plus `handle message error`.
-- A recurring timer whose next time cannot be computed (`timer_recurring_next_fire_failed`) or
-  saved (`timer_recurring_persist_failed`) is not re-queued; it stays `pending` and the next
-  start tries again (`replayPending`, which skips one it still cannot compute).
+- A recurring timer whose next time cannot be computed (`timer_recurring_next_fire_failed`) does
+  not fire and is not re-queued; it stays `pending` and the next start tries again
+  (`replayPending`, which skips one it still cannot compute).
 
 ## Health
 
 - `systemctl status sy-timer`; `journalctl -u sy-timer`. Besides plain lines, the node logs one
   JSON object per event (`logEvent` in `logging.go`): `timer_startup`, `timer_scheduled`,
-  `timer_fired`, `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
-  `timer_missed_policy_applied`, `timer_fire_emit_failed`, `timer_handler_error`.
+  `timer_fired` (one per attempt), `timer_canceled`, `timer_rescheduled`, `timer_owner_purged`,
+  `timer_missed_policy_applied`, `timer_handler_error`, and for the delivery
+  `timer_fire_persist_failed`, `timer_fire_emit_failed`, `timer_fire_undelivered`,
+  `timer_fire_refused`, `timer_fire_lost`, `timer_fire_dropped`.
 - `curl -s 127.0.0.1:8080/hives/<hive>/timer/now` on the motherbee proves the admin → timer
   round trip; `.../timer/timers` shows the pending timers.
 

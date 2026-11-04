@@ -901,7 +901,7 @@ The recovery flow is:
 
 A timer's `missed_policy` is forwarded to SY.timer, and SY.timer applies it to its own late fires; the WF's synthetic fires at recovery do not apply it.
 
-This recovery flow gives the WF authority over its own timer state across restarts. The reason is that the WF needs to update its instance state when a timer fires, and only the WF can do that — SY.timer firing a timer in the WF's absence is fire-and-forget, the WF would never see it.
+This recovery flow gives the WF authority over its own timer state across restarts. The reason is that the WF needs to update its instance state when a timer fires, and only the WF can do that. SY.timer sends a fire again while the WF is not connected for an hour at most, and keeps those retries in memory (`docs/sy-timer.md` §7.8): a fire lost past that, the WF would never see.
 
 ## 12. Soft abort
 

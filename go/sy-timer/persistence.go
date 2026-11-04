@@ -291,6 +291,12 @@ func countPendingTimers(ctx context.Context, db *sql.DB) (int64, error) {
 	return count, err
 }
 
+func countPendingTimersByOwner(ctx context.Context, db *sql.DB, ownerL2Name string) (int64, error) {
+	var count int64
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM timers WHERE owner_l2_name=? AND status='pending'`, ownerL2Name).Scan(&count)
+	return count, err
+}
+
 func gcHistoricalTimers(ctx context.Context, db *sql.DB, now time.Time, retention time.Duration) (int64, error) {
 	if retention <= 0 {
 		retention = defaultHistoryRetention

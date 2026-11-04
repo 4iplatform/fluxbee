@@ -5875,9 +5875,8 @@ fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
         vpns = snapshot.header.vpn_assignment_count,
         "vpn assignment snapshot"
     );
-    if snapshot.vpns.is_empty() {
-        tracing::warn!("vpn table empty in config snapshot");
-    }
+    // No VPN rule is the normal state of a hive without VPNs: the debug line above counts them
+    // (FINDINGS A-146).
     let mut rules: Vec<(u16, &str, u8, u32, u16)> = Vec::new();
     for entry in &snapshot.vpns {
         let flags = entry.flags;
@@ -6911,40 +6910,37 @@ fn serialize_with_package(
 /// no memory package from the sender (nothing legitimate sets one, and a node could otherwise put
 /// one in an agent's prompt, §6.2). None when the gate drops it.
 fn prepare_local_delivery(hive_id: &str, msg: &Message, src_via_hub: bool) -> Option<Message> {
-    if is_system_kind(&msg.meta.msg_type) {
-        // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
-        // (policy/system.rego -> system.wasm), evaluated via authorize_system() — the SINGLE
-        // source of truth, no Rust fallback (the router fails closed at startup if the wasm cannot
-        // load). System DENY is final. (The user/OPA layer handles routing and, in future, may
-        // only narrow this — never broaden it.)
-        let action = msg.meta.msg.as_deref().unwrap_or_default();
-        if system_policy::is_protected_system_action(action) {
-            // Option B security invariant: a src learned TRANSITIVELY via the hub's reachability
-            // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
-            // authority — it is denied here WITHOUT consulting the allow policy at all, so a
-            // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
-            // A tap copy (`via_tap`) is denied the same way: it keeps the original sender's name,
-            // but goes to the tap's target, which that sender never addressed
-            // (docs/control-path-hardening-v1.md §5). A directly-authenticated src still goes
-            // through the normal authority gate.
-            let authorized = !src_via_hub
-                && !msg.meta.via_tap
-                && system_policy::authorize_system(
-                    action,
-                    msg.routing.src_l2_name.as_deref(),
-                    hive_id,
-                );
-            if !authorized {
-                tracing::warn!(
-                    action = action,
-                    src_uuid = %msg.routing.src,
-                    src_l2_name = ?msg.routing.src_l2_name,
-                    src_via_hub = src_via_hub,
-                    via_tap = msg.meta.via_tap,
-                    "router dropped protected SYSTEM action from unauthorized origin"
-                );
-                return None;
-            }
+    // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
+    // (policy/system.rego -> system.wasm), evaluated via authorize_system(), the single source of
+    // truth with no Rust fallback (the router fails closed at startup if the wasm cannot load).
+    // System DENY is final; the user/OPA layer handles routing and may only narrow this. A
+    // protected verb is gated whatever the message's msg_type and in any case: a node that took one
+    // sent as `admin`, or as `config_set`, ran it from any sender (FINDINGS A-100).
+    let named = msg.meta.msg.as_deref().unwrap_or_default();
+    if let Some(action) = system_policy::protected_system_action(named) {
+        // Option B security invariant: a src learned TRANSITIVELY via the hub's reachability
+        // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
+        // authority — it is denied here WITHOUT consulting the allow policy at all, so a
+        // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
+        // A tap copy (`via_tap`) is denied the same way: it keeps the original sender's name,
+        // but goes to the tap's target, which that sender never addressed
+        // (docs/control-path-hardening-v1.md §5). A directly-authenticated src still goes
+        // through the normal authority gate.
+        let authorized = !src_via_hub
+            && !msg.meta.via_tap
+            && system_policy::authorize_system(action, msg.routing.src_l2_name.as_deref(), hive_id);
+        if !authorized {
+            tracing::warn!(
+                action = action,
+                msg = named,
+                msg_type = %msg.meta.msg_type,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                src_via_hub = src_via_hub,
+                via_tap = msg.meta.via_tap,
+                "router dropped protected SYSTEM action from unauthorized origin"
+            );
+            return None;
         }
     }
     let mut prepared = msg.clone();
@@ -7735,6 +7731,52 @@ mod tests {
         assert!(prepare_local_delivery("worker1", &message("SPAWN_NODE", false), false).is_some());
         assert!(prepare_local_delivery("worker1", &message("SPAWN_NODE", true), false).is_none());
         assert!(prepare_local_delivery("worker1", &message("VAULT_PUT", true), false).is_some());
+    }
+
+    /// A-100: a protected verb is gated whatever its msg_type and in any case, so a node that runs
+    /// `config_get` or an `admin` CONFIG_SET never takes one from a sender the policy refuses.
+    #[test]
+    fn a_protected_verb_is_gated_on_any_msg_type_and_in_any_case() {
+        let message = |sender: &str, msg_type: &str, action: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(sender.to_string()),
+                dst: Destination::Unicast("AI.sales@worker1".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: Some(action.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        // Each with the sender the policy admits for it: the primary Admin for a node's live config
+        // (rule 2), the hive's orchestrator for a read (rule 3).
+        for (msg_type, action, authority) in [
+            (SYSTEM_KIND, "CONFIG_GET", "SY.admin@motherbee"),
+            (SYSTEM_KIND, "config_get", "SY.admin@motherbee"),
+            (SYSTEM_KIND, " Config_Set ", "SY.admin@motherbee"),
+            ("admin", "CONFIG_SET", "SY.admin@motherbee"),
+            ("user", "node_status_get", "SY.orchestrator@worker1"),
+        ] {
+            let rogue = message("AI.intruso@worker1", msg_type, action);
+            assert!(
+                prepare_local_delivery("worker1", &rogue, false).is_none(),
+                "{msg_type}/{action:?} from a node must be dropped"
+            );
+            let authorized = message(authority, msg_type, action);
+            assert!(
+                prepare_local_delivery("worker1", &authorized, false).is_some(),
+                "{msg_type}/{action:?} from {authority} must pass"
+            );
+        }
+        // What is not a protected verb passes as before, whoever sends it.
+        for action in ["CONFIG_GET_RESPONSE", "TIMER_FIRED", "chat"] {
+            let message = message("AI.intruso@worker1", "user", action);
+            assert!(prepare_local_delivery("worker1", &message, false).is_some());
+        }
     }
 
     /// R1: a WAN frame's sender is bound to its session: a node of the peer's own LSA bucket, or,

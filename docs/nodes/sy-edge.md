@@ -326,12 +326,19 @@ added (see above).
   (`access_denied`) is the first thing the edge reads after it sends the request: the edge's
   connect succeeds first. The detail (`IoWebFailure`) goes to the edge's log only.
 - **`IO_WEB_CONNECT_TIMEOUT`, 5 s:** the TCP connection and the TLS handshake, together.
-- **`IO_WEB_HEAD_TIMEOUT`, 30 s:** io.web's response head, once the request is sent. The body
-  has no deadline of its own, and the client keeps the door's pace.
+- **`IO_WEB_HEAD_TIMEOUT`, 30 s:** io.web's response head, once the request is sent.
+- **`IO_WEB_BODY_IDLE_TIMEOUT`, 30 s:** io.web sending nothing of its body for that long, while the
+  edge waits on it, ends the response; the client keeps the door's pace, and its own slowness never
+  counts (`IoWebBody`, A-90).
 - **`web_max_inflight`, 128 by default (0 turns it off):** the proxied requests in flight at
   once, each with its own connection to io.web, each held from the request to the response's last
   byte, or to the end of the client's connection. One more gets a quick `503 WEB_BUSY` and never
   reaches io.web; the refusals are logged at most once per 10 s, with their count.
+- **`web_max_inflight_per_ip`, 16 by default (0 turns it off):** the share of those one client
+  address holds, its IPv6 /64 as one (`PeerSlots`, A-90). One more gets a quick
+  `429 WEB_PEER_BUSY` and never reaches io.web.
+- **`Connection: close` to io.web:** each proxied request's connection is closed by io.web first,
+  so its TIME_WAIT is on the motherbee, never a port of the ingress toward it (A-90).
 - **hyper's buffer** on a connection to io.web is 64 KiB (`IO_WEB_MAX_BUF`), as on the door's
   own connections.
 
@@ -589,6 +596,7 @@ cannot run: another origin, an edge with no public listener, or a RELOAD or CHAL
 | `public_max_inflight_per_ip` | `SY_EDGE_PUBLIC_MAX_INFLIGHT_PER_IP` | 8 (0: no cap) |
 | `public_ready_timeout_ms` | `SY_EDGE_PUBLIC_READY_TIMEOUT_MS` | 60 000 |
 | `web_max_inflight` | `SY_EDGE_WEB_MAX_INFLIGHT` | 128 (0: no cap) |
+| `web_max_inflight_per_ip` | `SY_EDGE_WEB_MAX_INFLIGHT_PER_IP` | 16 (0: no cap) |
 | `tls_vault_key` | `SY_EDGE_TLS_VAULT_KEY` | none |
 | `vault_hive` | `SY_EDGE_VAULT_HIVE` | `motherbee` |
 | `tls_cert`, `tls_key` | `SY_EDGE_TLS_CERT`, `SY_EDGE_TLS_KEY` | none |
@@ -651,7 +659,8 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
   id, and the edge logs why, at most once per 10 s with the count; nothing restarts. No mesh TLS
   material, `hive_id` or uplink at boot: every web host answers 502 until it is fixed and the edge
   restarts (the boot ERROR says which, and so does `upstream` in the answer to `EDGE_WEB_ROUTES`).
-  More than `web_max_inflight` requests at once: a quick 503.
+  More than `web_max_inflight` requests at once: a quick 503; more than `web_max_inflight_per_ip`
+  from one address: a quick 429. An io.web that stalls mid-body loses the response after 30 s.
 - **Slow, stalled or greedy clients.** A client below the door's pace loses its connection, and
   the download or `/e/` slot it held; a head that does not arrive in 30 s, or an `/e/` body not
   whole in 30 s, ends it too. One address past its share of connections or downloads is refused
@@ -672,9 +681,8 @@ is answered as `restart_required` and not applied. `CONFIG_GET` returns the curr
 - The proxy's stage 2 (io-web-v2 §11.3): the edge passes cookies and `Authorization` to io.web as
   the client sent them; filtering cookies to `__Host-` ones, and bodies on upload paths, come
   with sessions. Today every web route is GET and HEAD with no body.
-- The proxy keeps no connection to io.web between requests, and io.web's response body has no
-  deadline of its own: an io.web that stalls mid-body holds that request's slot until the client
-  leaves.
+- The proxy keeps no connection to io.web between requests: each one is a new TCP connection and
+  TLS handshake, closed by io.web once its response ends (A-90).
 - The `shared-secret` mode is one static bearer per channel. There is no other auth mode.
 - The owner node's reply is always sent as `200 application/json`.
 

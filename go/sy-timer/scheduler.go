@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -20,7 +21,9 @@ import (
 type timerHeapEntry struct {
 	timerUUID string
 	fireAtUTC int64
-	index     int
+	// retry is set on an entry that sends a fire again: its target did not take it (retryLater).
+	retry *fireAttempt
+	index int
 }
 
 type timerHeap []*timerHeapEntry
@@ -55,6 +58,50 @@ type timerScheduler struct {
 	wakeCh chan struct{}
 	lockMu sync.Mutex
 	locks  map[string]*sync.Mutex
+
+	sentMu sync.Mutex
+	// sent holds each fire sent in the last deliveryAnswerWindow, by the trace_id of its
+	// TIMER_FIRED, for the router's UNREACHABLE to name it (undelivered).
+	sent map[string]*fireAttempt
+}
+
+// Delivery (FINDINGS A-115). A fire is saved before it is sent, so a stop between the two loses it
+// instead of sending it twice. A fire the router answers UNREACHABLE because its target is not
+// connected (transientUnreachable) is sent again while it is still on time: up to an hour from its
+// first attempt, less for a fire_if_within one-shot (its window from its scheduled time) and for a
+// recurring timer (its next instance); a drop one-shot is not sent again. The retries live in memory:
+// a fire SY.timer is retrying when it stops is lost, as is one its target does not take in time.
+const (
+	// deliveryRetryWindow is how long a fire is sent again while its target cannot take it, from
+	// its first attempt.
+	deliveryRetryWindow = time.Hour
+	// deliveryAnswerWindow is how long a sent fire waits for the router's UNREACHABLE: one with no
+	// answer by then reached its target.
+	deliveryAnswerWindow = 30 * time.Second
+	// storageRetryDelay is when a fire whose row could not be saved is tried again; nothing was sent.
+	storageRetryDelay = 30 * time.Second
+)
+
+// deliveryRetryDelays are the waits before each new attempt of a fire; the last one repeats.
+var deliveryRetryDelays = []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute}
+
+// transientUnreachable are the router's UNREACHABLE reasons for a target that is down, restarting or
+// behind a link that is down. A fire refused for another reason (VPN_BLOCKED, OPA_*) is not sent
+// again.
+var transientUnreachable = map[string]bool{
+	"NODE_NOT_FOUND":      true,
+	"PEER_UNAVAILABLE":    true,
+	"WAN_UNAVAILABLE":     true,
+	"GATEWAY_UNAVAILABLE": true,
+}
+
+// fireAttempt is a fire on its way: the row as it was when it fired (the fire's scheduled time and
+// fire_count), which attempt this is, and until when it is sent again.
+type fireAttempt struct {
+	row      timerRow
+	attempt  int
+	deadline time.Time
+	sentAt   time.Time
 }
 
 func newTimerScheduler(service *Service) *timerScheduler {
@@ -63,6 +110,7 @@ func newTimerScheduler(service *Service) *timerScheduler {
 		items:   timerHeap{},
 		wakeCh:  make(chan struct{}, 1),
 		locks:   map[string]*sync.Mutex{},
+		sent:    map[string]*fireAttempt{},
 	}
 }
 
@@ -163,6 +211,10 @@ func (s *timerScheduler) processDue(ctx context.Context, now time.Time) {
 		if entry == nil {
 			return
 		}
+		if entry.retry != nil {
+			s.retryFire(ctx, entry.retry)
+			continue
+		}
 		s.fireTimerByUUID(ctx, entry.timerUUID, now)
 	}
 }
@@ -184,30 +236,10 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 		return
 	}
 	actual := time.Now().UTC()
-	if err := s.emitTimerFired(*row, actual); err != nil {
-		logEvent("timer_fire_emit_failed", map[string]any{
-			"timer_uuid":     row.UUID,
-			"owner_l2_name":  row.OwnerL2Name,
-			"target_l2_name": row.TargetL2Name,
-			"kind":           row.Kind,
-			"scheduled_fire": row.FireAtUTC,
-			"actual_fire":    actual.UTC().UnixMilli(),
-			"error":          err.Error(),
-		})
-		log.Printf("emit TIMER_FIRED failed for %s: %v", row.UUID, err)
-	}
-	logEvent("timer_fired", map[string]any{
-		"timer_uuid":     row.UUID,
-		"owner_l2_name":  row.OwnerL2Name,
-		"target_l2_name": row.TargetL2Name,
-		"kind":           row.Kind,
-		"scheduled_fire": row.FireAtUTC,
-		"actual_fire":    actual.UTC().UnixMilli(),
-		"fire_count":     row.FireCount + 1,
-	})
+	fire := &fireAttempt{row: *row, attempt: 1, deadline: deliveryDeadline(*row, actual)}
+	row.FireCount++
+	row.LastFiredAtUTC = nullableNow(actual)
 	if row.Kind == "recurring" {
-		row.FireCount++
-		row.LastFiredAtUTC = nullableNow(actual)
 		nextFireAt, _, err := nextRecurringFireAt(*row, actual)
 		if err != nil {
 			logEvent("timer_recurring_next_fire_failed", map[string]any{
@@ -218,35 +250,165 @@ func (s *timerScheduler) fireTimerByUUID(ctx context.Context, timerUUID string, 
 			return
 		}
 		row.FireAtUTC = nextFireAt
-		if err := updateTimer(ctx, s.service.db, *row); err != nil {
-			logEvent("timer_recurring_persist_failed", map[string]any{
-				"timer_uuid": row.UUID,
-				"error":      err.Error(),
-			})
-			log.Printf("failed to persist recurring timer %s: %v", row.UUID, err)
-			return
+		if next := time.UnixMilli(nextFireAt).UTC(); next.Before(fire.deadline) {
+			fire.deadline = next
 		}
+	} else {
+		row.Status = "fired"
+	}
+	if err := updateTimer(ctx, s.service.db, *row); err != nil {
+		logEvent("timer_fire_persist_failed", map[string]any{
+			"timer_uuid": row.UUID,
+			"error":      err.Error(),
+		})
+		log.Printf("fire of %s not sent: its row was not saved: %v", row.UUID, err)
+		s.push(row.UUID, actual.Add(storageRetryDelay).UnixMilli())
+		return
+	}
+	if row.Kind == "recurring" {
 		logEvent("timer_recurring_requeued", map[string]any{
 			"timer_uuid":     row.UUID,
 			"fire_at_utc_ms": row.FireAtUTC,
 			"fire_count":     row.FireCount,
 		})
 		s.push(row.UUID, row.FireAtUTC)
-		return
 	}
-
-	row.Status = "fired"
-	row.FireCount++
-	row.LastFiredAtUTC = nullableNow(actual)
-	if err := updateTimer(ctx, s.service.db, *row); err != nil {
-		logEvent("timer_fired_persist_failed", map[string]any{
-			"timer_uuid": row.UUID,
-			"error":      err.Error(),
-		})
-		log.Printf("failed to persist fired timer %s: %v", row.UUID, err)
-	}
+	s.deliver(fire)
 }
 
+// deliveryDeadline is until when a fire of row, first sent at first, is sent again: an hour, or a
+// fire_if_within one-shot's window from its scheduled time if that ends sooner; a drop one-shot is
+// not sent again. The fire cuts a recurring timer's at its next instance.
+func deliveryDeadline(row timerRow, first time.Time) time.Time {
+	deadline := first.Add(deliveryRetryWindow)
+	if row.Kind == "recurring" {
+		return deadline
+	}
+	switch row.MissedPolicy {
+	case "drop":
+		return first
+	case "fire_if_within":
+		if row.MissedWithinMS.Valid {
+			if within := time.UnixMilli(row.FireAtUTC + row.MissedWithinMS.Int64).UTC(); within.Before(deadline) {
+				return within
+			}
+		}
+	}
+	return deadline
+}
+
+// deliver sends a fire, and keeps it for the router's UNREACHABLE to name it (undelivered). A fire
+// the link does not take is sent again; one over the frame limit cannot go at all, and is lost.
+func (s *timerScheduler) deliver(fire *fireAttempt) {
+	now := time.Now().UTC()
+	traceID := uuid.NewString()
+	fields := map[string]any{
+		"timer_uuid":     fire.row.UUID,
+		"owner_l2_name":  fire.row.OwnerL2Name,
+		"target_l2_name": fire.row.TargetL2Name,
+		"kind":           fire.row.Kind,
+		"scheduled_fire": fire.row.FireAtUTC,
+		"actual_fire":    now.UnixMilli(),
+		"fire_count":     fire.row.FireCount + 1,
+		"attempt":        fire.attempt,
+		"trace_id":       traceID,
+	}
+	// Kept before it goes: the router's UNREACHABLE can come back before Send returns.
+	fire.sentAt = now
+	s.sentMu.Lock()
+	for id, sent := range s.sent {
+		if now.Sub(sent.sentAt) > deliveryAnswerWindow {
+			delete(s.sent, id)
+		}
+	}
+	s.sent[traceID] = fire
+	s.sentMu.Unlock()
+	if err := s.emitTimerFired(fire.row, now, traceID); err != nil {
+		s.sentMu.Lock()
+		delete(s.sent, traceID)
+		s.sentMu.Unlock()
+		fields["error"] = err.Error()
+		logEvent("timer_fire_emit_failed", fields)
+		log.Printf("emit TIMER_FIRED failed for %s: %v", fire.row.UUID, err)
+		var tooLarge *fluxbeesdk.MessageTooLargeError
+		if !errors.As(err, &tooLarge) {
+			s.retryLater(fire, "SEND_FAILED")
+		}
+		return
+	}
+	logEvent("timer_fired", fields)
+}
+
+// undelivered takes the router's UNREACHABLE for a fire sent in the last deliveryAnswerWindow: a
+// fire whose target was not there is sent again. It reports whether traceID named a fire.
+func (s *timerScheduler) undelivered(traceID, reason string) bool {
+	s.sentMu.Lock()
+	fire, ok := s.sent[traceID]
+	delete(s.sent, traceID)
+	s.sentMu.Unlock()
+	if !ok {
+		return false
+	}
+	if !transientUnreachable[reason] {
+		logEvent("timer_fire_refused", map[string]any{
+			"timer_uuid":     fire.row.UUID,
+			"target_l2_name": fire.row.TargetL2Name,
+			"reason":         reason,
+			"attempt":        fire.attempt,
+		})
+		log.Printf("fire of %s refused by the router (%s): not sent again", fire.row.UUID, reason)
+		return true
+	}
+	s.retryLater(fire, reason)
+	return true
+}
+
+// retryLater queues a fire's next attempt, unless it would no longer be on time: then the fire is
+// lost.
+func (s *timerScheduler) retryLater(fire *fireAttempt, reason string) {
+	next := time.Now().UTC().Add(deliveryRetryDelays[min(fire.attempt, len(deliveryRetryDelays))-1])
+	fields := map[string]any{
+		"timer_uuid":     fire.row.UUID,
+		"target_l2_name": fire.row.TargetL2Name,
+		"reason":         reason,
+		"attempt":        fire.attempt,
+	}
+	if next.After(fire.deadline) {
+		logEvent("timer_fire_lost", fields)
+		log.Printf("fire of %s lost: %s did not take it in %d attempts (%s)", fire.row.UUID, fire.row.TargetL2Name, fire.attempt, reason)
+		return
+	}
+	fields["retry_at_utc_ms"] = next.UnixMilli()
+	logEvent("timer_fire_undelivered", fields)
+	fire.attempt++
+	s.pushEntry(&timerHeapEntry{timerUUID: fire.row.UUID, fireAtUTC: next.UnixMilli(), retry: fire})
+}
+
+// retryFire sends a fire again, unless its timer was canceled or purged since.
+func (s *timerScheduler) retryFire(ctx context.Context, fire *fireAttempt) {
+	lock := s.timerLock(fire.row.UUID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	row, err := getTimer(ctx, s.service.db, fire.row.UUID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		s.retryLater(fire, "STORAGE_ERROR")
+		return
+	}
+	if err != nil || row.Status == "canceled" {
+		logEvent("timer_fire_dropped", map[string]any{
+			"timer_uuid": fire.row.UUID,
+			"attempt":    fire.attempt,
+			"reason":     "the timer was canceled or purged",
+		})
+		return
+	}
+	s.deliver(fire)
+}
+
+// handleMissedTimer applies an overdue one-shot's missed_policy at start. One that fires is queued: it
+// goes when the scheduler runs, as the node serves requests, and is sent again until its owner is
+// connected again (deliver).
 func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, now time.Time) error {
 	switch row.MissedPolicy {
 	case "fire":
@@ -257,7 +419,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 			"now_utc_ms":     now.UTC().UnixMilli(),
 			"outcome":        "fire",
 		})
-		s.fireTimerByUUID(ctx, row.UUID, now)
+		s.push(row.UUID, row.FireAtUTC)
 	case "drop":
 		row.Status = "canceled"
 		logEvent("timer_missed_policy_applied", map[string]any{
@@ -289,7 +451,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 				"missed_within_ms": row.MissedWithinMS.Int64,
 				"outcome":          "fire",
 			})
-			s.fireTimerByUUID(ctx, row.UUID, now)
+			s.push(row.UUID, row.FireAtUTC)
 			return nil
 		}
 		row.Status = "canceled"
@@ -316,7 +478,7 @@ func (s *timerScheduler) handleMissedTimer(ctx context.Context, row timerRow, no
 	return nil
 }
 
-func (s *timerScheduler) emitTimerFired(row timerRow, actual time.Time) error {
+func (s *timerScheduler) emitTimerFired(row timerRow, actual time.Time, traceID string) error {
 	userPayload := json.RawMessage(row.Payload)
 	if len(userPayload) == 0 {
 		userPayload = json.RawMessage(`{}`)
@@ -350,7 +512,7 @@ func (s *timerScheduler) emitTimerFired(row timerRow, actual time.Time) error {
 		s.service.sender.UUID(),
 		fluxbeesdk.UnicastDestination(row.TargetL2Name),
 		16,
-		uuid.NewString(),
+		traceID,
 		fluxbeesdk.MsgTimerFired,
 		payload,
 	)
@@ -361,9 +523,13 @@ func (s *timerScheduler) emitTimerFired(row timerRow, actual time.Time) error {
 }
 
 func (s *timerScheduler) push(timerUUID string, fireAtUTC int64) {
+	s.pushEntry(&timerHeapEntry{timerUUID: timerUUID, fireAtUTC: fireAtUTC})
+}
+
+func (s *timerScheduler) pushEntry(entry *timerHeapEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	heap.Push(&s.items, &timerHeapEntry{timerUUID: timerUUID, fireAtUTC: fireAtUTC})
+	heap.Push(&s.items, entry)
 	s.signal()
 }
 

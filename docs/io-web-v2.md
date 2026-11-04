@@ -8,8 +8,11 @@
     0.1.84);
   - release 0.1.85, the proxy and io.web, is validated on 8.x (2026-10-24; ledger 0.1.85):
     `https://archi.<id>/` serves io.web's page through the edge.
-- Next is stage 2 (§11.3: sessions, Cloud's one-time code, Archi behind io.web). FINDINGS A-89
-  and A-90, the proxy's and io.web's limits under load, come first.
+- Next is stage 2 (§11.3: sessions, Cloud's one-time code, Archi behind io.web). It waits for
+  the operator's definition of its security.
+- FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are in 0.1.99 (2026-11-04):
+  io.web's handshakes have slots of their own, and the proxy gives each client a share, has
+  io.web close first and ends a stalled body.
 
 **What this document is.** The single place that records where this track stands, so the next
 iteration starts from here and not from the conversation. It supersedes:

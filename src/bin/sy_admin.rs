@@ -31,7 +31,7 @@ use fluxbee_ai_sdk::{
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ModelSettings, UsageRecorder,
     UsageWork,
 };
-use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
+use fluxbee_sdk::blob::{safe_fs, BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::mesh::{is_valid_hive_id, HiveRegistry, HiveRole};
 use fluxbee_sdk::protocol::{
     is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
@@ -14473,7 +14473,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         | "timer_convert" | "timer_parse" | "timer_format" => vec![
             "These are narrow SY.timer read-only actions exposed through SY.admin for operator visibility and introspection.",
             "Direct node-to-node SDK usage remains the primary interaction model for SY.timer scheduling and owner-bound mutations.",
-            "TIMER_GET and TIMER_LIST are open read operations in v1, so SY.admin may expose them without impersonation or ownership proxying.",
+            "SY.timer answers TIMER_GET and TIMER_LIST to SY.admin for every owner, while a node reads only its own timers, so SY.admin exposes them without impersonation or ownership proxying.",
             "Owner-bound mutation verbs such as schedule/cancel/reschedule remain outside SY.admin in v1.",
         ],
         "get_ilk" => vec![
@@ -14870,16 +14870,123 @@ fn materialize_inline_runtime_package(
     Ok(package_root)
 }
 
+/// Caps on a bundle_upload (FINDINGS A-84): the zip itself, all it extracts to, and its entries.
+const BUNDLE_MAX_ZIP_BYTES: u64 = 512 * 1024 * 1024;
+const BUNDLE_MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const BUNDLE_MAX_ENTRIES: usize = 10_000;
+
+/// A bundle_upload's zip, opened under the blob root without following a symlink at any step: each
+/// directory on its path is one, and the zip is a regular file (FINDINGS A-84). Syncthing brings the
+/// workers' symlinks into the blob tree, and through one SY.admin would read, install and delete
+/// whatever file it named. It is removed through the directory it was opened in, never by its path.
+struct BundleBlob {
+    path: PathBuf,
+    dir: std::os::fd::OwnedFd,
+    name: String,
+    file: fs::File,
+}
+
+impl BundleBlob {
+    fn open(blob_root: &Path, rel: &Path) -> Result<Self, String> {
+        let path = blob_root.join(rel);
+        let refused = |err: io::Error| {
+            if matches!(
+                err.raw_os_error(),
+                Some(nix::libc::ELOOP) | Some(nix::libc::ENOTDIR)
+            ) {
+                format!(
+                    "bundle blob '{}' is reached through a symlink or a non-directory: {err}",
+                    path.display()
+                )
+            } else {
+                format!("bundle blob not found '{}': {err}", path.display())
+            }
+        };
+        let mut names = rel
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let name = names
+            .pop()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "bundle_upload blob_path names no file (got '{}')",
+                    rel.display()
+                )
+            })?
+            .to_string();
+        let mut dir: std::os::fd::OwnedFd = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(blob_root)
+            .map_err(refused)?
+            .into();
+        for parent in names {
+            dir = safe_fs::open_dir_no_follow(Some(&dir), Path::new(parent)).map_err(refused)?;
+        }
+        let fd = safe_fs::open_file_no_follow(&dir, &name).map_err(refused)?;
+        if !safe_fs::is_regular_file(&fd).map_err(refused)? {
+            return Err(format!(
+                "bundle blob '{}' is not a regular file",
+                path.display()
+            ));
+        }
+        let file = fs::File::from(fd);
+        let size = file.metadata().map_err(refused)?.len();
+        if size > BUNDLE_MAX_ZIP_BYTES {
+            return Err(format!(
+                "bundle blob '{}' is {size} bytes, at most {BUNDLE_MAX_ZIP_BYTES}",
+                path.display()
+            ));
+        }
+        Ok(Self {
+            path,
+            dir,
+            name,
+            file,
+        })
+    }
+
+    /// Removes the zip from the directory it was opened in.
+    fn remove(&self) {
+        use std::os::fd::AsRawFd;
+        let _ = nix::unistd::unlinkat(
+            Some(self.dir.as_raw_fd()),
+            self.name.as_str(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        );
+    }
+}
+
+/// Copies at most `left` bytes from `from` to `to`: an entry that would extract more is refused,
+/// whatever its header says (FINDINGS A-84).
+fn copy_capped(
+    from: &mut impl io::Read,
+    to: &mut impl io::Write,
+    left: u64,
+) -> Result<u64, String> {
+    let copied = io::copy(&mut io::Read::take(from, left.saturating_add(1)), to)
+        .map_err(|err| format!("failed to extract a zip entry: {err}"))?;
+    if copied > left {
+        return Err(format!(
+            "bundle_upload zip extracts to more than {BUNDLE_MAX_EXTRACTED_BYTES} bytes"
+        ));
+    }
+    Ok(copied)
+}
+
 fn materialize_bundle_runtime_package(
     blob_root: &Path,
     blob_path: &str,
     staging_root: &Path,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<(PathBuf, BundleBlob), String> {
     let rel_blob_path = runtime_package_safe_blob_rel_path(blob_path)?;
-    let bundle_path = blob_root.join(&rel_blob_path);
-    if !bundle_path.is_file() {
-        return Err(format!("bundle blob not found '{}'", bundle_path.display()));
-    }
+    let bundle = BundleBlob::open(blob_root, &rel_blob_path)?;
+    let bundle_path = bundle.path.clone();
 
     let extraction_root = staging_root.join(format!("bundle-{}", Uuid::new_v4().simple()));
     fs::create_dir_all(&extraction_root).map_err(|err| {
@@ -14890,18 +14997,7 @@ fn materialize_bundle_runtime_package(
         )
     })?;
 
-    let archive_file = match fs::File::open(&bundle_path) {
-        Ok(file) => file,
-        Err(err) => {
-            let _ = fs::remove_dir_all(&extraction_root);
-            return Err(format!(
-                "failed to open bundle zip '{}' : {}",
-                bundle_path.display(),
-                err
-            ));
-        }
-    };
-    let mut archive = match ZipArchive::new(archive_file) {
+    let mut archive = match ZipArchive::new(&bundle.file) {
         Ok(archive) => archive,
         Err(err) => {
             let _ = fs::remove_dir_all(&extraction_root);
@@ -14913,6 +15009,14 @@ fn materialize_bundle_runtime_package(
         }
     };
 
+    if archive.len() > BUNDLE_MAX_ENTRIES {
+        let _ = fs::remove_dir_all(&extraction_root);
+        return Err(format!(
+            "bundle_upload zip has {} entries, at most {BUNDLE_MAX_ENTRIES}",
+            archive.len()
+        ));
+    }
+    let mut extracted = 0u64;
     let mut root_dir_name: Option<String> = None;
     for index in 0..archive.len() {
         let mut entry = match archive.by_index(index) {
@@ -14964,6 +15068,19 @@ fn materialize_bundle_runtime_package(
             );
         }
 
+        // Files and directories only: a zip's symlink would be extracted as a file holding its
+        // target, a package that does not say what it is (FINDINGS A-84).
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "bundle_upload zip holds a symlink '{}': only files and directories",
+                enclosed.display()
+            ));
+        }
+
         let output_path = extraction_root.join(&enclosed);
         if entry.is_dir() {
             if let Err(err) = fs::create_dir_all(&output_path) {
@@ -14993,7 +15110,14 @@ fn materialize_bundle_runtime_package(
             ));
         }
 
-        let mut output_file = match fs::File::create(&output_path) {
+        // Each file once (a second entry under its name is refused), with the package's own modes:
+        // 0755 when the zip marks it executable, 0644 otherwise, never setuid, setgid or writable
+        // by others (FINDINGS A-84).
+        let mut output_file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+        {
             Ok(file) => file,
             Err(err) => {
                 let _ = fs::remove_dir_all(&extraction_root);
@@ -15004,23 +15128,29 @@ fn materialize_bundle_runtime_package(
                 ));
             }
         };
-        if let Err(err) = io::copy(&mut entry, &mut output_file) {
+        match copy_capped(
+            &mut entry,
+            &mut output_file,
+            BUNDLE_MAX_EXTRACTED_BYTES - extracted,
+        ) {
+            Ok(copied) => extracted += copied,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!("{err} ('{}')", output_path.display()));
+            }
+        }
+        let mode = if entry.unix_mode().is_some_and(|mode| mode & 0o111 != 0) {
+            0o755
+        } else {
+            0o644
+        };
+        if let Err(err) = output_file.set_permissions(fs::Permissions::from_mode(mode)) {
             let _ = fs::remove_dir_all(&extraction_root);
             return Err(format!(
-                "failed to extract zip entry '{}' : {}",
+                "failed to set extracted file permissions '{}' : {}",
                 output_path.display(),
                 err
             ));
-        }
-        if let Some(mode) = entry.unix_mode() {
-            if let Err(err) = fs::set_permissions(&output_path, fs::Permissions::from_mode(mode)) {
-                let _ = fs::remove_dir_all(&extraction_root);
-                return Err(format!(
-                    "failed to set extracted file permissions '{}' : {}",
-                    output_path.display(),
-                    err
-                ));
-            }
         }
     }
 
@@ -15036,7 +15166,7 @@ fn materialize_bundle_runtime_package(
         );
     }
 
-    Ok((package_root, bundle_path))
+    Ok((package_root, bundle))
 }
 
 fn publish_runtime_package_inline(
@@ -15088,7 +15218,7 @@ fn publish_runtime_package_bundle(
     manifest_path: &Path,
     set_current: bool,
 ) -> Result<serde_json::Value, String> {
-    let (package_root, bundle_file) =
+    let (package_root, bundle) =
         materialize_bundle_runtime_package(blob_root, blob_path, staging_root)?;
     let extraction_root = package_root
         .parent()
@@ -15114,7 +15244,7 @@ fn publish_runtime_package_bundle(
         }
     };
     let _ = fs::remove_dir_all(&extraction_root);
-    let _ = fs::remove_file(&bundle_file);
+    bundle.remove();
     Ok(serde_json::json!({
         "source_kind": "bundle_upload",
         "blob_path": blob_path,
@@ -24373,6 +24503,126 @@ mod tests {
         let _ = fs::remove_dir_all(blob_root);
         let _ = fs::remove_dir_all(staging_root);
         let _ = fs::remove_dir_all(dist_root);
+    }
+
+    /// The blob, staging and dist roots of a bundle test, with an empty manifest.
+    fn seed_bundle_roots(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let blob_root = test_temp_dir(&format!("sy-admin-bundle-{tag}-blob"));
+        let staging_root = test_temp_dir(&format!("sy-admin-bundle-{tag}-stage"));
+        let runtimes_root = test_temp_dir(&format!("sy-admin-bundle-{tag}-dist")).join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+        (blob_root, staging_root, runtimes_root, manifest_path)
+    }
+
+    const DEMO_BUNDLE: &[(&str, &str, Option<u32>)] = &[
+        ("ai.full.demo/package.json", "{\n  \"name\": \"ai.full.demo\",\n  \"version\": \"0.2.0\",\n  \"type\": \"full_runtime\",\n  \"entry_point\": \"bin/start.sh\"\n}", Some(0o600)),
+        ("ai.full.demo/bin/start.sh", "#!/bin/sh\necho ready\n", Some(0o700)),
+    ];
+
+    /// A-84: a blob_path that goes through a symlink, at its last step or at a directory, is
+    /// refused, and what the symlink names is left alone.
+    #[test]
+    fn publish_runtime_package_bundle_refuses_a_symlinked_blob() {
+        let (blob_root, staging_root, runtimes_root, manifest_path) = seed_bundle_roots("symlink");
+        let real = blob_root.join("packages/incoming/real.zip");
+        write_test_bundle(&real, DEMO_BUNDLE).expect("write bundle");
+        std::os::unix::fs::symlink(&real, blob_root.join("packages/link.zip")).expect("file link");
+        std::os::unix::fs::symlink(
+            blob_root.join("packages/incoming"),
+            blob_root.join("packages/dirlink"),
+        )
+        .expect("dir link");
+        for blob_path in ["packages/link.zip", "packages/dirlink/real.zip"] {
+            let err = publish_runtime_package_bundle(
+                &blob_root,
+                blob_path,
+                &staging_root,
+                &runtimes_root,
+                &manifest_path,
+                true,
+            )
+            .expect_err("a symlinked blob must be refused");
+            assert!(err.contains("symlink"), "{blob_path}: err={err}");
+        }
+        assert!(real.exists(), "the file a symlink named must be left alone");
+        assert!(!runtimes_root.join("ai.full.demo").exists());
+    }
+
+    /// A-84: a zip that holds a symlink is refused.
+    #[test]
+    fn publish_runtime_package_bundle_refuses_a_symlink_entry() {
+        let (blob_root, staging_root, runtimes_root, manifest_path) = seed_bundle_roots("entry");
+        let bundle_path = blob_root.join("packages/incoming/evil.zip");
+        write_test_bundle(&bundle_path, DEMO_BUNDLE).expect("write bundle");
+        let mut zip = zip::ZipWriter::new_append(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&bundle_path)
+                .expect("open bundle"),
+        )
+        .expect("append to bundle");
+        zip.add_symlink(
+            "ai.full.demo/config/secret",
+            "/etc/shadow",
+            FileOptions::default(),
+        )
+        .expect("add symlink");
+        zip.finish().expect("finish bundle");
+        let err = publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/evil.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+            true,
+        )
+        .expect_err("a symlink entry must be refused");
+        assert!(err.contains("holds a symlink"), "err={err}");
+    }
+
+    /// A-84: what a bundle extracts gets the package's own modes: 0755 for what the zip marks
+    /// executable, 0644 for the rest.
+    #[test]
+    fn publish_runtime_package_bundle_sets_its_own_modes() {
+        let (blob_root, staging_root, runtimes_root, manifest_path) = seed_bundle_roots("modes");
+        write_test_bundle(&blob_root.join("packages/incoming/demo.zip"), DEMO_BUNDLE)
+            .expect("write bundle");
+        publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/demo.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+            true,
+        )
+        .expect("publish bundle");
+        let mode = |rel: &str| {
+            fs::metadata(runtimes_root.join("ai.full.demo/0.2.0").join(rel))
+                .expect("installed file")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(mode("package.json"), 0o644);
+        assert_eq!(mode("bin/start.sh"), 0o755);
+    }
+
+    #[test]
+    fn copy_capped_refuses_more_than_its_cap() {
+        let mut out = Vec::new();
+        assert_eq!(copy_capped(&mut "hello".as_bytes(), &mut out, 5), Ok(5));
+        assert!(copy_capped(&mut "hello".as_bytes(), &mut Vec::new(), 4).is_err());
     }
 
     #[test]

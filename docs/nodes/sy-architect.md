@@ -273,6 +273,11 @@ skills, handbooks and a personality.
 - `POST /api/software/publish` publishes an uploaded `.zip`, or packages a single binary first.
 - Pipeline artifacts are published inside the executor plan (`inline_package` or
   `bundle_upload`).
+- SY.admin opens a `bundle_upload`'s zip under the blob root without following a symlink at any
+  step, takes only a regular file of at most 512 MiB, extracts at most 10 000 entries and 1 GiB,
+  only files and directories, each file once, with its own modes (0755 when the zip marks it
+  executable, 0644 otherwise), and removes the zip through the directory it opened it in
+  (`BundleBlob`, `materialize_bundle_runtime_package`; FINDINGS A-84).
 
 ## LLM, key and usage records
 
