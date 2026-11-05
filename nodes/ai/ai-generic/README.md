@@ -172,19 +172,23 @@ On every request the node reads the key of its provider from SY.vault:
   - its labels and memories: the thread, the dominant context and reason, up to 4 contexts and 4
     reasons, up to 3 memories, and what the package left out;
   - then the recent conversation, the communication's last turns (up to 20), oldest first, one
-    line each: `- [2026-10-30 12:05] <who>: "<text>"`, the time in UTC. `<who>` is `you` for the
-    agent's own turns, and `<sender ILK> via <node>` for the others, the node being the one the
-    message came through (the IO node, for a message a WF forwarded), so the person and a
-    supervisor in one thread read apart. The text is a JSON string, so no text can pass for a
+    line each: `- [2026-10-30 12:05] <who>: "<text>"`, the time in UTC
+    ([docs/cognition-hands-v1.md](../../../docs/cognition-hands-v1.md) §6). `<who>` names the
+    writer of another's turn: `<kind> <name> (<ILK>)`, the kind `person`, `agent`, `workflow` or
+    `system`, and `via <node>` after a person's, the node they wrote through (the IO node, for a
+    message a WF forwarded). So a person, a supervisor, another agent and a WF's own text read
+    apart. The agent's own turns read `you, to <whom>`. A turn kept before turns named a writer
+    reads `<sender ILK> via <node>`. The text is a JSON string, so no text can pass for a
     turn's line of its own; files are counted (`[2 attachments]`), and an answer that chose from
     a WF's menu says so, even with a blank text (`chose invoice {"quantity":10}`). The message
     being answered is not among them.
   - This is the agents' recent conversation, and their only one: SY.cognition takes each turn as
     it arrives, so the next message carries the one before it. The node keeps no history of its
     own (FINDINGS A-133).
-  - **The message being answered names its sender the same way,** once a block comes before it:
-    `Current user message, from <sender ILK> via <node>:`, the node being where its cycle started,
-    the first entry of its trace, or else the sender. As text, a line ahead of the message; as parts, a text part of its
+  - **The message being answered names its writer the same way,** once a block comes before it:
+    `Current user message, from <writer>:`. Its writer is its `meta.context.writer`, else its
+    sender's ILK, with the kind and name the identity memory of the agent's hive gives; the node
+    is where its cycle started, the first entry of its trace, or else the sender. As text, a line ahead of the message; as parts, a text part of its
     own after the blocks.
   - Nothing ahead of the message is cut, and the message itself never is (FINDINGS A-71): with 20
     turns of 2,000 characters the block passes 40,000 characters (some 10,000 tokens a call), and

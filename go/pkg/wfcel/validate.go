@@ -1004,6 +1004,9 @@ func validateSentContext(path string, action ActionDefinition) ValidationErrors 
 			if _, writesWF := context[ContextWF]; writesWF {
 				errs = append(errs, ValidationError{Path: path + ".meta.context." + ContextWF, Message: "is the WF's own block (vars, menu and subject): the engine writes it, from the action's vars, menu and subject"})
 			}
+			if _, writesWriter := context[contextWriter]; writesWriter {
+				errs = append(errs, ValidationError{Path: path + ".meta.context." + contextWriter, Message: "is who wrote the message's text: the engine writes it, the WF for a send_message and the message's own writer for a forward"})
+			}
 			if _, asks := context["response_envelope"]; asks {
 				errs = append(errs, ValidationError{Path: path + ".meta.context.response_envelope", Message: "is not part of the definition language: a WF asks an agent with menu"})
 			}

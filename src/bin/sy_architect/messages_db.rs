@@ -114,6 +114,10 @@ pub struct MessagesDetail {
     pub to: Option<String>,
     pub from_ilk: String,
     pub to_ilk: Option<String>,
+    /// Who wrote its text (`meta.context.writer`, docs/cognition-hands-v1.md §7): their name and
+    /// their ILK, each when the message named it.
+    pub writer_name: Option<String>,
+    pub writer_ilk: Option<String>,
     pub ich: Option<String>,
     pub thread_id: Option<String>,
     pub trace_id: Option<String>,
@@ -252,8 +256,8 @@ impl MessagesDb {
         dedupe_key: &str,
     ) -> Result<Option<MessagesDetail>, MessagesDbError> {
         let sql = format!(
-            "SELECT {LIST_COLUMNS}, from_ilk, to_ilk, trace_id, tags, content, message \
-             FROM turns WHERE dedupe_key = $1"
+            "SELECT {LIST_COLUMNS}, from_ilk, to_ilk, writer_name, writer_ilk, trace_id, tags, \
+             content, message FROM turns WHERE dedupe_key = $1"
         );
         let rows = self
             .client
@@ -313,6 +317,8 @@ fn row_to_detail(row: &Row) -> MessagesDetail {
         to: item.to,
         from_ilk: row.get("from_ilk"),
         to_ilk: row.get("to_ilk"),
+        writer_name: row.get("writer_name"),
+        writer_ilk: row.get("writer_ilk"),
         ich: item.ich,
         thread_id: item.thread_id,
         trace_id: row.get("trace_id"),

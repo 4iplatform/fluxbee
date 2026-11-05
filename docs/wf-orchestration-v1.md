@@ -1260,7 +1260,8 @@ design chat; the build design is §5.4.10, the review round §5.4.11, and the ga
   - posting a customer's conversation in a team's channel is an exposure decision of its own.
 
   If the gate shows that the summary falls short, they come in.
-- **The WF's own messages carry the person** (the rest of A-116): a `send_message` carries the
+- **The WF's own messages carry the person** (the rest of A-116; since the next release after
+  0.1.100, they also name the WF as their writer, docs/cognition-hands-v1.md): a `send_message` carries the
   `src_ilk` and `ich` of the message that started the instance. Today it carries none, and the agent
   logs `missing src_ilk`.
 

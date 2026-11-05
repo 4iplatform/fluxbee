@@ -486,7 +486,8 @@ func TestValidateDefinitionEventMatchSrcAndInternalTransitions(t *testing.T) {
 
 // 0.1.91 (items 5 to 7): forward sends a message as it was received, the event's or one a
 // keep_message kept; a send_message and a forward write the WF's block (meta.context.wf), which
-// their own context never writes, and its vars.
+// their own context never writes, and its vars. Nor does it write the writer
+// (docs/cognition-hands-v1.md §5), which the engine writes.
 func TestValidateDefinitionForwardKeepMessageAndTheWFBlock(t *testing.T) {
 	action := func(actions string) error {
 		t.Helper()
@@ -510,18 +511,20 @@ func TestValidateDefinitionForwardKeepMessageAndTheWFBlock(t *testing.T) {
 	const at = "states[0].transitions[0].actions[0]"
 	for actions, want := range map[string]string{
 		`{"type": "forward"}`: at + ".target: must not be empty",
-		`{"type": "forward", "target": "SY.admin@motherbee"}`:                                                        at + ".target: must not target a SY.* / RT.* system node",
-		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"msg": "TURN"}}`:                                 at + ".meta.msg: is not a field of forward: a forward keeps the message's own msg",
-		`{"type": "forward", "target": "AI.sales@worker1", "payload": {"text": "x"}}`:                                at + ".payload: is not a field of forward: a forward sends the message's payload as it was received",
-		`{"type": "forward", "target": "AI.sales@worker1", "message": "customer"}`:                                   at + ".message: must name a message a keep_message keeps",
-		`{"type": "forward", "target": "AI.sales@worker1", "message": "a-b"}`:                                        at + ".message: must be a valid identifier",
-		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": "x"}}`:                                at + ".meta.context: must be a JSON object",
-		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"wf": 1}}}`:                          at + ".meta.context.wf: is the WF's own block",
-		`{"type": "forward", "target": "AI.sales@worker1", "vars": [1]}`:                                             at + ".vars: must be a JSON object",
-		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"$ref": "state.x"}}`:                             at + ".vars: must be a JSON object",
-		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"x": {"$ref": "nope.x"}}}`:                       at + ".vars.x.$ref: root must be input, state, or event",
-		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": {"wf": {"trail": []}}}}`: at + ".meta.context.wf: is the WF's own block",
-		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": [1]}}`:                   at + ".meta.context: must be a JSON object",
+		`{"type": "forward", "target": "SY.admin@motherbee"}`:                                                               at + ".target: must not target a SY.* / RT.* system node",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"msg": "TURN"}}`:                                        at + ".meta.msg: is not a field of forward: a forward keeps the message's own msg",
+		`{"type": "forward", "target": "AI.sales@worker1", "payload": {"text": "x"}}`:                                       at + ".payload: is not a field of forward: a forward sends the message's payload as it was received",
+		`{"type": "forward", "target": "AI.sales@worker1", "message": "customer"}`:                                          at + ".message: must name a message a keep_message keeps",
+		`{"type": "forward", "target": "AI.sales@worker1", "message": "a-b"}`:                                               at + ".message: must be a valid identifier",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": "x"}}`:                                       at + ".meta.context: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"wf": 1}}}`:                                 at + ".meta.context.wf: is the WF's own block",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": [1]}`:                                                    at + ".vars: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"$ref": "state.x"}}`:                                    at + ".vars: must be a JSON object",
+		`{"type": "forward", "target": "AI.sales@worker1", "vars": {"x": {"$ref": "nope.x"}}}`:                              at + ".vars.x.$ref: root must be input, state, or event",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": {"wf": {"trail": []}}}}`:        at + ".meta.context.wf: is the WF's own block",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": [1]}}`:                          at + ".meta.context: must be a JSON object",
+		`{"type": "send_message", "target": "AI.x@worker1", "meta": {"msg": "M", "context": {"writer": {"ilk": "ilk:x"}}}}`: at + ".meta.context.writer: is who wrote the message's text",
+		`{"type": "forward", "target": "AI.sales@worker1", "meta": {"context": {"writer": "ilk:x"}}}`:                       at + ".meta.context.writer: is who wrote the message's text",
 		`{"type": "keep_message"}`: at + ".name: must be a valid identifier",
 		`{"type": "keep_message", "name": "customer", "message": "customer"}`:      at + ".message: is not a field of keep_message",
 		`{"type": "set_variable", "name": "x", "value": "1", "vars": {"a": 1}}`:    at + ".vars: is not a field of set_variable",

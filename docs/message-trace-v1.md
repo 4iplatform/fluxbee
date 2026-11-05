@@ -266,6 +266,10 @@ else it knows it did.
 
 ## 9. Open
 
+**Who wrote a message** is not the trace's: it travels apart, in `meta.context.writer`, from
+whoever writes the text (A-137, [cognition-hands-v1](cognition-hands-v1.md) §4). The trace stays
+debug and log.
+
 Nothing: the design closed on 2026-11-04. The last two points went this way:
 - the length of `act`'s words: decision 13;
 - words from the WF's definition: withdrawn for now (§7).

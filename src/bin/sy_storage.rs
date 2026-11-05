@@ -10,6 +10,7 @@ use tokio::time;
 use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 
+use fluxbee_sdk::message_writer;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
     VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
@@ -105,7 +106,9 @@ CREATE TABLE IF NOT EXISTS turns (
     tags        TEXT[],
     thread_id   TEXT,
     trace_id    TEXT,
-    message     JSONB NOT NULL
+    message     JSONB NOT NULL,
+    writer_ilk  TEXT,
+    writer_name TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_dedupe_key ON turns (dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_turns_ts_key ON turns (ts DESC, dedupe_key DESC);
@@ -128,6 +131,23 @@ ORDER BY 1
 const TURNS_CTX_SEQ_DROP_SQL: &str = r#"
 DROP INDEX IF EXISTS idx_turns_ctx_seq;
 ALTER TABLE turns DROP COLUMN IF EXISTS ctx, DROP COLUMN IF EXISTS seq;
+"#;
+
+/// `turns.writer_ilk` and `writer_name`, who wrote each message's text (`meta.context.writer`,
+/// docs/cognition-hands-v1.md §7), added once to a table made before them (`add_turns_writer`). The
+/// catalog is read first, so a start that finds both skips the `ALTER TABLE` and its
+/// `ACCESS EXCLUSIVE` lock on `turns`.
+const TURNS_WRITER_COLUMNS_SQL: &str = r#"
+SELECT column_name::text FROM information_schema.columns
+WHERE table_schema = current_schema() AND table_name = 'turns'
+  AND column_name IN ('writer_ilk', 'writer_name')
+ORDER BY 1
+"#;
+/// Adding a nullable column with no default changes only the catalog: it is quick once it holds its
+/// lock.
+const TURNS_WRITER_ADD_SQL: &str = r#"
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS writer_ilk TEXT,
+                  ADD COLUMN IF NOT EXISTS writer_name TEXT;
 "#;
 
 /// Every record lands in the inbox first, keyed by `dedupe_key` (`message_dedupe_key`), so a
@@ -429,6 +449,9 @@ enum SchemaStep {
     Sql(&'static str),
     /// `turns.ctx` and `seq` dropped, only while the catalog shows them (`drop_turns_ctx_seq`).
     DropTurnsCtxSeq,
+    /// `turns.writer_ilk` and `writer_name` added, only while the catalog lacks one
+    /// (`add_turns_writer`).
+    AddTurnsWriter,
 }
 
 /// What `ensure_schema` runs at start, in order. Each schema statement waits at most 5 s for its
@@ -436,10 +459,11 @@ enum SchemaStep {
 /// table behind it, so it fails instead, and SY.storage exits and retries
 /// (`exit_without_database`). The reset leaves the shared connection's later statements waiting as
 /// long as they need.
-const SCHEMA_STEPS: [SchemaStep; 7] = [
+const SCHEMA_STEPS: [SchemaStep; 8] = [
     SchemaStep::Sql("SET lock_timeout = '5s'"),
     SchemaStep::Sql(TURNS_SCHEMA_SQL),
     SchemaStep::DropTurnsCtxSeq,
+    SchemaStep::AddTurnsWriter,
     SchemaStep::Sql(INBOX_SCHEMA_SQL),
     SchemaStep::Sql(COGNITION_SCHEMA_SQL),
     SchemaStep::Sql(USAGE_SCHEMA_SQL),
@@ -526,6 +550,9 @@ struct TurnRecord {
     trace_id: String,
     /// The whole message, as the router copied it: `turns` is the message log (Archi reads it).
     message: Value,
+    /// Who wrote its text (`meta.context.writer`, docs/cognition-hands-v1.md §7).
+    writer_ilk: Option<String>,
+    writer_name: Option<String>,
 }
 
 #[tokio::main]
@@ -841,6 +868,7 @@ impl Storage {
             match step {
                 SchemaStep::Sql(sql) => self.client.batch_execute(sql).await?,
                 SchemaStep::DropTurnsCtxSeq => self.drop_turns_ctx_seq().await?,
+                SchemaStep::AddTurnsWriter => self.add_turns_writer().await?,
             }
         }
         Ok(())
@@ -865,6 +893,22 @@ impl Storage {
             columns = %columns.join(", "),
             "dropped the turns columns nothing writes since 0.1.83, and any index on them"
         );
+        Ok(())
+    }
+
+    /// Adds `turns.writer_ilk` and `writer_name` (`TURNS_WRITER_ADD_SQL`), only while the catalog
+    /// lacks one of them.
+    async fn add_turns_writer(&self) -> Result<(), StorageError> {
+        let columns = self
+            .client
+            .query(TURNS_WRITER_COLUMNS_SQL, &[])
+            .await?
+            .len();
+        if columns == 2 {
+            return Ok(());
+        }
+        self.client.batch_execute(TURNS_WRITER_ADD_SQL).await?;
+        tracing::info!("added the turns columns writer_ilk and writer_name");
         Ok(())
     }
 
@@ -1310,8 +1354,8 @@ WHERE dedupe_key = $1
         db.execute(
             r#"
 INSERT INTO turns (dedupe_key, ts, from_ilk, to_ilk, ich, msg_type, content, tags, thread_id,
-                   trace_id, message)
-VALUES ($1, COALESCE($2, now()), $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                   trace_id, message, writer_ilk, writer_name)
+VALUES ($1, COALESCE($2, now()), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (dedupe_key) DO NOTHING
 "#,
             &[
@@ -1326,6 +1370,8 @@ ON CONFLICT (dedupe_key) DO NOTHING
                 &turn.thread_id,
                 &turn.trace_id,
                 &turn.message,
+                &turn.writer_ilk,
+                &turn.writer_name,
             ],
         )
         .await?;
@@ -3222,9 +3268,15 @@ async fn ensure_database_exists(base: &PgConfig, dbname: &str) -> Result<(), Sto
 
 fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
     let trace_id = required_str(&value, &["routing", "trace_id"], "routing.trace_id")?;
+    let writer = message_writer::writer_of(value.pointer("/meta/context"));
+    let writer_ilk = writer.as_ref().and_then(|writer| writer.ilk.clone());
+    let writer_name = writer.and_then(|writer| writer.name);
+    // An ILK: the message's `src_ilk`, else its writer's (docs/cognition-hands-v1.md §7), else none.
+    // Never the sender's node UUID, which no ILK is: a WF's message to an IO node names no
+    // `src_ilk` (FINDINGS A-139), and names the WF as its writer.
     let from_ilk = get_str(&value, &["meta", "src_ilk"])
-        .or_else(|| get_str(&value, &["routing", "src"]))
-        .ok_or_else(|| missing_field("meta.src_ilk|routing.src"))?;
+        .or_else(|| writer_ilk.clone())
+        .unwrap_or_default();
     let to_ilk = get_str(&value, &["meta", "dst_ilk"]);
     let ich = get_str(&value, &["meta", "ich"]).unwrap_or_else(|| "unknown".to_string());
     let msg_type = get_str(&value, &["meta", "msg_type"])
@@ -3246,6 +3298,8 @@ fn parse_turn(value: Value) -> Result<TurnRecord, StorageError> {
         thread_id,
         trace_id,
         message: value,
+        writer_ilk,
+        writer_name,
     })
 }
 
@@ -3914,6 +3968,36 @@ mod tests {
         );
     }
 
+    /// `turns` keeps who wrote each message (docs/cognition-hands-v1.md §7), and its `from_ilk` is
+    /// an ILK or none, never the sender's node UUID.
+    #[test]
+    fn a_turn_keeps_its_writer_and_from_ilk_is_never_a_node_uuid() {
+        let mut wf_text = message("trace-2", "ilk:ana", "Ana has not answered");
+        wf_text["meta"]["context"] =
+            serde_json::json!({"writer": {"ilk": "ilk:wf", "name": "WF.soporte@worker1"}});
+        let turn = parse_turn(wf_text).expect("parses");
+        assert_eq!(turn.from_ilk, "ilk:ana");
+        assert_eq!(
+            (turn.writer_ilk.as_deref(), turn.writer_name.as_deref()),
+            (Some("ilk:wf"), Some("WF.soporte@worker1"))
+        );
+
+        // A WF's message to an IO node names no src_ilk: its writer's ILK stands for it.
+        let mut to_io = message("trace-3", "node-uuid", "tu nota de crédito");
+        to_io["meta"].as_object_mut().unwrap().remove("src_ilk");
+        to_io["meta"]["context"] = serde_json::json!({"writer": {"ilk": "ilk:wf"}});
+        assert_eq!(
+            parse_turn(to_io.clone()).expect("parses").from_ilk,
+            "ilk:wf"
+        );
+
+        // With neither, none: the sender's UUID is no ILK.
+        to_io["meta"].as_object_mut().unwrap().remove("context");
+        let turn = parse_turn(to_io).expect("parses");
+        assert_eq!(turn.from_ilk, "");
+        assert_eq!((turn.writer_ilk, turn.writer_name), (None, None));
+    }
+
     #[test]
     fn the_message_log_is_created_whole() {
         let start = TURNS_SCHEMA_SQL
@@ -3940,7 +4024,9 @@ mod tests {
                 "tags",
                 "thread_id",
                 "trace_id",
-                "message"
+                "message",
+                "writer_ilk",
+                "writer_name"
             ]
         );
         for column in [
@@ -4007,11 +4093,22 @@ mod tests {
             [
                 SchemaStep::Sql(TURNS_SCHEMA_SQL),
                 SchemaStep::DropTurnsCtxSeq,
+                SchemaStep::AddTurnsWriter,
                 SchemaStep::Sql(INBOX_SCHEMA_SQL),
                 SchemaStep::Sql(COGNITION_SCHEMA_SQL),
                 SchemaStep::Sql(USAGE_SCHEMA_SQL),
             ]
         );
+    }
+
+    /// A table made before the writer columns gets both, once: the catalog says which it has.
+    #[test]
+    fn the_writer_columns_are_added_once() {
+        assert!(TURNS_WRITER_COLUMNS_SQL.contains("column_name IN ('writer_ilk', 'writer_name')"));
+        assert!(TURNS_WRITER_ADD_SQL.contains("ADD COLUMN IF NOT EXISTS writer_ilk TEXT"));
+        assert!(TURNS_WRITER_ADD_SQL.contains("ADD COLUMN IF NOT EXISTS writer_name TEXT"));
+        assert!(TURNS_SCHEMA_SQL.contains("writer_ilk  TEXT,"));
+        assert!(TURNS_SCHEMA_SQL.contains("writer_name TEXT"));
     }
 
     fn record(seq: u64, subject: &str, producer: &str, payload: Value) -> StreamRecord {

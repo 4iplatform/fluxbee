@@ -89,7 +89,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 	}
 
 	rt := &NodeRuntime{
-		ActCtx:     ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock},
+		ActCtx:     ActionContext{Dispatcher: NewSDKDispatcher(sender), Clock: clock, SelfILK: sdk.ReadSelfIlkFromEnv()},
 		NodeUUID:   sender.UUID(),
 		NodeName:   sender.FullName(),
 		Plane:      plane,

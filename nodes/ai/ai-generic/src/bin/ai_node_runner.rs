@@ -30,10 +30,11 @@ use fluxbee_sdk::managed_control_plane::{
     DEFAULT_MANAGED_NODES_ROOT,
 };
 use fluxbee_sdk::message_trace;
+use fluxbee_sdk::message_writer::{self, IlkFacts, Writer};
 use fluxbee_sdk::protocol::{
-    MemoryPackage, MemoryTurn, MemoryTurnDirection, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE,
-    MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET,
-    MSG_NODE_STATUS_GET_RESPONSE,
+    MemoryPackage, MemoryTurn, MemoryTurnDirection, MemoryTurnParty, MSG_CONFIG_GET,
+    MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE,
+    MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
 };
 use fluxbee_sdk::{
     managed_node_config_path_with_root, managed_node_instance_dir, managed_node_name,
@@ -825,7 +826,10 @@ impl AiNode for GenericAiNode {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        let message_label = current_message_label(&msg);
+        let message_label = current_message_label(&msg, |ilk| {
+            message_writer::hive_of(&self.node_name)
+                .and_then(|hive| message_writer::ilk_facts(hive, ilk))
+        });
         let input = inject_prompt_blocks_into_text_input(&input, &prompt_blocks, &message_label);
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
@@ -6839,15 +6843,24 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
     Some(lines.join("\n"))
 }
 
-/// One turn of the recent conversation, on one line: when, who spoke, and what. The agent's own
-/// turns are "you"; another's names its sender's ILK and the node it came through, so a person and
-/// a supervisor in one thread read apart. The text goes as a JSON string, so no text can pass for
-/// a turn's line of its own; files are counted, and an answer that chose from a WF's menu says
-/// what it chose, even with a blank text.
+/// One turn of the recent conversation, on one line: when, who spoke, and what. Another's turn
+/// names its writer (`party_label`), so a person, a supervisor, another agent and a WF in one thread
+/// read apart (docs/cognition-hands-v1.md §6); a turn kept before turns named a writer names its
+/// sender's ILK and the node it came through. The agent's own turns are "you", with whom they
+/// answered when the turn names it. The text goes as a JSON string, so no text can pass for a
+/// turn's line of its own; files are counted, and an answer that chose from a WF's menu says what it
+/// chose, even with a blank text.
 fn render_memory_turn(turn: &MemoryTurn) -> String {
     let speaker = match turn.direction {
-        MemoryTurnDirection::Out => "you".to_string(),
-        MemoryTurnDirection::In => speaker_name(turn.src_ilk.as_deref(), turn.via.as_deref())
+        MemoryTurnDirection::Out => match turn.to.as_ref().and_then(|to| party_label(to, None)) {
+            Some(to) => format!("you, to {to}"),
+            None => "you".to_string(),
+        },
+        MemoryTurnDirection::In => turn
+            .writer
+            .as_ref()
+            .and_then(|writer| party_label(writer, turn.via.as_deref()))
+            .or_else(|| speaker_name(turn.src_ilk.as_deref(), turn.via.as_deref()))
             .unwrap_or_else(|| "unknown sender".to_string()),
     };
     let mut said = Vec::new();
@@ -6874,7 +6887,29 @@ fn render_memory_turn(turn: &MemoryTurn) -> String {
     format!("- [{time}] {speaker}: {}", said.join(" "))
 }
 
-/// Who spoke, as the recent turns and the current message name a speaker: `<ILK> via <node>`, or
+/// A party of a turn as the model reads it (docs/cognition-hands-v1.md §6): `<kind> <name> (<ILK>)`,
+/// with either of name and ILK alone, and the kind when the identity gave one. A party that may be a
+/// person, one whose kind is a person's or unknown, adds `via <node>`, where they wrote; an agent's
+/// or a WF's name is its node already. `None` with neither a name nor an ILK.
+fn party_label(party: &MemoryTurnParty, via: Option<&str>) -> Option<String> {
+    let mut label = match (party.name.as_deref(), party.ilk.as_deref()) {
+        (Some(name), Some(ilk)) => format!("{} ({})", one_line(name), one_line(ilk)),
+        (Some(name), None) => one_line(name),
+        (None, Some(ilk)) => one_line(ilk),
+        (None, None) => return None,
+    };
+    let kind = party.kind.as_deref();
+    if let Some(kind) = kind {
+        label = format!("{} {label}", one_line(kind));
+    }
+    let maybe_a_person = !matches!(kind, Some("agent" | "workflow" | "system"));
+    if let Some(via) = via.filter(|via| maybe_a_person && Some(*via) != party.name.as_deref()) {
+        label.push_str(&format!(" via {}", one_line(via)));
+    }
+    Some(label)
+}
+
+/// Who spoke, as a turn kept before turns named a writer names a speaker: `<ILK> via <node>`, or
 /// either alone. `None` when neither is known.
 fn speaker_name(src_ilk: Option<&str>, via: Option<&str>) -> Option<String> {
     match (src_ilk.map(one_line), via.map(one_line)) {
@@ -6914,10 +6949,12 @@ fn json_line(text: &str) -> String {
     line
 }
 
-/// The line ahead of the message being answered, once blocks come before it: who sent it, named as
-/// the recent turns name a speaker. The node it came through is where its cycle started, the first
-/// entry of its trace (`meta.context.trace`), else its sender.
-fn current_message_label(msg: &Message) -> String {
+/// The line ahead of the message being answered, once blocks come before it: who wrote it, named as
+/// the recent turns name a writer (`party_label`). Its writer is its `meta.context.writer`, else its
+/// `src_ilk`, with the name and the kind `facts` gives of its ILK (docs/cognition-hands-v1.md §6).
+/// The node it came through is where its cycle started, the first entry of its trace
+/// (`meta.context.trace`), else its sender.
+fn current_message_label(msg: &Message, facts: impl Fn(&str) -> Option<IlkFacts>) -> String {
     let origin = message_trace::origin(msg.meta.context.as_ref());
     let via = origin.as_deref().or_else(|| {
         msg.routing
@@ -6926,7 +6963,20 @@ fn current_message_label(msg: &Message) -> String {
             .map(str::trim)
             .filter(|node| !node.is_empty())
     });
-    match speaker_name(extract_src_ilk(msg).as_deref(), via) {
+    let writer = message_writer::writer_of(msg.meta.context.as_ref())
+        .unwrap_or_else(|| Writer::new(extract_src_ilk(msg).as_deref(), None));
+    let known = writer.ilk.as_deref().and_then(&facts);
+    let party = MemoryTurnParty {
+        name: writer
+            .name
+            .or_else(|| known.as_ref().and_then(|known| known.name.clone())),
+        kind: known
+            .as_ref()
+            .and_then(IlkFacts::kind)
+            .map(ToString::to_string),
+        ilk: writer.ilk,
+    };
+    match party_label(&party, via).or_else(|| speaker_name(None, via)) {
         Some(speaker) => format!("Current user message, from {speaker}:"),
         None => "Current user message:".to_string(),
     }
@@ -8324,6 +8374,8 @@ mod tests {
             direction,
             src_ilk: Some(src_ilk.to_string()),
             via: via.map(str::to_string),
+            writer: None,
+            to: None,
             text: text.to_string(),
             attachments: 0,
             choice: None,
@@ -8448,6 +8500,103 @@ mod tests {
         );
     }
 
+    /// Each line names its writer by kind, name and ILK, a person with the node they wrote through,
+    /// and the agent's own turns whom they answered (docs/cognition-hands-v1.md §6). The current
+    /// message is named the same way, from its writer and what the identity says of its ILK.
+    #[test]
+    fn each_turn_names_its_writer_and_the_agents_whom_it_answered() {
+        let party = |kind: Option<&str>, name: Option<&str>, ilk: Option<&str>| MemoryTurnParty {
+            ilk: ilk.map(ToString::to_string),
+            name: name.map(ToString::to_string),
+            kind: kind.map(ToString::to_string),
+        };
+        let ana = party(Some("person"), Some("Ana Pérez"), Some("ilk:ana"));
+        let said = |writer: MemoryTurnParty, via: &str, text: &str| MemoryTurn {
+            writer: Some(writer),
+            ..memory_turn(
+                MemoryTurnDirection::In,
+                "ilk:ana",
+                Some(via),
+                text,
+                "2026-11-05T10:05:00.000Z",
+            )
+        };
+        let lines = [
+            said(ana.clone(), "IO.slack@motherbee", "Me cobraron dos veces"),
+            MemoryTurn {
+                to: Some(ana.clone()),
+                ..memory_turn(
+                    MemoryTurnDirection::Out,
+                    "ilk:sales",
+                    None,
+                    "Ya lo paso a facturación",
+                    "2026-11-05T10:05:00.000Z",
+                )
+            },
+            said(
+                party(
+                    Some("agent"),
+                    Some("AI.invoice@worker1"),
+                    Some("ilk:invoice"),
+                ),
+                "IO.slack@motherbee",
+                "Nota de crédito NC-55 emitida",
+            ),
+            said(
+                party(Some("workflow"), Some("WF.soporte@worker1"), Some("ilk:wf")),
+                "WF.soporte@worker1",
+                "Ana no contesta hace 2 días",
+            ),
+            said(
+                party(None, None, Some("ilk:new")),
+                "IO.slack@motherbee",
+                "hola",
+            ),
+            said(
+                party(None, Some("WF.soporte@worker1"), None),
+                "WF.soporte@worker1",
+                "ping",
+            ),
+        ]
+        .iter()
+        .map(render_memory_turn)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                r#"- [2026-11-05 10:05] person Ana Pérez (ilk:ana) via IO.slack@motherbee: "Me cobraron dos veces""#,
+                r#"- [2026-11-05 10:05] you, to person Ana Pérez (ilk:ana): "Ya lo paso a facturación""#,
+                r#"- [2026-11-05 10:05] agent AI.invoice@worker1 (ilk:invoice): "Nota de crédito NC-55 emitida""#,
+                r#"- [2026-11-05 10:05] workflow WF.soporte@worker1 (ilk:wf): "Ana no contesta hace 2 días""#,
+                r#"- [2026-11-05 10:05] ilk:new via IO.slack@motherbee: "hola""#,
+                r#"- [2026-11-05 10:05] WF.soporte@worker1: "ping""#,
+            ]
+        );
+
+        let mut msg = sample_user_request_with_context(
+            json!({"writer": {"ilk": "ilk:wf"}, "trace": [
+                {"t": "2026-11-07T10:09:00.000Z", "from": "WF.soporte@worker1", "to": "AI.generic@motherbee", "act": ["send_message"]}
+            ]}),
+            Some("ilk:ana"),
+        );
+        let facts = |ilk: &str| {
+            (ilk == "ilk:wf").then(|| IlkFacts {
+                ilk_type: "agent".to_string(),
+                name: Some("WF.soporte@worker1".to_string()),
+            })
+        };
+        assert_eq!(
+            current_message_label(&msg, facts),
+            "Current user message, from workflow WF.soporte@worker1 (ilk:wf):"
+        );
+        msg.meta.context = Some(json!({"writer": {"ilk": "ilk:ana", "name": "Ana Pérez"}}));
+        msg.routing.src_l2_name = Some("IO.slack@motherbee".to_string());
+        assert_eq!(
+            current_message_label(&msg, |_| None),
+            "Current user message, from Ana Pérez (ilk:ana) via IO.slack@motherbee:"
+        );
+    }
+
     /// With blocks ahead of it, the message is named as the recent turns name a speaker: its
     /// sender's ILK and the node it came through, where its cycle started (its trace's first entry)
     /// or else its sender. As text, a line ahead of it; as parts, a text part of its own after the
@@ -8458,7 +8607,7 @@ mod tests {
             sample_wf_context(),
             Some("ilk:11111111-1111-4111-8111-111111111111"),
         );
-        let label = current_message_label(&msg);
+        let label = current_message_label(&msg, |_| None);
         assert_eq!(
             label,
             "Current user message, from ilk:11111111-1111-4111-8111-111111111111 via IO.api@motherbee:"
@@ -8466,11 +8615,14 @@ mod tests {
         let mut direct = sample_user_request_with_context(json!({}), None);
         direct.routing.src_l2_name = Some("IO.slack.T01@motherbee".to_string());
         assert_eq!(
-            current_message_label(&direct),
+            current_message_label(&direct, |_| None),
             "Current user message, from via IO.slack.T01@motherbee:"
         );
         direct.routing.src_l2_name = None;
-        assert_eq!(current_message_label(&direct), "Current user message:");
+        assert_eq!(
+            current_message_label(&direct, |_| None),
+            "Current user message:"
+        );
 
         let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
@@ -9965,6 +10117,8 @@ mod tests {
                 },
                 src_ilk: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
                 via: (n % 2 == 0).then(|| "IO.api@motherbee".to_string()),
+                writer: None,
+                to: None,
                 text: format!("{n:02} {}", "x".repeat(1_997)),
                 attachments: 0,
                 choice: None,

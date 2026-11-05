@@ -290,13 +290,17 @@ moment the router appended the record), `attempts`, `processed_at`, `last_error`
 ### 6.1 `turns`: the message log
 
 One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`, `to_ilk`, `ich`,
-`msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`.
+`msg_type`, `content`, `tags`, `thread_id`, `trace_id`, `message`, `writer_ilk`, `writer_name`.
 
 - **The key** is `dedupe_key`, the same as the inbox's (`idx_turns_dedupe_key`, unique). A response
   shares the `trace_id` of its request and still has its own row.
 - **Where each column comes from** (`parse_turn`):
   - `trace_id`, from `routing.trace_id`, and it is required;
-  - `from_ilk`, from `meta.src_ilk` or, if it is missing, from `routing.src`;
+  - `from_ilk`, from `meta.src_ilk`, else the writer's ILK, else empty: never a node's UUID, which
+    no ILK is;
+  - `writer_ilk` and `writer_name`, who wrote the message's text, from `meta.context.writer`
+    (docs/cognition-hands-v1.md §7). A table made before them gets both once, at start
+    (`add_turns_writer`), only while the catalog lacks one;
   - `to_ilk`, from `meta.dst_ilk`; `ich`, from `meta.ich` (`unknown` if it is missing);
   - `msg_type`, from `meta.type`; `thread_id`, from `meta.thread_id`;
   - `content`, the payload; `tags`, those of `payload.tags` or `meta.tags`, sorted and without

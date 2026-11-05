@@ -106,7 +106,8 @@ func traceAct(msg sdk.Message) string {
 }
 
 // contextWithoutTrace is a message's meta.context as it went, without its trace, whose times change
-// at each run: its other keys in order, each value byte for byte.
+// at each run, and without its writer, which every send names (TestTheWFNamesTheWriterOfWhatItSends):
+// its other keys in order, each value byte for byte.
 func contextWithoutTrace(t *testing.T, msg sdk.Message) string {
 	t.Helper()
 	var metaContext map[string]json.RawMessage
@@ -114,6 +115,7 @@ func contextWithoutTrace(t *testing.T, msg sdk.Message) string {
 		t.Fatalf("meta.context %s: %v", msg.Meta.Context, err)
 	}
 	delete(metaContext, sdk.TraceKey)
+	delete(metaContext, sdk.WriterKey)
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)

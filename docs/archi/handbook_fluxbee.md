@@ -325,7 +325,8 @@ Common guards:
   - Every message a WF sends is a `user` message, and carries the instance's thread.
   - A message the WF writes to an agent or a WF carries the instance's person: the `src_ilk` and
     `ich` that the messages of the person's IO node share: the IO node the person wrote from. On a thread several people write on,
-    it carries none.
+    it carries none. Its writer is the WF (below): the agent reads it as the WF's, not as the
+    person's words.
   - A message the WF writes to an IO node never names the person as its sender: the router's stamp
     names the WF. To the person's own IO node (the one whose message started the instance; another IO node of
     `start_from`, the team's say, is not the person's), it names the person as
@@ -385,6 +386,11 @@ Common guards:
   its own entry. The WF's entry names the actions of its step, the one that sent the message first
   (`["send_message", "schedule_timer"]`). An agent reads the trace before the message. It is for
   debugging and the log: `turns` keeps every message with it.
+- **Who wrote it.** Every message also names its writer, `meta.context.writer`: the person a text
+  of theirs comes from, an agent for its answer, the WF for its own `send_message`. A `forward`
+  keeps the writer of what it passes on. An agent's memory names each line by its writer, and
+  its cognition analyzes only what a person wrote, or what the agent answered a person. A
+  definition never writes `writer`.
 
 #### 4.2.4 Asking an agent or a person: the menu
 

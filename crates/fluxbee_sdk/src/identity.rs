@@ -797,6 +797,31 @@ pub fn find_ilk_by_handler_node_from_hive_config(
     find_ilk_by_handler_node_from_hive_id(&hive_id, handler_node)
 }
 
+/// Resolve one active ILK by its id (`ilk:<uuid>`): its type and display name among the rest.
+pub fn find_ilk_by_id_from_shm_name(
+    identity_shm_name: &str,
+    ilk_id: &str,
+) -> Result<Option<IdentityIlkOption>, IdentityShmError> {
+    let wanted = ilk_id.trim();
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = list_ilks_from_shm_name(identity_shm_name)?;
+    Ok(snapshot
+        .ilks
+        .into_iter()
+        .find(|ilk| ilk.ilk_id.eq_ignore_ascii_case(wanted)))
+}
+
+/// Resolve one active ILK by its id for one hive.
+pub fn find_ilk_by_id_from_hive_id(
+    hive_id: &str,
+    ilk_id: &str,
+) -> Result<Option<IdentityIlkOption>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    find_ilk_by_id_from_shm_name(&shm_name, ilk_id)
+}
+
 /// Block until a SY node's own ILK is visible in identity SHM, polling every
 /// `poll_interval`. Returns the resolved ILK id (e.g. `"ilk:<uuid>"`).
 ///

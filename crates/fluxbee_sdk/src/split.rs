@@ -9,6 +9,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::message_trace::{self, TraceNote};
+use crate::message_writer;
 use crate::node_client::NodeError;
 use crate::protocol::NodeAnnouncePayload;
 use crate::protocol::{build_withdraw, Destination, Message};
@@ -130,9 +131,14 @@ impl NodeSender {
 
     /// Sends `msg` with this node's entry in its cycle's trace (docs/message-trace-v1.md): when it
     /// sends it, its own name, and what `note` adds, the destination by name and the actions it
-    /// took. A message that is not the solution's carries no trace.
+    /// took. A message that is not the solution's carries no trace. A writer it names by ILK alone
+    /// gets its name from the identity memory of this node's hive (docs/cognition-hands-v1.md §5).
     pub async fn send_traced(&self, mut msg: Message, note: TraceNote) -> Result<(), NodeError> {
-        message_trace::write_entry(&mut msg, &self.full_name(), note);
+        let full_name = self.full_name();
+        message_trace::write_entry(&mut msg, &full_name, note);
+        if let Some(hive) = message_writer::hive_of(&full_name) {
+            message_writer::fill_name(&mut msg, hive);
+        }
         let msg = normalize_outbound_message(msg);
         let data = serde_json::to_vec(&msg)?;
         if data.len() > MAX_FRAME_SIZE {

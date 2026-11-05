@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -41,7 +42,9 @@ const (
 
 	// Field offsets within IlkEntry (1160 bytes total).
 	ilkOffIlkID       = 0
+	ilkOffType        = 16  // u8: 0 human, 1 agent, 2 system
 	ilkOffFlags       = 18  // u16
+	ilkOffDisplayName = 36  // [u8; 128]
 	ilkOffHandlerNode = 164 // [u8; 128]
 
 	// IlkEntry flags.
@@ -287,43 +290,82 @@ func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error
 	if handler == "" {
 		return "", false, nil
 	}
-	path := shmFilePath(shmName)
+	var ilkBytes [16]byte
+	var found bool
+	read, err := readIlkEntries(shmFilePath(shmName), func(entries []byte, count int) {
+		ilkBytes, found = scanIlkEntriesByHandler(entries, count, handler)
+	})
+	if err != nil || !read || !found {
+		return "", false, err
+	}
+	return "ilk:" + uuid.UUID(ilkBytes).String(), true, nil
+}
+
+// LookupIlk is what the identity memory of hiveID says of the active ILK ilkID ("ilk:<uuid>"): its
+// type (human, agent or system) and its display name. (_, false, nil) on a miss, and when the region
+// is absent.
+func LookupIlk(hiveID, ilkID string) (IlkFacts, bool, error) {
+	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
+	return lookupIlkAt(shmFilePath(name), ilkID)
+}
+
+func lookupIlkAt(path, ilkID string) (IlkFacts, bool, error) {
+	wanted, err := uuid.Parse(strings.TrimPrefix(strings.TrimSpace(ilkID), "ilk:"))
+	if err != nil {
+		return IlkFacts{}, false, nil
+	}
+	var facts IlkFacts
+	var found bool
+	read, err := readIlkEntries(path, func(entries []byte, count int) {
+		facts, found = scanIlkEntriesByID(entries, count, [16]byte(wanted))
+	})
+	if err != nil || !read || !found {
+		return IlkFacts{}, false, err
+	}
+	return facts, true, nil
+}
+
+// readIlkEntries maps the identity memory at path and runs scan over its ILK entries under the
+// region's seqlock: scan runs again when a writer moved the region meanwhile, for
+// identitySeqlockTimeoutMs at most. False when the region is absent, not of this SDK's version, or
+// still moving at the deadline.
+func readIlkEntries(path string, scan func(entries []byte, count int)) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false, nil
+			return false, nil
 		}
-		return "", false, fmt.Errorf("identity shm open %q: %w", path, err)
+		return false, fmt.Errorf("identity shm open %q: %w", path, err)
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return "", false, fmt.Errorf("identity shm stat: %w", err)
+		return false, fmt.Errorf("identity shm stat: %w", err)
 	}
 	size := int(fi.Size())
 	if size < identityHeaderSize {
-		return "", false, nil
+		return false, nil
 	}
 	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
-		return "", false, fmt.Errorf("identity shm mmap: %w", err)
+		return false, fmt.Errorf("identity shm mmap: %w", err)
 	}
 	defer syscall.Munmap(data) //nolint:errcheck
 
 	magic := binary.LittleEndian.Uint32(data[hdrOffMagic:])
 	if magic != identityMagic {
-		return "", false, nil
+		return false, nil
 	}
 	version := binary.LittleEndian.Uint32(data[hdrOffVersion:])
 	if version != identityVersionCurrent {
-		return "", false, nil
+		return false, nil
 	}
 
 	ilkCount := int(binary.LittleEndian.Uint32(data[hdrOffIlkCount:]))
 	maxIlks := int(binary.LittleEndian.Uint32(data[hdrOffMaxIlks:]))
 	maxTenants := int(binary.LittleEndian.Uint32(data[hdrOffMaxTenants:]))
 	if maxIlks <= 0 {
-		return "", false, nil
+		return false, nil
 	}
 	if ilkCount > maxIlks {
 		ilkCount = maxIlks
@@ -333,7 +375,7 @@ func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error
 	ilkOffset = identityAlignUp(ilkOffset+tenantEntrySize*maxTenants, identityRegionAlign)
 	needed := ilkOffset + ilkCount*ilkEntrySize
 	if needed > size {
-		return "", false, nil
+		return false, nil
 	}
 
 	seqPtr := (*uint64)(unsafe.Pointer(&data[hdrOffSeq]))
@@ -343,23 +385,64 @@ func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error
 		if s1&1 != 0 {
 			runtime.Gosched()
 			if time.Now().After(deadline) {
-				return "", false, nil
+				return false, nil
 			}
 			continue
 		}
-		ilkBytes, found := scanIlkEntriesByHandler(data[ilkOffset:], ilkCount, handler)
+		scan(data[ilkOffset:], ilkCount)
 		s2 := atomic.LoadUint64(seqPtr)
 		if s1 == s2 {
-			if found {
-				return "ilk:" + uuid.UUID(ilkBytes).String(), true, nil
-			}
-			return "", false, nil
+			return true, nil
 		}
 		if time.Now().After(deadline) {
-			return "", false, nil
+			return false, nil
 		}
 		runtime.Gosched()
 	}
+}
+
+// scanIlkEntriesByID finds the active entry of id: its type and its display name.
+func scanIlkEntriesByID(buf []byte, count int, id [16]byte) (IlkFacts, bool) {
+	for i := 0; i < count; i++ {
+		off := i * ilkEntrySize
+		if off+ilkEntrySize > len(buf) {
+			break
+		}
+		entry := buf[off : off+ilkEntrySize]
+		if binary.LittleEndian.Uint16(entry[ilkOffFlags:])&ilkFlagActive == 0 {
+			continue
+		}
+		if !bytes.Equal(entry[ilkOffIlkID:ilkOffIlkID+16], id[:]) {
+			continue
+		}
+		return IlkFacts{
+			Type: ilkTypeName(entry[ilkOffType]),
+			Name: identityFixedStr(entry[ilkOffDisplayName : ilkOffDisplayName+128]),
+		}, true
+	}
+	return IlkFacts{}, false
+}
+
+// ilkTypeName is an entry's ilk_type as the identity names it (fluxbee_sdk ilk_type_from_shm).
+func ilkTypeName(value byte) string {
+	switch value {
+	case 0:
+		return "human"
+	case 1:
+		return "agent"
+	case 2:
+		return "system"
+	default:
+		return "unknown"
+	}
+}
+
+// identityFixedStr is a null-terminated fixed-length buffer's text.
+func identityFixedStr(buf []byte) string {
+	if end := bytes.IndexByte(buf, 0); end >= 0 {
+		buf = buf[:end]
+	}
+	return strings.TrimSpace(string(buf))
 }
 
 func scanIlkEntriesByHandler(buf []byte, count int, handler string) ([16]byte, bool) {

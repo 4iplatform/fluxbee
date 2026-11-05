@@ -8,6 +8,7 @@ pub mod managed_node;
 #[cfg(feature = "mesh-tls")]
 pub mod mesh;
 pub mod message_trace;
+pub mod message_writer;
 pub mod node_client;
 pub mod node_config;
 pub mod node_secret;

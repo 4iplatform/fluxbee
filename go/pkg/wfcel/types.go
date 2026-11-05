@@ -86,6 +86,10 @@ type ActionMeta struct {
 // menu, as loaded, "subject": the action's subject}.
 const ContextWF = "wf"
 
+// contextWriter is the key of who wrote a message's text in its meta.context (the SDK's WriterKey,
+// docs/cognition-hands-v1.md §4), which the engine writes on what a WF sends.
+const contextWriter = "writer"
+
 // The subjects a send_message or a forward to an IO node marks its message with
 // (wf-orchestration-v1 §5.4.2): new opens a subject; same continues the subject of the WF's last
 // message on the conversation to that node; end ends it. The IO node places the message by it, since

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use fluxbee_sdk::message_writer::{Writer, WRITER_KEY};
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -10,6 +11,9 @@ pub fn new_trace_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// A person's message as an IO node sends it: `src_ilk` is the person, who wrote it, and the
+/// message names them as its writer (`meta.context.writer`, docs/cognition-hands-v1.md §5). The SDK
+/// fills their name from the identity as it sends it.
 pub fn build_user_message(
     src_node_uuid: &str,
     dst_node_uuid: Option<String>,
@@ -36,6 +40,12 @@ pub fn build_user_message(
     let thread_id = extract_thread_id_from_context_obj(&context_obj);
     // Keep thread_id only in canonical meta.thread_id carrier.
     context_obj.remove("thread_id");
+    let writer = Writer::new(src_ilk.as_deref(), None);
+    if writer.ilk.is_some() {
+        if let Ok(writer) = serde_json::to_value(writer) {
+            context_obj.insert(WRITER_KEY.to_string(), writer);
+        }
+    }
 
     Message {
         routing: Routing {
@@ -199,6 +209,34 @@ mod tests {
                 .as_ref()
                 .and_then(|ctx| ctx.get("ich"))
                 .and_then(Value::as_str),
+            None
+        );
+    }
+
+    /// A person's message names them as its writer (docs/cognition-hands-v1.md §5); the SDK fills
+    /// their name as it sends it. A message with no person names no writer.
+    #[test]
+    fn build_user_message_names_the_person_as_its_writer() {
+        let build = |src_ilk: Option<&str>| {
+            build_user_message(
+                "src-node",
+                Some("WF.soporte@worker1".to_string()),
+                DEFAULT_TTL,
+                "trace-1".to_string(),
+                src_ilk.map(ToString::to_string),
+                None,
+                json!({"io": {"channel": "slack"}}),
+                json!({"type": "text", "content": "hi"}),
+            )
+        };
+        let msg = build(Some("ilk:ana"));
+        assert_eq!(
+            fluxbee_sdk::message_writer::writer_of(msg.meta.context.as_ref()),
+            Some(Writer::new(Some("ilk:ana"), None))
+        );
+        assert_eq!(msg.meta.context.as_ref().unwrap()["io"]["channel"], "slack");
+        assert_eq!(
+            build(None).meta.context.as_ref().unwrap().get("writer"),
             None
         );
     }

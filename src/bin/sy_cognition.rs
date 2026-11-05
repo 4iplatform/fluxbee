@@ -18,12 +18,13 @@ use uuid::Uuid;
 
 use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRecorder};
 use fluxbee_sdk::message_trace;
+use fluxbee_sdk::message_writer::{self, IlkFacts};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
     MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, MemoryTurn, MemoryTurnChoice,
-    MemoryTurnDirection, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    MEMORY_PACKAGE_VERSION, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    MemoryTurnDirection, MemoryTurnParty, Message, Meta, Routing, VaultSecretChangedPayload,
+    VaultSecretInterest, MEMORY_PACKAGE_VERSION, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::SystemRpcRequest;
 use fluxbee_sdk::stream::{
@@ -286,6 +287,9 @@ struct CognitionRuntimeState {
     no_agent_ilk_total: u64,
     /// Turns the intake added to their communication's last turns, ahead of the worker.
     intake_turns_total: u64,
+    /// Turns the worker did not analyze: no person at their other end (docs/cognition-hands-v1.md
+    /// §6). They stay among their communication's last turns.
+    turns_not_analyzed_total: u64,
     /// Records of a stream batch at or below the last seq taken for that stream and epoch.
     stream_repeats_skipped_total: u64,
     /// `COGNITION_STATE_GET` exchanges with SY.storage (one per communication loaded), and the
@@ -854,18 +858,22 @@ async fn intake_turn(
         .as_deref()
         .filter(|thread_id| !thread_id.trim().is_empty())?;
     let agent = agent_identity_of(app_state, agent_node).await?;
-    recent_turn_of(message, agent_node, &agent.ilk, ts_ms)
+    recent_turn_of(message, agent_node, &agent.ilk, ts_ms, |ilk| {
+        message_writer::ilk_facts(&app_state.hive_id, ilk)
+    })
 }
 
 /// A copy of a turn as its communication keeps it. The agent sent it (`out`) when its router names
-/// the agent node as the sender; otherwise the agent received it (`in`), through `turn_via`. An
-/// answer that chose from a WF's menu keeps its choice (`menu_choice`). A turn with neither text,
-/// files nor a choice is left out: the package would show it empty.
+/// the agent node as the sender; otherwise the agent received it (`in`), through `turn_via`. A turn
+/// the agent got names its writer, and one it sent whom it answered (`turn_party`, with what `facts`
+/// says of each ILK). An answer that chose from a WF's menu keeps its choice (`menu_choice`). A
+/// turn with neither text, files nor a choice is left out: the package would show it empty.
 fn recent_turn_of(
     message: &Message,
     agent_node: &str,
     agent_ilk: &str,
     ts_ms: u64,
+    facts: impl Fn(&str) -> Option<IlkFacts>,
 ) -> Option<RecentTurn> {
     let thread_id = message
         .meta
@@ -901,6 +909,14 @@ fn recent_turn_of(
             MemoryTurnDirection::In => turn_via(message),
             MemoryTurnDirection::Out => None,
         },
+        writer: match direction {
+            MemoryTurnDirection::In => turn_writer(message, &facts),
+            MemoryTurnDirection::Out => None,
+        },
+        to: match direction {
+            MemoryTurnDirection::In => None,
+            MemoryTurnDirection::Out => turn_party(message.meta.dst_ilk.as_deref(), None, &facts),
+        },
         text,
         attachments,
         choice,
@@ -917,6 +933,81 @@ fn recent_turn_of(
         ich: message.meta.ich.clone(),
         turn,
     })
+}
+
+/// Who wrote a turn the agent got (docs/cognition-hands-v1.md §6): its `meta.context.writer`, else
+/// its `src_ilk`, which stood for its writer before messages named one.
+fn turn_writer(
+    message: &Message,
+    facts: &impl Fn(&str) -> Option<IlkFacts>,
+) -> Option<MemoryTurnParty> {
+    match message_writer::writer_of(message.meta.context.as_ref()) {
+        Some(writer) => turn_party(writer.ilk.as_deref(), writer.name.as_deref(), facts),
+        None => turn_party(message.meta.src_ilk.as_deref(), None, facts),
+    }
+}
+
+/// A party of a turn: its ILK, its name (the message's, else the identity's), and its kind as the
+/// identity says (`IlkFacts::kind`); none with neither an ILK nor a name. Each within the turn's caps.
+fn turn_party(
+    ilk: Option<&str>,
+    name: Option<&str>,
+    facts: &impl Fn(&str) -> Option<IlkFacts>,
+) -> Option<MemoryTurnParty> {
+    let present = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let ilk = present(ilk);
+    let known = ilk.as_deref().and_then(facts);
+    let name = present(name).or_else(|| known.as_ref().and_then(|known| known.name.clone()));
+    if ilk.is_none() && name.is_none() {
+        return None;
+    }
+    Some(MemoryTurnParty {
+        ilk: ilk.map(|ilk| turn_field(&ilk, COGNITION_TURN_NAME_MAX_CHARS)),
+        name: name.map(|name| turn_field(&name, COGNITION_TURN_NAME_MAX_CHARS)),
+        kind: known
+            .as_ref()
+            .and_then(IlkFacts::kind)
+            .map(ToString::to_string),
+    })
+}
+
+/// Whether a turn has a person at its other end: the turns cognition analyzes
+/// (docs/cognition-hands-v1.md §6). A turn the agent got has one unless its writer is known not to be
+/// a person: an ILK the identity names `agent` or `system`, or a writer with no ILK, a node. An
+/// answer the agent sent has one unless its `dst_ilk` is known not to be a person. An ILK the
+/// identity does not know yet is taken as a person's: a person's first message may come before the
+/// replica has their ILK, and a turn analyzed for nothing costs less than a person's turn lost.
+fn person_at_other_end(
+    message: &Message,
+    agent_node: &str,
+    facts: impl Fn(&str) -> Option<IlkFacts>,
+) -> bool {
+    let known_not_a_person = |ilk: &str| {
+        facts(ilk.trim()).is_some_and(|facts| !facts.is_person() && facts.kind().is_some())
+    };
+    if message.routing.src_l2_name.as_deref() == Some(agent_node) {
+        return !message
+            .meta
+            .dst_ilk
+            .as_deref()
+            .is_some_and(known_not_a_person);
+    }
+    match message_writer::writer_of(message.meta.context.as_ref()) {
+        Some(writer) => writer
+            .ilk
+            .as_deref()
+            .is_some_and(|ilk| !known_not_a_person(ilk)),
+        None => !message
+            .meta
+            .src_ilk
+            .as_deref()
+            .is_some_and(known_not_a_person),
+    }
 }
 
 /// The node a turn came in through: where its cycle started, its trace's first entry
@@ -1222,6 +1313,27 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
                 "sy.cognition failed to sync jsr-memory after a load"
             );
         }
+    }
+
+    // Only a turn with a person at its other end is analyzed (docs/cognition-hands-v1.md §6): a turn
+    // between agents, or a WF's own text, stays among the communication's last turns, which the
+    // intake took, and in `turns`. Its communication is loaded all the same, so its last turns go to
+    // SY.storage.
+    if !person_at_other_end(&msg, &turn.agent_node, |ilk| {
+        message_writer::ilk_facts(&app_state.hive_id, ilk)
+    }) {
+        app_state
+            .runtime_state
+            .lock()
+            .await
+            .turns_not_analyzed_total += 1;
+        tracing::debug!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            agent_ilk = %agent_ilk,
+            "sy.cognition took a turn with no person at its other end: not analyzed"
+        );
+        return;
     }
 
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
@@ -2721,6 +2833,7 @@ fn build_status_payload(
         "stream_repeats_skipped_total": runtime_state.stream_repeats_skipped_total,
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
         "intake_turns_total": runtime_state.intake_turns_total,
+        "turns_not_analyzed_total": runtime_state.turns_not_analyzed_total,
         "state_fetches_total": runtime_state.state_fetches_total,
         "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "published_entities_total": runtime_state.published_entities_total,
@@ -2891,6 +3004,7 @@ fn build_cognition_config_get_payload(
         "publish_errors_total": runtime_state.publish_errors_total,
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
         "intake_turns_total": runtime_state.intake_turns_total,
+        "turns_not_analyzed_total": runtime_state.turns_not_analyzed_total,
         "state_fetch_failures_total": runtime_state.state_fetch_failures_total,
         "last_thread_id": runtime_state.last_thread_id,
         "last_tags": runtime_state.last_tags,
@@ -4906,9 +5020,14 @@ mod tests {
         turn_copy(TEST_AGENT_NODE, Some(TEST_AGENT), text(content))
     }
 
+    /// What an identity with no ILK says: nothing.
+    fn no_facts(_: &str) -> Option<IlkFacts> {
+        None
+    }
+
     /// The turn the intake keeps of `message`, which its router took at `ts_ms`.
     fn taken(message: &Message, ts_ms: u64) -> RecentTurn {
-        recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, ts_ms).expect("a turn")
+        recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, ts_ms, no_facts).expect("a turn")
     }
 
     fn texts(turns: &[MemoryTurn]) -> Vec<&str> {
@@ -5866,6 +5985,11 @@ mod tests {
                     direction: MemoryTurnDirection::In,
                     src_ilk: Some("ilk:person".to_string()),
                     via: Some("IO.api@motherbee".to_string()),
+                    writer: Some(MemoryTurnParty {
+                        ilk: Some("ilk:person".to_string()),
+                        ..MemoryTurnParty::default()
+                    }),
+                    to: None,
                     text: "How much is the Pro plan?".to_string(),
                     attachments: 0,
                     choice: None,
@@ -5875,6 +5999,8 @@ mod tests {
                     direction: MemoryTurnDirection::Out,
                     src_ilk: Some(TEST_AGENT.to_string()),
                     via: None,
+                    writer: None,
+                    to: None,
                     text: "USD 49 a license. How many do you want?".to_string(),
                     attachments: 0,
                     choice: None,
@@ -5967,6 +6093,199 @@ mod tests {
             ]
         );
         worker.abort();
+    }
+
+    /// A turn with no person at its other end is not analyzed (docs/cognition-hands-v1.md §6): the
+    /// worker loads its communication, whose row goes out with the turn, counts it, and calls no
+    /// model. Here a WF's own text: its writer is the WF's node.
+    #[tokio::test]
+    async fn a_turn_with_no_person_at_its_other_end_is_loaded_and_not_analyzed() {
+        let (app_state, mut router) = test_app_state("cognoperson", None);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        let mut reminder = turn_copy(
+            "WF.sales@motherbee",
+            Some("ilk:person"),
+            text("Ana has not answered in 2 days: send a reminder"),
+        );
+        reminder.meta.context = Some(json!({"writer": {"name": "WF.sales@motherbee"}}));
+        let batch = turns_batch("cognoperson", &[(1, TEST_TS, &reminder)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        let (ack, _) = next_outgoing(&mut router).await;
+        assert_eq!(ack.meta.msg.as_deref(), Some(MSG_STREAM_ACK));
+
+        let worker = tokio::spawn(handle_turn(
+            turn_rx.try_recv().expect("the queued turn"),
+            Arc::clone(&app_state),
+        ));
+        let (request, _) = next_outgoing(&mut router).await;
+        assert_eq!(request.meta.msg.as_deref(), Some(MSG_COGNITION_STATE_GET));
+        router
+            .inject(Message {
+                routing: Routing {
+                    src: "SY.storage@motherbee".to_string(),
+                    src_l2_name: Some("SY.storage@motherbee".to_string()),
+                    dst: Destination::Unicast(request.routing.src.clone()),
+                    ttl: 1,
+                    trace_id: request.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(MSG_COGNITION_STATE_RESPONSE.to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::to_value(CognitionStateResponse {
+                    ok: true,
+                    envelopes: Vec::new(),
+                    next: None,
+                    error: None,
+                })
+                .expect("state"),
+            })
+            .await
+            .expect("the state");
+
+        let (_, rows) = next_outgoing(&mut router).await;
+        assert_eq!(rows.len(), 1, "the row goes out after the load");
+        assert_eq!(
+            texts(&rows[0].data.turns),
+            ["Ana has not answered in 2 days: send a reminder"]
+        );
+        worker.await.expect("the worker ends");
+        let state = app_state.runtime_state.lock().await;
+        assert_eq!(state.turns_not_analyzed_total, 1);
+        assert_eq!(state.semantic_tagger_calls_total, 0);
+    }
+
+    /// A turn the agent got names its writer, and one it sent whom it answered, each with the name
+    /// and the kind the identity gives (docs/cognition-hands-v1.md §6). A message with no writer
+    /// stands for its `src_ilk`.
+    #[test]
+    fn a_turn_names_its_writer_and_an_answer_whom_it_went_to() {
+        let known = |ilk: &str| match ilk {
+            "ilk:ana" => Some(IlkFacts {
+                ilk_type: "human".to_string(),
+                name: Some("Ana Pérez".to_string()),
+            }),
+            "ilk:wf" => Some(IlkFacts {
+                ilk_type: "agent".to_string(),
+                name: Some("WF.sales@motherbee".to_string()),
+            }),
+            "ilk:invoice" => Some(IlkFacts {
+                ilk_type: "agent".to_string(),
+                name: Some("AI.invoice@motherbee".to_string()),
+            }),
+            _ => None,
+        };
+        let party = |ilk: Option<&str>, name: Option<&str>, kind: Option<&str>| {
+            Some(MemoryTurnParty {
+                ilk: ilk.map(ToString::to_string),
+                name: name.map(ToString::to_string),
+                kind: kind.map(ToString::to_string),
+            })
+        };
+        let written = |writer: Value| {
+            let mut message = supervisor_says("said");
+            message.meta.src_ilk = Some("ilk:ana".to_string());
+            message.meta.context.as_mut().expect("context")["writer"] = writer;
+            recent_turn_of(&message, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, known)
+                .expect("a turn")
+                .turn
+        };
+
+        let ana = written(json!({"ilk": "ilk:ana"}));
+        assert_eq!(
+            ana.writer,
+            party(Some("ilk:ana"), Some("Ana Pérez"), Some("person"))
+        );
+        assert_eq!(ana.to, None);
+        assert_eq!(
+            written(json!({"ilk": "ilk:wf", "name": "WF.sales@motherbee"})).writer,
+            party(Some("ilk:wf"), Some("WF.sales@motherbee"), Some("workflow"))
+        );
+        assert_eq!(
+            written(json!({"ilk": "ilk:invoice"})).writer,
+            party(
+                Some("ilk:invoice"),
+                Some("AI.invoice@motherbee"),
+                Some("agent")
+            )
+        );
+        // A name the message gives stays; an ILK the identity does not know has no kind.
+        assert_eq!(
+            written(json!({"ilk": "ilk:temp", "name": "Juan"})).writer,
+            party(Some("ilk:temp"), Some("Juan"), None)
+        );
+        let unnamed = recent_turn_of(
+            &person_says("hi"),
+            TEST_AGENT_NODE,
+            TEST_AGENT,
+            TEST_TS,
+            known,
+        )
+        .expect("a turn")
+        .turn;
+        assert_eq!(unnamed.writer, party(Some("ilk:person"), None, None));
+
+        let mut answer = agent_says("Your credit note is on its way");
+        answer.meta.dst_ilk = Some("ilk:ana".to_string());
+        let answer = recent_turn_of(&answer, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, known)
+            .expect("a turn")
+            .turn;
+        assert_eq!(answer.writer, None);
+        assert_eq!(
+            answer.to,
+            party(Some("ilk:ana"), Some("Ana Pérez"), Some("person"))
+        );
+    }
+
+    /// Cognition analyzes a turn with a person at its other end (docs/cognition-hands-v1.md §6): one
+    /// a person wrote to the agent, or the agent's answer to a person. An ILK the identity does not
+    /// know yet is taken as a person's.
+    #[test]
+    fn only_a_turn_with_a_person_at_its_other_end_is_analyzed() {
+        let known = |ilk: &str| {
+            let ilk_type = match ilk {
+                "ilk:ana" => "human",
+                "ilk:sales" | "ilk:wf" => "agent",
+                "ilk:frontdesk" => "system",
+                _ => return None,
+            };
+            Some(IlkFacts {
+                ilk_type: ilk_type.to_string(),
+                name: None,
+            })
+        };
+        let got = |writer: Option<Value>, src_ilk: Option<&str>| {
+            let mut message = turn_copy("WF.sales@motherbee", src_ilk, text("said"));
+            message.meta.context = writer.map(|writer| json!({"writer": writer}));
+            person_at_other_end(&message, TEST_AGENT_NODE, known)
+        };
+        assert!(got(Some(json!({"ilk": "ilk:ana"})), Some("ilk:ana")));
+        assert!(got(Some(json!({"ilk": "ilk:new"})), Some("ilk:new")));
+        assert!(!got(Some(json!({"ilk": "ilk:wf"})), Some("ilk:ana")));
+        assert!(!got(
+            Some(json!({"ilk": "ilk:sales", "name": "AI.sales@motherbee"})),
+            Some("ilk:sales")
+        ));
+        assert!(!got(Some(json!({"ilk": "ilk:frontdesk"})), Some("ilk:ana")));
+        assert!(!got(
+            Some(json!({"name": "WF.sales@motherbee"})),
+            Some("ilk:ana")
+        ));
+        assert!(got(None, Some("ilk:ana")));
+        assert!(got(None, None));
+        assert!(!got(None, Some("ilk:sales")));
+
+        let sent = |dst_ilk: Option<&str>| {
+            let mut message = agent_says("answered");
+            message.meta.dst_ilk = dst_ilk.map(ToString::to_string);
+            person_at_other_end(&message, TEST_AGENT_NODE, known)
+        };
+        assert!(sent(Some("ilk:ana")));
+        assert!(sent(Some("ilk:new")));
+        assert!(sent(None));
+        assert!(!sent(Some("ilk:sales")));
+        assert!(!sent(Some("ilk:frontdesk")));
     }
 
     /// A communication keeps its last 20 turns in the order its router took them, each with who
@@ -6063,7 +6382,7 @@ mod tests {
             Some("ilk:person"),
             json!({"type": "event", "name": "typing"}),
         );
-        assert!(recent_turn_of(&no_text, TEST_AGENT_NODE, TEST_AGENT, TEST_TS).is_none());
+        assert!(recent_turn_of(&no_text, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, no_facts).is_none());
     }
 
     /// Text of more bytes a character keeps fewer turns: they stay under the bytes a package and a
@@ -6110,9 +6429,16 @@ mod tests {
             &mut threads,
             &[],
             vec![
-                recent_turn_of(&to_sales, TEST_AGENT_NODE, "ilk:sales", TEST_TS).expect("a turn"),
-                recent_turn_of(&to_invoice, "AI.invoice@motherbee", "ilk:invoice", TEST_TS)
+                recent_turn_of(&to_sales, TEST_AGENT_NODE, "ilk:sales", TEST_TS, no_facts)
                     .expect("a turn"),
+                recent_turn_of(
+                    &to_invoice,
+                    "AI.invoice@motherbee",
+                    "ilk:invoice",
+                    TEST_TS,
+                    no_facts,
+                )
+                .expect("a turn"),
             ],
         );
         let hot_set = build_memory_hot_set_snapshot(&threads, &[], Vec::new()).expect("hot set");
@@ -6334,6 +6660,13 @@ mod tests {
         let mut received = person_says("ok");
         received.meta.context = chose.meta.context.clone();
         assert_eq!(taken(&received, TEST_TS).turn.choice, None);
-        assert!(recent_turn_of(&agent_says(""), TEST_AGENT_NODE, TEST_AGENT, TEST_TS).is_none());
+        assert!(recent_turn_of(
+            &agent_says(""),
+            TEST_AGENT_NODE,
+            TEST_AGENT,
+            TEST_TS,
+            no_facts
+        )
+        .is_none());
     }
 }

@@ -111,6 +111,13 @@ stays in the last turns.
    are durable whatever the model calls below do. If the load fails, the turn is skipped
    (`state_fetch_failures_total`). One held but idle for 5 minutes is checked against SY.storage
    again.
+   - **Only a turn with a person at its other end is analyzed** (`person_at_other_end`,
+     [cognition-hands-v1](../cognition-hands-v1.md) §6): one the agent got, unless its writer
+     (`meta.context.writer`, else its `src_ilk`) is known not to be a person, an ILK the identity
+     names `agent` or `system`, or a writer with no ILK, a node; an answer the agent sent, unless
+     its `dst_ilk` is. An ILK the identity does not know yet counts as a person's. Any other turn
+     stops here: it stays among the last turns, unanalyzed and unnumbered
+     (`turns_not_analyzed_total`), with no model call. Its communication was loaded all the same.
 4. **Text:** the message's text content (`TextV1Payload`, `extract_turn_text`). A message
    without text gets an empty tag set, and no tagger call.
 5. **AI key:** resolved from SY.vault on every turn (§8). Without it the turn is skipped and
@@ -196,6 +203,12 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
   - `via`, on `in` only: the node it came in through: where its cycle started, the first entry of
     `meta.context.trace` (docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise
     its sender's L2 name;
+  - `writer`, on `in` only: who wrote it, its `meta.context.writer`, else its `src_ilk`; and `to`,
+    on `out` only: whom the agent answered, its `dst_ilk` ([cognition-hands-v1](../cognition-hands-v1.md)
+    §6). Each is `{ilk, name, kind}`: the name the message gives, else the identity's display
+    name, and the kind the identity's type gives (`person`, `agent`, `workflow` or `system`, none
+    for an ILK it does not know), read in the identity memory of the cognition's hive and kept a
+    minute (`message_writer::ilk_facts`);
   - `text`: `extract_turn_text`, cut at 2,000 characters (`COGNITION_TURN_TEXT_MAX_CHARS`), the
     last one an ellipsis when cut. Empty for a turn with files alone: it is kept, so the agent's
     answer to it keeps its question;
@@ -478,13 +491,17 @@ before a WF's block when the message carries one (`render_memory_package_prompt_
 `inject_prompt_blocks_into_text_input` in `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
 
 - The block ends with the recent conversation, oldest first: one line per turn, with its time
-  (UTC, to the minute) and who spoke. The agent's own turns read "you"; another's read its
-  sender's ILK and the node it came through, so a person and a supervisor in one thread read
-  apart (`render_memory_turn`).
+  (UTC, to the minute) and who spoke (`render_memory_turn`, docs/cognition-hands-v1.md §6):
+  - another's turn names its writer: `<kind> <name> (<ILK>)`, the kind `person`, `agent`,
+    `workflow` or `system` as the identity says, and `via <node>` after a person's, the node they
+    wrote through. So a person, a supervisor, another agent and a WF's own text read apart;
+  - the agent's own turns read `you, to <whom>`, or `you` when the turn names nobody;
+  - a turn kept before turns named a writer reads its sender's ILK and the node it came through.
 - Each turn's text is a JSON string, so no text can pass for a turn's line of its own; files are
   counted, and an answer that chose from a WF's menu reads `chose <option> <params>`.
 - After the blocks, the message being answered is named the same way: `Current user message,
-  from <ILK> via <node>:` (`current_message_label`), a line of the text or a text part of its own.
+  from <writer>:` (`current_message_label`), a line of the text or a text part of its own. The
+  agent reads its writer's kind and name in the identity memory of its own hive.
 - The AI SDK cuts nothing of what the model reads ahead of the message: it cuts only the
   immediate memory's history (FINDINGS A-71), which ai.generic never gives it. With 20 turns of
   2,000 characters the block passes 40,000 characters (some 10,000 tokens a call, and again on
@@ -570,8 +587,9 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
 `STATUS` reports, under `turns_consumer`:
 
 - the flow: `processed_turns_total`, `invalid_turns_total`, `dropped_turns_queue_full_total`,
-  `stream_repeats_skipped_total`, `no_agent_ilk_total`, and `intake_turns_total` (turns the
-  intake added to their communications' last turns, §3.4);
+  `stream_repeats_skipped_total`, `no_agent_ilk_total`, `intake_turns_total` (turns the
+  intake added to their communications' last turns, §3.4), and `turns_not_analyzed_total` (turns
+  with no person at their other end, §3);
 - the state loads: `state_fetches_total`, `state_fetch_failures_total`, and the `rebuild_*`
   counters of the start reload;
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, failures and invalid

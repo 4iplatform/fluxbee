@@ -9873,6 +9873,8 @@ mod tests {
                 direction: fluxbee_sdk::protocol::MemoryTurnDirection::In,
                 src_ilk: Some("ilk:person".to_string()),
                 via: Some("IO.api@motherbee".to_string()),
+                writer: None,
+                to: None,
                 text: format!("{n:02} {}", "x".repeat(1_997)),
                 attachments: 0,
                 choice: None,

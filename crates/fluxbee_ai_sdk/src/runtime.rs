@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::message_trace::TraceNote;
+use fluxbee_sdk::message_writer::{self, Writer};
 use fluxbee_sdk::node_client::NodeError;
-use fluxbee_sdk::protocol::is_system_kind;
+use fluxbee_sdk::protocol::{is_solution_kind, is_system_kind};
 use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -429,10 +430,12 @@ async fn process_one<N: AiNode>(
     let maybe_response = run_handler(node.as_ref(), msg, config.handler_timeout, &metrics).await;
 
     if let Some(mut response) = maybe_response {
-        response.routing.src = writer.uuid().to_string();
-        if response.meta.src_ilk.is_none() {
-            response.meta.src_ilk = config.self_ilk_id.clone();
-        }
+        stamp_reply(
+            &mut response,
+            writer.uuid(),
+            &writer.full_name(),
+            config.self_ilk_id.as_deref(),
+        );
         let note = reply_trace_note(requester.as_deref(), &mut response);
         // Sending a reply again is safe: a send that timed out or was refused never queued it (the
         // SDK's send is a cancel-safe channel send), so a reply cannot go out twice.
@@ -456,6 +459,20 @@ async fn process_one<N: AiNode>(
 
     metrics.processed_messages.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// What the runtime stamps on an answer as it sends it: this node as its sender, its ILK when the
+/// answer names no `src_ilk`, and itself as the writer of a solution answer, its ILK and its node
+/// name (docs/cognition-hands-v1.md §5), in place of the request's writer, which the reply's context
+/// brought along.
+fn stamp_reply(response: &mut Message, node_uuid: &str, node_name: &str, self_ilk: Option<&str>) {
+    response.routing.src = node_uuid.to_string();
+    if response.meta.src_ilk.is_none() {
+        response.meta.src_ilk = self_ilk.map(ToString::to_string);
+    }
+    if is_solution_kind(&response.meta.msg_type) {
+        message_writer::set_writer(&mut response.meta, Writer::new(self_ilk, Some(node_name)));
+    }
 }
 
 /// The agent's entry in its reply's trace (docs/message-trace-v1.md §5): to whoever asked, with what
@@ -718,6 +735,45 @@ mod tests {
         let note = reply_trace_note(Some("IO.slack@motherbee"), &mut response);
         assert_eq!(note.act, ["identity_assigned", "registered"]);
         assert_eq!(response.meta.context, Some(json!({})));
+    }
+
+    /// An answer names the agent as its writer, in place of the request's (docs/cognition-hands-v1.md
+    /// §5); a control answer names none.
+    #[test]
+    fn an_answer_names_the_agent_as_its_writer() {
+        let mut response = message("user");
+        response.meta.context =
+            Some(json!({"writer": {"ilk": "ilk:ana", "name": "Ana"}, "trace": []}));
+        stamp_reply(
+            &mut response,
+            "uuid-sales",
+            "AI.sales@worker1",
+            Some("ilk:sales"),
+        );
+        assert_eq!(response.routing.src, "uuid-sales");
+        assert_eq!(response.meta.src_ilk.as_deref(), Some("ilk:sales"));
+        assert_eq!(
+            message_writer::writer_of(response.meta.context.as_ref()),
+            Some(Writer::new(Some("ilk:sales"), Some("AI.sales@worker1")))
+        );
+        assert!(response.meta.context.as_ref().unwrap()["trace"].is_array());
+
+        // With no ILK of its own, the agent names its node.
+        let mut response = message("user");
+        stamp_reply(&mut response, "uuid-sales", "AI.sales@worker1", None);
+        assert_eq!(
+            message_writer::writer_of(response.meta.context.as_ref()),
+            Some(Writer::new(None, Some("AI.sales@worker1")))
+        );
+
+        let mut control = message("system");
+        stamp_reply(
+            &mut control,
+            "uuid-sales",
+            "AI.sales@worker1",
+            Some("ilk:sales"),
+        );
+        assert_eq!(control.meta.context, None);
     }
 
     #[tokio::test]

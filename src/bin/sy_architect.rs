@@ -20698,8 +20698,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
             ['ICH', detail.ich || '(none)'],
             ['Thread', detail.thread_id || '(none)'],
             ['Trace', detail.trace_id || '(none)'],
-            ['From ILK', detail.from_ilk],
+            ['From ILK', detail.from_ilk || '(none)'],
             ['To ILK', detail.to_ilk || '(none)'],
+            ['Writer', [detail.writer_name, detail.writer_ilk].filter(Boolean).join(' ') || '(none)'],
             ['Size', formatSize(detail.size_bytes)],
             ['Key', detail.dedupe_key]
           ];

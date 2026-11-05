@@ -538,6 +538,8 @@ The instance's person is the `src_ilk` and `ich` of the message that started it,
   - To the person's IO node, the one whose message started the instance, it names the person: its `dst_ilk` is the person's `src_ilk`, and its `ich` the person's (none when the person's message had none). A `forward` to it names the person the same way (§10.7).
   - To any other `IO.*` node (the team's, say, even when `start_from` names it too) it names no person and no channel: no `dst_ilk` and no `ich`.
 
+**Who wrote it** (`meta.context.writer`, docs/cognition-hands-v1.md §5): every message a WF writes, a `send_message`, names the WF as its writer, its ILK (`FLUXBEE_NODE_ILK_ID`) and its node name, whatever the `src_ilk` says: the `src_ilk` says whose conversation it is, and the writer who wrote the text. A `forward` passes the text on with the writer the message came with, and a message that named none goes on naming none. A definition's `meta.context` never writes `writer`: the validator refuses it, as it refuses `wf`. Cognition analyzes a message to an agent only when a person wrote it.
+
 On a thread several people write on (io.slack gives a Slack channel's top level one thread for everyone), a message from the person's IO node with another `src_ilk` leaves the instance with no person: the store drops it, the node's log says so once, and from then on the instance's sends carry no person and a `forward` keeps the message's own, since an agent binds per-person state to a message's `src_ilk`. A message from another node never counts: an agent, or the team's IO node, even one of `start_from`.
 
 **Payload substitution rules.**

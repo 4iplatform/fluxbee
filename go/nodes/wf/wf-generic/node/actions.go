@@ -44,6 +44,9 @@ type ActionContext struct {
 	Dispatcher Dispatcher
 	Timer      TimerSender
 	Clock      ClockFunc
+	// SelfILK is the WF node's own ILK (FLUXBEE_NODE_ILK_ID): with the node's name, the writer its
+	// own messages name (docs/cognition-hands-v1.md §5).
+	SelfILK string
 	// TransitionActions are the kinds of action the step a send belongs to runs, in order: a
 	// transition's exit, own and entry actions (RunTransition), else the actions run together
 	// (runActions). The WF's entry in the message's trace names them (traceNote).
@@ -158,6 +161,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		return fmt.Errorf("send_message: %w", err)
 	}
 	inst.withCycleTrace(metaContext)
+	metaContext[sdk.WriterKey] = actx.writer()
 	contextRaw, err := withWFBlock(metaContext, action, inst, eventMap)
 	if err != nil {
 		return fmt.Errorf("send_message: %w", err)
@@ -248,6 +252,7 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 		return fmt.Errorf("forward: %w", err)
 	}
 	inst.withCycleTrace(metaContext)
+	withSourceWriter(metaContext, source)
 	contextRaw, err := withWFBlock(metaContext, action, inst, eventMap)
 	if err != nil {
 		return fmt.Errorf("forward: %w", err)
@@ -308,6 +313,28 @@ func (inst *WFInstance) messageToForward(name string, event sdk.Message) (sdk.Me
 // system message (a TIMER_FIRED, a control verb).
 func receivedFromANode(msg sdk.Message) bool {
 	return msg.SourceL2Name() != "" && !sdk.IsSystemKind(msg.Meta.MsgType)
+}
+
+// writer is who wrote what the WF itself sends: the WF node, by its ILK and its name
+// (docs/cognition-hands-v1.md §5). An agent that gets it does not analyze it as a person's words,
+// though its src_ilk names the person, whose conversation it is.
+func (actx ActionContext) writer() sdk.Writer {
+	writer := sdk.Writer{ILK: actx.SelfILK}
+	if actx.Dispatcher != nil {
+		writer.Name = actx.Dispatcher.NodeL2Name()
+	}
+	return writer
+}
+
+// withSourceWriter puts on metaContext the writer of the message a forward sends, in place of any
+// the action's meta.context wrote: the forward passes the text on, and its writer with it. A message
+// that names none goes on naming none.
+func withSourceWriter(metaContext map[string]any, source sdk.Message) {
+	if writer, ok := sdk.WriterOf(source.Meta.Context); ok {
+		metaContext[sdk.WriterKey] = writer
+		return
+	}
+	delete(metaContext, sdk.WriterKey)
 }
 
 // withCycleTrace puts the trace of the cycle the instance is handling on metaContext, in place of

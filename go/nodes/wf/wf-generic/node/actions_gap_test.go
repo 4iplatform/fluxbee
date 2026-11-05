@@ -193,6 +193,70 @@ func TestSendMessageWithoutContextCarriesItsTrace(t *testing.T) {
 	}
 }
 
+// What the WF writes names the WF as its writer, its ILK and its node name; a forward passes the
+// text on with the writer it came with, whatever the action's meta.context brings, and a message
+// that named none goes on naming none (docs/cognition-hands-v1.md §5). A send to an agent still
+// carries the person as its src_ilk: whose conversation it is.
+func TestTheWFNamesTheWriterOfWhatItSends(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.soporte@worker1", uuid: "wf-uuid-writer"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	actx.SelfILK = "ilk:wf"
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:writer", "conv-w", "invoice", map[string]any{}, fixedClock)
+	inst.PersonILK = "ilk:ana"
+	writerOf := func(msg sdk.Message) sdk.Writer {
+		t.Helper()
+		writer, _ := sdk.WriterOf(msg.Meta.Context)
+		return writer
+	}
+
+	send := ActionDefinition{Type: "send_message", Target: "AI.sales@worker1", Meta: &ActionMeta{Msg: "remind"}, Payload: map[string]any{"text": "Ana has not answered"}}
+	if err := execSendMessage(context.Background(), send, inst, msgWithName("TIMER_FIRED"), actx); err != nil {
+		t.Fatal(err)
+	}
+	sent := disp.sent[len(disp.sent)-1]
+	if got := writerOf(sent); got != (sdk.Writer{ILK: "ilk:wf", Name: "WF.soporte@worker1"}) {
+		t.Fatalf("a send's writer: %+v", got)
+	}
+	if derefStringPtr(sent.Meta.SrcIlk) != "ilk:ana" {
+		t.Fatalf("a send to an agent carries the person: %+v", sent.Meta)
+	}
+
+	answer := from("AI.sales@worker1", sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-answer"},
+		Meta:    sdk.Meta{MsgType: "user", ThreadID: strPtr("conv-w"), SrcIlk: strPtr("ilk:sales"), Context: json.RawMessage(`{"writer":{"ilk":"ilk:sales","name":"AI.sales@worker1"}}`)},
+		Payload: json.RawMessage(`{"type":"text","content":"credit note issued"}`),
+	})
+	inst.takeCycleTrace(answer)
+	// The kept answer is forwarded on a later event whose context names another writer, and the
+	// action's meta.context brings one too: from the event by a $ref, or written.
+	event := answer
+	event.Meta.Context = json.RawMessage(`{"writer":{"ilk":"ilk:forged"}}`)
+	for _, actionContext := range []any{
+		map[string]any{"$ref": "event.context"},
+		map[string]any{"writer": map[string]any{"ilk": "ilk:forged"}},
+	} {
+		for _, c := range []struct {
+			context string
+			want    sdk.Writer
+		}{
+			{`{"writer":{"ilk":"ilk:sales","name":"AI.sales@worker1"}}`, sdk.Writer{ILK: "ilk:sales", Name: "AI.sales@worker1"}},
+			{`{"io":{"channel":"slack"}}`, sdk.Writer{}},
+		} {
+			answer.Meta.Context = json.RawMessage(c.context)
+			if err := inst.keep("answer", answer, actx); err != nil {
+				t.Fatal(err)
+			}
+			forward := ActionDefinition{Type: "forward", Target: "AI.invoice@worker1", Message: "answer", Meta: &ActionMeta{Context: actionContext}}
+			if err := execForward(context.Background(), forward, inst, event, actx); err != nil {
+				t.Fatal(err)
+			}
+			if got := writerOf(disp.sent[len(disp.sent)-1]); got != c.want {
+				t.Fatalf("a forward of %s, its action's context %v: writer %+v, want %+v", c.context, actionContext, got, c.want)
+			}
+		}
+	}
+}
+
 // A forward of another WF's message carries this WF's block only: none when its action has no vars,
 // menu or subject, and never the block the message brought.
 func TestAForwardCarriesNoOtherWFsBlock(t *testing.T) {

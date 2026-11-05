@@ -128,10 +128,17 @@ pub struct MemoryTurn {
     /// The sender's ILK, when the message carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src_ilk: Option<String>,
-    /// Only on `in`: the node it came in through. For a message a WF forwards, the first node of
-    /// its trail (`meta.context.wf.trail`); otherwise its sender.
+    /// Only on `in`: the node it came in through, where its cycle started: its trace's first entry
+    /// (docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise its sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// Only on `in`: who wrote it, its `meta.context.writer`, else its `src_ilk`
+    /// (docs/cognition-hands-v1.md §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<MemoryTurnParty>,
+    /// Only on `out`: whom the agent answered, the answer's `dst_ilk`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<MemoryTurnParty>,
     /// Its text, cut at 2,000 characters. Empty when it carried only files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
@@ -144,6 +151,20 @@ pub struct MemoryTurn {
     pub choice: Option<MemoryTurnChoice>,
     /// When its agent's router took it (RFC 3339, UTC).
     pub ts: String,
+}
+
+/// Who is at one end of a turn (docs/cognition-hands-v1.md §6): their ILK, their name, and their
+/// kind, as the message and the identity memory say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTurnParty {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ilk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `person`, `agent`, `workflow` or `system` (`message_writer::IlkFacts::kind`); none when the
+    /// identity does not know the ILK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// An option an agent chose from a WF's menu, as its answer's `meta.context.evaluation` names it.

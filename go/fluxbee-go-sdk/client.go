@@ -193,12 +193,16 @@ func (s *NodeSender) Send(msg Message) error {
 
 // SendTraced queues msg for the router with this node's entry in its cycle's trace
 // (docs/message-trace-v1.md): when it sends it, its own name, and what note adds, the destination
-// by name and the actions it took. A message that is not the solution's carries no trace. A
-// message whose frame is over the limit is refused with *MessageTooLargeError before it is queued:
-// queued, it would make the writer drop the connection. A full queue fails with "sender queue
-// full".
+// by name and the actions it took. A message that is not the solution's carries no trace. A writer
+// it names by ILK alone gets its name from the identity memory of this node's hive
+// (docs/cognition-hands-v1.md §5). A message whose frame is over the limit is refused with
+// *MessageTooLargeError before it is queued: queued, it would make the writer drop the connection.
+// A full queue fails with "sender queue full".
 func (s *NodeSender) SendTraced(msg Message, note TraceNote) error {
 	WriteTraceEntry(&msg, s.FullName(), note)
+	if hive := hiveOf(s.FullName()); hive != "" {
+		fillWriterName(&msg, func(ilk string) (IlkFacts, bool) { return IlkFactsOf(hive, ilk) })
+	}
 	data, err := MarshalMessage(msg)
 	if err != nil {
 		return err
