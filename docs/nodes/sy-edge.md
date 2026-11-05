@@ -337,8 +337,10 @@ added (see above).
 - **`web_max_inflight_per_ip`, 16 by default (0 turns it off):** the share of those one client
   address holds, its IPv6 /64 as one (`PeerSlots`, A-90). One more gets a quick
   `429 WEB_PEER_BUSY` and never reaches io.web.
-- **`Connection: close` to io.web:** each proxied request's connection is closed by io.web first,
-  so its TIME_WAIT is on the motherbee, never a port of the ingress toward it (A-90).
+- **`Connection: close` to io.web:** io.web closes each proxied request's connection first, with
+  its TLS close_notify. The edge then drops it with that close_notify unread, so the connection
+  ends in resets and neither side keeps a TIME_WAIT. No port of the ingress toward the motherbee
+  waits after a request (A-90; seen on the wire on 8.x with 0.1.99).
 - **hyper's buffer** on a connection to io.web is 64 KiB (`IO_WEB_MAX_BUF`), as on the door's
   own connections.
 

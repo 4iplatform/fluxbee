@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ live, gate passed (two runs, the second from zero) | snap `pre-namefix-0-1-98` (all 4 VMs) · `apt install fluxbee=0.1.97` + core-update of the spokes |
+| **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ live, checked on 8.x | snap `pre-sprint-0-1-99` (all 4 VMs) · `apt install fluxbee=0.1.98` + core-update of the spokes |
+| **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ replaced by 0.1.99 | snap `pre-namefix-0-1-98` (deleted 2026-11-04) · `apt install fluxbee=0.1.97` + core-update of the spokes |
 | **0.1.97** | 2026-11-03 | `b91260a5` | motherbee + spokes (core): SY.admin's executor dispatches a fixed step through the tool's own dispatch (A-144) | ✅ replaced by 0.1.98 (gate in course) | snap `pre-dispatchfix-0-1-97` (deleted 2026-11-03) · `apt install fluxbee=0.1.96` + core-update of the spokes |
 | **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ✅ replaced by 0.1.97 (gate in course) | snap `pre-gatefix-0-1-96` (deleted 2026-11-03) · `apt install fluxbee=0.1.95` + core-update of the spokes |
 | **0.1.95** | 2026-11-03 | `a864b0aa` | motherbee + spokes (core); SY.architect's own model `claude-opus-5-5` (`ai.model`, CONFIG_SET); the motherbee's `hive.yaml` back on `claude-sonnet-5-5`; the old gate (WF gate0192, its agents and roles) removed | ✅ replaced by 0.1.96 (gate in course) | snap `pre-wfcase5-0-1-95` (deleted 2026-11-03) · `apt install fluxbee=0.1.94` + core-update of the spokes; SY.architect's `config.json` back to `{"ai":{"model":null}}` |
@@ -107,6 +108,61 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.99 — The sprint's blocks 1 and 2: SY.timer 1.2, Archi's staged turn, the router's protected verbs and VPN warning, bundle_upload, io.slack's download, io.web's handshakes and the edge's proxy (A-115, A-147, A-146, A-100, A-84, A-85, A-89, A-90)
+
+- **Date:** 2026-11-04 (ART) · **Previous version:** 0.1.98 · **Commit:** `34cff128`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the first two blocks of the sprint of 2026-11-04 (FINDINGS, the board): the small items
+  the tests found, and the 🔴 items, simple and important.
+- **What changed:**
+  - **SY.timer 1.2 (A-115):**
+    - a fire is saved before it is sent, so it never goes twice;
+    - one the router answers `UNREACHABLE` is sent again after 5, 10, 20 and 40 s, then each
+      minute, for up to an hour;
+    - an overdue fire at start waits for its owner;
+    - caps on the delay, the payload and the pending count;
+    - TIMER_GET and TIMER_LIST answer the owner and SY.admin only;
+    - a node schedules only for itself, a SY node for any.
+  - **Archi (A-147):** a turn that stages a plan answers the model's own text, then the staged
+    message.
+  - **The router:**
+    - no "vpn table empty" warning at every connect (A-146);
+    - a protected verb is gated on any `msg_type`, in any case and with spaces around it (A-100).
+  - **SY.admin (A-84):** `bundle_upload` follows no symlink, takes a regular file, and extracts
+    under caps with its own modes.
+  - **io.slack (A-85):** the file download has timeouts, follows only same-origin redirects, and
+    reads under a byte cap.
+  - **io.web (A-89):** handshakes have slots of their own, 128 in all and 32 per source, for 3 s.
+  - **The edge's proxy (A-90):** 16 of its 128 slots per client address, `Connection: close` to
+    io.web, and a 30 s deadline on a stalled body.
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - SY.timer's Go tests in a Linux container, race detector on;
+  - the catalog's parity, the doc links, the loopback binds and the router's dispatcher guards.
+- **Deploy:**
+  - build of `34cff128` in 26 min, publish in 14 s;
+  - 0.1.99 on all 4 in 272 s (manifest `f70fa8a71b3bf1d3`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - every product unit restarted on its new binary (only Syncthing and the nftables oneshots are
+    older, as the release does not touch them).
+- **Checked on 8.x** (FINDINGS has each one):
+  - A-146: no VPN warning in the four routers' journals since their restart;
+  - A-100: an intruder's `CONFIG_GET` (admin), `config_get` and ` Config_Get ` (system) dropped
+    by the router, and no other drop on the four hives;
+  - A-89: of 34 silent connections from ingress1 to io.web, 2 closed at once and 32 at 3 s;
+  - A-90: the web host answered through the proxy, and no side keeps a TIME_WAIT after a request
+    (io.web closes first; the connection then ends in resets);
+  - A-115: a fire for a node that was away went again at +5, +10 and +20 s and reached it once on
+    its return; the reads, the lists and the target rule refused as designed; SY.admin sees every
+    owner; the HELP says 1.2;
+  - A-147: a new session asked a question and staged a restart, and Archi answered both. The
+    plan was cancelled.
+  - A-84 and A-85: by tests.
+- **Found in the checks:** A-152, a staged turn says how to confirm twice (fixed in code for the
+  next release).
+- **Rollback:** `apt install fluxbee=0.1.98` on the motherbee, then a core-update of the spokes.
+  SY.timer's database has the same schema.
 
 ## 0.1.98 — From WF Case 5's gate: a workflow's name follows the runtime naming policy (A-145); the gate passed
 

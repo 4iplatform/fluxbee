@@ -4788,8 +4788,8 @@ fn io_web_request(req: &Request, forwarding: &Forwarding<'_>) -> hyper::Request<
 /// stripped first (`strip_hop_by_hop`), then `DROPPED_REQUEST_HEADERS` and every `X-Forwarded-*`;
 /// then the edge's own `Host` (the web host), `X-Forwarded-For`, `X-Forwarded-Proto`,
 /// `X-Forwarded-Host`, `Forwarded` (RFC 7239) and `X-Request-Id`, in place of any the client sent;
-/// and `Connection: close`, so io.web closes first and the closed connection's TIME_WAIT is io.web's,
-/// never a port of the ingress toward the motherbee (FINDINGS A-90).
+/// and `Connection: close`, so io.web closes first: no port of the ingress toward the motherbee is
+/// left in TIME_WAIT after a request (FINDINGS A-90).
 fn io_web_request_headers(inbound: &HeaderMap, forwarding: &Forwarding<'_>) -> HeaderMap {
     let mut headers = inbound.clone();
     strip_hop_by_hop(&mut headers);

@@ -10,7 +10,8 @@
     `https://archi.<id>/` serves io.web's page through the edge.
 - Next is stage 2 (§11.3: sessions, Cloud's one-time code, Archi behind io.web). It waits for
   the operator's definition of its security.
-- FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are in 0.1.99 (2026-11-04):
+- FINDINGS A-89 and A-90, the proxy's and io.web's limits under load, are live since 0.1.99
+  (2026-11-04, checked on 8.x):
   io.web's handshakes have slots of their own, and the proxy gives each client a share, has
   io.web close first and ends a stalled body.
 

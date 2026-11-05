@@ -25,14 +25,20 @@ no change required
 
 ### This sprint (2026-11-04)
 
-1. **Small, from the tests** (✅ in code for 0.1.99, to check on 8.x):
+1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5 found
+   on the way):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
       fired twice; after a reboot, an overdue fire waits for its owner; caps on the delay, the
       count and the payload; listing and reading only for the owner and SY.admin; and the target
       rule, the operator's call (2026-11-04: a node schedules only for itself, a SY node for any).
-2. **The 🔴, simple and important** (✅ in code for 0.1.99, to check on 8.x):
+   4. A-152 [Archi], found checking A-147: the confirm sentence said once. In code, for the next
+      release.
+   5. A-151 [General/SY.timer], found on the way to A-115: a `TIMER_LIST` longer than one frame. The
+      operator's call: this sprint or later.
+2. **The 🔴, simple and important** (✅ 0.1.99, 2026-11-04: A-100, A-89 and A-90 validated on 8.x;
+   A-84 and A-85 by tests):
    1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
    2. A-84 [General/SY.admin]: `bundle_upload` with no symlinks, regular files only, caps and its
       own modes.
@@ -46,7 +52,8 @@ no change required
    2. A-137 [WF]: the chat on cognition across hands. It builds on A-138: the mark cognition would
       read travels in the message.
 
-Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release, with a WF gate.
+Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3 goes in its own release,
+with a WF gate.
 
 ### WF
 
@@ -59,15 +66,12 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 
 - Stage 2 ([io-web-v2](../../docs/io-web-v2.md)): sessions, Cloud's one-time code, Archi behind
   io.web. It waits for the operator's definition of its security.
-- A-89 ✅ io.web's connection slots fill before any authentication. *Sprint: in code, to check on
-  8.x.*
-- A-90 ✅ One client can exhaust the edge's way to io.web. *Sprint: in code, to check on 8.x.*
 - A-142 (Archi) bites here once stage 2 proxies Archi.
 
 ### Archi
 
-- A-147 ✅ A chat turn that stages a plan drops the model's own text. *Sprint: in code, to check
-  on 8.x.*
+- A-152 ✅ A turn that stages a plan says how to confirm twice. *Sprint: in code, for the next
+  release.*
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - A-120 🟡 Archi cannot take a page down.
@@ -82,8 +86,6 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 - A-114 🟡 No IO node writes first to a person; io.api delivers no answer at all.
 - A-91 🔵 io.blob and io.cloud boot UNCONFIGURED while they work.
 - **io.slack:**
-  - A-85 ✅ The file fetch has no timeout and buffers the whole body. *Sprint: in code, to check
-    on 8.x.*
   - A-136 🟡 One interlocutor's conversation is split by where they write in Slack.
   - A-148 🟡 What it lacks against the standard, starting with its revamp's architecture.
 - **io.blob:**
@@ -95,15 +97,8 @@ Blocks 1 and 2 go out in one release, checked on 8.x; block 3 in its own release
 
 ### General
 
-- A-146 ✅ The router warns at every connect when no VPN rule exists. *Sprint: in code, to check
-  on 8.x.*
-- A-100 ✅ The router gates protected verbs only for `msg_type` system, in exact case. *Sprint: in
-  code, to check on 8.x.*
-- A-84 ✅ `bundle_upload` follows symlinks and extracts without caps. *Sprint: in code, to check on
-  8.x.*
-- A-115 ✅ SY.timer: no retry, no caps, an open listing. *Sprint: in code, to check on 8.x.*
 - A-151 🟡 A `TIMER_LIST` longer than one frame fails: a WF with about 280 pending timers cannot
-  reconcile at its start.
+  reconcile at its start. *The operator's call: this sprint or later.*
 - A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
 - A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
@@ -1182,6 +1177,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-152 [Archi] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
+
+- **Seen on 8.x (0.1.99):** Archi's answer ended "Reply CONFIRM to execute or CANCEL to discard.",
+  and the staged message after it said the same: "A compiled executor plan is pending in this chat.
+  Reply CONFIRM to execute or CANCEL to discard."
+- **Why:**
+  - The prompt asks the model to end a plan's summary with that sentence (the pipeline confirmation
+    rules, after `fluxbee_plan_compiler`).
+  - A pipeline's message, which the model presents verbatim, ends with it too ("Plan compiled and
+    validated. … Reply CONFIRM to execute or CANCEL to discard.").
+  - Until A-147 the model's text was dropped, so it never showed twice.
+- **Fixed (in code, for the next release):**
+  - The prompt no longer asks the model for the sentence: the chat adds it.
+  - When the model's text ends with the staged message's closing sentence, the chat takes it off
+    (`staged_turn_message`, src/bin/sy_architect.rs).
+  - Test: `a_staged_turn_says_how_to_confirm_once`.
+
 ### A-151 [General/SY.timer] 🟡 OPEN (found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
 
 - **What happens:** SY.timer answers a `TIMER_LIST` in one `TIMER_RESPONSE`, which must fit the
@@ -1260,7 +1272,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   (writing first; the family's).
 - **Fix:** io.slack's track, inside the IO topic, starting with the architecture.
 
-### A-147 [Archi] ✅ RESOLVED (0.1.99; by tests; for the next release by the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
+### A-147 [Archi] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; for the next release by the operator, 2026-11-03; found the same day, WF Case 5's gate) — A chat turn that stages a plan answers only "a plan is pending": what the operator asked alongside is dropped
 
 - **Seen on 8.x:** the operator asked in one message for the running conversations, with their state
   and since when, and for one of them to be cancelled. Archi staged the cancel. Its answer was only
@@ -1277,8 +1289,11 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   (`staged_turn_message`, src/bin/sy_architect.rs). A turn with no text of the model's, or one that
   only repeats the staged message, shows the staged message alone. Test:
   `a_turn_that_stages_a_plan_keeps_the_models_answer`.
+- **Checked on 8.x (0.1.99, 2026-11-04):** in a new session, one turn asked what SY.timer does
+  and staged a restart of `AI.pruebas@worker1`. Archi answered both: its own text, then the staged
+  message. The plan was then cancelled. The same answer said how to confirm twice: A-152.
 
-### A-146 [General/router] ✅ RESOLVED (0.1.99; for the next release by the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
+### A-146 [General/router] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; for the next release by the operator, 2026-11-03; found the same day, sweeping WF Case 5's gate journals) — The router warns "vpn table empty in config snapshot" each time a node connects, and no VPN rule is the normal state
 
 - **Seen on 8.x:** worker1's rt-gateway logged it 22 times on 2026-11-02 and 50 times on 2026-11-03,
   none on 2026-11-01. It fires on every connect of a node that is not `SY.*` or `RT.*`: the gate's
@@ -1289,6 +1304,9 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
 - **Fix:** log it at debug, or not at all. The operator (2026-11-03): in the next release.
 - **Fixed (0.1.99):** the warning is gone: `assign_vpn`'s debug line before it already counts the
   snapshot's VPN rules.
+- **Checked on 8.x (0.1.99, 2026-11-04):** no `vpn table empty` line in the four routers' journals
+  since each restarted on 0.1.99. worker1's one line, at 00:14:04 UTC, came from its 0.1.98 router,
+  a minute before the core update restarted it.
 
 ### A-145 ✅ RESOLVED (0.1.98; by tests, and the second run named its workflow right; found 2026-11-03, WF Case 5's gate) — A workflow name with a hyphen passed SY.wf-rules and its check, and the package's publish refused it after the slots rotated
 
@@ -2206,7 +2224,7 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   (payments' `PAYMENT_DUE`, "nobody took it", "quiet") went to the person's ILK
   ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §5.4.12).
 
-### A-115 [General/SY.timer] ✅ RESOLVED (0.1.99, SY.timer 1.2; by tests; found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
+### A-115 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.99, SY.timer 1.2, 2026-11-04; the caps by tests; found 2026-10-27, iteration 2 design) — SY.timer: no retry, no caps, an open listing, and a drifted doc
 
 - **What happens:**
   - **A fire is sent once.** If its owner is down, SY.timer ignores the router's `UNREACHABLE`
@@ -2261,6 +2279,16 @@ Details are in [wf-orchestration-v1](../../docs/wf-orchestration-v1.md) §3.2, r
   - **The target:** a node schedules for itself; a SY node for any (`TIMER_FORBIDDEN`).
   - Tests: go/sy-timer `delivery_linux_test.go`, `limits_linux_test.go`, and the read and list
     tests. Found on the way: A-151.
+- **Checked on 8.x (0.1.99, 2026-11-04), on worker1:**
+  - A throwaway node armed a 60 s timer for itself and left. The fire at 00:23:20 UTC found no
+    target (`NODE_NOT_FOUND`) and went again after 5, 10 and 20 s. The node, back at 00:23:46, got
+    it at 00:23:55, once (`fire_count` 1). SY.timer logged four `timer_fired` (attempts 1 to 4) and
+    three `timer_fire_undelivered`.
+  - The node's own list answered. Another owner's list, and a timer for another node, got
+    `TIMER_FORBIDDEN`. Another node's `TIMER_GET` got `TIMER_NOT_OWNER`, and the owner's answered.
+  - SY.admin listed every owner's timers and read the gate's. The HELP says 1.2, with the new
+    error codes.
+  - The caps (the delay, the payload, the counts): by tests.
 
 ### A-114 [IO] 🟡 OPEN (found 2026-10-27, iteration 2 design) — An agent cannot write first to a person, and a WF does not answer an agent by default
 
@@ -2524,7 +2552,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
 - **Validated:** after the deploy, and after the A-109 relaunch, `node_help`, the binary, the stamp
   and `_system` all agreed.
 
-### A-100 [General/router] ✅ RESOLVED (0.1.99; by tests; found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
+### A-100 [General/router] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; found 2026-10-26, 0.1.86 review) — The router gates protected verbs only for `msg_type` system, in exact case
 
 - **What happens:** the router's delivery gate checks protected verbs only on `msg_type: system`,
   and only in exact case. A node that took `msg_type: admin`, or a verb in lower case, received a
@@ -2544,6 +2572,11 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   (`protected_system_action`, src/router/system_policy.rs; `prepare_local_delivery`). The
   orchestrator's own guard (SO-05) reads it the same way. Test:
   `a_protected_verb_is_gated_on_any_msg_type_and_in_any_case`.
+- **Checked on 8.x (0.1.99, 2026-11-04):** a throwaway node on worker1 sent `AI.pruebas@worker1`
+  `CONFIG_GET` as `admin`, then `config_get` and ` Config_Get ` as `system`. None got an answer. The
+  router logged the three drops under the canonical `CONFIG_GET`, each with the message's own name
+  and `msg_type`. The four hives logged no other drop since the release, so no legitimate sender
+  was cut.
 
 ### A-99 ✅ VALIDATED ON 8.x (0.1.87, 2026-10-27) — When a file generator runs, the model's own text is dropped
 
@@ -2680,7 +2713,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **To decide** with the IO family's review: whether the siblings should materialize their
   defaults the same way, so that a node's state says whether it works.
 
-### A-90 [io.web] ✅ RESOLVED (0.1.99; by tests; found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
+### A-90 [io.web] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; the share per client and the stalled body by tests; found 2026-10-24, 0.1.85 review) — One client can exhaust the edge's way to io.web
 
 - **What happens:** the proxy opens a TCP and TLS connection to io.web for each request and closes
   it first. Each one leaves a TIME_WAIT on the ingress.
@@ -2701,13 +2734,24 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **Fixed (0.1.99):** one client address holds at most 16 of the proxy's 128 slots
   (`web_max_inflight_per_ip`, `PeerSlots`, moved to the SDK for the edge and io.web), and past them
   gets a quick `429 WEB_PEER_BUSY`. Every request to io.web carries `Connection: close`, so io.web
-  closes first and the TIME_WAIT is the motherbee's, never a port of the ingress. io.web sending
+  closes first (what each side keeps after it: the check below). io.web sending
   nothing of a body for 30 s, while the edge waits on it, ends the response (`IoWebBody`). No pool:
   each request is still its own TCP and TLS connection. Tests:
   `one_client_holds_at_most_its_share_of_the_proxy`,
   `a_body_io_web_stalls_ends_and_gives_its_slots_back`.
+- **Checked on 8.x (0.1.99, 2026-11-04):**
+  - The web host answered through the proxy, the outside probe's cases as on 0.1.85.
+  - What each request's connection ends with (tcpdump on ingress1, port 9200):
+    - io.web sends its FIN first, with its TLS close_notify;
+    - the edge answers with its FIN, then a reset, since it drops the connection with that
+      close_notify unread;
+    - io.web answers with a reset.
+  - So neither side keeps a TIME_WAIT. `ss`, sampled every 50 ms on both sides during ten
+    requests, saw only ESTAB.
+  - No port of the ingress waits after a request, which is what the fix is for. The TIME_WAIT is
+    nobody's, not the motherbee's, as this entry said before the check.
 
-### A-89 [io.web] ✅ RESOLVED (0.1.99; by tests; found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
+### A-89 [io.web] ✅ VALIDATED ON 8.x (0.1.99, 2026-11-04; found 2026-10-24, 0.1.85 review) — io.web's connection slots fill before any authentication
 
 - **What happens:** io.web takes one of its 256 slots at accept, before the TLS handshake, which
   may take 10 s.
@@ -2727,6 +2771,9 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   address (its IPv6 /64 as one, the SDK's `PeerSlots`), each for 3 s at most, down from 10 s
   (nodes/io/io-web/src/web.rs). Tests: `past_its_handshake_cap_a_new_connection_is_closed_at_once`,
   `silent_connections_hold_no_served_slot`.
+- **Checked on 8.x (0.1.99, 2026-11-04):** ingress1 opened 34 silent connections to io.web. Two
+  were closed at once, the other 32 at 3.0 to 3.1 s. io.web logged `IO.web at its handshake cap;
+  closing new connections` with `max_handshakes_per_source=32`.
 
 ### A-88 ✅ RESOLVED (0.1.84; covered by tests, the fixed bodies seen on 8.x) — An `/e/` error hands internal detail to the internet
 
@@ -2767,7 +2814,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
 - **Fix:** a minimum rate, an idle deadline, a per-IP cap, and download slots kept apart from
   `/e/` (with the edge's work in [io-web-v2](../../docs/io-web-v2.md)).
 
-### A-85 [IO/io.slack] ✅ RESOLVED (0.1.99; by tests; found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
+### A-85 [IO/io.slack] ✅ RESOLVED (0.1.99, deployed 2026-11-04; by tests, no check on 8.x; found 2026-10-22) — io.slack's file fetch has no timeout and buffers the whole body
 
 - **What happens:** `download_private_file` (nodes/io/io-slack/src/main.rs) uses a client with no
   timeout, reads the whole body into memory and checks the size only afterwards.
@@ -2783,7 +2830,7 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   cost: a minimum rate (the 120 s deadline bounds a slow one) and a check of the address the name
   resolves to (the origin is Slack's). Test: `a_shared_file_is_downloaded_within_its_share`.
 
-### A-84 [General/SY.admin] ✅ RESOLVED (0.1.99; by tests; found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
+### A-84 [General/SY.admin] ✅ RESOLVED (0.1.99, deployed 2026-11-04; by tests, no check on 8.x; found 2026-10-22) — `bundle_upload` follows symlinks and extracts without caps
 
 - **What happens:** `runtime_package_safe_blob_rel_path` (src/bin/sy_admin.rs) refuses only
   absolute paths and `..`, and the file is opened following symlinks; Syncthing replicates symlinks
