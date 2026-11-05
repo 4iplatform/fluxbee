@@ -1,9 +1,9 @@
 # SY.timer — System Node
 
-**Status:** v1.2 implemented / aligned with current runtime
+**Status:** v1.3 implemented / aligned with current runtime
 **Date:** 2026-04-13; checked against the code on 2026-10-27; v1.2 on 2026-11-04, in 0.1.99: a fire saved
 before it goes and sent again while its target is down, caps, reads by the owner, a node's own
-target (FINDINGS A-115)
+target (FINDINGS A-115); v1.3 for the next release: `TIMER_LIST` in pages (FINDINGS A-151)
 **Audience:** Node developers, workflow authors, ops/SRE
 
 The node as it runs, file by file: [nodes/sy-timer.md](nodes/sy-timer.md).
@@ -525,6 +525,7 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 | `owner_l2_name` | Optional. A node may name only itself (`TIMER_FORBIDDEN` otherwise); `SY.admin`, any owner. |
 | `status_filter` | `"pending"`, `"fired"`, `"canceled"`, or `"all"` (default `"pending"`). |
 | `limit` | Maximum number of results. Default 100, maximum 1000. |
+| `cursor` | Optional. The `next_cursor` of the page before: where this page starts. |
 
 **Response:**
 ```json
@@ -539,7 +540,14 @@ Lists the requester's timers; `SY.admin` lists any owner's, or the whole hive's.
 }
 ```
 
-`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, subject to `status_filter` and `limit` (§12.1). A response must fit in one 128 KiB frame: a list of about 280 timers or more does not, and is answered `TIMER_INTERNAL` (FINDINGS A-151).
+`owner_l2_name` is optional, and the response echoes the owner it listed: the requester when a node leaves it out, `null` when `SY.admin` lists the whole hive. Either way by `fire_at`, then by uuid, subject to `status_filter` and `limit` (§12.1).
+
+**Pages** (since v1.3, FINDINGS A-151). A response fits one 128 KiB frame. A list whose timers take more than 96 KiB, encoded (`maxTimerListPageBytes`), is answered a page at a time:
+- the page lists the timers that fit, and `next_cursor` says where the next one starts (`"<fire_at_utc_ms>:<uuid>"` of the page's last timer);
+- the same request with `cursor` set to it, and `limit` lowered by what came, lists the next;
+- the last page has no `next_cursor`.
+
+Both SDKs' `List` follow the pages up to the limit (`TimerClient.List`, go/fluxbee-go-sdk; `TimerClient::list`, crates/fluxbee_sdk), so a WF reconciles all its timers at start (`Recover`). `SY.admin`'s `timer_list` answers one page, and takes `cursor` for the next. A cursor that is not one is refused, `TIMER_INVALID_PAYLOAD`.
 
 ### 7.7 `TIMER_PURGE_OWNER` (exclusive use of `SY.orchestrator`)
 
@@ -773,7 +781,7 @@ Returns a complete descriptor of the node's capabilities, meant for both human a
     "verb": "TIMER_HELP",
     "node_family": "SY",
     "node_kind": "SY.timer",
-    "version": "1.2",
+    "version": "1.3",
     "description": "System node providing persistent timers and authoritative time/timezone services.",
     "operations": [
       {
@@ -1268,7 +1276,7 @@ responseToUser := fmt.Sprintf("The event is on %s", formatted.Formatted)
 | Minimum duration | 60 s | Enforced (`TIMER_BELOW_MINIMUM`); a cron may not fire twice within 60 s. Constant, not configurable |
 | Maximum delay | 366 days | One-shots (`TIMER_ABOVE_MAXIMUM`); a recurring timer has none |
 | Pending timers | 10,000 per owner, 100,000 per hive | A new timer past either is `TIMER_LIMIT_EXCEEDED`. About 10,000 per hive is the load it was designed for |
-| `TIMER_LIST` maximum | 1000 results | Per request; default 100, and a larger `limit` is cut to 1000. And what fits in one 128 KiB frame, about 280 timers (FINDINGS A-151) |
+| `TIMER_LIST` maximum | 1000 results | Per request; default 100, and a larger `limit` is cut to 1000. A page holds what fits in one 128 KiB frame, 96 KiB of timers, and `next_cursor` lists the next (§7.6, FINDINGS A-151) |
 | Retention of fired/canceled timers | 7 days | Deleted when `SY.timer` starts, never in between (§5.2). A constant |
 | Firing precision | ±5 s | Best-effort, subject to load |
 | `payload` and `metadata` size | 32 KiB each | `TIMER_LIMIT_EXCEEDED`; with both, a `TIMER_FIRED` fits in the router's 128 KiB frame |
@@ -1288,7 +1296,6 @@ responseToUser := fmt.Sprintf("The event is on %s", formatted.Formatted)
 - Configurable retention per owner.
 - Dead-letter for undelivered `TIMER_FIRED`.
 - Retries that survive a restart of `SY.timer`: they live in memory (§7.8). A lost fire is its owner's to cover. An agent owns no timers: it is a pure responder, and timers live in a WF ([agent-tools-v1](agent-tools-v1.md) §6.2–§6.3). A WF reconciles its timers with `SY.timer` when it starts and runs each one whose time has passed (`Recover`, `go/nodes/wf/wf-generic/node/recover.go`; [wf-orchestration-v1](wf-orchestration-v1.md) §2, §4.4).
-- `TIMER_LIST` in pages, so a list longer than one frame can be read (FINDINGS A-151).
 
 ---
 

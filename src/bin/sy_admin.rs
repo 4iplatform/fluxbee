@@ -10355,6 +10355,11 @@ async fn handle_hive_paths(
             {
                 payload["limit"] = serde_json::json!(limit);
             }
+            // A page fits one frame: the answer's next_cursor, given back here, lists the next
+            // (FINDINGS A-151).
+            if let Some(cursor) = query.get("cursor").filter(|value| !value.is_empty()) {
+                payload["cursor"] = serde_json::json!(cursor);
+            }
             let (status, resp) =
                 handle_timer_rpc(ctx, client, "timer_list", "TIMER_LIST", payload, hive).await?;
             Ok(Some((status, resp)))
@@ -13720,6 +13725,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "limit",
                 "u32",
                 "Optional result limit. Defaults inside SY.timer and is capped there.",
+            ),
+            admin_action_body_field(
+                "cursor",
+                "string",
+                "Optional: the next_cursor of the page before. SY.timer answers a page that fits one frame, with next_cursor while more timers follow.",
             ),
         ],
         _ => Vec::new(),
@@ -22554,7 +22564,8 @@ mod tests {
             json!([
                 { "name": "owner_l2_name", "type": "string", "description": "Optional canonical L2 owner filter. When omitted, SY.timer returns timers for the full hive." },
                 { "name": "status_filter", "type": "string", "description": "Optional timer status filter: pending, fired, canceled, or all." },
-                { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." }
+                { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." },
+                { "name": "cursor", "type": "string", "description": "Optional: the next_cursor of the page before. SY.timer answers a page that fits one frame, with next_cursor while more timers follow." }
             ])
         );
     }

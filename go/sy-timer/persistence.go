@@ -194,67 +194,46 @@ LIMIT 1
 	return &row, nil
 }
 
-func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit int) ([]timerRow, error) {
+// timerListCursor is where a TIMER_LIST page ended: the last timer it listed, by fire time and uuid,
+// the order a list keeps. The next page starts after it (FINDINGS A-151).
+type timerListCursor struct {
+	fireAtUTC int64
+	uuid      string
+}
+
+// listTimers lists up to limit timers, an owner's or every owner's, in a status or all, by fire time
+// and then uuid, after a cursor when there is one.
+func listTimers(ctx context.Context, db *sql.DB, ownerL2Name, statusFilter string, limit int, after *timerListCursor) ([]timerRow, error) {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
 	if limit > maxListLimit {
 		limit = maxListLimit
 	}
-	if ownerL2Name == "" {
-		if statusFilter == "" || statusFilter == "all" {
-			rows, err := db.QueryContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
-FROM timers
-ORDER BY fire_at_utc ASC
-LIMIT ?
-`, limit)
-			if err != nil {
-				return nil, err
-			}
-			defer rows.Close()
-			return collectTimerRows(rows)
-		}
-
-		rows, err := db.QueryContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
-FROM timers
-WHERE status=?
-ORDER BY fire_at_utc ASC
-LIMIT ?
-`, statusFilter, limit)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		return collectTimerRows(rows)
+	var conditions []string
+	var args []any
+	if ownerL2Name != "" {
+		conditions = append(conditions, "owner_l2_name=?")
+		args = append(args, ownerL2Name)
 	}
-	if statusFilter == "" || statusFilter == "all" {
-		rows, err := db.QueryContext(ctx, `
-SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
-       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
-FROM timers
-WHERE owner_l2_name=?
-ORDER BY fire_at_utc ASC
-LIMIT ?
-`, ownerL2Name, limit)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		return collectTimerRows(rows)
+	if statusFilter != "" && statusFilter != "all" {
+		conditions = append(conditions, "status=?")
+		args = append(args, statusFilter)
 	}
-
-	rows, err := db.QueryContext(ctx, `
+	if after != nil {
+		conditions = append(conditions, "(fire_at_utc > ? OR (fire_at_utc = ? AND uuid > ?))")
+		args = append(args, after.fireAtUTC, after.fireAtUTC, after.uuid)
+	}
+	query := `
 SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
        missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
-FROM timers
-WHERE owner_l2_name=? AND status=?
-ORDER BY fire_at_utc ASC
-LIMIT ?
-`, ownerL2Name, statusFilter, limit)
+FROM timers`
+	if len(conditions) > 0 {
+		query += "\nWHERE " + strings.Join(conditions, " AND ")
+	}
+	query += "\nORDER BY fire_at_utc ASC, uuid ASC\nLIMIT ?"
+	args = append(args, limit)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

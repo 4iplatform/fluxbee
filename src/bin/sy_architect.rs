@@ -13663,6 +13663,7 @@ fn translate_scmd(
                                 params["limit"] = json!(limit);
                             }
                         }
+                        "cursor" => params["cursor"] = Value::String(value.to_string()),
                         _ => {}
                     }
                 }

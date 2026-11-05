@@ -130,7 +130,7 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 | `TIMER_SCHEDULE` | `fire_at_utc_ms` or `fire_in_ms` (exactly one), optional `target_l2_name`, `client_ref`, `payload`, `missed_policy`, `missed_within_ms`, `metadata` | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_SCHEDULE_RECURRING` | `cron_spec`, optional `cron_tz` and the same optional fields | any node; it becomes the owner, and the target unless it is a SY node |
 | `TIMER_GET` | `timer_uuid`, or `client_ref` (the caller's own pending timer) | the owner, and `SY.admin@motherbee` for any timer by `timer_uuid` (`TIMER_NOT_OWNER` otherwise) |
-| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000) | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time. A response over the 128 KiB frame, about 280 timers, is `TIMER_INTERNAL` (FINDINGS A-151) |
+| `TIMER_LIST` | optional `owner_l2_name`, `status_filter` (`pending` default, `fired`, `canceled`, `all`), `limit` (default 100, max 1000), `cursor` | a node lists its own (another owner is `TIMER_FORBIDDEN`); `SY.admin@motherbee` lists any owner's, or the whole hive's; ordered by fire time, then uuid. A page fits one 128 KiB frame: `next_cursor`, given back as `cursor`, lists the next, and both SDKs' `List` follow the pages (since 1.3, FINDINGS A-151) |
 | `TIMER_CANCEL` | `timer_uuid` or `client_ref` | the owner only (`TIMER_NOT_OWNER`); a `client_ref` with no pending timer answers `ok` with `found: false`; a fired one-shot gives `TIMER_ALREADY_FIRED` |
 | `TIMER_RESCHEDULE` | `timer_uuid` or `client_ref`, and `new_fire_at_utc_ms` or `new_fire_in_ms` | the owner only; pending one-shots only (`TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_ALREADY_FIRED`) |
 | `TIMER_PURGE_OWNER` | `owner_l2_name` | only `SY.orchestrator@<same hive>` (`TIMER_FORBIDDEN` otherwise); deletes every timer of that owner, any status |
@@ -172,7 +172,7 @@ cancelling are not exposed: a timer belongs to the node that created it.
 | Route | Verb |
 | --- | --- |
 | `GET /hives/{hive}/timer/help` | `TIMER_HELP` |
-| `GET /hives/{hive}/timer/timers?owner_l2_name=&status_filter=&limit=` | `TIMER_LIST` |
+| `GET /hives/{hive}/timer/timers?owner_l2_name=&status_filter=&limit=&cursor=` | `TIMER_LIST`, one page |
 | `GET /hives/{hive}/timer/timers/{timer_uuid}` | `TIMER_GET` |
 | `GET /hives/{hive}/timer/now` | `TIMER_NOW` |
 | `POST /hives/{hive}/timer/now-in` | `TIMER_NOW_IN` |

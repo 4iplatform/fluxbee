@@ -3,6 +3,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -140,5 +142,88 @@ func TestScheduleIsCapped(t *testing.T) {
 				t.Fatalf("an existing timer's client_ref must still be answered: %+v", again)
 			}
 		})
+	}
+}
+
+// A TIMER_LIST longer than a frame answers in pages (FINDINGS A-151): each page fits, a page with
+// more after it says where they start (next_cursor), and the pages list every timer once, by fire
+// time and then uuid. A cursor that is not one is refused.
+func TestTimerListAnswersInPagesThatFitAFrame(t *testing.T) {
+	service, tx := newTestService(t)
+	const owner = "WF.demo@motherbee"
+	const total = 300
+	payload := `{"note":"` + strings.Repeat("x", 900) + `"}`
+	base := time.Now().UTC().Add(time.Hour).UnixMilli()
+	for i := 0; i < total; i++ {
+		insertOwnedTimer(t, service.db, timerRow{
+			UUID:         fmt.Sprintf("timer-%03d", i),
+			OwnerL2Name:  owner,
+			TargetL2Name: owner,
+			Kind:         "oneshot",
+			FireAtUTC:    base + int64(i/2), // two by two at one time: the uuid orders them
+			MissedPolicy: "fire",
+			Payload:      payload,
+			Status:       "pending",
+			CreatedAtUTC: base,
+		})
+	}
+
+	type page struct {
+		OK     bool `json:"ok"`
+		Count  int  `json:"count"`
+		Timers []struct {
+			UUID string `json:"uuid"`
+		} `json:"timers"`
+		NextCursor string `json:"next_cursor"`
+		Error      *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	list := func(cursor string) (page, int) {
+		t.Helper()
+		request := map[string]any{"limit": 1000}
+		if cursor != "" {
+			request["cursor"] = cursor
+		}
+		if err := service.respondTimerList(mustBuildSystemMessageAs(t, request, "TIMER_LIST", owner)); err != nil {
+			t.Fatalf("list timers: %v", err)
+		}
+		raw := mustReadResponsePayload(t, tx)
+		var answer page
+		if err := json.Unmarshal(raw, &answer); err != nil {
+			t.Fatalf("decode a page: %v", err)
+		}
+		return answer, len(raw)
+	}
+
+	var listed []string
+	cursor := ""
+	for pages := 1; ; pages++ {
+		answer, size := list(cursor)
+		if !answer.OK || answer.Count != len(answer.Timers) || size > maxTimerListPageBytes+1024 {
+			t.Fatalf("page %d: ok=%v count=%d of %d timers, %d bytes", pages, answer.OK, answer.Count, len(answer.Timers), size)
+		}
+		for _, timer := range answer.Timers {
+			listed = append(listed, timer.UUID)
+		}
+		if answer.NextCursor == "" {
+			if pages < 2 {
+				t.Fatalf("%d timers of about 1 KiB fit one page", total)
+			}
+			break
+		}
+		cursor = answer.NextCursor
+	}
+	if len(listed) != total {
+		t.Fatalf("the pages listed %d timers, want %d", len(listed), total)
+	}
+	for i, uuid := range listed {
+		if want := fmt.Sprintf("timer-%03d", i); uuid != want {
+			t.Fatalf("timer %d is %s, want %s: every timer once, in order", i, uuid, want)
+		}
+	}
+
+	if answer, _ := list("nonsense"); answer.OK || answer.Error == nil || answer.Error.Code != "TIMER_INVALID_PAYLOAD" {
+		t.Fatalf("a cursor that is not one: %+v", answer)
 	}
 }

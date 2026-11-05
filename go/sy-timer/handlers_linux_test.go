@@ -776,7 +776,7 @@ func TestConcurrentScheduleWithSameClientRefCreatesExactlyOneTimer(t *testing.T)
 	}
 
 	// Exactly one pending row must exist in the database.
-	rows, err := listTimers(context.Background(), service.db, "WF.demo@motherbee", "pending", 100)
+	rows, err := listTimers(context.Background(), service.db, "WF.demo@motherbee", "pending", 100, nil)
 	if err != nil {
 		t.Fatalf("list pending timers: %v", err)
 	}

@@ -74,7 +74,7 @@ func TestInsertGetAndListTimer(t *testing.T) {
 		t.Fatalf("unexpected timer row: %+v", got)
 	}
 
-	items, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10)
+	items, err := listTimers(ctx, db, "WF.demo@motherbee", "pending", 10, nil)
 	if err != nil {
 		t.Fatalf("list timers: %v", err)
 	}

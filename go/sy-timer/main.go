@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	_ "time/tzdata"
@@ -22,7 +23,7 @@ import (
 )
 
 const (
-	version             = "1.2"
+	version             = "1.3"
 	defaultNodeBaseName = "SY.timer"
 	configDir           = "/etc/fluxbee"
 	routerSockDir       = "/var/run/fluxbee/routers"
@@ -37,6 +38,9 @@ const (
 	// maxTimerDataBytes caps a timer's payload, and its metadata: a TIMER_FIRED with both fits in
 	// the router's 128 KiB frame.
 	maxTimerDataBytes = 32 * 1024
+	// maxTimerListPageBytes is the most a TIMER_LIST page's timers take, encoded: with the rest of
+	// the response it fits the router's 128 KiB frame (FINDINGS A-151).
+	maxTimerListPageBytes = 96 * 1024
 )
 
 // maxPendingTimersPerOwner and maxPendingTimers cap the pending timers of one owner, and of the hive.
@@ -120,6 +124,8 @@ type timerListRequest struct {
 	OwnerL2Name  string `json:"owner_l2_name,omitempty"`
 	StatusFilter string `json:"status_filter,omitempty"`
 	Limit        int    `json:"limit,omitempty"`
+	// Cursor is the next_cursor of the page before, where this one starts.
+	Cursor string `json:"cursor,omitempty"`
 }
 
 type timerPurgeOwnerRequest struct {
@@ -429,7 +435,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer, 60 seconds to 366 days ahead. Its fire goes to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
 			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression. Its fires go to the requester; only a SY node may name another target_l2_name. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
 			{Verb: "TIMER_GET", Description: "Read one of the caller's timers by uuid, or its active timer by client_ref. SY.admin reads any timer by uuid.", RequiredFields: []string{"timer_uuid OR client_ref"}},
-			{Verb: "TIMER_LIST", Description: "List the caller's timers. SY.admin lists every owner's, or one owner's with owner_l2_name.", OptionalFields: []string{"owner_l2_name", "status_filter", "limit"}},
+			{Verb: "TIMER_LIST", Description: "List the caller's timers, by fire time, a page at a time: an answer with next_cursor has more, which the same request with cursor set to it lists. SY.admin lists every owner's, or one owner's with owner_l2_name.", OptionalFields: []string{"owner_l2_name", "status_filter", "limit", "cursor"}},
 			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
 			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester, by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref", "new_fire_at_utc_ms OR new_fire_in_ms"}},
 			{Verb: "TIMER_PURGE_OWNER", Description: "Delete every timer owned by a node. Reserved to SY.orchestrator.", RequiredFields: []string{"owner_l2_name"}},
@@ -740,25 +746,65 @@ func (s *Service) respondTimerList(incoming fluxbeesdk.Message) error {
 			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_FORBIDDEN", "a node lists its own timers; another owner's are listed by SY.admin only")
 		}
 	}
-	rows, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit)
+	after, err := parseTimerListCursor(req.Cursor)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INVALID_PAYLOAD", err.Error())
+	}
+	rows, err := listTimers(context.Background(), s.db, ownerFilter, statusFilter, req.Limit, after)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_STORAGE_ERROR", err.Error())
 	}
+	// A page fits one frame (FINDINGS A-151): the timers past maxTimerListPageBytes go in the next
+	// page, after the cursor of the last one this page lists.
 	items := make([]fluxbeesdk.TimerInfo, 0, len(rows))
-	for _, row := range rows {
+	pageBytes := 0
+	nextCursor := ""
+	for i, row := range rows {
 		info, err := timerRowToInfo(row)
 		if err != nil {
 			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INTERNAL", err.Error())
 		}
+		encoded, err := json.Marshal(info)
+		if err != nil {
+			return s.sendTimerError(incoming, "TIMER_LIST", "TIMER_INTERNAL", err.Error())
+		}
+		if i > 0 && pageBytes+len(encoded)+1 > maxTimerListPageBytes {
+			nextCursor = formatTimerListCursor(rows[i-1])
+			break
+		}
+		pageBytes += len(encoded) + 1
 		items = append(items, info)
 	}
-	return s.sendTimerResponse(incoming, map[string]any{
+	response := map[string]any{
 		"ok":            true,
 		"verb":          "TIMER_LIST",
 		"owner_l2_name": nullableJSONValue(ownerFilter),
 		"count":         len(items),
 		"timers":        items,
-	})
+	}
+	if nextCursor != "" {
+		response["next_cursor"] = nextCursor
+	}
+	return s.sendTimerResponse(incoming, response)
+}
+
+// formatTimerListCursor is the cursor after row: its fire time, in ms, and its uuid.
+func formatTimerListCursor(row timerRow) string {
+	return fmt.Sprintf("%d:%s", row.FireAtUTC, row.UUID)
+}
+
+// parseTimerListCursor reads a cursor formatTimerListCursor wrote, nil for none.
+func parseTimerListCursor(cursor string) (*timerListCursor, error) {
+	cursor = strings.TrimSpace(cursor)
+	if cursor == "" {
+		return nil, nil
+	}
+	fireAt, uuid, ok := strings.Cut(cursor, ":")
+	fireAtUTC, err := strconv.ParseInt(fireAt, 10, 64)
+	if !ok || err != nil || strings.TrimSpace(uuid) == "" {
+		return nil, fmt.Errorf("cursor must be a next_cursor of TIMER_LIST, got %q", cursor)
+	}
+	return &timerListCursor{fireAtUTC: fireAtUTC, uuid: uuid}, nil
 }
 
 func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
