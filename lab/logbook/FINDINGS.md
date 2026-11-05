@@ -26,8 +26,8 @@ no change required
 ### This sprint (2026-11-04)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
-   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ in code for the next
-   release, 2026-11-05):
+   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ with 0.1.101, 2026-11-05,
+   7's close checked by its gate's conversations):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
@@ -56,21 +56,19 @@ no change required
       (2026-11-05).
    2. A-137 [WF]: the chat on cognition across hands. Its first part, agreed and built 2026-11-05
       ([cognition-hands-v1](../../docs/cognition-hands-v1.md)): who wrote each turn, which turns
-      cognition analyzes, and how the immediate memory names its speakers. The rest, one topic at
-      a time.
+      cognition analyzes, and how the immediate memory names its speakers. ✅ 0.1.101, its WF gate
+      on 8.x (2026-11-05). The rest, one topic at a time.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
-A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154 and A-137's first part are in
-code for the next release, with the empty-block fix.
+A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
+empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x.
 
 ### WF
 
-- From A-138's gate: an empty `wf: {}` block on a WF message whose action has no vars, menu or
-  subject. *In code, for the next release.*
-- A-153 ✅ Nothing limits how many timers a WF definition holds. *In code, for the next release.*
-- A-154 ✅ Nothing closes a WF conversation that went quiet. *In code, for the next release.*
-- A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part in
-  code, for the next release.*
+- From A-137's gate: a person with no name reads with their ILK as their name. *In code, for the
+  next release.*
+- A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
+  0.1.101; the rest, one topic at a time.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1184,7 +1182,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-154 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
+### A-154 [WF] ✅ RESOLVED (in 0.1.101, by tests; its close on 8.x being checked; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
 - **What happens:** a running instance stays open until its flow reaches an end, a cancel or a
   failure.
@@ -1231,9 +1229,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
   Tests: the close past the default and past a definition's own timeout, a pending timer and
   recent activity keeping a conversation open, and the field's bounds.
-- **Status:** in code for the next release, with A-153.
+- **On 8.x (0.1.101):** WF gate0202 runs with `idle_timeout` 1h. Its two conversations are quiet
+  since 23:00 UTC, with no timer, and close at its first GC pass past their timeout.
+- **Status:** in 0.1.101; its close on 8.x being checked.
 
-### A-153 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
+### A-153 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
 
 - **What happens:** a definition may name any number of timer keys.
   - Each `schedule_timer` names a literal `timer_key`, and the WF keeps one timer per instance and
@@ -1264,7 +1264,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the `schedule_timer` actions; a key that only a `cancel_timer` or a `reschedule_timer` names sets
   no timer. Spec §10.2 and §21 and the handbook say it. Tests: 10 keys load, each scheduled twice
   too; 11 are refused, named.
-- **Status:** in code for the next release.
+- **Checked on 8.x (0.1.101):** SY.wf-rules refused a definition that schedules 11 timer keys:
+  `COMPILE_ERROR`, *"states: schedule 11 timer keys (k01, …, k11): a definition schedules 10 at
+  most, the timers one conversation holds at once; a logic that needs more is two WFs"*.
+- **Status:** validated.
 
 ### A-152 [Archi] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
 
@@ -1829,6 +1832,30 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     writer in both SDKs, named by the IO node, the agent and the WF; cognition's analysis rule and
     the turns' writer and addressee; ai.generic's labels; `turns.writer_ilk` and `writer_name`,
     and `from_ilk` never a node's UUID; Archi's Messages screen. Its gate comes with the release.
+  - **Checked on 8.x (0.1.101, 2026-11-05),** with the WF gate0202 on worker1:
+    - **The setup:** a client standing for an IO node, `AI.pruebas@worker1` and a 60 s timer.
+      Two people of the tenant `pruebas` took part, one registered and one temporary.
+    - **Writers:**
+      - the client's message named the person;
+      - the WF's forward to the agent carried the person, the name filled from worker1's
+        identity memory by the WF's SDK;
+      - the agent's answer named the agent, and the WF's forward kept it;
+      - the WF's own text, at the timer, named the WF.
+    - **The agent's memory** (the agent copied its lines):
+      - `person <name> (<ILK>) via IO.gate0202@worker1`;
+      - `you, to person <name> (<ILK>)`;
+      - `Current user message, from workflow WF.gate0202@worker1 (<ILK>)`.
+    - **Cognition:**
+      - each communication kept its 4 turns, numbered 3: the WF's text was not analyzed;
+      - SY.cognition made 4 model calls for the person's cycle, and 2 for the timer's: those of
+        the agent's answer to the person, none for the WF's text.
+    - **`turns`** keeps each message's writer, and Archi's message detail shows it.
+    - **None of the gate's WF messages carried a `wf` block:** 0 of 8. The empty-block fix holds.
+  - **Found in the gate:** a person with no name read with their ILK as their name,
+    `person ilk:X (ilk:X)`.
+    - SY.identity writes an ILK's own id as its display name when it has none
+      (`ilk_entry_from_record`).
+    - The SDKs now take that as no name (`facts_of`, `lookupIlkAt`). In code for the next release.
   - **Open:** the rest of the topic, one at a time (cognition-hands-v1 §9).
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack

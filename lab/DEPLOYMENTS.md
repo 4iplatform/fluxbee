@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ live, checked on 8.x | snap `pre-trace-0-1-100` (all 4 VMs) · `apt install fluxbee=0.1.99` + core-update of the spokes |
+| **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ live, checking on 8.x | snap `pre-writer-0-1-101` (all 4 VMs) · `apt install fluxbee=0.1.100` + core-update of the spokes |
+| **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ replaced by 0.1.101 | snap `pre-trace-0-1-100` (deleted 2026-11-05) · `apt install fluxbee=0.1.99` + core-update of the spokes |
 | **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ replaced by 0.1.100 | snap `pre-sprint-0-1-99` (deleted 2026-11-05) · `apt install fluxbee=0.1.98` + core-update of the spokes |
 | **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ replaced by 0.1.99 | snap `pre-namefix-0-1-98` (deleted 2026-11-04) · `apt install fluxbee=0.1.97` + core-update of the spokes |
 | **0.1.97** | 2026-11-03 | `b91260a5` | motherbee + spokes (core): SY.admin's executor dispatches a fixed step through the tool's own dispatch (A-144) | ✅ replaced by 0.1.98 (gate in course) | snap `pre-dispatchfix-0-1-97` (deleted 2026-11-03) · `apt install fluxbee=0.1.96` + core-update of the spokes |
@@ -107,6 +108,85 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.101 — Who wrote each message and which turns cognition analyzes (A-137's first part), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154)
+
+- **Date:** 2026-11-05 (ART) · **Previous version:** 0.1.100 · **Commit:** `abf2a8d4`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:**
+  - the sprint's block 1: A-153 and A-154, decided with the operator on 2026-11-05;
+  - block 3: A-137's first part, designed with the operator the same day
+    ([cognition-hands-v1](../docs/cognition-hands-v1.md));
+  - the empty `wf: {}` block found in 0.1.100's gate.
+- **What changed:**
+  - **Who wrote each message (A-137):**
+    - every solution message names its writer, `meta.context.writer`, with its ILK and name;
+    - an IO node names the person, an agent itself, and a WF itself for its own text; a forward
+      keeps the message's own writer;
+    - both SDKs fill a missing name from the identity memory as they send;
+    - SY.storage keeps the writer in `turns.writer_ilk` and `writer_name`, added once, and
+      `from_ilk` is never a node's UUID;
+    - Archi's Messages screen shows the writer.
+  - **What cognition analyzes (A-137):**
+    - only a turn with a person at its other end; a WF's own text and turns between agents stay
+      among the last turns, unanalyzed;
+    - each kept turn names its writer, or whom the agent answered, with their kind (`person`,
+      `agent`, `workflow`, `system`);
+    - ai.generic names each line of the immediate memory, and the current message, by its writer.
+  - **WF (A-153, A-154):**
+    - a definition schedules at most 10 timer keys;
+    - a definition's `idle_timeout` (1h to 7d, 4d when left out) closes a conversation with no
+      event and no timer pending, as a cancel does, once a GC interval;
+    - WF_HELP names the `idle_timeout` in force;
+    - a WF message carries the WF's block only when its action gives it something.
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - the six Go modules: gofmt, vet and the race detector, in a Linux container;
+  - the catalog's parity, the doc links, the loopback binds and the router's dispatcher guards;
+  - GitHub's CI green on `abf2a8d4`.
+- **Deploy:**
+  - build of `abf2a8d4` in 26 min, publish in 17 s;
+  - 0.1.101 on all 4 in 278 s (manifest `679a4b98a58b8ff8`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - every product unit restarted on its new binary, and the managed nodes on their 0.1.101
+    runtimes (only Syncthing is older, as the release does not touch it);
+  - 8.x ran no WF node before the release, so A-154's first pass closed no conversation.
+- **Checked on 8.x** (FINDINGS has each one):
+  - **A-153:** SY.wf-rules refused a definition that schedules 11 timer keys (`COMPILE_ERROR`,
+    naming the 11).
+  - **A-137,** with the WF gate0202 on worker1:
+    - the setup: a client standing for an IO node, `AI.pruebas@worker1` and a 60 s timer, for
+      two people of the tenant `pruebas`, one registered and one temporary;
+    - **the writers:**
+      - the client's message named the person;
+      - the WF's forward to the agent carried the person, with the name filled from worker1's
+        identity memory;
+      - the agent's answer named the agent, and the WF's forward to the client kept it;
+      - the WF's own text, at the timer, named the WF;
+    - **the agent's memory** (the agent copied its lines): `person <name> (<ILK>) via
+      IO.gate0202@worker1`, `you, to person <name> (<ILK>)`, and `Current user message, from
+      workflow WF.gate0202@worker1 (<ILK>)`;
+    - **cognition:**
+      - each communication kept its 4 turns, numbered 3: the WF's text was not analyzed;
+      - SY.cognition made 4 model calls for the person's cycle, and 2 for the timer's, those of
+        the agent's answer to the person;
+    - **`turns`** keeps each message's writer, and Archi's message detail shows it.
+  - **A-154:** pending. The gate's two conversations are quiet since 23:00 UTC with no timer, and
+    close at the WF's first GC pass past their `idle_timeout` (1h).
+- **Found in the checks:**
+  - **A person with no name reads with their ILK as their name** (`person ilk:X (ilk:X)`).
+    SY.identity writes an ILK's own id as its display name when it has none. The SDKs take that as
+    no name (fixed in code for the next release).
+  - **A test environment note:** in a Linux container, sy-opa-rules' tests need `--shm-size`,
+    since Docker's 64 MB `/dev/shm` is less than its region.
+- **Rollback:**
+  - `apt install fluxbee=0.1.100` on the motherbee, then a core-update of the spokes.
+  - `turns` keeps its two new nullable columns, which 0.1.100 ignores. A 0.1.100 node takes a
+    message's writer as one more context key.
+  - A WF definition that sets `idle_timeout` does not load on 0.1.100; none on 8.x does but the
+    gate's.
 
 ---
 
