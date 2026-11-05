@@ -155,10 +155,7 @@ pub fn ilk_facts(hive_id: &str, ilk: &str) -> Option<IlkFacts> {
     let facts = identity::find_ilk_by_id_from_hive_id(hive_id, ilk)
         .ok()
         .flatten()
-        .map(|option| IlkFacts {
-            ilk_type: option.ilk_type,
-            name: option.display_name,
-        });
+        .map(|option| facts_of(ilk, option.ilk_type, option.display_name));
     if let Ok(mut known) = known.lock() {
         if known.len() >= ILK_FACTS_MAX {
             known.clear();
@@ -166,6 +163,18 @@ pub fn ilk_facts(hive_id: &str, ilk: &str) -> Option<IlkFacts> {
         known.insert(key, (Instant::now(), facts.clone()));
     }
     facts
+}
+
+/// What the identity memory says of `ilk`, its type and display name. The identity writes an ILK's
+/// own id as its display name when it has no name (a person not registered yet,
+/// `ilk_entry_from_record` in SY.identity): that is no name.
+fn facts_of(ilk: &str, ilk_type: String, display_name: Option<String>) -> IlkFacts {
+    IlkFacts {
+        ilk_type,
+        name: display_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(ilk.trim())),
+    }
 }
 
 /// The hive of a node's full name (`AI.sales@worker1`), or none.
@@ -297,5 +306,30 @@ mod tests {
         assert!(!facts("agent", None).is_person());
         assert_eq!(hive_of("AI.sales@worker1"), Some("worker1"));
         assert_eq!(hive_of("AI.sales"), None);
+    }
+
+    /// An ILK's own id as its display name, what the identity writes for a person with no name, is
+    /// no name (found in 0.1.101's gate).
+    #[test]
+    fn an_ilk_named_by_its_own_id_has_no_name() {
+        let named = |name: Option<&str>| {
+            facts_of(
+                "ilk:72c4b355-2671-4753-a23a-cab7d07eba22",
+                "human".to_string(),
+                name.map(ToString::to_string),
+            )
+            .name
+        };
+        assert_eq!(
+            named(Some("ilk:72c4b355-2671-4753-a23a-cab7d07eba22")),
+            None
+        );
+        assert_eq!(
+            named(Some("ILK:72C4B355-2671-4753-A23A-CAB7D07EBA22")),
+            None
+        );
+        assert_eq!(named(Some(" ")), None);
+        assert_eq!(named(None), None);
+        assert_eq!(named(Some("Ana Pérez")), Some("Ana Pérez".to_string()));
     }
 }

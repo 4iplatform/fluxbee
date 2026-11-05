@@ -322,6 +322,11 @@ func lookupIlkAt(path, ilkID string) (IlkFacts, bool, error) {
 	if err != nil || !read || !found {
 		return IlkFacts{}, false, err
 	}
+	// The identity writes an ILK's own id as its display name when it has no name (a person not
+	// registered yet): that is no name.
+	if strings.EqualFold(facts.Name, "ilk:"+wanted.String()) {
+		facts.Name = ""
+	}
 	return facts, true, nil
 }
 

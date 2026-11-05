@@ -79,15 +79,21 @@ func TestAMissingNameIsFilledFromTheIdentity(t *testing.T) {
 	})
 }
 
-// The identity memory says an active ILK's type and display name; an inactive one and an unknown id
-// are misses, and so is a region that is not there.
+// The identity memory says an active ILK's type and display name, and a display name that is only
+// the ILK is no name; an inactive one and an unknown id are misses, and so is a region that is not
+// there.
 func TestLookupIlkReadsTypeAndNameFromTheIdentityMemory(t *testing.T) {
-	ana, wf, gone := uuid.New(), uuid.New(), uuid.New()
+	ana, wf, gone, temp := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	path := writeIdentityRegion(t, []testIlk{
 		{id: ana, kind: 0, name: "Ana Pérez", active: true},
 		{id: wf, kind: 1, name: "WF.soporte@worker1", active: true},
 		{id: gone, kind: 0, name: "Gone", active: false},
+		// SY.identity writes a person with no name under their own ILK (found in 0.1.101's gate).
+		{id: temp, kind: 0, name: "ilk:" + temp.String(), active: true},
 	})
+	if facts, ok, _ := lookupIlkAt(path, "ilk:"+temp.String()); !ok || facts != (IlkFacts{Type: "human"}) {
+		t.Fatalf("a person named by their own ILK has no name: %+v %v", facts, ok)
+	}
 	if facts, ok, err := lookupIlkAt(path, "ilk:"+ana.String()); err != nil || !ok || facts != (IlkFacts{Type: "human", Name: "Ana Pérez"}) {
 		t.Fatalf("ana: %+v %v %v", facts, ok, err)
 	}

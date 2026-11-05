@@ -134,7 +134,9 @@ Cognition analyzes the first two lines only: a person is at their other end.
 
 - `ilk`: the writer's ILK. A node with no ILK of its own names only its name.
 - `name`: the identity's display name for that ILK: a registered person's name, or a node's name.
-  Left out when the identity has none (a person not registered yet).
+  Left out when the identity has none (a person not registered yet). The identity memory writes
+  an ILK's own id as its display name then; the readers take that as no name (found in 0.1.101's
+  gate).
 - Plain JSON, beside the trace. System messages carry none.
 
 ---
