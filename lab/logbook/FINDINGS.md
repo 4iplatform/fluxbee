@@ -25,18 +25,17 @@ no change required
 
 ### This sprint (2026-11-04)
 
-1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5 found
-   on the way):
+1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
+   on the way, ✅ with 0.1.100, 2026-11-05):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
       fired twice; after a reboot, an overdue fire waits for its owner; caps on the delay, the
       count and the payload; listing and reading only for the owner and SY.admin; and the target
       rule, the operator's call (2026-11-04: a node schedules only for itself, a SY node for any).
-   4. A-152 [Archi], found checking A-147: the confirm sentence said once. In code, for the next
-      release.
-   5. A-151 [General/SY.timer], found on the way to A-115: a `TIMER_LIST` longer than one frame. In
-      code (SY.timer 1.3), out with block 3's release and its WF gate.
+   4. A-152 [Archi], found checking A-147: the confirm sentence said once.
+   5. A-151 [General/SY.timer], found on the way to A-115: `TIMER_LIST` in pages (SY.timer 1.3),
+      checked with a WF's start over 350 timers.
 2. **The 🔴, simple and important** (✅ 0.1.99, 2026-11-04: A-100, A-89 and A-90 validated on 8.x;
    A-84 and A-85 by tests):
    1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
@@ -49,17 +48,18 @@ no change required
       by io.web, a deadline for a stalled body.
 3. **WF, design first, one topic at a time:**
    1. A-138 [WF]: the conversation's trace in the message: design agreed and built 2026-11-04
-      ([message-trace-v1](../../docs/message-trace-v1.md)); the release and its WF gate next.
+      ([message-trace-v1](../../docs/message-trace-v1.md)); ✅ 0.1.100, its WF gate on 8.x
+      (2026-11-05).
    2. A-137 [WF]: the chat on cognition across hands. It builds on A-138: the mark cognition would
       read travels in the message.
 
-Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3 goes in its own release,
-with a WF gate.
+Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
+A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-137's chat is next.
 
 ### WF
 
-- A-138 ✅ A message carries only a WF's trail of node names, not its conversation's trace.
-  *Sprint: built ([message-trace-v1](../../docs/message-trace-v1.md)), for the next release.*
+- From A-138's gate: an empty `wf: {}` block on a WF message whose action has no vars, menu or
+  subject. *In code, for the next release.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
@@ -71,8 +71,6 @@ with a WF gate.
 
 ### Archi
 
-- A-152 ✅ A turn that stages a plan says how to confirm twice. *Sprint: in code, for the next
-  release.*
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - A-120 🟡 Archi cannot take a page down.
@@ -98,8 +96,6 @@ with a WF gate.
 
 ### General
 
-- A-151 ✅ A `TIMER_LIST` longer than one frame fails: a WF with about 280 pending timers cannot
-  reconcile at its start. *Sprint: in code (SY.timer 1.3), with block 3's release.*
 - A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
 - A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
@@ -1178,7 +1174,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-152 [Archi] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
+### A-152 [Archi] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
 
 - **Seen on 8.x (0.1.99):** Archi's answer ended "Reply CONFIRM to execute or CANCEL to discard.",
   and the staged message after it said the same: "A compiled executor plan is pending in this chat.
@@ -1194,8 +1190,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - When the model's text ends with the staged message's closing sentence, the chat takes it off
     (`staged_turn_message`, src/bin/sy_architect.rs).
   - Test: `a_staged_turn_says_how_to_confirm_once`.
+- **Checked on 8.x (0.1.100, 2026-11-05):** the same turn as A-147's check, a question and a staged
+  restart of `AI.pruebas@worker1`. Archi answered both, and the sentence came once, at the end of
+  the staged message. The plan was cancelled.
 
-### A-151 [General/SY.timer] ✅ RESOLVED (in code for the next release, SY.timer 1.3; by tests; found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
+### A-151 [General/SY.timer] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05, SY.timer 1.3; found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
 
 - **What happens:** SY.timer answers a `TIMER_LIST` in one `TIMER_RESPONSE`, which must fit the
   router's 128 KiB frame. A WF's timer takes about 450 bytes listed, so about 280 fit; a longer
@@ -1219,6 +1218,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - A cursor that is not one is `TIMER_INVALID_PAYLOAD`.
   - Tests: `TestTimerListAnswersInPagesThatFitAFrame` (300 timers of about 1 KiB),
     `TestListFollowsSYTimersPages`, `timer_client_list_follows_sy_timers_pages`.
+- **Checked on 8.x (0.1.100, 2026-11-05):**
+  - 350 timers of about 1 KiB for a throwaway node, more than one frame: `TIMER_LIST` answered
+    them in 5 pages (79, 79, 79, 79 and 34), each about 99 KB. SY.admin's `timer_list` gave the
+    same pages with `cursor`, and the HELP says 1.3 and names `cursor`.
+  - **A WF's start, the case of this finding:** 350 timers of the WF's client_ref format, pending
+    for `WF.gate0201@worker1` before the WF existed. The WF started, its `Recover` listed all 350
+    across the pages and cancelled each as an orphan, in 8 s. No `TIMER_LIST` failed, and the node
+    never ran DEGRADED.
+  - The throwaway timers were cancelled. They stay in SY.timer's history until its GC, at its
+    first start after 7 days (docs/sy-timer.md §5.2).
 
 ### A-150 [WF] 🔵 TO EVALUATE (kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
 
@@ -1485,7 +1494,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - a message the WF writes to an IO node does not name the person as its sender;
   - an agent still gets the person (A-116).
 
-### A-138 [WF] ✅ RESOLVED (in code for the next release; by tests; design agreed 2026-11-04, [message-trace-v1](../../docs/message-trace-v1.md); the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
+### A-138 [WF] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05; design agreed 2026-11-04, [message-trace-v1](../../docs/message-trace-v1.md); the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
 - **The operator's direction (2026-10-31, put on the table as a topic 2026-11-02):** the facts
   travel in the message itself: the trace, the nodes it passed through, and the state. Each node
@@ -1545,6 +1554,21 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - The router writes its entry when it picks a destination.
   - ai.generic shows the trace to the model, and with cognition takes the "via" from its origin.
   - Tests in each place.
+- **Checked on 8.x (0.1.100, 2026-11-05),** with the WF gate0200 on worker1: a client standing for
+  an IO node, an internal event, `AI.pruebas@worker1`, and a 60 s timer.
+  - The answer reached the client with the cycle's `trace_id` and four entries: the client's, the
+    WF's `[forward, schedule_timer]`, the agent's, and the WF's
+    `[forward, cancel_timer, schedule_timer]`.
+  - The agent, asked to copy its trace, copied the two lines it received.
+  - The hold's message came 60 s later under a `trace_id` of its own, with one entry,
+    `[send_message]`.
+  - `turns` keeps the cycle's five messages, each with its trace.
+  - The frontdesk's note rests on its test: no frontdesk runs on 8.x.
+- **Found in the gate:** a WF message whose action has no `vars`, `menu` or `subject` carried an
+  empty `wf: {}`. While the block had the trail it was never empty. Fixed in code for the next
+  release: the block goes only when it carries something, and a forwarded message's block from
+  another WF never goes on (`withWFBlock`; test `TestAForwardCarriesNoOtherWFsBlock`). Two
+  comments in `wfcel` still named the trail.
 
 ### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 

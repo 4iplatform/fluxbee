@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ live, checked on 8.x | snap `pre-sprint-0-1-99` (all 4 VMs) · `apt install fluxbee=0.1.98` + core-update of the spokes |
+| **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ live, checked on 8.x | snap `pre-trace-0-1-100` (all 4 VMs) · `apt install fluxbee=0.1.99` + core-update of the spokes |
+| **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ replaced by 0.1.100 | snap `pre-sprint-0-1-99` (deleted 2026-11-05) · `apt install fluxbee=0.1.98` + core-update of the spokes |
 | **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ replaced by 0.1.99 | snap `pre-namefix-0-1-98` (deleted 2026-11-04) · `apt install fluxbee=0.1.97` + core-update of the spokes |
 | **0.1.97** | 2026-11-03 | `b91260a5` | motherbee + spokes (core): SY.admin's executor dispatches a fixed step through the tool's own dispatch (A-144) | ✅ replaced by 0.1.98 (gate in course) | snap `pre-dispatchfix-0-1-97` (deleted 2026-11-03) · `apt install fluxbee=0.1.96` + core-update of the spokes |
 | **0.1.96** | 2026-11-03 | `3726dca1` | motherbee + spokes (core): two fixes from WF Case 5's gate, SY.admin's executor and identity writes (A-144, A-143), and Archi's chat CONFIRM | ✅ replaced by 0.1.97 (gate in course) | snap `pre-gatefix-0-1-96` (deleted 2026-11-03) · `apt install fluxbee=0.1.95` + core-update of the spokes |
@@ -106,6 +107,61 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.100 — The sprint's block 3: the message trace with the frontdesk's identity note, SY.timer 1.3's pages, Archi's confirm sentence once (A-138, A-151, A-152)
+
+- **Date:** 2026-11-05 (ART) · **Previous version:** 0.1.99 · **Commit:** `b052722b`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's block 3 (FINDINGS, the board): A-138, designed with the operator on
+  2026-11-04 ([message-trace-v1](../docs/message-trace-v1.md)), and A-151 and A-152, found on the
+  way.
+- **What changed:**
+  - **The message trace (A-138):**
+    - every solution message carries `meta.context.trace`, one entry for each node of its cycle:
+      the time, the source, the destination and the node's actions;
+    - both SDKs write the sender's entry as it sends;
+    - an agent's reply names the requester and the option it chose, and the frontdesk notes
+      whether it assigned an identity;
+    - the router writes its entry when it picks a destination;
+    - the WF sends the trace of its cycle and names its step's actions, and its block has no trail;
+    - ai.generic shows the trace to the model, and the speaker's "via", like cognition's, comes
+      from its origin.
+  - **SY.timer 1.3 (A-151):** `TIMER_LIST` answers in pages that fit one frame, with
+    `next_cursor`; both SDKs follow the pages; SY.admin's `timer_list` and Archi take `cursor`.
+  - **Archi (A-152):** a turn that stages a plan says how to confirm once.
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - the six Go modules: gofmt, vet and the race detector, in a Linux container;
+  - the catalog's parity, the doc links, the loopback binds and the router's dispatcher guards.
+- **Deploy:**
+  - build of `b052722b` in 25 min, publish in 14 s;
+  - 0.1.100 on all 4 in 251 s (manifest `f8115929915afe84`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - every product unit restarted on its new binary, and the managed nodes on their 0.1.100
+    runtimes (only Syncthing and the nftables oneshots are older, as the release does not touch
+    them).
+- **Checked on 8.x** (FINDINGS has each one):
+  - A-138, with the WF gate0200 on worker1 (a client standing for an IO node, an internal event,
+    `AI.pruebas@worker1` and a 60 s timer):
+    - the answer reached the client with the cycle's `trace_id` and four entries, the WF's two
+      naming their step's actions;
+    - the agent copied the trace it was shown;
+    - the timer's message went under a `trace_id` of its own, with one entry;
+    - `turns` keeps the cycle's five messages, each with its trace;
+    - the frontdesk's note rests on its test, since no frontdesk runs on 8.x.
+  - A-151:
+    - 350 timers of about 1 KiB listed in 5 pages, through SY.timer and through SY.admin;
+    - a WF that started with 350 pending timers listed them all and reconciled them in 8 s.
+  - A-152: Archi answered a question and staged a restart in one turn, and the confirm sentence
+    came once. The plan was cancelled.
+  - The gates' workflows, gate0200 and gate0201, and their files on worker1 were removed.
+- **Found in the checks:** an empty `wf: {}` block on a WF message whose action has no vars, menu
+  or subject (fixed in code for the next release).
+- **Rollback:** `apt install fluxbee=0.1.99` on the motherbee, then a core-update of the spokes.
+  SY.timer's database has the same schema. A 0.1.99 node takes a message with a trace as one more
+  context key.
 
 ---
 
