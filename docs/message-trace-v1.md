@@ -4,7 +4,7 @@
 
 - The direction was agreed with the operator on 2026-11-04, in a design chat (FINDINGS A-138, the
   sprint's block 3).
-- Open: the two points of §9.
+- Open: the two points of §9, both small.
 - Next: the build, in one release with A-151, and its WF gate. The A-137 chat (cognition across
   hands) builds on this trace.
 
@@ -25,9 +25,9 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
 ```json
 "trace": [
   {"t": "2026-11-04T10:17:03.120Z", "from": "IO.slack@motherbee", "to": "WF.ventas@worker1"},
-  {"t": "2026-11-04T10:17:03.180Z", "from": "WF.ventas@worker1", "to": "AI.ventas@worker1", "act": "forward"},
+  {"t": "2026-11-04T10:17:03.180Z", "from": "WF.ventas@worker1", "to": "AI.ventas@worker1", "act": ["forward"]},
   {"t": "2026-11-04T10:17:09.410Z", "from": "AI.ventas@worker1", "to": "WF.ventas@worker1"},
-  {"t": "2026-11-04T10:17:09.470Z", "from": "WF.ventas@worker1", "to": "IO.slack@motherbee", "act": "forward"}
+  {"t": "2026-11-04T10:17:09.470Z", "from": "WF.ventas@worker1", "to": "IO.slack@motherbee", "act": ["forward"]}
 ]
 ```
 
@@ -122,6 +122,14 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
    después"*).
    - The data stays in storage, in `turns`.
    - Archi's log screen (Messages) is the one to expand.
+10. **The trace replaces the WF's trail:** *"esto es la actualización del trail, y sí integraremos
+    esto"*.
+    - The WF stops writing `meta.context.wf.trail`.
+    - ai.generic and cognition read the trace instead.
+11. **The actions are free, not a fixed list:** *"no debería ser fijo… sería mejor tipo tags
+    libres"*, and *"dije tags por el concepto, que no sean fijas"*.
+    - Each node notes what it did, in its own words, by the rule of decision 5.
+    - "Tags" names the idea, not the field: the field is `act` (§4).
 
 ---
 
@@ -135,7 +143,9 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
   - A reply goes to the requester's UUID, so its `to` is the request's `src_l2_name`, which the
     router stamps.
   - A message sent with no destination has no `to`: the router's entry follows it (§5).
-- `act`: optional, what the node did (§5).
+- `act`: optional, a list of free tags, short words that say what the node did (§5).
+  - The field is `act`, not `tags`. A message's own `payload.tags` or `meta.tags` already fill the
+    `tags` column of `turns` (`parse_turn`, src/bin/sy_storage.rs).
 
 An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, under 1% of a frame.
 
@@ -143,12 +153,15 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 
 ## 5. Who writes what
 
-| Node | When | `from` → `to` | `act` |
+| Node | When | `from` → `to` | What it notes in `act`, at least |
 |---|---|---|---|
-| An IO (`build_user_message`) | a message enters: a person writes, a person clicks | the IO → its destination | none |
+| An IO (`build_user_message`) | a message enters: a person writes, a person clicks | the IO → its destination | nothing, or what it saw (a click) |
 | A WF | each send of a transition | the WF → its destination | its action: `forward`, `send_message` |
 | An agent (the AI runtime, as it sends) | each reply | the agent → the requester | the option it chose, when it answers a menu |
 | The router | a message with no destination | the router → the destination it picked | `resolve` |
+
+The last column is what each node writes by default. The tags are free: a node adds whatever it
+knows about what it did.
 
 **How it travels within a cycle:**
 
@@ -173,7 +186,7 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
   ```
   Trace:
   10:17:03.120 IO.slack@motherbee -> WF.ventas@worker1
-  10:17:03.180 WF.ventas@worker1 -> AI.ventas@worker1 (forward)
+  10:17:03.180 WF.ventas@worker1 -> AI.ventas@worker1 [forward]
   ```
 
 - The speaker label's "via" takes the trace's first entry, the cycle's origin. Cognition reads it
@@ -193,6 +206,7 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 - **The router writing every entry, checking the nodes' entries, or signing them:** the purpose is
   debug and log, and each node owns its entry.
 - **A cap on entries:** a cycle is a few messages, set by the solution.
+- **A fixed list of actions for each kind of node:** each node owns what it notes (decision 11).
 - **Other places for it:**
   - among the system fields of `meta`: it is solution data;
   - next to `trace_id` in `routing`: both SDKs rebuild `routing` on a reply, and the router routes
@@ -206,7 +220,8 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 - **The AI runtime:** writes the agent's entry where it stamps the agent's ILK.
 - **The WF:**
   - writes its entry on each send;
-  - its `send_message` copies the event's trace.
+  - its `send_message` copies the event's trace;
+  - stops writing its trail.
 - **The router:** writes its entry when it picks the destination of a message that has none, on the
   local, peer and WAN paths.
 - **ai.generic and cognition:** read the trace for the path and the "via".
@@ -224,10 +239,7 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 
 ## 9. Open
 
-1. **The WF's trail.**
-   - The trace says what it says, with times and actions, and for every node.
-   - The proposal: the trail goes, and its readers (ai.generic and cognition) read the trace.
-2. **The `act` of each kind of node,** as §5 proposes:
-   - the WF's action;
-   - the option an agent chose;
-   - `resolve` for the router.
+1. **A length per tag,** so that a tag stays a word and not a description (*"nada descriptivo"*).
+   The proposal: up to 32 characters each, and up to 8 tags for each entry.
+2. **Tags from the WF's definition.** An action could carry the tags the solution's author wants
+   to see in the trace, written through Archi: for example, `escalado` on the handover.

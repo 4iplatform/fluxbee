@@ -1517,7 +1517,9 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - each node writes its own entry, and the router writes one only when it picks a destination;
   - plain JSON, not compressed; debug and log, not security;
   - the AI model reads it, and Archi shows it later.
-  - Open: whether the WF's trail goes, and each node's `act` (§9).
+  - The trace replaces the WF's trail, and the actions are free, not a fixed list (the operator,
+    the same chat).
+  - Open: a length per tag, and tags from the WF's definition (§9).
 
 ### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
