@@ -35,8 +35,8 @@ no change required
       rule, the operator's call (2026-11-04: a node schedules only for itself, a SY node for any).
    4. A-152 [Archi], found checking A-147: the confirm sentence said once. In code, for the next
       release.
-   5. A-151 [General/SY.timer], found on the way to A-115: a `TIMER_LIST` longer than one frame. The
-      operator's call: this sprint or later.
+   5. A-151 [General/SY.timer], found on the way to A-115: a `TIMER_LIST` longer than one frame. In
+      this sprint (the operator, 2026-11-04), out with block 3's release and its WF gate.
 2. **The 🔴, simple and important** (✅ 0.1.99, 2026-11-04: A-100, A-89 and A-90 validated on 8.x;
    A-84 and A-85 by tests):
    1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
@@ -98,7 +98,7 @@ with a WF gate.
 ### General
 
 - A-151 🟡 A `TIMER_LIST` longer than one frame fails: a WF with about 280 pending timers cannot
-  reconcile at its start. *The operator's call: this sprint or later.*
+  reconcile at its start. *Sprint: with block 3's release.*
 - A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
 - A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
@@ -1194,7 +1194,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (`staged_turn_message`, src/bin/sy_architect.rs).
   - Test: `a_staged_turn_says_how_to_confirm_once`.
 
-### A-151 [General/SY.timer] 🟡 OPEN (found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
+### A-151 [General/SY.timer] 🟡 OPEN, in this sprint (found 2026-11-04, reading SY.timer for A-115) — A `TIMER_LIST` longer than one frame fails, so a WF with about 280 pending timers cannot reconcile at its start
 
 - **What happens:** SY.timer answers a `TIMER_LIST` in one `TIMER_RESPONSE`, which must fit the
   router's 128 KiB frame. A WF's timer takes about 450 bytes listed, so about 280 fit; a longer
@@ -1206,6 +1206,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** `TIMER_LIST` in pages. SY.timer answers what fits, with a cursor (`fire_at`, `uuid`) for
   the next page, and both SDKs' `List` follow the pages up to the limit. For the operator: this
   sprint, or later.
+- **2026-11-04, the operator:** in this sprint (*"A151 si, incluilo"*). It goes out with block 3's
+  release, whose WF gate restarts a WF and checks its reconcile.
 
 ### A-150 [WF] 🔵 TO EVALUATE (kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
 
