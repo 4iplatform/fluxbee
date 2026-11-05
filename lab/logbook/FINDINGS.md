@@ -48,7 +48,8 @@ no change required
    5. A-90 [io.web]: a share of the edge's slots per client, connections to io.web reused or closed
       by io.web, a deadline for a stalled body.
 3. **WF, design first, one topic at a time:**
-   1. A-138 [WF]: the conversation's trace in the message: design, build, gate.
+   1. A-138 [WF]: the conversation's trace in the message: design agreed 2026-11-04
+      ([message-trace-v1](../../docs/message-trace-v1.md)); build and gate next.
    2. A-137 [WF]: the chat on cognition across hands. It builds on A-138: the mark cognition would
       read travels in the message.
 
@@ -57,8 +58,8 @@ with a WF gate.
 
 ### WF
 
-- A-138 🔵 A message carries only a WF's trail of node names, not its conversation's trace.
-  *Sprint.*
+- A-138 🟡 A message carries only a WF's trail of node names, not its conversation's trace.
+  *Sprint: design agreed ([message-trace-v1](../../docs/message-trace-v1.md)), build next.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
@@ -1474,7 +1475,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - a message the WF writes to an IO node does not name the person as its sender;
   - an agent still gets the person (A-116).
 
-### A-138 [WF] 🔵 TO EVALUATE, its own topic (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
+### A-138 [WF] 🟡 DESIGN AGREED (2026-11-04, [message-trace-v1](../../docs/message-trace-v1.md)), the build next (the operator, 2026-11-02, the WF Case 4 design chat) — A message carries only a WF's trail of node names, not its conversation's trace
 
 - **The operator's direction (2026-10-31, put on the table as a topic 2026-11-02):** the facts
   travel in the message itself: the trace, the nodes it passed through, and the state. Each node
@@ -1509,6 +1510,14 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
 - **Status:** a topic of its own, after the WF track. Case 4 uses the WF's facts and its own marks,
   and builds no general trace.
 - **2026-11-04, the operator:** for the WF track, and important: in this sprint.
+- **2026-11-04, the design chat: the direction is agreed** ([message-trace-v1](../../docs/message-trace-v1.md)):
+  - each message carries the trace of its cycle, a pulse: `meta.context.trace`, keyed by
+    `trace_id`, which is already the cycle's id;
+  - each entry holds the time, the source, the destination, and the node's action;
+  - each node writes its own entry, and the router writes one only when it picks a destination;
+  - plain JSON, not compressed; debug and log, not security;
+  - the AI model reads it, and Archi shows it later.
+  - Open: whether the WF's trail goes, and each node's `act` (§9).
 
 ### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
