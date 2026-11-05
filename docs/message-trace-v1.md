@@ -4,7 +4,7 @@
 
 - The direction was agreed with the operator on 2026-11-04, in a design chat (FINDINGS A-138, the
   sprint's block 3).
-- Open: the two points of §9, both small.
+- The design closed the same day: nothing is open (§9).
 - Next: the build, in one release with A-151, and its WF gate. The A-137 chat (cognition across
   hands) builds on this trace.
 
@@ -129,7 +129,13 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
 11. **The actions are free, not a fixed list:** *"no debería ser fijo… sería mejor tipo tags
     libres"*, and *"dije tags por el concepto, que no sean fijas"*.
     - Each node notes what it did, in its own words, by the rule of decision 5.
-    - "Tags" names the idea, not the field: the field is `act` (§4).
+    - The word is `act`, never "tag" (*"coincido en decir act, no tag nunca más"*).
+12. **The WF notes what it does:** *"el wf tiene acciones, no hay invento en esto. Escribe lo que
+    el wf hace"*.
+    - Its entry lists the actions its transition ran, so an entry can hold more than one: *"tal
+      vez un nodo hace más de una acción a la vez… raro… pero posible"*.
+13. **Short words:** each one names an action, in up to 32 characters, and an entry holds up to 8
+    (the operator's "ok" to the proposal).
 
 ---
 
@@ -143,8 +149,9 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
   - A reply goes to the requester's UUID, so its `to` is the request's `src_l2_name`, which the
     router stamps.
   - A message sent with no destination has no `to`: the router's entry follows it (§5).
-- `act`: optional, a list of free tags, short words that say what the node did (§5).
-  - The field is `act`, not `tags`. A message's own `payload.tags` or `meta.tags` already fill the
+- `act`: optional, a list of free words, each one an action the node took (§5). Each word has up to
+  32 characters, and an entry has up to 8 of them.
+  - `tags` already names something else: a message's own `payload.tags` or `meta.tags` fill the
     `tags` column of `turns` (`parse_turn`, src/bin/sy_storage.rs).
 
 An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, under 1% of a frame.
@@ -156,12 +163,12 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 | Node | When | `from` → `to` | What it notes in `act`, at least |
 |---|---|---|---|
 | An IO (`build_user_message`) | a message enters: a person writes, a person clicks | the IO → its destination | nothing, or what it saw (a click) |
-| A WF | each send of a transition | the WF → its destination | its action: `forward`, `send_message` |
+| A WF | each send of a transition | the WF → its destination | the actions its transition ran, the one that sent this message first: `["send_message", "schedule_timer"]` on Case 4's post to the team |
 | An agent (the AI runtime, as it sends) | each reply | the agent → the requester | the option it chose, when it answers a menu |
 | The router | a message with no destination | the router → the destination it picked | `resolve` |
 
-The last column is what each node writes by default. The tags are free: a node adds whatever it
-knows about what it did.
+The last column is what each node writes by default. The words are free: a node adds whatever
+else it knows it did.
 
 **How it travels within a cycle:**
 
@@ -207,6 +214,9 @@ knows about what it did.
   debug and log, and each node owns its entry.
 - **A cap on entries:** a cycle is a few messages, set by the solution.
 - **A fixed list of actions for each kind of node:** each node owns what it notes (decision 11).
+- **Words from the WF's definition,** a field on an action or a CEL function that adds to the
+  trace: not now. The WF notes the actions it runs, and a function waits for a case that needs it
+  (*"no sé si vale la pena alguna función en el wf"*).
 - **Other places for it:**
   - among the system fields of `meta`: it is solution data;
   - next to `trace_id` in `routing`: both SDKs rebuild `routing` on a reply, and the router routes
@@ -219,7 +229,7 @@ knows about what it did.
 - **The IO family:** `build_user_message` writes the IO's entry.
 - **The AI runtime:** writes the agent's entry where it stamps the agent's ILK.
 - **The WF:**
-  - writes its entry on each send;
+  - writes its entry on each send, with the actions of its transition;
   - its `send_message` copies the event's trace;
   - stops writing its trail.
 - **The router:** writes its entry when it picks the destination of a message that has none, on the
@@ -239,7 +249,6 @@ knows about what it did.
 
 ## 9. Open
 
-1. **A length per tag,** so that a tag stays a word and not a description (*"nada descriptivo"*).
-   The proposal: up to 32 characters each, and up to 8 tags for each entry.
-2. **Tags from the WF's definition.** An action could carry the tags the solution's author wants
-   to see in the trace, written through Archi: for example, `escalado` on the handover.
+Nothing: the design closed on 2026-11-04. The last two points went this way:
+- the length of `act`'s words: decision 13;
+- words from the WF's definition: withdrawn for now (§7).

@@ -1519,7 +1519,10 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - the AI model reads it, and Archi shows it later.
   - The trace replaces the WF's trail, and the actions are free, not a fixed list (the operator,
     the same chat).
-  - Open: a length per tag, and tags from the WF's definition (§9).
+  - Closed the same day:
+    - `act` holds the node's actions, in short words;
+    - a WF lists the actions its transition ran, so an entry can hold more than one;
+    - no words from the WF's definition for now.
 
 ### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
