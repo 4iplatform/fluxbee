@@ -160,7 +160,7 @@ A workflow's instances are reads: `GET /hives/{hive}/nodes/WF.<workflow_name>/wf
 ## Pipeline confirmation rules
 
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
-- After `fluxbee_plan_compiler` returns `status: "plan_ready"`, call NO more tools. Present the `human_summary` and end with "Reply CONFIRM to execute or CANCEL to discard." Only the literal word CONFIRM triggers execution.
+- After `fluxbee_plan_compiler` returns `status: "plan_ready"`, call NO more tools. Present the `human_summary`; do not say how to confirm, the chat adds that line itself. Only the literal word CONFIRM triggers execution.
 - After `fluxbee_plan_compiler` returns `status: "blocked"`, call NO more tools. Present the `human_summary` as the blocker and stop; do not ask for CONFIRM.
 - Never call `fluxbee_plan_compiler` more than once per task unless the operator gives new information that resolves the blocker.
 - A user message such as "reintenta", "sí, reintenta", or "seguí" after a blocked mutation is permission to call `fluxbee_plan_compiler` again if the missing state has now been resolved.
@@ -11288,11 +11288,25 @@ async fn persist_router_incoming_message(
 }
 
 /// The chat's answer to a turn that staged a confirmation: the model's own text, which carries what
-/// the operator asked alongside the action, then the staged message (FINDINGS A-147).
+/// the operator asked alongside the action, then the staged message (FINDINGS A-147). The staged
+/// message ends saying how to confirm or cancel, so the model's copy of that sentence goes: a
+/// pipeline's message, which the model presents verbatim, ends with it too (FINDINGS A-152).
 fn staged_turn_message(model_text: Option<&str>, staged: String) -> String {
-    match model_text.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) if text != staged.trim() => format!("{text}\n\n{staged}"),
-        _ => staged,
+    let Some(text) = model_text
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && *text != staged.trim())
+    else {
+        return staged;
+    };
+    let text = staged
+        .find("Reply CONFIRM")
+        .and_then(|at| text.strip_suffix(staged[at..].trim_end()))
+        .map(str::trim_end)
+        .unwrap_or(text);
+    if text.is_empty() {
+        staged
+    } else {
+        format!("{text}\n\n{staged}")
     }
 }
 
@@ -28739,6 +28753,34 @@ mod tests {
         assert_eq!(staged_turn_message(None, staged.clone()), staged);
         assert_eq!(staged_turn_message(Some("  "), staged.clone()), staged);
         assert_eq!(staged_turn_message(Some(&staged), staged.clone()), staged);
+    }
+
+    #[test]
+    fn a_staged_turn_says_how_to_confirm_once() {
+        let staged = PendingConfirmationFlow::PlanCompile
+            .staged_message()
+            .to_string();
+        let summary = "This plan restarts the agent node AI.pruebas on worker1.";
+        let answer = format!("{summary}\n\nReply CONFIRM to execute or CANCEL to discard.\n");
+        let message = staged_turn_message(Some(&answer), staged.clone());
+        assert_eq!(message, format!("{summary}\n\n{staged}"));
+        assert_eq!(message.matches("Reply CONFIRM").count(), 1, "{message}");
+
+        let only_the_line = "Reply CONFIRM to execute or CANCEL to discard.";
+        assert_eq!(
+            staged_turn_message(Some(only_the_line), staged.clone()),
+            staged
+        );
+
+        // A pipeline's first confirmation ends with its own sentence, and only that one goes.
+        let staged = PendingConfirmationFlow::PipelineConfirm1
+            .staged_message()
+            .to_string();
+        let answer = "Design ready. Reply CONFIRM to continue or CANCEL to discard.";
+        assert_eq!(
+            staged_turn_message(Some(answer), staged.clone()),
+            format!("Design ready.\n\n{staged}")
+        );
     }
 
     #[test]
