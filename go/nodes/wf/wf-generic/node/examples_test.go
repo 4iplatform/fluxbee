@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,43 @@ func sentTo(t *testing.T, disp *mockDispatcher, node string) sdk.Message {
 	return sdk.Message{}
 }
 
+// tracePath is the nodes a message went through in its cycle: its trace's senders, in order
+// (docs/message-trace-v1.md).
+func tracePath(msg sdk.Message) string {
+	var path []string
+	for _, entry := range sdk.TraceEntries(msg.Meta.Context) {
+		path = append(path, entry.From)
+	}
+	return fmt.Sprint(path)
+}
+
+// traceAct is what the last entry of a message's trace says its sender did.
+func traceAct(msg sdk.Message) string {
+	entries := sdk.TraceEntries(msg.Meta.Context)
+	if len(entries) == 0 {
+		return ""
+	}
+	return strings.Join(entries[len(entries)-1].Act, " ")
+}
+
+// contextWithoutTrace is a message's meta.context as it went, without its trace, whose times change
+// at each run: its other keys in order, each value byte for byte.
+func contextWithoutTrace(t *testing.T, msg sdk.Message) string {
+	t.Helper()
+	var metaContext map[string]json.RawMessage
+	if err := json.Unmarshal(msg.Meta.Context, &metaContext); err != nil {
+		t.Fatalf("meta.context %s: %v", msg.Meta.Context, err)
+	}
+	delete(metaContext, sdk.TraceKey)
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(metaContext); err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
 // wfBlock is the WF's block of a message's meta.context.
 func wfBlock(t *testing.T, msg sdk.Message) map[string]any {
 	t.Helper()
@@ -108,8 +146,8 @@ func TestTheRouterExampleRepliesToTheIONodeTheQuestionCameFrom(t *testing.T) {
 	ask := func(io string) (string, sdk.Message) {
 		t.Helper()
 		thread := "conv-" + io
-		relay := from(io, sdk.Message{Routing: sdk.Routing{TraceID: "trace-" + io}, Meta: sdk.Meta{MsgType: "user", ThreadID: &thread}, Payload: json.RawMessage(question)})
-		relay.Meta.Context = json.RawMessage(`{"io":{"reply_target":{"kind":"api","address":"conv-1"}}}`)
+		relay := from(io, sdk.Message{Routing: sdk.Routing{TraceID: "trace-" + io}, Payload: json.RawMessage(question),
+			Meta: sdk.Meta{MsgType: "user", ThreadID: &thread, Context: json.RawMessage(`{"io":{"reply_target":{"kind":"api","address":"conv-1"}}}`)}})
 		instanceID := startInstance(t, rt, relay)
 		msg := sentTo(t, disp, "AI.host@motherbee")
 		if msg.Meta.MsgType != "user" || msg.Meta.Msg != nil || string(msg.Payload) != question || derefString(msg.Meta.ThreadID) != thread {
@@ -144,7 +182,7 @@ func TestTheRouterExampleRepliesToTheIONodeTheQuestionCameFrom(t *testing.T) {
 	dispatch(agentAnswer(t, "AI.host@motherbee", request, `{"type":"text","content":"the answer"}`, nil))
 	msg := sentTo(t, disp, "IO.api.support@motherbee")
 	if string(msg.Payload) != `{"type":"text","content":"the answer"}` ||
-		string(msg.Meta.Context) != `{"io":{"reply_target":{"address":"conv-1","kind":"api"}},"wf":{"trail":["AI.host@motherbee","WF.invoice@motherbee"]}}` {
+		contextWithoutTrace(t, msg) != `{"io":{"reply_target":{"address":"conv-1","kind":"api"}},"wf":{}}` || tracePath(msg) != "[IO.api.support@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
 		t.Fatalf("the answer goes back to IO.api as it came, with its reply context: %s %s", msg.Payload, msg.Meta.Context)
 	}
 	if row := mustGetInstance(t, rt, viaAPI); row.CurrentState != "answered" {
@@ -154,7 +192,8 @@ func TestTheRouterExampleRepliesToTheIONodeTheQuestionCameFrom(t *testing.T) {
 	viaWhatsApp, request := ask("IO.wapp.acme@motherbee")
 	dispatch(agentAnswer(t, "AI.host@motherbee", request, `{"type":"text","content":"ROUTE_SPECIALIST"}`, nil))
 	escalated := sentTo(t, disp, "AI.specialist@motherbee")
-	if string(escalated.Payload) != question || fmt.Sprint(wfBlock(t, escalated)["trail"]) != "[IO.wapp.acme@motherbee WF.invoice@motherbee]" {
+	// The question goes on in the cycle the host's answer is part of: its trace is that cycle's.
+	if string(escalated.Payload) != question || tracePath(escalated) != "[IO.wapp.acme@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
 		t.Fatalf("the host escalates the question as it came: %s %s", escalated.Payload, escalated.Meta.Context)
 	}
 	dispatch(agentAnswer(t, "AI.specialist@motherbee", escalated, `{"type":"text","content":"the specialist's answer"}`, nil))
@@ -540,9 +579,9 @@ func (c *salesConversation) count(node string) int {
 	return count
 }
 
-func (c *salesConversation) trail(msg sdk.Message) string {
-	c.t.Helper()
-	return fmt.Sprint(wfBlock(c.t, msg)["trail"])
+// cyclePath is the nodes msg went through in its cycle (tracePath).
+func (c *salesConversation) cyclePath(msg sdk.Message) string {
+	return tracePath(msg)
 }
 
 // options names the options of the menu a message offers, in its WF's block.
@@ -563,10 +602,10 @@ func (c *salesConversation) options(msg sdk.Message) string {
 func (c *salesConversation) delivered(reply, agent string) {
 	c.t.Helper()
 	msg := c.sentTo(salesIO)
-	if string(msg.Payload) != fmt.Sprintf(`{"type":"text","content":%q}`, reply) || c.trail(msg) != "["+agent+" "+salesWFNode+"]" ||
+	if string(msg.Payload) != fmt.Sprintf(`{"type":"text","content":%q}`, reply) || !strings.HasSuffix(c.cyclePath(msg), " "+agent+" "+salesWFNode+"]") ||
 		c.io(msg) != c.personIO() || derefString(msg.Meta.ThreadID) != salesThread || derefString(msg.Meta.DstIlk) != personILK ||
 		derefString(msg.Meta.Ich) != personICH {
-		c.t.Fatalf("the person gets %q from %s, with its trail, context.io, dst_ilk and ich: %+v %s %s", reply, agent, msg.Meta, msg.Payload, msg.Meta.Context)
+		c.t.Fatalf("the person gets %q from %s, at the end of its cycle %s, with context.io, dst_ilk and ich: %+v %s %s", reply, agent, c.cyclePath(msg), msg.Meta, msg.Payload, msg.Meta.Context)
 	}
 }
 
@@ -599,7 +638,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	}
 	toSales := c.sentTo(salesAgent)
 	if string(toSales.Payload) != string(first.Payload) || derefString(toSales.Meta.SrcIlk) != personILK || derefString(toSales.Meta.Ich) != personICH ||
-		toSales.Meta.Msg != nil || derefString(toSales.Meta.ThreadID) != salesThread || c.trail(toSales) != "["+salesIO+" "+salesWFNode+"]" ||
+		toSales.Meta.Msg != nil || derefString(toSales.Meta.ThreadID) != salesThread || c.cyclePath(toSales) != "["+salesIO+" "+salesWFNode+"]" ||
 		c.options(toSales) != "answer invoice consult handover" || c.io(toSales) != c.personIO() {
 		t.Fatalf("sales gets the person's message: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
@@ -636,7 +675,7 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.choose(salesAgent, toSales, "Te paso con facturación.", "invoice", salesOrder())
 	c.inState("invoice_thinking")
 	toInvoice := c.sentTo(invoiceAgent)
-	if string(toInvoice.Payload) != string(ask.Payload) || c.trail(toInvoice) != "["+salesIO+" "+salesWFNode+"]" ||
+	if string(toInvoice.Payload) != string(ask.Payload) || c.cyclePath(toInvoice) != "["+salesIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" ||
 		fmt.Sprint(wfBlock(t, toInvoice)["vars"]) != "map[order:map[product:Pro quantity:10 unit_price:100]]" || c.options(toInvoice) != "issued answer done" {
 		t.Fatalf("invoice gets the person's message and the order: %s %s", toInvoice.Payload, toInvoice.Meta.Context)
 	}
@@ -691,8 +730,10 @@ func TestTheSalesInvoiceExampleRunsTheOperatorsCircuit(t *testing.T) {
 	c.delivered("Decime.", salesAgent)
 	c.inState("payments_thinking")
 	toPayments := c.sentTo(paymentsAgent)
-	// The WF's own message carries the person's src_ilk and ich (the rest of FINDINGS A-116).
-	if derefString(toPayments.Meta.Msg) != "PAYMENT_DUE" || !strings.Contains(string(toPayments.Payload), "was not paid") || c.trail(toPayments) != "["+salesWFNode+"]" ||
+	// The WF's own message carries the person's src_ilk and ich (the rest of FINDINGS A-116). It goes
+	// out with sales' answer, so in that answer's cycle: its trace is the person's message's.
+	if derefString(toPayments.Meta.Msg) != "PAYMENT_DUE" || !strings.Contains(string(toPayments.Payload), "was not paid") ||
+		c.cyclePath(toPayments) != "["+salesIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" ||
 		fmt.Sprint(wfBlock(t, toPayments)["vars"]) != "map[invoice:map[amount:1000 due_in:2m invoice_number:F-0001]]" || c.options(toPayments) != "notify" ||
 		c.io(toPayments) != c.personIO() || derefString(toPayments.Meta.SrcIlk) != personILK || derefString(toPayments.Meta.Ich) != personICH {
 		t.Fatalf("payments gets the due date: %+v %s %s", toPayments.Meta, toPayments.Payload, toPayments.Meta.Context)
@@ -843,7 +884,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.inState("consulting")
 	toSupervisors := c.sentTo(supervisorsIO)
 	if derefString(toSupervisors.Meta.Msg) != "SUPERVISOR_QUESTION" || string(toSupervisors.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, question) ||
-		derefString(toSupervisors.Meta.ThreadID) != salesThread || string(toSupervisors.Meta.Context) != `{"wf":{"trail":["`+salesWFNode+`"]}}` ||
+		derefString(toSupervisors.Meta.ThreadID) != salesThread || contextWithoutTrace(t, toSupervisors) != `{"wf":{}}` || tracePath(toSupervisors) != "["+salesIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" ||
 		toSupervisors.Meta.SrcIlk != nil || toSupervisors.Meta.Ich != nil || toSupervisors.Meta.DstIlk != nil {
 		t.Fatalf("the supervisors get the question: %+v %s %s", toSupervisors.Meta, toSupervisors.Payload, toSupervisors.Meta.Context)
 	}
@@ -884,7 +925,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.inState("consulting")
 	toTeam := c.sentTo(supervisorsIO)
 	if c.count(supervisorsIO) != questions+1 || string(toTeam.Payload) != `{"type":"text","content":"Daría 15%: el cliente compra seguido."}` ||
-		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.trail(toTeam) != "["+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent ||
+		fmt.Sprint(wfBlock(t, toTeam)["subject"]) != "same" || c.cyclePath(toTeam) != "["+supervisorsIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" || c.count(salesIO) != sent ||
 		derefString(toTeam.Meta.DstIlk) != supervisorILK || derefString(toTeam.Meta.Ich) != supervisorsICH {
 		t.Fatalf("sales' answer goes to the team, in the question's thread: %+v %s %s", toTeam.Meta, toTeam.Payload, toTeam.Meta.Context)
 	}
@@ -894,7 +935,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	answer := c.supervisor("Aprobado hasta 15%.")
 	c.inState("sales_relaying")
 	toSales = c.sentTo(salesAgent)
-	if string(toSales.Payload) != string(answer.Payload) || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait answer_team" ||
+	if string(toSales.Payload) != string(answer.Payload) || c.cyclePath(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" || c.options(toSales) != "decided wait answer_team" ||
 		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[question:"+question+"]" || derefString(toSales.Meta.SrcIlk) != supervisorILK {
 		t.Fatalf("sales gets the supervisor's answer: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
@@ -1088,7 +1129,7 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 	c.person("¿Hola? ¿Alguien?")
 	toTeam := c.sentTo(supervisorsIO)
 	if !strings.Contains(string(toTeam.Payload), "Alguien") || wfBlock(t, toTeam)["subject"] != "same" || derefString(toTeam.Meta.SrcIlk) != personILK ||
-		c.trail(toTeam) != "["+salesIO+" "+salesWFNode+"]" {
+		c.cyclePath(toTeam) != "["+salesIO+" "+salesWFNode+"]" {
 		t.Fatalf("the person's message goes to the team: %s %s", toTeam.Payload, toTeam.Meta.Context)
 	}
 	if _, untaken := c.pending("team_untaken"); !untaken {
@@ -1102,7 +1143,7 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 	// as its dst_ilk and on their own channel, and the case is taken: "nobody took it" goes, and
 	// "quiet" counts.
 	c.supervisor("Hola Ana, soy Juan. Ya veo la factura F-0001, dame un minuto.")
-	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.trail(msg) != "["+supervisorsIO+" "+salesWFNode+"]" ||
+	if msg := c.sentTo(salesIO); !strings.Contains(string(msg.Payload), "soy Juan") || c.io(msg) != c.personIO() || c.cyclePath(msg) != "["+supervisorsIO+" "+salesWFNode+"]" ||
 		derefString(msg.Meta.SrcIlk) != supervisorILK || derefString(msg.Meta.DstIlk) != personILK || derefString(msg.Meta.Ich) != personICH {
 		t.Fatalf("the team's message goes to the person: %+v %s %s", msg.Meta, msg.Payload, msg.Meta.Context)
 	}
@@ -1134,7 +1175,7 @@ func TestTheSalesInvoiceExampleHandsTheConversationToTheTeam(t *testing.T) {
 	c.inState("back_from_team")
 	toSales := c.sentTo(salesAgent)
 	if string(toSales.Payload) != string(click.Payload) || derefString(toSales.Meta.SrcIlk) != teamMemberILK || c.options(toSales) != "answer" ||
-		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[came_back:handback team_since:"+since+"]" || c.trail(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" {
+		fmt.Sprint(wfBlock(t, toSales)["vars"]) != "map[came_back:handback team_since:"+since+"]" || c.cyclePath(toSales) != "["+supervisorsIO+" "+salesWFNode+"]" {
 		t.Fatalf("sales gets the click, with its note: %+v %s %s", toSales.Meta, toSales.Payload, toSales.Meta.Context)
 	}
 

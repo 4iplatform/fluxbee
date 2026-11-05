@@ -102,8 +102,9 @@ func TestTheMenuGoesInTheWFBlockAsWritten(t *testing.T) {
 	if got := string(rawBlock(t, toHost)["menu"]); got != want {
 		t.Fatalf("the menu on the wire:\n got %s\nwant %s", got, want)
 	}
-	if block := rawBlock(t, sentTo(t, disp, "AI.other@motherbee")); block["menu"] != nil || block["trail"] == nil {
-		t.Fatalf("a send without a menu: %v", block)
+	toOther := sentTo(t, disp, "AI.other@motherbee")
+	if block := rawBlock(t, toOther); block["menu"] != nil || tracePath(toOther) == "[]" {
+		t.Fatalf("a send without a menu: %v %s", block, toOther.Meta.Context)
 	}
 
 	// WF_GET_CODE answers the definition as it was written: the known option by its name alone.

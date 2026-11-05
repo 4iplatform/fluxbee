@@ -231,7 +231,7 @@ func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 	if err != nil {
 		return err
 	}
-	return rt.ActCtx.Dispatcher.SendMsg(resp)
+	return rt.ActCtx.Dispatcher.SendMsg(resp, sdk.TraceNote{})
 }
 
 func handleNodeConfigGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
@@ -470,7 +470,7 @@ func replyOrError(rt *NodeRuntime, name string, payload any, build func(payload 
 		if err != nil {
 			return true, err
 		}
-		err = rt.ActCtx.Dispatcher.SendMsg(resp)
+		err = rt.ActCtx.Dispatcher.SendMsg(resp, sdk.TraceNote{})
 		var tooLarge *sdk.MessageTooLargeError
 		return errors.As(err, &tooLarge), err
 	}

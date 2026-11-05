@@ -57,6 +57,8 @@ func newTestRuntime(t *testing.T, path, definition string, timer TimerSender) (*
 // from is msg as the router delivers it from sender: routing.src_l2_name stamped.
 func from(sender string, msg sdk.Message) sdk.Message {
 	msg.Routing.SrcL2Name = &sender
+	// The sender's entry in the message's trace, as its SDK writes it (docs/message-trace-v1.md).
+	sdk.WriteTraceEntry(&msg, sender, sdk.TraceNote{})
 	return msg
 }
 

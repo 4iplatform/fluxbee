@@ -111,13 +111,50 @@ fn sanitize_reply_context(context: Option<Value>, options: ReplyContextOptions) 
     obj.remove("src_ilk");
     obj.remove("response_envelope");
     // The request's WF block and evaluation: a WF puts its own block on every message it sends,
-    // and an answer carries only its own evaluation (`ResponseContract::answer`).
+    // and an answer carries only its own evaluation (`ResponseContract::answer`). Nor does it carry
+    // actions noted on another reply (`set_reply_act`).
     obj.remove("wf");
     obj.remove("evaluation");
+    obj.remove(REPLY_ACT_KEY);
     if !options.preserve_final_response_contract {
         obj.remove("final_response_contract");
     }
     Some(Value::Object(obj))
+}
+
+/// Where a node notes on its reply the actions its entry in the message's trace names
+/// (`set_reply_act`). It never goes out: the runtime takes it into the entry as it sends the reply
+/// (`take_reply_act`, docs/message-trace-v1.md §5).
+const REPLY_ACT_KEY: &str = "trace_act";
+
+/// Notes on `reply` what its node did, for the node's entry in the message's trace: the runtime
+/// writes them as the entry's `act` when it sends the reply. A reply whose context is not an object
+/// takes none.
+pub fn set_reply_act<I, S>(reply: &mut Message, act: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let words = act.into_iter().map(Into::into).collect::<Vec<String>>();
+    let context = reply
+        .meta
+        .context
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(context) = context.as_object_mut() {
+        context.insert(REPLY_ACT_KEY.to_string(), json!(words));
+    }
+}
+
+/// The actions noted on `reply` (`set_reply_act`), taken out of it.
+pub fn take_reply_act(reply: &mut Message) -> Vec<String> {
+    reply
+        .meta
+        .context
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|context| context.remove(REPLY_ACT_KEY))
+        .and_then(|words| serde_json::from_value(words).ok())
+        .unwrap_or_default()
 }
 
 /// Puts an answer's evaluation (`ContractAnswer::evaluation`) in the reply's
@@ -1248,7 +1285,7 @@ mod tests {
     }
 
     /// A WF's block and an evaluation are the request's: an answer carries neither back, only its
-    /// own evaluation.
+    /// own evaluation. The cycle's trace goes on with it (docs/message-trace-v1.md).
     #[test]
     fn a_reply_never_carries_the_requests_wf_block_or_evaluation() {
         let request = Message {
@@ -1261,27 +1298,33 @@ mod tests {
             },
             meta: Meta {
                 context: Some(json!({
-                    "wf": {
-                        "trail": ["IO.api@motherbee", "WF.sales.invoice@worker1"],
-                        "vars": {"order": {"quantity": 10}}
-                    },
+                    "wf": {"vars": {"order": {"quantity": 10}}},
                     "evaluation": {"area": "invoice"},
                     "io": {"channel": "api"},
+                    "trace": [{"t": "2026-11-04T10:17:03.120Z", "from": "IO.api@motherbee",
+                               "to": "WF.sales.invoice@worker1"}],
                 })),
                 ..Meta::default()
             },
             payload: json!({}),
         };
 
+        let trace = json!([{"t": "2026-11-04T10:17:03.120Z", "from": "IO.api@motherbee",
+                            "to": "WF.sales.invoice@worker1"}]);
         let mut reply =
             build_reply_message_runtime_src(&request, json!({"type":"text","content":"hola"}));
-        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+        assert_eq!(
+            reply.meta.context,
+            Some(json!({"io": {"channel": "api"}, "trace": trace}))
+        );
 
         // Its own evaluation goes beside the rest of its context.
         set_reply_evaluation(&mut reply, json!({"area": "sales"}));
         assert_eq!(
             reply.meta.context,
-            Some(json!({"io": {"channel": "api"}, "evaluation": {"area": "sales"}}))
+            Some(
+                json!({"io": {"channel": "api"}, "trace": trace, "evaluation": {"area": "sales"}})
+            )
         );
         let mut bare = build_reply_message_runtime_src(
             &Message {
@@ -2028,8 +2071,8 @@ mod tests {
         );
         for context in [
             json!({}),
-            json!({"wf": {"trail": ["WF.sales.invoice@worker1"]}}),
-            json!({"wf": {"trail": ["WF.sales.invoice@worker1"], "menu": null}}),
+            json!({"wf": {"vars": {"order": {"quantity": 10}}}}),
+            json!({"wf": {"menu": null}}),
             json!({"wf": "WF.sales.invoice@worker1"}),
         ] {
             assert_eq!(
@@ -2052,7 +2095,7 @@ mod tests {
         assert_eq!(contract.menu(), None);
 
         let contract = resolve_message_contract(&meta(json!({
-            "wf": {"trail": ["WF.sales.invoice@worker1"], "menu": sales_menu()}
+            "wf": {"menu": sales_menu()}
         })))
         .expect("ok")
         .expect("a contract");

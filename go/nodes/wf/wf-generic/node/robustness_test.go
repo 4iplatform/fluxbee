@@ -18,11 +18,11 @@ type panickingDispatcher struct {
 	panicAt string
 }
 
-func (d *panickingDispatcher) SendMsg(msg sdk.Message) error {
+func (d *panickingDispatcher) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
 	if msg.Routing.Dst.Value() == d.panicAt {
 		panic("a send that panics")
 	}
-	return d.mockDispatcher.SendMsg(msg)
+	return d.mockDispatcher.SendMsg(msg, note)
 }
 
 func lastLog(t *testing.T, rt *NodeRuntime, instanceID string) WFLogEntry {
@@ -324,9 +324,9 @@ type sendHook struct {
 	onSend func(sdk.Message)
 }
 
-func (d *sendHook) SendMsg(msg sdk.Message) error {
+func (d *sendHook) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
 	d.onSend(msg)
-	return d.mockDispatcher.SendMsg(msg)
+	return d.mockDispatcher.SendMsg(msg, note)
 }
 
 // journalGo journals a GO for instanceID as a start that crashed in its run leaves it, at attempts.
@@ -599,7 +599,7 @@ func TestADefinitionsNumbersGoOnTheWireAsWritten(t *testing.T) {
 	if got := string(disp.sent[0].Payload); got != `{"count":3,"limit":7,"list":[1,2.0],"one":1.0,"ratio":2.5}` {
 		t.Fatalf("payload on the wire: %s", got)
 	}
-	if got := string(disp.sent[0].Meta.Context); got != `{"backoff":1.5,"retries":3,"wf":{"trail":["WF.invoice@motherbee"]}}` {
+	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"backoff":1.5,"retries":3,"wf":{}}` {
 		t.Fatalf("meta.context on the wire: %s", got)
 	}
 	if got := string(disp.sent[1].Payload); got != `{"count":3,"limit":10,"list":[1,2.0],"one":1.0,"ratio":2.5}` {

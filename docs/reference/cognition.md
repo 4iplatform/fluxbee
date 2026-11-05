@@ -193,8 +193,9 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
 - **What a turn keeps** (`MemoryTurn` in `crates/fluxbee_sdk/src/protocol.rs`):
   - `direction`: `out` when its router names the agent node as the sender, `in` otherwise;
   - `src_ilk`: the sender's ILK, when the message had one;
-  - `via`, on `in` only: the node it came in through. For a message a WF forwards, the first node
-    of `meta.context.wf.trail`, the IO node it came from; otherwise its sender's L2 name;
+  - `via`, on `in` only: the node it came in through: where its cycle started, the first entry of
+    `meta.context.trace` (docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise
+    its sender's L2 name;
   - `text`: `extract_turn_text`, cut at 2,000 characters (`COGNITION_TURN_TEXT_MAX_CHARS`), the
     last one an ellipsis when cut. Empty for a turn with files alone: it is kept, so the agent's
     answer to it keeps its question;

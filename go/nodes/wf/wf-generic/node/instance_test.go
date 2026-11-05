@@ -19,10 +19,12 @@ type mockDispatcher struct {
 	sendErr error
 }
 
-func (m *mockDispatcher) SendMsg(msg sdk.Message) error {
+// SendMsg records msg as the SDK would send it, with this node's entry in its trace.
+func (m *mockDispatcher) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
 	if m.sendErr != nil {
 		return m.sendErr
 	}
+	sdk.WriteTraceEntry(&msg, m.l2name, note)
 	m.sent = append(m.sent, msg)
 	return nil
 }

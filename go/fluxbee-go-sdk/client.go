@@ -186,11 +186,19 @@ func MarshalMessage(msg Message) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// Send queues msg for the router. A message whose frame is over the limit
-// is refused with *MessageTooLargeError before it is queued: queued, it
-// would make the writer drop the connection. A full queue fails with
-// "sender queue full".
+// Send queues msg for the router, with this node's entry in its cycle's trace (SendTraced).
 func (s *NodeSender) Send(msg Message) error {
+	return s.SendTraced(msg, TraceNote{})
+}
+
+// SendTraced queues msg for the router with this node's entry in its cycle's trace
+// (docs/message-trace-v1.md): when it sends it, its own name, and what note adds, the destination
+// by name and the actions it took. A message that is not the solution's carries no trace. A
+// message whose frame is over the limit is refused with *MessageTooLargeError before it is queued:
+// queued, it would make the writer drop the connection. A full queue fails with "sender queue
+// full".
+func (s *NodeSender) SendTraced(msg Message, note TraceNote) error {
+	WriteTraceEntry(&msg, s.FullName(), note)
 	data, err := MarshalMessage(msg)
 	if err != nil {
 		return err

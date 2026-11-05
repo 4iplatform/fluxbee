@@ -30,6 +30,8 @@ use crate::shm::{
 use fluxbee_sdk::mesh::{
     install_crypto_provider, peer_hive_from_cert, HiveRegistry, MeshTlsMaterial,
 };
+use fluxbee_sdk::message_trace::{self, TraceNote};
+use fluxbee_sdk::protocol::is_solution_kind;
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reachability, build_wan_reject, Destination,
@@ -917,6 +919,7 @@ async fn handle_node(
                     &log_stream,
                     hive_id,
                     identity_frontdesk_node_name,
+                    router_name,
                     router_uuid,
                     is_gateway,
                     &lsa_snapshot,
@@ -1037,6 +1040,7 @@ async fn handle_message(
     log_stream: &stream::StreamHandle,
     hive_id: &str,
     identity_frontdesk_node_name: &str,
+    router_name: &str,
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
@@ -1345,6 +1349,17 @@ async fn handle_message(
                 send_unreachable_to(&msg, &src_handle.sender, router_uuid, "OPA_NO_TARGET")?;
                 return Ok(());
             };
+            // The router picked the destination, so the cycle's trace has its entry. Only the
+            // sender's router writes it: a router the message reaches unresolved, through a peer or
+            // the WAN, resolves it again without one (docs/message-trace-v1.md §5).
+            message_trace::write_entry(
+                &mut msg,
+                router_name,
+                TraceNote {
+                    to: Some(target.to_string()),
+                    act: vec!["resolve".to_string()],
+                },
+            );
             let nodes_guard = nodes.lock().await;
             let route = resolve_by_name(target, &src_handle, &nodes_guard, fib, &msg.meta).await?;
             match route {
@@ -6674,23 +6689,11 @@ fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &s
 }
 
 fn should_publish_turn(msg: &Message) -> bool {
-    if is_system_kind(&msg.meta.msg_type) {
-        return false;
-    }
-    if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
-        return false;
-    }
-    true
+    is_solution_kind(&msg.meta.msg_type)
 }
 
 fn should_enrich_with_memory_package(msg: &Message) -> bool {
-    if is_system_kind(&msg.meta.msg_type) {
-        return false;
-    }
-    if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
-        return false;
-    }
-    true
+    is_solution_kind(&msg.meta.msg_type)
 }
 
 /// A local node a message is delivered to.
@@ -9227,6 +9230,7 @@ mod tests {
             &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
+            "RT.gateway@motherbee",
             Uuid::new_v4(),
             false,
             &Arc::new(Mutex::new(None)),
@@ -10231,6 +10235,7 @@ mod tests {
                 &stream::StreamHandle::detached(),
                 "motherbee",
                 "SY.frontdesk.gov@motherbee",
+                "RT.gateway@motherbee",
                 Uuid::new_v4(),
                 false,
                 &Arc::new(Mutex::new(None)),
@@ -10245,6 +10250,90 @@ mod tests {
                 assert_eq!(delivered, want, "{sender_name} -> {name}");
             }
         }
+    }
+
+    /// docs/message-trace-v1.md §5: when the router picks a message's destination, the cycle's trace
+    /// gets its entry, after the sender's, and the message reaches the node it picked.
+    #[tokio::test]
+    async fn the_router_notes_the_destination_it_picks_in_the_trace() {
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let mut fib = Vec::new();
+        let mut uuids = HashMap::new();
+        let mut inboxes = HashMap::new();
+        for name in ["IO.sim@motherbee", "SY.frontdesk.gov@motherbee"] {
+            let uuid = Uuid::new_v4();
+            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            nodes.lock().await.insert(
+                uuid,
+                NodeHandle {
+                    name: name.to_string(),
+                    vpn_id: 0,
+                    sender: tx,
+                    connected_at: 0,
+                },
+            );
+            fib.push(FibEntry {
+                pattern: name.to_string(),
+                match_kind: MATCH_EXACT,
+                vpn_id: 0,
+                source: FibSource::LocalNode,
+                next_hop: Some(FibNextHop::Local(uuid)),
+                admin_distance: ADMIN_DISTANCE_LOCAL,
+                priority: 0,
+                metric: 0,
+                installed_at: 0,
+                action: ACTION_FORWARD,
+            });
+            uuids.insert(name, uuid);
+            inboxes.insert(name, rx);
+        }
+        // A person with no ILK yet: the router sends the message to the frontdesk.
+        let mut message: Message = serde_json::from_slice(&test_frame(
+            uuids["IO.sim@motherbee"],
+            "user",
+            None,
+            Destination::Resolve,
+            serde_json::json!({"type": "text", "content": "hola"}),
+        ))
+        .unwrap();
+        message_trace::write_entry(&mut message, "IO.sim@motherbee", TraceNote::default());
+        handle_message(
+            &message,
+            &nodes,
+            &Arc::new(Mutex::new(fib)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &stream::StreamHandle::detached(),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            "RT.gateway@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let frame = inboxes
+            .get_mut("SY.frontdesk.gov@motherbee")
+            .unwrap()
+            .try_recv()
+            .expect("the frontdesk gets the message");
+        let delivered: Message = serde_json::from_slice(&frame).unwrap();
+        let trace = message_trace::entries(delivered.meta.context.as_ref());
+        assert_eq!(trace.len(), 2, "{:?}", delivered.meta.context);
+        assert_eq!(trace[0].from, "IO.sim@motherbee");
+        assert_eq!(trace[0].to, None);
+        assert_eq!(trace[1].from, "RT.gateway@motherbee");
+        assert_eq!(trace[1].to.as_deref(), Some("SY.frontdesk.gov@motherbee"));
+        assert_eq!(trace[1].act, ["resolve"]);
     }
 
     /// A-78 through `handle_message`: SY.vault's broadcast reaches every node but the edge, its
@@ -10333,6 +10422,7 @@ mod tests {
                 &stream::StreamHandle::detached(),
                 "motherbee",
                 "SY.frontdesk.gov@motherbee",
+                "RT.gateway@motherbee",
                 Uuid::new_v4(),
                 false,
                 &Arc::new(Mutex::new(None)),
@@ -10424,6 +10514,7 @@ mod tests {
             &stream::StreamHandle::detached(),
             "motherbee",
             "SY.frontdesk.gov@motherbee",
+            "RT.gateway@motherbee",
             Uuid::new_v4(),
             false,
             &Arc::new(Mutex::new(None)),

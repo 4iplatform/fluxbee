@@ -48,8 +48,8 @@ a communication it has not loaded, SY.cognition loads its state from SY.storage.
 Two paths take each turn:
 
 - **The intake,** in the `STREAM_BATCH` handler, adds the turn to its communication's last turns:
-  who spoke (`in` or `out`), the sender's ILK, the node it came through (the IO node at the head
-  of a WF's trail), its text cut at 2,000 characters, its files, the option an answer chose from a
+  who spoke (`in` or `out`), the sender's ILK, the node it came through (where its cycle started,
+  the first entry of its trace, `meta.context.trace`), its text cut at 2,000 characters, its files, the option an answer chose from a
   WF's menu, and its time. It rewrites the memory region at once, so the agent's next message
   carries the turn before it, whatever the worker's backlog, and appends the thread row of a
   communication the worker has loaded. 20 turns at most, and 48 KiB.

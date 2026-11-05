@@ -10,8 +10,8 @@ use fluxbee_ai_sdk::{
     build_model_user_content_parts, build_reply_message_runtime_src, build_text_response,
     control_request, create_function_calling_model, create_llm_client, extract_response_envelope,
     extract_text, is_infrastructure_message, note_infrastructure_message,
-    resolve_model_input_from_payload_with_options, AiAccount, AiNode, AiProvider, ControlRequest,
-    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    resolve_model_input_from_payload_with_options, set_reply_act, AiAccount, AiNode, AiProvider,
+    ControlRequest, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolRegistry, HiveAiConfig, ImmediateConversationMemory,
     LanceDbThreadStateStore, Message, ModelInputOptions, ModelSettings, NodeRuntime,
     ResolvedModelInput, RuntimeConfig, TenantSource, ThreadStateGetTool, ThreadStatePutTool,
@@ -3358,7 +3358,26 @@ fn build_frontdesk_result_reply(
     } else {
         build_text_response(payload.human_message.clone())?
     };
-    Ok(build_reply_message_runtime_src(msg, value))
+    let mut reply = build_reply_message_runtime_src(msg, value);
+    set_reply_act(&mut reply, frontdesk_trace_act(&payload));
+    Ok(reply)
+}
+
+/// What the frontdesk did, for its entry in the message's trace (docs/message-trace-v1.md §5):
+/// whether it assigned the person an identity, once it decided, and its result's code. While it
+/// still collects the data, the code alone.
+fn frontdesk_trace_act(payload: &FrontdeskResultPayload) -> Vec<String> {
+    let decision = match payload.status.as_str() {
+        "ok" => Some("identity_assigned"),
+        "error" => Some("identity_not_assigned"),
+        _ => None,
+    };
+    decision
+        .map(ToString::to_string)
+        .into_iter()
+        .chain(Some(payload.result_code.to_ascii_lowercase()))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Result<()> {
@@ -3889,6 +3908,27 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// The frontdesk's entry in the message's trace says whether it assigned the person an identity,
+    /// once it decided, with its result's code (docs/message-trace-v1.md §5).
+    #[test]
+    fn the_frontdesks_reply_notes_whether_it_assigned_an_identity() {
+        let act = |status: &str, code: &str| {
+            let mut reply = build_frontdesk_result_reply(
+                &sample_request(),
+                frontdesk_result_payload(status, code, "hola"),
+            )
+            .expect("a reply");
+            fluxbee_ai_sdk::take_reply_act(&mut reply)
+        };
+        assert_eq!(act("ok", "REGISTERED"), ["identity_assigned", "registered"]);
+        assert_eq!(act("ok", "MERGED"), ["identity_assigned", "merged"]);
+        assert_eq!(
+            act("error", "REGISTER_FAILED"),
+            ["identity_not_assigned", "register_failed"]
+        );
+        assert_eq!(act("needs_input", "IN_CONVERSATION"), ["in_conversation"]);
     }
 
     /// A NODE_STATUS_GET from the orchestrator of the frontdesk's hive, the one that sends it.

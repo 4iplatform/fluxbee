@@ -368,11 +368,16 @@ Common guards:
   `end` closes the post's buttons and marks it closed. Without `subject`, the IO node does as always.
 - **The WF's block.** Every send and forward carries `meta.context.wf`. An agent shows it to its
   model, and never sends it back. A send's `meta.context` never writes `wf`. The block holds:
-  - `trail`: the nodes the message went through;
   - `vars`: the action's `vars`, the facts the WF gives the receiver. io.slack shows them as a line
     under the post;
   - `menu`: the action's menu;
   - `subject`: the action's subject.
+- **The message's trace.** Every message of a solution carries `meta.context.trace`: one entry for
+  each node it went through in its cycle, from where it started (a person's message, a timer) to
+  where it ends, with the time, the source, the destination and what the node did. Each node writes
+  its own entry. The WF's entry names the actions of its step, the one that sent the message first
+  (`["send_message", "schedule_timer"]`). An agent reads the trace before the message. It is for
+  debugging and the log: `turns` keeps every message with it.
 
 #### 4.2.4 Asking an agent or a person: the menu
 

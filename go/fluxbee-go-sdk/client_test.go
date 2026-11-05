@@ -215,7 +215,10 @@ func TestAFrameCarriesARawPayloadByteForByte(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	frame := string(<-tx)
-	if !strings.Contains(frame, `"payload":`+payload) || !strings.Contains(frame, `"context":{"note":"a<b"}`) {
+	// The context's own keys go byte for byte too, with the sender's entry in its trace
+	// (docs/message-trace-v1.md).
+	if !strings.Contains(frame, `"payload":`+payload) || !strings.Contains(frame, `"context":{"note":"a<b","trace":[{"t":"`) ||
+		!strings.Contains(frame, `"from":"WF.demo@worker1","to":"AI.sales@worker1"}]}`) {
 		t.Fatalf("the frame changed the payload or the context: %s", frame)
 	}
 	if strings.HasSuffix(frame, "\n") {

@@ -5,8 +5,9 @@
 - The direction was agreed with the operator on 2026-11-04, in a design chat (FINDINGS A-138, the
   sprint's block 3).
 - The design closed the same day: nothing is open (§9).
-- Next: the build, in one release with A-151, and its WF gate. The A-137 chat (cognition across
-  hands) builds on this trace.
+- Built in code the same day, for the next release (§8).
+- Next: the release, with A-151, and its WF gate on 8.x. Then the A-137 chat (cognition across
+  hands), which builds on this trace.
 
 This is the single place for the topic.
 
@@ -136,6 +137,11 @@ está la nota de crédito?". When the WF's last message of the cycle reaches io.
       vez un nodo hace más de una acción a la vez… raro… pero posible"*.
 13. **Short words:** each one names an action, in up to 32 characters, and an entry holds up to 8
     (the operator's "ok" to the proposal).
+14. **The frontdesk notes whether it assigned an identity:** *"No estaría mal que el frontdesk
+    tenga la acción de asignar identidad o no cuando lo apruebe"*.
+    - Once it decides, its entry says `identity_assigned` or `identity_not_assigned`, with its
+      result's code (`registered`, `merged`, `register_failed`…).
+    - While it collects the data, the code alone (`in_conversation`).
 
 ---
 
@@ -165,6 +171,7 @@ An entry takes about 90 bytes. A cycle of 4 to 12 entries is 0.4 to 1.1 KB, unde
 | An IO (`build_user_message`) | a message enters: a person writes, a person clicks | the IO → its destination | nothing, or what it saw (a click) |
 | A WF | each send of a transition | the WF → its destination | the actions its transition ran, the one that sent this message first: `["send_message", "schedule_timer"]` on Case 4's post to the team |
 | An agent (the AI runtime, as it sends) | each reply | the agent → the requester | the option it chose, when it answers a menu |
+| The frontdesk (an agent) | each reply | the frontdesk → the requester | `identity_assigned` or `identity_not_assigned` once it decides, and its result's code (decision 14) |
 | The router | a message with no destination | the router → the destination it picked | `resolve` |
 
 The last column is what each node writes by default. The words are free: a node adds whatever
@@ -224,26 +231,34 @@ else it knows it did.
 
 ---
 
-## 8. What changes (the build)
+## 8. What changed (the build, 2026-11-04)
 
-- **The IO family:** `build_user_message` writes the IO's entry.
-- **The AI runtime:** writes the agent's entry where it stamps the agent's ILK.
+- **Both SDKs write the sender's entry on every solution message they send.**
+  - Rust: `NodeSender::send`, or `send_traced` with a note (crates/fluxbee_sdk/src/message_trace.rs).
+  - Go: `NodeSender.Send`, or `SendTraced` with a note (go/fluxbee-go-sdk/message_trace.go).
+  - The note (`TraceNote`) is what the node adds: the destination by name, and its actions.
+  - So every IO node writes its entry with no change of its own: its messages go through the
+    SDK's send.
+- **The AI runtime** sends a reply with a note: to the request's `src_l2_name`, the words the node
+  noted on its reply (`set_reply_act`), and the option the agent chose from a menu.
+  - The frontdesk notes its identity decision (decision 14).
 - **The WF:**
-  - writes its entry on each send, with the actions of its transition;
-  - its `send_message` copies the event's trace;
-  - stops writing its trail.
-- **The router:** writes its entry when it picks the destination of a message that has none, on the
-  local, peer and WAN paths.
-- **ai.generic and cognition:** read the trace for the path and the "via".
-- **The docs:**
-  - this one;
-  - the WF spec's `meta.context`;
-  - Archi's handbook chapter on WFs, for what a node sees.
-- **Tests:** in each place. The WF gate of the release checks a cycle's trace in `turns`.
-- **Not touched:**
-  - the SY nodes and system messages;
-  - SY.storage, since `turns` keeps the whole message;
-  - Archi's screen, which comes later.
+  - **Which trace a send carries:** the trace of the cycle the instance is handling
+    (`takeCycleTrace`):
+    - a node's message brings its own;
+    - an internal event keeps it;
+    - a timer's fire starts one with none.
+  - It lives in memory: after a restart, a send starts its trace anew.
+  - **Its note** names the kinds of action of its step, the one that sent the message first.
+  - **It no longer writes the block's `trail`.**
+- **The router** writes its entry when it resolves a message with no destination, only on the
+  sender's router (`handle_message`).
+- **ai.generic:**
+  - the `Message trace (UTC)` block, with the newest 32 entries;
+  - the speaker's "via" comes from the trace's origin.
+- **Cognition** takes the "via" from the trace's origin too.
+- **Tests:** in each place.
+- **The docs** that described the trail now describe the trace.
 
 ---
 

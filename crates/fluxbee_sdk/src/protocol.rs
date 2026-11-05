@@ -540,6 +540,14 @@ pub fn is_system_kind(msg_type: &str) -> bool {
     msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
 }
 
+/// Whether a message-kind string is the solution's: any kind but system, admin and
+/// query_response. The router publishes these as turns and gives an agent its memory with them, and
+/// they carry the trace of their cycle (docs/message-trace-v1.md).
+#[inline]
+pub fn is_solution_kind(msg_type: &str) -> bool {
+    !is_system_kind(msg_type) && msg_type != "admin" && msg_type != "query_response"
+}
+
 pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";

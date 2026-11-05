@@ -2,10 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fluxbee_sdk::message_trace::TraceNote;
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::is_system_kind;
 use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -15,7 +16,7 @@ use crate::errors::AiSdkError;
 use crate::errors::Result;
 use crate::function_calling::DEFAULT_MAX_TURNS;
 use crate::llm::MODEL_CALL_TIMEOUT;
-use crate::message::{build_reply_message_runtime_src, Message};
+use crate::message::{build_reply_message_runtime_src, take_reply_act, Message};
 use crate::node_trait::AiNode;
 
 /// Command channel the AI runtime drains. Binary callers must declare a
@@ -422,6 +423,9 @@ async fn process_one<N: AiNode>(
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<()> {
+    // The reply goes to the requester's UUID: its entry in the cycle's trace names the requester by
+    // the name the router stamped on the request.
+    let requester = msg.routing.src_l2_name.clone();
     let maybe_response = run_handler(node.as_ref(), msg, config.handler_timeout, &metrics).await;
 
     if let Some(mut response) = maybe_response {
@@ -429,14 +433,18 @@ async fn process_one<N: AiNode>(
         if response.meta.src_ilk.is_none() {
             response.meta.src_ilk = config.self_ilk_id.clone();
         }
+        let note = reply_trace_note(requester.as_deref(), &mut response);
         // Sending a reply again is safe: a send that timed out or was refused never queued it (the
         // SDK's send is a cancel-safe channel send), so a reply cannot go out twice.
         execute_with_retry(
             || async {
-                timeout(config.write_timeout, writer.send(response.clone()))
-                    .await
-                    .map_err(|_| AiSdkError::Timeout("router write timeout".to_string()))?
-                    .map_err(AiSdkError::Node)
+                timeout(
+                    config.write_timeout,
+                    writer.send_traced(response.clone(), note.clone()),
+                )
+                .await
+                .map_err(|_| AiSdkError::Timeout("router write timeout".to_string()))?
+                .map_err(AiSdkError::Node)
             },
             &config.write_retry,
             "write",
@@ -448,6 +456,26 @@ async fn process_one<N: AiNode>(
 
     metrics.processed_messages.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// The agent's entry in its reply's trace (docs/message-trace-v1.md §5): to whoever asked, with what
+/// the node noted it did (`set_reply_act`, taken out of the reply) and the option it chose when it
+/// answered a menu (`meta.context.evaluation.option`).
+fn reply_trace_note(requester: Option<&str>, response: &mut Message) -> TraceNote {
+    let mut act = take_reply_act(response);
+    let option = response
+        .meta
+        .context
+        .as_ref()
+        .and_then(|context| context.pointer("/evaluation/option"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|option| !option.is_empty());
+    act.extend(option.map(ToString::to_string));
+    TraceNote {
+        to: requester.map(ToString::to_string),
+        act,
+    }
 }
 
 /// Runs a message's handler once. When it fails or runs out of time it may already have called a
@@ -670,6 +698,27 @@ mod tests {
     }
 
     const SHORT: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn a_reply_names_its_requester_and_the_option_the_agent_chose() {
+        let mut response = message("user");
+        response.meta.context = Some(json!({
+            "evaluation": {"reply": "Te paso con el equipo", "option": " handover ", "params": {}}
+        }));
+        let note = reply_trace_note(Some("WF.ventas@worker1"), &mut response);
+        assert_eq!(note.to.as_deref(), Some("WF.ventas@worker1"));
+        assert_eq!(note.act, ["handover"]);
+
+        response.meta.context = None;
+        let note = reply_trace_note(None, &mut response);
+        assert_eq!(note, TraceNote::default());
+
+        // What the node noted it did comes first, and never goes out in the reply.
+        crate::message::set_reply_act(&mut response, ["identity_assigned", "registered"]);
+        let note = reply_trace_note(Some("IO.slack@motherbee"), &mut response);
+        assert_eq!(note.act, ["identity_assigned", "registered"]);
+        assert_eq!(response.meta.context, Some(json!({})));
+    }
 
     #[tokio::test]
     async fn a_handler_out_of_time_is_answered_with_an_error_and_never_run_again() {

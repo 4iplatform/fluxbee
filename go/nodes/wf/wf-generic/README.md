@@ -29,10 +29,11 @@ How it runs a workflow (0.1.90, 0.1.91, Case 3 and Case 4, docs/wf-orchestration
   `start_from`, and its running instances fail at the next start (`definition_unavailable`).
 - **Forwarding.** `forward` sends a message on as it was received, the event's or one `keep_message`
   kept: the payload byte for byte, every meta field but `memory_package`; the WF changes the
-  destination, the thread, the `meta.context` keys it writes and its block, `meta.context.wf` (the
-  trail of the nodes the message went through, the action's `vars`, its `menu`, and its `subject`,
-  `new`, `same` or `end`, on a send or a forward to an `IO.*` node), which every message a WF sends
-  carries. A transition matches by `msg`, by `src` or both; one without a `target_state` is
+  destination, the thread, the `meta.context` keys it writes, the trace and its block,
+  `meta.context.wf` (the action's `vars`, its `menu`, and its `subject`, `new`, `same` or `end`, on
+  a send or a forward to an `IO.*` node), which every message a WF sends carries. The trace,
+  `meta.context.trace`, is the cycle's the instance is handling, and the Go SDK adds the WF's entry
+  with the kinds of action of its step (docs/message-trace-v1.md). A transition matches by `msg`, by `src` or both; one without a `target_state` is
   internal (no exit or entry actions); a timer's `fire_in` or `fire_at` may be a `$ref`, checked
   when the action runs. The Go SDK writes frames without HTML escaping.
 - **Asking an agent.** A `send_message` or a `forward` to an `AI.*` node may offer it a `menu`, the

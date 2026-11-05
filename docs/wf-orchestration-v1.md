@@ -557,7 +557,8 @@ todo probado"*.
 7. **The WF's block, `meta.context.wf`,** goes on every message a WF sends.
    - `trail` lists the nodes the message went through. A `forward` takes the message's own trail
      (or its sender's name, when it has none) and adds the WF's name. A `send_message` starts it
-     with the WF's name.
+     with the WF's name. **Replaced in 0.1.100** by the message's trace, `meta.context.trace`, which
+     every node writes ([message-trace-v1](message-trace-v1.md), FINDINGS A-138).
    - `vars` holds what the action's `vars` writes, `$ref`-resolved: the WF's deterministic context
      for the receiver. It is left out when the action has none.
    - Neither action's `context` may write `wf`, and validation refuses it. A `wf` that a `$ref`

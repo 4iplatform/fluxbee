@@ -183,24 +183,29 @@ On every request the node reads the key of its provider from SY.vault:
     it arrives, so the next message carries the one before it. The node keeps no history of its
     own (FINDINGS A-133).
   - **The message being answered names its sender the same way,** once a block comes before it:
-    `Current user message, from <sender ILK> via <node>:`, the node being the first of a WF's
-    trail or else the sender. As text, a line ahead of the message; as parts, a text part of its
+    `Current user message, from <sender ILK> via <node>:`, the node being where its cycle started,
+    the first entry of its trace, or else the sender. As text, a line ahead of the message; as parts, a text part of its
     own after the blocks.
   - Nothing ahead of the message is cut, and the message itself never is (FINDINGS A-71): with 20
     turns of 2,000 characters the block passes 40,000 characters (some 10,000 tokens a call), and
     the WF's block and the message still reach the model whole.
-- **A WF's block:** a WF puts `meta.context.wf`, `{"trail": [node names], "vars": {...}}`, on every
+- **The message's trace:** `meta.context.trace` ([docs/message-trace-v1.md](../../../docs/message-trace-v1.md)),
+  one entry for each node of the message's cycle. The node shows it to the model as a text block
+  after the memory block: `Message trace (UTC):`, one line for each entry, such as
+  `10:17:03.180 WF.sales.invoice@worker1 -> AI.invoice@worker1 [forward]`, the newest 32 after a
+  line that counts the rest.
+- **A WF's block:** a WF puts `meta.context.wf`, `{"vars": {...}}`, on every
   message it sends
   ([docs/wf-orchestration-v1.md §5.2.1](../../../docs/wf-orchestration-v1.md#521-the-build-design)),
   with a `menu` when it asks the agent to choose (below). The node shows it to the model as a text
-  block after the memory block and before the message: the trail as a path
-  (`IO.api@motherbee -> WF.sales.invoice@worker1`), `vars` as JSON, cut at 8 KiB with a line that
-  says so, and the menu.
+  block after the trace and before the message: `vars` as JSON, cut at 8 KiB with a line that says
+  so, and the menu.
   - Text and multimodal input alike: as parts, each block is a text part of its own, first.
 - **Its reply** carries the agent's own ILK as `src_ilk` and the sender's as `dst_ilk`. Its
   `meta.context` is the request's without `thread_id`, `src_ilk`, `response_envelope`,
   `final_response_contract`, `wf` and `evaluation`: an answer never carries the request's WF block
-  back, and its evaluation is only ever its own.
+  back, and its evaluation is only ever its own. It keeps the request's trace, and the runtime adds
+  the agent's entry as it sends: to whoever asked, with the option it chose from a menu.
 - **A structured answer:** a message whose `meta.context.response_envelope` holds a contract
   (`json_object_v1`: `required`, `properties` of type `string`, `boolean`, `integer` or `number`, an
   optional `enum` for strings, `strict`) is answered with the contract's object, as JSON in the

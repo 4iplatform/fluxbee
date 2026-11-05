@@ -41,7 +41,7 @@ type flakyDispatcher struct {
 	sent      []sdk.Message
 }
 
-func (m *flakyDispatcher) SendMsg(msg sdk.Message) error {
+func (m *flakyDispatcher) SendMsg(msg sdk.Message, _ sdk.TraceNote) error {
 	m.calls++
 	if m.calls <= m.failFirst {
 		if m.err != nil {
@@ -119,8 +119,9 @@ func TestRouteToFailedTerminatesInstance(t *testing.T) {
 
 // 0.1.91 (wf-orchestration-v1 §5.2.1, items 1 and 7) + gap-3 + Case 3 (§5.3.6): a send carries the
 // instance's thread, the conversation's (thread_id_ref left the language), and its meta.context
-// (e.g. the person's context.io) with the WF's block: a trail that starts at this node, what the
-// action's vars writes, $ref-resolved, and the action's menu, as written.
+// (e.g. the person's context.io) with its trace, the WF's entry naming its action
+// (docs/message-trace-v1.md), and the WF's block: what the action's vars writes, $ref-resolved, and
+// the action's menu, as written.
 func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap"}
 	actx := makeActx(t, disp, &mockTimerSender{})
@@ -156,16 +157,19 @@ func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	if got := derefStringPtr(sent.Meta.ThreadID); got != "conv-9" {
 		t.Fatalf("a send carries the instance's thread, got %q", got)
 	}
-	want := `{"io":{"reply_target":{"address":"conv-9","kind":"api"}},"wf":{"menu":{"help":"Invoice the <order> & answer.","options":[{"name":"issued","description":"You issued it.","params":{"due_in":{"type":"string","enum":["1h","30d"]}}},{"name":"answer","description":"You answer."}]},"trail":["WF.invoice@motherbee"],"vars":{"note":"<a & b>","order":{"quantity":10,"unit_price":1.5}}}}`
-	if got := string(sent.Meta.Context); got != want {
+	want := `{"io":{"reply_target":{"address":"conv-9","kind":"api"}},"wf":{"menu":{"help":"Invoice the <order> & answer.","options":[{"name":"issued","description":"You issued it.","params":{"due_in":{"type":"string","enum":["1h","30d"]}}},{"name":"answer","description":"You answer."}]},"vars":{"note":"<a & b>","order":{"quantity":10,"unit_price":1.5}}}}`
+	if got := contextWithoutTrace(t, sent); got != want {
 		t.Fatalf("meta.context:\n got %s\nwant %s", got, want)
+	}
+	if tracePath(sent) != "[WF.invoice@motherbee]" || traceAct(sent) != "send_message" {
+		t.Fatalf("the trace: %s", sent.Meta.Context)
 	}
 }
 
-// Without a meta.context or vars, a send still carries the WF's block, with its trail, and the
-// instance's thread; without a person (the message that started the instance had no src_ilk nor
-// ich), it carries none.
-func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
+// Without a meta.context or vars, a send still carries its trace, the WF's block and the instance's
+// thread; without a person (the message that started the instance had no src_ilk nor ich), it
+// carries none.
+func TestSendMessageWithoutContextCarriesItsTrace(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap2"}
 	actx := makeActx(t, disp, &mockTimerSender{})
 	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-2", "conv-2", "invoice", map[string]any{}, fixedClock)
@@ -181,8 +185,8 @@ func TestSendMessageWithoutContextCarriesTheTrail(t *testing.T) {
 	if got := derefStringPtr(disp.sent[0].Meta.ThreadID); got != "conv-2" {
 		t.Fatalf("a send carries the instance's thread, got %q", got)
 	}
-	if got := string(disp.sent[0].Meta.Context); got != `{"wf":{"trail":["WF.invoice@motherbee"]}}` {
-		t.Fatalf("meta.context: %s", got)
+	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"wf":{}}` || tracePath(disp.sent[0]) != "[WF.invoice@motherbee]" {
+		t.Fatalf("meta.context: %s", disp.sent[0].Meta.Context)
 	}
 	if meta := disp.sent[0].Meta; meta.SrcIlk != nil || meta.Ich != nil {
 		t.Fatalf("no person: %+v", meta)
@@ -216,13 +220,13 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	}
 	const carriesThePerson, namesThePerson, noPerson = `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="ilk:person" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="" ich=""`
 	for _, c := range []struct{ target, subject, ilks, context string }{
-		{"AI.payments@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
-		{"WF.billing@motherbee", "", carriesThePerson, `{"wf":{"trail":["WF.sales@motherbee"]}}`},
-		{personsIO, "same", namesThePerson, `{"wf":{"subject":"same","trail":["WF.sales@motherbee"]}}`},
-		{"IO.slack.team@motherbee", "end", noPerson, `{"wf":{"subject":"end","trail":["WF.sales@motherbee"]}}`},
+		{"AI.payments@motherbee", "", carriesThePerson, `{"wf":{}}`},
+		{"WF.billing@motherbee", "", carriesThePerson, `{"wf":{}}`},
+		{personsIO, "same", namesThePerson, `{"wf":{"subject":"same"}}`},
+		{"IO.slack.team@motherbee", "end", noPerson, `{"wf":{"subject":"end"}}`},
 	} {
 		sent := send(c.target, c.subject)
-		if ilks(sent) != c.ilks || derefString(sent.Meta.ThreadID) != "conv-3" || string(sent.Meta.Context) != c.context {
+		if ilks(sent) != c.ilks || derefString(sent.Meta.ThreadID) != "conv-3" || contextWithoutTrace(t, sent) != c.context {
 			t.Fatalf("a send to %s: %s on %q, %s; want %s, %s", c.target, ilks(sent), derefString(sent.Meta.ThreadID), sent.Meta.Context, c.ilks, c.context)
 		}
 	}
@@ -236,6 +240,7 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		Meta:    sdk.Meta{MsgType: "user", SrcIlk: strPtr("ilk:agent"), DstIlk: strPtr("ilk:supervisor"), Ich: strPtr("ich:slack:team"), ThreadID: strPtr("conv-3")},
 		Payload: json.RawMessage(`{"type":"text","content":"approved"}`),
 	})
+	inst.takeCycleTrace(answer) // as its transition takes it
 	forward := func(target, subject string) sdk.Message {
 		t.Helper()
 		if err := execForward(context.Background(), ActionDefinition{Type: "forward", Target: target, Subject: subject}, inst, answer, actx); err != nil {
@@ -245,7 +250,7 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	}
 	const asReceived = `src_ilk="ilk:agent" dst_ilk="ilk:supervisor" ich="ich:slack:team"`
 	if sent := forward("IO.slack.team@motherbee", "same"); ilks(sent) != asReceived ||
-		string(sent.Meta.Context) != `{"wf":{"subject":"same","trail":["AI.sales@motherbee","WF.sales@motherbee"]}}` {
+		contextWithoutTrace(t, sent) != `{"wf":{"subject":"same"}}` || tracePath(sent) != "[AI.sales@motherbee WF.sales@motherbee]" {
 		t.Fatalf("a forward to the team: %s %s", ilks(sent), sent.Meta.Context)
 	}
 	if sent := forward(personsIO, ""); ilks(sent) != `src_ilk="ilk:agent" dst_ilk="ilk:person" ich="ich:api:conv-3"` {
@@ -286,5 +291,51 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 		if sent := send(target, ""); ilks(sent) != noPerson {
 			t.Fatalf("a send to %s without a person: %s", target, ilks(sent))
 		}
+	}
+}
+
+// The trace a transition's sends carry is its cycle's (docs/message-trace-v1.md): a node's message
+// brings its own; an internal event, under its trace_id, keeps the one of the event that emitted it;
+// a timer's fire starts a cycle with none. A trace an action's context writes is not the cycle's,
+// and never goes out.
+func TestATransitionSendsTheTraceOfItsCycle(t *testing.T) {
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-trace", "conv-t", "invoice", map[string]any{}, fixedClock)
+	person := from("IO.in@motherbee", sdk.Message{Routing: sdk.Routing{TraceID: "trace-person"}, Meta: sdk.Meta{MsgType: "user"}, Payload: json.RawMessage(`{}`)})
+	entries := func() int {
+		var list []sdk.TraceEntry
+		_ = json.Unmarshal(inst.cycleTrace, &list)
+		return len(list)
+	}
+	inst.takeCycleTrace(person)
+	if entries() != 1 {
+		t.Fatalf("a node's message brings its trace: %s", inst.cycleTrace)
+	}
+	internal := sdk.Message{Routing: sdk.Routing{TraceID: "trace-person"}, Meta: sdk.Meta{MsgType: "user", Msg: strPtr("CHECKED")}}
+	inst.takeCycleTrace(internal)
+	if entries() != 1 {
+		t.Fatalf("an internal event keeps its cycle's trace: %s", inst.cycleTrace)
+	}
+
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-trace"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	actx.TransitionActions = []string{"set_variable", "send_message", "schedule_timer"}
+	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Context: map[string]any{"trace": "not the cycle's"}}, Payload: map[string]any{}}
+	if err := execSendMessage(context.Background(), action, inst, internal, actx); err != nil {
+		t.Fatal(err)
+	}
+	if sent := disp.sent[0]; tracePath(sent) != "[IO.in@motherbee WF.invoice@motherbee]" || traceAct(sent) != "send_message set_variable schedule_timer" {
+		t.Fatalf("the send carries the cycle's trace and names the step's actions, its own first: %s", sent.Meta.Context)
+	}
+
+	fire := from("SY.timer@motherbee", sdk.Message{Routing: sdk.Routing{TraceID: "trace-fire"}, Meta: sdk.Meta{MsgType: sdk.SYSTEMKind, Msg: strPtr("TIMER_FIRED")}})
+	inst.takeCycleTrace(fire)
+	if inst.cycleTrace != nil {
+		t.Fatalf("a timer's fire starts a cycle with none: %s", inst.cycleTrace)
+	}
+	if err := execSendMessage(context.Background(), action, inst, fire, actx); err != nil {
+		t.Fatal(err)
+	}
+	if sent := disp.sent[1]; tracePath(sent) != "[WF.invoice@motherbee]" {
+		t.Fatalf("a send on a timer's fire starts its trace: %s", sent.Meta.Context)
 	}
 }

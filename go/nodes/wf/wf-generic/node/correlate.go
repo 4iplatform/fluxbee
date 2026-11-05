@@ -334,6 +334,7 @@ func (rt *NodeRuntime) runCreation(ctx context.Context, msg sdk.Message, instanc
 	inst.PersonIO = msg.SourceL2Name()
 	inst.DefinitionHash = rt.DefHash
 	inst.CurrentTraceID = msg.Routing.TraceID
+	inst.takeCycleTrace(msg)
 	log.Printf(
 		"wf: create accepted instance_id=%s thread_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q payload=%s",
 		instanceID,
@@ -545,7 +546,7 @@ func answerNotTaken(actx ActionContext, msg sdk.Message, reason, detail string) 
 		thread := *threadID
 		resp.Meta.ThreadID = &thread
 	}
-	if err := actx.Dispatcher.SendMsg(resp); err != nil {
+	if err := actx.Dispatcher.SendMsg(resp, sdk.TraceNote{}); err != nil {
 		return fmt.Errorf("%s not sent: %w", msgNotTaken, err)
 	}
 	return nil

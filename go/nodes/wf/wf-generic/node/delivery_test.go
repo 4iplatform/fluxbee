@@ -474,8 +474,8 @@ type crashingDispatcher struct {
 	crashAt string
 }
 
-func (d *crashingDispatcher) SendMsg(msg sdk.Message) error {
-	if err := d.mockDispatcher.SendMsg(msg); err != nil {
+func (d *crashingDispatcher) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
+	if err := d.mockDispatcher.SendMsg(msg, note); err != nil {
 		return err
 	}
 	if msg.Routing.Dst.Value() == d.crashAt {

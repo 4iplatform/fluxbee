@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
+use crate::message_trace::{self, TraceNote};
 use crate::node_client::NodeError;
 use crate::protocol::NodeAnnouncePayload;
 use crate::protocol::{build_withdraw, Destination, Message};
@@ -124,6 +125,14 @@ impl NodeSender {
     }
 
     pub async fn send(&self, msg: Message) -> Result<(), NodeError> {
+        self.send_traced(msg, TraceNote::default()).await
+    }
+
+    /// Sends `msg` with this node's entry in its cycle's trace (docs/message-trace-v1.md): when it
+    /// sends it, its own name, and what `note` adds, the destination by name and the actions it
+    /// took. A message that is not the solution's carries no trace.
+    pub async fn send_traced(&self, mut msg: Message, note: TraceNote) -> Result<(), NodeError> {
+        message_trace::write_entry(&mut msg, &self.full_name(), note);
         let msg = normalize_outbound_message(msg);
         let data = serde_json::to_vec(&msg)?;
         if data.len() > MAX_FRAME_SIZE {

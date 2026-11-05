@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use fluxbee_ai_sdk::{AiAccount, AiProvider, HiveAiConfig, TenantSource, UsageRecorder};
+use fluxbee_sdk::message_trace;
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
@@ -918,24 +919,17 @@ fn recent_turn_of(
     })
 }
 
-/// The node a turn came in through: for a message a WF forwards, the first node of its trail
-/// (`meta.context.wf.trail`, the IO node it came from); otherwise its sender, as its router names
-/// it.
+/// The node a turn came in through: where its cycle started, its trace's first entry
+/// (`meta.context.trace`, docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise
+/// its sender, as its router names it.
 fn turn_via(message: &Message) -> Option<String> {
     let named = |node: Option<&str>| {
         node.map(str::trim)
             .filter(|node| !node.is_empty())
             .map(|node| turn_field(node, COGNITION_TURN_NAME_MAX_CHARS))
     };
-    named(
-        message
-            .meta
-            .context
-            .as_ref()
-            .and_then(|context| context.pointer("/wf/trail/0"))
-            .and_then(Value::as_str),
-    )
-    .or_else(|| named(message.routing.src_l2_name.as_deref()))
+    named(message_trace::origin(message.meta.context.as_ref()).as_deref())
+        .or_else(|| named(message.routing.src_l2_name.as_deref()))
 }
 
 /// What an agent chose from a WF's menu with an answer it sent: the option and its params, as its
@@ -4898,9 +4892,12 @@ mod tests {
     /// What a supervisor writes through the supervisors' io.slack, and a WF forwards to the agent.
     fn supervisor_says(content: &str) -> Message {
         let mut message = turn_copy("WF.sales@motherbee", Some("ilk:supervisor"), text(content));
-        message.meta.context = Some(json!({
-            "wf": {"trail": ["IO.slack.supervisores@motherbee", "WF.sales@motherbee"]}
-        }));
+        message.meta.context = Some(json!({"trace": [
+            {"t": "2026-10-30T12:05:00.000Z", "from": "IO.slack.supervisores@motherbee",
+             "to": "WF.sales@motherbee"},
+            {"t": "2026-10-30T12:05:00.050Z", "from": "WF.sales@motherbee",
+             "to": TEST_AGENT_NODE, "act": ["forward"]}
+        ]}));
         message
     }
 

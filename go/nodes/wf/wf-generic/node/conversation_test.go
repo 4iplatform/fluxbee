@@ -65,7 +65,8 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 	const payload = `{"type":"text","content":"<b>1 & 2</b> > 0","amount":1.10,"z":1,"a":[2.50,"x"]}`
 	frame := `{"routing":{"src":"io-uuid","src_l2_name":"IO.in@motherbee","dst":"WF.invoice@motherbee","ttl":16,"trace_id":"trace-raw"},` +
 		`"meta":{"type":"user","src_ilk":"ilk:person","dst_ilk":"ilk:wf","ich":"ich:api:1","thread_id":"conv-1","scope":"vpn","priority":"high",` +
-		`"memory_package":{"package_version":1,"thread_id":"conv-1"},"context":{"io":{"reply_target":{"kind":"api","address":"a&b"}}}},` +
+		`"memory_package":{"package_version":1,"thread_id":"conv-1"},"context":{"io":{"reply_target":{"kind":"api","address":"a&b"}},` +
+		`"trace":[{"t":"2026-11-04T10:17:03.120Z","from":"IO.in@motherbee","to":"WF.invoice@motherbee"}]}},` +
 		`"payload":` + payload + `}`
 	path := filepath.Join(t.TempDir(), "wf.db")
 	rt, disp := newTestRuntime(t, path, forwardingWorkflowJSON, nil)
@@ -92,8 +93,9 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 	if forwarded.Routing.Dst.Value() != "AI.host@motherbee" || forwarded.Routing.SrcL2Name != nil || forwarded.Routing.Src != "wf-uuid" || forwarded.Routing.TraceID != "trace-raw" {
 		t.Fatalf("the routing is the WF's: %+v", forwarded.Routing)
 	}
-	if got := string(meta.Context); got != `{"channel":"sales","io":{"reply_target":{"address":"a&b","kind":"api"}},"wf":{"menu":{"options":[{"name":"ok","description":"It is fine & done."}]},"trail":["IO.in@motherbee","WF.invoice@motherbee"],"vars":{"seen":"IO.in@motherbee"}}}` {
-		t.Fatalf("the context: the message's, the keys the action writes and the WF's block: %s", got)
+	if got := contextWithoutTrace(t, forwarded); got != `{"channel":"sales","io":{"reply_target":{"address":"a&b","kind":"api"}},"wf":{"menu":{"options":[{"name":"ok","description":"It is fine & done."}]},"vars":{"seen":"IO.in@motherbee"}}}` ||
+		tracePath(forwarded) != "[IO.in@motherbee WF.invoice@motherbee]" || traceAct(forwarded) != "forward keep_message" {
+		t.Fatalf("the context: the message's, the keys the action writes, its trace and the WF's block: %s", meta.Context)
 	}
 
 	// The inbound journal keeps a message byte for byte too, for a replay.
@@ -109,14 +111,15 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 	}
 
 	// After a restart, the kept message goes out as it came, and the agent's answer, forwarded, keeps
-	// the trail it brings.
+	// the trace it brings: its cycle's.
 	rt, disp = newTestRuntime(t, path, forwardingWorkflowJSON, &mockTimerLister{})
 	if err := rt.Recover(context.Background(), recoverOpts); err != nil {
 		t.Fatal(err)
 	}
 	reply := from("AI.host@motherbee", sdk.Message{
 		Routing: sdk.Routing{Src: "agent-uuid", TraceID: "trace-reply"},
-		Meta:    sdk.Meta{MsgType: "user", ThreadID: forwarded.Meta.ThreadID, Context: json.RawMessage(`{"wf":{"trail":["IO.in@motherbee","WF.invoice@motherbee","AI.host@motherbee"]}}`)},
+		Meta: sdk.Meta{MsgType: "user", ThreadID: forwarded.Meta.ThreadID, Context: json.RawMessage(`{"trace":[{"t":"2026-11-04T10:17:03.120Z","from":"IO.in@motherbee","to":"WF.invoice@motherbee"},` +
+			`{"t":"2026-11-04T10:17:03.180Z","from":"WF.invoice@motherbee","to":"AI.host@motherbee","act":["forward"]}]}`)},
 		Payload: json.RawMessage(`{"type":"text","content":"a < b"}`),
 	})
 	if err := Dispatch(context.Background(), reply, rt); err != nil {
@@ -126,7 +129,7 @@ func TestAForwardedPayloadGoesOutByteForByte(t *testing.T) {
 		t.Fatalf("sent %d", len(disp.sent))
 	}
 	if wire := onTheWire(disp.sent[0]); !strings.Contains(wire, `"payload":{"type":"text","content":"a < b"}`) ||
-		fmt.Sprint(wfBlock(t, disp.sent[0])["trail"]) != "[IO.in@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
+		tracePath(disp.sent[0]) != "[IO.in@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
 		t.Fatalf("the answer, forwarded: %s", wire)
 	}
 	if wire := onTheWire(disp.sent[1]); !strings.Contains(wire, `"payload":`+payload) || derefString(disp.sent[1].Meta.SrcIlk) != "ilk:person" {

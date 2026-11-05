@@ -133,10 +133,10 @@ func TestARefWithADefaultForwardsAMessageWithoutContext(t *testing.T) {
 		t.Fatalf("sent %d", len(disp.sent))
 	}
 	// Each carries the WF's block too (wf-orchestration-v1 §5.2.1, item 7).
-	if got := string(disp.sent[0].Meta.Context); got != `{"io":{"channel":"wapp"},"wf":{"trail":["WF.invoice@motherbee"]}}` {
+	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"io":{"channel":"wapp"},"wf":{}}` {
 		t.Fatalf("a present field is taken: %s", got)
 	}
-	if got := string(disp.sent[1].Meta.Context); got != `{"wf":{"trail":["WF.invoice@motherbee"]}}` {
+	if got := contextWithoutTrace(t, disp.sent[1]); got != `{"wf":{}}` {
 		t.Fatalf("a missing field takes its default: %s", got)
 	}
 	if got := string(disp.sent[0].Payload); got != `{"lang":"en","text":"hello"}` {

@@ -78,6 +78,11 @@ type WFInstance struct {
 	Input          map[string]any
 	StateVars      map[string]any // mutable state variables (state_json)
 	CurrentTraceID string         // trace_id of the event being processed: its sends carry it
+	// cycleTrace is the trace of the cycle the instance is handling, and cycleTraceID that cycle's
+	// trace_id (takeCycleTrace): the sends of its transitions carry it. In memory only: after a
+	// restart, a send starts its trace anew.
+	cycleTrace     json.RawMessage
+	cycleTraceID   string
 	CreatedAtMS    int64
 	UpdatedAtMS    int64
 	TerminatedAtMS *int64
@@ -307,8 +312,14 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	}
 
 	// The event's trace_id goes on every send of the transition (and on a send again when recovery
-	// runs the event again).
+	// runs the event again), and so does the trace of its cycle, with the WF's entry naming what the
+	// step runs: the exit, own and entry actions (docs/message-trace-v1.md §5).
 	inst.CurrentTraceID = event.Routing.TraceID
+	inst.takeCycleTrace(event)
+	actx.TransitionActions = actionKinds(chosen.Actions)
+	if !internal {
+		actx.TransitionActions = actionKinds(stateDef.ExitActions, chosen.Actions, targetStateDef.EntryActions)
+	}
 
 	// Execute exit_actions → transition.actions → entry_actions. A fatal action failure (gap-2) at
 	// any step routes the instance to a loud terminal failure instead of advancing with inconsistent
@@ -455,6 +466,7 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 
 	prevState := inst.CurrentState
 	inst.CurrentTraceID = event.Routing.TraceID
+	inst.takeCycleTrace(event)
 
 	// Run current state's exit_actions then cancelled entry_actions. Best-effort: the instance is
 	// already terminating into cancelled, so an action failure here is logged, not routed to failed.
@@ -474,6 +486,19 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 	return inst.commit(ctx, actx, mutation)
 }
 
+// takeCycleTrace takes the trace of the cycle event belongs to (docs/message-trace-v1.md): a node's
+// message brings its own; an internal event is of the cycle of the event that emitted it, under its
+// trace_id, and keeps that one; anything else, a timer's fire above all, starts a cycle with none.
+func (inst *WFInstance) takeCycleTrace(event sdk.Message) {
+	switch {
+	case receivedFromANode(event):
+		inst.cycleTrace = sdk.TraceOf(event.Meta.Context)
+	case event.Routing.TraceID == "" || event.Routing.TraceID != inst.cycleTraceID:
+		inst.cycleTrace = nil
+	}
+	inst.cycleTraceID = event.Routing.TraceID
+}
+
 // executeActions runs a slice of actions, logging each result. On the FIRST action whose effective
 // on_error policy is "fail", the failure STOPS the slice and is returned, so the caller routes the
 // instance to a loud terminal failure instead of silently advancing with inconsistent state (gap-2).
@@ -490,6 +515,9 @@ func (inst *WFInstance) executeActionsBestEffort(ctx context.Context, actions []
 }
 
 func (inst *WFInstance) runActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow, bestEffort bool) error {
+	if actx.TransitionActions == nil {
+		actx.TransitionActions = actionKinds(actions)
+	}
 	for i, action := range actions {
 		path := fmt.Sprintf("action[%d]", i)
 		err := executeAction(ctx, path, action, inst, event, actx, emitted)

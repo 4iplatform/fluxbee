@@ -772,7 +772,7 @@ What goes out:
 - **The payload, byte for byte**, never decoded: its text, its attachments, the order of its keys and its numbers as they came (`1.10` stays `1.10`, `<b>` stays `<b>`).
 - **The meta is the message's**: every field of it but `memory_package` (its type, `msg`, `src_ilk`, `dst_ilk`, `ich`, `scope`, `priority`, `context` and any other), and the WF sets the thread and the context. The sender's `src_ilk` travels intact: a person's message forwarded to an agent keeps the person, for the agent's memory.
 - **To the person's IO node** (the one whose message started the instance) the WF names the person too, when the instance has one (§10.1, FINDINGS A-139): `dst_ilk` is the person's `src_ilk` and `ich` the person's (none when the person's message had none). An agent answers whoever spoke, on the channel they spoke from, so its answer to a supervisor names the supervisor and the supervisors' channel; forwarded to the person, it names the person and the person's channel. Without a person both stay the message's.
-- **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; the WF's block, whose trail is the message's own and this node; and, to the person's IO node, `dst_ilk` and `ich`.
+- **What the WF changes is metadata**: the destination, `target`; the thread, which becomes the instance's (§10.1); the context keys the action writes; the trace, which is the cycle's the instance is handling (§10.9); the WF's block; and, to the person's IO node, `dst_ilk` and `ich`.
 
 A `forward` fails when there is no message to forward: the event is a `TIMER_FIRED`, an internal event or a control message (no node sent it as a workflow message), or no message is kept under `message` yet. Its `on_error` defaults to `fail`, as for `send_message`. It has no `meta.msg` and no `payload`: a definition that writes either is refused at load, and so is a `forward` without `message` where the event may be no node's message, a `TIMER_FIRED` or an internal event (§8.5, 8d).
 
@@ -795,10 +795,10 @@ The pattern of a conversation: the initial state keeps the person's message (`cu
 Every message a WF sends, a `send_message` or a `forward`, carries the WF's block in `meta.context.wf` (since 0.1.91): deterministic context for the receiver, which an agent shows its model before the person's text.
 
 ```json
-{ "wf": { "trail": ["IO.api.sales@worker1", "WF.sales@worker1"], "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
+{ "wf": { "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
 ```
 
-- **`trail`** lists the nodes the message went through. A `forward` takes the message's own trail (or its sender's name, when it has none) and adds the WF's name; a `send_message` starts it with the WF's name. An agent's answer never carries the request's `wf` back, so a forwarded answer's trail starts at the agent.
+- **The trace is not in the block** (since 0.1.100, FINDINGS A-138): every message of a solution carries `meta.context.trace` ([message-trace-v1](message-trace-v1.md)), which replaced the block's `trail`. A WF's send carries the trace of the cycle the instance is handling: a node's message brings its own, an internal event keeps it, and a timer's fire starts one with none. A kept message forwarded later goes with the current cycle's trace, not its own. The Go SDK adds the WF's entry as it sends: its name, the destination, the time, and the kinds of action of its step, the one that sent the message first. An action's `meta.context` never writes the trace: the cycle's goes in its place.
 - **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
 - **`menu`** is the action's menu, as written but with no empty field and with each option's params in name order (§10.10); it is left out when the action has none.
 - **`subject`** is the action's subject (§10.1); it is left out when the action has none.

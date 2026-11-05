@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,9 +20,10 @@ import (
 // from its control plane, and the WF never saw that answer: the instance hung (FINDINGS A-117).
 const wfMsgType = "user"
 
-// Dispatcher abstracts sending L2 messages (testable without a real network).
+// Dispatcher abstracts sending L2 messages (testable without a real network). The note is what the
+// WF's entry in the message's trace adds (docs/message-trace-v1.md §5), the SDK writing the entry.
 type Dispatcher interface {
-	SendMsg(msg sdk.Message) error
+	SendMsg(msg sdk.Message, note sdk.TraceNote) error
 	NodeL2Name() string
 	NodeUUID() string
 }
@@ -42,6 +44,10 @@ type ActionContext struct {
 	Dispatcher Dispatcher
 	Timer      TimerSender
 	Clock      ClockFunc
+	// TransitionActions are the kinds of action the step a send belongs to runs, in order: a
+	// transition's exit, own and entry actions (RunTransition), else the actions run together
+	// (runActions). The WF's entry in the message's trace names them (traceNote).
+	TransitionActions []string
 }
 
 // executeAction executes a single action definition. Its error goes to the caller (runActions),
@@ -146,12 +152,13 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 	}
 
 	// gap-3: an optional meta.context (an IO node's context.io, say), resolved with the same $ref
-	// rules as the payload, and the WF's block over it, a trail that starts at this node.
+	// rules as the payload, the trace of the cycle the instance is handling, and the WF's block.
 	metaContext := map[string]any{}
 	if err := writeActionContext(metaContext, action, inst, eventMap); err != nil {
 		return fmt.Errorf("send_message: %w", err)
 	}
-	contextRaw, err := withWFBlock(metaContext, []string{actx.Dispatcher.NodeL2Name()}, action, inst, eventMap)
+	inst.withCycleTrace(metaContext)
+	contextRaw, err := withWFBlock(metaContext, action, inst, eventMap)
 	if err != nil {
 		return fmt.Errorf("send_message: %w", err)
 	}
@@ -185,7 +192,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 			msg.Meta.Ich = &ich
 		}
 	}
-	return sendWithRetry(ctx, actx, "send_message", msg)
+	return sendWithRetry(ctx, actx, "send_message", msg, traceNote("send_message", actx))
 }
 
 // personsIO reports whether target is the person's IO node: the IO node (IO.*) whose message started
@@ -215,8 +222,9 @@ func (inst *WFInstance) toPerson(meta *sdk.Meta) {
 // event's, or the one kept under action.Message. Its payload goes out byte for byte, never decoded,
 // and its meta is the message's (type, msg, src_ilk, dst_ilk, ich, scope, priority and context)
 // without memory_package. What the WF changes is metadata: the destination (a target written in
-// the definition), the thread (the instance's), the context keys the action writes and the WF's
-// block, whose trail is the message's own (or its sender's name) and this node. To the person's IO
+// the definition), the thread (the instance's), the context keys the action writes, the trace,
+// which is the cycle's the instance is handling (a kept message's own is of an earlier cycle), and
+// the WF's block. To the person's IO
 // node (personsIO) its dst_ilk and ich are the instance's person and the person's channel, when it
 // has a person (toPerson, FINDINGS A-139): an agent answers whoever spoke, on the channel they spoke
 // from, so its answer to a supervisor names the supervisor and the supervisors' channel.
@@ -235,12 +243,12 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 			return fmt.Errorf("forward: the message's context: %w", err)
 		}
 	}
-	trail := append(messageTrail(source, metaContext), actx.Dispatcher.NodeL2Name())
 	eventMap := messageToMap(event)
 	if err := writeActionContext(metaContext, action, inst, eventMap); err != nil {
 		return fmt.Errorf("forward: %w", err)
 	}
-	contextRaw, err := withWFBlock(metaContext, trail, action, inst, eventMap)
+	inst.withCycleTrace(metaContext)
+	contextRaw, err := withWFBlock(metaContext, action, inst, eventMap)
 	if err != nil {
 		return fmt.Errorf("forward: %w", err)
 	}
@@ -263,7 +271,7 @@ func execForward(ctx context.Context, action ActionDefinition, inst *WFInstance,
 		Meta:    meta,
 		Payload: source.Payload,
 	}
-	return sendWithRetry(ctx, actx, "forward", msg)
+	return sendWithRetry(ctx, actx, "forward", msg, traceNote("forward", actx))
 }
 
 // execKeepMessage keeps the event's message, whole and as received, under the action's name: a later
@@ -302,23 +310,41 @@ func receivedFromANode(msg sdk.Message) bool {
 	return msg.SourceL2Name() != "" && !sdk.IsSystemKind(msg.Meta.MsgType)
 }
 
-// messageTrail is the trail a message brings: its own (meta.context.wf.trail, the nodes it went
-// through), or its sender's name when it has none.
-func messageTrail(msg sdk.Message, metaContext map[string]any) []string {
-	if block, ok := metaContext[wfcel.ContextWF].(map[string]any); ok {
-		if hops, ok := block["trail"].([]any); ok && len(hops) > 0 {
-			trail := make([]string, 0, len(hops)+1)
-			for _, hop := range hops {
-				name, ok := hop.(string)
-				if !ok {
-					return []string{msg.SourceL2Name()}
-				}
-				trail = append(trail, name)
-			}
-			return trail
+// withCycleTrace puts the trace of the cycle the instance is handling on metaContext, in place of
+// any the message brought or the action wrote, or takes it off when the cycle has none yet (a
+// timer's fire starts one): the SDK adds the WF's entry as it sends (docs/message-trace-v1.md §5).
+func (inst *WFInstance) withCycleTrace(metaContext map[string]any) {
+	if inst.cycleTrace != nil {
+		metaContext[sdk.TraceKey] = inst.cycleTrace
+		return
+	}
+	delete(metaContext, sdk.TraceKey)
+}
+
+// traceNote is what the WF's entry in a message's trace says it did (docs/message-trace-v1.md §5):
+// the kind of action that sent it, then the step's other kinds of action, so an entry may hold more
+// than one.
+func traceNote(sent string, actx ActionContext) sdk.TraceNote {
+	act := []string{sent}
+	for _, kind := range actx.TransitionActions {
+		if kind != sent && !slices.Contains(act, kind) {
+			act = append(act, kind)
 		}
 	}
-	return []string{msg.SourceL2Name()}
+	return sdk.TraceNote{Act: act}
+}
+
+// actionKinds is the kinds of action of lists, in order, each once.
+func actionKinds(lists ...[]ActionDefinition) []string {
+	var kinds []string
+	for _, list := range lists {
+		for _, action := range list {
+			if !slices.Contains(kinds, action.Type) {
+				kinds = append(kinds, action.Type)
+			}
+		}
+	}
+	return kinds
 }
 
 // writeActionContext writes the keys of the action's meta.context, $ref-resolved, over metaContext:
@@ -342,17 +368,14 @@ func writeActionContext(metaContext map[string]any, action ActionDefinition, ins
 }
 
 // withWFBlock is metaContext with the WF's block (meta.context.wf, wf-orchestration-v1 §5.2.1,
-// item 7), as the message goes: trail, the nodes the message went through; vars, what the action's
-// vars writes, $ref-resolved: the deterministic context the WF gives the receiver; menu, the action's
-// menu as it loaded, its known options written in, what an agent or an IO node's people may choose
-// from (§5.3.6, §5.4.4); and subject, the mark an IO node places the message by (§5.4.2). vars, menu
-// and subject are there only when the action has them.
-func withWFBlock(metaContext map[string]any, trail []string, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
-	hops := make([]any, len(trail))
-	for i, name := range trail {
-		hops[i] = name
-	}
-	block := map[string]any{"trail": hops}
+// item 7), as the message goes: vars, what the action's vars writes, $ref-resolved: the
+// deterministic context the WF gives the receiver; menu, the action's menu as it loaded, its known
+// options written in, what an agent or an IO node's people may choose from (§5.3.6, §5.4.4); and
+// subject, the mark an IO node places the message by (§5.4.2). Each is there only when the action
+// has it. The nodes the message went through are its trace's (docs/message-trace-v1.md), which
+// replaced the block's trail.
+func withWFBlock(metaContext map[string]any, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
+	block := map[string]any{}
 	if action.Vars != nil {
 		vars, err := Resolve(action.Vars, inst.Input, inst.StateVars, eventMap)
 		if err != nil {
@@ -390,7 +413,7 @@ func transitionTraceID(inst *WFInstance, event sdk.Message) string {
 // momentarily full queue drains before the error is treated as fatal; a permanent condition (dead
 // connection) still fails after the attempts. A message over the frame limit is refused the same
 // way every time, so it fails at once.
-func sendWithRetry(ctx context.Context, actx ActionContext, verb string, msg sdk.Message) error {
+func sendWithRetry(ctx context.Context, actx ActionContext, verb string, msg sdk.Message, note sdk.TraceNote) error {
 	var sendErr error
 	for attempt := 0; attempt < sendMaxAttempts; attempt++ {
 		if attempt > 0 {
@@ -400,7 +423,7 @@ func sendWithRetry(ctx context.Context, actx ActionContext, verb string, msg sdk
 			case <-time.After(sendRetryBackoff):
 			}
 		}
-		if sendErr = actx.Dispatcher.SendMsg(msg); sendErr == nil {
+		if sendErr = actx.Dispatcher.SendMsg(msg, note); sendErr == nil {
 			return nil
 		}
 		var tooLarge *sdk.MessageTooLargeError
@@ -608,8 +631,8 @@ func NewSDKDispatcher(sender *sdk.NodeSender) *SDKDispatcher {
 	return &SDKDispatcher{sender: sender}
 }
 
-func (d *SDKDispatcher) SendMsg(msg sdk.Message) error {
-	return d.sender.Send(msg)
+func (d *SDKDispatcher) SendMsg(msg sdk.Message, note sdk.TraceNote) error {
+	return d.sender.SendTraced(msg, note)
 }
 
 func (d *SDKDispatcher) NodeL2Name() string {

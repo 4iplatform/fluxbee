@@ -29,6 +29,7 @@ use fluxbee_sdk::managed_control_plane::{
     ManagedControlPlaneState, ManagedNodeConfigContract, ManagedNodeLifecycleState,
     DEFAULT_MANAGED_NODES_ROOT,
 };
+use fluxbee_sdk::message_trace;
 use fluxbee_sdk::protocol::{
     MemoryPackage, MemoryTurn, MemoryTurnDirection, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE,
     MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE, MSG_NODE_STATUS_GET,
@@ -50,6 +51,10 @@ const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
 const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
+/// The most trace entries the model reads, the newest (`render_trace_prompt_block`): a cycle is a
+/// few messages, and one that loops would otherwise fill the prompt (docs/message-trace-v1.md §6).
+const TRACE_PROMPT_MAX_ENTRIES: usize = 32;
+
 /// The most of a WF's `vars` the model reads, as JSON (`render_wf_prompt_block`).
 const WF_VARS_PROMPT_MAX_BYTES: usize = 8 * 1024;
 const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
@@ -805,16 +810,21 @@ impl AiNode for GenericAiNode {
                 (extract_text(&msg.payload).unwrap_or_default(), None)
             };
         let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
+        let trace_block = render_trace_prompt_block(msg.meta.context.as_ref());
         let wf_block = render_wf_prompt_block(
             msg.meta.context.as_ref(),
             contract.as_ref().and_then(MessageContract::menu),
         );
-        // What the model reads before the message: the memory block, then the WF's, then who
-        // sent the message, named as the recent turns name a speaker.
-        let prompt_blocks = [cognition_block.as_deref(), wf_block.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        // What the model reads before the message: the memory block, the message's trace, the
+        // WF's block, then who sent the message, named as the recent turns name a speaker.
+        let prompt_blocks = [
+            cognition_block.as_deref(),
+            trace_block.as_deref(),
+            wf_block.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let message_label = current_message_label(&msg);
         let input = inject_prompt_blocks_into_text_input(&input, &prompt_blocks, &message_label);
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
@@ -6905,45 +6915,63 @@ fn json_line(text: &str) -> String {
 }
 
 /// The line ahead of the message being answered, once blocks come before it: who sent it, named as
-/// the recent turns name a speaker. The node it came through is the first node of a WF's trail
-/// (`meta.context.wf.trail`), else its sender.
+/// the recent turns name a speaker. The node it came through is where its cycle started, the first
+/// entry of its trace (`meta.context.trace`), else its sender.
 fn current_message_label(msg: &Message) -> String {
-    fn named(node: Option<&str>) -> Option<&str> {
-        node.map(str::trim).filter(|node| !node.is_empty())
-    }
-    let via = named(
-        msg.meta
-            .context
-            .as_ref()
-            .and_then(|context| context.pointer("/wf/trail/0"))
-            .and_then(Value::as_str),
-    )
-    .or_else(|| named(msg.routing.src_l2_name.as_deref()));
+    let origin = message_trace::origin(msg.meta.context.as_ref());
+    let via = origin.as_deref().or_else(|| {
+        msg.routing
+            .src_l2_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+    });
     match speaker_name(extract_src_ilk(msg).as_deref(), via) {
         Some(speaker) => format!("Current user message, from {speaker}:"),
         None => "Current user message:".to_string(),
     }
 }
 
+/// The message's trace (`meta.context.trace`, docs/message-trace-v1.md §6) as the model reads it:
+/// one line for each node the message went through, oldest first, with when it sent it (UTC), where
+/// to, and the actions it took. The newest `TRACE_PROMPT_MAX_ENTRIES` only, after a line that counts
+/// the rest. `None` without a trace.
+fn render_trace_prompt_block(context: Option<&Value>) -> Option<String> {
+    let entries = message_trace::entries(context);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["Message trace (UTC):".to_string()];
+    let earlier = entries.len().saturating_sub(TRACE_PROMPT_MAX_ENTRIES);
+    if earlier > 0 {
+        lines.push(format!("[{earlier} earlier entries]"));
+    }
+    for entry in &entries[earlier..] {
+        let clock = entry.t.get(11..23).unwrap_or(&entry.t);
+        let mut line = format!("{} {}", one_line(clock), one_line(&entry.from));
+        if let Some(to) = &entry.to {
+            line.push_str(&format!(" -> {}", one_line(to)));
+        }
+        if !entry.act.is_empty() {
+            let act = entry
+                .act
+                .iter()
+                .map(|word| one_line(word))
+                .collect::<Vec<_>>();
+            line.push_str(&format!(" [{}]", act.join(", ")));
+        }
+        lines.push(line);
+    }
+    Some(lines.join("\n"))
+}
+
 /// The WF's block, `meta.context.wf` (docs/wf-orchestration-v1.md §5.2.1), as the model reads it:
-/// the path the message took, from its `trail`, the WF's `vars` as JSON, cut at
-/// `WF_VARS_PROMPT_MAX_BYTES` with a line that says so, and the WF's `menu`, checked
-/// (`MenuContract::prompt`, §5.3.6). `None` without a block, or with no trail, vars or menu in it.
+/// the WF's `vars` as JSON, cut at `WF_VARS_PROMPT_MAX_BYTES` with a line that says so, and the
+/// WF's `menu`, checked (`MenuContract::prompt`, §5.3.6). `None` without a block, or with no vars
+/// or menu in it. The path the message took is its trace's (`render_trace_prompt_block`).
 fn render_wf_prompt_block(context: Option<&Value>, menu: Option<&MenuContract>) -> Option<String> {
     let wf = context?.get("wf")?;
     let mut lines = vec!["Workflow context:".to_string()];
-    let trail = wf
-        .get("trail")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
-    if !trail.is_empty() {
-        lines.push(format!("Path: {}", trail.join(" -> ")));
-    }
     let vars = wf
         .get("vars")
         .filter(|vars| !vars.is_null() && vars.as_object().is_none_or(|vars| !vars.is_empty()));
@@ -8421,8 +8449,9 @@ mod tests {
     }
 
     /// With blocks ahead of it, the message is named as the recent turns name a speaker: its
-    /// sender's ILK and the node it came through, the first node of a WF's trail or else its
-    /// sender. As text, a line ahead of it; as parts, a text part of its own after the blocks.
+    /// sender's ILK and the node it came through, where its cycle started (its trace's first entry)
+    /// or else its sender. As text, a line ahead of it; as parts, a text part of its own after the
+    /// blocks.
     #[test]
     fn the_current_message_names_its_speaker_after_the_blocks() {
         let msg = sample_user_request_with_context(
@@ -8504,47 +8533,45 @@ mod tests {
         );
     }
 
-    /// A WF's block as Case 1's WF sends it to invoice (docs/wf-orchestration-v1.md §5.2.1).
+    /// A WF's message as Case 1's WF sends it to invoice (docs/wf-orchestration-v1.md §5.2.1): the
+    /// trace of its cycle, and the WF's block.
     fn sample_wf_context() -> Value {
         json!({
             "io": {"channel": "api"},
+            "trace": [
+                {"t": "2026-11-04T10:17:03.120Z", "from": "IO.api@motherbee", "to": "WF.sales.invoice@worker1"},
+                {"t": "2026-11-04T10:17:03.180Z", "from": "WF.sales.invoice@worker1",
+                 "to": "AI.generic@motherbee", "act": ["forward"]}
+            ],
             "wf": {
-                "trail": ["IO.api@motherbee", "WF.sales.invoice@worker1"],
                 "vars": {"order": {"product": "Pro", "quantity": 10, "unit_price": 49}}
             }
         })
     }
 
     #[test]
-    fn the_wf_block_shows_the_trail_as_a_path_and_the_vars_as_json() {
+    fn the_wf_block_shows_the_vars_as_json() {
         let block =
             render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         assert_eq!(
             block,
             "Workflow context:\n\
-             Path: IO.api@motherbee -> WF.sales.invoice@worker1\n\
              Variables: {\"order\":{\"product\":\"Pro\",\"quantity\":10,\"unit_price\":49}}"
         );
 
-        // Either part alone.
-        let trail_only = json!({"wf": {"trail": ["WF.sales.invoice@worker1"], "vars": {}}});
-        assert_eq!(
-            render_wf_prompt_block(Some(&trail_only), None).as_deref(),
-            Some("Workflow context:\nPath: WF.sales.invoice@worker1")
-        );
         let vars_only = json!({"wf": {"vars": {"invoice": {"number": "A-1"}}}});
         assert_eq!(
             render_wf_prompt_block(Some(&vars_only), None).as_deref(),
             Some("Workflow context:\nVariables: {\"invoice\":{\"number\":\"A-1\"}}")
         );
 
-        // No block, or nothing in it.
+        // No block, or nothing in it: a trail, as WFs wrote before the trace, is no part of it.
         assert_eq!(render_wf_prompt_block(None, None), None);
         for context in [
             json!({"io": {"channel": "api"}}),
             json!({"wf": {}}),
-            json!({"wf": {"trail": [], "vars": {}}}),
-            json!({"wf": {"trail": [" ", 7], "vars": null}}),
+            json!({"wf": {"trail": ["WF.sales.invoice@worker1"], "vars": {}}}),
+            json!({"wf": {"vars": null}}),
             json!({"wf": "WF.sales.invoice@worker1"}),
         ] {
             assert_eq!(
@@ -8553,6 +8580,51 @@ mod tests {
                 "{context}"
             );
         }
+    }
+
+    #[test]
+    fn the_trace_block_shows_each_node_with_its_time_where_to_and_its_actions() {
+        assert_eq!(
+            render_trace_prompt_block(Some(&sample_wf_context())).as_deref(),
+            Some(
+                "Message trace (UTC):\n\
+                 10:17:03.120 IO.api@motherbee -> WF.sales.invoice@worker1\n\
+                 10:17:03.180 WF.sales.invoice@worker1 -> AI.generic@motherbee [forward]"
+            )
+        );
+
+        // A message sent with no destination, then the router's entry; two actions at once.
+        let resolved = json!({"trace": [
+            {"t": "2026-11-04T10:17:03.120Z", "from": "IO.slack@motherbee"},
+            {"t": "2026-11-04T10:17:03.121Z", "from": "RT.gateway@motherbee",
+             "to": "AI.frontdesk@motherbee", "act": ["resolve"]},
+            {"t": "2026-11-04T10:17:05.000Z", "from": "WF.ventas@worker1",
+             "to": "IO.slack@motherbee", "act": ["send_message", "schedule_timer"]}
+        ]});
+        assert_eq!(
+            render_trace_prompt_block(Some(&resolved)).as_deref(),
+            Some(
+                "Message trace (UTC):\n\
+                 10:17:03.120 IO.slack@motherbee\n\
+                 10:17:03.121 RT.gateway@motherbee -> AI.frontdesk@motherbee [resolve]\n\
+                 10:17:05.000 WF.ventas@worker1 -> IO.slack@motherbee [send_message, schedule_timer]"
+            )
+        );
+
+        // A loop: the newest entries, after a line that counts the rest.
+        let hops = (0..40)
+            .map(|n| json!({"t": format!("2026-11-04T10:17:{:02}.000Z", n % 60), "from": format!("N{n}@h")}))
+            .collect::<Vec<_>>();
+        let block = render_trace_prompt_block(Some(&json!({"trace": hops}))).expect("a trace");
+        let lines = block.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2 + TRACE_PROMPT_MAX_ENTRIES);
+        assert_eq!(lines[1], "[8 earlier entries]");
+        assert_eq!(lines[2], "10:17:08.000 N8@h");
+
+        // No trace.
+        assert_eq!(render_trace_prompt_block(None), None);
+        assert_eq!(render_trace_prompt_block(Some(&json!({"trace": []}))), None);
+        assert_eq!(render_trace_prompt_block(Some(&json!({"wf": {}}))), None);
     }
 
     #[test]
@@ -8611,7 +8683,7 @@ mod tests {
     /// The WF's block shows its menu after the path and the variables: its help, its options and
     /// `none`, and the answer's shape. A block with only a menu is still shown.
     #[test]
-    fn the_wf_block_shows_the_menu_after_the_path_and_the_variables() {
+    fn the_wf_block_shows_the_menu_after_the_variables() {
         let contract = sample_menu_contract();
         let menu = contract.menu().expect("the menu");
         let block = render_wf_prompt_block(Some(&sample_wf_menu_context()), Some(menu))
@@ -8619,7 +8691,6 @@ mod tests {
         assert_eq!(
             block,
             "Workflow context:\n\
-             Path: IO.api@motherbee -> WF.sales.invoice@worker1\n\
              Variables: {\"order\":{\"product\":\"Pro\",\"quantity\":10,\"unit_price\":49}}\n\
              Help: The person is buying licenses. A discount above 10% needs a supervisor's approval.\n\
              Options (choose exactly one):\n\
@@ -8638,20 +8709,24 @@ mod tests {
         );
     }
 
-    /// With both blocks the model reads the memory first, then the WF's, then the message: as text
-    /// and as parts alike.
+    /// With every block the model reads the memory first, then the message's trace, then the WF's
+    /// block, then the message: as text and as parts alike.
     #[test]
-    fn the_memory_block_comes_first_then_the_wf_block_then_the_message() {
+    fn the_memory_block_comes_first_then_the_trace_and_the_wf_block_then_the_message() {
         let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
+        let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         let label = "Current user message, from via IO.api@motherbee:";
 
-        let text =
-            inject_prompt_blocks_into_text_input("dale, facturámelo", &[&memory, &wf], label);
+        let text = inject_prompt_blocks_into_text_input(
+            "dale, facturámelo",
+            &[&memory, &trace, &wf],
+            label,
+        );
         assert_eq!(
             text,
-            format!("{memory}\n\n{wf}\n\n{label}\ndale, facturámelo")
+            format!("{memory}\n\n{trace}\n\n{wf}\n\n{label}\ndale, facturámelo")
         );
         assert_eq!(
             inject_prompt_blocks_into_text_input("dale, facturámelo", &[&wf], label),
@@ -9857,16 +9932,20 @@ mod tests {
 
         let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
+        let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {memory}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
         );
-        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+        // The reply goes on with the cycle's trace; the runtime adds the agent's entry as it sends.
+        let mut context = sample_wf_context();
+        context.as_object_mut().expect("an object").remove("wf");
+        assert_eq!(reply.meta.context, Some(context));
     }
 
-    /// The line ahead of `sample_user_request_with_context`'s message when a WF's block comes
-    /// with it: its ILK, and the first node of the WF's trail.
+    /// The line ahead of `sample_user_request_with_context`'s message when a WF's sample context
+    /// comes with it: its ILK, and where its cycle started, its trace's first entry.
     const SAMPLE_MESSAGE_LABEL: &str =
         "Current user message, from ilk:11111111-1111-4111-8111-111111111111 via IO.api@motherbee:";
 
@@ -9894,6 +9973,7 @@ mod tests {
             .collect();
         let memory = render_memory_package_prompt_block(Some(&package)).expect("memory block");
         assert!(memory.chars().count() > 20 * 2_000, "every turn whole");
+        let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
 
         let node = test_node();
@@ -9912,11 +9992,14 @@ mod tests {
             .expect("a reply");
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {memory}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {memory}\n\n{trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
         );
 
-        let input =
-            inject_prompt_blocks_into_text_input("hola", &[&memory, &wf], SAMPLE_MESSAGE_LABEL);
+        let input = inject_prompt_blocks_into_text_input(
+            "hola",
+            &[&memory, &trace, &wf],
+            SAMPLE_MESSAGE_LABEL,
+        );
         let model = ScriptedModel::new(Vec::new(), None).with_call_text("Hi, what do you need?");
         let files = Arc::new(ReplyFiles::default());
         let ctx = BehaviorContext::default();
@@ -9959,14 +10042,17 @@ mod tests {
             .expect("a reply");
 
         let contract = sample_menu_contract();
+        let trace = render_trace_prompt_block(Some(&sample_wf_menu_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_menu_context()), contract.menu())
             .expect("the WF's block");
         assert!(wf.contains("\n- none: None of the options fits.\n"));
         assert_eq!(
             reply.payload["content"],
-            format!("Echo: {wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
+            format!("Echo: {trace}\n\n{wf}\n\n{SAMPLE_MESSAGE_LABEL}\nhola")
         );
-        assert_eq!(reply.meta.context, Some(json!({"io": {"channel": "api"}})));
+        let mut context = sample_wf_menu_context();
+        context.as_object_mut().expect("an object").remove("wf");
+        assert_eq!(reply.meta.context, Some(context));
     }
 
     /// A message with an invalid menu, or with a menu and a response_envelope, is answered with
