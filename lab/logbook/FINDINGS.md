@@ -26,7 +26,8 @@ no change required
 ### This sprint (2026-11-04)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
-   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, for the next release):
+   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ in code for the next
+   release, 2026-11-05):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
@@ -53,19 +54,23 @@ no change required
    1. A-138 [WF]: the conversation's trace in the message: design agreed and built 2026-11-04
       ([message-trace-v1](../../docs/message-trace-v1.md)); ✅ 0.1.100, its WF gate on 8.x
       (2026-11-05).
-   2. A-137 [WF]: the chat on cognition across hands. It builds on A-138: the mark cognition would
-      read travels in the message.
+   2. A-137 [WF]: the chat on cognition across hands. Its first part, agreed and built 2026-11-05
+      ([cognition-hands-v1](../../docs/cognition-hands-v1.md)): who wrote each turn, which turns
+      cognition analyzes, and how the immediate memory names its speakers. The rest, one topic at
+      a time.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
-A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-137's chat is next.
+A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154 and A-137's first part are in
+code for the next release, with the empty-block fix.
 
 ### WF
 
 - From A-138's gate: an empty `wf: {}` block on a WF message whose action has no vars, menu or
   subject. *In code, for the next release.*
-- A-153 🔴 Nothing limits how many timers a WF definition holds. *Sprint, for the next release.*
-- A-154 🔴 Nothing closes a WF conversation that went quiet. *Sprint, for the next release.*
-- A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint.*
+- A-153 ✅ Nothing limits how many timers a WF definition holds. *In code, for the next release.*
+- A-154 ✅ Nothing closes a WF conversation that went quiet. *In code, for the next release.*
+- A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part in
+  code, for the next release.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1179,7 +1184,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-154 [WF] 🔴 OPEN (found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
+### A-154 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
 - **What happens:** a running instance stays open until its flow reaches an end, a cancel or a
   failure.
@@ -1211,14 +1216,24 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **The definition's field:**
     - `idle_timeout`, in `fire_in`'s format (`"4d"`), 4 days when the definition leaves it out.
     - The validator refuses more than 7 days, and less than 1 hour, the pass's interval. The
-      floor is proposed, for the operator to confirm.
+      floor was proposed to the operator on 2026-11-05, who went on without objecting.
     - A conversation closes within the hour after its timeout.
-  - **A goodbye message** ("we are closing your case") is the author's own timer, one of the 10
-    (A-153).
-  - **The docs:** the spec (§21 and the instance's lifecycle) and Archi's handbook say it.
-- **Status:** in the sprint, for the next release, with A-153.
+  - **A goodbye message** ("we are closing your case") is the definition's: the `cancelled`
+    state's entry actions, which an operator's cancel runs too, or a timer of its own, one of the
+    10 (A-153).
+  - **The docs:** the spec (§8.1, §12.5, §15 and §21) and Archi's handbook say it.
+- **Built (2026-11-05):**
+  - `idle_timeout` in the definition (`IdleAfter`, go/pkg/wfcel);
+  - `closeQuietInstances` on the receive loop, once a GC interval (go/nodes/wf/wf-generic/node/idle.go).
+    It cancels a quiet instance as SY.admin's cancel does: the event its actions see is a
+    `WF_CANCEL_INSTANCE` whose reason says why, and the instance's log gets an `idle_close` entry;
+  - WF_HELP names the `idle_timeout` in force.
 
-### A-153 [WF] 🔴 OPEN (found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
+  Tests: the close past the default and past a definition's own timeout, a pending timer and
+  recent activity keeping a conversation open, and the field's bounds.
+- **Status:** in code for the next release, with A-153.
+
+### A-153 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
 
 - **What happens:** a definition may name any number of timer keys.
   - Each `schedule_timer` names a literal `timer_key`, and the WF keeps one timer per instance and
@@ -1245,7 +1260,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** the validator refuses a definition with more than 10 distinct timer keys, as it refuses
   a menu past its limits. Archi gets the error when it writes the WF; the way out is two WFs. The
   spec's enforced limits (§21) and Archi's handbook (docs/archi/handbook_fluxbee.md) say it.
-- **Status:** in the sprint, for the next release.
+- **Built (2026-11-05):** `timerKeyErrors` (go/pkg/wfcel/validate.go) counts the distinct keys of
+  the `schedule_timer` actions; a key that only a `cancel_timer` or a `reschedule_timer` names sets
+  no timer. Spec §10.2 and §21 and the handbook say it. Tests: 10 keys load, each scheduled twice
+  too; 11 are refused, named.
+- **Status:** in code for the next release.
 
 ### A-152 [Archi] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
 
@@ -1643,7 +1662,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   another WF never goes on (`withWFBlock`; test `TestAForwardCarriesNoOtherWFsBlock`). Two
   comments in `wfcel` still named the trail.
 
-### A-137 [WF] 🔵 TO EVALUATE, its own topic (found 2026-10-31, the WF Case 4 design chat) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part in code for the next release, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
   - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
@@ -1798,13 +1817,19 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
           identity memory.
         - The Go SDK, the WF's, finds an ILK only by its channel or its handler node
           (go/fluxbee-go-sdk/identity_shm.go).
-    - **Proposed, for the operator to confirm:** the writer travels in the message, `{ilk, name}`,
-      and no longer comes from the trace.
+    - **Agreed (the operator, 2026-11-05: *"si, cerrado"*):** the writer travels in the message,
+      `{ilk, name}`, and no longer comes from the trace.
       - **Who names it:** whoever writes the text. An IO node names the person, an agent itself,
         and a WF itself for its own text. A forward keeps it.
       - **The name:** as it sends, every node's SDK fills a missing name from the identity memory.
       - **Who reads it:** cognition and the agent read it as it comes, and `turns` keeps the
         writer's ILK and name.
+  - **Built (2026-11-05), the first part, for the next release:** consolidated in
+    [cognition-hands-v1](../../docs/cognition-hands-v1.md), whose §8 lists what changed: the
+    writer in both SDKs, named by the IO node, the agent and the WF; cognition's analysis rule and
+    the turns' writer and addressee; ai.generic's labels; `turns.writer_ilk` and `writer_name`,
+    and `from_ilk` never a node's UUID; Archi's Messages screen. Its gate comes with the release.
+  - **Open:** the rest of the topic, one at a time (cognition-hands-v1 §9).
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
