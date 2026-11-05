@@ -31,7 +31,11 @@ type WorkflowDefinition struct {
 	// order, when no transition of the current state takes an event, in any state. A catch transition
 	// has a state transition's shape, but its event_match may be empty, which matches every event, and
 	// it sets no timers. When the catch takes nothing either, the event is logged, as without one.
-	Catch          []TransitionDefinition `json:"catch,omitempty"`
+	Catch []TransitionDefinition `json:"catch,omitempty"`
+	// IdleTimeout is how long an instance stays open with no event taken and no timer pending
+	// (FINDINGS A-154): then the WF closes it, as a cancel does. A duration in fire_in's format, from
+	// MinIdleTimeout to MaxIdleTimeout; DefaultIdleTimeout when the definition leaves it out.
+	IdleTimeout    string `json:"idle_timeout,omitempty"`
 	inputValidator *jsonschema.Schema
 }
 

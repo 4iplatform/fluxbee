@@ -243,8 +243,12 @@ SY.wf-rules checks it (`go/pkg/wfcel`), and an error names the exact path.
 
 - **Its fields:** `wf_schema_version` (`"1"`), `workflow_type`, `description`, `start_from`,
   `input_schema` (the JSON Schema of the first message's payload), `initial_state`,
-  `terminal_states`, `states` and, optionally, `catch`. Any other field is refused. The language
-  no longer has `meta.type`, `target_ref` or `thread_id_ref`.
+  `terminal_states`, `states` and, optionally, `catch` and `idle_timeout`. Any other field is
+  refused. The language no longer has `meta.type`, `target_ref` or `thread_id_ref`.
+- **`idle_timeout`** closes a conversation that went quiet: no event for that long, and no timer
+  pending. A duration from `1h` to `7d`; `4d` when the definition leaves it out. It closes as a
+  cancel does: the current state's exit actions, then the `cancelled` state's entry actions, if
+  the definition has that state. The next message on the thread starts a new instance.
 - **`start_from`** names the nodes whose messages start an instance: IO nodes or WFs, each with its
   hive. Never an `AI.*` node, because an agent only answers, and never a `SY.*` or `RT.*` node.
 - **One instance per conversation.** An instance lives on the thread of the message that started
@@ -354,6 +358,9 @@ Common guards:
 - **Timer actions:** `schedule_timer` (`timer_key`, `fire_in` or `fire_at`, `missed_policy`),
   `cancel_timer` and `reschedule_timer`, all through SY.timer.
   - The minimum is 60 s. A time may be a `$ref`; the minimum is then checked when the timer is set.
+  - A definition schedules at most 10 timer keys: the WF keeps one timer per conversation and key,
+    so its keys are the most timers a conversation holds at once. A logic that needs more is two
+    WFs.
   - A timeout is a `TIMER_FIRED` transition, guarded by `event.timer_key == '<key>'`. Every wait for
     an answer needs one.
   - `missed_policy` is `fire`, `drop` or `fire_if_within` (with `missed_within_ms`). It covers
@@ -510,7 +517,9 @@ runs it, and each compiles as it stands: a test compiles every definition in thi
   with a reply, one without.
 - **A send to an agent whose answer must reach the person** writes the person's `io` context, kept
   in `state.io` from their first message.
-- **Every instance ends.** An `idle` timer closes a conversation nobody writes in.
+- **Every instance ends.** An `idle` timer closes a conversation nobody writes in, as soon as the
+  solution needs. Without one, the WF closes a conversation that went quiet, with no timer pending,
+  after its `idle_timeout`.
 
 **Writing texts:**
 - A text never repeats a value the definition holds elsewhere. Say "a while", never "30 minutes":

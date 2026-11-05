@@ -33,7 +33,8 @@ type RunOptions struct {
 //     the GC goroutine
 //  4. Enters the receive loop; without a config in use it answers control messages only, saying
 //     why, and a restart applies a corrected config. A node that started without SY.timer's answer
-//     asks it again from the loop, until it reconciles its timers
+//     asks it again from the loop, until it reconciles its timers. Once a GC interval the loop
+//     closes the conversations that went quiet (closeQuietInstances)
 func Run(ctx context.Context, opts RunOptions) error {
 	clock := opts.Clock
 	if clock == nil {
@@ -117,6 +118,15 @@ func Run(ctx context.Context, opts RunOptions) error {
 	listing := false
 	recoverOpts := RecoverOptions{OwnerL2Name: rt.NodeName}
 
+	// The quiet conversations close once a GC interval (FINDINGS A-154), on the loop: between two
+	// messages, as a cancel SY.admin sends.
+	var idleTick <-chan time.Time
+	if materialized != nil {
+		ticker := time.NewTicker(time.Duration(materialized.Config.GCIntervalSeconds) * time.Second)
+		defer ticker.Stop()
+		idleTick = ticker.C
+	}
+
 	log.Printf("wf: entering receive loop for %s", sender.FullName())
 	for {
 		select {
@@ -146,6 +156,8 @@ func Run(ctx context.Context, opts RunOptions) error {
 			if rt.timersPending == nil {
 				reconcileTick = nil
 			}
+		case <-idleTick:
+			rt.closeQuietInstances(ctx)
 		}
 	}
 }

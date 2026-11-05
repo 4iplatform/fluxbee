@@ -863,6 +863,35 @@ func TestATargetWithSpacesIsRefused(t *testing.T) {
 	assertErrorContains(t, err, "states[0].entry_actions[0].target: must be a node name without spaces around it")
 }
 
+// A definition schedules 10 timer keys at most (FINDINGS A-153): a key scheduled twice counts once,
+// and a key that only a cancel_timer or a reschedule_timer names counts none. validWorkflowJSON
+// schedules invoice_timeout; the timers here go on the completed state's entry.
+func TestADefinitionSchedulesTenTimerKeysAtMost(t *testing.T) {
+	load := func(actions ...string) error {
+		t.Helper()
+		data := strings.Replace(validWorkflowJSON(), `"entry_actions": [],`, `"entry_actions": [`+strings.Join(actions, ", ")+`],`, 1)
+		_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+		return err
+	}
+	schedule := func(from, to int) []string {
+		var actions []string
+		for i := from; i <= to; i++ {
+			actions = append(actions, fmt.Sprintf(`{"type": "schedule_timer", "timer_key": "k%02d", "fire_in": "5m"}`, i))
+		}
+		return actions
+	}
+	if err := load(schedule(1, 9)...); err != nil {
+		t.Fatalf("10 keys: %v", err)
+	}
+	again := append(schedule(1, 9), schedule(1, 9)...)
+	again = append(again, `{"type": "cancel_timer", "timer_key": "k10"}`, `{"type": "reschedule_timer", "timer_key": "k11", "fire_in": "5m"}`)
+	if err := load(again...); err != nil {
+		t.Fatalf("10 keys, each scheduled twice, and 2 only cancelled or moved: %v", err)
+	}
+	assertErrorContains(t, load(schedule(1, 10)...),
+		"states: schedule 11 timer keys (invoice_timeout, k01, k02, k03, k04, k05, k06, k07, k08, k09, k10): a definition schedules 10 at most")
+}
+
 // A day count past what a duration holds is refused: "213504d" wrapped to 25m26s, and an agent's
 // answer reaches it through a $ref.
 func TestADurationOfTooManyDaysIsRefused(t *testing.T) {

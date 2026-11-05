@@ -504,8 +504,73 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 			errs = append(errs, ValidationError{Path: path + ".message", Message: "must name a message a keep_message keeps"})
 		}
 	})
+	errs = append(errs, timerKeyErrors(def)...)
+	errs = append(errs, idleTimeoutErrors(def.IdleTimeout)...)
 	errs = append(errs, eventlessErrors(def)...)
 	return errs
+}
+
+// A definition's idle timeout (FINDINGS A-154): how long a conversation stays open with no event
+// taken and no timer pending. The WF looks for quiet conversations once an hour, so a shorter one
+// would not hold; 7 days is the ceiling, the operator's.
+const (
+	DefaultIdleTimeout = "4d"
+	MinIdleTimeout     = time.Hour
+	MaxIdleTimeout     = 7 * 24 * time.Hour
+)
+
+// idleTimeoutErrors checks a definition's idle_timeout: left out, or a duration from MinIdleTimeout
+// to MaxIdleTimeout.
+func idleTimeoutErrors(value string) ValidationErrors {
+	if value == "" {
+		return nil
+	}
+	duration, err := ParseWorkflowDuration(value)
+	if err != nil {
+		return ValidationErrors{{Path: "idle_timeout", Message: `must be a duration (e.g. "4d" or "36h")`}}
+	}
+	if duration < MinIdleTimeout || duration > MaxIdleTimeout {
+		return ValidationErrors{{Path: "idle_timeout", Message: "must be 1h to 7d: the time a conversation stays open with no event and no timer pending"}}
+	}
+	return nil
+}
+
+// IdleAfter is how long an instance of def stays open with no event taken and no timer pending, and
+// the definition's words for it: its idle_timeout, or DefaultIdleTimeout.
+func (def *WorkflowDefinition) IdleAfter() (time.Duration, string) {
+	value := def.IdleTimeout
+	if value == "" {
+		value = DefaultIdleTimeout
+	}
+	duration, err := ParseWorkflowDuration(value)
+	if err != nil {
+		// The validator refused it at load: a definition built by hand gets the default.
+		value = DefaultIdleTimeout
+		duration, _ = ParseWorkflowDuration(value)
+	}
+	return duration, value
+}
+
+// MaxTimerKeys is the most timer keys a definition schedules (FINDINGS A-153): the WF keeps one
+// timer per instance and key, so a definition's keys are the most timers one conversation holds at
+// once. A logic that needs more is two WFs.
+const MaxTimerKeys = 10
+
+// timerKeyErrors refuses a definition whose schedule_timer actions name more than MaxTimerKeys
+// distinct keys. A key that only a cancel_timer or a reschedule_timer names sets no timer.
+func timerKeyErrors(def *WorkflowDefinition) ValidationErrors {
+	keys := map[string]bool{}
+	def.eachAction(func(_ string, action ActionDefinition) {
+		if action.Type == "schedule_timer" && strings.TrimSpace(action.TimerKey) != "" {
+			keys[action.TimerKey] = true
+		}
+	})
+	if len(keys) <= MaxTimerKeys {
+		return nil
+	}
+	return ValidationErrors{{Path: "states", Message: fmt.Sprintf(
+		"schedule %d timer keys (%s): a definition schedules %d at most, the timers one conversation holds at once; a logic that needs more is two WFs",
+		len(keys), strings.Join(sortedKeys(keys), ", "), MaxTimerKeys)}}
 }
 
 // catchActions are the action types a catch transition takes. Timers belong to states: a catch that

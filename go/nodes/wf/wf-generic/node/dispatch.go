@@ -259,6 +259,8 @@ func handleNodeConfigSet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 }
 
 func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
+	// The idle_timeout in force: the definition's, or the default (FINDINGS A-154).
+	_, idleTimeout := rt.Def.IdleAfter()
 	payload := map[string]any{
 		"ok":              true,
 		"workflow_type":   rt.Def.WorkflowType,
@@ -267,6 +269,7 @@ func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 		"states":          stateNames(rt.Def),
 		"terminal_states": rt.Def.TerminalStates,
 		"input_schema":    rt.Def.InputSchema,
+		"idle_timeout":    idleTimeout,
 	}
 	return sendReply(ctx, msg, MsgWFHelpResponse, payload, rt)
 }

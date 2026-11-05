@@ -318,6 +318,7 @@ Fields:
 | `terminal_states` | List of state names that end the instance when reached. |
 | `states` | Array of state definitions. |
 | `catch` | Optional. Transitions the engine tries, in order, when no transition of the current state takes an event, in any state (§9.5). |
+| `idle_timeout` | Optional. How long an instance stays open with no event taken and no timer pending; then the WF closes it, as a cancel does (§12.5). A duration as `fire_in` takes (`"36h"`, `"4d"`), from 1 hour to 7 days; 4 days when the definition leaves it out. |
 
 ### 8.2 State definition
 
@@ -601,6 +602,8 @@ Fields:
 | `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`), or a `$ref` to one. Minimum 60s. |
 | `fire_at` | Alternative to `fire_in`. RFC 3339 absolute UTC timestamp, or a `$ref` to one, 60 s ahead at least. |
 | `missed_policy` | Forwarded to SY.timer. `"fire"`, `"drop"`, or `"fire_if_within"` with `missed_within_ms`. |
+
+**At most 10 timer keys in a definition** (FINDINGS A-153). The WF keeps one timer per instance and key, so the keys the `schedule_timer` actions name are the most timers one conversation holds at once. A definition whose `schedule_timer` actions name more than 10 distinct keys is refused at load; a key that only a `cancel_timer` or a `reschedule_timer` names sets no timer. A logic that needs more is two WFs. A node's pending timers are its open conversations' (an instance that ends cancels its own, §11.3), so the node's count follows its conversations: 1000 running instances (§21) hold 10,000 at most, SY.timer's limit per owner.
 
 **A time from state.** `fire_in` and `fire_at` take a `$ref` (with an optional literal `default`, §10.1), resolved when the action runs: the time can come from the instance's state or from an agent's answer, as when an invoice's due date sets the timer that checks its payment (`"fire_in": {"$ref": "state.invoice.due_in"}`). The value must then be a string that parses, and the 60 s floor is checked then; one that does not fails the action, under its `on_error` (a timer action continues by default, so a time an agent gives is worth `"on_error": "fail"`). A literal is checked at load.
 
@@ -944,6 +947,16 @@ On receiving `WF_CANCEL_INSTANCE`:
 
 If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transition (the mutex is held by the evaluator), the cancel waits on the mutex and applies once the current transition completes. Once it acquires the mutex, it immediately performs the forced transition to `cancelled`.
 
+### 12.5 A quiet conversation closes on its own
+
+An instance whose flow never reaches an end would stay open for good: it would keep its thread, its state and a place among the node's running instances, and a message weeks later would take up the old flow where it stopped. So the WF closes a conversation that went quiet (FINDINGS A-154):
+
+- **Quiet** means no event taken for the definition's `idle_timeout` (§8.1; 4 days when it names none), and no timer pending. The last activity is the instance's `updated_at_ms`, which every event it takes sets: a message, a fired timer, an internal event. A conversation that waits for its own timer is not abandoned, however long the wait: a due date 30 days away holds it open.
+- **When:** the node looks for quiet conversations once a GC interval (`gc_interval_seconds`, an hour by default), on its receive loop, between two messages. So a conversation closes within that interval after its timeout, and a close never meets a transition.
+- **How:** as a cancel does (§12.2): the current state's `exit_actions`, then the `entry_actions` of the definition's `cancelled` state when it has one, its timers cancelled (none), status `cancelled`. Those actions see the event SY.admin's cancel would bring, `WF_CANCEL_INSTANCE`, with no sender and a `trace_id` of its own, whose `payload.reason` says why (`quiet for 4d with no timer pending (idle_timeout)`). The instance's log says it too, as an `idle_close` entry.
+- **After:** the next message on the thread starts a new instance, from a `start_from` node. The agents still know the person: cognition's memory is the thread's and the agent's, not the instance's.
+- **A goodbye** ("we are closing your case") is the definition's: the `cancelled` state's entry actions, which an operator's cancel runs too, or a timer of its own that closes sooner.
+
 ## 13. Persistence
 
 ### 13.1 What is stored
@@ -1196,12 +1209,13 @@ Response (for §19.2's workflow):
     "initial_state": "validating_data",
     "states": ["validating_data", "missing_data_requested", "creating_invoice", "delivering_to_customer", "completed", "failed", "cancelled"],
     "terminal_states": ["completed", "missing_data_requested", "failed", "cancelled"],
-    "input_schema": { "type": "object", "required": ["customer_id", "items"], "properties": { "customer_id": { "type": "string" } } }
+    "input_schema": { "type": "object", "required": ["customer_id", "items"], "properties": { "customer_id": { "type": "string" } } },
+    "idle_timeout": "4d"
   }
 }
 ```
 
-`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is the definition's `start_from` (§8.1), among the senders OPA lets through (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
+`states` lists the state names, and `input_schema` is the definition's, as written (abridged above). `idle_timeout` is the one in force: the definition's, or `4d` (§12.5). The descriptor has no version, trigger pattern, source hints or list of operations: an earlier design had them, and they were never built. Who may start an instance is the definition's `start_from` (§8.1), among the senders OPA lets through (§17). `WF_GET_CODE` answers the whole definition (`{"ok": true, "workflow_type": ..., "definition_json": "<the definition, as a string>"}`), to the same two senders.
 
 Archi does not read `WF_HELP` today (§19.5).
 
@@ -1787,6 +1801,8 @@ Workflow authors should be aware of these limits.
 - **Guard evaluation: 10 ms.** A guard is stopped at its timeout, and counts as false (§9.3).
 - **`set_variable` evaluation: 1,000,000 CEL cost units.** Past it the action fails (§10.5).
 - **Minimum timer duration: 60 seconds** (SY.timer's own minimum), checked at load for a literal, and when the action runs for a `$ref` (§10.2).
+- **At most 10 timer keys in a definition,** the timers one conversation holds at once, checked at load (§10.2).
+- **A quiet conversation closes:** no event for its `idle_timeout` (4 days by default, 1 hour to 7 days) and no timer pending (§12.5).
 - **100 log entries per instance**, FIFO.
 - **Retention: 7 days for terminated instances** (default, configurable).
 - **At most 100 internal events after one event** (`internal_event_cap`).
