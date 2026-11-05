@@ -26,7 +26,7 @@ no change required
 ### This sprint (2026-11-04)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
-   on the way, ✅ with 0.1.100, 2026-11-05):
+   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, for the next release):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
@@ -36,6 +36,9 @@ no change required
    4. A-152 [Archi], found checking A-147: the confirm sentence said once.
    5. A-151 [General/SY.timer], found on the way to A-115: `TIMER_LIST` in pages (SY.timer 1.3),
       checked with a WF's start over 350 timers.
+   6. A-153 [WF], from A-151's talk with the operator: at most 10 timers in a WF definition.
+   7. A-154 [WF], from A-153's talk: a quiet WF conversation closes on its own, after 4 days by
+      default.
 2. **The 🔴, simple and important** (✅ 0.1.99, 2026-11-04: A-100, A-89 and A-90 validated on 8.x;
    A-84 and A-85 by tests):
    1. A-100 [General/router]: protected verbs gated on any `msg_type`, in any case.
@@ -60,6 +63,8 @@ A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-137's chat is next.
 
 - From A-138's gate: an empty `wf: {}` block on a WF message whose action has no vars, menu or
   subject. *In code, for the next release.*
+- A-153 🔴 Nothing limits how many timers a WF definition holds. *Sprint, for the next release.*
+- A-154 🔴 Nothing closes a WF conversation that went quiet. *Sprint, for the next release.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
@@ -1174,6 +1179,74 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-154 [WF] 🔴 OPEN (found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
+
+- **What happens:** a running instance stays open until its flow reaches an end, a cancel or a
+  failure.
+  - The WF's hourly pass (`StartGC`, go/nodes/wf/wf-generic/node/gc.go) deletes only instances
+    that ended more than `gc_retention_days` (7) ago.
+  - An instance that waits for a message that never comes keeps its thread, its state and one of
+    the node's running instances (1000, by the spec's guidance, §21). A message from the person
+    weeks later takes up the old flow where it stopped.
+- **Decided (the operator, 2026-11-05):**
+  - The system closes a quiet conversation, and no definition has to program it. 4 days by
+    default; a definition may change it, up to 7 days: *"el timeout default es 4dias (4*24hrs),
+    pero el usuario podria cambiarlo... no mas de 7 días"*.
+  - The WF does it, for each conversation: *"mejor que sea el mismo WF si se puede por
+    conversacion, porque es timeout por conversacion"*. A SY.timer timer for each conversation
+    would double a node's pending timers, and every message would have to move it.
+  - Quiet means no activity and no pending timer: *"es inactiva cuando no tiene timers tampoco,
+    ademas de actividad"*. A conversation that waits for its own timer is not abandoned. The due
+    date of the handbook's Atom 5 (docs/archi/handbook_fluxbee.md) waits 30 days on one.
+- **Fix:**
+  - **The close:**
+    - The WF's hourly pass also closes each running instance that holds no timer
+      (`wf_instance_timers`) and whose last activity is older than its definition's timeout. The
+      last activity is `updated_at_ms`, set at each event the instance takes: a message, a fired
+      timer or an internal event.
+    - It closes the instance as a cancel does: status `cancelled`, with the reason in the
+      instance's log ("quiet for 4 days").
+    - The next message on its thread starts a new instance. The agents still know the person:
+      cognition's communication is the thread and the agent, not the instance.
+  - **The definition's field:**
+    - `idle_timeout`, in `fire_in`'s format (`"4d"`), 4 days when the definition leaves it out.
+    - The validator refuses more than 7 days, and less than 1 hour, the pass's interval. The
+      floor is proposed, for the operator to confirm.
+    - A conversation closes within the hour after its timeout.
+  - **A goodbye message** ("we are closing your case") is the author's own timer, one of the 10
+    (A-153).
+  - **The docs:** the spec (§21 and the instance's lifecycle) and Archi's handbook say it.
+- **Status:** in the sprint, for the next release, with A-153.
+
+### A-153 [WF] 🔴 OPEN (found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
+
+- **What happens:** a definition may name any number of timer keys.
+  - Each `schedule_timer` names a literal `timer_key`, and the WF keeps one timer per instance and
+    key (`execScheduleTimer`, go/nodes/wf/wf-generic/node/actions.go). So the definition fixes how
+    many timers one conversation holds at once.
+  - The validator checks only that a key is not empty (go/pkg/wfcel/validate.go), and the spec's
+    limits (docs/spec-systemnode-wf-v1_1.md §21) name none for timers.
+- **A node's count:**
+  - One running instance per thread (`InstanceRegistry`, node/correlate.go), and at most 1000
+    running instances per WF node, by the spec's guidance (§21): beyond it, more nodes.
+  - An instance that ends (a terminal state, a cancel or a failure) cancels its timers in SY.timer
+    and drops them (§11.3, `cancelAllTimers`), and a fired timer is no longer pending. The pending
+    timers are those of the conversations open now.
+  - Nothing ends an instance on its own yet: one whose flow never reaches an end stays open. A-154
+    closes a quiet one, after 4 days by default.
+  - With 10 timers a conversation, a node holds at most 10,000 pending, SY.timer's limit per owner.
+    The WF reads back at most 1000 at its start (§21): a scale topic, for when a WF nears it.
+- **Decided (the operator, 2026-11-05): at most 10 timers in a definition.**
+  - The operator first put the limit on the node: *"es de locos hacer algo con mas de eso, y si es
+    necesario es porque hay que poner otro nodo... de hecho te diria 10"*.
+  - A node's count grows with the conversations open at once, so a limit there limits customers.
+    It goes on the definition, per conversation: *"puede ser no más de diez timers para una lógica
+    muy compleja"*.
+- **Fix:** the validator refuses a definition with more than 10 distinct timer keys, as it refuses
+  a menu past its limits. Archi gets the error when it writes the WF; the way out is two WFs. The
+  spec's enforced limits (§21) and Archi's handbook (docs/archi/handbook_fluxbee.md) say it.
+- **Status:** in the sprint, for the next release.
+
 ### A-152 [Archi] ✅ VALIDATED ON 8.x (0.1.100, 2026-11-05; found 2026-11-04, checking A-147 on 8.x) — A turn that stages a plan says how to confirm twice
 
 - **Seen on 8.x (0.1.99):** Archi's answer ended "Reply CONFIRM to execute or CANCEL to discard.",
@@ -1629,6 +1702,109 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   operator before anything is built, and it is not part of WF Case 4.
 - **2026-11-04, the operator:** for the WF track, and important: its chat comes in this sprint,
   after A-138.
+- **The chat (2026-11-05):**
+  - **The operator, on what cognition is for:**
+    - It gives a conversation its history as metadata: abstract cues, feelings, what was lived.
+      The agent gets it as context, beside the immediate memory, the last turns as they were said.
+    - Between agents, only the immediate memory: *"las conversaciones entre agentes solo
+      necesitan la memoria inmediata, nada de análisis de metadata cognitiva"*.
+    - The first question: can cognition analyze a conversation with several interlocutors, a WF's
+      above all?
+  - **Verified in the code (2026-11-05):**
+    - **The key holds.** The WF puts its instance's thread on every message it sends
+      (`execForward` and `execSendMessage`, go/nodes/wf/wf-generic/node/actions.go). So what a
+      person says through a WF lands in one communication, the person's thread with the agent.
+    - **A forward reads right.**
+      - It keeps the message's `src_ilk` and `ich`.
+      - Cognition names the node a turn came in through by the origin of the turn's trace
+        (`turn_via`, A-138), so the turn reads as the person's, through their IO node.
+      - The agent's memory reads as if the person had spoken to it.
+    - **The WF's own text reads as the person's.**
+      - A `send_message` to an agent carries the person as its `src_ilk` (§5.4.3, the rest of
+        A-116).
+      - So a timer's "Ana has not answered in 2 days" is analyzed as a turn of Ana's.
+    - **An agent's answer that the WF forwards to another agent keeps its ILKs.**
+      - For invoice, it is a turn from sales to Ana, through the IO node where the cycle
+        started.
+      - It is analyzed in full, the feeling included, once in each agent's communication.
+    - **The analysis has no speakers.**
+      - The immediate memory names each turn's speaker: "you", or the ILK and the node
+        (`render_memory_turn`, nodes/ai/ai-generic).
+      - The tagger takes one turn at a time, with its ILKs as opaque hints. Both ILKs weigh the
+        same (`current_turn_ilk_weights`).
+      - The narrator writes the memory and the episodes from labels and signals, with no speakers
+        (src/bin/sy_cognition/narrative_summarizer_ai.rs).
+      - So the feeling is the conversation's, not a person's. With one person and one agent that
+        holds. With several people on a thread, their feelings blend into one, with no name.
+  - **Decided (the operator, 2026-11-05): cognition decides which turns it analyzes, turn by turn,
+    by their origin and destination.** *"el truco es informarle al cognitive que mensajes tiene
+    que analizar cognitivamente y cuales no basado en origen/destino.. [...] deberia ser cognitive
+    que sepa o no si tiene que evaluarlo"*.
+  - **Agreed with the operator (2026-11-05):** *"si, perfecto hasta ahi"*.
+    - **The rule:**
+      - A turn is analyzed when a person is at its other end. That is a turn to the agent that a
+        person wrote, or an answer of the agent to a person (its `dst_ilk`).
+      - The other turns still go into `turns` and the package's last turns, unanalyzed.
+    - **Whether an ILK is a person:** the identity memory names each ILK's type, on every hive
+      (the workers' replicas copy the primary). Cognition reads it already for the agent's ILK.
+      WF, IO and AI nodes are registered as `agent` (`derive_ilk_type_for_node`,
+      src/bin/sy_orchestrator.rs).
+    - **Who wrote a turn:** the last node in its trace that did not forward it.
+      - A WF notes first the action that sent the message (docs/message-trace-v1.md §5).
+      - When that node is the person's IO node, the writer is the person named in the
+        `src_ilk`. Otherwise it is that node: the agent or the WF.
+    - **Nothing new in the router:** it names the WF as the sender both of a forward and of the
+      WF's own text. Only the WF knows which it sent, and its trace entry says it.
+    - **The `src_ilk` of the WF's own text stays the person (§5.4.3):**
+      - The agent keeps each interlocutor's state under the `src_ilk` (`ThreadStateToolsProvider`,
+        nodes/ai/ai-generic).
+      - With the WF's own ILK there, all the WF's conversations would share one state.
+  - **The immediate memory, the operator's next question (2026-11-05):** does it mix? *"si se
+    mezcla hay que ponerle interlocutores, sino se hace una ensalada"*.
+    - **Verified:**
+      - Each communication has one list: everyone who spoke to the agent on the thread, in order.
+      - Each line names its speaker: `you`, or `<ILK> via <node>` (`render_memory_turn`, and
+        `current_message_label` for the current message, nodes/ai/ai-generic). The labels fall
+        short:
+        - the WF's own text carries the person's ILK;
+        - an ILK is an opaque id, with no type and no name. An IO node sends no name when it
+          provisions a person (nodes/io/common/src/provision.rs), so only a registered person has
+          one;
+        - an agent's answer that a WF forwards names, as its node, the IO node where the cycle
+          started;
+        - the agent's own turns say `you`, not whom they answered.
+    - **Agreed with the operator (2026-11-05), with an addition:**
+      - **Each line names its writer:**
+        - a person by their ILK and IO node, with their name when the identity has one;
+        - an agent or a WF by its node.
+      - **The agent's own turns** name whom they answered.
+      - **It stays one list:** *"mezclado esta bien, el tema es como identificar a los
+        interlocutores"*.
+      - **The operator's addition:** the writer's ILK and name both go in the message and in
+        storage. A node that sends a message fills a missing name from the identity memory: *"yo
+        diria de poner los dos, y que luego con la SHM de ilk se pueda llenar si no esta el nombre
+        [...] que los nodos tengan la capacida de resolver eso, el que mande el mensaje"*.
+    - **Verified for the addition:**
+      - **What `turns` keeps:** `from_ilk` (the `src_ilk`), `to_ilk` and the whole message, its
+        trace included, but no name (src/bin/sy_storage.rs).
+        - A message with no `src_ilk`, like a WF's to an IO node (A-139), puts its sender's node
+          UUID in `from_ilk` (`parse_turn`). That UUID is no ILK.
+      - **Names in the identity memory:**
+        - Every node has one: the orchestrator registers each AI, IO and WF node with its node name
+          as its display name (`ILK_REGISTER`, src/bin/sy_orchestrator.rs).
+        - A person has one once registered.
+      - **Who can read a name:**
+        - The Rust SDK, the IO nodes' and the agents', reads every ILK's type and name from the
+          identity memory.
+        - The Go SDK, the WF's, finds an ILK only by its channel or its handler node
+          (go/fluxbee-go-sdk/identity_shm.go).
+    - **Proposed, for the operator to confirm:** the writer travels in the message, `{ilk, name}`,
+      and no longer comes from the trace.
+      - **Who names it:** whoever writes the text. An IO node names the person, an agent itself,
+        and a WF itself for its own text. A forward keeps it.
+      - **The name:** as it sends, every node's SDK fills a missing name from the identity memory.
+      - **Who reads it:** cognition and the agent read it as it comes, and `turns` keeps the
+        writer's ILK and name.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
