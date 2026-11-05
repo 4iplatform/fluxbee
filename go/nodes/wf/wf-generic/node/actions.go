@@ -372,8 +372,9 @@ func writeActionContext(metaContext map[string]any, action ActionDefinition, ins
 // deterministic context the WF gives the receiver; menu, the action's menu as it loaded, its known
 // options written in, what an agent or an IO node's people may choose from (§5.3.6, §5.4.4); and
 // subject, the mark an IO node places the message by (§5.4.2). Each is there only when the action
-// has it. The nodes the message went through are its trace's (docs/message-trace-v1.md), which
-// replaced the block's trail.
+// has it, and the block only with one of them: a message with none carries no block, not even the
+// one a forwarded message brings from another WF. The nodes the message went through are its
+// trace's (docs/message-trace-v1.md), which replaced the block's trail.
 func withWFBlock(metaContext map[string]any, action ActionDefinition, inst *WFInstance, eventMap map[string]any) (json.RawMessage, error) {
 	block := map[string]any{}
 	if action.Vars != nil {
@@ -389,7 +390,11 @@ func withWFBlock(metaContext map[string]any, action ActionDefinition, inst *WFIn
 	if action.Subject != "" {
 		block["subject"] = action.Subject
 	}
-	metaContext[wfcel.ContextWF] = block
+	if len(block) == 0 {
+		delete(metaContext, wfcel.ContextWF)
+	} else {
+		metaContext[wfcel.ContextWF] = block
+	}
 	raw, err := wfcel.EncodeJSON(metaContext)
 	if err != nil {
 		return nil, fmt.Errorf("marshal meta.context: %w", err)

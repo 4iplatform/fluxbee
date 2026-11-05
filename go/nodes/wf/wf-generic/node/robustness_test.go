@@ -599,7 +599,7 @@ func TestADefinitionsNumbersGoOnTheWireAsWritten(t *testing.T) {
 	if got := string(disp.sent[0].Payload); got != `{"count":3,"limit":7,"list":[1,2.0],"one":1.0,"ratio":2.5}` {
 		t.Fatalf("payload on the wire: %s", got)
 	}
-	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"backoff":1.5,"retries":3,"wf":{}}` {
+	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"backoff":1.5,"retries":3}` {
 		t.Fatalf("meta.context on the wire: %s", got)
 	}
 	if got := string(disp.sent[1].Payload); got != `{"count":3,"limit":10,"list":[1,2.0],"one":1.0,"ratio":2.5}` {

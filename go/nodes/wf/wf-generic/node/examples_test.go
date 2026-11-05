@@ -182,7 +182,7 @@ func TestTheRouterExampleRepliesToTheIONodeTheQuestionCameFrom(t *testing.T) {
 	dispatch(agentAnswer(t, "AI.host@motherbee", request, `{"type":"text","content":"the answer"}`, nil))
 	msg := sentTo(t, disp, "IO.api.support@motherbee")
 	if string(msg.Payload) != `{"type":"text","content":"the answer"}` ||
-		contextWithoutTrace(t, msg) != `{"io":{"reply_target":{"address":"conv-1","kind":"api"}},"wf":{}}` || tracePath(msg) != "[IO.api.support@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
+		contextWithoutTrace(t, msg) != `{"io":{"reply_target":{"address":"conv-1","kind":"api"}}}` || tracePath(msg) != "[IO.api.support@motherbee WF.invoice@motherbee AI.host@motherbee WF.invoice@motherbee]" {
 		t.Fatalf("the answer goes back to IO.api as it came, with its reply context: %s %s", msg.Payload, msg.Meta.Context)
 	}
 	if row := mustGetInstance(t, rt, viaAPI); row.CurrentState != "answered" {
@@ -884,7 +884,7 @@ func TestTheSalesInvoiceExampleConsultsTheSupervisors(t *testing.T) {
 	c.inState("consulting")
 	toSupervisors := c.sentTo(supervisorsIO)
 	if derefString(toSupervisors.Meta.Msg) != "SUPERVISOR_QUESTION" || string(toSupervisors.Payload) != fmt.Sprintf(`{"content":%q,"type":"text"}`, question) ||
-		derefString(toSupervisors.Meta.ThreadID) != salesThread || contextWithoutTrace(t, toSupervisors) != `{"wf":{}}` || tracePath(toSupervisors) != "["+salesIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" ||
+		derefString(toSupervisors.Meta.ThreadID) != salesThread || contextWithoutTrace(t, toSupervisors) != `{}` || tracePath(toSupervisors) != "["+salesIO+" "+salesWFNode+" "+salesAgent+" "+salesWFNode+"]" ||
 		toSupervisors.Meta.SrcIlk != nil || toSupervisors.Meta.Ich != nil || toSupervisors.Meta.DstIlk != nil {
 		t.Fatalf("the supervisors get the question: %+v %s %s", toSupervisors.Meta, toSupervisors.Payload, toSupervisors.Meta.Context)
 	}

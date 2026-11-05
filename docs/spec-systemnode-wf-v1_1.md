@@ -792,7 +792,7 @@ The pattern of a conversation: the initial state keeps the person's message (`cu
 
 ### 10.9 The WF's block: `meta.context.wf`
 
-Every message a WF sends, a `send_message` or a `forward`, carries the WF's block in `meta.context.wf` (since 0.1.91): deterministic context for the receiver, which an agent shows its model before the person's text.
+A message a WF sends, a `send_message` or a `forward`, carries the WF's block in `meta.context.wf` (since 0.1.91) when its action has `vars`, a `menu` or a `subject`: deterministic context for the receiver, which an agent shows its model before the person's text. Until 0.1.100 every message carried it, with its `trail`; since 0.1.101 a message whose action has none of the three carries no block.
 
 ```json
 { "wf": { "vars": { "order": { "product": "Pro", "quantity": 10, "unit_price": 100 } }, "menu": { "options": [ { "name": "issued", "description": "You issued the invoice." } ] } } }
@@ -802,7 +802,7 @@ Every message a WF sends, a `send_message` or a `forward`, carries the WF's bloc
 - **`vars`** holds what the action's `vars` writes, `$ref`-resolved; it is left out when the action has none.
 - **`menu`** is the action's menu, as written but with no empty field and with each option's params in name order (§10.10); it is left out when the action has none.
 - **`subject`** is the action's subject (§10.1); it is left out when the action has none.
-- An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten.
+- An action's `meta.context` never writes `wf`: validation refuses it, and a `$ref` that brings one is overwritten. A forwarded message's own block, another WF's, never goes on: the WF's own block takes its place, or none.
 
 ### 10.10 `menu`: asking an agent or a person
 

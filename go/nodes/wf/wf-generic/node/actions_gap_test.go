@@ -166,9 +166,9 @@ func TestSendMessageCarriesTheInstancesThreadAndTheWFBlock(t *testing.T) {
 	}
 }
 
-// Without a meta.context or vars, a send still carries its trace, the WF's block and the instance's
-// thread; without a person (the message that started the instance had no src_ilk nor ich), it
-// carries none.
+// Without a meta.context or vars, a send still carries its trace and the instance's thread, and no
+// WF block, which would say nothing; without a person (the message that started the instance had no
+// src_ilk nor ich), it carries none.
 func TestSendMessageWithoutContextCarriesItsTrace(t *testing.T) {
 	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap2"}
 	actx := makeActx(t, disp, &mockTimerSender{})
@@ -185,11 +185,37 @@ func TestSendMessageWithoutContextCarriesItsTrace(t *testing.T) {
 	if got := derefStringPtr(disp.sent[0].Meta.ThreadID); got != "conv-2" {
 		t.Fatalf("a send carries the instance's thread, got %q", got)
 	}
-	if got := contextWithoutTrace(t, disp.sent[0]); got != `{"wf":{}}` || tracePath(disp.sent[0]) != "[WF.invoice@motherbee]" {
+	if got := contextWithoutTrace(t, disp.sent[0]); got != `{}` || tracePath(disp.sent[0]) != "[WF.invoice@motherbee]" {
 		t.Fatalf("meta.context: %s", disp.sent[0].Meta.Context)
 	}
 	if meta := disp.sent[0].Meta; meta.SrcIlk != nil || meta.Ich != nil {
 		t.Fatalf("no person: %+v", meta)
+	}
+}
+
+// A forward of another WF's message carries this WF's block only: none when its action has no vars,
+// menu or subject, and never the block the message brought.
+func TestAForwardCarriesNoOtherWFsBlock(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-gap2b"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	inst := NewInstance(mustLoadValidDefinition(t), "wfi:inst-2b", "conv-2", "invoice", map[string]any{}, fixedClock)
+	upstream := from("WF.sales@motherbee", sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-upstream"},
+		Meta:    sdk.Meta{MsgType: "user", ThreadID: strPtr("conv-2"), Context: json.RawMessage(`{"wf":{"vars":{"order":1},"subject":"new"}}`)},
+		Payload: json.RawMessage(`{"type":"text","content":"invoice it"}`),
+	})
+	inst.takeCycleTrace(upstream)
+	for _, c := range []struct{ subject, context string }{
+		{"", `{}`},
+		{"same", `{"wf":{"subject":"same"}}`},
+	} {
+		action := ActionDefinition{Type: "forward", Target: "IO.slack.team@motherbee", Subject: c.subject}
+		if err := execForward(context.Background(), action, inst, upstream, actx); err != nil {
+			t.Fatal(err)
+		}
+		if sent := disp.sent[len(disp.sent)-1]; contextWithoutTrace(t, sent) != c.context {
+			t.Fatalf("a forward with subject %q: %s, want %s", c.subject, sent.Meta.Context, c.context)
+		}
 	}
 }
 
@@ -220,8 +246,8 @@ func TestASendNamesThePersonAsItsTargetNeedsAndCarriesTheSubject(t *testing.T) {
 	}
 	const carriesThePerson, namesThePerson, noPerson = `src_ilk="ilk:person" dst_ilk="" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="ilk:person" ich="ich:api:conv-3"`, `src_ilk="" dst_ilk="" ich=""`
 	for _, c := range []struct{ target, subject, ilks, context string }{
-		{"AI.payments@motherbee", "", carriesThePerson, `{"wf":{}}`},
-		{"WF.billing@motherbee", "", carriesThePerson, `{"wf":{}}`},
+		{"AI.payments@motherbee", "", carriesThePerson, `{}`},
+		{"WF.billing@motherbee", "", carriesThePerson, `{}`},
 		{personsIO, "same", namesThePerson, `{"wf":{"subject":"same"}}`},
 		{"IO.slack.team@motherbee", "end", noPerson, `{"wf":{"subject":"end"}}`},
 	} {

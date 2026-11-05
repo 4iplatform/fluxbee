@@ -77,9 +77,9 @@ type ActionMeta struct {
 	Context any `json:"context,omitempty"`
 }
 
-// ContextWF is the key of the WF's block in the meta.context of every message a WF sends:
-// {"trail": [the nodes the message went through], "vars": {what the action's vars writes},
-// "menu": the action's menu, as loaded, "subject": the action's subject}.
+// ContextWF is the key of the WF's block in the meta.context of a message a WF sends, when its action
+// has vars, a menu or a subject: {"vars": {what the action's vars writes}, "menu": the action's
+// menu, as loaded, "subject": the action's subject}.
 const ContextWF = "wf"
 
 // The subjects a send_message or a forward to an IO node marks its message with

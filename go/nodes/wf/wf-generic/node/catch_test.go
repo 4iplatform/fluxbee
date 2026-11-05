@@ -29,7 +29,8 @@ func ioMessage(thread, msgName, payload string) sdk.Message {
 	return from("IO.in@motherbee", msg)
 }
 
-// rawBlock is the WF's block of a message as it went on the wire, field by field.
+// rawBlock is the WF's block of a message as it went on the wire, field by field: none for a message
+// that carries no block.
 func rawBlock(t *testing.T, msg sdk.Message) map[string]json.RawMessage {
 	t.Helper()
 	var metaContext map[string]json.RawMessage
@@ -37,8 +38,10 @@ func rawBlock(t *testing.T, msg sdk.Message) map[string]json.RawMessage {
 		t.Fatalf("meta.context %s: %v", msg.Meta.Context, err)
 	}
 	var block map[string]json.RawMessage
-	if err := json.Unmarshal(metaContext["wf"], &block); err != nil {
-		t.Fatalf("meta.context.wf %s: %v", metaContext["wf"], err)
+	if raw, ok := metaContext["wf"]; ok {
+		if err := json.Unmarshal(raw, &block); err != nil {
+			t.Fatalf("meta.context.wf %s: %v", raw, err)
+		}
 	}
 	return block
 }

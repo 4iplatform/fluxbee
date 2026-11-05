@@ -250,7 +250,9 @@ else it knows it did.
     - a timer's fire starts one with none.
   - It lives in memory: after a restart, a send starts its trace anew.
   - **Its note** names the kinds of action of its step, the one that sent the message first.
-  - **It no longer writes the block's `trail`.**
+  - **It no longer writes the block's `trail`.** Since 0.1.101 it writes the block only when the
+    action has `vars`, a `menu` or a `subject`: 0.1.100's gate showed an empty `wf: {}` on every
+    other message.
 - **The router** writes its entry when it resolves a message with no destination, only on the
   sender's router (`handle_message`).
 - **ai.generic:**

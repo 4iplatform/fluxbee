@@ -937,7 +937,7 @@ func validateSentContext(path string, action ActionDefinition) ValidationErrors 
 			errs = append(errs, ValidationError{Path: path + ".meta.context", Message: "must be a JSON object"})
 		case !IsWorkflowRef(context):
 			if _, writesWF := context[ContextWF]; writesWF {
-				errs = append(errs, ValidationError{Path: path + ".meta.context." + ContextWF, Message: "is the WF's own block (trail, vars and menu): the engine writes it, from the action's vars and menu"})
+				errs = append(errs, ValidationError{Path: path + ".meta.context." + ContextWF, Message: "is the WF's own block (vars, menu and subject): the engine writes it, from the action's vars, menu and subject"})
 			}
 			if _, asks := context["response_envelope"]; asks {
 				errs = append(errs, ValidationError{Path: path + ".meta.context.response_envelope", Message: "is not part of the definition language: a WF asks an agent with menu"})

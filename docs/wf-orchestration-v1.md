@@ -554,7 +554,9 @@ todo probado"*.
    - A later keep under the same name replaces it.
    - Kept messages are committed with the transition, and go when the instance ends.
    - It refuses a `TIMER_FIRED` and an internal event, and its `on_error` defaults to `fail`.
-7. **The WF's block, `meta.context.wf`,** goes on every message a WF sends.
+7. **The WF's block, `meta.context.wf`,** goes on every message a WF sends. **Since 0.1.101** only
+   when the action has `vars`, a `menu` or a `subject`: without the trail, an empty block said
+   nothing (found in 0.1.100's gate).
    - `trail` lists the nodes the message went through. A `forward` takes the message's own trail
      (or its sender's name, when it has none) and adds the WF's name. A `send_message` starts it
      with the WF's name. **Replaced in 0.1.100** by the message's trace, `meta.context.trace`, which

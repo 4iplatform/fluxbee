@@ -194,8 +194,8 @@ On every request the node reads the key of its provider from SY.vault:
   after the memory block: `Message trace (UTC):`, one line for each entry, such as
   `10:17:03.180 WF.sales.invoice@worker1 -> AI.invoice@worker1 [forward]`, the newest 32 after a
   line that counts the rest.
-- **A WF's block:** a WF puts `meta.context.wf`, `{"vars": {...}}`, on every
-  message it sends
+- **A WF's block:** a WF puts `meta.context.wf`, `{"vars": {...}}`, on a message
+  it sends with variables
   ([docs/wf-orchestration-v1.md §5.2.1](../../../docs/wf-orchestration-v1.md#521-the-build-design)),
   with a `menu` when it asks the agent to choose (below). The node shows it to the model as a text
   block after the trace and before the message: `vars` as JSON, cut at 8 KiB with a line that says
