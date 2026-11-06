@@ -69,6 +69,10 @@ empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x.
   next release.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
   0.1.101; the rest, one topic at a time.*
+- A-155 🟡 The feelings (episodes): the agent never reads them, and they never fade nor build up.
+  *With A-137's next topic, several people on one thread.*
+- A-156 🟡 Cognition's weights: an open item's decay is not stored, `last_seen_at` moves when the
+  item is not seen, and the averages average a constant. *With A-155.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1181,6 +1185,69 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-155 [WF] 🟡 OPEN (found 2026-11-05, preparing A-137's next topic; read in the code) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
+
+- **What happens:**
+  - SY.cognition builds episodes, its feelings: an affect `anger`, `escalation` or `urgency` from
+    a turn's signals (`build_episode_candidate`, src/bin/sy_cognition.rs). The narrator writes each
+    one's text with its model call (`episode_summary`, `episode_reason`).
+  - The package carries up to 4 episodes by intensity, with their title and intensity only
+    (`build_memory_package_for_thread`). The narrator's text stays in storage.
+  - ai.generic renders the thread, the dominant context and reason, 4 contexts, 4 reasons and 3
+    memories (`render_memory_package_prompt_block`, nodes/ai/ai-generic/src/bin/ai_node_runner.rs).
+    Of the episodes it prints only how many the package left out.
+  - So the feelings, what the operator says cognition is for (*"indicios abstractos, sentires,
+    vivencias"*, 2026-11-05), are computed and paid for, and never reach the agent's model.
+- **Since when:** the first wiring of the package into ai.generic (`108c9646`, 2026-04-14) rendered
+  the labels and memories, and the episodes only as a truncation flag.
+- **They never fade nor build up** (`update_episodes_for_thread`):
+  - An episode's intensity is its affect's fixed base, 8 for anger and escalation, 7 for urgency.
+    A repeat keeps the higher of the two, so it never rises; nothing lowers it, and nothing closes
+    it.
+  - The package takes 4 by intensity, so among more than 4, which go is arbitrary: an anger of
+    weeks ago can leave today's out.
+  - The operator (2026-11-05): every item of cognition is a kind of weighted average that fades
+    with time, measured in the lab with its own code. Feelings are the same: *"si ocurre siempre se
+    refuerzan, si ocurren de vez en cuando perduran pero leves y si pasa una vez desaparece con el
+    tiempo"*, with *"más intensos y [...] más inercia en la fórmula"* than contexts. *"Esto
+    claramente no se hizo en el código."*
+- **The docs:** ai-generic's README lists what it renders, without the episodes.
+  docs/reference/cognition.md §1 counts "notable moments (episodes)" among what cognition gives an
+  agent. A-134's "four labels of each" reads as if the episodes were among them.
+- **Status:** open, with A-137's topic "several people on one thread"
+  ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §9): a feeling has to say whose it is
+  before an agent reads it.
+
+### A-156 [WF] 🟡 OPEN (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
+
+- **The math holds as documented** (docs/reference/cognition.md §5): an item a turn names gets
+  `weight × decay + 1.0`, one it does not gets `weight × decay`, and an open one closes under 0.25.
+  A context named once closes on the 9th turn without it, a reason on the 5th, a co-occurrence on
+  the 7th (checked numerically).
+- **The decay of an open item is not stored:**
+  - SY.cognition writes a context, a reason or a co-occurrence when a turn names it or when it
+    closes, not when it decays (`update_contexts_for_thread`, `update_reasons_for_thread`,
+    `update_cooccurrences_for_thread`, src/bin/sy_cognition.rs).
+  - A communication loaded from SY.storage takes the stored weights (`context_state_from_payload`):
+    after a restart, a communication evicted from memory, or its agent moving hives. Its open items
+    come back at their weight of the last turn that named them, up to 8 turns of decay higher for a
+    context, and which ones dominate can change.
+- **`last_seen_at` moves when the item is not seen:** a turn that only decays a context, a reason,
+  a co-occurrence or a memory sets it to the turn's time. It says when the communication last
+  moved, not when the item was last named.
+- **The averages average a constant:** `weight_avg_cumulative` and `weight_avg_ema` average each
+  turn's score, which is always 1.0, as no evaluator scores a tag (docs/history/12-cognition-v2.md
+  §8.2). They are always 1.0, and nothing reads them.
+- **Stale docs:**
+  - docs/history/12-cognition-v2.md §9 still lists the beta's values: `REASON_DECAY_FACTOR` 1.5
+    (the code multiplies by 0.75, as its own §8.2 says), `MEMORY_DECAY_STEP` 0.25 subtracted (the
+    code multiplies by 0.97), and an unbind threshold of −0.05 (the code uses 0.35, §8.3).
+  - Its §8.1 and §8.6 point to the Cognitive Lab audit for the context update and the episode
+    gate: that audit is not in the repo.
+  - docs/reference/cognition.md §5 says an episode's repeat raises its intensity; it does not
+    (A-155).
+- **Status:** open, with A-155.
 
 ### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 

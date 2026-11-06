@@ -6,9 +6,9 @@
   The operator opened that chat on 2026-11-05. Its first part was agreed the same day (§3): who
   wrote each turn, which turns cognition analyzes, and how the immediate memory names its
   speakers.
-- Built in code the same day, for the next release, with A-153 and A-154 (§8). Next: the release
-  and its gate on 8.x.
-- The rest of A-137 is open (§9), one topic at a time.
+- Built in code the same day, and released in 0.1.101 with A-153 and A-154 (§8), checked on 8.x.
+- The rest of A-137 is open (§9), one topic at a time. The first, several people on one thread
+  and the feelings, is in the chat (§10). Its numbers wait for the lab's code.
 
 This is the single place for the topic.
 
@@ -228,9 +228,133 @@ Cognition analyzes the first two lines only: a person is at their other end.
 
 The rest of A-137, one topic at a time:
 
-- **Several people on one thread:** the analysis blends their feelings into one, with no name. It
-  could analyze each interlocutor apart.
+- **Several people on one thread:** the analysis blends their feelings into one, with no name.
+  In the chat since 2026-11-05 (§10).
+- **Where cognition keeps its state** (§10.6): the next topic.
 - **A conversation with no agent:** who owns it, and which hive's cognition keeps it. In Case 4,
   Juan talks with Ana from 10:00 to 10:16 and no agent is in that part.
 - **Handing over:** how the next agent sees what was said meanwhile.
 - **Who pays** for an analysis with no agent.
+
+---
+
+## 10. Several people on one thread, and the feelings (chat of 2026-11-05)
+
+### 10.1 Facts (verified in the code, 2026-11-05)
+
+- **Where several people share a communication:**
+  - in a Slack channel: the thread is the channel, or the Slack thread, whoever writes
+    (`slack_inbound_io_context`, nodes/io/common/src/io_context.rs);
+  - in WF Case 4: Juan's hand-back note reaches sales on Ana's thread.
+
+  WhatsApp is one to one.
+- **The analysis has no owners** (src/bin/sy_cognition.rs):
+  - the tagger reads each turn alone, with its ILKs as opaque hints;
+  - the narrator writes the memory and the episodes from labels and signals, with no speaker and
+    no text;
+  - an episode is one per scope instance and affect, with no ILK, and an agent's own answer can
+    raise one;
+  - contexts and reasons count who sent and who got them (`ilk_profile`), and nothing reads it.
+- **The feelings never reach the agent, and never fade** (FINDINGS A-155):
+  - ai.generic shows no episode;
+  - an episode's intensity is its affect's fixed base (8, 8, 7), never lowered, never closed;
+  - the package takes 4 by intensity, which among more than 4 is arbitrary.
+- **The other items fade as designed** (docs/reference/cognition.md §5): a turn that names an item
+  makes its weight `weight × decay + 1`, a turn that does not makes it `weight × decay`, and an
+  open one closes under 0.25.
+  - Contexts decay by 0.85, reasons by 0.75, co-occurrences by 0.80, and memories by 0.97
+    (memories never close).
+  - So an item said every turn builds up, one said every few turns stays faint, and one said once
+    goes: a context on its 9th turn without it.
+- **Three defects** (FINDINGS A-156):
+  - an open item's decay is not stored, so a reload brings back its weight of the last turn that
+    named it;
+  - `last_seen_at` moves on a turn that does not name the item;
+  - the averages (`weight_avg_cumulative`, `weight_avg_ema`) average each naming turn's score,
+    always 1.0.
+- **The docs:** no doc has the feelings' formula. 12-cognition-v2 §8.6 points to the Cognitive
+  Lab audit, which is not in the repo. The beta spec (docs/history/legacy/12-cognition-v2-BETA.md)
+  names `habit_count`, `habit_penalty` and `novelty_bonus`, keyed by affect and main context, with
+  no formula. The lab's code is not in the repo, its history, or the noe branch.
+
+### 10.2 Decided (the operator, 2026-11-05)
+
+1. **One communication, and each feeling and each memory names its owner** (*"Concuerdo con esa
+   opción que propones"*). Same rule as the immediate memory: mixed, with each interlocutor named.
+2. **Each ILK owns its feelings, and each person is evaluated apart:** *"Cada ilk es dueña de sus
+   sentires [...] si hay más de una persona jugando en la charla, cada uno tendrá su historia y se
+   evaluará por ilk"*.
+3. **The feelings follow the math of every other item,** a weighted average that fades with time:
+   *"si ocurre siempre se refuerzan, si ocurren de vez en cuando perduran pero leves y si pasa una
+   vez desaparece con el tiempo"*.
+   - Only their numbers are larger, for more inertia: *"al menos x2-x10 dependiendo del sentir"*.
+   - That math was measured in the lab, with its own code: *"esa dinámica fue medida y funcionó"*.
+4. **The numbers:** today's for now. The operator brings the lab's code to check them: *"supongamos
+   que los números son los del soft actuales y mañana consigo el código y verificamos los
+   números"*.
+5. **`last_seen_at` and the averages are bugs to fix:** *"son bugs desastrosos de programación
+   deficiente y que no se terminó"*.
+6. **Cognition keeps its own state; SY.storage keeps the messages:** *"cognitive tiene
+   persistencia propia, storage guarda mensajes, la idea no es que sea repositorio de cognitive"*.
+   Its own topic (§10.6).
+
+### 10.3 The feelings' math (proposed; its numbers to check against the lab's code)
+
+- **A feeling** is one per person, affect and context: "Ana, anger, billing". The beta keyed its
+  habit counter by affect and main context.
+- **A person's turn** whose signals pass the gate for an affect (`build_episode_candidate`, as
+  today) makes that feeling's weight `weight × d + s`. Each other analyzed turn of the same person
+  makes each of that person's open feelings `weight × d`. A feeling closes under 0.25, and opens
+  again when it comes back.
+  - The clock is the owner's own turns: Pedro writing calm does not fade Ana's anger.
+  - Only a person's own turn raises a feeling. An agent's answer adds to the contexts and reasons,
+    never to a feeling.
+- **The numbers:** a context's decay (0.85) with its half-life stretched by each affect's inertia
+  (`d = 0.85^(1/k)`), and a step of the affect's base intensity over 4:
+
+| Affect | Inertia | d | s | Half-life (turns) | Said once, gone on its turn without it |
+| --- | --- | --- | --- | --- | --- |
+| urgency | ×2 | 0.922 | 1.75 | 8.5 | 24th |
+| anger | ×5 | 0.968 | 2 | 21.3 | 64th |
+| escalation | ×10 | 0.984 | 2 | 42.7 | 128th |
+| (a context, today) | ×1 | 0.85 | 1 | 4.3 | 9th |
+
+  Said every 20 turns, urgency stays at 0.5 to 2.2, anger at 2.3 to 4.2, and escalation at 5.3 to
+  7.2. Said every 40 turns, urgency goes between them, and anger and escalation stay.
+- **Its text:** the narrator's, as today, now knowing whose feeling it is.
+- **The memory:** one per scope, as today, now naming who said what. The narrator gets each turn's
+  writer.
+- **The package:** the open feelings by weight, up to 12. Each has its owner, affect and context,
+  a level from its weight, when it was last felt, and its text.
+- **The agent:** a "Feelings" block, the person being answered first.
+
+### 10.4 The bugs fixed with it (A-156)
+
+- **`last_seen_at`** moves only on a turn that names the item.
+- **The averages** average the item's weight over the turns it is open. The beta's example does:
+  a context of weight 4.2 has averages of 2.85 over 23 samples. Today they average the score,
+  always 1.0, and only on a naming turn.
+- **The docs:** 12-cognition-v2 §9 loses the beta's values, and docs/reference/cognition.md §5
+  says how a feeling builds up and fades.
+
+### 10.5 What the change touches
+
+- SY.cognition: the feelings' key, math and narrator input.
+- The package's `EpisodeSummary`: owner, context, level, date and text.
+- ai.generic: the "Feelings" block.
+
+No new node, message or model call. SY.storage needs no new column: a communication reloads from
+each row's `payload`.
+
+### 10.6 Next topic: where cognition keeps its state
+
+- **Today it has none of its own:**
+  - Locally it keeps only its config. It reports a `memory.lance` path that nothing opens: LanceDB
+    was 12-cognition-v2's local layer, never built (FINDINGS A-38).
+  - Since 0.1.77 its rows go to SY.storage@motherbee (`storage.cognition.batch`, the `cognition_*`
+    tables), and it reloads from there over the mesh (`COGNITION_STATE_GET`), as
+    docs/router-stream-v1.md §6.2 designed it (2026-10-17).
+- **The operator's direction** (§10.2, 6): cognition keeps its own state, and SY.storage keeps the
+  messages.
+- **A-156's first defect belongs there:** an open item's decay is not stored, because each write
+  is a stream record to the motherbee.
