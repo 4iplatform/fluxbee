@@ -57,25 +57,25 @@ no change required
    2. A-137 [WF]: the chat on cognition across hands. Its first part, agreed and built 2026-11-05
       ([cognition-hands-v1](../../docs/cognition-hands-v1.md)): who wrote each turn, which turns
       cognition analyzes, and how the immediate memory names its speakers. ✅ 0.1.101, its WF gate
-      on 8.x (2026-11-05). The rest, one topic at a time.
+      on 8.x (2026-11-05). Its second topic, several people on one thread and the feelings (§10),
+      agreed and built 2026-11-05 with A-155, A-157 and two of A-156's three: ✅ 0.1.102, its
+      gate on 8.x (2026-11-06). Next, where cognition keeps its state (§10.6), to review whole
+      first; then the rest, one topic at a time.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
-empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x.
+empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x. A-137's feelings, with A-155,
+A-157, two of A-156's three and the fix of a person with no name, went out in 0.1.102
+(2026-11-06), checked on 8.x.
 
 ### WF
 
-- From A-137's gate: a person with no name reads with their ILK as their name. *In code, for the
-  next release.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
-  0.1.101; the rest, one topic at a time.*
-- A-155 ✅ The feelings (episodes): each person's, fading and building up, and the agent reads
-  them. *In code, for the next release.*
-- A-157 ✅ The feelings' gate waited for words the tagger was never asked for: no feeling was ever
-  made on 8.x. *In code, for the next release.*
-- A-156 🟡 Cognition's weights: `last_seen_at` and the averages *in code, for the next release*;
-  an open item's decay not stored waits for where cognition keeps its state (cognition-hands-v1
-  §10.6), a decision to review whole first.
+  0.1.101, the feelings ✅ 0.1.102; next, where cognition keeps its state (cognition-hands-v1
+  §10.6), a decision to review whole first; then the rest of §9.*
+- A-156 🟡 Cognition's weights: `last_seen_at` and the averages ✅ 0.1.102, checked on 8.x; an
+  open item's decay not stored waits for where cognition keeps its state (cognition-hands-v1
+  §10.6).
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1189,7 +1189,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-155 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, preparing A-137's next topic) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
+### A-155 [WF] ✅ VALIDATED ON 8.x (0.1.102, 2026-11-06; found 2026-11-05, preparing A-137's next topic) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
 
 - **What happens:**
   - SY.cognition builds episodes, its feelings: an affect `anger`, `escalation` or `urgency` from
@@ -1232,9 +1232,29 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (found in the review round: the gate gave one affect a turn);
   - the package carries up to 12 open feelings by weight, each with its owner, affect, context,
     level, `last_felt_at` and text, and ai.generic shows them, those of whom it answers first.
-- **Status:** in code for the next release.
+- **Checked on 8.x (0.1.102):** the gate gate0204 on worker1.
+  - The setup: a client standing for an IO node, `AI.pruebas@worker1`, no WF, and two people of
+    the tenant `pruebas` on one thread, A registered and B temporary. Four turns: A angry at a
+    third double charge, B calm on another invoice, A calm, then B asking the agent to copy its
+    Feelings lines.
+  - A's angry turn opened three feelings of A's around `billing`: anger 2.0, escalation 2.0 and
+    urgency 1.75 (A-157), with one text naming A: *"Person Gate 0195 Equipo faced a third
+    duplicate charge on invoice 123 and responded with anger, demanding same-day resolution and
+    threatening to switch provider"*.
+  - B's turn and the agent's answers moved none of them. A's calm turn faded each once.
+  - The package the agent got for B's last turn, read in worker1's memory region, was version 4
+    and carried A's three feelings by weight, each `faint` and last felt at A's angry turn:
+    - escalation 1.9678 (2 × 0.85^(1/10));
+    - anger 1.936 (2 × 0.85^(1/5));
+    - urgency 1.6134 (1.75 × 0.85^(1/2)).
+  - Asked by B to copy them, the agent declined: *"Son notas internas de la conversación y tratan
+    sobre otra persona"*.
+  - Each stored row has its owner, context, status `open` and one occurrence. The fade is not
+    stored (A-156's first).
+  - SY.cognition made 16 model calls for the 8 turns, 2 each, as before: the feelings add none.
+- **Status:** validated.
 
-### A-157 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, building A-155; seen on 8.x) — The feelings' gate waits for words the tagger is never asked for, so no feeling was ever made
+### A-157 [WF] ✅ VALIDATED ON 8.x (0.1.102, 2026-11-06; found 2026-11-05, building A-155; seen on 8.x) — The feelings' gate waits for words the tagger is never asked for, so no feeling was ever made
 
 - **Seen on 8.x (0.1.101, 2026-11-05):** `cognition_episodes` has no row, with 276 reasons and 63
   communications. The tagger's extra hints are phrases ("credit note issued", "agent not yet set
@@ -1250,9 +1270,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     (`COGNITION_AFFECT_SIGNALS`), defined in its prompt, with an example each;
   - the parser maps the words a model may vary (`angry`, `deadline`) and drops any other;
   - the gate reads that set.
-- **Status:** in code for the next release, with A-155.
+- **Checked on 8.x (0.1.102):** in A-155's gate, the tagger named frustration, escalation and
+  urgency on the angry turn, and each affect's gate opened its feeling. These were the first rows
+  ever in `cognition_episodes` on 8.x. The calm turns opened none.
+- **Status:** validated.
 
-### A-156 [WF] 🟡 OPEN, two of its three in code for the next release (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
+### A-156 [WF] 🟡 OPEN, two of its three ✅ in 0.1.102, validated on 8.x (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
 
 - **The math holds as documented** (docs/reference/cognition.md §5): an item a turn names gets
   `weight × decay + 1.0`, one it does not gets `weight × decay`, and an open one closes under 0.25.
@@ -1288,9 +1311,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   names the item; the averages average the weight over every turn the item is open
   (`sample_weight`), as the beta's example does (weight 4.2, averages 2.85 over 23 samples). The
   stale docs are corrected.
-- **Status:** the second and third in code for the next release. The first waits for where
-  cognition keeps its state (§10.6): the operator wants that reviewed whole, as a decision more
-  complex than it looked (2026-11-05), so nothing of it is built.
+- **Checked on 8.x (0.1.102),** in A-155's gate:
+  - `confrontational pushback`, `seeking urgent resolution` and `withdrawal intent` were named on
+    A's first turn and closed 5 turns later at 0.2373. Each closed row keeps `last_seen_at` at the
+    naming turn (05:10:33 UTC), with `closed_at` at the closing one (05:12:08). Before the fix
+    both were 05:12:08.
+  - Their averages are 0.548 over 6 samples, the mean of 1, 0.75, 0.5625, 0.4219, 0.3164 and
+    0.2373. The other reasons' averages run from 0.64 to 2.6, no longer 1.0.
+- **Status:** the second and third validated in 0.1.102. The first waits for where cognition keeps
+  its state (§10.6): the operator wants that reviewed whole, as a decision more complex than it
+  looked (2026-11-05), so nothing of it is built.
 
 ### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
@@ -1781,7 +1811,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   another WF never goes on (`withWFBlock`; test `TestAForwardCarriesNoOtherWFsBlock`). Two
   comments in `wfcel` still named the trail.
 
-### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part in code for the next release, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part ✅ 0.1.101 and its feelings ✅ 0.1.102, validated on 8.x, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
   - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
@@ -1971,8 +2001,15 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     `person ilk:X (ilk:X)`.
     - SY.identity writes an ILK's own id as its display name when it has none
       (`ilk_entry_from_record`).
-    - The SDKs now take that as no name (`facts_of`, `lookupIlkAt`). In code for the next release.
-  - **Open:** the rest of the topic, one at a time (cognition-hands-v1 §9).
+    - The SDKs now take that as no name (`facts_of`, `lookupIlkAt`). ✅ 0.1.102: in A-155's gate,
+      cognition's turns name the temporary person by their ILK, with no name.
+  - **The second topic, several people on one thread and the feelings** (cognition-hands-v1 §10):
+    agreed and built 2026-11-05, ✅ 0.1.102 with A-155, A-157 and two of A-156's three, validated
+    on 8.x (2026-11-06).
+  - **Open:**
+    - where cognition keeps its state (§10.6): the operator wants it reviewed whole before any
+      decision;
+    - then the rest of the topic, one at a time (§9).
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 

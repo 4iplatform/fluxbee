@@ -8,7 +8,10 @@
   speakers.
 - Built in code the same day, and released in 0.1.101 with A-153 and A-154 (§8), checked on 8.x.
 - The rest of A-137 is open (§9), one topic at a time. The first, several people on one thread
-  and the feelings, is in the chat (§10). Its numbers wait for the lab's code.
+  and the feelings, was agreed on 2026-11-05 (§10). It was released in 0.1.102 and checked on
+  8.x (§10.5). Its numbers wait for the lab's code.
+- Next: where cognition keeps its state (§10.6). The operator wants it reviewed whole before any
+  decision.
 
 This is the single place for the topic.
 
@@ -344,11 +347,11 @@ The rest of A-137, one topic at a time:
 - **The docs:** 12-cognition-v2 §9 loses the beta's values, and docs/reference/cognition.md §5
   says how a feeling builds up and fades.
 
-### 10.5 Built (2026-11-05, for the next release)
+### 10.5 Built (2026-11-05), released in 0.1.102 (2026-11-06)
 
 - **SY.cognition** (src/bin/sy_cognition.rs):
   - `feeling_owner` and `narrator_speaker` read the turn's owner and speaker in `handle_turn`;
-  - `feeling_candidate`, `update_feelings_for_turn` and `feeling_envelope` move the owner's
+  - `feeling_candidates`, `update_feelings_for_turn` and `feeling_envelope` move the owner's
     feelings, with `feeling_decay`, `feeling_step`, `feeling_level` and `COGNITION_FEELING_INERTIA`;
   - the narrator gets the speaker (`NarrativeSummarizerAiInput.speaker`), and its prompt names
     people;
@@ -385,6 +388,18 @@ The rest of A-137, one topic at a time:
 
 No new node, message or model call. SY.storage needs no new column: a communication reloads from
 each row's `payload`.
+
+**Checked on 8.x (0.1.102, 2026-11-06),** with a client standing for an IO node and
+`AI.pruebas@worker1` on one thread, for two people of the tenant `pruebas` (FINDINGS A-155):
+
+- One angry turn of A's opened three feelings of A's, anger, escalation and urgency, around the
+  same context, with one text naming A.
+- B's turn and the agent's answers left them. A's calm turn faded each once, by its own inertia.
+- The agent got A's feelings, each named by its owner, and declined to copy them to B: notes about
+  another person.
+- The closed reasons kept `last_seen_at` at the turn that named them, and the averages followed
+  the weight.
+- The feelings added no model call.
 
 ### 10.6 Next topic: where cognition keeps its state
 

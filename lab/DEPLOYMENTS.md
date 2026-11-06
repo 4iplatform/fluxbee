@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ live, checked on 8.x | snap `pre-writer-0-1-101` (all 4 VMs) · `apt install fluxbee=0.1.100` + core-update of the spokes |
+| **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ live, checked on 8.x | snap `pre-feelings-0-1-102` (all 4 VMs) · `apt install fluxbee=0.1.101` + core-update of the spokes |
+| **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ replaced by 0.1.102 | snap `pre-writer-0-1-101` (deleted 2026-11-06) · `apt install fluxbee=0.1.100` + core-update of the spokes |
 | **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ replaced by 0.1.101 | snap `pre-trace-0-1-100` (deleted 2026-11-05) · `apt install fluxbee=0.1.99` + core-update of the spokes |
 | **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ replaced by 0.1.100 | snap `pre-sprint-0-1-99` (deleted 2026-11-05) · `apt install fluxbee=0.1.98` + core-update of the spokes |
 | **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ replaced by 0.1.99 | snap `pre-namefix-0-1-98` (deleted 2026-11-04) · `apt install fluxbee=0.1.97` + core-update of the spokes |
@@ -108,6 +109,81 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.102 — The feelings: each person's, fading with their own turns, read by the agent (A-137's second topic: A-155, A-157, two of A-156's three)
+
+- **Date:** 2026-11-06 (ART) · **Previous version:** 0.1.101 · **Commit:** `476bf231`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:**
+  - A-137's second topic, several people on one thread and the feelings, was agreed with the
+    operator on 2026-11-05 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §10). It brings
+    the findings it raised: A-155, A-157, and A-156's second and third.
+  - It also carries the fix of a person with no name, found in 0.1.101's gate.
+  - Where cognition keeps its state (A-156's first) stays out at the operator's word, to be
+    reviewed whole first.
+- **What changed:**
+  - **The feelings (A-155):**
+    - there is one per owner ILK, affect and context, and only the person's own turn moves them;
+    - a turn that shows one makes it weight × d + s. Each other turn of the owner makes it
+      weight × d, and it closes under 0.25;
+    - d is a context's decay to the root of the affect's inertia (urgency 2, anger 5,
+      escalation 10), and s is the base intensity over 4;
+    - each affect has its own gate. The narrator writes one text for the moment, naming who
+      spoke;
+    - the memory package, version 4, carries up to 12 open feelings by weight, each with its
+      owner, affect, context, level, weight, last time felt and text. ai.generic shows them as
+      "Feelings", with the feelings of the person it answers first.
+  - **The tagger (A-157):** a closed set of affect signals (frustration, escalation and urgency),
+    which the gate reads.
+  - **The weights (A-156):** the averages take the weight on every turn an item is open, and
+    `last_seen_at` moves only on a turn that names it.
+  - **A person with no name:** both SDKs take an ILK's own id, which SY.identity writes as the
+    display name of an ILK with none, as no name.
+  - SY.storage writes a feeling's weight to the episode's `intensity`. The Go SDK's turns gain
+    `writer` and `to`.
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - the six Go modules: gofmt, vet and the race detector, in a Linux container;
+  - GitHub's CI green on `476bf231`: the Rust and Go tests, the posture guards and the router's
+    dispatcher guards.
+- **Deploy:**
+  - build of `476bf231` in 26 min, publish in 14 s;
+  - snapshot `pre-feelings-0-1-102` taken on all 4 VMs, `pre-writer-0-1-101` dropped;
+  - 0.1.102 on all 4 in 291 s (manifest `09ba4a03fb3b405f`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - every product process runs its new binary, none a replaced one, and the managed nodes run
+    their 0.1.102 runtimes;
+  - `AI.pruebas@worker1` restarted on ai.generic 0.1.102 at 05:07:25 UTC, before worker1's
+    SY.cognition (05:08:19). So no AI node on the old runtime met a package with feelings.
+- **Checked on 8.x** (FINDINGS has each one), with the gate gate0204 on worker1:
+  - **The setup:**
+    - a client standing for an IO node and `AI.pruebas@worker1`, with no WF;
+    - two people of the tenant `pruebas` on one thread: A registered and B temporary;
+    - four turns: A angry at a third double charge, B calm, A calm, then B asking the agent to
+      copy its Feelings lines.
+  - **A-157:** on A's angry turn the tagger named frustration, escalation and urgency. These were
+    the first feelings ever made on 8.x.
+  - **A-155:**
+    - three feelings of A's around `billing`, anger 2.0, escalation 2.0 and urgency 1.75, with one
+      text naming A;
+    - B's turn and the agent's answers left them. A's calm turn faded each once: escalation
+      1.9678, anger 1.936, urgency 1.6134, each `faint`;
+    - the agent got them, owned by A, in the version 4 package read in worker1's memory region;
+    - asked by B, the agent declined to copy them: *"Son notas internas de la conversación y
+      tratan sobre otra persona"*;
+    - 16 model calls for the 8 turns, 2 each, as before.
+  - **A-156:**
+    - the three reasons closed 5 turns after A's first turn keep `last_seen_at` at that turn,
+      apart from `closed_at`;
+    - their averages are 0.548, the mean of their weights over 6 samples.
+  - **A person with no name:** cognition's turns name B by their ILK, with no name.
+- **Found in the checks:** nothing new.
+- **Rollback:**
+  - `apt install fluxbee=0.1.101` on the motherbee, then a core-update of the spokes.
+  - 0.1.101 reads a feeling's row as a plain episode of intensity 0, which its agents never read
+    (A-155).
 
 ---
 
