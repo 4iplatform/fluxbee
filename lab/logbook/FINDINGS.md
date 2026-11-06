@@ -61,7 +61,8 @@ no change required
       agreed and built 2026-11-05 with A-155, A-157 and two of A-156's three: ✅ 0.1.102, its
       gate on 8.x (2026-11-06). Where cognition keeps its state, reviewed whole and agreed on
       2026-11-06 (§11), built as A-158 with A-156's first: ✅ 0.1.103, its gate on 8.x
-      (2026-11-06). Then the rest, one topic at a time.
+      (2026-11-06). The rest, agreed in the chat of 2026-11-06 (§12): its design to review
+      whole, then to build.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
@@ -74,7 +75,8 @@ in 0.1.103 (2026-11-06), checked on 8.x.
 
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
   0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
-  A-156's first); then the rest of §9.*
+  A-156's first); the rest agreed in the chat of 2026-11-06 (cognition-hands-v1 §12: the
+  handover's lines, people with no agent, episodes as public news), its design to review whole.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -2122,7 +2124,18 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **Where cognition keeps its state** (cognition-hands-v1 §11): reviewed whole and agreed on
     2026-11-06. A node is born and dies on its hive, and cognition keeps its own file on each
     hive. ✅ 0.1.103 as A-158, with A-156's first, validated on 8.x (2026-11-06).
-  - **Open:** the rest of the topic, one at a time (§9).
+  - **The rest** (cognition-hands-v1 §12), agreed in the chat of 2026-11-06:
+    - whoever takes a conversation back sees what was said meanwhile, each line naming its writer
+      (in Case 4, sales sees Juan's part);
+    - cognition analyzes people's turns with no agent at either end, on the paths that exist;
+    - an episode is the gossip, not a feeling: *"el 'chisme' de que se pelearon"*. Episodes are
+      public, like the news, fade with time and not with messages, and an agent gets those of the
+      people in its conversation;
+    - the ILK that holds an analysis's result pays for it, through its tenant;
+    - the lab's POC, read: no numbers for the feelings; its episode, the social event worth
+      remembering, is the one Fluxbee never took (§12.2).
+  - **Open:** the design of §12.4 is to review whole before building. §12.6 keeps handing over
+    between agents and a conversation that reaches an agent late.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 

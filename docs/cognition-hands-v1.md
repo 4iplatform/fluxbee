@@ -9,10 +9,13 @@
 - Built in code the same day, and released in 0.1.101 with A-153 and A-154 (§8), checked on 8.x.
 - The rest of A-137 is open (§9), one topic at a time. The first, several people on one thread
   and the feelings, was agreed on 2026-11-05 (§10). It was released in 0.1.102 and checked on
-  8.x (§10.5). Its numbers wait for the lab's code.
+  8.x (§10.5). The lab's code has no numbers for them (§12.2); they are tuned with use.
 - Where cognition keeps its state was reviewed whole with the operator and agreed on 2026-11-06
   (§11): its own file on each hive, and SY.storage keeps the messages only. Built the same day
   and released in 0.1.103, checked on 8.x (§11.6).
+- The rest, chats of 2026-11-06 (§12): whoever takes a conversation back sees what was said
+  meanwhile; cognition analyzes people's turns with no agent; and episodes are public news that
+  fade with time. Agreed in the chat; its design is to review whole before building.
 
 This is the single place for the topic.
 
@@ -235,10 +238,9 @@ The rest of A-137, one topic at a time:
 - **Several people on one thread:** the analysis blended their feelings into one, with no name.
   Agreed 2026-11-05 (§10), released in 0.1.102.
 - **Where cognition keeps its state:** agreed 2026-11-06 (§11), released in 0.1.103.
-- **A conversation with no agent:** who owns it, and which hive's cognition keeps it. In Case 4,
-  Juan talks with Ana from 10:00 to 10:16 and no agent is in that part.
-- **Handing over:** how the next agent sees what was said meanwhile.
-- **Who pays** for an analysis with no agent.
+- **A conversation with no agent, handing over, and who pays:** agreed 2026-11-06 with the
+  episodes as public news (§12). Its design is to review whole before building; §12.6 keeps what
+  is still open.
 
 ---
 
@@ -615,3 +617,216 @@ of the tenant `pruebas`, on one thread, with no WF.
 - **A lab note:** the row of a 16-turn communication is 127 KB, 61% of it co-occurrences, written
   twice a turn. SQLite's WAL reached 3.8 MB before its first fold into the file, at 1000 pages.
   This is as designed, and small beside the turn's two model calls.
+
+---
+
+## 12. The rest of A-137: handing over, people with no agent, and the episodes (chats of 2026-11-06)
+
+### 12.1 Facts (verified in the code, 2026-11-06)
+
+- **Cognition takes a turn only when an `AI.*` node sends it or receives it:** the router copies
+  it at the agent's entry or delivery (`is_agent_node` and `cognition_copy`,
+  src/router/mod.rs). SY.storage takes every turn.
+- **The example, WF Case 4** (docs/wf-orchestration-v1.md §5.4, its gate in 0.1.94):
+  - at 10:00 Ana asks sales for a credit note, and sales hands the case to the team;
+  - from 10:02 to 10:16 Juan and Ana talk. Each message is a WF forward to the other person's IO
+    node, so no agent is at either end and no cognition gets them;
+  - they are in SY.storage, on Ana's thread: io.slack gives a reply in a recorded post's Slack
+    thread the conversation's thread id (nodes/io/io-slack/src/thread_records.rs);
+  - at 10:16 Juan hands it back with a note, which the WF forwards to sales as Juan's message;
+  - at 10:17 Ana asks "¿entonces ya está la nota de crédito?".
+- **What sales has at 10:17:** its turns up to 10:00, Juan's note and Ana's question.
+  - Nothing of Juan's part reaches it, and Ana's feelings did not move in it.
+  - A hand-back by the quiet timer brings no note: sales gets a fixed text and learns nothing of
+    what was said.
+- **The layout on 8.x:** the IO nodes run on the motherbee, and the WF and the agents on worker1
+  (Case 4's gate ran `WF.gate0192@worker1`).
+- **Who pays today:** cognition charges each turn's model calls to the tenant of the
+  communication's agent (`AiAccount::charge` with `TenantSource::Agent`, src/bin/sy_cognition.rs).
+  - The identity memory holds every ILK's tenant on every hive.
+  - A tenant is a cost center, *"not a company and not a permission boundary"*
+    (docs/reference/identity.md §3.1).
+- **Nothing in cognition fades with time.** Contexts, reasons and memories fade with their
+  communication's turns, and a feeling with its owner's turns.
+- **Nothing of cognition crosses hives** (A-70). Since 0.1.103 each hive keeps its own file.
+- **The router has a broadcast that crosses hives** (src/router/mod.rs):
+  - its destination is `Broadcast`, with `meta.target` a pattern of node names;
+  - at TTL 3 or more it goes on over the WAN, and each router drops a repeat by its trace id;
+  - SY.admin uses it to reach `SY.opa.rules@*`.
+- **The narrator's call** writes the memory and a feeling's text from the turn's labels, signals
+  and speaker. It does not see the turn's text (src/bin/sy_cognition/narrative_summarizer_ai.rs).
+- **The package (version 4) calls the feelings `episodes`** (crates/fluxbee_sdk/src/protocol.rs),
+  a name left from 12-cognition-v2.
+- **Identity has no team and no group.**
+- **The tagger's topics are free text.** gate0205's thread named one topic `billing`,
+  `invoice dispute`, `duplicate charges` and `billing claim`.
+
+### 12.2 The lab's POC (read 2026-11-06)
+
+The Cognitive Lab, in TypeScript, with its spec of 2026-03-02.
+
+- **What went into 12-cognition-v2:** its contexts, with a weight per ILK; its scope energy; its
+  memories.
+- **No numbers for §10's feelings:** it has no feelings.
+- **Its episode, which Fluxbee never took:** *"evento socio-emocional relevante para recordar"*.
+  - **Four lenses:**
+    - anger or friction, which *"puede deteriorar el vínculo"*;
+    - discomfort;
+    - joy or appreciation;
+    - shame or rejection.
+  - **It is born of a break in the pattern.** What is habitual makes none: every two of one lens
+    in one context take a point off the next, up to five.
+  - **An intensity from 0 to 10, and a conservative gate:** 7 or more, with evidence of 8 or more
+    anchored in one of the period's two leading contexts.
+  - **A state:** resolved, pending, follow-up or inconclusive. It also names the ILKs involved.
+  - **It does not fade:** it stays as history.
+  - **It costs no call of its own:** it comes from the same model call as the memories.
+- **Fluxbee's episodes came from it,** per turn and per affect. They became the feelings in 0.1.102.
+
+### 12.3 Decided (the operator, 2026-11-06)
+
+1. **Whoever takes a conversation back sees what was said meanwhile.** The lines of Juan's part
+   reach sales' memory, each naming its writer. *"interesantísimo! muy importante conocer el
+   ambiente y el contexto en un ámbito de trabajo"*.
+2. **Cognition analyzes people's turns with no agent at either end,** on the paths that exist:
+   *"habilitar su análisis a los humanos"*. Between agents, still only the immediate memory (§3).
+3. **An episode is the gossip, not a feeling:** *"episodios (no sentimientos, memorias, nada
+   personal), sino el 'chisme' de que se pelearon, eso serviría para el ambiente laboral,
+   MUCHO"*. Feelings and memories stay with whoever serves the conversation.
+4. **Episodes are public, like the news:** *"los episodios podrían ser públicos como las noticias
+   tal vez, así no necesitamos el ID si no lo podemos conseguir o la situación colectiva entre
+   pares ocurrió en otro ID hilo... es igual de importante"*. A third interlocutor sees one *"si
+   rankea"*.
+5. **An episode fades with time, not with messages:** *"un episodio se apaga entonces con el
+   tiempo, no con los eventos de mensajes.. esto cambia un poco el concepto hasta ahora pero me
+   cierra"*.
+6. **The ILK that holds an analysis's result pays for it, through its tenant:** *"lo paga el ILK
+   que tiene el resultado del análisis, no queda otra.. creo que es posible asignarlo a eso.
+   ilk-tenant"*.
+7. **An agent gets the episodes of the people in its conversation:** *"coincido con todo,
+   arrancá con a)"*.
+   - The episodes of its topic wait until topics are one vocabulary.
+   - All of them would not fit the package.
+8. **Agreed as proposed** (*"coincido con todo"*):
+   - an episode's intensity halves every 7 days, and it leaves under 2 of 10;
+   - every hive's cognition keeps a copy of every episode, so none depends on another hive to read;
+   - in a conversation with no agent, each turn's writer pays, and the WF's hive analyzes it;
+   - public means the whole installation.
+
+### 12.4 The design (to review whole before building)
+
+#### What an agent sees
+
+At 10:17 sales' package carries:
+
+- **its turns, with Juan's part among them,** each naming its writer:
+  `person Juan … (ilk:…) via IO.slack.<team>@motherbee`;
+- **its memories and the feelings, as today.** Juan's part moves Ana's feelings, and Juan's own;
+- **the news:** the episodes of the people in its conversation that still rank, the strongest
+  first. For example: *"Ana and Juan argued over the credit note's delay. Pending. 2 hours ago."*
+  - The agent reads them as internal context, like the feelings, and does not repeat them to the
+    person.
+
+#### People's turns with no agent: the router
+
+- **The copy:** the router of a WF's hive also copies to its cognition what a WF forwards to an IO
+  node, a relay between people. Cognition decides whether a person wrote it, as it does (§3).
+- **Each person's message is copied once,** on its way to the other person. What a WF forwards to
+  an agent is copied at the agent, as today.
+- **No new path:** the copy goes to the same hive's cognition, as an agent's does.
+
+#### Whose communication the turns join: cognition
+
+- **On this hive, the thread's communication whose agent served it last.** In Case 4 that is
+  sales'. Its agent's tenant pays, and its package carries the lines.
+- **Otherwise, a communication with no agent,** `(thread_id, none)`. Each turn's writer pays
+  through their tenant: a new `TenantSource::Writer`.
+- **A WF on another hive than its agent:** the agent gets the news, not the lines. To recommend:
+  a WF runs on its agents' hive.
+- **A turn it already holds is skipped** (the same cycle, writer and text). A WF that forwards
+  one message both to an agent and to a person does not count it twice.
+
+#### The episode
+
+- **Where it is made:** in the narrator's call of any analyzed turn, so it costs no new model
+  call.
+  - The narrator also gets whom the turn is to.
+  - Beside the memory, it may return an episode: its lens, a title, a summary, its state, a base
+    intensity and its evidence.
+  - The summary is impersonal: what happened, between whom and how it stood, never what someone
+    feels.
+- **The gate is the POC's:**
+  - a known lens (the POC's four);
+  - 7 or more of 10 once the habit and the novelty adjust it;
+  - evidence of 8 or more, anchored in one of the communication's two leading contexts.
+  - The habit counts the episodes of one lens among the same people, not in one topic, since
+    topics are free text.
+- **Its fields:**
+  - an id, its lens, title, summary and state;
+  - its intensity and its birth time;
+  - the ILKs involved (the writer and whom the turn was to);
+  - where it came from (the thread, the hive and the node), kept though nobody needs them to read
+    it.
+- **It never changes.** A later episode between the same people tells what changed.
+- **It travels once:**
+  - the cognition that makes it keeps it and broadcasts it to `SY.cognition@*`, at TTL 3;
+  - each cognition keeps its copy by id;
+  - a hive added later starts with none, and they fade anyway.
+- **Its weight is intensity × 0.5^(age / 7 days),** computed from its age when it is read.
+  - It leaves the file under 2.
+  - Each write of the region sweeps the faded ones.
+  - A package written before one faded shows it with its age.
+- **The file:** a table of episodes in `cognition.db`, apart from the communications, with the
+  people's ILKs indexed.
+
+#### The package: version 5
+
+- **`feelings`:** the version 4 `episodes`, renamed now that an episode is the news.
+- **`news`:** up to 5 episodes of the conversation's people, by weight, each with:
+  - its lens, title, summary and state;
+  - its age;
+  - the people's names.
+- **ai.generic shows them as "News",** after the feelings.
+
+#### Who pays
+
+- **The narrator's call, as today:** the communication's holder pays, its agent's tenant, or the
+  writer's when it has no agent.
+- **An episode costs nothing more,** and reading one costs nothing.
+
+### 12.5 Every leg
+
+- **The router:** the copy of what a WF forwards to an IO node, on the WF's hive.
+- **SY.cognition:**
+  - the communication with no agent;
+  - joining the thread's last agent;
+  - skipping a turn it already holds;
+  - the narrator's episode and its gate;
+  - the broadcast and its reception;
+  - the table of episodes, their weight by age and the sweep;
+  - the package's version 5;
+  - the writer as payer.
+- **The Rust SDK:** the package's version 5, `TenantSource::Writer` and the episode's message.
+- **ai.generic:** the news, and the feelings under their own name.
+- **SY.storage:** its check of a usage record takes the writer as it takes the agent. It checks
+  the source against the producer and looks the tenant up by the writer's ILK
+  (`check_usage_record` and `decide_usage_tenant`, src/bin/sy_storage.rs).
+- **To verify in the build:** the system policy lets `SY.cognition` broadcast to
+  `SY.cognition@*`.
+- **Unchanged:** identity, the vault, SY.admin, the orchestrator, the WF engine (no mark is
+  needed) and io.slack.
+- **The factory reset:** it removes the motherbee's file, its episodes with it. A worker's stays
+  (A-160).
+
+### 12.6 Open
+
+- **Handing over between agents:** when sales takes the conversation back from invoice, it does
+  not see invoice's turns, since two agents on one thread are two communications (A-70). Does
+  the same rule as Juan's part apply?
+- **A conversation that starts among people and later reaches an agent:** does the agent's
+  communication start from the one with no agent?
+- **The episodes of a topic** (option b): once topics are one vocabulary.
+- **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
+  lenses.
+- **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
+  hive.
