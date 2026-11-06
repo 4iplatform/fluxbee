@@ -69,10 +69,13 @@ empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x.
   next release.*
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
   0.1.101; the rest, one topic at a time.*
-- A-155 🟡 The feelings (episodes): the agent never reads them, and they never fade nor build up.
-  *With A-137's next topic, several people on one thread.*
-- A-156 🟡 Cognition's weights: an open item's decay is not stored, `last_seen_at` moves when the
-  item is not seen, and the averages average a constant. *With A-155.*
+- A-155 ✅ The feelings (episodes): each person's, fading and building up, and the agent reads
+  them. *In code, for the next release.*
+- A-157 ✅ The feelings' gate waited for words the tagger was never asked for: no feeling was ever
+  made on 8.x. *In code, for the next release.*
+- A-156 🟡 Cognition's weights: `last_seen_at` and the averages *in code, for the next release*;
+  an open item's decay not stored waits for where cognition keeps its state (cognition-hands-v1
+  §10.6), a decision to review whole first.
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1186,7 +1189,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-155 [WF] 🟡 OPEN (found 2026-11-05, preparing A-137's next topic; read in the code) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
+### A-155 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, preparing A-137's next topic) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
 
 - **What happens:**
   - SY.cognition builds episodes, its feelings: an affect `anger`, `escalation` or `urgency` from
@@ -1215,11 +1218,41 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The docs:** ai-generic's README lists what it renders, without the episodes.
   docs/reference/cognition.md §1 counts "notable moments (episodes)" among what cognition gives an
   agent. A-134's "four labels of each" reads as if the episodes were among them.
-- **Status:** open, with A-137's topic "several people on one thread"
-  ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §9): a feeling has to say whose it is
-  before an agent reads it.
+- **Decided (the operator, 2026-11-05):** each ILK owns its feelings, evaluated apart; the same
+  math as every other item, with two to ten times a context's inertia by feeling; the numbers
+  today's until the lab's code is found ([cognition-hands-v1](../../docs/cognition-hands-v1.md)
+  §10.2).
+- **Fix** (§10.3, built 2026-11-05, §10.5):
+  - a feeling is one per owner, affect and context. A turn of its owner that shows it makes its
+    weight `weight × d + s`, and each other turn of the owner `weight × d`; it closes under 0.25;
+  - `s` is the base intensity over 4, and `d` a context's decay to the root of the affect's inertia:
+    urgency ×2, anger ×5, escalation ×10;
+  - only a person's own turn shows or moves a feeling, and the narrator knows who spoke;
+  - each affect has its own gate, so one turn may raise several, with one text for the moment
+    (found in the review round: the gate gave one affect a turn);
+  - the package carries up to 12 open feelings by weight, each with its owner, affect, context,
+    level, `last_felt_at` and text, and ai.generic shows them, those of whom it answers first.
+- **Status:** in code for the next release.
 
-### A-156 [WF] 🟡 OPEN (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
+### A-157 [WF] ✅ RESOLVED (in code for the next release; by tests; found 2026-11-05, building A-155; seen on 8.x) — The feelings' gate waits for words the tagger is never asked for, so no feeling was ever made
+
+- **Seen on 8.x (0.1.101, 2026-11-05):** `cognition_episodes` has no row, with 276 reasons and 63
+  communications. The tagger's extra hints are phrases ("credit note issued", "agent not yet set
+  up"), never one of the gate's words.
+- **Why:**
+  - the gate (`build_episode_candidate`) fires on `frustration`, `escalation` or `urgency` among the
+    turn's extra signals;
+  - the tagger's prompt asks for extras as *"concise lowercase narrative hints"*, with no
+    vocabulary (`build_system_prompt`, src/bin/sy_cognition/semantic_tagger_ai.rs);
+  - the golden corpus expected those words as extras, so the tests passed.
+- **Fix:**
+  - the tagger names the writer's affects in a closed set of their own, `affect_signals`
+    (`COGNITION_AFFECT_SIGNALS`), defined in its prompt, with an example each;
+  - the parser maps the words a model may vary (`angry`, `deadline`) and drops any other;
+  - the gate reads that set.
+- **Status:** in code for the next release, with A-155.
+
+### A-156 [WF] 🟡 OPEN, two of its three in code for the next release (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
 
 - **The math holds as documented** (docs/reference/cognition.md §5): an item a turn names gets
   `weight × decay + 1.0`, one it does not gets `weight × decay`, and an open one closes under 0.25.
@@ -1247,7 +1280,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     gate: that audit is not in the repo.
   - docs/reference/cognition.md §5 says an episode's repeat raises its intensity; it does not
     (A-155).
-- **Status:** open, with A-155.
+- **The operator (2026-11-05):** the second and third are *"bugs desastrosos de programación
+  deficiente y que no se terminó"*. The first is where cognition keeps its state: *"cognitive tiene
+  persistencia propia, storage guarda mensajes"* ([cognition-hands-v1](../../docs/cognition-hands-v1.md)
+  §10.6).
+- **Fix of the second and third** (built 2026-11-05): `last_seen_at` moves only on a turn that
+  names the item; the averages average the weight over every turn the item is open
+  (`sample_weight`), as the beta's example does (weight 4.2, averages 2.85 over 23 samples). The
+  stale docs are corrected.
+- **Status:** the second and third in code for the next release. The first waits for where
+  cognition keeps its state (§10.6): the operator wants that reviewed whole, as a decision more
+  complex than it looked (2026-11-05), so nothing of it is built.
 
 ### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
