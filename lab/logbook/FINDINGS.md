@@ -26,8 +26,8 @@ no change required
 ### This sprint (2026-11-04)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
-   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ with 0.1.101, 2026-11-05,
-   7's close checked by its gate's conversations):
+   on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ validated on 8.x with
+   0.1.101, 2026-11-05):
    1. A-146 [General/router]: the VPN warning gone.
    2. A-147 [Archi]: the model's text shown with a staged plan.
    3. A-115 [General/SY.timer]: a fire sent again while its owner is unreachable; a one-shot never
@@ -1182,7 +1182,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-154 [WF] ✅ RESOLVED (in 0.1.101, by tests; its close on 8.x being checked; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
+### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
 - **What happens:** a running instance stays open until its flow reaches an end, a cancel or a
   failure.
@@ -1229,9 +1229,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 
   Tests: the close past the default and past a definition's own timeout, a pending timer and
   recent activity keeping a conversation open, and the field's bounds.
-- **On 8.x (0.1.101):** WF gate0202 runs with `idle_timeout` 1h. Its two conversations are quiet
-  since 23:00 UTC, with no timer, and close at its first GC pass past their timeout.
-- **Status:** in 0.1.101; its close on 8.x being checked.
+- **Checked on 8.x (0.1.101):** WF gate0202, with `idle_timeout` 1h, on worker1.
+  - Its two conversations went quiet at 23:00 UTC, with no timer left.
+  - The pass at 23:58 UTC left them open: 58 minutes quiet.
+  - The pass at 00:58 UTC (2026-11-06) closed both: status `cancelled`.
+  - Each instance's log reads `idle_close` *"closed: quiet for 1h with no timer pending
+    (idle_timeout)"*, then the `cancelled` state's `send_message` of `GATE_CLOSED` to the client.
+    The client had left after the gate, so the router answered `UNREACHABLE`, which the WF does
+    not answer (spec §12).
+- **Status:** validated.
 
 ### A-153 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-151's gate with the operator) — Nothing limits how many timers a WF definition holds
 

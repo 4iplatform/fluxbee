@@ -21,7 +21,7 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ live, checking on 8.x | snap `pre-writer-0-1-101` (all 4 VMs) · `apt install fluxbee=0.1.100` + core-update of the spokes |
+| **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ live, checked on 8.x | snap `pre-writer-0-1-101` (all 4 VMs) · `apt install fluxbee=0.1.100` + core-update of the spokes |
 | **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ replaced by 0.1.101 | snap `pre-trace-0-1-100` (deleted 2026-11-05) · `apt install fluxbee=0.1.99` + core-update of the spokes |
 | **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ replaced by 0.1.100 | snap `pre-sprint-0-1-99` (deleted 2026-11-05) · `apt install fluxbee=0.1.98` + core-update of the spokes |
 | **0.1.98** | 2026-11-03 | `b8f41f1c` | motherbee + spokes (core): a workflow's name follows the runtime naming policy (A-145) | ✅ replaced by 0.1.99 | snap `pre-namefix-0-1-98` (deleted 2026-11-04) · `apt install fluxbee=0.1.97` + core-update of the spokes |
@@ -173,8 +173,12 @@
       - SY.cognition made 4 model calls for the person's cycle, and 2 for the timer's, those of
         the agent's answer to the person;
     - **`turns`** keeps each message's writer, and Archi's message detail shows it.
-  - **A-154:** pending. The gate's two conversations are quiet since 23:00 UTC with no timer, and
-    close at the WF's first GC pass past their `idle_timeout` (1h).
+  - **A-154,** with the same gate, whose definition sets `idle_timeout` 1h:
+    - its two conversations went quiet at 23:00 UTC with no timer; the pass at 23:58 UTC left
+      them open, and the one at 00:58 UTC (2026-11-06) closed both;
+    - each instance's log: `idle_close` *"closed: quiet for 1h with no timer pending
+      (idle_timeout)"*, then the `cancelled` state's `GATE_CLOSED` to the client, which had left,
+      so the router answered `UNREACHABLE`.
 - **Found in the checks:**
   - **A person with no name reads with their ILK as their name** (`person ilk:X (ilk:X)`).
     SY.identity writes an ILK's own id as its display name when it has none. The SDKs take that as
