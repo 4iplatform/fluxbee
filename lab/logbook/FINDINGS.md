@@ -75,8 +75,8 @@ A-157, two of A-156's three and the fix of a person with no name, went out in 0.
   0.1.101, the feelings ✅ 0.1.102; where cognition keeps its state agreed 2026-11-06
   (cognition-hands-v1 §11), building as A-158; then the rest of §9.*
 - A-158 🔴 Cognition keeps its state in SY.storage: a worker's cognition depends on the motherbee,
-  and a host reboot leaves each conversation's first message with no memory. *Sprint: agreed
-  2026-11-06, building.*
+  and a host reboot leaves each conversation's first message with no memory. *Sprint: agreed and
+  built 2026-11-06, for 0.1.103.*
 - A-156 🟡 Cognition's weights: `last_seen_at` and the averages ✅ 0.1.102, checked on 8.x; an
   open item's decay not stored is fixed with A-158.
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
@@ -120,6 +120,8 @@ A-157, two of A-156's three and the fix of a person with no name, went out in 0.
 - A-103 🔵 The tool cards restate constants by hand.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
+- A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
+  A-158).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
   U-12): to check, then bring here or close.
@@ -1194,7 +1196,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-158 [WF] 🔴 OPEN, agreed 2026-11-06, to build (found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
+### A-158 [WF] 🔴 OPEN, agreed and built 2026-11-06, for 0.1.103 (found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
 
 - **Cognition keeps nothing on its own disk but its config.** 12-cognition-v2 §10.2 planned a
   local LanceDB (`memory.lance`), never built (A-38): the path is reported and nothing opens it.
@@ -1229,7 +1231,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - at start the region is filled from the file before the first turn;
   - a closed item leaves the state;
   - the tables, the `storage.cognition.*` subjects, `COGNITION_STATE_GET` and the idle check go.
-- **Status:** agreed 2026-11-06; to build for the next release.
+- **Built (2026-11-06,** [cognition-hands-v1](../../docs/cognition-hands-v1.md) §11.5):
+  - SY.cognition's file (`state_store.rs`), its loads and writes, the start that fills the region,
+    the closed items gone; SY.storage drops the tables once; the router and the SDK lose the
+    subjects;
+  - `serde_json` reads floats back exactly (`float_roundtrip`): the file's round-trip test found a
+    weight coming back a last digit off.
+- **The review round** (one, 2026-11-06) found:
+  - **medium:** a communication just changed was let go when it did not fit a full region, so the
+    worker's write-back could save a stale copy over the turns the intake took meanwhile. Fixed:
+    the communications just changed, the worker's and the unsaved stay held, in or out of the
+    region;
+  - a row that could not be read stopped the start and blocked its communication: now it starts
+    again, and is left out at start; every state struct takes a default for a field it lacks;
+  - a row of a newer state version (after a rollback) was written over: now it is kept as it is;
+  - a failed write was never taken again: now its communications stay held and the next write
+    takes them;
+  - the router's docs still took `storage.cognition.*`.
+
+  Each with its test.
+- **Status:** built and reviewed 2026-11-06; to release in 0.1.103 and check on 8.x.
+
+### A-160 [General/ops] 🟡 OPEN (found 2026-11-06, building A-158; read in the code) — The factory reset clears the motherbee's cognition, not a worker's
+
+- **What it does:** `fluxbee-factory-reset` runs on the motherbee. It truncates every table of
+  `fluxbee_storage` and removes this hive's SY.cognition state (`cognition_paths`).
+- **Until 0.1.102** every hive's cognition state lived in those tables, so the truncate cleared the
+  workers' too. Only a worker's memory region kept its packages: a pre-existing gap.
+- **Since A-158** each hive keeps its cognition in its own file. The reset removes the
+  motherbee's (`cognition.db` and its sidecars), and a worker's stays, with the communications of
+  agents the reset purges.
+- **A fix for later:** an explicit SY.admin action that tells a hive's SY.cognition to drop its
+  communications, which the reset calls for each worker.
+- **Status:** recorded; the reset's docstring says it. The operator's call on when.
 
 ### A-159 [General/identity] 🔵 TO DESIGN, a chapter of its own (the operator, 2026-11-06, reviewing where cognition keeps its state) — An ILK is deleted for good while data elsewhere refers to it
 
