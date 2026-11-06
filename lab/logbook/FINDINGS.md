@@ -60,25 +60,21 @@ no change required
       on 8.x (2026-11-05). Its second topic, several people on one thread and the feelings (§10),
       agreed and built 2026-11-05 with A-155, A-157 and two of A-156's three: ✅ 0.1.102, its
       gate on 8.x (2026-11-06). Where cognition keeps its state, reviewed whole and agreed on
-      2026-11-06 (§11): A-158, with A-156's first, to build next. Then the rest, one topic at a
-      time.
+      2026-11-06 (§11), built as A-158 with A-156's first: ✅ 0.1.103, its gate on 8.x
+      (2026-11-06). Then the rest, one topic at a time.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
 empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x. A-137's feelings, with A-155,
 A-157, two of A-156's three and the fix of a person with no name, went out in 0.1.102
-(2026-11-06), checked on 8.x.
+(2026-11-06), checked on 8.x. Where cognition keeps its state, A-158 with A-156's first, went out
+in 0.1.103 (2026-11-06), checked on 8.x.
 
 ### WF
 
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
-  0.1.101, the feelings ✅ 0.1.102; where cognition keeps its state agreed 2026-11-06
-  (cognition-hands-v1 §11), building as A-158; then the rest of §9.*
-- A-158 🔴 Cognition keeps its state in SY.storage: a worker's cognition depends on the motherbee,
-  and a host reboot leaves each conversation's first message with no memory. *Sprint: agreed and
-  built 2026-11-06, for 0.1.103.*
-- A-156 🟡 Cognition's weights: `last_seen_at` and the averages ✅ 0.1.102, checked on 8.x; an
-  open item's decay not stored is fixed with A-158.
+  0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
+  A-156's first); then the rest of §9.*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -1196,7 +1192,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-158 [WF] 🔴 OPEN, agreed and built 2026-11-06, for 0.1.103 (found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
+### A-158 [WF] ✅ VALIDATED ON 8.x (0.1.103, 2026-11-06; found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
 
 - **Cognition keeps nothing on its own disk but its config.** 12-cognition-v2 §10.2 planned a
   local LanceDB (`memory.lance`), never built (A-38): the path is reported and nothing opens it.
@@ -1250,7 +1246,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the router's docs still took `storage.cognition.*`.
 
   Each with its test.
-- **Status:** built and reviewed 2026-11-06; to release in 0.1.103 and check on 8.x.
+- **Validated on 8.x (0.1.103, 2026-11-06),** with the gate gate0205 on worker1 (person A of the
+  tenant `pruebas` and `AI.pruebas@worker1`, 8 turns of A's, no WF):
+  - the motherbee's 8 `cognition_*` tables and the 474 inbox rows of their subjects are gone,
+    said once in SY.storage's journal;
+  - the folder is 0700, and `cognition.db` and its WAL files 0600, on the motherbee and on
+    worker1, still so after worker1's reboot;
+  - one row for the thread, written twice a turn, with no write failed;
+  - after five calm turns, the angry turn's reasons `seeking urgent resolution` and
+    `confrontational pushback`, and four of its contexts, are gone from the row.
+    `withdrawal intent` closed and came back at 0.75, the weight of a new item;
+  - with SY.storage stopped for 29 s, worker1's SY.cognition restarted from its file, filled its
+    region before any turn and analyzed the next one. SY.storage then took every turn and usage
+    record, with no stream record lost;
+  - after a reboot of worker1, the region came back from the file before any turn. The answer to
+    the first message recalled the first problem: *"Me dijiste que te cobraron dos veces la
+    factura 123 por tercera vez…"*;
+  - 32 model calls for the 16 turns, 2 each, as before.
+- **A lab note from the gate:** the row of a 16-turn communication is 127 KB, 61% of it
+  co-occurrences, written twice a turn. SQLite's WAL reached 3.8 MB before its first fold, at
+  1000 pages. This is as designed, and small beside the turn's two model calls.
+- **Status:** closed. The factory reset on the workers stays open as A-160.
 
 ### A-160 [General/ops] 🟡 OPEN (found 2026-11-06, building A-158; read in the code) — The factory reset clears the motherbee's cognition, not a worker's
 
@@ -1368,7 +1384,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   ever in `cognition_episodes` on 8.x. The calm turns opened none.
 - **Status:** validated.
 
-### A-156 [WF] 🟡 OPEN, two of its three ✅ in 0.1.102, validated on 8.x (found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
+### A-156 [WF] ✅ VALIDATED ON 8.x (two of its three in 0.1.102, the first with A-158 in 0.1.103, 2026-11-06; found 2026-11-05, reviewing cognition's math for A-155 at the operator's request; read in the code) — Cognition's weights: an open item's decay is not stored, its `last_seen_at` moves when it is not seen, and its averages average a constant
 
 - **The math holds as documented** (docs/reference/cognition.md §5): an item a turn names gets
   `weight × decay + 1.0`, one it does not gets `weight × decay`, and an open one closes under 0.25.
@@ -1414,6 +1430,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Status:** the second and third validated in 0.1.102. The first is fixed with A-158: where
   cognition keeps its state, reviewed whole with the operator and agreed on 2026-11-06
   (cognition-hands-v1 §11). Each communication's row is written whole, so every decay is kept.
+- **The first, validated on 8.x (0.1.103, 2026-11-06):** across a restart of worker1's SY.cognition
+  and a reboot of worker1, person A's feelings faded by their own inertia over A's seven calm
+  turns, each as computed: anger 2.0 → 1.593, escalation 2.0 → 1.7849, urgency 1.75 → 0.9908.
+  Closed.
 
 ### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
@@ -1904,7 +1924,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   another WF never goes on (`withWFBlock`; test `TestAForwardCarriesNoOtherWFsBlock`). Two
   comments in `wfcel` still named the trail.
 
-### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part ✅ 0.1.101 and its feelings ✅ 0.1.102, validated on 8.x, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part ✅ 0.1.101, its feelings ✅ 0.1.102 and where cognition keeps its state ✅ 0.1.103, validated on 8.x, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
   - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
@@ -2101,7 +2121,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     on 8.x (2026-11-06).
   - **Where cognition keeps its state** (cognition-hands-v1 §11): reviewed whole and agreed on
     2026-11-06. A node is born and dies on its hive, and cognition keeps its own file on each
-    hive. Building as A-158.
+    hive. ✅ 0.1.103 as A-158, with A-156's first, validated on 8.x (2026-11-06).
   - **Open:** the rest of the topic, one at a time (§9).
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack

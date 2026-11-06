@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ live, checked on 8.x | snap `pre-feelings-0-1-102` (all 4 VMs) · `apt install fluxbee=0.1.101` + core-update of the spokes |
+| **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ live, checked on 8.x | snap `pre-cogstate-0-1-103` (all 4 VMs) · `apt install fluxbee=0.1.102` + core-update of the spokes |
+| **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ replaced by 0.1.103 | snap `pre-feelings-0-1-102` (deleted 2026-11-06) · `apt install fluxbee=0.1.101` + core-update of the spokes |
 | **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ replaced by 0.1.102 | snap `pre-writer-0-1-101` (deleted 2026-11-06) · `apt install fluxbee=0.1.100` + core-update of the spokes |
 | **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ replaced by 0.1.101 | snap `pre-trace-0-1-100` (deleted 2026-11-05) · `apt install fluxbee=0.1.99` + core-update of the spokes |
 | **0.1.99** | 2026-11-04 | `34cff128` | motherbee + spokes (core): the sprint's blocks 1 and 2, SY.timer 1.2 (A-115), Archi's staged turn (A-147), the router's VPN warning and protected verbs (A-146, A-100), `bundle_upload` (A-84), io.slack's download (A-85), io.web's handshakes and the edge's proxy (A-89, A-90) | ✅ replaced by 0.1.100 | snap `pre-sprint-0-1-99` (deleted 2026-11-05) · `apt install fluxbee=0.1.98` + core-update of the spokes |
@@ -109,6 +110,96 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.103 — SY.cognition keeps its state in its own file on its hive, closed items leave it, SY.storage drops the cognition tables (A-158, with A-156's first)
+
+- **Date:** 2026-11-06 (ART) · **Previous version:** 0.1.102 · **Commit:** `8af07c3d`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:**
+  - Where cognition keeps its state was reviewed whole with the operator and agreed on 2026-11-06
+    ([cognition-hands-v1](../docs/cognition-hands-v1.md) §11):
+    - a node is born and dies on its hive;
+    - cognition keeps its state in a file of its own, to work on its own;
+    - SY.storage keeps the messages;
+    - what cognition keeps is online state, so a closed item is deleted.
+  - Until 0.1.102 that state lived in 8 `cognition_*` tables on the motherbee (A-158):
+    - a worker's cognition skipped a turn when the motherbee did not answer;
+    - after a host reboot, each conversation's first message reached its agent with no memory;
+    - an open item's decay was not stored (A-156's first).
+- **What changed:**
+  - **SY.cognition:**
+    - one SQLite file, `cognition.db`, in its folder on its hive. The folder is 0700, and the file
+      and its WAL files are 0600 from their creation;
+    - one row per communication with its whole state, written whenever a turn changes it, before
+      the memory region;
+    - a communication it does not hold loads from the file. At start, the most recent ones fill
+      the region before the first turn;
+    - an item that closes leaves the state, so one that comes back starts from zero;
+    - the reload over the mesh and the 5-minute idle check are gone. `STATUS` reports the file.
+  - **SY.storage:** the cognition handlers, tables and `COGNITION_STATE_GET` are gone. The tables,
+    and the inbox rows of their subjects, are dropped once, while the catalog shows them.
+  - **The router's stream and the Rust SDK:** `storage.cognition.*` and the SDK's cognition module
+    are gone.
+  - `serde_json` reads floats back exactly (`float_roundtrip`).
+  - `fluxbee-factory-reset` removes the motherbee's file. A worker's file stays (A-160).
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - the CI guards that run on a Mac;
+  - GitHub's CI green on `8af07c3d`: the Rust tests, the posture guards and the router's
+    dispatcher guards. No Go code changed.
+- **Deploy:**
+  - build of `8af07c3d` in 55 min: `float_roundtrip` rebuilt every crate that uses `serde_json`;
+  - publish in 15 s;
+  - snapshot `pre-cogstate-0-1-103` taken on all 4 VMs, `pre-feelings-0-1-102` dropped;
+  - 0.1.103 on all 4 in 289 s (manifest `5e1b8cd47805f124`), health clean;
+  - the web route `acknowledged`, upstream `ready`.
+- **Checked on 8.x** (FINDINGS A-158 has each one), with the gate gate0205 on worker1:
+  - **The setup:** a client standing for an IO node, `AI.pruebas@worker1` and person A of the
+    tenant `pruebas`, on one thread, with no WF. A plays 8 turns:
+    - one angry at a third double charge;
+    - five calm ones;
+    - one with SY.storage stopped;
+    - one after a reboot, asking what the first problem was.
+  - **The motherbee:** its 8 `cognition_*` tables and the 474 inbox rows of their subjects are
+    gone, said once in SY.storage's journal.
+  - **The file:**
+    - the folder is 0700, and `cognition.db` and its WAL files 0600, on the motherbee and on
+      worker1, still so after worker1's reboot;
+    - it holds one row for the thread, with its turns, items and feelings, written twice a turn
+      (by the intake and by the worker), with no write failed.
+  - **Closed items leave it:**
+    - after the five calm turns, the angry turn's reasons `seeking urgent resolution` and
+      `confrontational pushback`, and four of its contexts, are gone;
+    - `withdrawal intent` closed and came back on A's last calm turn at 0.75, the weight of a new
+      item.
+  - **With SY.storage stopped** on the motherbee for 29 s:
+    - worker1's SY.cognition restarted and filled its region from the file before any turn;
+    - it analyzed the next turn;
+    - SY.storage then took the thread's 14 turns and the usage records, with no stream record
+      lost.
+  - **After a reboot of worker1:**
+    - SY.cognition loaded the communication from its file and wrote the region before any turn
+      (14 turns, 5 memories, 3 feelings);
+    - the answer to the first message recalled the first problem: *"Me dijiste que te cobraron dos
+      veces la factura 123 por tercera vez. Exigías que lo resolvieran hoy y dijiste que, si no, te
+      irías a otro proveedor."*
+  - **The decays are kept (A-156's first):** across that restart and that reboot, A's feelings
+    faded by their own inertia over A's seven calm turns, each as computed:
+    - anger 2.0 → 1.593;
+    - escalation 2.0 → 1.7849;
+    - urgency 1.75 → 0.9908.
+  - **The cost:** 32 model calls for the 16 turns, 2 each, as before.
+- **Found in the checks:**
+  - a lab note: the row of a 16-turn communication is 127 KB, 61% of it co-occurrences, and it is
+    written twice a turn. SQLite's WAL reached 3.8 MB before its first fold into the file, at 1000
+    pages. This is as designed, and small beside the turn's two model calls;
+  - nothing else new.
+- **Rollback:**
+  - `apt install fluxbee=0.1.102` on the motherbee, then a core-update of the spokes.
+  - 0.1.102's SY.storage creates the cognition tables again, empty, so its cognition starts with
+    no state. The file stays as it is, and a return to 0.1.103 reads it.
 
 ---
 

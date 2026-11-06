@@ -11,7 +11,8 @@
   and the feelings, was agreed on 2026-11-05 (§10). It was released in 0.1.102 and checked on
   8.x (§10.5). Its numbers wait for the lab's code.
 - Where cognition keeps its state was reviewed whole with the operator and agreed on 2026-11-06
-  (§11): its own file on each hive, and SY.storage keeps the messages only. To build next.
+  (§11): its own file on each hive, and SY.storage keeps the messages only. Built the same day
+  and released in 0.1.103, checked on 8.x (§11.6).
 
 This is the single place for the topic.
 
@@ -231,9 +232,9 @@ Cognition analyzes the first two lines only: a person is at their other end.
 
 The rest of A-137, one topic at a time:
 
-- **Several people on one thread:** the analysis blends their feelings into one, with no name.
-  In the chat since 2026-11-05 (§10).
-- **Where cognition keeps its state:** agreed 2026-11-06 (§11), to build next.
+- **Several people on one thread:** the analysis blended their feelings into one, with no name.
+  Agreed 2026-11-05 (§10), released in 0.1.102.
+- **Where cognition keeps its state:** agreed 2026-11-06 (§11), released in 0.1.103.
 - **A conversation with no agent:** who owns it, and which hive's cognition keeps it. In Case 4,
   Juan talks with Ana from 10:00 to 10:16 and no agent is in that part.
 - **Handing over:** how the next agent sees what was said meanwhile.
@@ -586,3 +587,31 @@ agent could come up on another hive as the same ILK. That is wrong since 0.1.83 
   file came back a last digit off (1.8075 for 1.8074999999999999), found by the file's round-trip
   test.
 - **`fluxbee-factory-reset`** removes the motherbee's file. A worker's stays (FINDINGS A-160).
+
+### 11.6 Checked on 8.x (0.1.103, 2026-11-06)
+
+The gate gate0205 on worker1: a client standing for an IO node, `AI.pruebas@worker1` and person A
+of the tenant `pruebas`, on one thread, with no WF.
+
+- **The motherbee:** the 8 `cognition_*` tables and the 474 inbox rows of their subjects are gone,
+  said once in SY.storage's journal.
+- **The file:** the folder 0700, `cognition.db` and its WAL files 0600, on the motherbee and on
+  worker1, and still so after worker1's reboot. One row for the thread, written twice a turn
+  (the intake and the worker), none failed.
+- **Closed items leave it:** after five calm turns, the angry turn's reasons `seeking urgent
+  resolution` and `confrontational pushback`, and four of its contexts, are gone. `withdrawal
+  intent` closed and came back on A's last calm turn at 0.75, the weight of a new one.
+- **With SY.storage stopped** for 29 s, worker1's SY.cognition restarted, filled its region from
+  the file before any turn, and analyzed the next turn. SY.storage then took every turn and
+  usage record, none lost.
+- **After a reboot of worker1,** the region came back from the file before any turn. The answer
+  to the first message recalled the first problem: *"Me dijiste que te cobraron dos veces la
+  factura 123 por tercera vez. Exigías que lo resolvieran hoy y dijiste que, si no, te irías a
+  otro proveedor."*
+- **The decays are kept:** across that restart and that reboot, A's feelings faded by their own
+  inertia over A's seven calm turns. Anger went 2.0 → 1.593, escalation 2.0 → 1.7849 and urgency
+  1.75 → 0.9908, each as computed.
+- **The cost:** 32 model calls for the 16 turns, 2 each, as before.
+- **A lab note:** the row of a 16-turn communication is 127 KB, 61% of it co-occurrences, written
+  twice a turn. SQLite's WAL reached 3.8 MB before its first fold into the file, at 1000 pages.
+  This is as designed, and small beside the turn's two model calls.
