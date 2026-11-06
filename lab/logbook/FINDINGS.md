@@ -59,8 +59,9 @@ no change required
       cognition analyzes, and how the immediate memory names its speakers. ✅ 0.1.101, its WF gate
       on 8.x (2026-11-05). Its second topic, several people on one thread and the feelings (§10),
       agreed and built 2026-11-05 with A-155, A-157 and two of A-156's three: ✅ 0.1.102, its
-      gate on 8.x (2026-11-06). Next, where cognition keeps its state (§10.6), to review whole
-      first; then the rest, one topic at a time.
+      gate on 8.x (2026-11-06). Where cognition keeps its state, reviewed whole and agreed on
+      2026-11-06 (§11): A-158, with A-156's first, to build next. Then the rest, one topic at a
+      time.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
@@ -71,11 +72,13 @@ A-157, two of A-156's three and the fix of a person with no name, went out in 0.
 ### WF
 
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
-  0.1.101, the feelings ✅ 0.1.102; next, where cognition keeps its state (cognition-hands-v1
-  §10.6), a decision to review whole first; then the rest of §9.*
+  0.1.101, the feelings ✅ 0.1.102; where cognition keeps its state agreed 2026-11-06
+  (cognition-hands-v1 §11), building as A-158; then the rest of §9.*
+- A-158 🔴 Cognition keeps its state in SY.storage: a worker's cognition depends on the motherbee,
+  and a host reboot leaves each conversation's first message with no memory. *Sprint: agreed
+  2026-11-06, building.*
 - A-156 🟡 Cognition's weights: `last_seen_at` and the averages ✅ 0.1.102, checked on 8.x; an
-  open item's decay not stored waits for where cognition keeps its state (cognition-hands-v1
-  §10.6).
+  open item's decay not stored is fixed with A-158.
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -115,6 +118,8 @@ A-157, two of A-156's three and the fix of a person with no name, went out in 0.
 - A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-103 🔵 The tool cards restate constants by hand.
+- A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
+  later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
   U-12): to check, then bring here or close.
@@ -1189,6 +1194,60 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-158 [WF] 🔴 OPEN, agreed 2026-11-06, to build (found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
+
+- **Cognition keeps nothing on its own disk but its config.** 12-cognition-v2 §10.2 planned a
+  local LanceDB (`memory.lance`), never built (A-38): the path is reported and nothing opens it.
+- **Its state is SY.storage's:**
+  - each turn sends up to ~100 rows (about 80 KB on a rich turn) into 8 `cognition_*` tables, each
+    row an item's last value;
+  - cognition reads them back over the mesh (`COGNITION_STATE_GET`).
+- **A worker's cognition depends on the motherbee.** It holds in memory only what fits the 4 MB
+  memory region (`retain_memory_hot_set`). Any other communication loads from SY.storage at its
+  next turn, and when SY.storage does not answer, that turn is not analyzed (src/bin/sy_cognition.rs,
+  "could not load a communication from SY.storage; turn skipped").
+- **A host reboot:** at start cognition reloads only what the memory region lists
+  (`reload_communications_from_shared_memory`). The region lives in `/dev/shm`, so after a host
+  reboot each conversation's first message reaches its agent with no memory.
+- **A check for a case that cannot happen:** the 5-minute idle reload exists for an agent that
+  moved to another hive and back. Since 0.1.83 SY.identity refuses that move
+  (`authorize_orchestrator_ilk_scope`), and the hive is part of a node's name.
+- **A-156's first** belongs here: an open item's decay is not stored.
+- **The operator (2026-11-06):**
+  - a node is born and dies on its hive (*"nunca pensé en lo contrario"*);
+  - cognition keeps its state in an embedded store of its own, its "config file";
+  - the message carries what serves the communication: *"no carguemos el sistema fluxbee completo
+    por temas propios del nodo o de la infra"*;
+  - what cognition keeps is online state, so a closed item is deleted;
+  - a communication is never deleted: *"alguien muere y nadie lo olvida"*;
+  - the file is cognition's alone.
+- **Fix (agreed, [cognition-hands-v1](../../docs/cognition-hands-v1.md) §11.3):**
+  - `cognition.db` (SQLite) in SY.cognition's folder on each hive, the folder 0700 and the file
+    0600;
+  - one row per communication with its whole state, written when a turn ends and when new turns
+    come in;
+  - at start the region is filled from the file before the first turn;
+  - a closed item leaves the state;
+  - the tables, the `storage.cognition.*` subjects, `COGNITION_STATE_GET` and the idle check go.
+- **Status:** agreed 2026-11-06; to build for the next release.
+
+### A-159 [General/identity] 🔵 TO DESIGN, a chapter of its own (the operator, 2026-11-06, reviewing where cognition keeps its state) — An ILK is deleted for good while data elsewhere refers to it
+
+- **Today:**
+  - a node's teardown marks its ILK, then purges it (`teardown_node`, src/bin/sy_admin.rs, "Mark,
+    then purge");
+  - a person's ILK is marked, which can be undone, and purged apart (`ILK_PURGE`).
+- **What refers to an ILK elsewhere:**
+  - the messages in SY.storage (`turns.from_ilk`, `to_ilk`, `writer_ilk`);
+  - cognition's communications, keyed by their agent's ILK, whose memories and feelings name
+    people's ILKs;
+  - the vault's secrets dedicated to it;
+  - identity's own channels and aliases.
+- **The operator (2026-11-06):** an ILK is disabled, and deleted only when nothing anywhere refers
+  to it: *"no se puede borrar un ILK, solo deshabilitarlo, se podría borrar si no tiene info
+  asociada en ningún lugar"*. *"Es un capítulo aparte para verlo, algo hay, no todo."*
+- **Status:** to review whole with the operator, later. Nothing is built.
+
 ### A-155 [WF] ✅ VALIDATED ON 8.x (0.1.102, 2026-11-06; found 2026-11-05, preparing A-137's next topic) — The feelings cognition gives an agent: the agent never reads them, and they never fade nor build up
 
 - **What happens:**
@@ -1318,9 +1377,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     both were 05:12:08.
   - Their averages are 0.548 over 6 samples, the mean of 1, 0.75, 0.5625, 0.4219, 0.3164 and
     0.2373. The other reasons' averages run from 0.64 to 2.6, no longer 1.0.
-- **Status:** the second and third validated in 0.1.102. The first waits for where cognition keeps
-  its state (§10.6): the operator wants that reviewed whole, as a decision more complex than it
-  looked (2026-11-05), so nothing of it is built.
+- **Status:** the second and third validated in 0.1.102. The first is fixed with A-158: where
+  cognition keeps its state, reviewed whole with the operator and agreed on 2026-11-06
+  (cognition-hands-v1 §11). Each communication's row is written whole, so every decay is kept.
 
 ### A-154 [WF] ✅ VALIDATED ON 8.x (0.1.101, 2026-11-05; found 2026-11-05, talking over A-153 with the operator) — Nothing closes a WF conversation that went quiet
 
@@ -2006,10 +2065,10 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **The second topic, several people on one thread and the feelings** (cognition-hands-v1 §10):
     agreed and built 2026-11-05, ✅ 0.1.102 with A-155, A-157 and two of A-156's three, validated
     on 8.x (2026-11-06).
-  - **Open:**
-    - where cognition keeps its state (§10.6): the operator wants it reviewed whole before any
-      decision;
-    - then the rest of the topic, one at a time (§9).
+  - **Where cognition keeps its state** (cognition-hands-v1 §11): reviewed whole and agreed on
+    2026-11-06. A node is born and dies on its hive, and cognition keeps its own file on each
+    hive. Building as A-158.
+  - **Open:** the rest of the topic, one at a time (§9).
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 

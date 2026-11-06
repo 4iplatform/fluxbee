@@ -10,8 +10,8 @@
 - The rest of A-137 is open (§9), one topic at a time. The first, several people on one thread
   and the feelings, was agreed on 2026-11-05 (§10). It was released in 0.1.102 and checked on
   8.x (§10.5). Its numbers wait for the lab's code.
-- Next: where cognition keeps its state (§10.6). The operator wants it reviewed whole before any
-  decision.
+- Where cognition keeps its state was reviewed whole with the operator and agreed on 2026-11-06
+  (§11): its own file on each hive, and SY.storage keeps the messages only. To build next.
 
 This is the single place for the topic.
 
@@ -233,7 +233,7 @@ The rest of A-137, one topic at a time:
 
 - **Several people on one thread:** the analysis blends their feelings into one, with no name.
   In the chat since 2026-11-05 (§10).
-- **Where cognition keeps its state** (§10.6): the next topic.
+- **Where cognition keeps its state:** agreed 2026-11-06 (§11), to build next.
 - **A conversation with no agent:** who owns it, and which hive's cognition keeps it. In Case 4,
   Juan talks with Ana from 10:00 to 10:16 and no agent is in that part.
 - **Handing over:** how the next agent sees what was said meanwhile.
@@ -299,7 +299,7 @@ The rest of A-137, one topic at a time:
    deficiente y que no se terminó"*.
 6. **Cognition keeps its own state; SY.storage keeps the messages:** *"cognitive tiene
    persistencia propia, storage guarda mensajes, la idea no es que sea repositorio de cognitive"*.
-   Its own topic (§10.6).
+   Its own topic, agreed on 2026-11-06 (§11).
 7. **The proposal of §10.3 and §10.4 is agreed, and the topic is to be finished whole:**
    *"coincido con todo, avanza como planteas pero este tema es para terminarlo, con las
    prioridades que creas, pero completo. Sentires está bien."* The order: the feelings with
@@ -312,7 +312,8 @@ The rest of A-137, one topic at a time:
 - **A person's turn** whose signals pass the gate for an affect (`build_episode_candidate`, as
   today) makes that feeling's weight `weight × d + s`. Each other analyzed turn of the same person
   makes each of that person's open feelings `weight × d`. A feeling closes under 0.25, and opens
-  again when it comes back.
+  again when it comes back. Since §11 a closed one leaves cognition's state, so one that comes
+  back starts from zero; until then it started from the weight it closed with.
   - The clock is the owner's own turns: Pedro writing calm does not fade Ana's anger.
   - Only a person's own turn raises a feeling. An agent's answer adds to the contexts and reasons,
     never to a feeling.
@@ -401,45 +402,165 @@ each row's `payload`.
   the weight.
 - The feelings added no model call.
 
-### 10.6 Next topic: where cognition keeps its state
+### 10.6 Where cognition keeps its state
 
-- **Today it has none of its own:**
-  - Locally it keeps only its config. It reports a `memory.lance` path that nothing opens: LanceDB
-    was 12-cognition-v2's local layer, never built (FINDINGS A-38).
-  - Since 0.1.77 its rows go to SY.storage@motherbee (`storage.cognition.batch`, the `cognition_*`
-    tables), and it reloads from there over the mesh (`COGNITION_STATE_GET`), as
-    docs/router-stream-v1.md §6.2 designed it (2026-10-17).
-- **The operator's direction** (§10.2, 6): cognition keeps its own state, and SY.storage keeps the
-  messages.
-- **A-156's first defect belongs there:** an open item's decay is not stored, because each write
-  is a stream record to the motherbee.
-- **More facts (verified 2026-11-05):**
-  - Only SY.cognition reads the `cognition_*` tables, through `COGNITION_STATE_GET`, to load a
-    communication. Archi and the rest never read them.
-  - The repo already embeds two stores: SQLite (`rusqlite`, bundled), which SY.vault keeps in its
-    state dir, and LanceDB, which SY.architect uses.
-  - A node's ILK is kept by its full name (`AI.sales@worker1`). A spawn may pass an existing
-    `ilk_id`, so an agent can come up on another hive as the same ILK. That case is why a
-    communication loads from SY.storage today: its state may have been made on another hive.
-  - 8.x holds only test data in those tables.
-- **The operator (2026-11-05), on the proposal below:** *"Tenemos que revisar mejor este tema… me
-  suena que es una decisión más compleja. Si podés cerrar esta etapa como está mejor, sin tocar esa
-  parte"*. So nothing of it is built: it is a topic of its own, to review whole before deciding.
-- **Proposed, not agreed:**
-  - Each hive's SY.cognition keeps its communications in its own SQLite file in its state dir,
-    one row per communication with its whole state: thread, contexts, reasons, co-occurrences,
-    scope, memories, feelings and last turns.
-  - It writes the row after each turn and each intake batch, so every decay is kept (A-156's
-    first), and loads it at start and at a communication's first turn.
-  - SY.storage keeps the messages only: the `cognition_*` tables, the `storage.cognition.*`
-    subjects and `COGNITION_STATE_GET` go, the tables dropped once and logged.
-  - **The open question:** an agent that comes up on another hive with its ILK finds its
-    communications on the old hive. The options:
-    1. SY.admin's spawn with an existing `ilk_id` hands them over, from the old hive's cognition
-       to the new one's, and reports it;
-    2. the new hive's cognition asks the others at a communication's first turn;
-    3. nothing travels: the agent starts its cognition again.
+Reviewed whole and agreed on 2026-11-06: §11. The proposal written here on 2026-11-05 said an
+agent could come up on another hive as the same ILK. That is wrong since 0.1.83 (§11.1).
 
-    Option 1 is explicit and goes through SY.admin.
-  - **Durability:** a hive lost loses its cognition, not its messages, which stay in SY.storage.
-    The VM snapshots cover it.
+---
+
+## 11. Where cognition keeps its state (chats of 2026-11-06)
+
+### 11.1 Facts (verified in the code, 2026-11-06)
+
+- **Cognition keeps nothing on its own disk but its config** (`persist_cognition_config_state`).
+  12-cognition-v2 §10.2 planned a local LanceDB, `memory.lance` in its folder. It was never built:
+  the path is reported and nothing opens it.
+- **Its state lives in SY.storage, on the motherbee:**
+  - each turn sends up to ~100 rows (about 80 KB on a rich turn) through the stream
+    (`storage.cognition.batch`) into 8 `cognition_*` tables;
+  - each row keeps an item's last value, overwritten turn by turn;
+  - cognition reads them back over the mesh (`COGNITION_STATE_GET`), and nothing else reads them.
+- **A worker's cognition depends on the motherbee:**
+  - in memory it holds only the communications that fit the memory region, 4 MB
+    (`retain_memory_hot_set`);
+  - any other loads from SY.storage at its next turn;
+  - when SY.storage does not answer, that turn is not analyzed ("could not load a communication
+    from SY.storage; turn skipped").
+- **A host reboot loses the agents' memory until each conversation speaks:**
+  - at start cognition reloads only what the memory region lists
+    (`reload_communications_from_shared_memory`);
+  - the region lives in `/dev/shm`, so it survives a restart of the process, not of the host;
+  - after a host reboot, each conversation's first message reaches its agent with no memory.
+- **Cognition's results are not in the messages:** `turns.tags` is the sender's
+  (`payload.tags` or `meta.tags`), not cognition's.
+- **What a communication's state is** (`ThreadCognitionState`):
+  - its items with their weights: contexts, reasons, co-occurrences and feelings, each with its
+    averages, open or closed, its dates and who took part;
+  - the active scope: the bound context and reason, and its energy;
+  - the memories: the narrator's text, one per scope;
+  - the feelings' texts;
+  - the last 20 turns, at most 48 KiB;
+  - counters: the turn count, first and last seen, and the last turn's ILKs and channel.
+- **Only open items are read:**
+  - the package carries open contexts, reasons and feelings, and the memories
+    (`build_memory_package_for_thread`);
+  - the scope picks its pair among open items (`select_dominant_context`,
+    `select_dominant_reason`);
+  - a closed item is read only when it comes back: it reopens from the weight it closed with,
+    under 0.25.
+- **Memories never close:** one per scope. Each time the narrator writes one, the communication's
+  others fade by 0.97.
+- **A node cannot move to another hive:**
+  - its hive is part of its name: `AI.x@worker1` started on worker2 is another node,
+    `AI.x@worker2`;
+  - since 0.1.83 SY.identity lets an orchestrator register only its own hive's node ILKs
+    (`authorize_orchestrator_ilk_scope`), so `SY.orchestrator@worker2` registering the ILK of
+    `AI.x@worker1` gets `UNAUTHORIZED`;
+  - only a teardown frees the id, and then it is a new node with a recycled id;
+  - cognition's 5-minute idle reload ("its agent may have moved away and back") exists only for
+    that case.
+- **A node is a node and its state:**
+  - an agent keeps its thread state in its folder (LanceDB, `thread-state`);
+  - a WF keeps its instances there (`wf_instances.db`), and its timers in its hive's SY.timer, by
+    the owner's name;
+  - io.slack keeps its thread records there (`slack_threads.db`);
+  - that folder is removed with the node.
+- **A node is named with its hive** in identity (`node_name`, an ICH's owner), in the vault's check
+  (`handler_node`), in IO configs (`io.dst_node`), in WF actions' targets and CEL guards, in the
+  operator's OPA, in routes, taps and timers.
+- **Every Fluxbee process runs as root:** the units have no `User=`, and managed nodes run as
+  `systemd-run` units. SY.vault keeps its SQLite file 0600 (`VaultStore::open`).
+
+### 11.2 Decided (the operator, 2026-11-06)
+
+1. **A node is born and dies on its hive** (*"nunca pensé en lo contrario"*), as D6 says of the
+   tenant.
+   - Moving one, if ever needed, is a process of its own.
+   - The operator's view, far ahead: solutions made of groups of agents of a "digital agent" (AD).
+     What would move is its soul, not a node: *"eso no se puede mudar así nomás.. se mudaría el
+     alma de ese AD si fuera necesario"*.
+2. **Cognition keeps its state in an embedded store of its own,** its "config file" for complex
+   data and current state.
+   - *"por mí es lo mismo mientras que esté embebido en cognitive y resuelva él sus problemas con
+     esa herramienta"*.
+   - Each node uses the tool that suits its data, since the data is bounded to it.
+3. **The message carries what serves the communication,** and nothing of a node's own matters.
+   - *"no carguemos el sistema fluxbee completo por temas propios del nodo o de la infra.. la idea
+     es que el mensaje sirva para comunicar y guarde sus datos"*.
+   - For cognition, that is the memory package the router attaches for the agent, as today.
+   - No per-turn result goes to SY.storage.
+4. **What cognition keeps is online state, not history:** *"no son históricos, son estados de uso
+   'online' nada más"*.
+   - A closed item is deleted when it closes: *"cerró, no necesita memoria de cálculo para seguir
+     con eso.. se borra"*.
+5. **A communication is never deleted,** not when it goes quiet, not when its agent is torn down.
+   Its memories and feelings involve people: *"alguien muere y nadie lo olvida"*.
+6. **Deleting an ILK is a chapter of its own** (FINDINGS A-159): an ILK is disabled, and deleted
+   only when nothing anywhere refers to it. *"algo hay, no todo"*.
+7. **A lost hive:** the snapshots cover it for now.
+8. **8.x:** the cognition tables go (*"borra todo lo que quieras en 8.xx"*).
+9. **The file is cognition's alone:** *"que el archivo de cognition tenga la seguridad para que
+   solo él acceda"*.
+
+### 11.3 The design
+
+- **The file:** `cognition.db`, in SY.cognition's folder on each hive
+  (`/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/`).
+  - The folder is 0700, and the file and its WAL sidecars are 0600 from their creation.
+  - Every Fluxbee process runs as root, so this keeps out every other user, not another root
+    process. A user per service waits with A-22 and A-60, parked.
+- **One row per communication `(thread_id, agent_ilk)`:** the agent node, the turn count, the last
+  activity, and the state as one JSON with its own version.
+  - The state holds the open items with their weights and averages, the active scope, the
+    memories, the open feelings, the last 20 turns and the counters.
+  - A row takes about 10 to 60 KB, the turns most of it.
+- **Writes:** each communication's row whole, in one transaction:
+  - when a turn's analysis ends;
+  - when its new turns come in (the intake).
+
+  Every decay is kept (A-156's first).
+- **Start:** the most recent communications, up to the region's capacity, are loaded, and the
+  region is written before the first turn. Any other loads from the file at its next turn.
+- **A closed item leaves the state when it closes.** One that comes back starts from zero (§10.3).
+- **Nothing deletes a communication.** The file grows with each new one: 10,000 take about 100 to
+  600 MB.
+- **What goes:**
+  - the 8 `cognition_*` tables, dropped once with a log line;
+  - the `storage.cognition.*` subjects, and their sink and producer in the router's stream;
+  - `COGNITION_STATE_GET` and the reload over the mesh;
+  - the 5-minute idle check;
+  - the `memory.lance` path.
+- **What stays:** the turns' copy to cognition (`cognition.turns`), its usage records
+  (`storage.usage`), the memory region and the package.
+- **What it gives:**
+  - a worker's cognition works on its own, whether the motherbee answers or not;
+  - after a host reboot, an agent has its memory from the first message;
+  - a turn no longer sends up to ~100 rows to the motherbee.
+
+### 11.4 Every leg
+
+- **SY.cognition:** the store, its loads and writes, the closed items, and its status (the file,
+  the communications, the bytes).
+- **SY.storage:** the cognition handlers, their tables and `COGNITION_STATE_GET` go. The tables are
+  dropped once, behind a marker.
+- **The router:** its stream drops `storage.cognition.*`.
+- **The Rust SDK:** the subjects, the envelopes and `COGNITION_STATE_GET` go. The Go SDK has none.
+- **Nothing changes** in the policy, identity, the vault, SY.admin, the orchestrator, packaging
+  (`rusqlite` is already in the workspace), Archi or Cloud.
+- **Posture:** the folder and the file.
+- **Docs:** docs/reference/cognition.md and storage.md, docs/nodes/sy-cognition.md and
+  sy-storage.md, the SDK READMEs, and a note in docs/router-stream-v1.md §6.2.
+- **Tests:**
+  - the store's round trip;
+  - a closed item gone from it;
+  - the folder's and the file's modes;
+  - a start that fills the region from the file;
+  - no `storage.cognition.*` subject left.
+- **The gate on 8.x:**
+  - a restart of SY.cognition keeps the memory;
+  - after a reboot of worker1, the first message carries memory;
+  - with SY.storage stopped for a while, worker1 keeps analyzing;
+  - a feeling that closes leaves the file;
+  - the file is 0600;
+  - the tables are gone from the motherbee.
