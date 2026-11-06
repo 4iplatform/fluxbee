@@ -433,7 +433,6 @@ subject (`subject_allowed`, `src/router/stream.rs`):
 | Subject | Who may append |
 | --- | --- |
 | `storage.turns`, `cognition.turns` | Nobody: the router makes these copies itself |
-| `storage.cognition.*` | `SY.cognition@<this hive>` |
 | `storage.usage` | Any node, except that SY.cognition may only on a `motherbee` or `worker` hive, and SY.frontdesk.gov, SY.architect and SY.admin only on the motherbee |
 | Anything else | Nobody |
 

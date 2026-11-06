@@ -291,14 +291,12 @@ What happens without any node's help:
   it in the table `turns`, the message log;
 - the router of an agent copies both directions of each turn with a `thread_id` as `cognition.turns`,
   for the SY.cognition of its hive;
-- SY.cognition derives threads, contexts, reasons, memories and episodes. It writes them back through
-  the stream (`storage.cognition.batch`) to SY.storage's `cognition_*` tables, and refreshes the
-  memory region.
+- SY.cognition derives contexts, reasons, scopes, memories and feelings, keeps them in its own file
+  on its hive, and refreshes the memory region.
 
 What a node must not do:
 
-- read `turns` or the `cognition_*` tables. Only SY.cognition reads a communication's state back, with
-  `COGNITION_STATE_GET` over the mesh;
+- read `turns`, or SY.cognition's file, which only SY.cognition reads;
 - read the memory region (`jsr-memory-<hive>`), which belongs to the router and SY.cognition;
 - use PostgreSQL as its integration surface.
 
@@ -316,7 +314,6 @@ router. The router keeps a short, best-effort log and delivers it in batches to 
   | Subject | Who may append it |
   | --- | --- |
   | `storage.usage` | any node; SY.storage checks each record. SY.cognition only on the motherbee or a worker; SY.frontdesk.gov, SY.architect and SY.admin only on the motherbee |
-  | `storage.cognition.*` | only `SY.cognition@<this hive>` |
   | `storage.turns`, `cognition.turns` | no node: only the router makes them |
 
 - **In practice a node does not call it.** The AI SDK's usage recorder appends the `storage.usage`

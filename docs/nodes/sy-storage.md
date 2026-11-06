@@ -1,8 +1,8 @@
 # SY.storage
 
 SY.storage is the mesh's durable store. It receives the router streams of every hive and writes
-them into the PostgreSQL database `fluxbee_storage`: the message log (`turns`), cognition's
-durable state (`cognition_*`) and LLM usage records (`llm_usage`). It also answers the queries
+them into the PostgreSQL database `fluxbee_storage`: the message log (`turns`) and LLM usage
+records (`llm_usage`). SY.cognition keeps its state in its own file, not here. It also answers the queries
 other system nodes make about that data.
 
 Source: `src/bin/sy_storage.rs`. Data model and table details: [docs/reference/storage.md](../reference/storage.md).
@@ -29,11 +29,11 @@ Source: `src/bin/sy_storage.rs`. Data model and table details: [docs/reference/s
 - Without a usable secret it starts without a database (`sy.storage started without active DB
   backend`): stream batches are not acknowledged, so the streams keep them and resend.
 - It creates its missing tables and indexes at every start (`ensure_schema`): `turns`,
-  `storage_inbox`, the `cognition_*` tables (threads, contexts, reasons, cooccurrences, scopes,
-  scope_instances, memories, episodes) and `llm_usage`, each statement waiting at most 5 s for its
-  lock. It runs no migrations: an existing table is left as it is, except that a `turns` that
-  still has `ctx` and `seq`, which nothing writes since 0.1.83, loses them and their index once,
-  and says so in one log line ([storage](../reference/storage.md) §6.1).
+  `storage_inbox` and `llm_usage`, each statement waiting at most 5 s for its lock. It runs no
+  migrations: an existing table is left as it is, except that a `turns` that still has `ctx` and
+  `seq`, which nothing writes since 0.1.83, loses them and their index once, and cognition's
+  `cognition_*` tables, written until 0.1.103, are dropped once with the inbox rows of their
+  subjects; each says so in one log line ([storage](../reference/storage.md) §6.1, §6.2).
 - The motherbee's orchestrator waits for it at boot: the unit active within 30 s, then a
   successful `STORAGE_METRICS_GET` over the mesh within 30 s (`finish_bootstrap`,
   `wait_for_storage_db_ready` in `src/bin/sy_orchestrator.rs`). Until then every admin action
@@ -44,14 +44,13 @@ Source: `src/bin/sy_storage.rs`. Data model and table details: [docs/reference/s
 | Message | Who may send | What it does |
 | --- | --- | --- |
 | `STREAM_BATCH` → `STREAM_ACK {up_to_seq}` | a router stream (`RT.<router>.stream@<hive>`, `is_stream_node_name`) | writes the batch into `storage_inbox` in one transaction, then acknowledges it (`ingest_stream_batch`); other senders are dropped with a warning |
-| `COGNITION_STATE_GET` → `COGNITION_STATE_RESPONSE` | `SY.cognition@*` | a page of one communication's durable state |
 | `STORAGE_METRICS_GET` → `STORAGE_METRICS_RESPONSE` | any node | inbox metrics: pending, pending with error, oldest pending age, processed, max attempts |
 | `USAGE_QUERY` → `USAGE_QUERY_RESPONSE` | `SY.admin@motherbee` only (`answer_usage_query`) | LLM usage records |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`, `NODE_STATUS_GET` | `CONFIG_*` only from `SY.admin@motherbee` (router system policy) | control; `CONFIG_SET` refuses `config.database.postgres_url` (Model D') |
 | `VAULT_SECRET_CHANGED` | `SY.vault@motherbee` | for a `postgres` change: exit with status 0, systemd restarts it with the new value |
 
-Checks on stream records (`stream_rows`): a record's producer must be on the stream's hive;
-`storage.cognition.*` must come from that hive's `SY.cognition`; a usage record must pass
+Checks on stream records (`stream_rows`): a record's producer must be on the stream's hive; a
+subject must have a handler (cognition's of 0.1.102 and before have none); a usage record must pass
 `check_usage_record`, and one whose tenant cannot be verified is stored on its last attempt
 with the claimed tenant, marked unverified.
 

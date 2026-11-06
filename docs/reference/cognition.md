@@ -1,7 +1,7 @@
 # Cognition (SY.cognition): reference
 
 **Status:** as built in 0.1.79 (2026-10-17); each communication's last turns added on 2026-10-30
-(§3.4).
+(§3.4); its state in its own file since 0.1.103 (§5, docs/cognition-hands-v1.md §11).
 **Audience:** developers of AI nodes, the router, SY.storage and anyone who reads agent memory.
 
 This page describes what SY.cognition does today, and names the code that backs each statement.
@@ -11,8 +11,9 @@ stale on keying, limits and transport; where it disagrees with this page, the co
 
 The main source is `src/bin/sy_cognition.rs`, with its two model calls in
 `src/bin/sy_cognition/semantic_tagger_ai.rs` and `src/bin/sy_cognition/narrative_summarizer_ai.rs`.
-A function or constant named without a path lives in `sy_cognition.rs`. The wire types are in
-`crates/fluxbee_sdk/src/cognition.rs`.
+A function or constant named without a path lives in `sy_cognition.rs`. Its file is
+`src/bin/sy_cognition/state_store.rs`, and the memory package's types are in
+`crates/fluxbee_sdk/src/protocol.rs`.
 
 ---
 
@@ -36,7 +37,8 @@ A function or constant named without a path lives in `sy_cognition.rs`. The wire
   `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.
 - **Who reads it:** ai.generic, through the memory package the router attaches to messages it
-  delivers to an agent (§7). A durable copy lives in SY.storage (§5).
+  delivers to an agent (§7). Its state lives in its own file on its hive, which only it reads
+  (§5); SY.storage keeps the messages, not cognition's state.
 - **The cost:** up to two model calls per turn, charged to the agent's tenant (§3, §9).
 
 ---
@@ -77,9 +79,9 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   anywhere else, or one it cannot read, is dropped without an ack.
 - It skips any record at or below the last seq it took from that stream and epoch
   (`stream_seen`, `stream_repeats_skipped_total`).
-- It takes each new `cognition.turns` record into its communication's last turns, rewrites the
-  memory region once for the batch, and appends the thread rows of the loaded communications it
-  touched (the intake, §3.4).
+- It takes each new `cognition.turns` record into its communication's last turns, writes each
+  communication it touched to its file and rewrites the memory region once for the batch (the
+  intake, §3.4).
 - Then it hands each record to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full queue drops
   the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its communication's
   last turns.
@@ -105,41 +107,36 @@ stays in the last turns.
    - The answer is cached while the SHM's `seq` is unchanged; when the `seq` cannot be read, for
      60 s (`COGNITION_AGENT_ILK_TTL`).
    - An agent node without an ILK in the SHM gets no memory (`no_agent_ilk_total`).
-3. **State:** a communication this cognition has not loaded is loaded from SY.storage first
-   (§6), even when the intake already holds its last turns (`adopt_stored_state` merges them).
-   The region is rewritten and the thread row goes out right after the load, so the merged turns
-   are durable whatever the model calls below do. If the load fails, the turn is skipped
-   (`state_fetch_failures_total`). One held but idle for 5 minutes is checked against SY.storage
-   again.
+3. **A person, then the state:**
    - **Only a turn with a person at its other end is analyzed** (`person_at_other_end`,
      [cognition-hands-v1](../cognition-hands-v1.md) §6): one the agent got, unless its writer
      (`meta.context.writer`, else its `src_ilk`) is known not to be a person, an ILK the identity
      names `agent` or `system`, or a writer with no ILK, a node; an answer the agent sent, unless
      its `dst_ilk` is. An ILK the identity does not know yet counts as a person's. Any other turn
-     stops here: it stays among the last turns, unanalyzed and unnumbered
-     (`turns_not_analyzed_total`), with no model call. Its communication was loaded all the same.
+     stops here: it stays among the last turns, which the intake wrote to the file, unanalyzed
+     and unnumbered (`turns_not_analyzed_total`), with no model call.
+   - **The state:** a communication this cognition does not hold is loaded from its file (§6),
+     where the intake wrote its turn (`held_or_loaded`). If the file cannot be read, the turn is
+     skipped (`store_load_failures_total`).
 4. **Text:** the message's text content (`TextV1Payload`, `extract_turn_text`). A message
    without text gets an empty tag set, and no tagger call.
 5. **AI key:** resolved from SY.vault on every turn (§8). Without it the turn is skipped and
    the node reports `degraded_no_ai_provider`.
 6. **Tagger:** one model call (§3.1). A failure skips the turn.
 7. **Number:** the communication's turn count goes up by one (`turn_count`, in
-   `update_thread_state_and_build_envelopes`). That number orders the communication: it is in
-   every envelope (`CognitionCommunicationRef.turn`), it marks where scope instances start and
-   end, and it guards the durable rows (§5). A skipped turn gets no number.
-8. **Derivations:** the thread's first and last seen, contexts, reasons, co-occurrences, scope
-   (§4); the thread row goes out in step 10. Steps 7 to 9 run on a copy of the communication's
-   state, without the lock the intake takes, so the intake never waits for a model call. A
-   communication no longer loaded when the copy is taken skips the turn: a blank state would
-   number it from 1 again. Until the turn is done, every region write keeps the communication
-   (`worker_turn`), so no intake batch drops it from a full region meanwhile.
+   `update_thread_state`): how many of its turns were analyzed. A skipped turn gets no number.
+8. **Derivations:** the communication's first and last seen, contexts, reasons, co-occurrences,
+   scope (§4). Steps 7 to 9 run on a copy of the communication's state, without the lock the
+   intake takes, so the intake never waits for a model call. Until the turn is done, every region
+   write keeps the communication held (`worker_turn`), even when it does not fit the region, so
+   no intake batch lets it go meanwhile.
 9. **Summarizer:** one model call when the communication has an active scope (§3.2). A failure
    skips only the memory of this turn and the text of its feelings: the feelings still move, and
    one opened by this turn has no text yet (§5).
-10. **Outputs:** the turn's envelopes go to SY.storage through the stream (§5). The copy goes back
-    into what is held (`write_back_turn`): its derivations replace the held ones, and its turns
-    are merged with those the intake took meanwhile. Then the memory region is rewritten (§7) and
-    the thread row goes out, built from what is held (`sync_held_state`).
+10. **Outputs:** the copy goes back into what is held (`write_back_turn`): its derivations replace
+    the held ones, and its turns are merged with those the intake took meanwhile. Then the
+    communication is written whole to its file (§5) and the memory region is rewritten (§7), both
+    from what is held (`sync_held_state`).
 
 ### 3.1 The tagger
 
@@ -197,9 +194,9 @@ The policy is published in `STATUS` and `CONFIG_GET` (`degraded_semantics_policy
 `take_stream_batch` takes every turn of a batch into its communication's last turns before the
 turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_turns`).
 
-- **When:** as the batch arrives, ahead of the worker and its model calls (about 5 s a turn). The
-  region is rewritten, and the thread rows of the loaded communications go to SY.storage, before
-  the batch is acked, so the next message the router delivers to the agent, a second later,
+- **When:** as the batch arrives, ahead of the worker and its model calls (about 5 s a turn). Each
+  communication it touched is written to the file and the region is rewritten before the batch is
+  acked, so the next message the router delivers to the agent, a second later,
   carries the turn before it, whatever the worker's backlog: the stream sends a record to its
   sinks as soon as it takes it. The message being delivered is never among its own turns: the
   router reads its package before it appends its copy (`deliver_locally`, §7).
@@ -230,23 +227,20 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
   - `ts`: when its router took it (the stream record's time), RFC 3339 in UTC.
 
   `src_ilk`, `via` and the option come from the message and are cut at 256 characters. U+0000
-  leaves every field (`turn_field`): PostgreSQL's `jsonb` refuses it, and every thread row that
-  carried the turn would fail until the turn left the window.
+  leaves every field (`turn_field`).
 - **How many:** the last 20, oldest first (`COGNITION_RECENT_TURNS`); the 21st pushes out the
   oldest. They also stay under 48 KiB serialized (`COGNITION_RECENT_TURNS_MAX_BYTES`), the oldest
   going first, never the newest: 20 turns of 2,000 characters of Latin text fit; a script of more
   bytes a character keeps fewer. The bound keeps a package and the message it rides on under a
-  frame (128 KiB, of which an inline text message takes at most 64 KiB) and a thread row under the
-  stream's record limit. A turn the communication holds already (a batch sent again) is not added.
-- **A communication not loaded yet** (new, after a restart, or after its agent moved here): the
-  intake starts it from the turns the region had for it, if any, and the region keeps the package
-  it had, with the new turns, until the worker loads it (§7). It writes no thread row: its turn
-  count is unknown, and a row of turn 0 could replace a stored one of turn 0 (a communication whose
-  turns never got a number) with fewer turns. The worker's load merges SY.storage's turns with the
-  intake's, each once, in the order they were taken (`merge_recent_turns`), and writes the row at
-  once (step 3). Until then its new turns live in the region alone.
+  frame (128 KiB, of which an inline text message takes at most 64 KiB). A turn the communication
+  holds already (a batch sent again) is not added.
+- **A communication not held** (new, after a restart, or let go from a full region, §7): the
+  intake loads it from the file, or starts it new, and adds the turn (`held_or_loaded`). When the
+  file cannot be read, the turn is kept out (`store_load_failures_total`): a new one would write
+  over what the file keeps.
 - **Who writes what:** the intake owns the last turns and the last turn's ILKs and channel; the
-  worker owns the rest. Both change the held state and publish it in `sync_held_state`, under the
+  worker owns the rest. Both change the held state and write it out in `sync_held_state`: each
+  communication changed is written whole to the file, then the region is rewritten, under the
   region's lock and then the state's, so neither loses the other's writes. The worker derives on a
   copy and writes it back merging the intake's turns (step 10 above).
 
@@ -254,22 +248,21 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
 
 ## 4. The entities
 
-Most ids are a SHA-256 of a prefix and their parts (`stable_entity_id`), so the live path and a
-rebuild produce the same ids. Those ids include the thread and the agent ILK, never the hive or
-the node. Scopes and scope instances get a random UUID when they open.
+A communication's state (`ThreadCognitionState`) holds its open items: an item that closes leaves
+it (docs/cognition-hands-v1.md §11.2). Most ids are a SHA-256 of a prefix and their parts
+(`stable_entity_id`), so an item that comes back gets the id it had. Those ids include the thread
+and the agent ILK, never the hive or the node. A scope gets a random UUID when it opens.
 
 | Entity | Id (`stable_entity_id` parts) | One per |
 | --- | --- | --- |
-| Thread | `thread`: thread, agent | communication |
 | Context | `context`: thread, agent, label | tag |
 | Reason | `reason`: thread, agent, label | reason label |
 | Co-occurrence | `cooccurrence`: thread, agent, context label, reason label | context and reason pair |
 | Scope | `scope:<uuid v4>` | phase of the conversation |
-| Scope instance | `scope_instance:<uuid v4>` | opening of a scope |
 | Memory | `memory`: thread, agent, scope id | scope |
 | Episode (a feeling) | `episode`: thread, agent, owner ILK, affect, context label | owner, affect and context |
 
-**Thread** (`build_thread_envelope_body`): first and last seen, the turn count, the last
+**The communication** (`ThreadCognitionState`): first and last seen, the turn count, the last
 turn's `src_ilk`, `dst_ilk` and `ich`, and the last turns (§3.4). The worker sets the first
 three, the intake the last two.
 
@@ -277,8 +270,8 @@ three, the intake the last two.
 
 - Each tag the tagger returns is a candidate with score 1.0. A candidate opens or reinforces
   its context: `weight = weight × 0.85 + 1.0` (`COGNITION_CONTEXT_DECAY_FACTOR`).
-- An open context the turn does not name decays by 0.85, and closes under
-  `thresholds.context_close` (default 0.25).
+- A context the turn does not name decays by 0.85, and closes under `thresholds.context_close`
+  (default 0.25): it leaves the state. One that comes back starts again from its score.
 - Each one also keeps a cumulative average and an EMA (alpha 0.25) of its weight, over every turn
   it is open, the turns that only decay it included (`sample_weight`, FINDINGS A-156); and per-ILK
   weights: the sender adds 1.0, the receiver 0.5 (`apply_ilk_participation`).
@@ -302,21 +295,23 @@ thresholds.
 
 - The dominant context and reason are the open ones with the highest weight; on a tie, the
   scope's own keep it (`select_dominant_context`, `select_dominant_reason`).
-- The first turn with both opens a scope and its instance, starting at that turn.
+- The first turn with both opens a scope. It keeps its pair's labels, tags and signals, which its
+  memory and its feelings read, whether or not the pair's items are still held.
 - Each later turn computes a binding: the Jaccard similarity of context tags, times that of
   reason signals, times the cosine of the ILK weights. Both participants weigh 1.0 here
   (`current_turn_ilk_weights`). The scope keeps an EMA of it (alpha 0.25).
 - When the dominants change and the EMA is under 0.35 (`COGNITION_SCOPE_UNBIND_THRESHOLD`) for
-  two turns in a row (`COGNITION_SCOPE_SUSTAIN_COUNT`), the scope and its instance close and a new
-  one opens. From the second turn on only.
+  two turns in a row (`COGNITION_SCOPE_SUSTAIN_COUNT`), the scope closes and a new one opens. From
+  the second turn on only.
 - A change that binds well relabels the scope instead.
 
 **Memory** (`update_memories_for_thread`): one per scope.
 
 - Its summary is the summarizer's. Its weight is `weight × 0.97 + max(binding EMA, 0.25)`.
-- The communication's other memories decay by 0.97 (`COGNITION_MEMORY_DECAY_FACTOR`).
+- The communication's other memories decay by 0.97 (`COGNITION_MEMORY_DECAY_FACTOR`). Memories
+  never close.
 
-**Episode, a person's feeling** (`build_episode_candidate`, `update_feelings_for_turn`;
+**Episode, a person's feeling** (`build_episode_candidates`, `update_feelings_for_turn`;
 docs/cognition-hands-v1.md §10.3):
 
 - **Who:** a feeling is its owner's, the person who wrote the turns that show it
@@ -351,115 +346,66 @@ docs/cognition-hands-v1.md §10.3):
 
   The operator set two to ten times by feeling (2026-11-05); the lab's numbers are to be checked
   against its code.
-- **It closes** under 0.25 (`COGNITION_FEELING_CLOSE_THRESHOLD`) and opens again when it comes back,
-  from the weight it closed with.
+- **It closes** under 0.25 (`COGNITION_FEELING_CLOSE_THRESHOLD`) and leaves the state. One that
+  comes back starts again from its step.
 - **Its averages** follow its weight over its owner's turns, with a context's EMA alpha slowed by
   the inertia (`feeling_ema_alpha`).
 - **Its level,** as the agent reads it (`feeling_level`): `strong` from three steps up, `present`
   from one, `faint` under one.
-- **Stored** when a turn shows it and when it closes. A decay in between is not, as a context's is
-  not (FINDINGS A-156): a reload brings back its weight of the last turn that showed it.
 
 ---
 
-## 5. Durable copy in SY.storage
+## 5. Its own file
 
-**The envelope** (`CognitionDurableEnvelope` in `crates/fluxbee_sdk/src/cognition.rs`):
+SY.cognition keeps its communications in a SQLite file of its own on its hive
+(`CognitionStore` in `src/bin/sy_cognition/state_store.rs`; docs/cognition-hands-v1.md §11). It
+is online state: what the next turn needs, never a history. SY.storage keeps the messages and
+nothing of cognition's.
 
-- `schema_version` 2 (`COGNITION_DURABLE_SCHEMA_VERSION`), `entity_version`, `entity`, `op`;
-- `entity_id`, `thread_id`, `agent_ilk`, `turn` (the communication's turn number);
-- `hive`, `writer` (the node name), `ts`, and `data` (the entity's fields).
-
-The op is `upsert` or `close`. SY.cognition never sends `delete`.
-
-**The way out** (`append_envelopes`, `pack_envelopes`):
-
-- A turn's envelopes are packed into records of at most 64 KB (`COGNITION_APPEND_MAX_BYTES`),
-  under the subject `storage.cognition.batch` (`CognitionEnvelopeBatch`).
-- Each pack is a `STREAM_APPEND` to SY.cognition's own router (`fluxbee_sdk::stream::append`).
-- The router takes `storage.cognition.*` only from `SY.cognition@<its hive>` (`subject_allowed`),
-  and sends it to `SY.storage@motherbee`.
-- **The thread row** has two writers: the intake, at every batch, for each loaded communication it
-  took a turn of, and the worker, after each load and each turn (`thread_rows`). Both build it from
-  what is held when it goes out, numbered with the worker's turn count and stamped with the time
-  it was built, and append it before they let go of the held state's lock (`sync_held_state`). A
-  communication the worker has not loaded writes none (§3.4).
-- **Rows of an equal turn** are ordered by the time they were built: SY.storage takes one only
-  when it is later than the stored one (the guard below), so a row its inbox applies late, behind
-  a full process queue or in its retry, never rolls the turns back.
-- The last turns live only in the thread row's `payload`; `cognition_threads` has no column for
-  them. 48 KiB at most (§3.4), so the row fits a pack.
-
-**In SY.storage** (`src/bin/sy_storage.rs`, `stream_rows`):
-
-- Each packed envelope becomes one inbox row under `storage.cognition.<entity>`, as if it had come
-  alone. Records of other producers are dropped.
-- Each entity has its table: `cognition_threads`, `cognition_contexts`, `cognition_reasons`,
-  `cognition_cooccurrences`, `cognition_scopes`, `cognition_scope_instances`,
-  `cognition_memories`, `cognition_episodes`.
-- Every row but a scope's carries `thread_id`, `agent_ilk` and `source_turn`. A thread row is
-  keyed by its communication (`communication_id`). A scope row keeps `source_turn` only.
-- **The guard:** an upsert replaces a row only when its turn is equal or later
-  (`WHERE ... source_turn <= EXCLUDED.source_turn`). A late retry, or a cognition that restarted
-  empty, never rolls a row back. A thread row of an equal turn must also be built at the same time
-  or later (`(source_turn, source_ts::timestamptz)`, `COGNITION_THREAD_UPSERT_SQL`).
-- A `close` is stored with status `closed` (`normalized_status`).
-- The envelope's schema version must be 2, or the row fails (`parse_cognition_envelope`).
-
-Delivery is best effort: what waits longer than the stream's window (120 s) is lost and
-counted. `docs/reference/storage.md` has the inbox, the retries and the table columns.
+- **Where:** `cognition.db` in SY.cognition's folder, `/var/lib/fluxbee/nodes/SY/SY.cognition@<hive>/`
+  (`STATUS` and `CONFIG_GET` give its path).
+- **Who reads it:** only SY.cognition. The folder is 0700, and the file and its WAL sidecars are
+  0600 from their creation; each start makes them so again (`CognitionStore::open`). Every Fluxbee
+  process runs as root, so this keeps out every other user, not another root process.
+- **One row per communication** (`communications`): the thread and the agent ILK as its key, its
+  last activity (`thread_recency_epoch_ms`), the version of its state, and the state as one JSON
+  (`ThreadCognitionState`: its open items, the active scope, the memories, the open feelings, the
+  last turns and the counters). A row takes about 10 to 60 KB, the turns most of it.
+- **Reading a row:** a field the row lacks takes its default, so a field added later keeps the
+  rows. A row of an older state version, or one that cannot be read, starts its communication
+  again, and is left out at start. A row of a newer state version (after a rollback) is kept as
+  it is, and its communication's turns are skipped (`store_load_failures_total`) until the newer
+  release is back.
+- **When it is written:** each communication changed, whole, in one transaction, whenever the held
+  state changes (`sync_held_state`): at every intake batch and after every worker turn. So every
+  decay is kept (FINDINGS A-156), and a restart takes up where the last turn left off. A write
+  that fails (`store_write_failures_total`) leaves its communications held, and the next write
+  takes them again.
+- **Nothing deletes a communication:** not when it goes quiet, not when its agent is torn down.
+  Its memories and feelings involve people (docs/cognition-hands-v1.md §11.2). The file grows with
+  each new communication.
+- **Durability:** WAL, with `synchronous=NORMAL`. A lost hive loses its file, as it loses its WF
+  instances and its agents' own state; the VM snapshots cover it.
+- **SY.storage's tables:** until 0.1.103 cognition wrote its items to 8 `cognition_*` tables of
+  SY.storage through the stream (`storage.cognition.*`) and read them back over the mesh
+  (`COGNITION_STATE_GET`). SY.storage drops those tables once at its start
+  (`drop_cognition_tables`), with the inbox rows of their subjects.
 
 ---
 
-## 6. Rebuild over the mesh
+## 6. Start and loads
 
-SY.cognition never reads PostgreSQL. It asks SY.storage for a communication's state
-(`fetch_communication_state`, `fetch_communication_envelopes`).
-
-**The request:** `COGNITION_STATE_GET {thread_id, agent_ilk, after}` to `SY.storage@motherbee`,
-5 s per page (`COGNITION_STATE_PAGE_TIMEOUT`).
-
-**The answer** (`answer_cognition_state`, `cognition_state` in `sy_storage.rs`):
-
-- every row of the communication, closed ones included, as the envelopes it wrote;
-- the scopes come through their instances, since a scope row has no `thread_id`;
-- order: thread, contexts, reasons, co-occurrences, scopes, scope instances, memories, episodes,
-  then by id (`COGNITION_STATE_ORDER`);
-- pages of up to 64 KB (`COGNITION_STATE_PAGE_BYTES`); `next` points to the last
-  `(entity, entity_id)` of the page;
-- an empty first page means the communication has no state;
-- only a caller named `SY.cognition@*`, as its router stamped it, is answered.
-
-**When it runs:**
-
-- **At start, before the first turn** (`reload_communications_from_shared_memory`): every
-  communication the memory region holds, four at a time (`COGNITION_RELOAD_CONCURRENCY`). The
-  main loop keeps acking batches meanwhile, and the intake keeps taking their last turns; turns
-  wait in the worker's queue.
-- **On the first turn of a communication it has not loaded:** after a restart, or when the agent
-  moved to this hive. The intake may hold its last turns already.
-- **After 5 minutes idle** (`COGNITION_HELD_STALE_AFTER`): a held communication is checked
-  before its next turn, because its agent may have moved away and back. The stored state replaces
-  the held one when its turn count is higher.
-
-**How it rebuilds** (`build_communication_state`): with the same keys as the live path, so the
-next turn finds what it rebuilt.
-
-- Contexts and reasons are keyed by label; co-occurrences by the two labels.
-- Memories are keyed by scope; feelings by owner, affect and context (`feeling_key`). A feeling
-  row with no owner, from 0.1.101 or older, is left out.
-- The active scope is the open instance with the latest start turn.
-- The last turns come from the thread row's payload.
-
-**The last turns at a load** (`adopt_stored_state`, `merge_recent_turns`): the stored turns and
-those held (the intake's) or in the region (at the start reload) are merged, each once, in the
-order their routers took them, and bounded as at intake. The region is written ahead of SY.storage,
-so after a restart its turns may be the newer ones: the reload keeps them and writes the thread row
-again when they add to the stored ones. After a host reset the region is gone, and the turns come
-from SY.storage alone.
-
-A communication SY.storage has no state for yet stays in the region as it was: its last
-envelopes may still be on their way.
+- **At start, before the first batch** (`load_most_recent`): the most recently active
+  communications are loaded from the file, up to twice the region's bytes of state, and the region
+  is written from them: what does not fit it is let go again. So after a restart, or a host reboot
+  that emptied the region, the agent's first message carries its memory
+  (`loaded_at_start_total`).
+- **At the next turn of a communication not held** (`held_or_loaded`): the intake loads it from
+  the file before it adds the turn, and the worker before it analyzes one. A communication the file
+  has not is new.
+- **A file that cannot be read** at a load skips the turn (`store_load_failures_total`); at start
+  nothing is loaded, and each communication loads at its next turn. A file that cannot be opened
+  stops the node: its state lives there.
 
 ---
 
@@ -475,18 +421,15 @@ envelopes may still be on their way.
   (`MemoryShmThreadEntry`).
 
 **The hot set** (`build_memory_hot_set_snapshot`, `retain_memory_hot_set`), rewritten at every
-intake batch, after every worker turn and after the reload (`sync_held_state`):
+intake batch, after every worker turn and at start (`sync_held_state`):
 
 - The communications SY.cognition holds are ranked and kept while they fit the 4 MiB.
-- The ranking puts first the communications just updated (the batch's, or the worker's turn),
-  which are never dropped. Then: most recent turn (the intake's last, or the worker's
+- The ranking puts first the communications just updated (the batch's, or the worker's turn).
+  They stay held even when they do not fit: one that does not fit stays out of the region, not
+  out of memory. So do the communications a failed write left unsaved. Then: most recent turn (the intake's last, or the worker's
   `last_seen_at`), with an active scope, most live entities, highest turn count.
-- A communication the intake holds but the worker has not loaded yet shows the package the region
-  had for it, with the turns taken since; one the region had none for shows its turns alone.
-- Next come the entries the region had for communications not held, in their previous order. A
-  restart never blanks what the agents read.
-- A communication that did not fit is dropped from memory too. It reloads from SY.storage if it
-  comes back (§6).
+- A communication that did not fit is let go from memory too. The file keeps it, and it comes back
+  at its next turn (§6).
 - The last turns make the entries bigger: a communication of 20 short turns (about 300 characters
   each) takes some 8 KB more, one of 20 turns of 2,000 characters about 45 KB, so a full region
   holds fewer communications than before (some 90 of the largest).
@@ -637,13 +580,13 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   `stream_repeats_skipped_total`, `no_agent_ilk_total`, `intake_turns_total` (turns the
   intake added to their communications' last turns, §3.4), and `turns_not_analyzed_total` (turns
   with no person at their other end, §3);
-- the state loads: `state_fetches_total`, `state_fetch_failures_total`, and the `rebuild_*`
-  counters of the start reload;
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, failures and invalid
   outputs;
-- the outputs: `published_entities_total`, `publish_errors_total`;
-- the live state: active threads, open contexts, reasons and co-occurrences, active scopes,
-  memories and open feelings (`active_episodes_total`).
+- the live state: the communications held, their contexts, reasons and co-occurrences, active
+  scopes, memories and feelings (`active_episodes_total`).
+
+Under `store`: the file's path, the communications it keeps and its bytes, the communications
+loaded at start (`loaded_at_start_total`), and the loads and writes with their failures.
 
 Under `shm`: the capacity, the communications kept and pruned, the payload bytes and the last
 sync status.
@@ -657,15 +600,8 @@ sync status.
 - **Acked but not processed:** SY.cognition acks a batch before the worker processes its turns.
   Turns queued when it stops lose their labels, memories and episodes; the stream does not resend
   them. Their text is in the last turns already.
-- **Turns before the load live in the region alone:** a communication's turns that the intake
-  took before the worker loaded it reach SY.storage only with that load; a host reset meanwhile
-  loses them. The load waits behind the worker's backlog.
 - **The region is written whole:** SY.cognition rewrites it at every batch and every worker turn,
   and the router parses it again after each write. The last turns make it fuller, so each write and
   parse takes longer.
-- **`memory.lance`:** `STATUS` and `CONFIG_GET` report a `memory_lance` path
-  (`ensure_runtime_paths`), but nothing in SY.cognition uses it.
-- **An open item's decay is not stored** (FINDINGS A-156): a context, reason, co-occurrence or
-  feeling is written when a turn names it and when it closes. A communication loaded again takes
-  its weight of the last turn that named it. Where cognition keeps its state is the next topic of
-  docs/cognition-hands-v1.md (§10.6).
+- **A lost hive loses its file:** the VM snapshots cover it for now
+  (docs/cognition-hands-v1.md §11.2).

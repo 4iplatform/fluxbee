@@ -2,16 +2,6 @@ pub use crate::blob::{
     constants as blob_constants, BlobConfig, BlobError, BlobGcOptions, BlobGcPassReport,
     BlobGcReport, BlobMetricsSnapshot, BlobRef, BlobStat, BlobToolkit, ResolveRetryConfig,
 };
-pub use crate::cognition::{
-    CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
-    CognitionDurableEnvelope, CognitionDurableOp, CognitionEpisodeData, CognitionIlkProfile,
-    CognitionMemoryData, CognitionReasonData, CognitionScopeData, CognitionScopeInstanceData,
-    CognitionThreadData, COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
-    SUBJECT_STORAGE_COGNITION_CONTEXTS, SUBJECT_STORAGE_COGNITION_COOCCURRENCES,
-    SUBJECT_STORAGE_COGNITION_EPISODES, SUBJECT_STORAGE_COGNITION_MEMORIES,
-    SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
-    SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
-};
 pub use crate::identity::{
     identity_shm_name_for_hive, load_hive_id, read_self_ilk_from_env, read_self_tenant_from_env,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,

@@ -25,11 +25,6 @@ pub const MSG_STREAM_STATUS_RESPONSE: &str = "STREAM_STATUS_RESPONSE";
 
 /// The router's copy of every message (except system, admin and query_response kinds).
 pub const SUBJECT_STORAGE_TURNS: &str = "storage.turns";
-/// What SY.cognition derives from turns (`storage.cognition.<entity>`).
-pub const SUBJECT_STORAGE_COGNITION_PREFIX: &str = "storage.cognition.";
-/// SY.cognition's envelopes of one turn, packed (`CognitionEnvelopeBatch`); SY.storage expands
-/// them into one row per envelope (docs/router-stream-v1.md §6.2).
-pub const SUBJECT_STORAGE_COGNITION_BATCH: &str = "storage.cognition.batch";
 /// The agent's router's copy of a message its local agent sent or received, for its local
 /// SY.cognition only (§6.2). The record's producer is that agent node.
 pub const SUBJECT_COGNITION_TURNS: &str = "cognition.turns";

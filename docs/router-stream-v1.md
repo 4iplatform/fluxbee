@@ -154,7 +154,7 @@ and the per-frame loop. The socket stays.
      | Subject | May append it |
      |---|---|
      | `storage.turns` | only the router itself; refused from a node |
-     | `storage.cognition.*` | only `SY.cognition@<this hive>` |
+     | `storage.cognition.*` | only `SY.cognition@<this hive>`; refused since 0.1.103 ([cognition-hands-v1](cognition-hands-v1.md) §11) |
      | `storage.usage` | any node (SY.storage checks it, §2.14) |
 
    - A refused append is counted and logged.
@@ -177,7 +177,7 @@ constants; the router starts reading `hive_role` for it.
 |---|---|---|---|
 | `storage.turns` | `SY.storage@motherbee` | `SY.storage@motherbee` | `SY.storage@motherbee` |
 | `cognition.turns` (stage 2a, §6.2) | `SY.cognition@motherbee` | `SY.cognition@<hive>` | — |
-| `storage.cognition.*` | `SY.storage@motherbee` | `SY.storage@motherbee` | — |
+| `storage.cognition.*` (until 0.1.103) | `SY.storage@motherbee` | `SY.storage@motherbee` | — |
 | `storage.usage` | `SY.storage@motherbee` | `SY.storage@motherbee` | `SY.storage@motherbee` |
 
 The table is as built in 2a: SY.cognition takes the copies its router makes of its agents'
@@ -306,7 +306,8 @@ is dropped like on a full queue.
       what its own nodes send;
     - a turn's message must name its producer as sender (`routing.src_l2_name`), the name Archi
       shows;
-    - `storage.cognition.*` must come from `SY.cognition@<the stream's hive>`;
+    - `storage.cognition.*` must come from `SY.cognition@<the stream's hive>` (until 0.1.103: it
+      has no handler since);
     - usage records are checked as §2.14 says.
   - **Its INFO log line per system message** drops to debug for `STREAM_BATCH`.
 - **SY.cognition (local, `cognition.turns`, best effort; §6.2 as built in 2a):**
@@ -315,7 +316,8 @@ is dropped like on a full queue.
   - **It skips any record at or below the last one it accepted from that stream and epoch,** so a
     repeat costs nothing and a stream whose seq restarted is not ignored.
   - **It sends its outputs with `STREAM_APPEND`** (`storage.cognition.batch`). From a worker they
-    reach the database for the first time (Q1).
+    reach the database for the first time (Q1). Until 0.1.103: since, its state stays in its own
+    file on its hive ([cognition-hands-v1](cognition-hands-v1.md) §11).
   - SY.policy is retired (§6.2).
 
 ### 2.8 The SDK
@@ -644,6 +646,10 @@ the ledger and the logbook.
 - **D22. The LLM cost stays as is for now** (two calls per turn, replies included).
 
 ### 6.2 Stage 2a: cognition per communication
+
+> **Since 0.1.103** cognition keeps its state in its own file on each hive, and its outputs and
+> `COGNITION_STATE_GET` below are gone ([cognition-hands-v1](cognition-hands-v1.md) §11). A node is
+> born and dies on its hive: the "agent that moved" cases below cannot happen since 0.1.83.
 
 - **A communication is the thread between a human (or another interlocutor) and the agent that
   serves it:** `(thread_id, agent ILK)`. That follows from D14 and D15: two agents in one IO

@@ -157,10 +157,11 @@ pushes them in acknowledged batches to their sinks.
   - `storage.turns`: a copy of each message a local node sends, except `SYSTEM`, `admin` and
     `query_response` messages (`should_publish_turn`);
   - `cognition.turns`: messages that local `AI.*` agents send or receive with a thread id;
-  - `STREAM_APPEND` from nodes: `storage.cognition.*` only from `SY.cognition@<hive>`, and
-    `storage.usage` (LLM usage records) from nodes, with SY.cognition accepted only on motherbee
-    and worker hives and SY.frontdesk.gov, SY.architect and SY.admin only on the motherbee
-    (`subject_allowed`). A refused append is counted.
+  - `STREAM_APPEND` from nodes: only `storage.usage` (LLM usage records), with SY.cognition
+    accepted only on motherbee and worker hives and SY.frontdesk.gov, SY.architect and SY.admin
+    only on the motherbee (`subject_allowed`). A refused append is counted. SY.cognition's
+    `storage.cognition.*`, taken until 0.1.103, is refused since: its state lives in its own file
+    ([cognition-hands-v1](../cognition-hands-v1.md) §11).
 - **Sinks** (`sinks_for`): `storage.*` goes to `SY.storage@motherbee` from every hive;
   `cognition.turns` goes to the hive's own `SY.cognition`, on motherbee and worker hives only.
 - **Window:** a record waits at most 120 s for its sink (`STREAM_MAX_AGE_SECS`) and the stream

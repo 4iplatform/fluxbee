@@ -827,7 +827,7 @@ async fn handle_node(
                 if is_system_kind(&msg.meta.msg_type)
                     && msg.meta.msg.as_deref() == Some(fluxbee_sdk::stream::MSG_STREAM_APPEND)
                 {
-                    take_stream_append(&log_stream, &msg, &conn_node_name, hive_id);
+                    take_stream_append(&log_stream, &msg, &conn_node_name);
                     continue;
                 }
                 tracing::info!(
@@ -6661,12 +6661,12 @@ static REFUSED_APPEND_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 /// A node's `STREAM_APPEND`: appended under its subject when that node may append it (§2.2), the
 /// producer being the node's connection name.
-fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &str, hive_id: &str) {
+fn take_stream_append(stream: &stream::StreamHandle, msg: &Message, producer: &str) {
     let append: Option<fluxbee_sdk::stream::StreamAppend> =
         serde_json::from_value(msg.payload.clone()).ok();
-    let allowed = append.as_ref().is_some_and(|append| {
-        stream::subject_allowed(&append.subject, producer, hive_id, stream.role())
-    });
+    let allowed = append
+        .as_ref()
+        .is_some_and(|append| stream::subject_allowed(&append.subject, producer, stream.role()));
     match (append, allowed) {
         (Some(append), true) => match serde_json::to_vec(&append.payload) {
             Ok(payload) => stream.append_from_node(&append.subject, producer, payload),

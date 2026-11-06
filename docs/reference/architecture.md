@@ -565,8 +565,8 @@ only from SY.admin and SY.architect (`handle_put` and its siblings in `src/bin/s
   Design: [router-stream-v1.md](../router-stream-v1.md); storage: [13-storage.md](storage.md).
 - **Memory per communication.** A communication is `(thread_id, agent ILK)`. An agent's router copies
   both directions of its `AI.*` nodes' turns under `cognition.turns` to SY.cognition on the same hive
-  (motherbee and workers), which keeps memory packages in `/jsr-memory-<hive>` and appends what it
-  derives under `storage.cognition.*` for SY.storage. On delivery to an `AI.*` node the router
+  (motherbee and workers), which keeps memory packages in `/jsr-memory-<hive>` and its state in its
+  own file on that hive (`cognition.db`). On delivery to an `AI.*` node the router
   attaches that communication's package as `meta.memory_package` and drops any package the sender
   set (`serialize_for_local_delivery`, `prepare_local_delivery`). Reference:
   [cognition.md](cognition.md); design: §6 of [router-stream-v1.md](../router-stream-v1.md).

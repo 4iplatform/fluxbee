@@ -17,9 +17,10 @@ REMOVED (operator decisions, 2026-09-28):
   - the remaining user ILKs (humans/agents/temporaries created by messages or by Cloud), and
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
-  - the message log: every table of the fluxbee_storage DB (turns, events, inbox, cognition...)
-    + SY.cognition's local cache/SHM + the conversation state of the base AI nodes and of the
-    frontdesk (thread-state/, immediate-memory/) + the Architect chat sessions;
+  - the message log: every table of the fluxbee_storage DB (turns, inbox, usage...)
+    + this hive's SY.cognition state (its file, cognition.db, and its SHM) + the conversation
+    state of the base AI nodes and of the frontdesk (thread-state/, immediate-memory/) + the
+    Architect chat sessions. A worker's SY.cognition file stays: this runs on the motherbee;
   - every vault secret except infrastructure (INFRA_KEYS / INFRA_PREFIXES below) -- including
     AI provider keys: the hive ends up as freshly installed, AI degraded until they are reloaded;
   - the user OPA policy on every hive (opa_clear: current, staged, backup; routers unload it --
@@ -298,7 +299,8 @@ def conversation_dirs():
 
 def cognition_paths(hive):
     node_dir = os.path.join(STATE_DIR, "nodes", "SY", "SY.cognition@%s" % hive)
-    paths = [os.path.join(node_dir, p) for p in ("memory.lance", "cache", "shm")]
+    files = ("cognition.db", "cognition.db-wal", "cognition.db-shm", "cache", "shm")
+    paths = [os.path.join(node_dir, p) for p in files]
     paths.append("/dev/shm/jsr-memory-%s" % hive)
     return [p for p in paths if os.path.exists(p)]
 
@@ -455,7 +457,7 @@ def main():
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
         print("[6] message log (%s): run as root to see the row counts" % STORAGE_DB)
-    print("    + SY.cognition cache: %s" % (", ".join(cog) or "none"))
+    print("    + SY.cognition state: %s" % (", ".join(cog) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
         print("      %s" % d)
@@ -548,7 +550,7 @@ def main():
             if not ok(status, resp):
                 print("  WARN could not start %s (%s): %s" % (n, status, str(resp)[:160]))
     left = {t: c for t, c in storage_counts(storage_tables()).items() if c}
-    print("  %d tables truncated%s; cognition cache and %d conversation dirs removed"
+    print("  %d tables truncated%s; cognition state and %d conversation dirs removed"
           % (len(tables), (" -- NOT EMPTY: %s" % left) if left else "", len(conv)))
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))

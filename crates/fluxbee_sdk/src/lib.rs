@@ -1,6 +1,5 @@
 pub mod blob;
 pub mod cloud;
-pub mod cognition;
 pub mod identity;
 pub mod logging;
 pub mod managed_control_plane;
@@ -29,18 +28,6 @@ pub mod timer;
 pub mod usage;
 pub mod vault;
 
-pub use cognition::{
-    CognitionCommunicationRef, CognitionContextData, CognitionCooccurrenceData,
-    CognitionDurableEntity, CognitionDurableEnvelope, CognitionDurableOp, CognitionEnvelopeBatch,
-    CognitionEpisodeData, CognitionIlkProfile, CognitionMemoryData, CognitionReasonData,
-    CognitionScopeData, CognitionScopeInstanceData, CognitionStateGet, CognitionStateResponse,
-    CognitionThreadData, COGNITION_DURABLE_ENTITY_VERSION_V1, COGNITION_DURABLE_SCHEMA_VERSION,
-    MSG_COGNITION_STATE_GET, MSG_COGNITION_STATE_RESPONSE, SUBJECT_STORAGE_COGNITION_CONTEXTS,
-    SUBJECT_STORAGE_COGNITION_COOCCURRENCES, SUBJECT_STORAGE_COGNITION_EPISODES,
-    SUBJECT_STORAGE_COGNITION_MEMORIES, SUBJECT_STORAGE_COGNITION_REASONS,
-    SUBJECT_STORAGE_COGNITION_SCOPES, SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES,
-    SUBJECT_STORAGE_COGNITION_THREADS,
-};
 pub use identity::{
     deterministic_system_ilk_id, identity_shm_name_for_hive, list_ich_options_from_hive_config,
     list_ich_options_from_hive_id, list_ich_options_from_shm_name, load_hive_id,

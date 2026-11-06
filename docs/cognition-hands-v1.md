@@ -543,7 +543,7 @@ agent could come up on another hive as the same ILK. That is wrong since 0.1.83 
 - **SY.cognition:** the store, its loads and writes, the closed items, and its status (the file,
   the communications, the bytes).
 - **SY.storage:** the cognition handlers, their tables and `COGNITION_STATE_GET` go. The tables are
-  dropped once, behind a marker.
+  dropped once, while the catalog shows them.
 - **The router:** its stream drops `storage.cognition.*`.
 - **The Rust SDK:** the subjects, the envelopes and `COGNITION_STATE_GET` go. The Go SDK has none.
 - **Nothing changes** in the policy, identity, the vault, SY.admin, the orchestrator, packaging
@@ -564,3 +564,25 @@ agent could come up on another hive as the same ILK. That is wrong since 0.1.83 
   - a feeling that closes leaves the file;
   - the file is 0600;
   - the tables are gone from the motherbee.
+
+### 11.5 Built (2026-11-06)
+
+- **SY.cognition** (src/bin/sy_cognition.rs, src/bin/sy_cognition/state_store.rs):
+  - `CognitionStore`: the file, its folder and modes, `load`, `save` (one transaction),
+    `most_recent` and `stats`;
+  - `sync_held_state` writes each communication a change touched before it rewrites the region;
+  - the intake and the worker load a communication they do not hold from the file
+    (`held_or_loaded`); the worker no longer loads a turn it does not analyze;
+  - at start, `load_most_recent` fills the region before the first batch;
+  - an item under its threshold leaves the state (`retain` in each update); the memory and the
+    feelings read the active scope's own pair, so they go on when the pair's items have closed;
+  - the envelopes, the reload over the mesh, the 5-minute idle check, the scope instances and the
+    `cache`, `shm` and `memory.lance` paths are gone; `STATUS` reports the file (`store`).
+- **SY.storage:** the cognition handlers, tables and `COGNITION_STATE_GET` are gone;
+  `drop_cognition_tables` drops the tables and the inbox rows of their subjects once.
+- **The router's stream** and **the Rust SDK:** `storage.cognition.*` and the SDK's cognition module
+  are gone.
+- **`serde_json` reads floats back exactly** (`float_roundtrip`): without it a weight written to the
+  file came back a last digit off (1.8075 for 1.8074999999999999), found by the file's round-trip
+  test.
+- **`fluxbee-factory-reset`** removes the motherbee's file. A worker's stays (FINDINGS A-160).

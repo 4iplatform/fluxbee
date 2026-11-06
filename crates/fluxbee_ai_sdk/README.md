@@ -285,9 +285,9 @@ it, `(thread_id, agent ILK)` ([docs/router-stream-v1.md §6](../../docs/router-s
   in. ai.generic renders it as a text block in front of the user input.
 - **No sequence number:** SY.cognition keeps the order of a communication with its own turn count.
 
-**Not on the message:** the durable cognition entities (threads, contexts, reasons, cooccurrences,
-scopes, scope instances, memories, episodes) and the message log (`turns`) live in SY.storage. A node
-does not read them; only SY.cognition reads a communication's state back (`COGNITION_STATE_GET`).
+**Not on the message:** cognition's state (contexts, reasons, cooccurrences, scopes, memories,
+feelings) lives in SY.cognition's own file on its hive, and the message log (`turns`) in SY.storage. A
+node reads neither.
 
 So, in an AI node:
 

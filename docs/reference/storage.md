@@ -19,7 +19,9 @@ constant named without a path lives in the first one. The design and its decisio
 > created before 0.1.81 needs, once, `ALTER TABLE turns ALTER COLUMN message SET NOT NULL;` and,
 > after the upgrade, `DROP TABLE storage_migrations;` (`CREATE TABLE IF NOT EXISTS` does not change
 > an existing table). Since 0.1.83 nothing writes `turns.ctx` and `seq`; 0.1.84 drops them and their
-> index, once (§6.1).
+> index, once (§6.1). Since 0.1.103 SY.cognition keeps its state in its own file
+> (docs/cognition-hands-v1.md §11): its subjects are gone, and SY.storage drops its tables once
+> (§6.2).
 
 ---
 
@@ -52,7 +54,7 @@ SY.architect reads `turns` directly from `fluxbee_storage`, with `SELECT` only
 | The WAN goes down | The stream keeps the records and retries within the window; what goes past it is lost and counted |
 | PostgreSQL slow or down | Without a database, SY.storage does not ack and the stream resends; if the connection drops, SY.storage exits and systemd restarts it |
 | Duplicates from retries | Each record lands on the same inbox row (`dedupe_key`) and each table absorbs the repeat |
-| Arrival order | It does not matter: each row has its key; the cognition rows also have their turn number |
+| Arrival order | It does not matter: each row has its key |
 
 ---
 
@@ -67,7 +69,7 @@ SY.architect reads `turns` directly from `fluxbee_storage`, with `SELECT` only
              │
              │ copies each message (storage.turns) and the turns of its
              │ AI.* agents (cognition.turns); takes the allowed
-             │ STREAM_APPEND (storage.cognition.batch, storage.usage)
+             │ STREAM_APPEND (storage.usage)
              ▼
   RT.<router>.stream@<hive>      log on disk, window 120 s / 32 MB
              │
@@ -76,14 +78,13 @@ SY.architect reads `turns` directly from `fluxbee_storage`, with `SELECT` only
      ┌───────┴──────────────────────────┐
      ▼                                  ▼
   SY.cognition@<same hive>           SY.storage@motherbee
-  (cognition.turns; motherbee        (storage.turns, storage.cognition.*,
-   and workers only)                   storage.usage)
-     │ jsr-memory (local SHM)           │
-     │ STREAM_APPEND                    ▼
-     │ storage.cognition.batch       storage_inbox ──► turns
-     │ storage.usage                               ──► cognition_*
-     └──► stream of its router                     ──► llm_usage
-          ──► SY.storage@motherbee                     (PostgreSQL)
+  (cognition.turns; motherbee        (storage.turns, storage.usage)
+   and workers only)                    │
+     │ cognition.db (its own file)      ▼
+     │ jsr-memory (local SHM)        storage_inbox ──► turns
+     │ STREAM_APPEND storage.usage                 ──► llm_usage
+     └──► stream of its router                         (PostgreSQL)
+          ──► SY.storage@motherbee
 ```
 
 ### 2.2 Components
@@ -93,7 +94,7 @@ SY.architect reads `turns` directly from `fluxbee_storage`, with `SELECT` only
 | Router | all hives | Copies the turns to its stream without waiting; takes the `STREAM_APPEND` of its nodes |
 | Router stream (`RT.<router>.stream@<hive>`) | one per router | Log on disk with a window; delivers batches with an ack to its sinks |
 | SY.storage | the motherbee only | Takes the batches into `storage_inbox` and from there to PostgreSQL; answers reads over the mesh |
-| SY.cognition | motherbee and workers | Takes `cognition.turns` from the streams of its hive; sends what it derives and its LLM usage through the stream |
+| SY.cognition | motherbee and workers | Takes `cognition.turns` from the streams of its hive; keeps its state in its own file; sends its LLM usage through the stream |
 | Nodes that call a model | wherever they run | Send one usage record per call (`storage.usage`) |
 
 ---
@@ -124,7 +125,6 @@ directory is not usable, the router carries on and the stream keeps records in m
    (`fluxbee_sdk::stream::append`, with no reply). The router consumes it and does not route it to
    any node (`take_stream_append`). The producer is the name of the connection. It only accepts
    (`subject_allowed`):
-   - `storage.cognition.*` from `SY.cognition@<this hive>`;
    - `storage.usage` from any node, except SY.cognition outside the motherbee and the workers, and
      SY.frontdesk.gov, SY.architect or SY.admin outside the motherbee (`usage_producer_allowed`);
    - `storage.turns` and `cognition.turns` never: only the router copies them.
@@ -134,7 +134,8 @@ directory is not usable, the router carries on and the stream keeps records in m
 The router never waits. It leaves the record in a bounded queue, and the disk work runs on a thread
 of its own. If the queue is full, or more than 16 MB are waiting for the disk, the record is dropped
 and counted. The turns and the appends have separate queues and caps; `storage.usage` has a reserve
-in both (1 MB and 128 slots), so the cognition packages do not crowd it out.
+in both (1 MB and 128 slots) that no other append may take. Since 0.1.103 no other subject is
+appended.
 
 ### 3.3 Delivery
 
@@ -203,11 +204,10 @@ Everything arrives over the mesh, as `system` messages (`build_storage_rpc_profi
 
 | Message | Direction | Use |
 | --- | --- | --- |
-| `STREAM_BATCH` | IN | Batches from the streams (`RT.*.stream@*`): `storage.turns`, `storage.cognition.batch`, `storage.usage` |
+| `STREAM_BATCH` | IN | Batches from the streams (`RT.*.stream@*`): `storage.turns`, `storage.usage` |
 | `STREAM_ACK` | OUT | Ack to the stream, after the batch is written into `storage_inbox` |
-| `COGNITION_STATE_GET` | IN/OUT | The rows of a communication, paged; only for `SY.cognition@*` (§7.1) |
-| `STORAGE_METRICS_GET` | IN/OUT | Inbox metrics, for any node (§7.2) |
-| `USAGE_QUERY` | IN/OUT | The LLM usage records; only for `SY.admin@motherbee` (§7.3) |
+| `STORAGE_METRICS_GET` | IN/OUT | Inbox metrics, for any node (§7.1) |
+| `USAGE_QUERY` | IN/OUT | The LLM usage records; only for `SY.admin@motherbee` (§7.2) |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS` | IN/OUT | Node control (§5.1) |
 | `VAULT_SECRET_CHANGED` | IN | A new `postgres` secret restarts the process (§5.6) |
 
@@ -219,17 +219,14 @@ Everything arrives over the mesh, as `system` messages (`build_storage_rpc_profi
    `src_l2_name` that the router stamps). Any other sender: dropped without an ack.
 2. **The records** (`stream_rows`). These are dropped, and acked anyway:
    - a record whose producer is not a node of the stream's hive;
-   - a `storage.cognition.*` that does not come from `SY.cognition@<the stream's hive>`;
    - a turn whose `routing.src_l2_name` is not its producer;
    - a usage record that `check_usage_record` rejects (§6.3);
-   - a subject with no handler.
-3. **`storage.cognition.batch`** is expanded: each envelope of the package gets a row of its own,
-   under `storage.cognition.<entity>`, as if it had come alone.
-4. **The inbox:** in one transaction, an upsert of each row into `storage_inbox` by its
+   - a subject with no handler, among them cognition's of 0.1.102 and before.
+3. **The inbox:** in one transaction, an upsert of each row into `storage_inbox` by its
    `dedupe_key` (`upsert_stream_rows`). The key is
    `<subject>:<FNV-1a hash of subject and payload>:<length>` (`message_dedupe_key`), so a resent
    batch lands on the same rows.
-5. **The ack:** `STREAM_ACK {up_to_seq}` with the last seq of the batch, only after the commit.
+4. **The ack:** `STREAM_ACK {up_to_seq}` with the last seq of the batch, only after the commit.
 6. **Processing** runs in a separate task (a queue of 64 batches, `STREAM_PROCESS_QUEUE`), so the
    ack never waits. If that queue is full, the rows wait for the inbox retry.
 
@@ -263,9 +260,6 @@ moment the router appended the record), `attempts`, `processed_at`, `last_error`
 | Subject | Table | Rule |
 | --- | --- | --- |
 | `storage.turns` | `turns` | `ON CONFLICT (dedupe_key) DO NOTHING` (`persist_turn`) |
-| `storage.cognition.threads` | `cognition_threads` | Key `communication_id`; replaced only by an equal or later turn |
-| `storage.cognition.contexts`, `.reasons`, `.cooccurrences`, `.scope_instances`, `.memories`, `.episodes` | `cognition_*` | Key: the id of the entity; same turn rule |
-| `storage.cognition.scopes` | `cognition_scopes` | Key `scope_id`; same turn rule |
 | `storage.usage` | `llm_usage` | `ON CONFLICT DO NOTHING` on `record_id` and `provider_response_id` (`persist_usage`) |
 
 ### 5.6 Reconnection and degradation
@@ -330,34 +324,13 @@ One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`
 - **Who reads it:** the Messages page of Archi (`src/bin/sy_architect/messages_db.rs`).
 - Nothing purges `turns`.
 
-### 6.2 `cognition_*`
+### 6.2 `cognition_*`: gone in 0.1.103
 
-`cognition_threads`, `cognition_contexts`, `cognition_reasons`, `cognition_cooccurrences`,
-`cognition_scopes`, `cognition_scope_instances`, `cognition_memories`, `cognition_episodes`
-(`COGNITION_SCHEMA_SQL`).
-
-- **Per communication:** every row, except a scope's, carries `thread_id` and `agent_ilk` (the
-  communication) and `source_turn`, the turn in which it was written. The thread row is keyed by the
-  communication (`communication_id`). A scope is reached through its instances.
-- **Each row** stores columns for fast reads and the whole envelope in `payload` (JSONB), plus
-  `entity_version`, `writer`, `source_ts` and `updated_at`.
-- **A feeling** (`cognition_episodes`, docs/cognition-hands-v1.md §10.3): its `intensity` column
-  holds its weight now. Its owner, context, status, averages and when it was last felt are in
-  `payload` only, which is what a rebuild reads.
-- **The guard:** an upsert replaces a row only if its turn is equal or later
-  (`WHERE ... source_turn <= EXCLUDED.source_turn`). A late retry, or a cognition that booted
-  empty, never moves it back.
-  - A thread row (`COGNITION_THREAD_UPSERT_SQL`) of an equal turn replaces the stored one only when
-    it was built later (`(source_turn, source_ts::timestamptz)`): SY.cognition writes it at every
-    batch, after each load and after each turn, many times with one turn number and each time with
-    the communication's last turns, and a row the inbox applies late (a full process queue, the
-    retry) would roll them back.
-- A `close` is stored with status `closed` (`normalized_status`). An envelope with a
-  `schema_version` other than 2 fails and stays in the inbox (`parse_cognition_envelope`).
-- **Indexes:** `(thread_id, agent_ilk)` on each per-communication table, and `scope_id`,
-  `context_id` and `reason_id` where they apply.
-
-What each entity is: `docs/reference/cognition.md` §4.
+SY.cognition wrote its items to 8 `cognition_*` tables until 0.1.103. It keeps its state in its own
+file since ([cognition-hands-v1](../cognition-hands-v1.md) §11; `docs/reference/cognition.md` §5).
+A start of SY.storage that finds one of those tables in the catalog drops them all, with the inbox
+rows of their subjects (`storage.cognition.%`), and says so in one line (`drop_cognition_tables`).
+A later start finds none and does nothing. A rollback to 0.1.102 creates them again, empty.
 
 ### 6.3 `llm_usage`: LLM usage (0.1.79)
 
@@ -426,20 +399,7 @@ cut off before), and the nodes send them through `storage.usage`.
 
 ## 7. Reads over the mesh
 
-### 7.1 `COGNITION_STATE_GET`
-
-The state of a communication, so that SY.cognition can rebuild it (`answer_cognition_state`).
-
-- It only answers a `SY.cognition@*` sender, by the name that the router stamps.
-- Request: `{thread_id, agent_ilk, after}`. Response: the envelopes, in the form cognition wrote
-  them, ordered by entity and then by id (`COGNITION_STATE_ORDER`).
-- Pages of up to 64 KB (`COGNITION_STATE_PAGE_BYTES`); `next` points to the last
-  `(entity, id)` of the page.
-- It runs in a task of its own, so the main loop keeps taking batches.
-
-When cognition asks for it: `docs/reference/cognition.md` §6.
-
-### 7.2 `STORAGE_METRICS_GET`
+### 7.1 `STORAGE_METRICS_GET`
 
 The inbox metrics (`answer_storage_metrics`, `StorageInboxMetrics` in
 `crates/fluxbee_sdk/src/storage.rs`): `pending`, `pending_with_error`, `oldest_pending_age_s`,
@@ -458,7 +418,7 @@ Who uses it:
   `sy-storage` to be active and for this query to answer `ok`. It tries every 250 ms, for up to
   30 s. Meanwhile, the admin commands get `ORCHESTRATOR_BOOTING`.
 
-### 7.3 `USAGE_QUERY`
+### 7.2 `USAGE_QUERY`
 
 The `llm_usage` records (`answer_usage_query`, `plan_usage_query`, `usage_query_page`).
 
@@ -502,16 +462,16 @@ The `llm_usage` records (`answer_usage_query`, `plan_usage_query`, `usage_query_
 
 ## 8. SY.cognition and the stream
 
-SY.cognition runs on the motherbee and on the workers, and does not read PostgreSQL. In short:
+SY.cognition runs on the motherbee and on the workers, and neither reads nor writes PostgreSQL.
+In short:
 
 - **Input:** `STREAM_BATCH` from the streams of its own hive (`cognition.turns`). It acks on
   receipt into a bounded queue, and skips what it already took from that stream and epoch.
 - **Communication:** `(thread_id, agent ILK)`. The producer of the record is the agent's node, and
   cognition maps it to its ILK through the identity SHM.
-- **Outputs:** `STREAM_APPEND` under `storage.cognition.batch`, packages of up to 64 KB, each
-  envelope with its communication and its turn number. And one usage record per call to a model
-  (`storage.usage`).
-- **Rebuild:** through `COGNITION_STATE_GET` (§7.1).
+- **Its state:** in its own file on its hive, which only it reads (`docs/reference/cognition.md`
+  §5).
+- **Outputs:** one usage record per call to a model (`storage.usage`).
 
 All the details: `docs/reference/cognition.md`.
 
@@ -527,7 +487,7 @@ All the details: `docs/reference/cognition.md`.
 | Queue → disk (the stream's own thread; fsync every 250 ms) | No |
 | Stream → sink (`STREAM_BATCH`, one batch in flight per sink; resend after 5 s without an ack) | No |
 | SY.storage → `storage_inbox` (one transaction) → `STREAM_ACK` | No (another process) |
-| `storage_inbox` → `turns` / `cognition_*` / `llm_usage` (a separate task, after the ack) | No (another process) |
+| `storage_inbox` → `turns` / `llm_usage` (a separate task, after the ack) | No (another process) |
 
 The router never waits for the log: it only leaves the copy in a bounded queue. A record waits for
 its sink for the window at most (120 s).
@@ -541,7 +501,7 @@ its sink for the window at most (120 s).
 | Stream disk not accessible | The stream keeps records in memory only |
 | 32 MB cap, or a full queue (16 MB waiting for the disk) | New records are dropped and counted; routing goes on |
 | Identity does not answer when a usage is charged | The row is retried; on attempt 10 it is stored unverified |
-| SY.cognition goes down | It loses its queue (what was acked and not processed); when it comes back, it reloads its communications from SY.storage |
+| SY.cognition goes down | It loses its queue (what was acked and not processed); when it comes back, it loads its communications from its own file |
 | `jsr-memory` cannot be read | The message is delivered without `memory_package`, and the router says so in its journal (at most every 30 s) |
 
 ### 9.3 Idempotency
@@ -554,11 +514,6 @@ INSERT INTO storage_inbox ... ON CONFLICT (dedupe_key) DO UPDATE SET attempts = 
 -- Turns: the same dedupe_key. (ctx, seq) was the key until 0.1.74; a response reuses the
 -- trace_id of its request, and it got lost. 0.1.84 drops both columns.
 INSERT INTO turns ... ON CONFLICT (dedupe_key) DO NOTHING;
-
--- Cognition: each row carries its communication and the turn in which it was written
--- (source_turn); it is replaced only by an equal or later turn.
-INSERT INTO cognition_contexts ... ON CONFLICT (context_id) DO UPDATE SET ...
-    WHERE cognition_contexts.source_turn <= EXCLUDED.source_turn;
 
 -- LLM usage: a response goes in only once (record_id, or provider_response_id where present).
 INSERT INTO llm_usage ... ON CONFLICT DO NOTHING;
@@ -596,7 +551,6 @@ matter.
 | --- | --- | --- |
 | `storage.turns` | The router where the message comes in (all roles) | `SY.storage@motherbee` |
 | `cognition.turns` | The router where the `AI.*` agent is (motherbee, worker) | `SY.cognition@<same hive>` |
-| `storage.cognition.batch` | `SY.cognition@<hive>`, with `STREAM_APPEND` | `SY.storage@motherbee` (expanded into `storage.cognition.<entity>`) |
 | `storage.usage` | Each node that calls a model, with `STREAM_APPEND` | `SY.storage@motherbee` |
 
 **Cursors:** each sink has its own (the last acked seq) in `state.json`; a slow or absent sink
@@ -636,7 +590,6 @@ const INBOX_REPLAY_BATCH_SIZE: i64 = 200;
 const INBOX_REPLAY_MAX_ROUNDS: u32 = 20;
 const STORAGE_INBOX_RETENTION_HOURS: i32 = 24;             // processed rows
 const INBOX_PURGE_BATCH: i64 = 10_000;
-const COGNITION_STATE_PAGE_BYTES: usize = 64 * 1024;
 const USAGE_QUERY_PAGE_BYTES: usize = 62 * 1024;
 const STORAGE_METRICS_LOG_INTERVAL_SECS: u64 = 30;
 const STORAGE_METRICS_WARN_PENDING: i64 = 100;

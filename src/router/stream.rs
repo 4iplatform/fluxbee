@@ -23,8 +23,8 @@ use fluxbee_sdk::rpc::{
 };
 use fluxbee_sdk::stream::{
     stream_node_name, StreamAck, StreamBatch, StreamRecord, MSG_STREAM_ACK, MSG_STREAM_BATCH,
-    MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE, SUBJECT_COGNITION_TURNS,
-    SUBJECT_STORAGE_COGNITION_PREFIX, SUBJECT_STORAGE_TURNS, SUBJECT_STORAGE_USAGE,
+    MSG_STREAM_STATUS, MSG_STREAM_STATUS_RESPONSE, SUBJECT_COGNITION_TURNS, SUBJECT_STORAGE_TURNS,
+    SUBJECT_STORAGE_USAGE,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -96,15 +96,10 @@ impl Source {
     }
 }
 
-/// Which producer may append which subject (§2.2). Turns, and their copies for cognition, only
-/// come from the router itself.
-pub fn subject_allowed(subject: &str, producer: &str, hive_id: &str, role: &str) -> bool {
-    if subject == SUBJECT_STORAGE_TURNS || subject == SUBJECT_COGNITION_TURNS {
-        return false;
-    }
-    if subject.starts_with(SUBJECT_STORAGE_COGNITION_PREFIX) {
-        return producer.eq_ignore_ascii_case(&format!("SY.cognition@{hive_id}"));
-    }
+/// Which producer may append which subject (§2.2): a node, its usage records alone. Turns, and their
+/// copies for cognition, only come from the router itself. Cognition's state, appended until
+/// 0.1.103, lives in its own file since (docs/cognition-hands-v1.md §11).
+pub fn subject_allowed(subject: &str, producer: &str, role: &str) -> bool {
     subject == SUBJECT_STORAGE_USAGE && usage_producer_allowed(producer, role)
 }
 
@@ -134,9 +129,9 @@ fn role_runs_cognition(role: &str) -> bool {
     )
 }
 
-/// The sinks of a subject on a hive of this role (§2.3, §6.2): SY.storage takes the log and
-/// everything derived, from every hive; the hive's own SY.cognition takes the copies its router made
-/// of its agents' communications.
+/// The sinks of a subject on a hive of this role (§2.3, §6.2): SY.storage takes the log and the
+/// usage records, from every hive; the hive's own SY.cognition takes the copies its router made of
+/// its agents' communications.
 pub fn sinks_for(subject: &str, role: &str, hive_id: &str) -> Vec<String> {
     if subject == SUBJECT_COGNITION_TURNS {
         return if role_runs_cognition(role) {
@@ -145,10 +140,7 @@ pub fn sinks_for(subject: &str, role: &str, hive_id: &str) -> Vec<String> {
             Vec::new()
         };
     }
-    if subject == SUBJECT_STORAGE_TURNS
-        || subject == SUBJECT_STORAGE_USAGE
-        || subject.starts_with(SUBJECT_STORAGE_COGNITION_PREFIX)
-    {
+    if subject == SUBJECT_STORAGE_TURNS || subject == SUBJECT_STORAGE_USAGE {
         return vec![format!("SY.storage@{PRIMARY_HIVE_ID}")];
     }
     Vec::new()
@@ -160,7 +152,6 @@ fn all_sinks(role: &str, hive_id: &str) -> Vec<String> {
     for subject in [
         SUBJECT_STORAGE_TURNS,
         SUBJECT_STORAGE_USAGE,
-        "storage.cognition.threads",
         SUBJECT_COGNITION_TURNS,
     ] {
         for sink in sinks_for(subject, role, hive_id) {
@@ -1487,7 +1478,9 @@ fn status_payload(stream_name: &str, shared: &Arc<StdMutex<Shared>>, counters: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxbee_sdk::stream::SUBJECT_STORAGE_COGNITION_BATCH;
+
+    /// A node append of another subject than the usage records, as the queue and the cap see it.
+    const OTHER_APPEND: &str = "storage.other";
 
     fn record(seq: u64, ts_ms: u64, subject: &str, payload: &str) -> Record {
         Record {
@@ -1545,37 +1538,22 @@ mod tests {
         assert!(!subject_allowed(
             SUBJECT_STORAGE_TURNS,
             "AI.sales@worker1",
-            "worker1",
             "worker"
         ));
-        assert!(subject_allowed(
-            "storage.cognition.threads",
+        // Cognition keeps its state in its own file since 0.1.103.
+        assert!(!subject_allowed(
+            "storage.cognition.batch",
             "SY.cognition@worker1",
-            "worker1",
-            "worker"
-        ));
-        assert!(!subject_allowed(
-            "storage.cognition.threads",
-            "AI.sales@worker1",
-            "worker1",
-            "worker"
-        ));
-        assert!(!subject_allowed(
-            "storage.cognition.threads",
-            "SY.cognition@motherbee",
-            "worker1",
             "worker"
         ));
         assert!(subject_allowed(
             SUBJECT_STORAGE_USAGE,
             "AI.sales@worker1",
-            "worker1",
             "worker"
         ));
         assert!(!subject_allowed(
             "storage.anything",
             "AI.sales@worker1",
-            "worker1",
             "worker"
         ));
     }
@@ -1584,9 +1562,8 @@ mod tests {
     /// node runs (§7.5).
     #[test]
     fn usage_records_from_charging_sy_nodes_only_where_they_run() {
-        let allowed = |producer: &str, role: &str| {
-            subject_allowed(SUBJECT_STORAGE_USAGE, producer, "h", role)
-        };
+        let allowed =
+            |producer: &str, role: &str| subject_allowed(SUBJECT_STORAGE_USAGE, producer, role);
         assert!(allowed("AI.sales@h", "ingress"));
         assert!(allowed("SY.cognition@h", "worker"));
         assert!(allowed("SY.cognition@h", "motherbee"));
@@ -1608,7 +1585,7 @@ mod tests {
             STREAM_NODE_APPEND_QUEUE - STREAM_USAGE_QUEUE_RESERVE,
             Ordering::Relaxed,
         );
-        handle.append_from_node(SUBJECT_STORAGE_COGNITION_BATCH, "SY.cognition@h", vec![1]);
+        handle.append_from_node(OTHER_APPEND, "SY.cognition@h", vec![1]);
         assert_eq!(
             handle.counters.dropped_queue_nodes.load(Ordering::Relaxed),
             1
@@ -1806,8 +1783,8 @@ mod tests {
         assert!(!shared.fits(Source::Nodes, SUBJECT_STORAGE_USAGE, node_cap + 1));
         // Other node appends leave the usage records their reserve (§7.4).
         let others = node_cap - STREAM_USAGE_RESERVE_BYTES;
-        assert!(shared.fits(Source::Nodes, SUBJECT_STORAGE_COGNITION_BATCH, others));
-        assert!(!shared.fits(Source::Nodes, SUBJECT_STORAGE_COGNITION_BATCH, others + 1));
+        assert!(shared.fits(Source::Nodes, OTHER_APPEND, others));
+        assert!(!shared.fits(Source::Nodes, OTHER_APPEND, others + 1));
         assert!(shared.fits(
             Source::Turns,
             SUBJECT_STORAGE_TURNS,
@@ -1906,13 +1883,6 @@ mod tests {
         assert!(!subject_allowed(
             SUBJECT_COGNITION_TURNS,
             "SY.cognition@worker1",
-            "worker1",
-            "worker"
-        ));
-        assert!(subject_allowed(
-            fluxbee_sdk::stream::SUBJECT_STORAGE_COGNITION_BATCH,
-            "SY.cognition@worker1",
-            "worker1",
             "worker"
         ));
     }
