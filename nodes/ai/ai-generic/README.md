@@ -170,7 +170,13 @@ On every request the node reads the key of its provider from SY.vault:
   ([docs/reference/cognition.md §7](../../../docs/reference/cognition.md#7-the-memory-region-and-the-memory-package)),
   and the node puts it in front of the user input as a text block, "Conversation memory":
   - its labels and memories: the thread, the dominant context and reason, up to 4 contexts and 4
-    reasons, up to 3 memories, and what the package left out;
+    reasons, up to 3 memories;
+  - the feelings of the people in it, the package's up to 12
+    ([docs/cognition-hands-v1.md](../../../docs/cognition-hands-v1.md) §10.3), one line each:
+    `- person Ana Pérez (ilk:…): anger about billing, strong, last felt 2026-11-05 10:05: "<what
+    was lived>"`. Those of the person being answered come first (its `meta.context.writer`, else
+    its `src_ilk`), then the rest, the strongest first;
+  - what the package left out;
   - then the recent conversation, the communication's last turns (up to 20), oldest first, one
     line each: `- [2026-10-30 12:05] <who>: "<text>"`, the time in UTC
     ([docs/cognition-hands-v1.md](../../../docs/cognition-hands-v1.md) §6). `<who>` names the

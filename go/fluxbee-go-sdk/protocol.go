@@ -130,16 +130,27 @@ type MemoryPackage struct {
 }
 
 // MemoryTurn is one turn of a communication, as its memory package carries it: a message its agent
-// received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through;
-// Choice, on "out" only, the option the agent chose from a WF's menu.
+// received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through, and
+// Writer who wrote it; To, on "out" only, whom the agent answered; Choice, on "out" only, the option
+// the agent chose from a WF's menu.
 type MemoryTurn struct {
 	Direction   string            `json:"direction"`
 	SrcIlk      *string           `json:"src_ilk,omitempty"`
 	Via         *string           `json:"via,omitempty"`
+	Writer      *MemoryTurnParty  `json:"writer,omitempty"`
+	To          *MemoryTurnParty  `json:"to,omitempty"`
 	Text        string            `json:"text,omitempty"`
 	Attachments uint32            `json:"attachments,omitempty"`
 	Choice      *MemoryTurnChoice `json:"choice,omitempty"`
 	Ts          string            `json:"ts"`
+}
+
+// MemoryTurnParty is who is at one end of a turn (docs/cognition-hands-v1.md §6): their ILK, their
+// name, and their kind (person, agent, workflow or system) when the identity knows the ILK.
+type MemoryTurnParty struct {
+	Ilk  *string `json:"ilk,omitempty"`
+	Name *string `json:"name,omitempty"`
+	Kind *string `json:"kind,omitempty"`
 }
 
 // MemoryTurnChoice is an option an agent chose from a WF's menu, its params as compact JSON.
@@ -168,10 +179,19 @@ type MemorySummary struct {
 	DominantReasonID  *string `json:"dominant_reason_id,omitempty"`
 }
 
+// EpisodeSummary is a person's feeling, as the package carries it (docs/cognition-hands-v1.md
+// §10.3): whose it is, what (Affect) about what (Context), how strong it is now (Level: strong,
+// present or faint; and its Weight), when its owner last showed it, and its text.
 type EpisodeSummary struct {
-	EpisodeID string `json:"episode_id"`
-	Title     string `json:"title"`
-	Intensity uint8  `json:"intensity"`
+	EpisodeID  string          `json:"episode_id"`
+	Owner      MemoryTurnParty `json:"owner"`
+	Affect     string          `json:"affect"`
+	Context    string          `json:"context"`
+	Title      string          `json:"title"`
+	Level      string          `json:"level"`
+	Weight     float64         `json:"weight"`
+	LastFeltAt string          `json:"last_felt_at"`
+	Summary    string          `json:"summary,omitempty"`
 }
 
 type MemoryPackageTruncated struct {

@@ -108,8 +108,23 @@ const COGNITION_SCOPE_SUSTAIN_COUNT: u32 = 2;
 const COGNITION_MEMORY_DECAY_FACTOR: f64 = 0.97;
 const COGNITION_EPISODE_MIN_INTENSITY: f64 = 7.0;
 const COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH: f64 = 8.0;
+/// Each feeling's inertia (docs/cognition-hands-v1.md §10.3): how many times a context's half-life
+/// its own is. The operator set two to ten times by feeling (2026-11-05); the lab's numbers are
+/// checked against its code when it is found.
+const COGNITION_FEELING_INERTIA: [(&str, f64); 3] =
+    [("urgency", 2.0), ("anger", 5.0), ("escalation", 10.0)];
+/// A feeling closes under this weight, as a context does by default.
+const COGNITION_FEELING_CLOSE_THRESHOLD: f64 = 0.25;
+/// How many open feelings a package carries, the heaviest first.
+const COGNITION_PACKAGE_MAX_FEELINGS: usize = 12;
+/// The most characters of a feeling's text a package carries.
+const COGNITION_FEELING_TEXT_MAX_CHARS: usize = 300;
 const COGNITION_MAX_TAGS: usize = 12;
 const COGNITION_MAX_REASON_SIGNALS: usize = 4;
+/// The affects a turn can show its writer feels: the episode gate's words (`build_episode_candidate`).
+/// The tagger names them in a closed set of their own, `affect_signals` (FINDINGS A-157); its free
+/// extra hints never named them.
+const COGNITION_AFFECT_SIGNALS: [&str; 3] = ["frustration", "escalation", "urgency"];
 const COGNITION_REASON_CANONICAL_SIGNALS: [&str; 8] = [
     "resolve",
     "inform",
@@ -126,6 +141,8 @@ struct SemanticTaggerOutput {
     tags: Vec<String>,
     reason_signals_canonical: Vec<String>,
     reason_signals_extra: Vec<String>,
+    /// The writer's own affect, from `COGNITION_AFFECT_SIGNALS` (FINDINGS A-157).
+    affect_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -466,22 +483,37 @@ struct MemoryState {
     last_seen_at: String,
 }
 
+/// A person's feeling (docs/cognition-hands-v1.md §10.3): one per owner, affect and context. Each
+/// of its owner's turns that shows it makes its weight `weight × decay + step`, and each of the
+/// owner's other turns `weight × decay`, as a context's, with the more inertia of its affect. It
+/// closes under `COGNITION_FEELING_CLOSE_THRESHOLD`, and opens again when it comes back.
 #[derive(Debug, Clone)]
 struct EpisodeState {
     episode_id: String,
-    scope_id: String,
-    scope_instance_id: String,
+    /// The person whose turns show it.
+    owner: MemoryTurnParty,
     affect_id: String,
+    context_id: String,
+    context_label: String,
+    /// The scope it was last felt in.
+    scope_id: String,
     title: String,
     summary: String,
+    reason: String,
     base_intensity: f64,
     evidence_strength: f64,
     evidence_context_ids: Vec<String>,
     evidence_reason_ids: Vec<String>,
     evidence_signals: Vec<String>,
-    intensity: f64,
-    reason: String,
+    weight: f64,
+    weight_avg_cumulative: f64,
+    weight_avg_ema: f64,
+    weight_samples: u64,
+    occurrences: u64,
+    status: String,
     created_at: String,
+    last_felt_at: String,
+    closed_at: Option<String>,
 }
 
 /// The deterministic half of an episode. Its summary and reason come from the narrative
@@ -493,6 +525,17 @@ struct EpisodeCandidate {
     base_intensity: f64,
     evidence_strength: f64,
     evidence_signals: Vec<String>,
+}
+
+/// What a person's turn shows (docs/cognition-hands-v1.md §10.3): the gate's affect, felt around
+/// the active scope's dominant context and reason.
+#[derive(Debug, Clone)]
+struct FeelingCandidate {
+    episode: EpisodeCandidate,
+    scope_id: String,
+    context_id: String,
+    context_label: String,
+    reason_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1010,6 +1053,58 @@ fn person_at_other_end(
     }
 }
 
+/// Whose feelings a turn moves (docs/cognition-hands-v1.md §10.3): the person who wrote a turn the
+/// agent got, by their ILK. None for the agent's own answer, a writer with no ILK, or one the
+/// identity knows is not a person; an ILK it does not know yet counts as a person's, as for the
+/// analysis.
+fn feeling_owner(
+    message: &Message,
+    agent_node: &str,
+    facts: impl Fn(&str) -> Option<IlkFacts>,
+) -> Option<MemoryTurnParty> {
+    if message.routing.src_l2_name.as_deref() == Some(agent_node) {
+        return None;
+    }
+    let writer = turn_writer(message, &facts)?;
+    writer.ilk.as_ref()?;
+    match writer.kind.as_deref() {
+        Some("agent" | "workflow" | "system") => None,
+        _ => Some(writer),
+    }
+}
+
+/// Who spoke a turn, as the narrator reads it (docs/cognition-hands-v1.md §10.3): `person Ana Pérez
+/// (ilk:…)` for a turn the agent got, `the agent, answering person Ana Pérez (ilk:…)` for its own.
+fn narrator_speaker(
+    message: &Message,
+    agent_node: &str,
+    facts: impl Fn(&str) -> Option<IlkFacts>,
+) -> Option<String> {
+    if message.routing.src_l2_name.as_deref() == Some(agent_node) {
+        let to = turn_party(message.meta.dst_ilk.as_deref(), None, &facts);
+        return Some(match to.as_ref().and_then(party_words) {
+            Some(to) => format!("the agent, answering {to}"),
+            None => "the agent".to_string(),
+        });
+    }
+    turn_writer(message, &facts).as_ref().and_then(party_words)
+}
+
+/// A party in words: `<kind> <name> (<ILK>)`, with either of name and ILK alone, and the kind when
+/// the identity gave one. None with neither a name nor an ILK.
+fn party_words(party: &MemoryTurnParty) -> Option<String> {
+    let named = match (party.name.as_deref(), party.ilk.as_deref()) {
+        (Some(name), Some(ilk)) => format!("{name} ({ilk})"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(ilk)) => ilk.to_string(),
+        (None, None) => return None,
+    };
+    Some(match party.kind.as_deref() {
+        Some(kind) => format!("{kind} {named}"),
+        None => named,
+    })
+}
+
 /// The node a turn came in through: where its cycle started, its trace's first entry
 /// (`meta.context.trace`, docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise
 /// its sender, as its router names it.
@@ -1336,6 +1431,10 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         return;
     }
 
+    // Whose feelings the turn moves, and who spoke it for the narrator (§10.3).
+    let facts = |ilk: &str| message_writer::ilk_facts(&app_state.hive_id, ilk);
+    let owner = feeling_owner(&msg, &turn.agent_node, facts);
+    let speaker = narrator_speaker(&msg, &turn.agent_node, facts);
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
     let (thresholds, semantic_tagger_config) = {
         let control_state = app_state.control_state.lock().await;
@@ -1458,6 +1557,8 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         &agent_ilk,
         src_ilk.as_deref(),
         dst_ilk.as_deref(),
+        owner.as_ref(),
+        speaker.as_deref(),
         &tagger,
         &thresholds,
         &api_key,
@@ -1542,7 +1643,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             .sum();
         let active_episodes = threads
             .values()
-            .map(|thread| thread.episodes.len() as u64)
+            .map(|thread| open_feelings(thread) as u64)
             .sum();
         (
             active_threads,
@@ -1937,7 +2038,16 @@ fn thread_live_entities_total(thread_state: &ThreadCognitionState) -> usize {
         + open_reasons
         + open_cooccurrences
         + thread_state.memories.len()
-        + thread_state.episodes.len()
+        + open_feelings(thread_state)
+}
+
+/// A communication's open feelings: the closed ones stay, and count for nothing.
+fn open_feelings(thread_state: &ThreadCognitionState) -> usize {
+    thread_state
+        .episodes
+        .values()
+        .filter(|feeling| feeling.status == "open")
+        .count()
 }
 
 fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
@@ -2065,7 +2175,6 @@ async fn fetch_communication_state(
         return Ok(None);
     }
     Ok(Some(build_communication_state(
-        key,
         rebuild_rows_from_envelopes(envelopes),
     )))
 }
@@ -2161,11 +2270,11 @@ fn rebuild_rows_from_envelopes(envelopes: Vec<Value>) -> RebuildRows {
 
 /// Assembles one communication's state from its durable rows, keyed exactly like the live path:
 /// contexts and reasons by label, co-occurrences by `"<context label>|<reason label>"`, memories by
-/// scope id, episodes by `"<scope instance id>|<affect id>"`. Keyed by entity id instead, every
-/// lookup of the next live turn missed and it re-created each entity, under the same id, next to
-/// the rebuilt one. The active scope is the open instance with the latest start turn. The last
-/// turns come back from the thread row.
-fn build_communication_state(key: &CommunicationKey, rows: RebuildRows) -> ThreadCognitionState {
+/// scope id, feelings by `"<owner ILK>|<affect id>|<context label>"` (`feeling_key`). Keyed by
+/// entity id instead, every lookup of the next live turn missed and it re-created each entity, under
+/// the same id, next to the rebuilt one. The active scope is the open instance with the latest start
+/// turn. The last turns come back from the thread row.
+fn build_communication_state(rows: RebuildRows) -> ThreadCognitionState {
     let mut state = ThreadCognitionState::default();
     if let Some(thread) = rows.thread {
         state.first_seen_at = thread.first_seen_at;
@@ -2194,9 +2303,7 @@ fn build_communication_state(key: &CommunicationKey, rows: RebuildRows) -> Threa
     }
     let scope_payloads: HashMap<String, CognitionScopeData> = rows.scopes.into_iter().collect();
     let mut open_instance: Option<(String, ScopeInstancePayload)> = None;
-    let mut instance_ids = Vec::new();
     for (scope_instance_id, payload) in rows.scope_instances {
-        instance_ids.push(scope_instance_id.clone());
         if payload.closed_at.is_some() {
             continue;
         }
@@ -2213,31 +2320,18 @@ fn build_communication_state(key: &CommunicationKey, rows: RebuildRows) -> Threa
         state.memories.insert(memory.scope_id.clone(), memory);
     }
     for (episode_id, payload) in rows.episodes {
-        // The live path derives an episode id from (communication, scope instance, affect), so the
-        // instance an episode belongs to is the one that reproduces its id.
-        let scope_instance_id = instance_ids
-            .iter()
-            .find(|id| {
-                stable_entity_id(
-                    "episode",
-                    &[
-                        key.thread_id.as_str(),
-                        key.agent_ilk.as_str(),
-                        id.as_str(),
-                        payload.affect_id.as_str(),
-                    ],
-                ) == episode_id
-            })
-            .cloned();
-        // Without its instance row the episode keeps its own id as key, which no live turn
-        // produces: it stays visible but is never mistaken for the open instance's episode.
-        let episode_key = match &scope_instance_id {
-            Some(instance_id) => format!("{}|{}", instance_id, payload.affect_id),
-            None => episode_id.clone(),
+        // A feeling is keyed by its owner, affect and context, as the live path keys it (§10.3).
+        // A row from before feelings had owners (0.1.101 and older) has none, and is left out.
+        let Some(feeling) = episode_state_from_payload(episode_id, payload) else {
+            continue;
         };
-        let episode =
-            episode_state_from_payload(episode_id, scope_instance_id.unwrap_or_default(), payload);
-        state.episodes.insert(episode_key, episode);
+        let Some(owner_ilk) = feeling.owner.ilk.clone() else {
+            continue;
+        };
+        state.episodes.insert(
+            feeling_key(&owner_ilk, &feeling.affect_id, &feeling.context_label),
+            feeling,
+        );
     }
     if let Some((scope_instance_id, scope_payload)) = &open_instance {
         state.active_scope = scope_binding_state_from_payload(
@@ -2325,27 +2419,39 @@ fn memory_state_from_payload(memory_id: String, data: CognitionMemoryData) -> Me
     }
 }
 
+/// A feeling from its durable row; None for a row with no owner or no context, from before
+/// feelings had them.
 fn episode_state_from_payload(
     episode_id: String,
-    scope_instance_id: String,
     data: CognitionEpisodeData,
-) -> EpisodeState {
-    EpisodeState {
+) -> Option<EpisodeState> {
+    let owner = data.owner.filter(|owner| owner.ilk.is_some())?;
+    let context_label = data.context_label?;
+    Some(EpisodeState {
         episode_id,
-        scope_id: data.scope_id.unwrap_or_default(),
-        scope_instance_id,
+        owner,
         affect_id: data.affect_id,
+        context_id: data.context_id.unwrap_or_default(),
+        context_label,
+        scope_id: data.scope_id.unwrap_or_default(),
         title: data.title,
         summary: data.summary,
+        reason: data.reason.unwrap_or_default(),
         base_intensity: data.base_intensity.unwrap_or_default(),
         evidence_strength: data.evidence_strength.unwrap_or_default(),
         evidence_context_ids: data.evidence_context_ids,
         evidence_reason_ids: data.evidence_reason_ids,
         evidence_signals: data.evidence_signals,
-        intensity: data.intensity.unwrap_or_default(),
-        reason: data.reason.unwrap_or_default(),
+        weight: data.weight.unwrap_or_default(),
+        weight_avg_cumulative: data.weight_avg_cumulative.unwrap_or_default(),
+        weight_avg_ema: data.weight_avg_ema.unwrap_or_default(),
+        weight_samples: data.weight_samples.unwrap_or_default(),
+        occurrences: data.occurrences.unwrap_or_default(),
+        status: data.status.unwrap_or_else(|| "open".to_string()),
         created_at: data.created_at.unwrap_or_default(),
-    }
+        last_felt_at: data.last_felt_at.unwrap_or_default(),
+        closed_at: data.closed_at,
+    })
 }
 
 fn scope_binding_state_from_payload(
@@ -2498,7 +2604,6 @@ fn build_memory_package_for_thread(
     const MAX_CONTEXTS: usize = 6;
     const MAX_REASONS: usize = 6;
     const MAX_MEMORIES: usize = 6;
-    const MAX_EPISODES: usize = 4;
 
     let mut contexts: Vec<&ContextState> = thread_state
         .contexts
@@ -2517,8 +2622,19 @@ fn build_memory_package_for_thread(
     let mut memories: Vec<&MemoryState> = thread_state.memories.values().collect();
     memories.sort_by(|left, right| right.weight.total_cmp(&left.weight));
 
-    let mut episodes: Vec<&EpisodeState> = thread_state.episodes.values().collect();
-    episodes.sort_by(|left, right| right.intensity.total_cmp(&left.intensity));
+    // The open feelings, the heaviest first, and the most recently felt on a tie (§10.3).
+    let mut episodes: Vec<&EpisodeState> = thread_state
+        .episodes
+        .values()
+        .filter(|feeling| feeling.status == "open")
+        .collect();
+    episodes.sort_by(|left, right| {
+        right
+            .weight
+            .total_cmp(&left.weight)
+            .then_with(|| right.last_felt_at.cmp(&left.last_felt_at))
+            .then_with(|| left.episode_id.cmp(&right.episode_id))
+    });
 
     let dominant_context = contexts.first().map(|context| MemoryContextSummary {
         context_id: context.context_id.clone(),
@@ -2534,7 +2650,9 @@ fn build_memory_package_for_thread(
     let dropped_contexts = contexts.len().saturating_sub(MAX_CONTEXTS) as u32;
     let dropped_reasons = reasons.len().saturating_sub(MAX_REASONS) as u32;
     let dropped_memories = memories.len().saturating_sub(MAX_MEMORIES) as u32;
-    let dropped_episodes = episodes.len().saturating_sub(MAX_EPISODES) as u32;
+    let dropped_episodes = episodes
+        .len()
+        .saturating_sub(COGNITION_PACKAGE_MAX_FEELINGS) as u32;
 
     MemoryPackage {
         package_version: MEMORY_PACKAGE_VERSION,
@@ -2572,11 +2690,18 @@ fn build_memory_package_for_thread(
             .collect(),
         episodes: episodes
             .into_iter()
-            .take(MAX_EPISODES)
-            .map(|episode| EpisodeSummary {
-                episode_id: episode.episode_id.clone(),
-                title: episode.title.clone(),
-                intensity: episode.intensity.round().clamp(0.0, u8::MAX as f64) as u8,
+            .take(COGNITION_PACKAGE_MAX_FEELINGS)
+            .map(|feeling| EpisodeSummary {
+                episode_id: feeling.episode_id.clone(),
+                owner: feeling.owner.clone(),
+                affect: feeling.affect_id.clone(),
+                context: feeling.context_label.clone(),
+                title: feeling.title.clone(),
+                level: feeling_level(feeling.weight, feeling_step(feeling.base_intensity))
+                    .to_string(),
+                weight: feeling.weight,
+                last_felt_at: feeling.last_felt_at.clone(),
+                summary: turn_field(&feeling.summary, COGNITION_FEELING_TEXT_MAX_CHARS),
             })
             .collect(),
         // Bounded at intake (`bound_recent_turns`): they all go.
@@ -3490,6 +3615,8 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
     agent_ilk: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
+    owner: Option<&MemoryTurnParty>,
+    speaker: Option<&str>,
     tagger: &SemanticTaggerOutput,
     thresholds: &CognitionThresholds,
     api_key: &str,
@@ -3561,13 +3688,39 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
         &thread_state.reasons,
         &mut thread_state.active_scope,
     ));
-    let memory_episode_result = update_memories_and_episodes_for_thread(
+    // Only a person's own turn shows feelings (docs/cognition-hands-v1.md §10.3); the narrator
+    // writes the moment's text with the memory's, from the text so far of the heaviest of them.
+    let felt = match owner {
+        Some(_) => feeling_candidates(
+            tagger,
+            &thread_state.active_scope,
+            &thread_state.contexts,
+            &thread_state.reasons,
+        ),
+        None => Vec::new(),
+    };
+    let previous_text = owner
+        .and_then(|owner| owner.ilk.as_deref())
+        .and_then(|owner_ilk| {
+            felt.iter()
+                .filter_map(|felt| {
+                    thread_state.episodes.get(&feeling_key(
+                        owner_ilk,
+                        &felt.episode.affect_id,
+                        &felt.context_label,
+                    ))
+                })
+                .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        })
+        .map(|feeling| (feeling.summary.clone(), feeling.reason.clone()));
+    let (memory_result, feeling_text) = update_memories_and_episodes_for_thread(
         hive_id,
         writer,
         comm,
         ts,
         src_ilk,
         dst_ilk,
+        speaker,
         tagger,
         api_key,
         account,
@@ -3575,15 +3728,30 @@ async fn update_thread_state_and_build_envelopes<S: NarrativeSummarizer>(
         &thread_state.contexts,
         &thread_state.reasons,
         &thread_state.active_scope,
+        &felt,
+        previous_text
+            .as_ref()
+            .map(|(summary, reason)| (summary.as_str(), reason.as_str())),
         &mut thread_state.memories,
-        &mut thread_state.episodes,
         narrative,
     )
     .await;
-    out.extend(memory_episode_result.envelopes);
+    out.extend(memory_result.envelopes);
+    if let Some(owner) = owner {
+        out.extend(update_feelings_for_turn(
+            hive_id,
+            writer,
+            comm,
+            ts,
+            owner,
+            felt,
+            feeling_text.as_ref(),
+            &mut thread_state.episodes,
+        ));
+    }
     ThreadUpdateResult {
         envelopes: out,
-        narrative: memory_episode_result.narrative,
+        narrative: memory_result.narrative,
     }
 }
 
@@ -3734,15 +3902,11 @@ fn update_contexts_for_thread(
         context.last_seen_at = ts.to_string();
         context.tags = candidate.tags.clone();
         context.weight = context.weight * COGNITION_CONTEXT_DECAY_FACTOR + candidate.score;
-        context.weight_samples = context.weight_samples.saturating_add(1);
-        context.weight_avg_cumulative = update_cumulative_average(
-            context.weight_avg_cumulative,
-            candidate.score,
-            context.weight_samples,
-        );
-        context.weight_avg_ema = update_ema(
-            context.weight_avg_ema,
-            candidate.score,
+        sample_weight(
+            &mut context.weight_samples,
+            &mut context.weight_avg_cumulative,
+            &mut context.weight_avg_ema,
+            context.weight,
             COGNITION_CONTEXT_EMA_ALPHA,
         );
         apply_ilk_participation(
@@ -3787,7 +3951,13 @@ fn update_contexts_for_thread(
             continue;
         }
         context.weight *= COGNITION_CONTEXT_DECAY_FACTOR;
-        context.last_seen_at = ts.to_string();
+        sample_weight(
+            &mut context.weight_samples,
+            &mut context.weight_avg_cumulative,
+            &mut context.weight_avg_ema,
+            context.weight,
+            COGNITION_CONTEXT_EMA_ALPHA,
+        );
         if context.weight < close_threshold {
             context.status = "closed".to_string();
             context.closed_at = Some(ts.to_string());
@@ -3869,15 +4039,11 @@ fn update_reasons_for_thread(
         reason.signals_canonical = candidate.signals_canonical.clone();
         reason.signals_extra = candidate.signals_extra.clone();
         reason.weight = reason.weight * COGNITION_REASON_DECAY_FACTOR + candidate.score;
-        reason.weight_samples = reason.weight_samples.saturating_add(1);
-        reason.weight_avg_cumulative = update_cumulative_average(
-            reason.weight_avg_cumulative,
-            candidate.score,
-            reason.weight_samples,
-        );
-        reason.weight_avg_ema = update_ema(
-            reason.weight_avg_ema,
-            candidate.score,
+        sample_weight(
+            &mut reason.weight_samples,
+            &mut reason.weight_avg_cumulative,
+            &mut reason.weight_avg_ema,
+            reason.weight,
             COGNITION_REASON_EMA_ALPHA,
         );
         apply_ilk_participation(
@@ -3923,7 +4089,13 @@ fn update_reasons_for_thread(
             continue;
         }
         reason.weight *= COGNITION_REASON_DECAY_FACTOR;
-        reason.last_seen_at = ts.to_string();
+        sample_weight(
+            &mut reason.weight_samples,
+            &mut reason.weight_avg_cumulative,
+            &mut reason.weight_avg_ema,
+            reason.weight,
+            COGNITION_REASON_EMA_ALPHA,
+        );
         if reason.weight < close_threshold {
             reason.status = "closed".to_string();
             reason.closed_at = Some(ts.to_string());
@@ -4028,16 +4200,12 @@ fn update_cooccurrences_for_thread(
             cooccurrence.closed_at = None;
             cooccurrence.last_seen_at = ts.to_string();
             cooccurrence.weight = cooccurrence.weight * COGNITION_COOCCURRENCE_DECAY_FACTOR + score;
-            cooccurrence.weight_samples = cooccurrence.weight_samples.saturating_add(1);
             cooccurrence.occurrences = cooccurrence.occurrences.saturating_add(1);
-            cooccurrence.weight_avg_cumulative = update_cumulative_average(
-                cooccurrence.weight_avg_cumulative,
-                score,
-                cooccurrence.weight_samples,
-            );
-            cooccurrence.weight_avg_ema = update_ema(
-                cooccurrence.weight_avg_ema,
-                score,
+            sample_weight(
+                &mut cooccurrence.weight_samples,
+                &mut cooccurrence.weight_avg_cumulative,
+                &mut cooccurrence.weight_avg_ema,
+                cooccurrence.weight,
                 COGNITION_COOCCURRENCE_EMA_ALPHA,
             );
 
@@ -4077,7 +4245,13 @@ fn update_cooccurrences_for_thread(
             continue;
         }
         cooccurrence.weight *= COGNITION_COOCCURRENCE_DECAY_FACTOR;
-        cooccurrence.last_seen_at = ts.to_string();
+        sample_weight(
+            &mut cooccurrence.weight_samples,
+            &mut cooccurrence.weight_avg_cumulative,
+            &mut cooccurrence.weight_avg_ema,
+            cooccurrence.weight,
+            COGNITION_COOCCURRENCE_EMA_ALPHA,
+        );
         if cooccurrence.weight < close_threshold {
             cooccurrence.status = "closed".to_string();
             cooccurrence.closed_at = Some(ts.to_string());
@@ -4242,6 +4416,10 @@ fn update_scope_binding_for_thread(
     out
 }
 
+/// The memory of the active scope, from the narrator, which also writes the text of the moment the
+/// turn's feelings (`felt`) come from, one for all of them, from the text so far. The narrator reads
+/// who spoke (`speaker`), so the memory names each person (docs/cognition-hands-v1.md §10.3).
+/// Nothing without an active scope with both dominants; no feeling text when the narrator fails.
 async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     hive_id: &str,
     writer: &str,
@@ -4249,6 +4427,7 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     ts: &str,
     src_ilk: Option<&str>,
     dst_ilk: Option<&str>,
+    speaker: Option<&str>,
     tagger: &SemanticTaggerOutput,
     api_key: &str,
     account: &AiAccount,
@@ -4256,26 +4435,21 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     contexts: &HashMap<String, ContextState>,
     reasons: &HashMap<String, ReasonState>,
     active_scope: &Option<ScopeBindingState>,
+    felt: &[FeelingCandidate],
+    previous_feeling_text: Option<(&str, &str)>,
     memories: &mut HashMap<String, MemoryState>,
-    episodes: &mut HashMap<String, EpisodeState>,
     narrative: &S,
-) -> ThreadUpdateResult {
+) -> (ThreadUpdateResult, Option<EpisodeNarrative>) {
     let mut out = Vec::new();
     let Some(scope) = active_scope.as_ref() else {
-        return ThreadUpdateResult::default();
+        return (ThreadUpdateResult::default(), None);
     };
     let Some(context) = contexts.get(&scope.dominant_context_label) else {
-        return ThreadUpdateResult::default();
+        return (ThreadUpdateResult::default(), None);
     };
     let Some(reason) = reasons.get(&scope.dominant_reason_label) else {
-        return ThreadUpdateResult::default();
+        return (ThreadUpdateResult::default(), None);
     };
-
-    let episode_candidate = build_episode_candidate(tagger, context);
-    let episode_existing = episode_candidate.as_ref().and_then(|candidate| {
-        let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
-        episodes.get(&episode_key)
-    });
 
     let narrative_result = match narrative
         .summarize(NarrativeSummarizerAiInput {
@@ -4283,16 +4457,23 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
             account,
             config: semantic_tagger_config,
             thread_id: &comm.thread_id,
+            speaker,
             context_label: &context.label,
             context_tags: &context.tags,
             reason_label: &reason.label,
             canonical_signals: &reason.signals_canonical,
             extra_signals: &tagger.reason_signals_extra,
             previous_memory_summary: memories.get(&scope.scope_id).map(|m| m.summary.as_str()),
-            episode_affect_id: episode_candidate.as_ref().map(|c| c.affect_id.as_str()),
-            episode_title: episode_candidate.as_ref().map(|c| c.title.as_str()),
-            previous_episode_summary: episode_existing.map(|episode| episode.summary.as_str()),
-            previous_episode_reason: episode_existing.map(|episode| episode.reason.as_str()),
+            episode_affects: felt
+                .iter()
+                .map(|felt| felt.episode.affect_id.as_str())
+                .collect(),
+            episode_titles: felt
+                .iter()
+                .map(|felt| felt.episode.title.as_str())
+                .collect(),
+            previous_episode_summary: previous_feeling_text.map(|(summary, _)| summary),
+            previous_episode_reason: previous_feeling_text.map(|(_, reason)| reason),
         })
         .await
     {
@@ -4305,22 +4486,21 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
                 error = %err,
                 "sy.cognition narrative summarizer failed; skipping memory/episode synthesis for turn"
             );
-            return ThreadUpdateResult {
-                envelopes: out,
-                narrative: NarrativeOutcome {
-                    called: true,
-                    failed: !matches!(
-                        err,
-                        fluxbee_ai_sdk::AiSdkError::Json(_)
-                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
-                    ),
-                    invalid_output: matches!(
-                        err,
-                        fluxbee_ai_sdk::AiSdkError::Json(_)
-                            | fluxbee_ai_sdk::AiSdkError::Protocol(_)
-                    ),
+            let invalid_output = matches!(
+                err,
+                fluxbee_ai_sdk::AiSdkError::Json(_) | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+            );
+            return (
+                ThreadUpdateResult {
+                    envelopes: out,
+                    narrative: NarrativeOutcome {
+                        called: true,
+                        failed: !invalid_output,
+                        invalid_output,
+                    },
                 },
-            };
+                None,
+            );
         }
     };
 
@@ -4337,32 +4517,17 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
         &current_ilk_weights,
         memories,
     ));
-    // The summarizer must return the episode text whenever a candidate was sent (else the
-    // call fails above), so an episode is the candidate's gate fields plus the AI's text.
-    if let Some((candidate, episode_narrative)) =
-        episode_candidate.zip(narrative_result.episode.as_ref())
-    {
-        out.extend(update_episodes_for_thread(
-            hive_id,
-            writer,
-            comm,
-            ts,
-            candidate,
-            episode_narrative,
-            scope,
-            context,
-            reason,
-            episodes,
-        ));
-    }
-    ThreadUpdateResult {
-        envelopes: out,
-        narrative: NarrativeOutcome {
-            called: true,
-            failed: false,
-            invalid_output: false,
+    (
+        ThreadUpdateResult {
+            envelopes: out,
+            narrative: NarrativeOutcome {
+                called: true,
+                failed: false,
+                invalid_output: false,
+            },
         },
-    }
+        narrative_result.episode,
+    )
 }
 
 fn update_memories_for_thread(
@@ -4436,7 +4601,6 @@ fn update_memories_for_thread(
             continue;
         }
         other_memory.weight *= COGNITION_MEMORY_DECAY_FACTOR;
-        other_memory.last_seen_at = ts.to_string();
         let data = CognitionMemoryData {
             summary: other_memory.summary.clone(),
             scope_id: Some(other_memory.scope_id.clone()),
@@ -4465,166 +4629,341 @@ fn update_memories_for_thread(
     out
 }
 
-fn update_episodes_for_thread(
+/// A feeling's key in its communication (docs/cognition-hands-v1.md §10.3): its owner, its affect
+/// and its context.
+fn feeling_key(owner_ilk: &str, affect_id: &str, context_label: &str) -> String {
+    format!("{owner_ilk}|{affect_id}|{context_label}")
+}
+
+/// The feelings a person's turn shows (docs/cognition-hands-v1.md §10.3): each affect the gate
+/// passes (`build_episode_candidates`), felt around the active scope's dominant context and reason.
+/// None without an active scope with both dominants, as a memory needs.
+fn feeling_candidates(
+    tagger: &SemanticTaggerOutput,
+    active_scope: &Option<ScopeBindingState>,
+    contexts: &HashMap<String, ContextState>,
+    reasons: &HashMap<String, ReasonState>,
+) -> Vec<FeelingCandidate> {
+    let Some(scope) = active_scope.as_ref() else {
+        return Vec::new();
+    };
+    let (Some(context), Some(reason)) = (
+        contexts.get(&scope.dominant_context_label),
+        reasons.get(&scope.dominant_reason_label),
+    ) else {
+        return Vec::new();
+    };
+    build_episode_candidates(tagger, context)
+        .into_iter()
+        .map(|episode| FeelingCandidate {
+            episode,
+            scope_id: scope.scope_id.clone(),
+            context_id: context.context_id.clone(),
+            context_label: context.label.clone(),
+            reason_id: reason.reason_id.clone(),
+        })
+        .collect()
+}
+
+/// How many times a context's half-life a feeling's is (`COGNITION_FEELING_INERTIA`).
+fn feeling_inertia(affect_id: &str) -> f64 {
+    COGNITION_FEELING_INERTIA
+        .iter()
+        .find(|(affect, _)| *affect == affect_id)
+        .map_or(1.0, |(_, inertia)| *inertia)
+}
+
+/// What each of its owner's turns keeps of a feeling: a context's decay to the root of the
+/// feeling's inertia, so its half-life is that many times a context's.
+fn feeling_decay(affect_id: &str) -> f64 {
+    COGNITION_CONTEXT_DECAY_FACTOR.powf(1.0 / feeling_inertia(affect_id))
+}
+
+/// What a turn that shows a feeling adds to it: its affect's base intensity over 4, so anger and
+/// escalation add 2 and urgency 1.75, where a context adds 1.
+fn feeling_step(base_intensity: f64) -> f64 {
+    base_intensity / 4.0
+}
+
+/// A feeling's EMA alpha: a context's, slowed by the feeling's inertia.
+fn feeling_ema_alpha(affect_id: &str) -> f64 {
+    COGNITION_CONTEXT_EMA_ALPHA / feeling_inertia(affect_id)
+}
+
+/// How strong a feeling is now, as the agent reads it: `strong` from three steps up, `present` from
+/// one, `faint` under one, a feeling shown once and fading.
+fn feeling_level(weight: f64, step: f64) -> &'static str {
+    if weight >= 3.0 * step {
+        "strong"
+    } else if weight >= step {
+        "present"
+    } else {
+        "faint"
+    }
+}
+
+/// An item's weight averages (FINDINGS A-156): over each turn it is open, the turn that names it
+/// and a turn that only decays it, its weight after the turn.
+fn sample_weight(samples: &mut u64, cumulative: &mut f64, ema: &mut f64, weight: f64, alpha: f64) {
+    *samples = samples.saturating_add(1);
+    *cumulative = update_cumulative_average(*cumulative, weight, *samples);
+    *ema = update_ema(*ema, weight, alpha);
+}
+
+/// Moves the feelings of a turn's owner (docs/cognition-hands-v1.md §10.3):
+/// - each open feeling of the owner the turn does not show takes `weight × decay`, and closes under
+///   `COGNITION_FEELING_CLOSE_THRESHOLD`;
+/// - each one it shows (`felt`, every affect the gate passed) takes `weight × decay + step`, and the
+///   narrator's text of the moment when the narrator wrote one; a feeling it opens without one has
+///   no text yet.
+///
+/// Other people's feelings stay: each person's turns are their own clock. A decay is stored only when
+/// it closes the feeling, as a context's (FINDINGS A-156): where cognition keeps its state is §10.6.
+fn update_feelings_for_turn(
     hive_id: &str,
     writer: &str,
     comm: &CognitionCommunicationRef,
     ts: &str,
-    candidate: EpisodeCandidate,
-    episode_narrative: &EpisodeNarrative,
-    scope: &ScopeBindingState,
-    context: &ContextState,
-    reason: &ReasonState,
-    episodes: &mut HashMap<String, EpisodeState>,
+    owner: &MemoryTurnParty,
+    felt: Vec<FeelingCandidate>,
+    text: Option<&EpisodeNarrative>,
+    feelings: &mut HashMap<String, EpisodeState>,
 ) -> Vec<(&'static str, Vec<u8>)> {
-    let mut out = Vec::new();
-    let episode_key = format!("{}|{}", scope.scope_instance_id, candidate.affect_id);
-    let episode = episodes.entry(episode_key).or_insert_with(|| EpisodeState {
-        episode_id: stable_entity_id(
-            "episode",
-            &[
-                &comm.thread_id,
-                &comm.agent_ilk,
-                &scope.scope_instance_id,
-                &candidate.affect_id,
-            ],
-        ),
-        scope_id: scope.scope_id.clone(),
-        scope_instance_id: scope.scope_instance_id.clone(),
-        affect_id: candidate.affect_id.clone(),
-        title: candidate.title.clone(),
-        summary: episode_narrative.summary.clone(),
-        base_intensity: candidate.base_intensity,
-        evidence_strength: candidate.evidence_strength,
-        evidence_context_ids: vec![context.context_id.clone()],
-        evidence_reason_ids: vec![reason.reason_id.clone()],
-        evidence_signals: candidate.evidence_signals.clone(),
-        intensity: candidate.base_intensity,
-        reason: episode_narrative.reason.clone(),
-        created_at: ts.to_string(),
-    });
-
-    episode.scope_id = scope.scope_id.clone();
-    episode.scope_instance_id = scope.scope_instance_id.clone();
-    episode.title = candidate.title.clone();
-    episode.summary = episode_narrative.summary.clone();
-    episode.base_intensity = episode.base_intensity.max(candidate.base_intensity);
-    episode.evidence_strength = episode.evidence_strength.max(candidate.evidence_strength);
-    episode.intensity = episode.intensity.max(candidate.base_intensity);
-    episode.reason = episode_narrative.reason.clone();
-    for context_id in [context.context_id.clone()] {
-        if !episode.evidence_context_ids.contains(&context_id) {
-            episode.evidence_context_ids.push(context_id);
-        }
-    }
-    for reason_id in [reason.reason_id.clone()] {
-        if !episode.evidence_reason_ids.contains(&reason_id) {
-            episode.evidence_reason_ids.push(reason_id);
-        }
-    }
-    for signal in &candidate.evidence_signals {
-        if !episode.evidence_signals.contains(signal) {
-            episode.evidence_signals.push(signal.clone());
-        }
-    }
-
-    let data = CognitionEpisodeData {
-        affect_id: episode.affect_id.clone(),
-        title: episode.title.clone(),
-        summary: episode.summary.clone(),
-        scope_id: Some(episode.scope_id.clone()),
-        base_intensity: Some(episode.base_intensity),
-        evidence_strength: Some(episode.evidence_strength),
-        evidence_context_ids: episode.evidence_context_ids.clone(),
-        evidence_reason_ids: episode.evidence_reason_ids.clone(),
-        evidence_signals: episode.evidence_signals.clone(),
-        intensity: Some(episode.intensity),
-        reason: Some(episode.reason.clone()),
-        created_at: Some(episode.created_at.clone()),
+    let Some(owner_ilk) = owner.ilk.clone() else {
+        return Vec::new();
     };
-    if let Ok(body) = serde_json::to_vec(&CognitionDurableEnvelope::new(
+    let mut out = Vec::new();
+    let felt: Vec<(String, FeelingCandidate)> = felt
+        .into_iter()
+        .map(|felt| {
+            let key = feeling_key(&owner_ilk, &felt.episode.affect_id, &felt.context_label);
+            (key, felt)
+        })
+        .collect();
+
+    for (key, feeling) in feelings.iter_mut() {
+        if feeling.status != "open"
+            || feeling.owner.ilk.as_deref() != Some(owner_ilk.as_str())
+            || felt.iter().any(|(felt_key, _)| felt_key == key)
+        {
+            continue;
+        }
+        feeling.weight *= feeling_decay(&feeling.affect_id);
+        sample_weight(
+            &mut feeling.weight_samples,
+            &mut feeling.weight_avg_cumulative,
+            &mut feeling.weight_avg_ema,
+            feeling.weight,
+            feeling_ema_alpha(&feeling.affect_id),
+        );
+        if feeling.weight < COGNITION_FEELING_CLOSE_THRESHOLD {
+            feeling.status = "closed".to_string();
+            feeling.closed_at = Some(ts.to_string());
+            out.extend(feeling_envelope(
+                hive_id,
+                writer,
+                comm,
+                ts,
+                CognitionDurableOp::Close,
+                feeling,
+            ));
+        }
+    }
+
+    for (felt_key, felt) in felt {
+        let candidate = felt.episode;
+        let feeling = feelings.entry(felt_key).or_insert_with(|| EpisodeState {
+            episode_id: stable_entity_id(
+                "episode",
+                &[
+                    &comm.thread_id,
+                    &comm.agent_ilk,
+                    &owner_ilk,
+                    &candidate.affect_id,
+                    &felt.context_label,
+                ],
+            ),
+            owner: owner.clone(),
+            affect_id: candidate.affect_id.clone(),
+            context_id: felt.context_id.clone(),
+            context_label: felt.context_label.clone(),
+            scope_id: felt.scope_id.clone(),
+            title: candidate.title.clone(),
+            summary: String::new(),
+            reason: String::new(),
+            base_intensity: candidate.base_intensity,
+            evidence_strength: candidate.evidence_strength,
+            evidence_context_ids: Vec::new(),
+            evidence_reason_ids: Vec::new(),
+            evidence_signals: Vec::new(),
+            weight: 0.0,
+            weight_avg_cumulative: 0.0,
+            weight_avg_ema: 0.0,
+            weight_samples: 0,
+            occurrences: 0,
+            status: "open".to_string(),
+            created_at: ts.to_string(),
+            last_felt_at: ts.to_string(),
+            closed_at: None,
+        });
+        // The owner's name as this turn gives it, which the identity may have learned since.
+        feeling.owner = owner.clone();
+        feeling.status = "open".to_string();
+        feeling.closed_at = None;
+        feeling.last_felt_at = ts.to_string();
+        feeling.scope_id = felt.scope_id.clone();
+        feeling.title = candidate.title.clone();
+        feeling.base_intensity = feeling.base_intensity.max(candidate.base_intensity);
+        feeling.evidence_strength = feeling.evidence_strength.max(candidate.evidence_strength);
+        feeling.weight = feeling.weight * feeling_decay(&feeling.affect_id)
+            + feeling_step(candidate.base_intensity);
+        sample_weight(
+            &mut feeling.weight_samples,
+            &mut feeling.weight_avg_cumulative,
+            &mut feeling.weight_avg_ema,
+            feeling.weight,
+            feeling_ema_alpha(&feeling.affect_id),
+        );
+        feeling.occurrences = feeling.occurrences.saturating_add(1);
+        if let Some(text) = text {
+            feeling.summary = text.summary.clone();
+            feeling.reason = text.reason.clone();
+        }
+        if !feeling.evidence_context_ids.contains(&felt.context_id) {
+            feeling.evidence_context_ids.push(felt.context_id.clone());
+        }
+        if !feeling.evidence_reason_ids.contains(&felt.reason_id) {
+            feeling.evidence_reason_ids.push(felt.reason_id.clone());
+        }
+        for signal in &candidate.evidence_signals {
+            if !feeling.evidence_signals.contains(signal) {
+                feeling.evidence_signals.push(signal.clone());
+            }
+        }
+        out.extend(feeling_envelope(
+            hive_id,
+            writer,
+            comm,
+            ts,
+            CognitionDurableOp::Upsert,
+            feeling,
+        ));
+    }
+    out
+}
+
+/// A feeling's durable row (`storage.cognition.episodes`).
+fn feeling_envelope(
+    hive_id: &str,
+    writer: &str,
+    comm: &CognitionCommunicationRef,
+    ts: &str,
+    op: CognitionDurableOp,
+    feeling: &EpisodeState,
+) -> Option<(&'static str, Vec<u8>)> {
+    let data = CognitionEpisodeData {
+        affect_id: feeling.affect_id.clone(),
+        title: feeling.title.clone(),
+        summary: feeling.summary.clone(),
+        owner: Some(feeling.owner.clone()),
+        context_id: Some(feeling.context_id.clone()),
+        context_label: Some(feeling.context_label.clone()),
+        status: Some(feeling.status.clone()),
+        scope_id: Some(feeling.scope_id.clone()),
+        base_intensity: Some(feeling.base_intensity),
+        evidence_strength: Some(feeling.evidence_strength),
+        evidence_context_ids: feeling.evidence_context_ids.clone(),
+        evidence_reason_ids: feeling.evidence_reason_ids.clone(),
+        evidence_signals: feeling.evidence_signals.clone(),
+        weight: Some(feeling.weight),
+        weight_avg_cumulative: Some(feeling.weight_avg_cumulative),
+        weight_avg_ema: Some(feeling.weight_avg_ema),
+        weight_samples: Some(feeling.weight_samples),
+        occurrences: Some(feeling.occurrences),
+        reason: Some(feeling.reason.clone()),
+        created_at: Some(feeling.created_at.clone()),
+        last_felt_at: Some(feeling.last_felt_at.clone()),
+        closed_at: feeling.closed_at.clone(),
+    };
+    let body = serde_json::to_vec(&CognitionDurableEnvelope::new(
         CognitionDurableEntity::Episode,
-        CognitionDurableOp::Upsert,
-        episode.episode_id.clone(),
+        op,
+        feeling.episode_id.clone(),
         Some(comm),
         hive_id.to_string(),
         writer.to_string(),
         ts.to_string(),
         data,
-    )) {
-        out.push((SUBJECT_STORAGE_COGNITION_EPISODES, body));
-    }
-
-    out
+    ))
+    .ok()?;
+    Some((SUBJECT_STORAGE_COGNITION_EPISODES, body))
 }
 
-/// The deterministic episode gate: an affect fires only on these canonical + extra signal
-/// combinations. The summary and reason are the narrative summarizer's.
-fn build_episode_candidate(
+/// The deterministic episode gate: each affect fires on its own combination of canonical and affect
+/// signals, so one turn may show several (FINDINGS A-155). The summary and reason are the narrative
+/// summarizer's.
+fn build_episode_candidates(
     tagger: &SemanticTaggerOutput,
     context: &ContextState,
-) -> Option<EpisodeCandidate> {
-    let extra_signals: HashSet<&str> = tagger
-        .reason_signals_extra
-        .iter()
-        .map(String::as_str)
-        .collect();
+) -> Vec<EpisodeCandidate> {
+    let affect_signals: HashSet<&str> = tagger.affect_signals.iter().map(String::as_str).collect();
     let canonical_signals: HashSet<&str> = tagger
         .reason_signals_canonical
         .iter()
         .map(String::as_str)
         .collect();
-
-    let mut affect_id = None;
-    let mut title = String::new();
-    let mut evidence_signals = Vec::new();
-    let mut base_intensity = 0.0;
-    let mut evidence_strength = 0.0;
-
-    if extra_signals.contains("frustration")
-        && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
-    {
-        affect_id = Some("anger".to_string());
-        title = format!("Friction around {}", context.label);
-        evidence_signals.extend(["frustration".to_string(), "challenge".to_string()]);
-        base_intensity = 8.0;
-        evidence_strength = 9.0;
-    } else if extra_signals.contains("escalation")
-        && (canonical_signals.contains("protect") || canonical_signals.contains("challenge"))
-    {
-        affect_id = Some("escalation".to_string());
-        title = format!("Escalation around {}", context.label);
-        evidence_signals.extend(["escalation".to_string(), "protect".to_string()]);
-        base_intensity = 8.0;
-        evidence_strength = 9.0;
-    } else if extra_signals.contains("urgency")
-        && canonical_signals.contains("resolve")
-        && canonical_signals.contains("request")
-    {
-        affect_id = Some("urgency".to_string());
-        title = format!("Urgent push on {}", context.label);
-        evidence_signals.extend([
-            "urgency".to_string(),
-            "request".to_string(),
-            "resolve".to_string(),
-        ]);
-        base_intensity = 7.0;
-        evidence_strength = 8.0;
-    }
-
-    if base_intensity < COGNITION_EPISODE_MIN_INTENSITY
-        || evidence_strength < COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH
-    {
-        return None;
-    }
-
-    Some(EpisodeCandidate {
-        affect_id: affect_id?,
+    let candidate = |affect_id: &str,
+                     title: String,
+                     evidence_signals: &[&str],
+                     base_intensity: f64,
+                     evidence_strength: f64| EpisodeCandidate {
+        affect_id: affect_id.to_string(),
         title,
         base_intensity,
         evidence_strength,
-        evidence_signals,
-    })
+        evidence_signals: evidence_signals.iter().map(ToString::to_string).collect(),
+    };
+
+    let mut out = Vec::new();
+    if affect_signals.contains("frustration")
+        && (canonical_signals.contains("challenge") || canonical_signals.contains("resolve"))
+    {
+        out.push(candidate(
+            "anger",
+            format!("Friction around {}", context.label),
+            &["frustration", "challenge"],
+            8.0,
+            9.0,
+        ));
+    }
+    if affect_signals.contains("escalation")
+        && (canonical_signals.contains("protect") || canonical_signals.contains("challenge"))
+    {
+        out.push(candidate(
+            "escalation",
+            format!("Escalation around {}", context.label),
+            &["escalation", "protect"],
+            8.0,
+            9.0,
+        ));
+    }
+    if affect_signals.contains("urgency")
+        && canonical_signals.contains("resolve")
+        && canonical_signals.contains("request")
+    {
+        out.push(candidate(
+            "urgency",
+            format!("Urgent push on {}", context.label),
+            &["urgency", "request", "resolve"],
+            7.0,
+            8.0,
+        ));
+    }
+    out.retain(|candidate| {
+        candidate.base_intensity >= COGNITION_EPISODE_MIN_INTENSITY
+            && candidate.evidence_strength >= COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH
+    });
+    out
 }
 
 fn build_scope_upsert_events(
@@ -5048,9 +5387,10 @@ mod tests {
                 "Memory of {} driven by {}.",
                 input.context_label, input.reason_label
             );
-            let episode = input.episode_affect_id.map(|affect| EpisodeNarrative {
-                summary: format!("AI episode summary ({affect})."),
-                reason: format!("AI episode reason ({affect})."),
+            let affects = input.episode_affects.join(", ");
+            let episode = (!affects.is_empty()).then(|| EpisodeNarrative {
+                summary: format!("AI episode summary ({affects})."),
+                reason: format!("AI episode reason ({affects})."),
             });
             async move {
                 Ok(NarrativeSummaries {
@@ -5065,7 +5405,16 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
-    /// One turn through the live path, with a canned narrative instead of the AI.
+    /// A person of the tests, by their ILK and name.
+    fn person(ilk: &str, name: &str) -> MemoryTurnParty {
+        MemoryTurnParty {
+            ilk: Some(ilk.to_string()),
+            name: Some(name.to_string()),
+            kind: Some("person".to_string()),
+        }
+    }
+
+    /// One turn of Juan's through the live path, with a canned narrative instead of the AI.
     async fn live_turn(
         thread: &mut ThreadCognitionState,
         seq: u64,
@@ -5092,19 +5441,50 @@ mod tests {
         canonical: &[&str],
         extra: &[&str],
     ) -> Vec<(&'static str, Vec<u8>)> {
+        live_turn_by(
+            thresholds,
+            Some(&person("ilk:juan", "Juan")),
+            thread,
+            seq,
+            tags,
+            canonical,
+            extra,
+        )
+        .await
+    }
+
+    /// One turn through the live path, written by `owner`, a person, or with no owner: the agent's
+    /// own answer.
+    async fn live_turn_by(
+        thresholds: &CognitionThresholds,
+        owner: Option<&MemoryTurnParty>,
+        thread: &mut ThreadCognitionState,
+        seq: u64,
+        tags: &[&str],
+        canonical: &[&str],
+        extra: &[&str],
+    ) -> Vec<(&'static str, Vec<u8>)> {
         let tagger = SemanticTaggerOutput {
             tags: strings(tags),
             reason_signals_canonical: strings(canonical),
             reason_signals_extra: strings(extra),
+            affect_signals: strings(extra),
         };
         let ts = format!("2026-01-01T{:02}:{:02}:00Z", seq / 60, seq % 60);
+        let (src_ilk, dst_ilk) = match owner {
+            Some(owner) => (owner.ilk.as_deref(), Some(TEST_AGENT)),
+            None => (Some(TEST_AGENT), Some("ilk:juan")),
+        };
+        let speaker = owner.and_then(party_words);
         let mut out = update_thread_state_and_build_envelopes(
             "motherbee",
             "SY.cognition@motherbee",
             TEST_THREAD,
             TEST_AGENT,
-            Some("ilk:juan"),
-            Some("ilk:agent"),
+            src_ilk,
+            dst_ilk,
+            owner,
+            speaker.as_deref(),
             &tagger,
             thresholds,
             "test-key",
@@ -5256,7 +5636,7 @@ mod tests {
             published.extend(live_turn(&mut reference, seq, turn.0, turn.1, turn.2).await);
         }
 
-        let mut rebuilt = build_communication_state(&key(TEST_THREAD), durable_rows(&published));
+        let mut rebuilt = build_communication_state(durable_rows(&published));
         let scope = rebuilt.active_scope.clone().expect("open scope rebuilt");
         assert_eq!(
             Some(&scope.scope_id),
@@ -5597,24 +5977,406 @@ mod tests {
     #[test]
     fn the_episode_gate_needs_its_signal_combination() {
         let context = context_state("billing");
-        let tagger = |canonical: &[&str], extra: &[&str]| SemanticTaggerOutput {
+        let tagger = |canonical: &[&str], affect: &[&str]| SemanticTaggerOutput {
             tags: strings(&["billing"]),
             reason_signals_canonical: strings(canonical),
-            reason_signals_extra: strings(extra),
+            affect_signals: strings(affect),
+            ..SemanticTaggerOutput::default()
         };
-        assert!(
-            build_episode_candidate(&tagger(&["inform"], &["frustration"]), &context).is_none()
+        let affects = |canonical: &[&str], affect: &[&str]| {
+            build_episode_candidates(&tagger(canonical, affect), &context)
+                .into_iter()
+                .map(|candidate| candidate.affect_id)
+                .collect::<Vec<_>>()
+        };
+        assert!(affects(&["inform"], &["frustration"]).is_empty());
+        assert!(affects(&["resolve", "challenge"], &[]).is_empty());
+        let urgency =
+            build_episode_candidates(&tagger(&["resolve", "request"], &["urgency"]), &context);
+        assert_eq!(urgency.len(), 1);
+        assert_eq!(urgency[0].affect_id, "urgency");
+        assert_eq!(urgency[0].title, "Urgent push on billing");
+        assert_eq!(urgency[0].base_intensity, 7.0);
+        assert_eq!(urgency[0].evidence_strength, 8.0);
+        // Each affect has its own gate, so one turn may show several (the review of 2026-11-05).
+        assert_eq!(
+            affects(&["challenge", "abandon"], &["frustration", "escalation"]),
+            ["anger", "escalation"]
         );
-        assert!(
-            build_episode_candidate(&tagger(&["resolve", "challenge"], &[]), &context).is_none()
+        assert_eq!(
+            affects(
+                &["resolve", "challenge", "request"],
+                &["frustration", "urgency", "escalation"]
+            ),
+            ["anger", "escalation", "urgency"]
         );
-        let candidate =
-            build_episode_candidate(&tagger(&["resolve", "request"], &["urgency"]), &context)
-                .expect("urgency candidate");
-        assert_eq!(candidate.affect_id, "urgency");
-        assert_eq!(candidate.title, "Urgent push on billing");
-        assert_eq!(candidate.base_intensity, 7.0);
-        assert_eq!(candidate.evidence_strength, 8.0);
+    }
+
+    /// A turn that shows two affects raises both feelings, and lets neither fade; the owner's other
+    /// feelings fade. The narrator writes one text for the moment.
+    #[tokio::test]
+    async fn a_turn_that_shows_two_affects_raises_both() {
+        let ana = person("ilk:ana", "Ana");
+        let mut thread = ThreadCognitionState::default();
+        says(
+            &mut thread,
+            Some(&ana),
+            1,
+            (&["billing"], &["resolve", "request"], &["urgency"]),
+        )
+        .await;
+        assert_eq!(feeling(&thread, "ilk:ana", "urgency").weight, 1.75);
+        let out = says(
+            &mut thread,
+            Some(&ana),
+            2,
+            (
+                &["billing"],
+                &["challenge", "resolve"],
+                &["frustration", "escalation"],
+            ),
+        )
+        .await;
+        assert_eq!(
+            envelopes_of(&out, SUBJECT_STORAGE_COGNITION_EPISODES).len(),
+            2
+        );
+        for affect in ["anger", "escalation"] {
+            let shown = feeling(&thread, "ilk:ana", affect);
+            assert_eq!(shown.weight, 2.0, "{affect}");
+            assert_eq!(shown.summary, "AI episode summary (anger, escalation).");
+        }
+        let urgency = feeling(&thread, "ilk:ana", "urgency");
+        assert!((urgency.weight - 1.75 * feeling_decay("urgency")).abs() < 1e-12);
+    }
+
+    /// Angry on billing: the tagger's signals that pass the anger gate.
+    const ANGRY: (&[&str], &[&str], &[&str]) =
+        (&["billing"], &["resolve", "challenge"], &["frustration"]);
+    /// Calm on billing: no feeling.
+    const CALM: (&[&str], &[&str], &[&str]) = (&["billing"], &["inform"], &[]);
+
+    async fn says(
+        thread: &mut ThreadCognitionState,
+        owner: Option<&MemoryTurnParty>,
+        seq: u64,
+        (tags, canonical, extra): (&[&str], &[&str], &[&str]),
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        live_turn_by(
+            &CognitionThresholds::default(),
+            owner,
+            thread,
+            seq,
+            tags,
+            canonical,
+            extra,
+        )
+        .await
+    }
+
+    fn feeling<'a>(
+        thread: &'a ThreadCognitionState,
+        owner: &str,
+        affect: &str,
+    ) -> &'a EpisodeState {
+        &thread.episodes[&feeling_key(owner, affect, "billing")]
+    }
+
+    /// A feeling is its owner's (docs/cognition-hands-v1.md §10.3): Ana's anger stays while Pedro
+    /// talks, fades only with Ana's own calm turns, by the root of anger's inertia, and closes on the
+    /// 64th of them. Its row names her, the context and the step.
+    #[tokio::test]
+    async fn a_feeling_is_its_owners_and_fades_with_their_own_turns() {
+        let (ana, pedro) = (person("ilk:ana", "Ana"), person("ilk:pedro", "Pedro"));
+        let mut thread = ThreadCognitionState::default();
+        let out = says(&mut thread, Some(&ana), 1, ANGRY).await;
+        let rows = envelopes_of(&out, SUBJECT_STORAGE_COGNITION_EPISODES);
+        assert_eq!(rows.len(), 1);
+        let row: CognitionEpisodeData = serde_json::from_value(rows[0].data.clone()).expect("row");
+        assert_eq!(row.owner.as_ref(), Some(&ana));
+        assert_eq!(row.affect_id, "anger");
+        assert_eq!(row.context_label.as_deref(), Some("billing"));
+        assert_eq!(row.weight, Some(2.0));
+        assert_eq!(row.summary, "AI episode summary (anger).");
+
+        for seq in 2..=11 {
+            says(&mut thread, Some(&pedro), seq, CALM).await;
+        }
+        assert_eq!(feeling(&thread, "ilk:ana", "anger").weight, 2.0);
+
+        let decay = feeling_decay("anger");
+        assert!((decay - 0.85f64.powf(0.2)).abs() < 1e-12);
+        let mut closed_on = None;
+        for calm in 1..=70u64 {
+            says(&mut thread, Some(&ana), 11 + calm, CALM).await;
+            let anger = feeling(&thread, "ilk:ana", "anger");
+            if anger.status == "closed" {
+                closed_on = Some(calm);
+                assert!(anger.closed_at.is_some());
+                break;
+            }
+            assert!((anger.weight - 2.0 * decay.powi(calm as i32)).abs() < 1e-9);
+        }
+        assert_eq!(closed_on, Some(64));
+        assert_eq!(
+            feeling(&thread, "ilk:ana", "anger").last_felt_at,
+            "2026-01-01T00:01:00Z",
+            "last felt on her angry turn"
+        );
+    }
+
+    /// A feeling that comes back builds up: anger on four turns in a row reads `strong`, once
+    /// `present`, and fading under one step `faint`. Each affect's inertia sets its decay: urgency
+    /// twice a context's half-life, anger five times, escalation ten.
+    #[tokio::test]
+    async fn a_feeling_that_comes_back_builds_up() {
+        let ana = person("ilk:ana", "Ana");
+        let mut thread = ThreadCognitionState::default();
+        says(&mut thread, Some(&ana), 1, ANGRY).await;
+        let level = |thread: &ThreadCognitionState| {
+            let anger = feeling(thread, "ilk:ana", "anger");
+            feeling_level(anger.weight, feeling_step(anger.base_intensity))
+        };
+        assert_eq!(level(&thread), "present");
+        for seq in 2..=4 {
+            says(&mut thread, Some(&ana), seq, ANGRY).await;
+        }
+        let anger = feeling(&thread, "ilk:ana", "anger");
+        let d = feeling_decay("anger");
+        assert!((anger.weight - 2.0 * (1.0 + d + d * d + d * d * d)).abs() < 1e-9);
+        assert_eq!(anger.occurrences, 4);
+        assert_eq!(level(&thread), "strong");
+
+        let mut thread = ThreadCognitionState::default();
+        says(&mut thread, Some(&ana), 1, ANGRY).await;
+        says(&mut thread, Some(&ana), 2, CALM).await;
+        assert_eq!(level(&thread), "faint");
+
+        let half_life = |affect: &str| 0.5f64.ln() / feeling_decay(affect).ln();
+        let context_half_life = 0.5f64.ln() / COGNITION_CONTEXT_DECAY_FACTOR.ln();
+        for (affect, inertia) in [("urgency", 2.0), ("anger", 5.0), ("escalation", 10.0)] {
+            assert!((half_life(affect) / context_half_life - inertia).abs() < 1e-9);
+        }
+        assert_eq!(feeling_step(8.0), 2.0);
+        assert_eq!(feeling_step(7.0), 1.75);
+    }
+
+    /// The agent's own answer shows no feeling and moves none: an agent has no feelings, and the
+    /// person's turns are their feelings' clock.
+    #[tokio::test]
+    async fn the_agents_own_answer_shows_and_moves_no_feeling() {
+        let juan = person("ilk:juan", "Juan");
+        let mut thread = ThreadCognitionState::default();
+        says(&mut thread, Some(&juan), 1, ANGRY).await;
+        let out = says(&mut thread, None, 2, ANGRY).await;
+        assert!(envelopes_of(&out, SUBJECT_STORAGE_COGNITION_EPISODES).is_empty());
+        assert_eq!(thread.episodes.len(), 1);
+        assert_eq!(feeling(&thread, "ilk:juan", "anger").weight, 2.0);
+    }
+
+    fn feeling_state(
+        owner: &str,
+        affect: &str,
+        context: &str,
+        weight: f64,
+        felt: &str,
+    ) -> EpisodeState {
+        EpisodeState {
+            episode_id: format!("episode:{owner}:{affect}:{context}"),
+            owner: person(owner, owner.trim_start_matches("ilk:")),
+            affect_id: affect.to_string(),
+            context_id: format!("context:{context}"),
+            context_label: context.to_string(),
+            scope_id: "scope:1".to_string(),
+            title: format!("Friction around {context}"),
+            summary: "x".repeat(400),
+            reason: String::new(),
+            base_intensity: 8.0,
+            evidence_strength: 9.0,
+            evidence_context_ids: Vec::new(),
+            evidence_reason_ids: Vec::new(),
+            evidence_signals: Vec::new(),
+            weight,
+            weight_avg_cumulative: weight,
+            weight_avg_ema: weight,
+            weight_samples: 1,
+            occurrences: 1,
+            status: "open".to_string(),
+            created_at: felt.to_string(),
+            last_felt_at: felt.to_string(),
+            closed_at: None,
+        }
+    }
+
+    /// The package carries the open feelings, the heaviest first and the most recently felt on a
+    /// tie, 12 at most, each with its owner, affect, context, level, when last felt and its text
+    /// cut at 300 characters. A closed one stays out.
+    #[test]
+    fn the_package_carries_the_open_feelings_by_weight() {
+        let mut thread = ThreadCognitionState::default();
+        for index in 0..14u32 {
+            let feeling = feeling_state(
+                &format!("ilk:p{index}"),
+                "anger",
+                "billing",
+                1.0 + f64::from(index),
+                "2026-01-01T00:00:00Z",
+            );
+            thread.episodes.insert(feeling.episode_id.clone(), feeling);
+        }
+        let mut closed =
+            feeling_state("ilk:gone", "anger", "billing", 99.0, "2026-01-01T00:00:00Z");
+        closed.status = "closed".to_string();
+        thread.episodes.insert(closed.episode_id.clone(), closed);
+        let older = feeling_state("ilk:tie", "urgency", "access", 13.5, "2026-01-01T00:00:00Z");
+        let newer = feeling_state("ilk:tie", "anger", "access", 13.5, "2026-01-02T00:00:00Z");
+        for feeling in [older, newer] {
+            thread.episodes.insert(feeling.episode_id.clone(), feeling);
+        }
+
+        let package = build_memory_package_for_thread(TEST_THREAD, &thread);
+        assert_eq!(package.package_version, MEMORY_PACKAGE_VERSION);
+        assert_eq!(package.episodes.len(), COGNITION_PACKAGE_MAX_FEELINGS);
+        let first = &package.episodes[0];
+        assert_eq!(first.owner.ilk.as_deref(), Some("ilk:p13"));
+        assert_eq!(first.weight, 14.0);
+        assert_eq!(first.level, "strong");
+        assert_eq!(
+            first.summary.chars().count(),
+            COGNITION_FEELING_TEXT_MAX_CHARS
+        );
+        assert_eq!(
+            (
+                package.episodes[1].affect.as_str(),
+                package.episodes[2].affect.as_str()
+            ),
+            ("anger", "urgency"),
+            "on a tie, the most recently felt first"
+        );
+        assert!(package
+            .episodes
+            .iter()
+            .all(|feeling| feeling.owner.ilk.as_deref() != Some("ilk:gone")));
+        assert_eq!(
+            package
+                .truncated
+                .as_ref()
+                .map(|truncated| truncated.dropped_episodes),
+            Some(4)
+        );
+    }
+
+    /// A rebuilt communication keys its feelings as the live path does, by owner, affect and
+    /// context, and goes on moving them; a row from before feelings had owners is left out.
+    #[tokio::test]
+    async fn a_rebuild_keeps_each_owners_feelings() {
+        let (ana, pedro) = (person("ilk:ana", "Ana"), person("ilk:pedro", "Pedro"));
+        let mut reference = ThreadCognitionState::default();
+        let mut published = Vec::new();
+        published.extend(says(&mut reference, Some(&ana), 1, ANGRY).await);
+        published.extend(says(&mut reference, Some(&pedro), 2, ANGRY).await);
+        // A row of 0.1.101: an episode with no owner nor context.
+        let legacy = CognitionDurableEnvelope::new(
+            CognitionDurableEntity::Episode,
+            CognitionDurableOp::Upsert,
+            "episode:legacy".to_string(),
+            Some(&CognitionCommunicationRef {
+                thread_id: TEST_THREAD.to_string(),
+                agent_ilk: TEST_AGENT.to_string(),
+                turn: 1,
+            }),
+            "motherbee".to_string(),
+            "SY.cognition@motherbee".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            CognitionEpisodeData {
+                affect_id: "anger".to_string(),
+                title: "Friction around billing".to_string(),
+                summary: "Old.".to_string(),
+                ..CognitionEpisodeData::default()
+            },
+        );
+        published.push((
+            SUBJECT_STORAGE_COGNITION_EPISODES,
+            serde_json::to_vec(&legacy).expect("legacy row"),
+        ));
+
+        let mut rebuilt = build_communication_state(durable_rows(&published));
+        assert_eq!(
+            sorted_keys(&rebuilt.episodes),
+            sorted_keys(&reference.episodes)
+        );
+        assert_eq!(rebuilt.episodes.len(), 2);
+        says(&mut reference, Some(&ana), 3, CALM).await;
+        says(&mut rebuilt, Some(&ana), 3, CALM).await;
+        for owner in ["ilk:ana", "ilk:pedro"] {
+            let (live, back) = (
+                feeling(&reference, owner, "anger"),
+                feeling(&rebuilt, owner, "anger"),
+            );
+            assert!((live.weight - back.weight).abs() < 1e-9);
+            assert_eq!(live.weight_samples, back.weight_samples);
+        }
+    }
+
+    /// An item's averages follow its weight over every turn it is open, and its `last_seen_at` stays
+    /// at the last turn that named it (FINDINGS A-156).
+    #[tokio::test]
+    async fn the_averages_follow_the_weight_and_last_seen_stays() {
+        let mut thread = ThreadCognitionState::default();
+        live_turn(&mut thread, 1, &["billing"], &["inform"], &[]).await;
+        live_turn(&mut thread, 2, &["shipping"], &["inform"], &[]).await;
+        live_turn(&mut thread, 3, &["shipping"], &["inform"], &[]).await;
+        let billing = &thread.contexts["billing"];
+        assert_eq!(billing.weight_samples, 3);
+        assert!((billing.weight - 0.7225).abs() < 1e-12);
+        assert!((billing.weight_avg_cumulative - (1.0 + 0.85 + 0.7225) / 3.0).abs() < 1e-12);
+        let ema = 0.25 * 0.7225 + 0.75 * (0.25 * 0.85 + 0.75 * 1.0);
+        assert!((billing.weight_avg_ema - ema).abs() < 1e-12);
+        assert_eq!(billing.last_seen_at, "2026-01-01T00:01:00Z");
+        // A reason named every turn averages its rising weight, no longer the constant score.
+        let reason = &thread.reasons["information exchange"];
+        assert!((reason.weight_avg_cumulative - (1.0 + 1.75 + 2.3125) / 3.0).abs() < 1e-12);
+    }
+
+    /// The narrator reads who spoke, and a turn names whose feelings it moves: a person who wrote to
+    /// the agent, not the agent nor a WF; an ILK the identity does not know counts as a person's.
+    #[test]
+    fn a_turn_names_its_speaker_and_the_owner_of_its_feelings() {
+        let facts = |ilk: &str| match ilk {
+            "ilk:person" => Some(IlkFacts {
+                ilk_type: "human".to_string(),
+                name: Some("Ana Pérez".to_string()),
+            }),
+            "ilk:wf" => Some(IlkFacts {
+                ilk_type: "agent".to_string(),
+                name: Some("WF.sales@motherbee".to_string()),
+            }),
+            _ => None,
+        };
+        let ana = person_says("me cobraron dos veces");
+        assert_eq!(
+            narrator_speaker(&ana, TEST_AGENT_NODE, facts).as_deref(),
+            Some("person Ana Pérez (ilk:person)")
+        );
+        assert_eq!(
+            feeling_owner(&ana, TEST_AGENT_NODE, facts),
+            Some(person("ilk:person", "Ana Pérez"))
+        );
+        let mut answer = agent_says("lo resolvemos");
+        answer.meta.dst_ilk = Some("ilk:person".to_string());
+        assert_eq!(
+            narrator_speaker(&answer, TEST_AGENT_NODE, facts).as_deref(),
+            Some("the agent, answering person Ana Pérez (ilk:person)")
+        );
+        assert_eq!(feeling_owner(&answer, TEST_AGENT_NODE, facts), None);
+        let mut wf_text = person_says("Ana no contesta hace 2 días");
+        wf_text.meta.context = Some(json!({"writer": {"ilk": "ilk:wf"}}));
+        assert_eq!(feeling_owner(&wf_text, TEST_AGENT_NODE, facts), None);
+        let unknown = turn_copy("IO.api@motherbee", Some("ilk:new"), text("hola"));
+        assert_eq!(
+            feeling_owner(&unknown, TEST_AGENT_NODE, facts).and_then(|owner| owner.ilk),
+            Some("ilk:new".to_string())
+        );
     }
 
     /// A close threshold is the weight under which an open entity closes, taken as set; a
@@ -6498,8 +7260,7 @@ mod tests {
             serde_json::to_value(&row).expect("row")
         })
         .collect();
-        let loaded =
-            build_communication_state(&key(TEST_THREAD), rebuild_rows_from_envelopes(stored));
+        let loaded = build_communication_state(rebuild_rows_from_envelopes(stored));
         assert_eq!(loaded.turns, held.turns);
         assert_eq!(loaded.src_ilk.as_deref(), Some("ilk:supervisor"));
 

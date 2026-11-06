@@ -1958,7 +1958,8 @@ WHERE cognition_episodes.source_turn <= EXCLUDED.source_turn
                 &envelope.data.evidence_context_ids,
                 &envelope.data.evidence_reason_ids,
                 &envelope.data.evidence_signals,
-                &envelope.data.intensity,
+                // A feeling's intensity is its weight now (docs/cognition-hands-v1.md §10.3).
+                &envelope.data.weight,
                 &envelope.data.reason,
                 &envelope.data.created_at,
                 &payload,

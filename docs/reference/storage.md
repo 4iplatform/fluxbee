@@ -341,6 +341,9 @@ One row per copied message. Columns: `dedupe_key`, `ts`, `stored_at`, `from_ilk`
   communication (`communication_id`). A scope is reached through its instances.
 - **Each row** stores columns for fast reads and the whole envelope in `payload` (JSONB), plus
   `entity_version`, `writer`, `source_ts` and `updated_at`.
+- **A feeling** (`cognition_episodes`, docs/cognition-hands-v1.md §10.3): its `intensity` column
+  holds its weight now. Its owner, context, status, averages and when it was last felt are in
+  `payload` only, which is what a rebuild reads.
 - **The guard:** an upsert replaces a row only if its turn is equal or later
   (`WHERE ... source_turn <= EXCLUDED.source_turn`). A late retry, or a cognition that booted
   empty, never moves it back.

@@ -32,8 +32,8 @@ use fluxbee_sdk::managed_control_plane::{
 use fluxbee_sdk::message_trace;
 use fluxbee_sdk::message_writer::{self, IlkFacts, Writer};
 use fluxbee_sdk::protocol::{
-    MemoryPackage, MemoryTurn, MemoryTurnDirection, MemoryTurnParty, MSG_CONFIG_GET,
-    MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE,
+    EpisodeSummary, MemoryPackage, MemoryTurn, MemoryTurnDirection, MemoryTurnParty,
+    MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE,
     MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
 };
 use fluxbee_sdk::{
@@ -810,7 +810,13 @@ impl AiNode for GenericAiNode {
             } else {
                 (extract_text(&msg.payload).unwrap_or_default(), None)
             };
-        let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
+        let current_writer_ilk = message_writer::writer_of(msg.meta.context.as_ref())
+            .and_then(|writer| writer.ilk)
+            .or_else(|| extract_src_ilk(&msg));
+        let cognition_block = render_memory_package_prompt_block(
+            msg.meta.memory_package.as_ref(),
+            current_writer_ilk.as_deref(),
+        );
         let trace_block = render_trace_prompt_block(msg.meta.context.as_ref());
         let wf_block = render_wf_prompt_block(
             msg.meta.context.as_ref(),
@@ -6771,7 +6777,13 @@ fn blob_name_end(bytes: &[u8], underscore: usize) -> Option<usize> {
 
 /// The communication's memory package as the model reads it, ahead of the message: its labels,
 /// memories and what was left out, then its last turns, oldest first (`render_memory_turn`).
-fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) -> Option<String> {
+/// The communication's memory as the model reads it: its labels and memories, the feelings of the
+/// people in it (those of `current_writer_ilk`, whom the agent answers, first), and its recent
+/// conversation.
+fn render_memory_package_prompt_block(
+    memory_package: Option<&MemoryPackage>,
+    current_writer_ilk: Option<&str>,
+) -> Option<String> {
     let package = memory_package?;
     let mut lines = Vec::new();
     lines.push("Conversation memory:".to_string());
@@ -6811,6 +6823,18 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
         .collect::<Vec<_>>();
     if !memory_labels.is_empty() {
         lines.push(format!("Memories: {}", memory_labels.join(", ")));
+    }
+
+    if !package.episodes.is_empty() {
+        lines.push(
+            "Feelings of the people here, those of whom you answer first, then the strongest; each: whose, what about what, how strong now, when last felt (UTC), and what was lived:"
+                .to_string(),
+        );
+        let mut feelings: Vec<&EpisodeSummary> = package.episodes.iter().collect();
+        feelings.sort_by_key(|feeling| {
+            current_writer_ilk.is_none() || feeling.owner.ilk.as_deref() != current_writer_ilk
+        });
+        lines.extend(feelings.into_iter().map(render_feeling));
     }
 
     if let Some(truncated) = package.truncated.as_ref() {
@@ -6879,12 +6903,36 @@ fn render_memory_turn(turn: &MemoryTurn) -> String {
             params => format!("chose {option} {}", one_line(params)),
         });
     }
-    // `2026-10-30T10:41:05.123Z` reads `2026-10-30 10:41`.
-    let time = match (turn.ts.get(..10), turn.ts.get(11..16)) {
+    format!(
+        "- [{}] {speaker}: {}",
+        minute_time(&turn.ts),
+        said.join(" ")
+    )
+}
+
+/// A time as the model reads it, to the minute: `2026-10-30T10:41:05.123Z` reads `2026-10-30 10:41`.
+fn minute_time(ts: &str) -> String {
+    match (ts.get(..10), ts.get(11..16)) {
         (Some(date), Some(clock)) => format!("{date} {clock}"),
-        _ => one_line(&turn.ts),
-    };
-    format!("- [{time}] {speaker}: {}", said.join(" "))
+        _ => one_line(ts),
+    }
+}
+
+/// One feeling on one line (docs/cognition-hands-v1.md §10.3): whose it is, what about what, how
+/// strong it is now, when its owner last showed it, and what was lived, as a JSON string.
+fn render_feeling(feeling: &EpisodeSummary) -> String {
+    let owner = party_label(&feeling.owner, None).unwrap_or_else(|| "someone".to_string());
+    let mut line = format!(
+        "- {owner}: {} about {}, {}, last felt {}",
+        one_line(&feeling.affect),
+        one_line(&feeling.context),
+        one_line(&feeling.level),
+        minute_time(&feeling.last_felt_at)
+    );
+    if !feeling.summary.is_empty() {
+        line.push_str(&format!(": {}", json_line(&feeling.summary)));
+    }
+    line
 }
 
 /// A party of a turn as the model reads it (docs/cognition-hands-v1.md §6): `<kind> <name> (<ILK>)`,
@@ -8345,12 +8393,65 @@ mod tests {
 
     #[test]
     fn render_memory_package_prompt_block_returns_none_when_absent() {
-        assert!(render_memory_package_prompt_block(None).is_none());
+        assert!(render_memory_package_prompt_block(None, None).is_none());
+    }
+
+    /// The feelings of the people in a communication (docs/cognition-hands-v1.md §10.3): one line
+    /// each, whose, what about what, how strong now, when last felt and what was lived; those of the
+    /// person the agent answers first, the rest in the package's order, the strongest first.
+    #[test]
+    fn the_memory_block_names_each_feeling_and_its_owner() {
+        let feeling =
+            |ilk: &str, name: &str, affect: &str, level: &str, summary: &str| EpisodeSummary {
+                episode_id: format!("episode:{ilk}:{affect}"),
+                owner: MemoryTurnParty {
+                    ilk: Some(ilk.to_string()),
+                    name: Some(name.to_string()),
+                    kind: Some("person".to_string()),
+                },
+                affect: affect.to_string(),
+                context: "billing".to_string(),
+                title: format!("{affect} around billing"),
+                level: level.to_string(),
+                weight: 2.0,
+                last_felt_at: "2026-11-05T10:05:03.123456+00:00".to_string(),
+                summary: summary.to_string(),
+            };
+        let package = MemoryPackage {
+            episodes: vec![
+                feeling(
+                    "ilk:ana",
+                    "Ana Pérez",
+                    "anger",
+                    "strong",
+                    "Third complaint about a double charge.",
+                ),
+                feeling("ilk:pedro", "Pedro Gómez", "urgency", "faint", ""),
+            ],
+            ..sample_memory_package()
+        };
+        let block = render_memory_package_prompt_block(Some(&package), Some("ilk:pedro"))
+            .expect("memory block");
+        let lines: Vec<&str> = block.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("Feelings of the people here"))
+            .expect("the feelings line");
+        assert_eq!(
+            lines[at + 1],
+            "- person Pedro Gómez (ilk:pedro): urgency about billing, faint, last felt 2026-11-05 10:05"
+        );
+        assert_eq!(
+            lines[at + 2],
+            "- person Ana Pérez (ilk:ana): anger about billing, strong, last felt 2026-11-05 10:05: \"Third complaint about a double charge.\""
+        );
+        let block = render_memory_package_prompt_block(Some(&package), None).expect("memory block");
+        assert!(block.contains("Feelings of the people here, those of whom you answer first, then the strongest; each: whose, what about what, how strong now, when last felt (UTC), and what was lived:\n- person Ana Pérez"));
     }
 
     #[test]
     fn inject_prompt_blocks_into_text_input_prefixes_cognition_block() {
-        let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
+        let block = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         let enriched = inject_prompt_blocks_into_text_input(
             "please help with this refund",
@@ -8451,7 +8552,7 @@ mod tests {
                 )
             },
         ];
-        let block = render_memory_package_prompt_block(Some(&package)).expect("memory block");
+        let block = render_memory_package_prompt_block(Some(&package), None).expect("memory block");
         assert_eq!(
             block,
             [
@@ -8624,7 +8725,7 @@ mod tests {
             "Current user message:"
         );
 
-        let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
+        let block = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         assert_eq!(
             inject_prompt_blocks_into_text_input("hola", &[&block], &label),
@@ -8649,7 +8750,7 @@ mod tests {
 
     #[test]
     fn inject_prompt_blocks_into_input_parts_adds_leading_text_part() {
-        let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
+        let block = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         let enriched = inject_prompt_blocks_into_input_parts(
             vec![fluxbee_ai_sdk::ModelContentPart::Text {
@@ -8865,7 +8966,7 @@ mod tests {
     /// block, then the message: as text and as parts alike.
     #[test]
     fn the_memory_block_comes_first_then_the_trace_and_the_wf_block_then_the_message() {
-        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
+        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
@@ -10082,7 +10183,7 @@ mod tests {
             .expect("on_message")
             .expect("a reply");
 
-        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()))
+        let memory = render_memory_package_prompt_block(Some(&sample_memory_package()), None)
             .expect("memory block");
         let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");
@@ -10125,7 +10226,8 @@ mod tests {
                 ts: format!("2026-10-30T12:{n:02}:00.000Z"),
             })
             .collect();
-        let memory = render_memory_package_prompt_block(Some(&package)).expect("memory block");
+        let memory =
+            render_memory_package_prompt_block(Some(&package), None).expect("memory block");
         assert!(memory.chars().count() > 20 * 2_000, "every turn whole");
         let trace = render_trace_prompt_block(Some(&sample_wf_context())).expect("the trace");
         let wf = render_wf_prompt_block(Some(&sample_wf_context()), None).expect("the WF's block");

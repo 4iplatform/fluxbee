@@ -333,11 +333,24 @@ pub struct CognitionMemoryData {
     pub last_seen_at: Option<String>,
 }
 
+/// A person's feeling (docs/cognition-hands-v1.md §10.3): one per owner, affect and context, with a
+/// weight its owner's turns raise and lower as a context's are, with more inertia.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CognitionEpisodeData {
     pub affect_id: String,
     pub title: String,
     pub summary: String,
+    /// The person whose turns show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::protocol::MemoryTurnParty>,
+    /// The context it is felt around.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The scope it was last felt in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,12 +363,27 @@ pub struct CognitionEpisodeData {
     pub evidence_reason_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_signals: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub intensity: Option<f64>,
+    /// Its weight now, and its averages over the turns it was open (FINDINGS A-156).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_avg_cumulative: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_avg_ema: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_samples: Option<u64>,
+    /// How many of its owner's turns showed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// When its owner last showed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_felt_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
 }
 
 const fn is_zero(value: &u64) -> bool {

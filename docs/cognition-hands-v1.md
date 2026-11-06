@@ -297,8 +297,12 @@ The rest of A-137, one topic at a time:
 6. **Cognition keeps its own state; SY.storage keeps the messages:** *"cognitive tiene
    persistencia propia, storage guarda mensajes, la idea no es que sea repositorio de cognitive"*.
    Its own topic (§10.6).
+7. **The proposal of §10.3 and §10.4 is agreed, and the topic is to be finished whole:**
+   *"coincido con todo, avanza como planteas pero este tema es para terminarlo, con las
+   prioridades que creas, pero completo. Sentires está bien."* The order: the feelings with
+   A-156's two bugs, then where cognition keeps its state, then the rest of §9.
 
-### 10.3 The feelings' math (proposed; its numbers to check against the lab's code)
+### 10.3 The feelings' math (agreed 2026-11-05; its numbers to check against the lab's code)
 
 - **A feeling** is one per person, affect and context: "Ana, anger, billing". The beta keyed its
   habit counter by affect and main context.
@@ -309,6 +313,8 @@ The rest of A-137, one topic at a time:
   - The clock is the owner's own turns: Pedro writing calm does not fade Ana's anger.
   - Only a person's own turn raises a feeling. An agent's answer adds to the contexts and reasons,
     never to a feeling.
+  - Each affect has its own gate, so one turn may show several: each is raised, none of them
+    fades on that turn, and the narrator writes one text for the moment.
 - **The numbers:** a context's decay (0.85) with its half-life stretched by each affect's inertia
   (`d = 0.85^(1/k)`), and a step of the affect's base intensity over 4:
 
@@ -319,8 +325,9 @@ The rest of A-137, one topic at a time:
 | escalation | ×10 | 0.984 | 2 | 42.7 | 128th |
 | (a context, today) | ×1 | 0.85 | 1 | 4.3 | 9th |
 
-  Said every 20 turns, urgency stays at 0.5 to 2.2, anger at 2.3 to 4.2, and escalation at 5.3 to
-  7.2. Said every 40 turns, urgency goes between them, and anger and escalation stay.
+- **How they hold:** said every 20 turns, urgency stays at 0.5 to 2.2, anger at 2.3 to 4.2, and
+  escalation at 5.3 to 7.2. Said every 40 turns, urgency goes between them, and anger and
+  escalation stay.
 - **Its text:** the narrator's, as today, now knowing whose feeling it is.
 - **The memory:** one per scope, as today, now naming who said what. The narrator gets each turn's
   writer.
@@ -337,11 +344,44 @@ The rest of A-137, one topic at a time:
 - **The docs:** 12-cognition-v2 §9 loses the beta's values, and docs/reference/cognition.md §5
   says how a feeling builds up and fades.
 
-### 10.5 What the change touches
+### 10.5 Built (2026-11-05, for the next release)
 
-- SY.cognition: the feelings' key, math and narrator input.
-- The package's `EpisodeSummary`: owner, context, level, date and text.
-- ai.generic: the "Feelings" block.
+- **SY.cognition** (src/bin/sy_cognition.rs):
+  - `feeling_owner` and `narrator_speaker` read the turn's owner and speaker in `handle_turn`;
+  - `feeling_candidate`, `update_feelings_for_turn` and `feeling_envelope` move the owner's
+    feelings, with `feeling_decay`, `feeling_step`, `feeling_level` and `COGNITION_FEELING_INERTIA`;
+  - the narrator gets the speaker (`NarrativeSummarizerAiInput.speaker`), and its prompt names
+    people;
+  - the tagger names the writer's affects in a closed set, `affect_signals`, which the gate reads:
+    its free extra hints never named them, so no feeling was ever made on 8.x (FINDINGS A-157);
+  - a rebuild keys feelings by `feeling_key`, and leaves out a row with no owner;
+  - `sample_weight` keeps every item's averages over its open turns, and a turn that only decays
+    an item leaves its `last_seen_at` (A-156).
+- **The package** (crates/fluxbee_sdk/src/protocol.rs): `MEMORY_PACKAGE_VERSION` 4; an
+  `EpisodeSummary` has its owner, affect, context, level, weight, `last_felt_at` and text. The Go
+  SDK mirrors it, with the turns' `writer` and `to`, which it lacked since 0.1.101.
+- **The durable row** (`CognitionEpisodeData`): owner, context, status, weight and averages,
+  occurrences, `last_felt_at`, `closed_at`. SY.storage's `intensity` column takes the weight.
+- **ai.generic:** the "Feelings" lines (`render_feeling`), those of the person being answered
+  first.
+- **The review round** (one, 2026-11-05) found that the gate gave one affect a turn, so an
+  escalating person who was also angry never got the escalation, and a feeling the turn showed
+  could fade on it. Fixed: each affect its own gate (`build_episode_candidates`). It also found
+  the reference's word on a narrator failure (now: the feelings move, without new text), and an
+  AI node on the old runtime cannot read a package with feelings: the deploy moves the AI nodes
+  before a feeling can exist, since the first needs the new tagger.
+- **Tests:**
+  - a feeling is its owner's, and fades only with their own turns, closing on the 64th for anger;
+  - one that comes back builds up and reads `strong`, and each affect's half-life is its inertia
+    times a context's;
+  - the agent's own answer shows and moves no feeling;
+  - a turn that shows two affects raises both, and the owner's other feeling fades;
+  - the package carries the open feelings by weight, 12 at most;
+  - a rebuild keeps each owner's feelings and leaves out a row with no owner;
+  - the averages follow the weight, and `last_seen_at` stays;
+  - a turn names its speaker and its feelings' owner;
+  - the tagger's affect signals are a closed set;
+  - ai.generic's block names each feeling and its owner.
 
 No new node, message or model call. SY.storage needs no new column: a communication reloads from
 each row's `payload`.
@@ -358,3 +398,33 @@ each row's `payload`.
   messages.
 - **A-156's first defect belongs there:** an open item's decay is not stored, because each write
   is a stream record to the motherbee.
+- **More facts (verified 2026-11-05):**
+  - Only SY.cognition reads the `cognition_*` tables, through `COGNITION_STATE_GET`, to load a
+    communication. Archi and the rest never read them.
+  - The repo already embeds two stores: SQLite (`rusqlite`, bundled), which SY.vault keeps in its
+    state dir, and LanceDB, which SY.architect uses.
+  - A node's ILK is kept by its full name (`AI.sales@worker1`). A spawn may pass an existing
+    `ilk_id`, so an agent can come up on another hive as the same ILK. That case is why a
+    communication loads from SY.storage today: its state may have been made on another hive.
+  - 8.x holds only test data in those tables.
+- **The operator (2026-11-05), on the proposal below:** *"Tenemos que revisar mejor este tema… me
+  suena que es una decisión más compleja. Si podés cerrar esta etapa como está mejor, sin tocar esa
+  parte"*. So nothing of it is built: it is a topic of its own, to review whole before deciding.
+- **Proposed, not agreed:**
+  - Each hive's SY.cognition keeps its communications in its own SQLite file in its state dir,
+    one row per communication with its whole state: thread, contexts, reasons, co-occurrences,
+    scope, memories, feelings and last turns.
+  - It writes the row after each turn and each intake batch, so every decay is kept (A-156's
+    first), and loads it at start and at a communication's first turn.
+  - SY.storage keeps the messages only: the `cognition_*` tables, the `storage.cognition.*`
+    subjects and `COGNITION_STATE_GET` go, the tables dropped once and logged.
+  - **The open question:** an agent that comes up on another hive with its ILK finds its
+    communications on the old hive. The options:
+    1. SY.admin's spawn with an existing `ilk_id` hands them over, from the old hive's cognition
+       to the new one's, and reports it;
+    2. the new hive's cognition asks the others at a communication's first turn;
+    3. nothing travels: the agent starts its cognition again.
+
+    Option 1 is explicit and goes through SY.admin.
+  - **Durability:** a hive lost loses its cognition, not its messages, which stay in SY.storage.
+    The VM snapshots cover it.

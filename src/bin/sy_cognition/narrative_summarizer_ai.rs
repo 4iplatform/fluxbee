@@ -19,14 +19,19 @@ pub(super) struct NarrativeSummarizerAiInput<'a> {
     pub(super) account: &'a AiAccount,
     pub(super) config: &'a CognitionSemanticTaggerConfig,
     pub(super) thread_id: &'a str,
+    /// Who spoke the turn (docs/cognition-hands-v1.md §10.3): `person Ana Pérez (ilk:…)`, or `the
+    /// agent, answering person Ana Pérez (ilk:…)`. The memory names people by it.
+    pub(super) speaker: Option<&'a str>,
     pub(super) context_label: &'a str,
     pub(super) context_tags: &'a [String],
     pub(super) reason_label: &'a str,
     pub(super) canonical_signals: &'a [String],
     pub(super) extra_signals: &'a [String],
     pub(super) previous_memory_summary: Option<&'a str>,
-    pub(super) episode_affect_id: Option<&'a str>,
-    pub(super) episode_title: Option<&'a str>,
+    /// The affects the turn's moment shows, each with its feeling's title; the narrator writes one
+    /// text for that moment. Empty when it shows none.
+    pub(super) episode_affects: Vec<&'a str>,
+    pub(super) episode_titles: Vec<&'a str>,
     pub(super) previous_episode_summary: Option<&'a str>,
     pub(super) previous_episode_reason: Option<&'a str>,
 }
@@ -59,7 +64,7 @@ pub(super) async fn run_narrative_summarizer_ai(
 ) -> Result<NarrativeSummaries, AiSdkError> {
     let request = LlmRequest {
         model: input.config.model.clone(),
-        system: Some(build_system_prompt(input.episode_affect_id.is_some())),
+        system: Some(build_system_prompt(!input.episode_affects.is_empty())),
         input: build_user_prompt(&input),
         input_parts: None,
         max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
@@ -90,12 +95,12 @@ pub(super) async fn run_narrative_summarizer_ai(
         ))
     })??;
 
-    parse_narrative_summaries(&response.content, input.episode_affect_id.is_some())
+    parse_narrative_summaries(&response.content, !input.episode_affects.is_empty())
 }
 
 fn build_system_prompt(include_episode: bool) -> String {
     let episode_rules = if include_episode {
-        "- episode_summary: 1-2 sentences describing the concrete moment of pressure or affect.\n\
+        "- episode_summary: 1-2 sentences describing the speaker's concrete moment of pressure or affect, naming the speaker; one text for all the affects the episode_candidate lists.\n\
          - episode_reason: one short sentence explaining why this episode is being registered.\n"
             .to_string()
     } else {
@@ -109,6 +114,7 @@ fn build_system_prompt(include_episode: bool) -> String {
             "{{\"memory_summary\":string,\"episode_summary\":string|null,\"episode_reason\":string|null}}\n",
             "Rules:\n",
             "- memory_summary: concise narrative synthesis of recurring thread pattern, 1-2 sentences.\n",
+            "- speaker is who spoke this turn. Name people as the speaker names them; when the thread has several people, the memory_summary says who said or sought what.\n",
             "- preserve continuity with previous summaries when provided.\n",
             "- use only the supplied evidence. Do not invent facts, names, or timeline details.\n",
             "- mention context and dominant reason naturally.\n",
@@ -123,6 +129,7 @@ fn build_system_prompt(include_episode: bool) -> String {
 fn build_user_prompt(input: &NarrativeSummarizerAiInput<'_>) -> String {
     let body = json!({
         "thread_id": input.thread_id,
+        "speaker": input.speaker,
         "context": {
             "label": input.context_label,
             "tags": input.context_tags,
@@ -138,8 +145,8 @@ fn build_user_prompt(input: &NarrativeSummarizerAiInput<'_>) -> String {
             "episode_reason": input.previous_episode_reason,
         },
         "episode_candidate": {
-            "affect_id": input.episode_affect_id,
-            "title": input.episode_title,
+            "affects": input.episode_affects,
+            "titles": input.episode_titles,
         }
     });
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())

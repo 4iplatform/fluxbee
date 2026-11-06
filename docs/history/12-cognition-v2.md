@@ -708,6 +708,8 @@ Per period. AI returns narrative memories that fuse context+reason. Application 
 
 Unchanged from audit. Gate conditions remain the same. Evidence now includes `evidence_reason_ids` in addition to `evidence_context_ids`.
 
+Current implementation (since 2026-11-05): the gate decides whether a person's turn shows a feeling; the feeling then lives as a weighted average of its owner's turns, as a context does, with each affect's own inertia (docs/cognition-hands-v1.md §10.3). The audit this section points to is not in the repo.
+
 ---
 
 ## 9. Parameters and Thresholds
@@ -727,7 +729,7 @@ Reasons use the same structural form as contexts (score, weight, decay, EMA, ILK
 | Parameter | Value | Note |
 |-----------|-------|------|
 | `REASON_SCORE_THRESHOLD` | 4 | May diverge from context threshold as tuning reveals different sensitivities |
-| `REASON_DECAY_FACTOR` | 1.5 | Faster decay than context — reasons are more volatile |
+| `REASON_DECAY_FACTOR` | 0.75 | Multiplied each turn a reason is not named; contexts take 0.85. Faster decay than context — reasons are more volatile (the beta's 1.5 was a step, never built) |
 | `MAX_REASON_SIGNALS` | 4 | Per message |
 | `MAX_OPEN_REASONS` | 10 | Lower than MAX_OPEN_CONTEXTS (20) because reasons are fewer and more general |
 | `REASON_ILK_WEIGHT_SENDER` | 1.0 | May diverge from context ILK weights |
@@ -752,7 +754,7 @@ Context and reason ILK weights start identical but are independently configurabl
 | Parameter | Value |
 |-----------|-------|
 | `SCOPE_ENERGY_ALPHA` | 0.25 |
-| `SCOPE_ENERGY_UNBIND_THRESHOLD` | -0.05 |
+| `SCOPE_ENERGY_UNBIND_THRESHOLD` | 0.35 (a similarity in [0, 1], §8.3; the beta's −0.05 was an energy) |
 | `SCOPE_ENERGY_MIN_CTX_FOR_EVAL` | 2 |
 | `SCOPE_ENERGY_SUSTAIN_COUNT` | 2 |
 
@@ -760,7 +762,7 @@ Context and reason ILK weights start identical but are independently configurabl
 
 | Parameter | Value |
 |-----------|-------|
-| `MEMORY_DECAY_STEP` | 0.25 |
+| `MEMORY_DECAY_FACTOR` | 0.97, multiplied each turn the memory is not updated (the beta's 0.25 step, never built) |
 
 ### 9.6 Episodes
 
@@ -768,6 +770,13 @@ Context and reason ILK weights start identical but are independently configurabl
 |-----------|-------|
 | `EPISODE_MIN_FINAL_INTENSITY` | 7 |
 | `EPISODE_MIN_EVIDENCE_STRENGTH` | 8 |
+| `FEELING_INERTIA` | urgency ×2, anger ×5, escalation ×10 a context's half-life (since 2026-11-05) |
+| `FEELING_CLOSE_THRESHOLD` | 0.25 |
+
+Since 2026-11-05 an episode is a person's feeling, one per owner, affect and context, with a weight
+that builds up and fades as a context's does, with more inertia (docs/cognition-hands-v1.md §10.3,
+docs/reference/cognition.md §5). The current values of every table here are in
+docs/reference/cognition.md §5.
 
 ---
 

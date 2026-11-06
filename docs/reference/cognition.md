@@ -20,8 +20,8 @@ A function or constant named without a path lives in `sy_cognition.rs`. The wire
 
 - **What it builds:** a memory per communication for each agent: what the conversation is about
   (contexts), what it seeks (reasons), the phases it goes through (scopes), a running summary
-  (memories), notable moments (episodes), and its last 20 turns (what the agent received and
-  sent).
+  (memories), the feelings of each person in it (episodes, §5), and its last 20 turns (what the
+  agent received and sent).
 - **Two paths, two timings:** the last turns are taken when the turn arrives, ahead of any model
   call, so the next message delivered to the agent carries the turn before it (§3.4). Everything
   else comes from a worker that takes the turns one at a time, with up to two model calls each,
@@ -134,7 +134,8 @@ stays in the last turns.
    number it from 1 again. Until the turn is done, every region write keeps the communication
    (`worker_turn`), so no intake batch drops it from a full region meanwhile.
 9. **Summarizer:** one model call when the communication has an active scope (§3.2). A failure
-   skips only the memory and episode updates of this turn.
+   skips only the memory of this turn and the text of its feelings: the feelings still move, and
+   one opened by this turn has no text yet (§5).
 10. **Outputs:** the turn's envelopes go to SY.storage through the stream (§5). The copy goes back
     into what is held (`write_back_turn`): its derivations replace the held ones, and its turns
     are merged with those the intake took meanwhile. Then the memory region is rewritten (§7) and
@@ -146,10 +147,15 @@ stays in the last turns.
 
 - **Input:** the turn's text, `max_tags`, `max_reason_signals`, the eight canonical signals, and
   as hints `src_ilk`, `dst_ilk` and `ich`.
-- **Output:** a JSON object with `tags`, `reason_signals_canonical` and `reason_signals_extra`.
-  Labels are normalized and capped; canonical signals outside the list are dropped.
+- **Output:** a JSON object with `tags`, `reason_signals_canonical`, `reason_signals_extra` and
+  `affect_signals`. Labels are normalized and capped; canonical and affect signals outside their
+  sets are dropped.
 - **Canonical signals** (`COGNITION_REASON_CANONICAL_SIGNALS`): `resolve`, `inform`, `protect`,
   `connect`, `challenge`, `confirm`, `request`, `abandon`.
+- **Affect signals** (`COGNITION_AFFECT_SIGNALS`, FINDINGS A-157): the writer's own affect, from
+  `frustration`, `escalation` and `urgency`, each defined in the prompt; the words a model may vary
+  (`angry`, `deadline`) are mapped to them (`normalize_affect_signal_label`). The free extra hints
+  never named them, so before 0.1.102 no feeling was ever made.
 - **Limits:** `semantic_tagger.timeout_ms` (default 8000, `COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS`);
   1024 output tokens (`SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS`); no temperature.
 - An answer it cannot parse as that JSON object counts as an invalid output
@@ -162,12 +168,15 @@ stays in the last turns.
 `update_memories_and_episodes_for_thread`:
 
 - **When:** the communication has an active scope, with its dominant context and reason.
-- **Input:** the dominant context (label, tags), the dominant reason (label, signals), the extra
-  signals, the previous memory summary of the scope, and the episode candidate if there is one
-  (affect and title, with the previous episode text). It never sees the message text.
-- **Output:** `memory_summary`, and `episode_summary` with `episode_reason` exactly when an
-  episode candidate was sent. An empty memory summary, or a missing episode text, is an invalid
-  output.
+- **Input:** who spoke the turn (`narrator_speaker`: `person Ana Pérez (ilk:…)`, or `the agent,
+  answering person Ana Pérez (ilk:…)`), the dominant context (label, tags), the dominant reason
+  (label, signals), the extra signals, the previous memory summary of the scope, and the affects
+  the turn shows, with their titles and the text so far of the heaviest of them. It never sees
+  the message text. The memory names each person as the speaker names them
+  (docs/cognition-hands-v1.md §10.3).
+- **Output:** `memory_summary`, and `episode_summary` with `episode_reason` exactly when the
+  turn shows an affect: one text for the moment, which each feeling the turn shows takes. An empty
+  memory summary, or a missing episode text, is an invalid output.
 - **Limits:** the same `semantic_tagger.timeout_ms`, provider and model as the tagger; 1024
   output tokens (`NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS`).
 
@@ -179,7 +188,7 @@ The policy is published in `STATUS` and `CONFIG_GET` (`degraded_semantics_policy
 - no AI key, or a tagger failure: `skip_semantic_derivation_fail_open`. The turn is not
   processed;
 - a summarizer failure: `skip_narrative_update_fail_open`. The turn keeps its thread, context,
-  reason, co-occurrence and scope updates, without memory or episode;
+  reason, co-occurrence, scope and feeling updates, without the memory or the feelings' text;
 - there is no fallback without a model, and nothing in the message path waits for cognition;
 - none of these touch the last turns, which need no model (§3.4).
 
@@ -258,7 +267,7 @@ the node. Scopes and scope instances get a random UUID when they open.
 | Scope | `scope:<uuid v4>` | phase of the conversation |
 | Scope instance | `scope_instance:<uuid v4>` | opening of a scope |
 | Memory | `memory`: thread, agent, scope id | scope |
-| Episode | `episode`: thread, agent, scope instance id, affect | scope instance and affect |
+| Episode (a feeling) | `episode`: thread, agent, owner ILK, affect, context label | owner, affect and context |
 
 **Thread** (`build_thread_envelope_body`): first and last seen, the turn count, the last
 turn's `src_ilk`, `dst_ilk` and `ich`, and the last turns (§3.4). The worker sets the first
@@ -270,8 +279,10 @@ three, the intake the last two.
   its context: `weight = weight × 0.85 + 1.0` (`COGNITION_CONTEXT_DECAY_FACTOR`).
 - An open context the turn does not name decays by 0.85, and closes under
   `thresholds.context_close` (default 0.25).
-- Each one also keeps a cumulative average, an EMA (alpha 0.25) and per-ILK weights: the sender
-  adds 1.0, the receiver 0.5 (`apply_ilk_participation`).
+- Each one also keeps a cumulative average and an EMA (alpha 0.25) of its weight, over every turn
+  it is open, the turns that only decay it included (`sample_weight`, FINDINGS A-156); and per-ILK
+  weights: the sender adds 1.0, the receiver 0.5 (`apply_ilk_participation`).
+- `last_seen_at` is the last turn that named it; a turn that only decays it leaves it.
 
 **Reasons** (`build_reason_candidates`, `update_reasons_for_thread`):
 
@@ -305,18 +316,49 @@ thresholds.
 - Its summary is the summarizer's. Its weight is `weight × 0.97 + max(binding EMA, 0.25)`.
 - The communication's other memories decay by 0.97 (`COGNITION_MEMORY_DECAY_FACTOR`).
 
-**Episode** (`build_episode_candidate`, `update_episodes_for_thread`): a fixed gate on the
-turn's signals.
+**Episode, a person's feeling** (`build_episode_candidate`, `update_feelings_for_turn`;
+docs/cognition-hands-v1.md §10.3):
 
-| Affect | Extra signal | Canonical signals |
-| --- | --- | --- |
-| `anger` | `frustration` | `challenge` or `resolve` |
-| `escalation` | `escalation` | `protect` or `challenge` |
-| `urgency` | `urgency` | `resolve` and `request` |
+- **Who:** a feeling is its owner's, the person who wrote the turns that show it
+  (`feeling_owner`): a turn the agent got whose writer is a person, or an ILK the identity does
+  not know yet. The agent's own answers show and move none; neither does a WF's or another
+  agent's text, which cognition does not analyze.
+- **The gate**, fixed, on the turn's signals, with the active scope's dominant context. Each
+  affect has its own, so one turn may show several (`build_episode_candidates`):
 
-- An episode needs intensity 7 and evidence 8 (`COGNITION_EPISODE_MIN_INTENSITY`,
-  `COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH`). Its summary and reason are the summarizer's.
-- One episode per scope instance and affect; a repeat raises its intensity and adds evidence.
+| Affect | Affect signal | Canonical signals | Base intensity |
+| --- | --- | --- | --- |
+| `anger` | `frustration` | `challenge` or `resolve` | 8 |
+| `escalation` | `escalation` | `protect` or `challenge` | 8 |
+| `urgency` | `urgency` | `resolve` and `request` | 7 |
+
+  It needs intensity 7 and evidence 8 (`COGNITION_EPISODE_MIN_INTENSITY`,
+  `COGNITION_EPISODE_MIN_EVIDENCE_STRENGTH`).
+- **One per owner, affect and context.** A turn that shows it makes its weight
+  `weight × d + s`, the narrator's text replacing its own. Each other turn of the same owner makes
+  each of the owner's other open feelings `weight × d`. Other people's turns move none: each
+  person's turns are their own feelings' clock.
+- **`s`** is the base intensity over 4 (`feeling_step`): 2 for anger and escalation, 1.75 for
+  urgency, where a context adds 1.
+- **`d`** is a context's decay (0.85) to the root of the affect's inertia
+  (`COGNITION_FEELING_INERTIA`, `feeling_decay`), so its half-life is that many times a context's:
+
+| Affect | Inertia | d | Half-life (owner's turns) | Shown once, closed on its owner's turn without it |
+| --- | --- | --- | --- | --- |
+| `urgency` | ×2 | 0.922 | 8.5 | 24th |
+| `anger` | ×5 | 0.968 | 21.3 | 64th |
+| `escalation` | ×10 | 0.984 | 42.7 | 128th |
+
+  The operator set two to ten times by feeling (2026-11-05); the lab's numbers are to be checked
+  against its code.
+- **It closes** under 0.25 (`COGNITION_FEELING_CLOSE_THRESHOLD`) and opens again when it comes back,
+  from the weight it closed with.
+- **Its averages** follow its weight over its owner's turns, with a context's EMA alpha slowed by
+  the inertia (`feeling_ema_alpha`).
+- **Its level,** as the agent reads it (`feeling_level`): `strong` from three steps up, `present`
+  from one, `faint` under one.
+- **Stored** when a turn shows it and when it closes. A decay in between is not, as a context's is
+  not (FINDINGS A-156): a reload brings back its weight of the last turn that showed it.
 
 ---
 
@@ -404,7 +446,8 @@ SY.cognition never reads PostgreSQL. It asks SY.storage for a communication's st
 next turn finds what it rebuilt.
 
 - Contexts and reasons are keyed by label; co-occurrences by the two labels.
-- Memories are keyed by scope; episodes by scope instance and affect.
+- Memories are keyed by scope; feelings by owner, affect and context (`feeling_key`). A feeling
+  row with no owner, from 0.1.101 or older, is left out.
 - The active scope is the open instance with the latest start turn.
 - The last turns come from the thread row's payload.
 
@@ -451,13 +494,17 @@ intake batch, after every worker turn and after the reload (`sync_held_state`):
 **The package** (`build_memory_package_for_thread`; `MemoryPackage` in
 `crates/fluxbee_sdk/src/protocol.rs`):
 
-- `package_version` 3 (`MEMORY_PACKAGE_VERSION`) and the `thread_id`.
+- `package_version` 4 (`MEMORY_PACKAGE_VERSION`) and the `thread_id`.
 - The dominant context and reason: the open ones with the highest weight.
 - Up to 6 open contexts and 6 open reasons, by weight.
-- Up to 6 memories by weight, and 4 episodes by intensity.
+- Up to 6 memories by weight.
+- Up to 12 open feelings (`episodes`), the heaviest first, then the most recently felt
+  (`COGNITION_PACKAGE_MAX_FEELINGS`). Each has its owner (ILK, name, kind), affect, context,
+  title, level, weight, when its owner last showed it, and the narrator's text cut at 300
+  characters.
 - `turns`: the last turns, oldest first, as §3.4 keeps them (`MemoryTurn`); left out when there
   are none. The message the package rides on is not among them.
-- `truncated` counts the labels, memories and episodes left out, when any were.
+- `truncated` counts the labels, memories and feelings left out, when any were.
 - There is no byte budget and no summary cut beyond those counts; the turns are bounded at intake
   (48 KiB).
 
@@ -596,7 +643,7 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   outputs;
 - the outputs: `published_entities_total`, `publish_errors_total`;
 - the live state: active threads, open contexts, reasons and co-occurrences, active scopes,
-  memories and episodes.
+  memories and open feelings (`active_episodes_total`).
 
 Under `shm`: the capacity, the communications kept and pruned, the payload bytes and the last
 sync status.
@@ -618,3 +665,7 @@ sync status.
   parse takes longer.
 - **`memory.lance`:** `STATUS` and `CONFIG_GET` report a `memory_lance` path
   (`ensure_runtime_paths`), but nothing in SY.cognition uses it.
+- **An open item's decay is not stored** (FINDINGS A-156): a context, reason, co-occurrence or
+  feeling is written when a turn names it and when it closes. A communication loaded again takes
+  its weight of the last turn that named it. Where cognition keeps its state is the next topic of
+  docs/cognition-hands-v1.md (§10.6).

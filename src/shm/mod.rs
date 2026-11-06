@@ -4048,7 +4048,7 @@ mod tests {
     use super::*;
     use fluxbee_sdk::protocol::{
         EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
-        MemoryReasonSummary, MemorySummary,
+        MemoryReasonSummary, MemorySummary, MemoryTurnParty,
     };
     use nix::sys::mman::shm_unlink;
     use std::ffi::CString;
@@ -4106,8 +4106,18 @@ mod tests {
                     }],
                     episodes: vec![EpisodeSummary {
                         episode_id: "episode:test".to_string(),
-                        title: "Urgent billing dispute".to_string(),
-                        intensity: 7,
+                        owner: MemoryTurnParty {
+                            ilk: Some("ilk:test".to_string()),
+                            name: Some("Ana".to_string()),
+                            kind: Some("person".to_string()),
+                        },
+                        affect: "urgency".to_string(),
+                        context: "billing".to_string(),
+                        title: "Urgent push on billing".to_string(),
+                        level: "present".to_string(),
+                        weight: 1.75,
+                        last_felt_at: "2026-11-05T10:05:00+00:00".to_string(),
+                        summary: "Ana needs the refund before Friday.".to_string(),
                     }],
                     turns: Vec::new(),
                     truncated: Some(MemoryPackageTruncated {

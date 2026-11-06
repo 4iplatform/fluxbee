@@ -8,7 +8,8 @@ use serde_json::json;
 use tokio::time;
 
 use crate::{
-    CognitionSemanticTaggerConfig, SemanticTaggerOutput, COGNITION_REASON_CANONICAL_SIGNALS,
+    CognitionSemanticTaggerConfig, SemanticTaggerOutput, COGNITION_AFFECT_SIGNALS,
+    COGNITION_REASON_CANONICAL_SIGNALS,
 };
 
 /// The tagger answers one small JSON object; the cap only bounds a runaway answer. A model that
@@ -35,6 +36,8 @@ struct RawSemanticTaggerResponse {
     reason_signals_canonical: Vec<String>,
     #[serde(default)]
     reason_signals_extra: Vec<String>,
+    #[serde(default)]
+    affect_signals: Vec<String>,
 }
 
 pub(super) async fn run_semantic_tagger_ai(
@@ -92,7 +95,7 @@ fn build_system_prompt(config: &CognitionSemanticTaggerConfig) -> String {
             "You are AI.tagger inside SY.cognition.\n",
             "Return exactly one JSON object and nothing else.\n",
             "Schema:\n",
-            "{{\"tags\":[string],\"reason_signals_canonical\":[string],\"reason_signals_extra\":[string]}}\n",
+            "{{\"tags\":[string],\"reason_signals_canonical\":[string],\"reason_signals_extra\":[string],\"affect_signals\":[string]}}\n",
             "Rules:\n",
             "- tags: concise lowercase semantic labels, max {max_tags}.\n",
             "- tags should capture topics, domains, intents, soft entities, or business themes.\n",
@@ -113,16 +116,23 @@ fn build_system_prompt(config: &CognitionSemanticTaggerConfig) -> String {
             "  request = ask for action/help/information without necessarily pushing conflict.\n",
             "  abandon = cancel, stop, withdraw, disengage, close out.\n",
             "- reason_signals_extra: concise lowercase narrative hints, max {max_reason_signals}.\n",
+            "- affect_signals: the writer's own affect, only from this closed set: {affects}, and only when the text shows it; an empty list when it shows none.\n",
+            "  frustration = anger, annoyance or exasperation, or a complaint repeated or charged with emotion.\n",
+            "  escalation = threatening to go over someone's head, to leave or cancel, or to take public or legal action.\n",
+            "  urgency = a deadline or time pressure the writer states.\n",
             "- Do not include markdown, comments, code fences, or extra keys.\n",
             "- Use only evidence present in the input.\n",
             "- examples:\n",
-            "  complaint about duplicate charge and urgent refund -> tags [billing, duplicate charge, refund dispute], canonical [resolve, challenge].\n",
-            "  asking whether access was restored and wanting confirmation -> tags [account access, restoration status], canonical [inform, confirm].\n",
-            "  wants account locked because of suspicious login -> tags [account security, suspicious login], canonical [protect, request].\n"
+            "  complaint about duplicate charge and urgent refund -> tags [billing, duplicate charge, refund dispute], canonical [resolve, challenge], affect [frustration, urgency].\n",
+            "  asking whether access was restored and wanting confirmation -> tags [account access, restoration status], canonical [inform, confirm], affect [].\n",
+            "  wants account locked because of suspicious login -> tags [account security, suspicious login], canonical [protect, request], affect [urgency].\n",
+            "  third failed delivery, will cancel and report it to consumer protection -> tags [delivery failure, cancellation], canonical [challenge, abandon], affect [frustration, escalation].\n"
         ),
         max_tags = config.max_tags,
         max_reason_signals = config.max_reason_signals,
         canonical = serde_json::to_string(&COGNITION_REASON_CANONICAL_SIGNALS.to_vec())
+            .unwrap_or_else(|_| "[]".to_string()),
+        affects = serde_json::to_string(&COGNITION_AFFECT_SIGNALS.to_vec())
             .unwrap_or_else(|_| "[]".to_string()),
     )
 }
@@ -164,7 +174,37 @@ fn parse_semantic_tagger_response(
             max_reason_signals,
             None,
         ),
+        affect_signals: normalize_affect_signals(parsed.affect_signals),
     })
+}
+
+/// The writer's affects (FINDINGS A-157): each mapped to its word in `COGNITION_AFFECT_SIGNALS`
+/// (`normalize_affect_signal_label`), anything else dropped, each once.
+fn normalize_affect_signals(values: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        let affect = normalize_affect_signal_label(&normalize_freeform_label(&value));
+        if COGNITION_AFFECT_SIGNALS.contains(&affect.as_str()) && !out.contains(&affect) {
+            out.push(affect);
+        }
+    }
+    out
+}
+
+fn normalize_affect_signal_label(value: &str) -> String {
+    match value {
+        "frustration" | "frustrated" | "anger" | "angry" | "annoyance" | "annoyed"
+        | "exasperation" | "exasperated" | "irritation" | "irritated" | "upset" => {
+            "frustration".to_string()
+        }
+        "escalation" | "escalate" | "escalating" | "threat" | "threatening" => {
+            "escalation".to_string()
+        }
+        "urgency" | "urgent" | "time pressure" | "deadline" | "hurry" | "asap" => {
+            "urgency".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 fn extract_json_object(raw: &str) -> Option<&str> {
@@ -350,6 +390,30 @@ mod tests {
         assert_eq!(parsed.tags, vec!["billing", "refund"]);
         assert_eq!(parsed.reason_signals_canonical, vec!["request", "resolve"]);
         assert_eq!(parsed.reason_signals_extra, vec!["urgency", "frustration"]);
+    }
+
+    /// The writer's affects come from their own closed set, words a model may vary mapped to it,
+    /// anything else dropped (FINDINGS A-157); an answer without the field has none.
+    #[test]
+    fn affect_signals_are_a_closed_set() {
+        let raw = r#"{
+            "tags": ["billing"],
+            "reason_signals_canonical": ["challenge"],
+            "reason_signals_extra": ["third complaint this month"],
+            "affect_signals": ["Angry", "deadline", "sadness", "frustration", "Escalation"]
+        }"#;
+        let parsed = parse_semantic_tagger_response(raw, 4, 4).expect("should parse");
+        assert_eq!(
+            parsed.affect_signals,
+            vec!["frustration", "urgency", "escalation"]
+        );
+        assert_eq!(
+            parsed.reason_signals_extra,
+            vec!["third complaint this month"]
+        );
+        let without = r#"{"tags":["billing"],"reason_signals_canonical":["inform"],"reason_signals_extra":[]}"#;
+        let parsed = parse_semantic_tagger_response(without, 4, 4).expect("should parse");
+        assert!(parsed.affect_signals.is_empty());
     }
 
     #[test]

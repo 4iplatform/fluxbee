@@ -94,8 +94,9 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
-/// The `MemoryPackage` SY.cognition writes: 3 added `turns` (2026-10-30).
-pub const MEMORY_PACKAGE_VERSION: u32 = 3;
+/// The `MemoryPackage` SY.cognition writes: 3 added `turns` (2026-10-30), 4 made `episodes` a
+/// person's feelings (2026-11-05).
+pub const MEMORY_PACKAGE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPackage {
@@ -210,11 +211,26 @@ pub struct MemorySummary {
     pub dominant_reason_id: Option<String>,
 }
 
+/// A person's feeling, as the package carries it (docs/cognition-hands-v1.md §10.3): whose it is,
+/// what and about what, how strong it is now, when its owner last showed it, and its text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeSummary {
     pub episode_id: String,
+    /// The person whose turns show it.
+    pub owner: MemoryTurnParty,
+    /// `anger`, `escalation` or `urgency`.
+    pub affect: String,
+    /// The context it was felt around.
+    pub context: String,
     pub title: String,
-    pub intensity: u8,
+    /// How strong it is now: `strong`, `present` or `faint`.
+    pub level: String,
+    pub weight: f64,
+    /// When its owner last showed it (RFC 3339, UTC).
+    pub last_felt_at: String,
+    /// The narrator's text of it, cut at 300 characters; empty when it has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
