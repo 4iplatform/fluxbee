@@ -61,8 +61,8 @@ no change required
       agreed and built 2026-11-05 with A-155, A-157 and two of A-156's three: ✅ 0.1.102, its
       gate on 8.x (2026-11-06). Where cognition keeps its state, reviewed whole and agreed on
       2026-11-06 (§11), built as A-158 with A-156's first: ✅ 0.1.103, its gate on 8.x
-      (2026-11-06). The rest, agreed in the chat of 2026-11-06 (§12): its design to review
-      whole, then to build.
+      (2026-11-06). The rest, agreed in the chat of 2026-11-06 (§12), built the same day with
+      its review round's fixes, for 0.1.104.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
@@ -75,8 +75,9 @@ in 0.1.103 (2026-11-06), checked on 8.x.
 
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
   0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
-  A-156's first); the rest agreed in the chat of 2026-11-06 (cognition-hands-v1 §12: the
-  handover's lines, people with no agent, episodes as public news), its design to review whole.*
+  A-156's first); the rest agreed in the chat of 2026-11-06 and built for 0.1.104
+  (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
+  news).*
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -2134,8 +2135,22 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     - the ILK that holds an analysis's result pays for it, through its tenant;
     - the lab's POC, read: no numbers for the feelings; its episode, the social event worth
       remembering, is the one Fluxbee never took (§12.2).
-  - **Open:** the design of §12.4 is to review whole before building. §12.6 keeps handing over
-    between agents and a conversation that reaches an agent late.
+  - **Built** (2026-11-06), for 0.1.104 (cognition-hands-v1 §12.7):
+    - the router copies what a local WF sends an IO node, a relay between people; cognition joins
+      it to the communication of the agent that served the thread last on its hive, or to the
+      thread's communication with no agent, whose writer pays (`TenantSource::Writer`);
+    - one message copied twice is one turn, analyzed once;
+    - the narrator's call may propose an episode, gated as in the POC; a kept episode goes to every
+      hive's cognition by the router's broadcast, and an agent's package carries the news of the
+      people in its conversation, up to 5, which ai.generic never repeats;
+    - SY.wf-rules refuses a definition that names an agent or a WF on another hive, and the
+      handbook states it as a rule (§4.2.7);
+    - the review round (one, two reviewers): a medium, a WF that sends a person's first message
+      to the agent and to another person at once had it analyzed and paid twice, and five lows;
+      all fixed, each with its test, but one noted (a definition applied before is checked at its
+      next apply).
+  - **Open:** §12.6 keeps handing over between agents, a conversation that reaches an agent late,
+    and the numbers.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
