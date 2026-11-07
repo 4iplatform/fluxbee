@@ -80,6 +80,8 @@ def main():
     p.add_argument("--branch", help="only the runs of this branch")
     p.add_argument("--minutes", type=float, default=20, help="give up after this long (default 20)")
     a = p.parse_args()
+    # Progress shows as it happens even when the output goes to a pipe or a file.
+    sys.stdout.reconfigure(line_buffering=True)
     sha = subprocess.run(["git", "rev-parse", a.commit + "^{commit}"], capture_output=True,
                          text=True, check=True).stdout.strip()
     print("commit %s%s" % (sha[:12], " on " + a.branch if a.branch else ""))
