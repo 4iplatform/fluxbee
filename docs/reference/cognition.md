@@ -437,7 +437,8 @@ belongs to the people it is about (`src/bin/sy_cognition/episodes.rs`; docs/cogn
   contexts. Never its title or summary, nor a model's free text: a lens not among the four shows
   as `(unknown)`, and of the contexts it shows the first 4, each cut at 40 characters.
 - **Its fields** (`Episode`): an id, the lens, a title, a summary (a paragraph: what happened,
-  between whom and how it stood, never what someone feels), its state (`resolved`, `pending`,
+  between whom and how it stood, never what someone feels; its people by name or ILK, and "the
+  agent" only the AI agent, never a person), its state (`resolved`, `pending`,
   `follow_up` or `inconclusive`), its intensity, its birth time, the ILKs of its people (the
   turn's writer and whom the turn was to, `episode_people`), and where it came from.
 - **It travels once** (`publish_episode`): kept here, then sent as a system broadcast,

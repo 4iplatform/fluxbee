@@ -1046,4 +1046,6 @@ has each number.
   (§12.6).
 - **Found, A-167:** the same episode says A threatened *"to have the agent removed from the
   account"*, a line A said to B after B had written. The narrator called B, the billing person,
-  "the agent".
+  "the agent". The operator agreed on the fix the same day: the narrator's rule, for 0.1.107. An
+  episode names its people by name or ILK, and says "the agent" only of the AI agent, never of a
+  person, even one who answers for a company. A turn between people is not the agent's.

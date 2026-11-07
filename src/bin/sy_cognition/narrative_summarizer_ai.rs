@@ -138,7 +138,7 @@ fn build_system_prompt(include_feeling: bool) -> String {
             "{feeling_rules}",
             "- episode: null, or one social event between the people of this turn worth remembering, public like the news: what happened between speaker and counterpart, never what someone feels. Only for a break in the pattern: what is routine for these people is null (episode_habits counts the live episodes of each lens they already have). Conservative: when in doubt, null.\n",
             "  - lens: one of {lenses}: friction is conflict or hostility that can harm the bond; discomfort is tension, uncertainty, delay or silence; appreciation is recognition or genuine thanks; shame is being judged, exposed or rejected.\n",
-            "  - title: a few words. summary: a paragraph of two to four sentences, impersonal: what happened, between whom (named as speaker and counterpart name them), and how it stood; no feelings, no private details.\n",
+            "  - title: a few words. summary: a paragraph of two to four sentences, impersonal: what happened, between whom (named as speaker and counterpart name them), and how it stood; no feelings, no private details. The agent is only the AI agent: never call a person the agent, even one who answers for a company (billing, support). A turn between people is not the agent's, and its episode names only them.\n",
             "  - state: one of {states}. base_intensity: 0-10. novelty: -2 to 2, how far it breaks the pattern. evidence_signals: the signals it rests on. evidence_strength: 0-10. evidence_contexts: the labels among leading_contexts it rests on.\n",
             "- no markdown, no code fences, no extra keys.\n"
         ),
@@ -330,6 +330,7 @@ mod tests {
         assert!(system.contains("never what someone feels"));
         assert!(system.contains("counterpart is whom this turn was written to"));
         assert!(system.contains("the person it answered, for the agent's own answer"));
+        assert!(system.contains("never call a person the agent"));
         let account = AiAccount::charge(
             fluxbee_ai_sdk::UsageRecorder::disabled(),
             "SY.cognition@worker1",
