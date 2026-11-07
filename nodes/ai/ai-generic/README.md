@@ -219,10 +219,17 @@ On every request the node reads the key of its provider from SY.vault:
 - **A structured answer:** a message whose `meta.context.response_envelope` holds a contract
   (`json_object_v1`: `required`, `properties` of type `string`, `boolean`, `integer` or `number`, an
   optional `enum` for strings, `strict`) is answered with the contract's object, as JSON in the
-  reply's text. The tool loop has the contract in its system prompt; the call without tools, after
-  a loop that wrote nothing, asks the provider for it and checks the object. An invalid contract is
-  an `ai_runtime_error`, and an object that fails its check an `invalid_structured_output`, neither
+  reply's text. Both paths ask the provider for it: every turn of the tool loop, next to the tools,
+  with the contract also in its system prompt (FINDINGS A-150), and the call without tools, after a
+  loop that wrote nothing, which also checks the object. An invalid contract is an
+  `ai_runtime_error`, and an object that fails its check an `invalid_structured_output`, neither
   retryable.
+  - **Anthropic** holds the answer to the contract's schema on both paths (structured outputs),
+    whatever `strict` says. **OpenAI** holds it only under `strict: true`, which it accepts only
+    when every property is `required`; without it, OpenAI takes the schema as a hint, as the
+    instruction is.
+  - **The journal:** the "AI chat request prepared" line says `output_contract_mode`:
+    `structured_output` under a response contract, with tools or without them.
   - **`text_field`** names one of the contract's required `string` properties, for example
     `"text_field": "reply"`. The reply's text is then that field's value, and the whole object goes
     in the reply's `meta.context.evaluation`. The object is checked on both paths, with tools and

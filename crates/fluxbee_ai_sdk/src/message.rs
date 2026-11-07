@@ -310,9 +310,10 @@ impl MessageContract {
         }
     }
 
-    /// The schema a response contract asks the provider for, on a call without tools, and the
-    /// tool loop's instruction in the system prompt. A menu has neither: the WF's block shows the
-    /// model the menu and its answer's shape, and the answer is checked afterwards.
+    /// The schema a response contract asks the provider for, with tools and without them (FINDINGS
+    /// A-150), and the tool loop's instruction in the system prompt. A menu has neither: the WF's
+    /// block shows the model the menu and its answer's shape, and the answer is checked
+    /// afterwards.
     pub fn output_schema(&self) -> Option<&OutputSchemaSpec> {
         match self {
             Self::Envelope(contract) => Some(&contract.output_schema),

@@ -931,6 +931,13 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
         if let Some(previous_response_id) = previous_response_id {
             body["previous_response_id"] = Value::String(previous_response_id);
         }
+        // The run's answer schema goes next to the tools, as the call without tools sends it, on
+        // every turn, as the tools do: any turn without a call is the final answer.
+        if let Some(output_schema) = &request.output_schema {
+            body["text"] = json!({
+                "format": build_openai_response_format(output_schema)?,
+            });
+        }
 
         let auth = format!("Bearer {}", self.client.api_key);
         let mut call =
@@ -1365,7 +1372,8 @@ fn truncated_answer_error(provider: AiProvider, limit: &str) -> AiSdkError {
 
 /// Heuristic: an Anthropic 400 that indicates the model does not support the `output_config`
 /// structured-outputs feature (audit M4), so `generate` can retry once with a prompt-instruction
-/// fallback instead of surfacing the raw 400. Conservative — only a 400 that names the feature.
+/// fallback instead of surfacing the raw 400, and a tool turn once without it. Conservative — only
+/// a 400 that names the feature.
 fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
     let AiSdkError::Protocol(msg) = err else {
         return false;
@@ -1375,6 +1383,19 @@ fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
     }
     let lower = msg.to_ascii_lowercase();
     lower.contains("output_config") || lower.contains("json_schema") || lower.contains("structured")
+}
+
+/// The `output_config` that asks Anthropic for `output_schema`'s object (structured outputs), the
+/// same on the plain path and on a tool turn. It holds the model's text to the schema; tool calls
+/// and thinking stay free, so a tool turn can still call its tools.
+fn anthropic_output_config(output_schema: &OutputSchemaSpec) -> Result<Value> {
+    output_schema.validate()?;
+    Ok(json!({
+        "format": {
+            "type": "json_schema",
+            "schema": output_schema.json_schema(),
+        }
+    }))
 }
 
 /// Detect a silently-truncated Anthropic completion (audit A2): stop_reason="max_tokens" means
@@ -1428,15 +1449,9 @@ impl LlmClient for AnthropicMessagesClient {
             body.insert("top_p".to_string(), Value::from(top_p));
         }
         if let Some(output_schema) = &request.output_schema {
-            output_schema.validate()?;
             body.insert(
                 "output_config".to_string(),
-                json!({
-                    "format": {
-                        "type": "json_schema",
-                        "schema": output_schema.json_schema(),
-                    }
-                }),
+                anthropic_output_config(output_schema)?,
             );
         }
         // Capability fallback (audit B5/M4): output_config is sent optimistically; a model that
@@ -1602,10 +1617,34 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
         if let Some(top_p) = self.model_settings.top_p {
             body.insert("top_p".to_string(), Value::from(top_p));
         }
-        let value = self
-            .client
-            .send(&Value::Object(body), UsageKind::FunctionTurn)
-            .await?;
+        // The run's answer schema goes next to the tools on every turn, as the tools do: any turn
+        // without a call is the final answer. It is the same on every turn of a run, so the turns
+        // still read the prompt cache, which a different `output_config` would invalidate.
+        if let Some(output_schema) = &request.output_schema {
+            body.insert(
+                "output_config".to_string(),
+                anthropic_output_config(output_schema)?,
+            );
+        }
+        let mut body = Value::Object(body);
+        let value = match self.client.send(&body, UsageKind::FunctionTurn).await {
+            Ok(value) => value,
+            // A model without structured outputs refuses `output_config` (audit M4): the turn is
+            // asked again without it, and the schema reaches the model only as its caller's
+            // instruction, as on every tool turn before FINDINGS A-150.
+            Err(err)
+                if request.output_schema.is_some() && anthropic_output_config_unsupported(&err) =>
+            {
+                if let Some(body) = body.as_object_mut() {
+                    body.remove("output_config");
+                }
+                tracing::warn!(
+                    "anthropic model rejected output_config on a tool turn; retrying without it"
+                );
+                self.client.send(&body, UsageKind::FunctionTurn).await?
+            }
+            Err(err) => return Err(err),
+        };
         anthropic_check_truncation(&value)?;
         let mut assistant_text = Vec::new();
         let mut tool_calls = Vec::new();
@@ -2100,62 +2139,74 @@ mod tests {
         status_line: &'static str,
         response_body: Value,
     ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        spawn_responses_server(vec![(status_line, response_body)])
+    }
+
+    /// A server that answers one request per connection with each of `responses` in turn, and
+    /// hands over each request's body. Each answer closes its connection, so the client's next
+    /// request opens the next one.
+    fn spawn_responses_server(
+        responses: Vec<(&'static str, Value)>,
+    ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept connection");
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let mut header_end = None;
-            let mut content_length = 0usize;
+            for (status_line, response_body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
 
-            loop {
-                let n = stream.read(&mut chunk).expect("read request");
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
+                loop {
+                    let n = stream.read(&mut chunk).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
 
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-                        let end = pos + 4;
-                        header_end = Some(end);
-                        let headers = String::from_utf8_lossy(&buf[..end]);
-                        for line in headers.lines() {
-                            let lower = line.to_ascii_lowercase();
-                            if let Some(value) = lower.strip_prefix("content-length:") {
-                                content_length =
-                                    value.trim().parse::<usize>().expect("content length");
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                            let end = pos + 4;
+                            header_end = Some(end);
+                            let headers = String::from_utf8_lossy(&buf[..end]);
+                            for line in headers.lines() {
+                                let lower = line.to_ascii_lowercase();
+                                if let Some(value) = lower.strip_prefix("content-length:") {
+                                    content_length =
+                                        value.trim().parse::<usize>().expect("content length");
+                                }
                             }
+                        }
+                    }
+
+                    if let Some(end) = header_end {
+                        if buf.len() >= end + content_length {
+                            break;
                         }
                     }
                 }
 
-                if let Some(end) = header_end {
-                    if buf.len() >= end + content_length {
-                        break;
-                    }
-                }
+                let header_end = header_end.expect("header end");
+                let body_bytes = &buf[header_end..header_end + content_length];
+                let body_value: Value =
+                    serde_json::from_slice(body_bytes).expect("json request body");
+                tx.send(body_value).expect("send captured body");
+
+                let response_json = serde_json::to_vec(&response_body).expect("serialize response");
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_json.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response head");
+                stream
+                    .write_all(&response_json)
+                    .expect("write response body");
             }
-
-            let header_end = header_end.expect("header end");
-            let body_bytes = &buf[header_end..header_end + content_length];
-            let body_value: Value = serde_json::from_slice(body_bytes).expect("json request body");
-            tx.send(body_value).expect("send captured body");
-
-            let response_json = serde_json::to_vec(&response_body).expect("serialize response");
-            let response = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response_json.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response head");
-            stream
-                .write_all(&response_json)
-                .expect("write response body");
         });
 
         (format!("http://{}", addr), rx, handle)
@@ -2726,6 +2777,7 @@ mod tests {
                     content: "publish a page".to_string(),
                 }],
                 tools: Vec::new(),
+                output_schema: None,
             })
             .await
             .expect_err("a cut turn is an error");
@@ -2735,6 +2787,94 @@ mod tests {
         let record = records.try_recv().expect("the cut answer still cost");
         assert_eq!(record.kind, UsageKind::FunctionTurn);
         assert_eq!(record.outcome, fluxbee_sdk::UsageOutcome::Truncated);
+    }
+
+    /// A run's answer schema, as a response contract gives it.
+    fn answer_schema() -> OutputSchemaSpec {
+        OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type": "object",
+                "properties": {
+                    "reply": {"type": "string"},
+                    "area": {"type": "string", "enum": ["sales", "invoice"]}
+                },
+                "required": ["reply", "area"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema")
+    }
+
+    /// A tool turn under the run's answer schema asks OpenAI for it next to the tools, as the call
+    /// without tools does (FINDINGS A-150): on the first turn, and on one that carries the tools'
+    /// results after `previous_response_id`. Without a schema there is no `text`.
+    #[tokio::test]
+    async fn an_openai_tool_turn_asks_for_the_answer_schema_next_to_its_tools() {
+        let ask = FunctionLoopItem::UserText {
+            content: "the report, please".to_string(),
+        };
+        let call = FunctionToolCall {
+            call_id: "call_1".to_string(),
+            response_id: Some("resp_1".to_string()),
+            name: "thread_state_get".to_string(),
+            arguments: json!({}),
+        };
+        let after_the_call = vec![
+            ask.clone(),
+            FunctionLoopItem::AssistantToolCalls {
+                content: None,
+                calls: vec![call.clone()],
+            },
+            FunctionLoopItem::ToolResult {
+                result: FunctionToolResult {
+                    call_id: call.call_id,
+                    response_id: call.response_id,
+                    name: call.name,
+                    arguments: call.arguments,
+                    output: json!({"status": "ok"}),
+                    is_error: false,
+                },
+            },
+        ];
+        let text = json!({
+            "format": build_openai_response_format(&answer_schema()).expect("format")
+        });
+        for (items, output_schema, sent_text, previous_response_id) in [
+            (vec![ask.clone()], Some(answer_schema()), Some(&text), None),
+            (
+                after_the_call,
+                Some(answer_schema()),
+                Some(&text),
+                Some("resp_1"),
+            ),
+            (vec![ask], None, None, None),
+        ] {
+            let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+                "id": "resp_2",
+                "status": "completed",
+                "output_text": "{\"reply\":\"listo\",\"area\":\"sales\"}"
+            }));
+            OpenAiResponsesClient::new("test-key", test_account())
+                .with_base_url(base_url)
+                .function_model("gpt-5.5", None, ModelSettings::default())
+                .run_turn(FunctionModelTurnRequest {
+                    items,
+                    tools: vec![tool_definition("thread_state_get")],
+                    output_schema,
+                })
+                .await
+                .expect("tool turn");
+            handle.join().expect("server thread");
+            let body = body_rx.recv().expect("captured body");
+            assert_eq!(body["tools"][0]["name"], "thread_state_get");
+            assert_eq!(body.get("text"), sent_text);
+            assert_eq!(
+                body.get("previous_response_id").and_then(Value::as_str),
+                previous_response_id
+            );
+        }
     }
 
     struct SlowModel(Duration);
@@ -2781,6 +2921,7 @@ mod tests {
         let turn = || FunctionModelTurnRequest {
             items: Vec::new(),
             tools: Vec::new(),
+            output_schema: None,
         };
 
         let slow = bounded(Duration::from_secs(5));
@@ -2895,6 +3036,7 @@ providers:
         system: Option<&str>,
         items: Vec<FunctionLoopItem>,
         tools: Vec<FunctionToolDefinition>,
+        output_schema: Option<OutputSchemaSpec>,
     ) -> (Value, FunctionModelTurnResponse) {
         let (base_url, body_rx, handle) = spawn_single_response_server(json!({
             "content": [{"type": "text", "text": "listo"}],
@@ -2914,7 +3056,11 @@ providers:
                 ModelSettings::default(),
             );
         let turn = model
-            .run_turn(FunctionModelTurnRequest { items, tools })
+            .run_turn(FunctionModelTurnRequest {
+                items,
+                tools,
+                output_schema,
+            })
             .await
             .expect("tool turn");
         assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
@@ -2951,6 +3097,7 @@ providers:
                 tool_definition("generate_csv_artifact"),
                 tool_definition("thread_state_get"),
             ],
+            None,
         )
         .await;
         let breakpoint = json!({"type": "ephemeral"});
@@ -2989,6 +3136,7 @@ providers:
                 ask(),
             ],
             Vec::new(),
+            None,
         )
         .await;
         assert_eq!(body.get("tools"), None);
@@ -2998,9 +3146,106 @@ providers:
         );
         assert!(!body.to_string().contains("cache_control"));
 
-        let (body, _) = anthropic_tool_turn(Some("  "), vec![ask()], Vec::new()).await;
+        let (body, _) = anthropic_tool_turn(Some("  "), vec![ask()], Vec::new(), None).await;
         assert_eq!(body.get("system"), None);
         assert_eq!(body.get("tools"), None);
         assert_eq!(body["messages"][0]["content"][0]["text"], "hola");
+    }
+
+    /// A tool turn under the run's answer schema asks Anthropic for it next to the tools, in the
+    /// `output_config` the call without tools sends (FINDINGS A-150): structured outputs hold the
+    /// model's text, never its tool calls. Without a schema there is no `output_config`.
+    #[tokio::test]
+    async fn an_anthropic_tool_turn_asks_for_the_answer_schema_next_to_its_tools() {
+        let ask = || {
+            vec![FunctionLoopItem::UserText {
+                content: "the report, please".to_string(),
+            }]
+        };
+        let tools = || vec![tool_definition("thread_state_get")];
+        let (body, _) = anthropic_tool_turn(
+            Some("You are AI.sales."),
+            ask(),
+            tools(),
+            Some(answer_schema()),
+        )
+        .await;
+        assert_eq!(body["tools"][0]["name"], "thread_state_get");
+        assert_eq!(
+            body["output_config"],
+            json!({"format": {"type": "json_schema", "schema": answer_schema().json_schema()}})
+        );
+
+        let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+            "content": [{"type": "text", "text": "{\"reply\":\"listo\",\"area\":\"sales\"}"}],
+            "stop_reason": "end_turn"
+        }));
+        AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(LlmRequest {
+                model: "claude-sonnet-5-5".to_string(),
+                system: None,
+                input: "the report, please".to_string(),
+                input_parts: None,
+                output_schema: Some(answer_schema()),
+                max_output_tokens: None,
+                model_settings: None,
+            })
+            .await
+            .expect("generate should succeed");
+        handle.join().expect("server thread");
+        assert_eq!(
+            body_rx.recv().expect("captured body")["output_config"],
+            body["output_config"]
+        );
+
+        let (body, _) = anthropic_tool_turn(Some("You are AI.sales."), ask(), tools(), None).await;
+        assert_eq!(body.get("output_config"), None);
+    }
+
+    /// A model without structured outputs refuses `output_config` with a 400 that names it: the
+    /// tool turn is asked once more without it, the rest of its request as it was, and the
+    /// caller's instruction is all that steers the answer, as before FINDINGS A-150.
+    #[tokio::test]
+    async fn an_anthropic_tool_turn_is_asked_again_without_a_schema_its_model_refuses() {
+        let (base_url, bodies, handle) = spawn_responses_server(vec![
+            (
+                "400 Bad Request",
+                json!({"type": "error", "error": {
+                    "type": "invalid_request_error",
+                    "message": "output_config.format: this model does not support structured outputs"
+                }}),
+            ),
+            (
+                "200 OK",
+                json!({"content": [{"type": "text", "text": "listo"}], "stop_reason": "end_turn"}),
+            ),
+        ]);
+        let turn = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model(
+                "claude-3-haiku-20240307",
+                Some("You are AI.sales.".to_string()),
+                ModelSettings::default(),
+            )
+            .run_turn(FunctionModelTurnRequest {
+                items: vec![FunctionLoopItem::UserText {
+                    content: "the report, please".to_string(),
+                }],
+                tools: vec![tool_definition("thread_state_get")],
+                output_schema: Some(answer_schema()),
+            })
+            .await
+            .expect("the turn, asked again");
+        handle.join().expect("server thread");
+        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+
+        let mut refused = bodies.recv().expect("the refused request");
+        let asked_again = bodies.recv().expect("the request asked again");
+        assert!(refused
+            .as_object_mut()
+            .and_then(|body| body.remove("output_config"))
+            .is_some());
+        assert_eq!(asked_again, refused);
     }
 }

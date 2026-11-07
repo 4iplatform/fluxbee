@@ -1022,12 +1022,13 @@ impl GenericAiNode {
         let files = Arc::new(ReplyFiles::default());
         let tool_registry = self.build_tool_registry(ctx, &files)?;
         let tool_count = tool_registry.definitions().len();
-        let output_contract_mode = match (contract, tool_count > 0) {
-            (Some(MessageContract::Envelope(_)), true) => "fallback_instruction",
-            (Some(MessageContract::Envelope(_)), false) => "structured_output",
+        let output_contract_mode = match contract {
+            // The provider is asked for the contract's object on either path: with tools, on every
+            // turn of the loop (FINDINGS A-150).
+            Some(MessageContract::Envelope(_)) => "structured_output",
             // The menu and its answer's shape ride in the WF's block, on either path.
-            (Some(MessageContract::Menu(_)), _) => "wf_block_instruction",
-            (None, _) => "free_text",
+            Some(MessageContract::Menu(_)) => "wf_block_instruction",
+            None => "free_text",
         };
         let text_field = match contract {
             Some(MessageContract::Envelope(envelope)) => envelope.text_field.as_deref(),
@@ -1090,7 +1091,8 @@ impl GenericAiNode {
     /// every file its tools made and the link of every page it published (`tool_loop_output`,
     /// FINDINGS A-98, A-99), or, under a `text_field` or a menu, the text its object gives. `None`
     /// when the model ended without text, made no file and published no page: the caller then asks
-    /// it once more, without tools.
+    /// it once more, without tools. Under a response contract, every turn asks the provider for
+    /// the contract's object (FINDINGS A-150), and the answer is still checked here.
     async fn run_tool_loop(
         &self,
         model: &dyn FunctionCallingModel,
@@ -1101,7 +1103,10 @@ impl GenericAiNode {
         input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<Option<AiChatAnswer>> {
-        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig {
+            output_schema: contract.and_then(MessageContract::output_schema).cloned(),
+            ..FunctionCallingConfig::default()
+        });
         // The agent's memory is cognition's package, in the input's memory block: never the AI
         // SDK's immediate memory, which ai.generic kept per sender (FINDINGS A-133).
         let run_input = FunctionRunInput {
@@ -2879,10 +2884,12 @@ fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
     value.truncate(end);
 }
 
-/// The tool loop's system prompt: the agent's `prompt`, then a response contract's instruction,
-/// which the provider enforces only on a call without tools. Under a WF's menu it stays the role:
-/// the WF's block shows the model the menu and its answer's shape (docs/wf-orchestration-v1.md
-/// §5.3.6).
+/// The tool loop's system prompt: the agent's `prompt`, then a response contract's instruction.
+/// Every turn also asks the provider for the contract's object (`run_tool_loop`, FINDINGS A-150);
+/// the instruction steers a provider that takes the schema only as a hint (OpenAI, unless the
+/// contract is `strict`) and a model without structured outputs. Under a WF's menu it stays the
+/// role: the WF's block shows the model the menu and its answer's shape
+/// (docs/wf-orchestration-v1.md §5.3.6).
 fn tool_loop_system_prompt(
     prompt: String,
     contract: Option<&MessageContract>,
@@ -10291,6 +10298,59 @@ mod tests {
                 r#"{"reply": "Hola", "area": "sales"}"#
             )))
         );
+    }
+
+    /// The schema each turn of one message's tool loop asks the provider for, under `contract`: a
+    /// turn that makes a file, then the answer.
+    async fn tool_turn_schemas(
+        contract: Option<&MessageContract>,
+    ) -> Vec<Option<fluxbee_ai_sdk::OutputSchemaSpec>> {
+        let model = ScriptedModel::new(
+            vec![(
+                "generate_text_artifact",
+                json!({"filename": "nota.txt", "content": "hola"}),
+            )],
+            Some(r#"{"reply": "Listo.", "area": "sales"}"#),
+        );
+        let ctx = BehaviorContext::default();
+        let files = Arc::new(ReplyFiles::default());
+        let tools = test_node()
+            .build_tool_registry(&ctx, &files)
+            .expect("registry");
+        // Only the turns matter here: under a menu, that answer is off it.
+        let _ = test_node()
+            .run_tool_loop(
+                &model,
+                &tools,
+                &files,
+                &ctx,
+                "dale, facturámelo".to_string(),
+                None,
+                contract,
+            )
+            .await;
+        let seen = model.seen.lock().expect("seen");
+        seen.iter().map(|turn| turn.output_schema.clone()).collect()
+    }
+
+    /// Under a response contract, with a `text_field` or without, every turn of the tool loop asks
+    /// the provider for the contract's object, the one that calls a tool too (FINDINGS A-150).
+    /// Under a WF's menu, or with no contract, no turn names a schema.
+    #[tokio::test]
+    async fn under_a_response_contract_every_tool_turn_asks_for_its_object() {
+        let schema = Some(sales_envelope().output_schema);
+        for contract in [sales_contract(), plain_sales_contract()] {
+            assert_eq!(
+                tool_turn_schemas(Some(&contract)).await,
+                [schema.clone(), schema.clone()],
+                "{contract:?}"
+            );
+        }
+        assert_eq!(
+            tool_turn_schemas(Some(&sample_menu_contract())).await,
+            [None, None]
+        );
+        assert_eq!(tool_turn_schemas(None).await, [None, None]);
     }
 
     /// Under a `text_field`, a tool loop whose model does not answer the contract's object fails,

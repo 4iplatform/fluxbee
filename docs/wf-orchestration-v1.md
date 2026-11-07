@@ -619,6 +619,21 @@ todo probado"*.
    - With tools, the contract is an instruction in the system prompt, checked afterwards; the
      provider enforces it only on the call without tools. The instruction asks for a value of its
      type in every field, never null.
+   - **Since FINDINGS A-150** the provider enforces it inside the tool loop too: every turn of the
+     loop asks for the contract's schema next to the tools, as the call without tools does
+     (`FunctionCallingConfig::output_schema`, crates/fluxbee_ai_sdk/src/function_calling.rs).
+     - Anthropic holds the model's text to the schema while it can still call tools
+       (`output_config.format`; structured outputs constrain the text, never a tool call or the
+       thinking). A model without structured outputs refuses it with a 400: that turn is asked
+       again without it, as before.
+     - OpenAI takes it as `text.format` next to `tools`, and holds the text to it only when the
+       contract is `strict`, which OpenAI accepts only with every property required.
+     - The instruction and the check afterwards stay: the instruction for OpenAI without
+       `strict` and for a model without structured outputs, the check as the backstop, since a
+       refusal may still miss the schema (a cut answer is an error of its own).
+     - It reaches a contract that a caller other than a WF writes, or that a WF's `forward` keeps
+       from the message it forwards: since Case 3 a WF asks an agent with a menu (§5.3.1), which
+       has no schema, and wfcel refuses a `response_envelope` in a WF's action.
 
 **Every definition in the repo changes** (pre-beta, no legacy):
 - `start_from` is added and `thread_id_ref` goes, in the examples, Archi's seeds, the docs,
@@ -689,7 +704,8 @@ todo probado"*.
   (Case 3, §5.3);
 - a cap in the engine on the agent calls between two triggers, as a backstop for a definition
   whose agents keep answering each other (A-125, with Case 3, §5.3);
-- the contract enforced by the provider inside the tool loop too.
+- the contract enforced by the provider inside the tool loop too (FINDINGS A-150, done later:
+  §5.2.1, the agents' item 3).
 
 #### 5.2.2 The validation on 8.x
 
@@ -786,7 +802,7 @@ docs, and the agents. Everything below was fixed before the release.
   what a forward copies, who can start an instance, and Archi's seeds and SY.admin's help on errors
   and sender-only matches.
 - **Kept open:** a cap on agent calls between two triggers (A-125, with Case 3), and the contract
-  enforced by the provider inside the tool loop.
+  enforced by the provider inside the tool loop (A-150, done later: §5.2.1).
 
 ### 5.3 Case 3: the internal consultation. Decided with the operator, 2026-10-30
 

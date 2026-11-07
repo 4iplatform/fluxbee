@@ -10,6 +10,7 @@ use crate::immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
+use crate::llm::OutputSchemaSpec;
 use crate::text_payload::ModelContentPart;
 use crate::{AiSdkError, Result};
 
@@ -221,6 +222,10 @@ pub enum FunctionLoopItem {
 pub struct FunctionModelTurnRequest {
     pub items: Vec<FunctionLoopItem>,
     pub tools: Vec<FunctionToolDefinition>,
+    /// The schema of the run's final answer (`FunctionCallingConfig::output_schema`), asked of
+    /// the provider on this turn; `None` leaves the model's text free.
+    #[serde(default)]
+    pub output_schema: Option<OutputSchemaSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,12 +252,19 @@ pub const DEFAULT_MAX_TURNS: usize = 8;
 #[derive(Debug, Clone)]
 pub struct FunctionCallingConfig {
     pub max_turns: usize,
+    /// The schema the run's final answer follows. Every turn asks the provider for it, since any
+    /// turn without a tool call is the final one: the provider holds the model's text to it while
+    /// the model can still call tools (Anthropic's `output_config`; OpenAI's `text.format`, held
+    /// only when the schema is `strict`). The runner does not check the answer: its caller does,
+    /// as ai.generic checks a response contract's object (FINDINGS A-150).
+    pub output_schema: Option<OutputSchemaSpec>,
 }
 
 impl Default for FunctionCallingConfig {
     fn default() -> Self {
         Self {
             max_turns: DEFAULT_MAX_TURNS,
+            output_schema: None,
         }
     }
 }
@@ -373,6 +385,7 @@ impl FunctionCallingRunner {
                 .run_turn(FunctionModelTurnRequest {
                     items: items.clone(),
                     tools: tools.definitions(),
+                    output_schema: self.config.output_schema.clone(),
                 })
                 .await?;
 
@@ -917,6 +930,66 @@ mod tests {
             assistant_messages,
             vec!["The tool failed, so there is nothing to confirm."]
         );
+    }
+
+    /// `SequencedModel`, noting the answer schema each turn asks for.
+    #[derive(Default)]
+    struct SchemaNotingModel {
+        turns: SequencedModel,
+        schemas: Mutex<Vec<Option<OutputSchemaSpec>>>,
+    }
+
+    #[async_trait]
+    impl FunctionCallingModel for SchemaNotingModel {
+        async fn run_turn(
+            &self,
+            request: FunctionModelTurnRequest,
+        ) -> Result<FunctionModelTurnResponse> {
+            self.schemas
+                .lock()
+                .await
+                .push(request.output_schema.clone());
+            self.turns.run_turn(request).await
+        }
+    }
+
+    /// The run's answer schema goes with every turn, the one that calls a tool too, since any turn
+    /// without a call is the final answer (FINDINGS A-150). Without one, no turn names a schema.
+    #[tokio::test]
+    async fn every_turn_asks_for_the_runs_answer_schema() {
+        let schema = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type": "object",
+                "properties": {"reply": {"type": "string"}},
+                "required": ["reply"],
+                "additionalProperties": false
+            }),
+            false,
+        )
+        .expect("schema");
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(DemoTool))
+            .expect("tool should register");
+        for (output_schema, asked) in [
+            (
+                Some(schema.clone()),
+                vec![Some(schema.clone()), Some(schema)],
+            ),
+            (None, vec![None, None]),
+        ] {
+            let runner = FunctionCallingRunner::new(FunctionCallingConfig {
+                output_schema,
+                ..FunctionCallingConfig::default()
+            });
+            let model = SchemaNotingModel::default();
+            runner
+                .run(&model, &tools, "create hive worker-220")
+                .await
+                .expect("runner should succeed");
+            assert_eq!(*model.schemas.lock().await, asked);
+        }
     }
 
     /// Fails the turn after the first: the first one asks for `demo_write`.

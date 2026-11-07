@@ -131,6 +131,20 @@ let answer = result.final_assistant_text;
   cached or not, and its answer.
 - The runner cuts a text input at 1,200 characters. A longer input has to go as
   `FunctionRunInput::current_user_parts`, which is sent as it is.
+- **An answer schema** (FINDINGS A-150):
+  `FunctionCallingConfig { output_schema: Some(spec), ..FunctionCallingConfig::default() }` asks
+  the provider for `spec` on every turn, next to the tools, since any turn without a tool call is
+  the final answer.
+  - Anthropic gets the plain path's `output_config.format`: structured outputs hold the model's
+    text to the schema and leave its tool calls and its thinking free. A model that refuses
+    `output_config` with a 400 has that turn asked again without it.
+  - OpenAI gets `text.format`, and holds the text to it only when `spec` is `strict`, which OpenAI
+    accepts only with every property required.
+  - The runner does not check the answer, and adds no instruction: the caller does both, as
+    ai.generic does with a response contract (`build_output_schema_fallback_instruction` in its
+    system prompt, the object checked afterwards).
+  - The schema is the same on every turn of a run, so the turns still read Anthropic's prompt
+    cache; a different `output_config` invalidates it.
 
 ### A plain call
 
