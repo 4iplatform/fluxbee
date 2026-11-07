@@ -160,14 +160,16 @@ If a worker hive does not exist yet, include topology/VPN creation in desired st
 
 **A join over a password asks the operator one thing first** (FINDINGS A-165). A join that logs in
 with `ssh_password` revokes its own access at its end, and nothing else closes password logins on
-the box. So with `ssh_password`, `add_hive` requires `harden_ssh`, and refuses the request without
-it:
+the box. So with `ssh_password` and no `ssh_key`, `add_hive` requires `harden_ssh`, and refuses the
+request without it:
 - `true` turns password logins off at the join's end. Afterwards only the hypervisor's console,
   or a key of the operator's own, gets in.
-- `false` leaves them on, and the join's answer warns about it.
+- `false` leaves them on, and the join's answer warns when it logged in over the password.
 
 Ask the operator which, with that consequence, and never choose for them. A join with `ssh_key`
-needs no such answer.
+needs no such answer: next to it, a password only feeds `sudo`. A join re-run after one that failed
+late finds the worker running and touches no SSH: its answer says so, and `harden_ssh` is not
+applied.
 
 ---
 

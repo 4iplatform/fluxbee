@@ -25522,8 +25522,11 @@ async fn add_hive_flow(
                     "syncthing_peer_linked": syncthing_peer_linked,
                     "syncthing_device_id": worker_syncthing_device_id,
                     "finalize": finalize,
-                    // No SSH login on this path: nothing for `add_hive_ssh_warnings` to say.
-                    "warnings": [],
+                    // No SSH on this path, so nothing was hardened (A-165).
+                    "warnings": socket_only_join_ssh_warnings(
+                        creds.password.is_some() && creds.ssh_key.is_none(),
+                        address,
+                    ),
                 });
             } else {
                 // Defensive guard: the match above returns on every non-Some path
@@ -28033,21 +28036,29 @@ fn reject_removed_add_hive_fields(payload: &serde_json::Value) -> Result<(), Str
     Ok(())
 }
 
-/// FINDINGS A-165: a join over `ssh_password` says what happens to password logins at its end,
-/// since nothing else closes them once it revokes its own access (D32). `harden_ssh: true` turns
-/// them off, and afterwards only the hypervisor's console or a key of the operator's own gets in;
-/// `harden_ssh: false` leaves them on, and the answer warns. A request that does not say is
-/// refused before anything touches the box.
+/// Whether a join may log in over a password: `ssh_password` with no `ssh_key`. Next to an
+/// `ssh_key` the password only feeds `sudo`, since the key seeds the motherbee's (FINDINGS A-165).
+fn password_login_possible(payload: &serde_json::Value) -> bool {
+    let given = |field: &str| {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    given("ssh_password") && !given("ssh_key")
+}
+
+/// FINDINGS A-165: a join that may log in over a password says what happens to password logins at
+/// its end, since nothing else closes them once it revokes its own access (D32). `harden_ssh: true`
+/// turns them off, and afterwards only the hypervisor's console or a key of the operator's own gets
+/// in; `harden_ssh: false` leaves them on, and the answer warns when the join did log in so. A
+/// request that does not say is refused before anything touches the box.
 fn require_password_logins_choice(payload: &serde_json::Value) -> Result<(), String> {
-    let password = payload
-        .get("ssh_password")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| !value.trim().is_empty());
     let chosen = payload
         .get("harden_ssh")
         .and_then(parse_bool_value)
         .is_some();
-    if password && !chosen {
+    if password_login_possible(payload) && !chosen {
         return Err(
             "add_hive with ssh_password must say what happens to password logins at its end: \
              harden_ssh true turns them off (afterwards only the hypervisor's console or a key of \
@@ -28090,6 +28101,22 @@ struct BootstrapCreds {
 /// password seeded the motherbee key) and did not harden SSH leaves the box taking passwords;
 /// removing the motherbee key at its end does not change that. The answer says so, and what closes
 /// it. Since A-165 the request chose it: `harden_ssh: false`.
+/// FINDINGS A-165: a socket-only re-run (the worker's orchestrator answers already, after an
+/// attempt that failed later) touches no SSH, so it applies no `harden_ssh` and cannot tell whether
+/// that attempt logged in over the password. When this request could have, the answer says so.
+fn socket_only_join_ssh_warnings(password_login_possible: bool, address: &str) -> Vec<String> {
+    if !password_login_possible {
+        return Vec::new();
+    }
+    vec![format!(
+        "This join found the worker's orchestrator already running at {address} (a re-run after an \
+         attempt that failed later) and changed nothing over SSH, so harden_ssh was not applied. \
+         If that attempt logged in with ssh_password, password logins stay enabled: to close them, \
+         set `PasswordAuthentication no` on that host in \
+         /etc/ssh/sshd_config.d/00-fluxbee-hardening.conf and restart ssh."
+    )]
+}
+
 fn add_hive_ssh_warnings(
     password_login: bool,
     harden_ssh_applied: bool,
@@ -33188,6 +33215,30 @@ mod tests {
         // No password, nothing to choose: the key channel, or a password left blank.
         assert!(refused(serde_json::json!({"ssh_user": "admin"})).is_ok());
         assert!(refused(serde_json::json!({"ssh_user": "admin", "ssh_password": "  "})).is_ok());
+        // Next to a key, the password only feeds sudo: the key seeds the motherbee's.
+        assert!(refused(serde_json::json!({
+            "ssh_user": "admin",
+            "ssh_password": "secret",
+            "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...",
+        }))
+        .is_ok());
+    }
+
+    /// A-165: a socket-only re-run applies no hardening, and says so when the request could have
+    /// logged in over the password.
+    #[test]
+    fn a_socket_only_rerun_says_it_touched_no_ssh() {
+        assert!(socket_only_join_ssh_warnings(false, "10.0.0.9").is_empty());
+        let warnings = socket_only_join_ssh_warnings(true, "10.0.0.9");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("harden_ssh was not applied"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("PasswordAuthentication no"),
+            "{warnings:?}"
+        );
     }
 
     /// A-165: the admin action itself refuses a password join that does not choose, with nothing

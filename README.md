@@ -342,7 +342,7 @@ motherbee:
 ```bash
 curl -sS -X POST http://127.0.0.1:8080/hives \
   -H 'Content-Type: application/json' \
-  -d '{"hive_id":"worker1","address":"192.0.2.21","ssh_user":"ubuntu","ssh_password":"..."}'
+  -d '{"hive_id":"worker1","address":"192.0.2.21","ssh_user":"ubuntu","ssh_password":"...","harden_ssh":true}'
 ```
 
 - Pass `ssh_key` (an unencrypted PEM private key) instead of `ssh_password` when the box only

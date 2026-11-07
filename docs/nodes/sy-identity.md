@@ -206,7 +206,8 @@ request gets `UNAUTHORIZED_REGISTRAR`.
 - A replica answers every primary-only message with `NOT_PRIMARY`; it does not forward it
   (`action_requires_primary`). A primary without a database answers `DB_NOT_READY`.
 - Because `SY.admin@` counts only from the same hive, a worker's replica refuses SY.admin's
-  queries: the admin's identity routes are useful with `hive = motherbee` only.
+  queries. So SY.admin sends every identity action to the primary, whatever hive its path names
+  (`identity_command_hive`).
 - `VAULT_SECRET_CHANGED` is handled before the table (see Failure behavior). `NODE_STATUS_GET` is
   answered by the SDK default handler.
 

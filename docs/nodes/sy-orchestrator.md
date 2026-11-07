@@ -356,9 +356,12 @@ With neither, the egress gets none and does not probe. A worker join copies the 
 `reachability_url` into the worker's `egress` section along with `gateway_ip`
 (`render_worker_egress_yaml`).
 
-A request with `ssh_password` must say what happens to password logins at the join's end:
-`harden_ssh` true turns them off, false leaves them on (`require_password_logins_choice`, FINDINGS
-A-165). Without it the join is refused with `INVALID_REQUEST` before anything starts.
+A request with `ssh_password` and no `ssh_key` must say what happens to password logins at the
+join's end: `harden_ssh` true turns them off, false leaves them on (`require_password_logins_choice`,
+FINDINGS A-165). Without it the join is refused with `INVALID_REQUEST` before anything starts. Next
+to an `ssh_key` the password only feeds `sudo`. A socket-only re-run touches no SSH and applies no
+`harden_ssh`; when its request carries a password, its `warnings` say so
+(`socket_only_join_ssh_warnings`).
 
 A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
 probe failed and the password seeded the motherbee key) with `harden_ssh: false` says there that

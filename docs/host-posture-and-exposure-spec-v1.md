@@ -296,7 +296,8 @@ How it is applied:
 
 - The VM template sets `PasswordAuthentication yes`, with a password published in the repo and
   NOPASSWD sudo (`lab/template-prep.sh:42`, `:46-47`).
-- Spokes are hardened only with `harden_ssh:true`; the default is false (A-2).
+- Spokes are hardened only with `harden_ssh:true`. A join over a password with no `ssh_key` must
+  choose it, true or false (A-165); otherwise it defaults to false (A-2).
 - On Ubuntu 24.04 sshd is socket-activated (`ssh.socket`).
 
 ### 1.4 Syncthing

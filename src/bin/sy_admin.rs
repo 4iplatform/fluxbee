@@ -11109,8 +11109,16 @@ fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
     };
     // A write cut short leaves the counter as it was, never empty: an empty one reads as 0.
     let staged = path.with_extension("next");
-    fs::write(&staged, next.to_string())?;
-    fs::rename(&staged, &path)?;
+    let written = (|| -> std::io::Result<()> {
+        let mut file = fs::File::create(&staged)?;
+        file.write_all(next.to_string().as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&staged, &path)
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&staged);
+        return Err(err.into());
+    }
     Ok(next)
 }
 
@@ -12221,7 +12229,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
 /// the types the product's own nodes read, each with what reads it and the value it expects.
 static VAULT_RESOURCE_TYPES_NOTE: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case), and a node finds a secret only under the exact type it reads. The SDK's resource types: {}. The product's own nodes also read: tls (the edge's certificate, value {{cert, key}}, which SY.admin's ACME writes), whatsapp (io.wapp, value {{access_token, app_secret, verify_token}}) and linkedhelper_adapter (io.linkedhelper, value a string or {{adapter_secret}}). Any other type must be the one its consumer reads, and must already normalize cleanly. metadata.tenant_id defaults to the hive's root tenant when omitted (infrastructure-wide secret, readable by every SY system caller). To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the tenant pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
+        "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case). A consumer that resolves its secret by type (an AI node's provider key) finds it only under that exact type. The SDK's resource types: {}. The product's own nodes also use: tls (the edge's certificate, value {{cert, key}}: SY.admin's ACME writes it in the root tenant with the edge as its owner, and SY.edge reads it by its tls_vault_key), whatsapp (io.wapp reads it by its key and requires this type, value {{access_token, app_secret, verify_token}}) and linkedhelper_adapter (io.linkedhelper reads it by its key, value a string or {{adapter_secret}}). Any other type must be the one its consumer reads, and must already normalize cleanly. metadata.tenant_id defaults to the hive's root tenant when omitted (infrastructure-wide secret, readable by every SY system caller). To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the tenant pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
         fluxbee_sdk::ResourceType::known_wire_values().join(", ")
     )
 });
@@ -12455,7 +12463,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "node_control_config_set" => {
             "Send CONFIG_SET to a node that participates in live control-plane config and return its CONFIG_RESPONSE."
         }
-        "list_ilks" => "List identity ilks in a hive. ?include_deleted=true adds the marked ones; ?pending_signup=true lists only the Fluxbee Cloud signups nobody finished (pending_signup), wherever they are charged.",
+        "list_ilks" => "List identity ilks (the primary answers for any hive). ?include_deleted=true adds the marked ones; ?pending_signup=true lists only the Fluxbee Cloud signups nobody finished (pending_signup), wherever they are charged.",
         "get_ilk" => "Read one identity ilk.",
         "set_ilk_definition" => {
             "Set the cognitive definition hashes for one identity agent ILK."
@@ -13404,7 +13412,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "ssh_password",
                 "string",
-                "Admin SSH password for the initial bootstrap of an empty box. Optional: only needed when the bootstrap key is not yet seeded (fresh box) and no ssh_key is supplied. With it, harden_ssh is required (FINDINGS A-165). Never logged, never stored — redacted at rest.",
+                "Admin SSH password for the initial bootstrap of an empty box. Optional: only needed when the bootstrap key is not yet seeded (fresh box) and no ssh_key is supplied. Without ssh_key, harden_ssh is required with it (FINDINGS A-165). Never logged, never stored — redacted at rest.",
             ),
             admin_action_body_field(
                 "ssh_key",
@@ -13434,7 +13442,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "harden_ssh",
                 "bool",
-                "What happens to password logins at the join's end. Required with ssh_password (INVALID_REQUEST without it), since nothing else closes them once the join revokes its own access (FINDINGS A-165): true turns them off, and afterwards only the hypervisor's console or a key of the operator's own gets in; false leaves them on, and the answer warns. Ask the operator; never choose for them. Optional without ssh_password.",
+                "What happens to password logins at the join's end. Required with ssh_password and no ssh_key (INVALID_REQUEST without it), since the join may log in over the password and nothing else closes password logins once it revokes its own access (FINDINGS A-165): true turns them off, and afterwards only the hypervisor's console or a key of the operator's own gets in; false leaves them on, and the answer warns when the join logged in over the password. Ask the operator; never choose for them. Optional otherwise: next to ssh_key the password only feeds sudo.",
             ),
             admin_action_body_field(
                 "restrict_ssh",
@@ -13912,8 +13920,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "hive_id": "worker-220",
             "address": "192.168.8.220",
             "ssh_user": "administrator",
-            "ssh_password": "<bootstrap-password-or-omit-if-key-seeded>",
-            "harden_ssh": true
+            "ssh_key": "<bootstrap PEM private key, or omit it when the motherbee key is seeded>"
         }),
         "run_node" => serde_json::json!({
             "node_name": "AI.sales@motherbee",
@@ -14226,7 +14233,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_hives" => "curl -X GET /hives",
         "get_hive" => "curl -X GET /hives/worker-220",
         "add_hive" => {
-            r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220","ssh_user":"administrator","ssh_password":"<bootstrap-pass-or-omit>","harden_ssh":true}'"#
+            r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220","ssh_user":"administrator","ssh_key":"<bootstrap-pem-or-omit>"}'"#
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
@@ -14640,7 +14647,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Owner-bound mutation verbs such as schedule/cancel/reschedule remain outside SY.admin in v1.",
         ],
         "get_ilk" => vec![
-            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
@@ -14683,19 +14690,19 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Refused while people are charged to it (TENANT_HAS_PEOPLE: charge them elsewhere first), while SY.vault still holds secrets of the tenant (TENANT_HAS_SECRETS, keys listed), node identities remain or it sponsors tenants. Operator-only.",
         ],
         "list_tenants" => vec![
-            "Lists the identity tenants currently known by SY.identity for one hive.",
+            "Lists the identity tenants SY.identity knows. SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
             "Use this when you need to discover root/default tenants, candidate sponsors, or tenant ids before spawning identity-aware software.",
             "This returns tenant summaries including sponsor_tenant_id, child_count, ilk_count, is_root, and is_sponsor.",
             "Use get_tenant for one specific tenant, its resolved sponsor record, and its child tenant summaries.",
         ],
         "get_tenant" => vec![
-            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
             "The tenant_id path segment must use the prefixed UUID format tnt:<uuid>.",
             "This lookup returns the tenant plus its resolved sponsor record when one exists, and child tenant summaries when this tenant sponsors others.",
             "Use this before set_tenant_sponsor or run_node when you need the exact tenant association already used by another node.",
         ],
         "create_tenant" => vec![
-            "Creates a tenant on the target hive through SY.identity.",
+            "Creates a tenant through the primary's SY.identity, the motherbee's, whatever hive the path names (A-143).",
             "Creation is idempotent by normalized name or domain; existing matches return created=false with the existing tenant_id.",
             "Use a root tenant with no sponsor for an admin/company tenant. Use sponsor_tenant_id for client tenants sponsored by that admin/company tenant.",
             "AI.* and IO.* node spawns should use the client tenant_id when the node operates for that client.",
@@ -17638,7 +17645,8 @@ async fn handle_identity_query(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let target_hive = identity_command_hive(&ctx.hive_id, action, hive);
+    let _ = hive;
+    let target_hive = identity_command_hive(&ctx.hive_id);
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE"),
@@ -17754,7 +17762,7 @@ async fn purge_tenant_vault_block(
 /// takes no request from SY.admin of another hive (F-07), reads included: a read sent there failed
 /// with UNAUTHORIZED_REGISTRAR. Every replica holds the primary's identities, so the primary
 /// answers a read for any hive.
-fn identity_command_hive(admin_hive: &str, _action: &str, _path_hive: Option<String>) -> String {
+fn identity_command_hive(admin_hive: &str) -> String {
     admin_hive.to_string()
 }
 
@@ -17765,7 +17773,8 @@ async fn handle_identity_command(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let target_hive = identity_command_hive(&ctx.hive_id, action, hive);
+    let _ = hive;
+    let target_hive = identity_command_hive(&ctx.hive_id);
     if action == "purge_tenant" {
         if let Some(blocked) = purge_tenant_vault_block(client, &target_hive, &payload).await {
             return Ok(blocked);
@@ -23308,69 +23317,59 @@ mod tests {
         assert_eq!(http_status_line(202), "HTTP/1.1 202 Accepted");
     }
 
-    /// Only the primary, SY.admin's own hive, writes an ILK or a tenant, and a spoke's replica
-    /// takes no request from it: every identity action that names a spoke goes to the primary
-    /// (A-143, WF Case 5's gate: Archi assigned a worker's agents their roles with
-    /// `hive: worker1`; and 2026-11-07, a read of worker1's ILKs refused on 8.x).
-    #[test]
-    fn identity_actions_go_to_the_primary_whatever_hive_the_path_names() {
-        for write in [
-            "set_ilk_definition",
-            "delete_ilk",
-            "set_ilk_tenant",
-            "purge_tenant",
-            "create_tenant",
-            "get_ilk",
-            "get_tenant",
-            "list_ilks",
-            "list_tenants",
-        ] {
-            assert_eq!(
-                identity_command_hive("motherbee", write, Some("worker1".to_string())),
-                "motherbee",
-                "{write}"
-            );
-            assert_eq!(
-                identity_command_hive("motherbee", write, None),
-                "motherbee",
-                "{write}"
-            );
-        }
-    }
-
-    /// A read of a spoke's identities asks the primary, and answers what it says (2026-11-07: on
-    /// 8.x `GET /hives/worker1/identity/ilks` answered UNAUTHORIZED_REGISTRAR from the replica).
+    /// Only the primary, SY.admin's own hive, writes an ILK or a tenant (A-143, WF Case 5's gate:
+    /// Archi assigned a worker's agents their roles with `hive: worker1`), and a spoke's replica
+    /// takes no request from SY.admin of another hive, reads included (2026-11-07: on 8.x
+    /// `GET /hives/worker1/identity/ilks` answered UNAUTHORIZED_REGISTRAR from the replica). So a
+    /// read that names a spoke asks the primary, and answers what it says.
     #[tokio::test]
     async fn a_read_of_a_spokes_identities_asks_the_primary() {
         let (ctx, mut harness) = opa_test_admin("identity-read-primary");
         let no_query = HashMap::new();
-        let ilks = json!({ "status": "ok", "ilks": [] });
-        let answered = async {
-            let sent = harness
-                .next_outgoing_within(Duration::from_secs(5))
-                .await
-                .expect("ILK_LIST");
-            harness
-                .inject(reply_to(&sent, "ILK_LIST_RESPONSE", ilks.clone()))
-                .await
-                .unwrap();
-            sent
-        };
-        let (served, sent) = tokio::join!(
-            handle_hive_paths(
-                "GET",
-                "/hives/worker1/identity/ilks",
-                &no_query,
-                &[],
-                &ctx,
-                &ctx.rpc
+        let ilk = format!("ilk:{}", Uuid::new_v4());
+        let tenant = format!("tnt:{}", Uuid::new_v4());
+        for (path, request, response) in [
+            (
+                "/hives/worker1/identity/ilks".to_string(),
+                "ILK_LIST",
+                "ILK_LIST_RESPONSE",
             ),
-            answered
-        );
-        assert_eq!(sent.meta.msg.as_deref(), Some("ILK_LIST"));
-        assert_eq!(dst_of(&sent), json!("SY.identity@motherbee"));
-        let (status, body) = served.expect("route").expect("served");
-        assert_eq!(status, 200, "{body}");
+            (
+                "/hives/worker1/identity/tenants".to_string(),
+                "TNT_LIST",
+                "TNT_LIST_RESPONSE",
+            ),
+            (
+                format!("/hives/worker1/identity/ilks/{ilk}"),
+                "ILK_GET",
+                "ILK_GET_RESPONSE",
+            ),
+            (
+                format!("/hives/worker1/identity/tenants/{tenant}"),
+                "TNT_GET",
+                "TNT_GET_RESPONSE",
+            ),
+        ] {
+            let answered = async {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect(request);
+                harness
+                    .inject(reply_to(&sent, response, json!({ "status": "ok" })))
+                    .await
+                    .unwrap();
+                sent
+            };
+            let (served, sent) = tokio::join!(
+                handle_hive_paths("GET", &path, &no_query, &[], &ctx, &ctx.rpc),
+                answered
+            );
+            assert_eq!(sent.meta.msg.as_deref(), Some(request), "{path}");
+            assert_eq!(dst_of(&sent), json!("SY.identity@motherbee"), "{path}");
+            let (status, body) = served.expect("route").expect("served");
+            assert_eq!(status, 200, "{path}: {body}");
+        }
     }
 
     /// The direct dispatch routes every action the executor may run, a workflow's deploy included
@@ -28510,7 +28509,17 @@ mod tests {
     #[test]
     fn the_vault_note_names_every_type_the_product_reads() {
         let spec = resolve_internal_action_spec("vault_put").expect("vault_put");
-        let notes = admin_action_executor_contract(spec)["notes"].to_string();
+        let contract = admin_action_executor_contract(spec);
+        let notes = contract["notes"]
+            .as_array()
+            .and_then(|notes| {
+                notes
+                    .iter()
+                    .filter_map(|note| note.as_str())
+                    .find(|note| note.starts_with("Model D'"))
+            })
+            .expect("the note on resource types")
+            .to_string();
         for known in fluxbee_sdk::ResourceType::known_wire_values() {
             assert!(notes.contains(known), "{known}");
         }
@@ -28526,17 +28535,21 @@ mod tests {
     }
 
     /// A join over a password must say what happens to password logins (FINDINGS A-165): the
-    /// help says so, and its example is a request the orchestrator takes.
+    /// help says so, and its examples take the key channel, so none makes the operator's choice.
     #[test]
     fn the_add_hive_help_asks_what_happens_to_password_logins() {
         let example = admin_action_example_payload("add_hive");
-        assert!(example.get("ssh_password").is_some());
-        assert_eq!(example["harden_ssh"], json!(true));
+        assert!(example.get("ssh_key").is_some());
+        assert!(example.get("ssh_password").is_none());
+        assert!(example.get("harden_ssh").is_none());
         assert!(admin_action_example_scmd("add_hive")
-            .is_some_and(|scmd| scmd.contains("\"harden_ssh\":true")));
+            .is_some_and(|scmd| !scmd.contains("ssh_password") && !scmd.contains("harden_ssh")));
         let spec = resolve_internal_action_spec("add_hive").expect("add_hive");
         let doc = build_admin_action_doc(spec).to_string();
-        assert!(doc.contains("Required with ssh_password"), "{doc}");
+        assert!(
+            doc.contains("Required with ssh_password and no ssh_key"),
+            "{doc}"
+        );
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
