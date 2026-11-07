@@ -3418,6 +3418,10 @@ fn build_pdf_bytes(title: Option<&str>, lines: &[String]) -> Vec<u8> {
     pdf
 }
 
+// Excel's limit on a sheet's name, in characters. The XLSX card says it, and a test holds its text
+// to it.
+const XLSX_SHEET_NAME_MAX_CHARS: usize = 31;
+
 fn sanitize_sheet_name(raw: Option<&str>) -> String {
     let candidate = raw.unwrap_or("Sheet1").trim();
     let filtered = candidate
@@ -3429,7 +3433,7 @@ fn sanitize_sheet_name(raw: Option<&str>) -> String {
     } else {
         filtered.as_str()
     };
-    final_name.chars().take(31).collect()
+    final_name.chars().take(XLSX_SHEET_NAME_MAX_CHARS).collect()
 }
 
 fn column_name(index: usize) -> String {
@@ -11978,6 +11982,22 @@ mod tests {
         assert!(says(format!(
             "kept between {RASTER_SIDE_MIN} and {RASTER_SIDE_MAX}"
         )));
+    }
+
+    #[test]
+    fn the_xlsx_card_says_where_a_sheet_name_is_cut() {
+        let long = "x".repeat(XLSX_SHEET_NAME_MAX_CHARS + 5);
+        assert_eq!(
+            sanitize_sheet_name(Some(&long)).chars().count(),
+            XLSX_SHEET_NAME_MAX_CHARS
+        );
+        let card = GenerateXlsxArtifactTool::card();
+        assert!(
+            card.limits
+                .iter()
+                .any(|limit| limit
+                    .contains(&format!("cut at {XLSX_SHEET_NAME_MAX_CHARS} characters")))
+        );
     }
 
     /// A size the model reads is in the largest unit it is a whole number of, never rounded.

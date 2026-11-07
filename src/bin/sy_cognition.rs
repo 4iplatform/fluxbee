@@ -2188,18 +2188,19 @@ async fn publish_episode(
             let mut state = app_state.runtime_state.lock().await;
             state.episodes_gated_out_total = state.episodes_gated_out_total.saturating_add(1);
             // At info, with the gate's numbers: whether such a proposal should be news is the
-            // operator's call on them (docs/cognition-hands-v1.md §12.6). Never its title or summary.
+            // operator's call on them (docs/cognition-hands-v1.md §12.6). Never its title or summary,
+            // nor a model's free text: an unknown lens shows as such, and the labels are capped.
             tracing::info!(
                 thread_id,
-                lens = %proposal.lens,
+                lens = episodes::lens_for_log(&proposal.lens),
                 refused = refusal.as_str(),
                 base_intensity = proposal.base_intensity,
                 novelty = proposal.novelty,
                 habit,
                 intensity = episodes::final_intensity(proposal, habit),
                 evidence_strength = proposal.evidence_strength,
-                evidence_contexts = ?proposal.evidence_contexts,
-                leading_contexts = ?leading,
+                evidence_contexts = ?episodes::labels_for_log(&proposal.evidence_contexts),
+                leading_contexts = ?episodes::labels_for_log(leading),
                 "sy.cognition: a proposed episode did not pass the gate"
             );
             return;

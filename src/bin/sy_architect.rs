@@ -14156,7 +14156,7 @@ async fn execute_admin_action_with_context(
     params: Value,
     purpose: &str,
 ) -> Result<Value, ArchitectError> {
-    let params_json = serde_json::to_string(&redact_json_secret_fields(&params))
+    let params_json = serde_json::to_string(&admin_params_for_log(action, &params))
         .unwrap_or_else(|_| "{}".to_string());
     let timeout = architect_admin_action_timeout(action, &params);
     tracing::info!(
@@ -14191,7 +14191,8 @@ async fn execute_admin_action_with_context(
         );
         Box::new(err)
     })?;
-    let payload_json = serde_json::to_string(&out.payload).unwrap_or_else(|_| "null".to_string());
+    let payload_json = serde_json::to_string(&admin_payload_for_log(action, &out.payload))
+        .unwrap_or_else(|_| "null".to_string());
     tracing::info!(
         purpose = %purpose,
         admin_target = %admin_target,
@@ -15867,6 +15868,65 @@ fn sanitize_user_message_for_persistence(user_message: &str) -> String {
             )
         }
         Err(_) => user_message.to_string(),
+    }
+}
+
+/// What Archi's log keeps of an admin action's params: its secrets redacted, and of a plan the
+/// executor validates or runs, the link's key an `unpublish_artifact` step names only as its SHA-256
+/// (`key_sha256_for_log`), as SY.admin's own logs keep it.
+fn admin_params_for_log(action: &str, params: &Value) -> Value {
+    let mut logged = redact_json_secret_fields(params);
+    let steps = match action {
+        "executor_validate_plan" => "/execution/steps",
+        "executor_execute_plan" => "/plan/execution/steps",
+        _ => return logged,
+    };
+    if let Some(steps) = logged.pointer_mut(steps).and_then(Value::as_array_mut) {
+        for step in steps {
+            if names_unpublish(step.get("action")) {
+                if let Some(args) = step.get_mut("args") {
+                    key_sha256_for_log(args);
+                }
+            }
+        }
+    }
+    logged
+}
+
+/// What Archi's log keeps of an admin action's answer: its secrets redacted, and the link's key an
+/// executor's event repeats from an `unpublish_artifact` step only as its SHA-256.
+fn admin_payload_for_log(action: &str, payload: &Value) -> Value {
+    let mut logged = redact_json_secret_fields(payload);
+    if action == "executor_execute_plan" {
+        if let Some(events) = logged.get_mut("events").and_then(Value::as_array_mut) {
+            for event in events {
+                if names_unpublish(event.get("step_action")) {
+                    if let Some(args) = event.get_mut("tool_args_preview") {
+                        key_sha256_for_log(args);
+                    }
+                }
+            }
+        }
+    }
+    logged
+}
+
+fn names_unpublish(action: Option<&Value>) -> bool {
+    action.and_then(Value::as_str).map(str::trim) == Some("unpublish_artifact")
+}
+
+/// A link's key is the permission to read its page: in a log it goes as `key_sha256`, the form the
+/// edge and SY.admin keep, or redacted when it is not text.
+fn key_sha256_for_log(args: &mut Value) {
+    let Some(fields) = args.as_object_mut() else {
+        return;
+    };
+    if let Some(key) = fields.remove("key") {
+        let logged = key.as_str().map_or_else(
+            || json!(NODE_SECRET_REDACTION_TOKEN),
+            |key| json!(format!("{:x}", Sha256::digest(key.trim().as_bytes()))),
+        );
+        fields.insert("key_sha256".to_string(), logged);
     }
 }
 
@@ -32235,5 +32295,42 @@ mod tests {
             ..matches_openai.clone()
         };
         assert!(!other_tenant.matches_interest(&openai_interest));
+    }
+
+    #[test]
+    fn archis_log_keeps_a_links_key_only_as_its_hash() {
+        let key = "a".repeat(64);
+        let hashed = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let step = json!({"id": "s1", "action": "unpublish_artifact", "args": {"key": key}});
+        let plan = json!({"execution": {"steps": [step]}});
+        let validate = admin_params_for_log("executor_validate_plan", &plan);
+        assert_eq!(
+            validate["execution"]["steps"][0]["args"],
+            json!({"key_sha256": hashed})
+        );
+        let execute = admin_params_for_log(
+            "executor_execute_plan",
+            &json!({"execution_id": "e1", "plan": plan, "token": "tok-1"}),
+        );
+        assert_eq!(
+            execute["plan"]["execution"]["steps"][0]["args"],
+            json!({"key_sha256": hashed})
+        );
+        assert_eq!(execute["token"], json!(NODE_SECRET_REDACTION_TOKEN));
+        let answer = admin_payload_for_log(
+            "executor_execute_plan",
+            &json!({"events": [{"step_action": "unpublish_artifact", "tool_args_preview": {"key": key}}]}),
+        );
+        assert_eq!(
+            answer["events"][0]["tool_args_preview"],
+            json!({"key_sha256": hashed})
+        );
+        assert!(!serde_json::to_string(&answer).expect("json").contains(&key));
+        // Another action's args go as they are.
+        let other = json!({"execution": {"steps": [{"id": "s1", "action": "list_hives", "args": {"key": "k"}}]}});
+        assert_eq!(
+            admin_params_for_log("executor_validate_plan", &other),
+            other
+        );
     }
 }

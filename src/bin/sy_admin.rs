@@ -2081,7 +2081,7 @@ fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
 /// the permission to read it, so the run log keeps what the command log keeps
 /// (`unpublish_artifact_log_params`, A-95); any other step's args go as they are.
 fn executor_log_step_args(action: &str, args: &serde_json::Value) -> serde_json::Value {
-    if action == "unpublish_artifact" {
+    if action.trim() == "unpublish_artifact" {
         unpublish_artifact_log_params(args)
     } else {
         args.clone()
@@ -2171,6 +2171,13 @@ fn validate_executor_plan(plan: &AdminExecutorPlan) -> Result<(), String> {
         let action = step.action.trim();
         if action.is_empty() {
             return Err(format!("{step_label}.action must be non-empty"));
+        }
+        // The step runs by the name as written, so a name the check would trim fails only later.
+        if action != step.action {
+            return Err(format!(
+                "{step_label}.action must have no surrounding whitespace: '{}'",
+                step.action
+            ));
         }
         let spec = resolve_internal_action_spec(action)
             .map_err(|detail| format!("{step_label}.action {detail}: '{action}'"))?;
@@ -14376,7 +14383,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
             "A publication that does not exist answers 404 NOT_FOUND.",
             "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
-            "No log keeps a link's key: the command log and the executor's run log keep it as its SHA-256, key_sha256.",
+            "No log keeps a link's key: the command log, the executor's run log and Archi's journal keep it as its SHA-256, key_sha256.",
         ],
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
@@ -25153,6 +25160,25 @@ mod tests {
         let refused = plan(json!({ "key": key, "hive": PRIMARY_HIVE_ID }))
             .expect_err("unpublish_artifact takes no hive");
         assert!(refused.contains("unexpected field 'hive'"), "{refused}");
+        let spaced = parse_executor_plan(json!({
+            "plan_version": ADMIN_EXECUTOR_PLAN_VERSION,
+            "kind": ADMIN_EXECUTOR_PLAN_KIND,
+            "metadata": { "name": "take_page_down", "target_hive": PRIMARY_HIVE_ID },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{ "id": "s1", "action": " unpublish_artifact", "args": { "key": key } }]
+            }
+        }))
+        .expect_err("a step names its action with no surrounding whitespace");
+        assert!(spaced.contains("no surrounding whitespace"), "{spaced}");
+        // Its run log would keep the key only as its hash all the same.
+        let logged = executor_log_step_args(" unpublish_artifact", &json!({ "key": key }));
+        assert!(
+            logged.get("key_sha256").is_some() && logged.get("key").is_none(),
+            "{logged}"
+        );
     }
 
     #[test]

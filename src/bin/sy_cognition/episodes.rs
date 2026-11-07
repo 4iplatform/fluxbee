@@ -144,6 +144,29 @@ impl GateRefusal {
     }
 }
 
+/// What a refusal's log line shows of the proposal's lens: the lens when it is one of
+/// `EPISODE_LENSES`. Another is the model's own words, and `unknown_lens` already says it.
+pub(crate) fn lens_for_log(lens: &str) -> &str {
+    if EPISODE_LENSES.contains(&lens) {
+        lens
+    } else {
+        "(unknown)"
+    }
+}
+
+/// What a refusal's log line shows of context labels, which a model writes: the first
+/// `LOG_LABELS_MAX`, each cut at `LOG_LABEL_MAX_CHARS` characters.
+pub(crate) fn labels_for_log(labels: &[String]) -> Vec<String> {
+    labels
+        .iter()
+        .take(LOG_LABELS_MAX)
+        .map(|label| label.chars().take(LOG_LABEL_MAX_CHARS).collect())
+        .collect()
+}
+
+const LOG_LABELS_MAX: usize = 4;
+const LOG_LABEL_MAX_CHARS: usize = 40;
+
 /// A proposal's final intensity, out of 10, rounded: its base, less a point for every two live
 /// episodes of its lens these people already have (`habit`, up to five points), plus its novelty
 /// (up to two either way). Computed whether or not the rest of the gate holds, so that a refusal
@@ -490,6 +513,22 @@ mod tests {
             gate_episode(&weak_and_unknown, &leading, 0),
             Err(GateRefusal::UnknownLens)
         );
+    }
+
+    #[test]
+    fn a_refusals_log_line_shows_no_free_text() {
+        assert_eq!(lens_for_log("friction"), "friction");
+        assert_eq!(
+            lens_for_log("Ana's anger at Juan over the refund"),
+            "(unknown)"
+        );
+        let labels: Vec<String> = (0..9).map(|n| format!("{n}{}", "x".repeat(80))).collect();
+        let logged = labels_for_log(&labels);
+        assert_eq!(logged.len(), LOG_LABELS_MAX);
+        assert!(logged
+            .iter()
+            .all(|label| label.chars().count() == LOG_LABEL_MAX_CHARS));
+        assert_eq!(labels_for_log(&["billing".to_string()]), ["billing"]);
     }
 
     #[test]
