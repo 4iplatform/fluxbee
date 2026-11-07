@@ -381,7 +381,7 @@ afresh (§2.4), so readers find a region created again from their next read on.
       "thread_id": "…",
       "agent_ilk": "ilk:<uuid>",
       "agent_node": "AI.sales@worker1",
-      "package": { "package_version": 2, "thread_id": "…" }
+      "package": { "package_version": 5, "thread_id": "…" }
     }
   ]
 }

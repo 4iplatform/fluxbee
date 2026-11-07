@@ -32,6 +32,11 @@
 - **After the track (the operator, 2026-11-03):** the atoms (handbook §4.2.6) become a document of
   their own, a reservoir Archi reads to develop solutions. They move with the solutions chapter,
   where a solution lives; until then they stay in the handbook.
+- **A solution runs on one hive** (the operator, 2026-11-06, docs/cognition-hands-v1.md §12.3):
+  a WF and the agents and WFs it names run on the same hive, *"formal y forzado para archi, que
+  sea sí o sí"*. SY.wf-rules refuses any other definition at the check and the deploy
+  (`checkSolutionOnHive`, docs/sy-wf-rules-spec.md §6), and the handbook says it as a rule
+  (§4.2.7). IO nodes are the doors and may run on any hive.
 
 This is the single place for the track. The cases are worked here one at a time.
 

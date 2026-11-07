@@ -282,12 +282,14 @@ it, `(thread_id, agent ILK)` ([docs/router-stream-v1.md §6](../../docs/router-s
 - **`meta.memory_package`:** set by the agent's router when it delivers a message with a `thread_id`
   to an `AI.*` node and SY.cognition has already built the memory of that communication. The router
   takes it from its hive's memory region, for each destination, and drops any package the sender put
-  in. ai.generic renders it as a text block in front of the user input.
+  in. It carries the communication's memories, the feelings of the person at the other end, and the
+  news of the people in the conversation (version 5). ai.generic renders it as a text block in front
+  of the user input, and tells the model to take the news into account and never repeat them.
 - **No sequence number:** SY.cognition keeps the order of a communication with its own turn count.
 
 **Not on the message:** cognition's state (contexts, reasons, cooccurrences, scopes, memories,
-feelings) lives in SY.cognition's own file on its hive, and the message log (`turns`) in SY.storage. A
-node reads neither.
+feelings, episodes) lives in SY.cognition's own file on its hive, and the message log (`turns`) in
+SY.storage. A node reads neither.
 
 So, in an AI node:
 

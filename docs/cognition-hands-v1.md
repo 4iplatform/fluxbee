@@ -15,7 +15,8 @@
   and released in 0.1.103, checked on 8.x (§11.6).
 - The rest, chats of 2026-11-06 (§12): whoever takes a conversation back sees what was said
   meanwhile; cognition analyzes people's turns with no agent; and episodes are public news that
-  fade with time. Agreed in the chat; its design is to review whole before building.
+  fade with time. Agreed in the chat, its design reviewed by the operator the same day:
+  building, for 0.1.104.
 
 This is the single place for the topic.
 
@@ -239,8 +240,7 @@ The rest of A-137, one topic at a time:
   Agreed 2026-11-05 (§10), released in 0.1.102.
 - **Where cognition keeps its state:** agreed 2026-11-06 (§11), released in 0.1.103.
 - **A conversation with no agent, handing over, and who pays:** agreed 2026-11-06 with the
-  episodes as public news (§12). Its design is to review whole before building; §12.6 keeps what
-  is still open.
+  episodes as public news (§12), building for 0.1.104. §12.6 keeps what is still open.
 
 ---
 
@@ -712,8 +712,20 @@ The Cognitive Lab, in TypeScript, with its spec of 2026-03-02.
    - every hive's cognition keeps a copy of every episode, so none depends on another hive to read;
    - in a conversation with no agent, each turn's writer pays, and the WF's hive analyzes it;
    - public means the whole installation.
+9. **A solution's WF and its agents run on one hive, enforced:** *"escribilo como formal y
+   forzado para archi, que sea sí o sí... una solución tiene que deployarse en el mismo hive..
+   pero sí seguro respecto del WF + AI, etc.. que sea parte de lo mismo"*.
+10. **A news item belongs to its protagonist.** The agent takes it into account to answer
+    accordingly, and never passes it on: *"las noticias pertenecen al protagonista, no las
+    repliquemos, solo informar para que el agente conteste en consecuencia y no terminemos en un
+    chismerío total"*.
+11. **Cognition's broadcast, yes,** with the policy reviewed: *"para eso es el broadcast, info a
+    todos los nodos"*.
+12. **No news by topic.** A news item is a paragraph, and the agent judges what applies: *"que se
+    arregle el agente, si es un párrafo, no una palabra la news"*.
+13. **Small fixes may ride along:** *"decidí vos... pero si podés mejor"*.
 
-### 12.4 The design (to review whole before building)
+### 12.4 The design (reviewed by the operator, 2026-11-06)
 
 #### What an agent sees
 
@@ -724,8 +736,8 @@ At 10:17 sales' package carries:
 - **its memories and the feelings, as today.** Juan's part moves Ana's feelings, and Juan's own;
 - **the news:** the episodes of the people in its conversation that still rank, the strongest
   first. For example: *"Ana and Juan argued over the credit note's delay. Pending. 2 hours ago."*
-  - The agent reads them as internal context, like the feelings, and does not repeat them to the
-    person.
+  - The agent takes them into account to answer accordingly. It never repeats them, to the
+    person or to anyone (§12.3, 10).
 
 #### People's turns with no agent: the router
 
@@ -741,8 +753,8 @@ At 10:17 sales' package carries:
   sales'. Its agent's tenant pays, and its package carries the lines.
 - **Otherwise, a communication with no agent,** `(thread_id, none)`. Each turn's writer pays
   through their tenant: a new `TenantSource::Writer`.
-- **A WF on another hive than its agent:** the agent gets the news, not the lines. To recommend:
-  a WF runs on its agents' hive.
+- **A WF and its agents are on one hive** (below), so the lines always reach the agent's
+  cognition.
 - **A turn it already holds is skipped** (the same cycle, writer and text). A WF that forwards
   one message both to an agent and to a person does not count it twice.
 
@@ -753,8 +765,8 @@ At 10:17 sales' package carries:
   - The narrator also gets whom the turn is to.
   - Beside the memory, it may return an episode: its lens, a title, a summary, its state, a base
     intensity and its evidence.
-  - The summary is impersonal: what happened, between whom and how it stood, never what someone
-    feels.
+  - The summary is a paragraph of two to four sentences, not a label. It is impersonal: what
+    happened, between whom and how it stood, never what someone feels.
 - **The gate is the POC's:**
   - a known lens (the POC's four);
   - 7 or more of 10 once the habit and the novelty adjust it;
@@ -769,7 +781,8 @@ At 10:17 sales' package carries:
     it.
 - **It never changes.** A later episode between the same people tells what changed.
 - **It travels once:**
-  - the cognition that makes it keeps it and broadcasts it to `SY.cognition@*`, at TTL 3;
+  - the cognition that makes it keeps it and broadcasts it to `SY.cognition@*`, at TTL 16 as
+    SY.vault's notice;
   - each cognition keeps its copy by id;
   - a hive added later starts with none, and they fade anyway.
 - **Its weight is intensity × 0.5^(age / 7 days),** computed from its age when it is read.
@@ -778,6 +791,16 @@ At 10:17 sales' package carries:
   - A package written before one faded shows it with its age.
 - **The file:** a table of episodes in `cognition.db`, apart from the communications, with the
   people's ILKs indexed.
+
+#### A solution on one hive
+
+- **SY.wf-rules refuses a definition that names an agent or a WF on another hive** than its own.
+  - The answer is `COMPILE_ERROR`, naming each action's path.
+  - It refuses at the check, the compile and the apply, so Archi learns it before any deploy.
+- **The targets are literal node names, each with its hive** (`target_ref` left the language in
+  0.1.90), so the check sees them all.
+- **IO nodes are the doors** and may run on any hive: on 8.x they run on the motherbee.
+- **Archi's handbook states it as a rule** of the WF chapter.
 
 #### The package: version 5
 
@@ -806,13 +829,18 @@ At 10:17 sales' package carries:
   - the table of episodes, their weight by age and the sweep;
   - the package's version 5;
   - the writer as payer.
-- **The Rust SDK:** the package's version 5, `TenantSource::Writer` and the episode's message.
+- **The Rust SDK:** the package's version 5 and `TenantSource::Writer`. The episode's message
+  stays in SY.cognition, which sends it and takes it. The Go SDK's copy of the package follows.
 - **ai.generic:** the news, and the feelings under their own name.
 - **SY.storage:** its check of a usage record takes the writer as it takes the agent. It checks
   the source against the producer and looks the tenant up by the writer's ILK
   (`check_usage_record` and `decide_usage_tenant`, src/bin/sy_storage.rs).
-- **To verify in the build:** the system policy lets `SY.cognition` broadcast to
-  `SY.cognition@*`.
+- **SY.wf-rules:** its definition load refuses another hive's agent or WF, with tests.
+- **Archi's handbook:** the rule, in the WF chapter.
+- **The system policy, reviewed in the build: nothing changes.** It gates only the protected
+  commands (`PROTECTED_SYSTEM_ACTIONS`), and SY nodes pass the broadcast's VPN filter. Each
+  cognition takes an episode only from a cognition, as its router names the sender, the way
+  SY.storage takes SY.vault's notice only from the vault.
 - **Unchanged:** identity, the vault, SY.admin, the orchestrator, the WF engine (no mark is
   needed) and io.slack.
 - **The factory reset:** it removes the motherbee's file, its episodes with it. A worker's stays
@@ -825,8 +853,57 @@ At 10:17 sales' package carries:
   the same rule as Juan's part apply?
 - **A conversation that starts among people and later reaches an agent:** does the agent's
   communication start from the one with no agent?
-- **The episodes of a topic** (option b): once topics are one vocabulary.
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
   lenses.
 - **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
   hive.
+- **Known limits of the build** (its review round):
+  - A WF's message to an agent and its copy to a person split across two stream batches, which is
+    rare, go to two communications on a new thread: the agent's and the one with no agent.
+  - During the upgrade to 0.1.104, an ai.generic still on 0.1.103 cannot read a package that its
+    new router cut (`truncated`), and that message fails. The packages start empty at the
+    upgrade (the state version 2), so a cut one is rare in that window.
+
+### 12.7 Built (2026-11-06)
+
+- **The router** copies at entry what a local WF sends an IO node, the WF as producer
+  (`copied_for_cognition_at_entry`, src/router/mod.rs).
+- **SY.cognition** (src/bin/sy_cognition.rs, src/bin/sy_cognition/episodes.rs):
+  - `holder_of`: an agent's turns are its communication's; a relay joins the communication whose
+    agent served the thread last on the hive, held or in the file (`last_agent_on_thread`), or
+    the thread's with no agent, `(thread_id, none)`, which the region leaves out;
+  - `payer_of`: the agent's tenant, or the writer's (`TenantSource::Writer`);
+  - `turn_key` and `turn_keys`: one message copied twice is one turn, analyzed once;
+  - the narrator reads whom the turn is to, the two leading contexts and the habits, and may
+    propose an episode in the same call; `gate_episode` is the POC's gate;
+  - `publish_episode`, `take_episode`, `EpisodeBook` and the file's table of episodes; the weight
+    by age, the sweep at each region write, the load at start;
+  - the package's version 5: `feelings` (the feelings, renamed in the code too) and up to 5
+    `news`;
+  - the file's state version 2, since the feelings changed name: the rows of 0.1.103 start
+    again.
+- **ai.generic** shows the news with their rule: the agent takes them into account, and never
+  repeats them, to the person or to anyone.
+- **SY.storage** takes `writer` as it takes `agent`.
+- **SY.wf-rules** refuses another hive's agent or WF (`checkSolutionOnHive`), and the handbook
+  states the rule (§4.2.7).
+- **Small fixes that rode along** (§12.3, 13):
+  - cognition's `STATUS` no longer names the durable entity schemas of SY.storage, gone in
+    0.1.103;
+  - the empty `cache` and `shm` folders cognition left in its folder go at its start, once, when
+    empty.
+- **The review round** (one, two reviewers): no high finding. Fixed, each with its test:
+  - a medium: a WF that sends a person's first message to the agent and to another person at
+    once had the relay join the communication with no agent, analyzed and paid twice. The relays
+    of a batch now find their communication after its other turns are held;
+  - who served a thread last is the newest last turn, not when the worker last analyzed it;
+  - the agent's own answer that a WF relays in a later cycle, under another trace, is not a
+    second turn (`echoes_own_answer`);
+  - a conversation's news reach all its people, not the first four;
+  - the communications with no agent are not loaded at start, nor counted as pruned from the
+    region;
+  - the package's `dropped_feelings` takes a default, as `dropped_news` does, so a router and a
+    cognition of two versions read each other's region during the upgrade.
+- **Noted, not changed:** SY.wf-rules checks a definition applied before 0.1.104 at its next apply
+  or rollback, never at start, so a running WF is never stopped by the rule. No WF was deployed
+  on 8.x (2026-11-06).

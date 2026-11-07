@@ -91,7 +91,56 @@ func (s *Service) loadWorkflow(req CompileRequest) (loadedWorkflow, error) {
 	if err != nil {
 		return loadedWorkflow{}, WfRulesError{Code: "COMPILE_ERROR", Detail: err.Error()}
 	}
+	if err := checkSolutionOnHive(def, s.cfg.HiveID); err != nil {
+		return loadedWorkflow{}, err
+	}
 	return loadedWorkflow{name: workflowName, definitionBytes: definitionBytes, def: def}, nil
+}
+
+// checkSolutionOnHive refuses a definition that names an agent (AI.*) or a WF (WF.*) on another
+// hive than this one (COMPILE_ERROR, naming each path): a solution's WFs and agents run on one hive,
+// so the people's turns a WF relays reach its agents' cognition (cognition-hands-v1 §12.4). IO
+// nodes are the doors and may run on any hive. Every starter and target is a node name with its
+// hive, written in the definition, so the check sees them all.
+func checkSolutionOnHive(def *wfcel.WorkflowDefinition, hive string) error {
+	var refused []string
+	check := func(path, name string) {
+		name = strings.TrimSpace(name)
+		upper := strings.ToUpper(name)
+		if !strings.HasPrefix(upper, "AI.") && !strings.HasPrefix(upper, "WF.") {
+			return
+		}
+		if _, nodeHive, _ := strings.Cut(name, "@"); nodeHive != hive {
+			refused = append(refused, fmt.Sprintf("%s: %s is on another hive", path, name))
+		}
+	}
+	actions := func(path string, list []wfcel.ActionDefinition) {
+		for i, action := range list {
+			if action.Target != "" {
+				check(fmt.Sprintf("%s[%d].target", path, i), action.Target)
+			}
+		}
+	}
+	transitions := func(path string, list []wfcel.TransitionDefinition) {
+		for j, transition := range list {
+			actions(fmt.Sprintf("%s[%d].actions", path, j), transition.Actions)
+		}
+	}
+	for i, name := range def.StartFrom {
+		check(fmt.Sprintf("start_from[%d]", i), name)
+	}
+	for i, state := range def.States {
+		actions(fmt.Sprintf("states[%d].entry_actions", i), state.EntryActions)
+		actions(fmt.Sprintf("states[%d].exit_actions", i), state.ExitActions)
+		transitions(fmt.Sprintf("states[%d].transitions", i), state.Transitions)
+	}
+	transitions("catch", def.Catch)
+	if len(refused) == 0 {
+		return nil
+	}
+	return WfRulesError{Code: "COMPILE_ERROR", Detail: fmt.Sprintf(
+		"a solution's WFs and agents run on one hive, this one (%s): %s",
+		hive, strings.Join(refused, "; "))}
 }
 
 // checkSlotLoads loads the definition of a slot as the WF node will, before an apply publishes the
@@ -104,10 +153,11 @@ func (s *Service) checkSlotLoads(workflowName, slot string, version uint64) erro
 	if err != nil {
 		return err
 	}
-	if _, err := wfcel.LoadDefinitionBytes(definitionBytes, "", s.clock); err != nil {
+	def, err := wfcel.LoadDefinitionBytes(definitionBytes, "", s.clock)
+	if err != nil {
 		return WfRulesError{Code: "COMPILE_ERROR", Detail: fmt.Sprintf("the %s definition (version %d) no longer loads: %v", slot, version, err)}
 	}
-	return nil
+	return checkSolutionOnHive(def, s.cfg.HiveID)
 }
 
 // decodeCompileRequest decodes a compile request with its definition's numbers as written

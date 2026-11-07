@@ -348,7 +348,7 @@ cut off before), and the nodes send them through `storage.usage`.
 | `stored_at` | When SY.storage wrote it |
 | `hive`, `node_name`, `node_ilk` | Who spent |
 | `tenant_id` | The tenant that SY.storage charged |
-| `tenant_source` | Why: `node`, `agent`, `case`, `root` or `fallback_root` |
+| `tenant_source` | Why: `node`, `agent`, `writer`, `case`, `root` or `fallback_root` |
 | `claimed_tenant_id` | The tenant that the record claimed |
 | `verified` | `false` when identity never answered and the tenant that the record claimed was kept |
 | `counterpart_ilk` | The counterpart (for SY.cognition, the agent's ILK) |
@@ -382,6 +382,7 @@ cut off before), and the nodes send them through `storage.usage`.
 | --- | --- | --- |
 | A node outside `SY.*` | `node` | Its own, according to identity, looked up by its name (`handler_node`) |
 | SY.cognition | `agent` | The one of the agent's ILK (`counterpart_ilk`), according to identity |
+| SY.cognition | `writer` | In a communication with no agent, the one of the writer's ILK (`counterpart_ilk`), according to identity (docs/cognition-hands-v1.md §12.4) |
 | SY.frontdesk.gov | `case` | The case's, as it comes |
 | SY.architect, SY.admin | `root` | The root tenant |
 | Any | `fallback_root` | The root tenant |

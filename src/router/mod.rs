@@ -843,8 +843,9 @@ async fn handle_node(
                     }
                 }
                 // A local agent's send, for its cognition (§6.2): what it receives is copied at
-                // delivery.
-                if is_agent_node(&conn_node_name) && is_communication_turn(&msg) {
+                // delivery. A local WF's message to an IO node too: a relay between people
+                // (docs/cognition-hands-v1.md §12.4).
+                if copied_for_cognition_at_entry(&conn_node_name, &msg) {
                     if let Some(copy) = cognition_copy(&msg, &conn_node_name) {
                         log_stream.append_cognition_turn(&conn_node_name, copy);
                     }
@@ -6718,6 +6719,21 @@ fn is_agent_node(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AI."))
 }
 
+/// Whether a node is a WF, whose messages to IO nodes go to its hive's cognition.
+fn is_workflow_node(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WF."))
+}
+
+/// What a sender's message brings its hive's cognition at entry: an agent's turn (§6.2), or a WF's
+/// turn to an IO node, a relay between people on the thread (docs/cognition-hands-v1.md §12.4).
+/// What a WF sends an agent is copied at the agent's delivery, as any turn an agent receives.
+fn copied_for_cognition_at_entry(sender: &str, msg: &Message) -> bool {
+    let to_an_io_node = matches!(&msg.routing.dst, Destination::Unicast(dst) if is_io_node(dst));
+    is_communication_turn(msg)
+        && (is_agent_node(sender) || (is_workflow_node(sender) && to_an_io_node))
+}
+
 /// Whether a message is a turn of a communication: a kind that counts as a turn, with a thread,
 /// neither a tap copy nor a broadcast (§6.2).
 fn is_communication_turn(msg: &Message) -> bool {
@@ -9701,7 +9717,8 @@ mod tests {
                 contexts: Vec::new(),
                 reasons: Vec::new(),
                 memories: Vec::new(),
-                episodes: Vec::new(),
+                feelings: Vec::new(),
+                news: Vec::new(),
                 turns: Vec::new(),
                 truncated: None,
             });
@@ -9895,7 +9912,8 @@ mod tests {
                 dominant_context_id: None,
                 dominant_reason_id: None,
             }],
-            episodes: Vec::new(),
+            feelings: Vec::new(),
+            news: Vec::new(),
             turns,
             truncated: None,
         };
@@ -9981,7 +9999,8 @@ mod tests {
             contexts: Vec::new(),
             reasons: Vec::new(),
             memories: Vec::new(),
-            episodes: Vec::new(),
+            feelings: Vec::new(),
+            news: Vec::new(),
             turns: Vec::new(),
             truncated: None,
         };
@@ -10018,6 +10037,58 @@ mod tests {
         assert_eq!(label("AI.a@motherbee").as_deref(), Some("a"));
         assert_eq!(label("AI.c@motherbee"), None);
         assert!(is_agent_node("ai.sales@worker1") && !is_agent_node("SY.frontdesk.gov@motherbee"));
+    }
+
+    /// At entry, the router copies for its cognition an agent's turns, and a WF's turns to an IO
+    /// node, the relay between people (docs/cognition-hands-v1.md §12.4); not what a WF sends an
+    /// agent, copied at the agent's delivery, nor an IO node's own sends.
+    #[test]
+    fn at_entry_cognition_gets_an_agents_turns_and_a_wfs_relays() {
+        let turn = |dst: &str| {
+            let mut msg = Message {
+                routing: Routing {
+                    src: Uuid::new_v4().to_string(),
+                    src_l2_name: None,
+                    dst: Destination::Unicast(dst.to_string()),
+                    ttl: 8,
+                    trace_id: Uuid::new_v4().to_string(),
+                },
+                meta: Meta {
+                    msg_type: "user".to_string(),
+                    thread_id: Some("thread:t".to_string()),
+                    ..Meta::default()
+                },
+                payload: serde_json::json!({"type": "text", "content": "hi"}),
+            };
+            msg.meta.thread_id = Some("thread:t".to_string());
+            msg
+        };
+        assert!(copied_for_cognition_at_entry(
+            "AI.sales@worker1",
+            &turn("WF.soporte@worker1")
+        ));
+        assert!(copied_for_cognition_at_entry(
+            "WF.soporte@worker1",
+            &turn("IO.slack.team@motherbee")
+        ));
+        assert!(copied_for_cognition_at_entry(
+            "wf.soporte@worker1",
+            &turn("IO.api@worker1")
+        ));
+        assert!(!copied_for_cognition_at_entry(
+            "WF.soporte@worker1",
+            &turn("AI.sales@worker1")
+        ));
+        assert!(!copied_for_cognition_at_entry(
+            "IO.slack@motherbee",
+            &turn("WF.soporte@worker1")
+        ));
+        let mut no_thread = turn("IO.slack.team@motherbee");
+        no_thread.meta.thread_id = None;
+        assert!(!copied_for_cognition_at_entry(
+            "WF.soporte@worker1",
+            &no_thread
+        ));
     }
 
     /// A-44: a second live process with a node's UUID does not take its route. Its HELLO waits
@@ -10996,7 +11067,8 @@ mod tests {
             contexts: Vec::new(),
             reasons: Vec::new(),
             memories: Vec::new(),
-            episodes: Vec::new(),
+            feelings: Vec::new(),
+            news: Vec::new(),
             turns: Vec::new(),
             truncated: None,
         };
@@ -11012,7 +11084,8 @@ mod tests {
             contexts: Vec::new(),
             reasons: Vec::new(),
             memories: Vec::new(),
-            episodes: Vec::new(),
+            feelings: Vec::new(),
+            news: Vec::new(),
             turns: Vec::new(),
             truncated: None,
         };

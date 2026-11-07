@@ -878,6 +878,14 @@ its errors, and the answers that arrive after their wait.
   - In chat, check every definition, show the operator what it does, and only then deploy.
   - In the pipeline, the designer's workflows are checked before the plan, and a refusal comes back
     to the designer.
+- **A solution runs on one hive. This is a rule, not a preference.** A workflow and every agent
+  (`AI.*`) and workflow (`WF.*`) its definition names run on the same hive: deploy the workflow on
+  its agents' hive, and create a new agent on the hive of the workflows that will use it.
+  - SY.wf-rules refuses any other definition, at the check and at the deploy: `COMPILE_ERROR`,
+    `a solution's WFs and agents run on one hive, this one (<hive>)`, with each path it found.
+  - IO nodes are the doors, and may run on any hive.
+  - Why: cognition, on the agents' hive, takes the turns the workflow relays between people, so
+    the agent that takes a conversation back sees what was said meanwhile.
 - **A workflow's name** is lowercase letters and digits, in parts joined by dots, the first
   starting with a letter: `sales`, `sales.gate0195`, never `sales-gate`. Its runtime is
   `wf.<workflow_name>`, and the runtime naming policy has no hyphen; the check refuses one.

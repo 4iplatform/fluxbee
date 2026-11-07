@@ -1,7 +1,9 @@
 # Cognition (SY.cognition): reference
 
 **Status:** as built in 0.1.79 (2026-10-17); each communication's last turns added on 2026-10-30
-(§3.4); its state in its own file since 0.1.103 (§5, docs/cognition-hands-v1.md §11).
+(§3.4); its state in its own file since 0.1.103 (§5, docs/cognition-hands-v1.md §11); the people's
+relays, the communications with no agent and the episodes, public news, since 0.1.104 (§2, §4.1,
+docs/cognition-hands-v1.md §12).
 **Audience:** developers of AI nodes, the router, SY.storage and anyone who reads agent memory.
 
 This page describes what SY.cognition does today, and names the code that backs each statement.
@@ -21,8 +23,11 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
 
 - **What it builds:** a memory per communication for each agent: what the conversation is about
   (contexts), what it seeks (reasons), the phases it goes through (scopes), a running summary
-  (memories), the feelings of each person in it (episodes, §5), and its last 20 turns (what the
-  agent received and sent).
+  (memories), the feelings of each person in it (§4), and its last 20 turns (what the agent
+  received and sent).
+- **The episodes:** social events between people, public like the news (§4.1). The cognition
+  whose turn showed one makes it and sends it to every hive's cognition; an agent gets those
+  about the people of its conversation, and they fade with time.
 - **Two paths, two timings:** the last turns are taken when the turn arrives, ahead of any model
   call, so the next message delivered to the agent carries the turn before it (§3.4). Everything
   else comes from a worker that takes the turns one at a time, with up to two model calls each,
@@ -32,14 +37,17 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   memory.
 - **A communication** is `(thread_id, agent ILK)` (`CommunicationKey`): one thread, and the
   agent that serves it. Two agents in one thread are two communications. The memory is never
-  keyed by hive or by node; the node is only how the router finds the agent.
+  keyed by hive or by node; the node is only how the router finds the agent. What people say to
+  each other through a WF on a thread no agent served on this hive is the communication with no
+  agent, `(thread_id, none)` (§2).
 - **Where it runs:** on the motherbee and on every worker, next to the agents (`hive.yaml`
   `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.
 - **Who reads it:** ai.generic, through the memory package the router attaches to messages it
   delivers to an agent (§7). Its state lives in its own file on its hive, which only it reads
   (§5); SY.storage keeps the messages, not cognition's state.
-- **The cost:** up to two model calls per turn, charged to the agent's tenant (§3, §9).
+- **The cost:** up to two model calls per turn, charged to the tenant of whoever holds the
+  result: the agent's, or the writer's in a communication with no agent (§3, §9).
 
 ---
 
@@ -56,6 +64,12 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   agent destination (`deliver_locally`). That covers messages from local nodes, from the WAN and
   from the hive's other routers (`handle_message`, `handle_wan_message`, `handle_peer_message`).
 - A message between two local agents is copied twice, once for each agent's communication.
+- **Relay:** a local WF sends a message to an IO node, which is how a WF passes what one person
+  says to another (`copied_for_cognition_at_entry`; docs/cognition-hands-v1.md §12.4). It is
+  copied when it enters the router, with the WF as the record's producer. What a WF sends an agent
+  is copied at the agent's delivery, as any turn the agent gets. A solution's WF runs on its
+  agents' hive (SY.wf-rules refuses any other definition), so the relay reaches its agents'
+  cognition.
 
 **What counts as a turn** (`is_communication_turn`):
 
@@ -65,7 +79,7 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
 
 **The copy** (`cognition_copy`): the message as routed, with the sender's real name in
 `routing.src_l2_name`, the action class filled in, and no memory package. The stream record's
-`producer` is the agent's node name (`append_cognition_turn`).
+`producer` is the agent's node name, or the WF's for a relay (`append_cognition_turn`).
 
 **Who receives it** (`sinks_for` in `src/router/stream.rs`):
 
@@ -79,9 +93,24 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   anywhere else, or one it cannot read, is dropped without an ack.
 - It skips any record at or below the last seq it took from that stream and epoch
   (`stream_seen`, `stream_repeats_skipped_total`).
+- **Whose communication** (`holder_of`): the producer's, for an agent; for a relay, the
+  communication whose agent served the thread last on this hive, held or in the file
+  (`last_agent_on_thread`), or else the thread's communication with no agent.
+  - *Served last* is the newest last turn, as its router took it (`last_turn_epoch_ms`), whatever
+    when the worker analyzed it.
+  - The relays of a batch find theirs after the batch's other turns are held. A WF that sends one
+    message to an agent and to a person puts both copies in one batch, in either order, so the
+    relay joins that agent's communication even on a new thread. Two copies split across two
+    batches, which is rare, go to two communications.
 - It takes each new `cognition.turns` record into its communication's last turns, writes each
   communication it touched to its file and rewrites the memory region once for the batch (the
   intake, §3.4).
+- **One message, one turn:** a turn's key is its cycle (trace id), its writer and its text
+  (`turn_key`), and a communication keeps the keys of its last turns (`turn_keys`). A message the
+  agent sent, which the WF then relays to the person, comes twice with one key: the second is
+  left out, and not analyzed (`duplicate_turns_skipped_total`). An answer of the agent that a WF
+  relays in a later cycle, under another trace, is left out too: the agent wrote it, and its
+  communication holds an answer with its text (`echoes_own_answer`).
 - Then it hands each record to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full queue drops
   the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its communication's
   last turns.
@@ -101,12 +130,16 @@ failure in steps 1 to 6 skips the turn; the message itself was already delivered
 stays in the last turns.
 
 1. **Thread:** `meta.thread_id` must be present (`invalid_turns_total` otherwise).
-2. **Agent:** the record's producer is the agent node. SY.cognition maps it to the agent's ILK and
-   tenant through its hive's identity SHM, by `handler_node` (`agent_identity_of`,
+2. **Holder:** whose communication the turn is (`holder_of`, §2). An agent node is mapped to its
+   ILK and tenant through its hive's identity SHM, by `handler_node` (`agent_identity_of`,
    `find_ilk_by_handler_node_from_hive_id`).
    - The answer is cached while the SHM's `seq` is unchanged; when the `seq` cannot be read, for
      60 s (`COGNITION_AGENT_ILK_TTL`).
    - An agent node without an ILK in the SHM gets no memory (`no_agent_ilk_total`).
+   - **Who pays** (`payer_of`): the agent's tenant (`TenantSource::Agent`) or, in a communication
+     with no agent, the tenant of the turn's writer, by their ILK (`TenantSource::Writer`). A
+     turn with neither is not analyzed. The ILK that holds the result pays
+     (docs/cognition-hands-v1.md §12.3).
 3. **A person, then the state:**
    - **Only a turn with a person at its other end is analyzed** (`person_at_other_end`,
      [cognition-hands-v1](../cognition-hands-v1.md) §6): one the agent got, unless its writer
@@ -137,6 +170,8 @@ stays in the last turns.
     the held ones, and its turns are merged with those the intake took meanwhile. Then the
     communication is written whole to its file (§5) and the memory region is rewritten (§7), both
     from what is held (`sync_held_state`).
+11. **Episode:** an episode the summarizer proposed goes through the gate, and one that passes is
+    kept and sent to every hive's cognition (`publish_episode`, §4.1).
 
 ### 3.1 The tagger
 
@@ -162,7 +197,7 @@ stays in the last turns.
 ### 3.2 The narrative summarizer
 
 `run_narrative_summarizer_ai` in `narrative_summarizer_ai.rs`, called by
-`update_memories_and_episodes_for_thread`:
+`update_memories_and_feelings_for_thread`:
 
 - **When:** the communication has an active scope, with its dominant context and reason.
 - **Input:** who spoke the turn (`narrator_speaker`: `person Ana Pérez (ilk:…)`, or `the agent,
@@ -170,11 +205,15 @@ stays in the last turns.
   (label, signals), the extra signals, the previous memory summary of the scope, and the affects
   the turn shows, with their titles and the text so far of the heaviest of them. It never sees
   the message text. The memory names each person as the speaker names them
-  (docs/cognition-hands-v1.md §10.3).
-- **Output:** `memory_summary`, and `episode_summary` with `episode_reason` exactly when the
+  (docs/cognition-hands-v1.md §10.3). For an episode, it also reads whom the turn is to
+  (`episode_people`), the communication's two leading contexts (`leading_contexts`) and how many
+  live episodes of each lens the turn's people already have (§4.1).
+- **Output:** `memory_summary`, and `feeling_summary` with `feeling_reason` exactly when the
   turn shows an affect: one text for the moment, which each feeling the turn shows takes. An empty
-  memory summary, or a missing episode text, is an invalid output.
-- **Limits:** the same `semantic_tagger.timeout_ms`, provider and model as the tagger; 1024
+  memory summary, or a missing feeling text, is an invalid output. And `episode`, null or a
+  proposal: its lens, title, summary, state, base intensity, novelty and evidence; one that does
+  not read is dropped, the memory kept (`episode_of_answer`).
+- **Limits:** the same `semantic_tagger.timeout_ms`, provider and model as the tagger; 1536
   output tokens (`NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS`).
 
 ### 3.3 Failures: fail-open
@@ -260,7 +299,7 @@ and the agent ILK, never the hive or the node. A scope gets a random UUID when i
 | Co-occurrence | `cooccurrence`: thread, agent, context label, reason label | context and reason pair |
 | Scope | `scope:<uuid v4>` | phase of the conversation |
 | Memory | `memory`: thread, agent, scope id | scope |
-| Episode (a feeling) | `episode`: thread, agent, owner ILK, affect, context label | owner, affect and context |
+| Feeling | `feeling`: thread, agent, owner ILK, affect, context label | owner, affect and context |
 
 **The communication** (`ThreadCognitionState`): first and last seen, the turn count, the last
 turn's `src_ilk`, `dst_ilk` and `ich`, and the last turns (§3.4). The worker sets the first
@@ -311,7 +350,7 @@ thresholds.
 - The communication's other memories decay by 0.97 (`COGNITION_MEMORY_DECAY_FACTOR`). Memories
   never close.
 
-**Episode, a person's feeling** (`build_episode_candidates`, `update_feelings_for_turn`;
+**A person's feeling** (`build_feeling_candidates`, `update_feelings_for_turn`;
 docs/cognition-hands-v1.md §10.3):
 
 - **Who:** a feeling is its owner's, the person who wrote the turns that show it
@@ -353,6 +392,42 @@ docs/cognition-hands-v1.md §10.3):
 - **Its level,** as the agent reads it (`feeling_level`): `strong` from three steps up, `present`
   from one, `faint` under one.
 
+### 4.1 The episodes, public news
+
+Not a communication's: an episode is a social event between people, public like the news, which
+belongs to the people it is about (`src/bin/sy_cognition/episodes.rs`; docs/cognition-hands-v1.md
+§12, from the lab's POC).
+
+- **Made** in the summarizer's call of any analyzed turn, with no call of its own: it proposes one
+  or none (§3.2), and the gate decides (`gate_episode`):
+  - a known lens: `friction`, `discomfort`, `appreciation` or `shame` (`EPISODE_LENSES`);
+  - a final intensity of 7 or more out of 10 (`EPISODE_MIN_INTENSITY`): the base intensity, a
+    point off for every two live episodes of that lens among the same people (the habit, up to
+    five), and the novelty, from -2 to 2;
+  - evidence of 8 or more (`EPISODE_MIN_EVIDENCE`), anchored in one of the communication's two
+    leading contexts;
+  - and it must be about a person: an ILK the identity knows as no one else's, or does not know.
+  A refused proposal counts in `episodes.gated_out_total`.
+- **Its fields** (`Episode`): an id, the lens, a title, a summary (a paragraph: what happened,
+  between whom and how it stood, never what someone feels), its state (`resolved`, `pending`,
+  `follow_up` or `inconclusive`), its intensity, its birth time, the ILKs of its people (the
+  turn's writer and whom the turn was to, `episode_people`), and where it came from.
+- **It travels once** (`publish_episode`): kept here, then sent as a system broadcast,
+  `COGNITION_EPISODE`, to `SY.cognition@*` with TTL 16, the router's broadcast that crosses
+  hives. Each cognition takes it only from a cognition, as its router names the sender, checks
+  it (`Episode::checked`) and keeps it once (`take_episode`; `episodes.received_total`,
+  `episodes.refused_total`). A hive added later starts with none.
+- **It fades with time, not turns:** its weight is `intensity × 0.5^(age / 7 days)`
+  (`Episode::weight_at`), and it leaves under 2 (`EPISODE_FADED_BELOW`, `fades_at_ms`). Each
+  region write sweeps the faded ones from memory and the file.
+- **Kept** in memory (`EpisodeBook`) and in the file's table of episodes (§5), read back at start
+  (`load_live_episodes`).
+- **Read:** each package carries up to 5 (`PACKAGE_MAX_NEWS`), as `news`: those about the people
+  of its communication (`people_of_conversation`: the writers of what its agent got, whom it
+  answered and the owners of its feelings), the strongest first (§7). ai.generic shows them with
+  their rule: the agent takes them into account to answer, and never repeats them, to the person
+  or to anyone.
+
 ---
 
 ## 5. Its own file
@@ -371,9 +446,12 @@ nothing of cognition's.
   last activity (`thread_recency_epoch_ms`), the version of its state, and the state as one JSON
   (`ThreadCognitionState`: its open items, the active scope, the memories, the open feelings, the
   last turns and the counters). A row takes about 10 to 60 KB, the turns most of it.
+- **One row per episode** (`episodes`): its id, when it fades, and the episode as one JSON
+  (§4.1), each kept once (`save_episode`) and deleted when it fades (`sweep_episodes`).
 - **Reading a row:** a field the row lacks takes its default, so a field added later keeps the
   rows. A row of an older state version, or one that cannot be read, starts its communication
-  again, and is left out at start. A row of a newer state version (after a rollback) is kept as
+  again, and is left out at start. Version 2 (0.1.104) names the feelings `feelings`, so the rows
+  0.1.103 wrote start again. A row of a newer state version (after a rollback) is kept as
   it is, and its communication's turns are skipped (`store_load_failures_total`) until the newer
   release is back.
 - **When it is written:** each communication changed, whole, in one transaction, whenever the held
@@ -396,8 +474,9 @@ nothing of cognition's.
 ## 6. Start and loads
 
 - **At start, before the first batch** (`load_most_recent`): the most recently active
-  communications are loaded from the file, up to twice the region's bytes of state, and the region
-  is written from them: what does not fit it is let go again. So after a restart, or a host reboot
+  communications with an agent are loaded from the file, up to twice the region's bytes of state,
+  and the region is written from them: what does not fit it is let go again. A communication with
+  no agent comes back at its next turn: its package reaches no one. So after a restart, or a host reboot
   that emptied the region, the agent's first message carries its memory
   (`loaded_at_start_total`).
 - **At the next turn of a communication not held** (`held_or_loaded`): the intake loads it from
@@ -423,7 +502,8 @@ nothing of cognition's.
 **The hot set** (`build_memory_hot_set_snapshot`, `retain_memory_hot_set`), rewritten at every
 intake batch, after every worker turn and at start (`sync_held_state`):
 
-- The communications SY.cognition holds are ranked and kept while they fit the 4 MiB.
+- The communications SY.cognition holds are ranked and kept while they fit the 4 MiB. A
+  communication with no agent is left out: its package would reach no one.
 - The ranking puts first the communications just updated (the batch's, or the worker's turn).
   They stay held even when they do not fit: one that does not fit stays out of the region, not
   out of memory. So do the communications a failed write left unsaved. Then: most recent turn (the intake's last, or the worker's
@@ -437,17 +517,21 @@ intake batch, after every worker turn and at start (`sync_held_state`):
 **The package** (`build_memory_package_for_thread`; `MemoryPackage` in
 `crates/fluxbee_sdk/src/protocol.rs`):
 
-- `package_version` 4 (`MEMORY_PACKAGE_VERSION`) and the `thread_id`.
+- `package_version` 5 (`MEMORY_PACKAGE_VERSION`) and the `thread_id`.
 - The dominant context and reason: the open ones with the highest weight.
 - Up to 6 open contexts and 6 open reasons, by weight.
 - Up to 6 memories by weight.
-- Up to 12 open feelings (`episodes`), the heaviest first, then the most recently felt
+- Up to 12 open feelings (`feelings`), the heaviest first, then the most recently felt
   (`COGNITION_PACKAGE_MAX_FEELINGS`). Each has its owner (ILK, name, kind), affect, context,
   title, level, weight, when its owner last showed it, and the narrator's text cut at 300
   characters.
+- Up to 5 `news` (`NewsSummary`): the episodes about the communication's people that still rank,
+  the strongest first, then the newest (`EpisodeBook::news_for`, §4.1). Each has its lens, title,
+  summary, state, people (ILK, name, kind), birth time, and its weight when the package was
+  written. A package written before one faded shows it with its age.
 - `turns`: the last turns, oldest first, as §3.4 keeps them (`MemoryTurn`); left out when there
   are none. The message the package rides on is not among them.
-- `truncated` counts the labels, memories and feelings left out, when any were.
+- `truncated` counts the labels, memories, feelings and news left out, when any were.
 - There is no byte budget and no summary cut beyond those counts; the turns are bounded at intake
   (48 KiB).
 
@@ -544,8 +628,10 @@ Every model call SY.cognition makes leaves a usage record (`docs/router-stream-v
 
 **The account** (`handle_turn`; `AiAccount` in `crates/fluxbee_ai_sdk/src/usage.rs`):
 
-- `AiAccount::charge` with the agent's tenant and `TenantSource::Agent`, recorded as `agent`;
-- `node_ilk` is SY.cognition's own ILK; `counterpart_ilk` is the agent's ILK;
+- `AiAccount::charge` with the agent's tenant and `TenantSource::Agent`, recorded as `agent`; in a
+  communication with no agent, with the writer's tenant and `TenantSource::Writer`, recorded as
+  `writer` (`payer_of`);
+- `node_ilk` is SY.cognition's own ILK; `counterpart_ilk` is the agent's ILK, or the writer's;
 - `trace_id` and `thread_id` are the turn's.
 - An agent without a tenant in the SHM is charged to the root tenant, as `fallback_root`.
 
@@ -561,10 +647,10 @@ Every model call SY.cognition makes leaves a usage record (`docs/router-stream-v
 
 **SY.storage decides the tenant** (`decide_usage_tenant`, `check_usage_record`):
 
-- A record from SY.cognition says `agent` with a `counterpart_ilk`, or `fallback_root` with the
-  root tenant. Anything else is refused (`wrong_source`, `not_root`).
-- For `agent`, the tenant charged is the agent ILK's tenant in the motherbee's identity SHM,
-  whatever the record claims. If identity cannot answer by the inbox row's last attempt, the
+- A record from SY.cognition says `agent` or `writer` with a `counterpart_ilk`, or `fallback_root`
+  with the root tenant. Anything else is refused (`wrong_source`, `not_root`).
+- For `agent` and `writer`, the tenant charged is that ILK's tenant in the motherbee's identity
+  SHM, whatever the record claims. If identity cannot answer by the inbox row's last attempt, the
   claimed tenant is kept with `verified = false`.
 - For `fallback_root`, the root tenant is charged.
 
@@ -578,15 +664,20 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
 
 - the flow: `processed_turns_total`, `invalid_turns_total`, `dropped_turns_queue_full_total`,
   `stream_repeats_skipped_total`, `no_agent_ilk_total`, `intake_turns_total` (turns the
-  intake added to their communications' last turns, §3.4), and `turns_not_analyzed_total` (turns
-  with no person at their other end, §3);
+  intake added to their communications' last turns, §3.4), `turns_not_analyzed_total` (turns
+  with no person at their other end, §3), `relay_turns_total` (the turns a WF relayed between
+  people, §2) and `duplicate_turns_skipped_total` (one message copied twice, §2);
 - the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, failures and invalid
   outputs;
 - the live state: the communications held, their contexts, reasons and co-occurrences, active
-  scopes, memories and feelings (`active_episodes_total`).
+  scopes, memories and feelings (`active_feelings_total`).
 
 Under `store`: the file's path, the communications it keeps and its bytes, the communications
 loaded at start (`loaded_at_start_total`), and the loads and writes with their failures.
+
+Under `episodes` (§4.1): those kept now (`live_total`), made here (`made_total`), proposed and
+refused by the gate (`gated_out_total`), taken from other hives (`received_total`) and refused
+from them (`refused_total`).
 
 Under `shm`: the capacity, the communications kept and pruned, the payload bytes and the last
 sync status.
@@ -598,10 +689,15 @@ sync status.
 - **FINDINGS A-72:** agents with a definition only work on the motherbee, since their assets do
   not reach the workers (`docs/reference/identity.md` §4). Cognition itself runs on the workers.
 - **Acked but not processed:** SY.cognition acks a batch before the worker processes its turns.
-  Turns queued when it stops lose their labels, memories and episodes; the stream does not resend
+  Turns queued when it stops lose their labels, memories and feelings; the stream does not resend
   them. Their text is in the last turns already.
 - **The region is written whole:** SY.cognition rewrites it at every batch and every worker turn,
   and the router parses it again after each write. The last turns make it fuller, so each write and
   parse takes longer.
 - **A lost hive loses its file:** the VM snapshots cover it for now
   (docs/cognition-hands-v1.md §11.2).
+- **An episode is not backfilled:** a hive added later, or a cognition that was down when one was
+  sent, does not get it. The broadcast is sent once, and episodes fade within weeks.
+- **Handing over between agents:** two agents on one thread are two communications, so the agent
+  that takes the conversation back sees nothing of the other agent's turns
+  (docs/cognition-hands-v1.md §12.6).

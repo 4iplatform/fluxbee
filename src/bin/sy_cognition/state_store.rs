@@ -1,6 +1,7 @@
 //! SY.cognition's own state (docs/cognition-hands-v1.md §11.3): one SQLite file in its folder on its
-//! hive, one row per communication with its whole state. Only this node reads it: the folder is
-//! 0700, and the file and its WAL sidecars 0600 from their creation.
+//! hive, one row per communication with its whole state, and one per episode it keeps, the public
+//! news of §12. Only this node reads it: the folder is 0700, and the file and its WAL sidecars 0600
+//! from their creation.
 
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use super::episodes::Episode;
 use super::{CognitionError, CommunicationKey, ThreadCognitionState};
 
 /// The file's name in SY.cognition's folder.
@@ -17,7 +19,9 @@ pub(crate) const STORE_FILE_NAME: &str = "cognition.db";
 /// The shape of a row's state. A field added with a default keeps it; a change older rows cannot
 /// take raises it. A row of an older shape, or one that cannot be read, starts its communication
 /// again; a row of a newer shape (after a rollback) is kept as it is, and its turns are skipped.
-const STATE_VERSION: i64 = 1;
+/// 2 (0.1.104): the feelings are `feelings`, since an episode is now a public event
+/// (docs/cognition-hands-v1.md §12).
+const STATE_VERSION: i64 = 2;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS communications (
@@ -29,6 +33,12 @@ CREATE TABLE IF NOT EXISTS communications (
     PRIMARY KEY (thread_id, agent_ilk)
 );
 CREATE INDEX IF NOT EXISTS idx_communications_last_seen ON communications (last_seen_ms);
+CREATE TABLE IF NOT EXISTS episodes (
+    episode_id  TEXT PRIMARY KEY,
+    fades_at_ms INTEGER NOT NULL,
+    episode     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_fades_at ON episodes (fades_at_ms);
 "#;
 
 const UPSERT_SQL: &str = r#"
@@ -153,18 +163,20 @@ impl CognitionStore {
         Ok(written)
     }
 
-    /// The most recently active communications, newest first, until their states take `max_bytes`.
-    /// A row that cannot be read is left out: it starts again at its next turn.
+    /// The most recently active communications with an agent, newest first, until their states take
+    /// `max_bytes`; those with no agent (`no_agent`), whose package reaches no one, are left out. A
+    /// row that cannot be read is left out: it starts again at its next turn.
     pub(crate) fn most_recent(
         &self,
         max_bytes: usize,
+        no_agent: &str,
     ) -> Result<Vec<(CommunicationKey, ThreadCognitionState)>, CognitionError> {
         let conn = self.connection();
         let mut select = conn.prepare(
             "SELECT thread_id, agent_ilk, state FROM communications WHERE state_version = ?1 \
-             ORDER BY last_seen_ms DESC",
+             AND agent_ilk <> ?2 ORDER BY last_seen_ms DESC",
         )?;
-        let mut rows = select.query(params![STATE_VERSION])?;
+        let mut rows = select.query(params![STATE_VERSION, no_agent])?;
         let mut out = Vec::new();
         let mut bytes = 0usize;
         while let Some(row) = rows.next()? {
@@ -188,6 +200,82 @@ impl CognitionStore {
             }
         }
         Ok(out)
+    }
+
+    /// The thread's communication whose agent served it last: the newest last turn
+    /// (`last_turn_epoch_ms`) and its agent node, the one with no agent (`no_agent`) left out. A
+    /// row that cannot be read is skipped.
+    pub(crate) fn last_agent_on_thread(
+        &self,
+        thread_id: &str,
+        no_agent: &str,
+    ) -> Result<Option<(i64, String)>, CognitionError> {
+        let conn = self.connection();
+        let mut select = conn.prepare(
+            "SELECT state FROM communications WHERE thread_id = ?1 AND agent_ilk <> ?2 \
+             AND state_version = ?3",
+        )?;
+        let mut rows = select.query(params![thread_id, no_agent, STATE_VERSION])?;
+        let mut last: Option<(i64, String)> = None;
+        while let Some(row) = rows.next()? {
+            let state: String = row.get(0)?;
+            let Ok(state) = serde_json::from_str::<ThreadCognitionState>(&state) else {
+                continue;
+            };
+            if state.agent_node.trim().is_empty() {
+                continue;
+            }
+            let last_turn_ms = super::last_turn_epoch_ms(&state);
+            if last.as_ref().is_none_or(|(ms, _)| last_turn_ms > *ms) {
+                last = Some((last_turn_ms, state.agent_node));
+            }
+        }
+        Ok(last)
+    }
+
+    /// Keeps an episode, once: false when the file had it already.
+    pub(crate) fn save_episode(&self, episode: &Episode) -> Result<bool, CognitionError> {
+        let inserted = self.connection().execute(
+            "INSERT OR IGNORE INTO episodes (episode_id, fades_at_ms, episode) VALUES (?1, ?2, ?3)",
+            params![
+                episode.episode_id,
+                episode.fades_at_ms(),
+                serde_json::to_string(episode)?
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// The episodes not faded by `now_ms`. One that cannot be read is left out, and leaves with
+    /// the next sweep that reaches its time.
+    pub(crate) fn live_episodes(&self, now_ms: i64) -> Result<Vec<Episode>, CognitionError> {
+        let conn = self.connection();
+        let mut select =
+            conn.prepare("SELECT episode_id, episode FROM episodes WHERE fades_at_ms > ?1")?;
+        let mut rows = select.query(params![now_ms])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let episode_id: String = row.get(0)?;
+            let episode: String = row.get(1)?;
+            match serde_json::from_str(&episode) {
+                Ok(episode) => out.push(episode),
+                Err(err) => tracing::warn!(
+                    episode_id = %episode_id,
+                    error = %err,
+                    "sy.cognition could not read an episode in its file; it is left out"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes the episodes faded by `now_ms`; returns how many.
+    pub(crate) fn sweep_episodes(&self, now_ms: i64) -> Result<u64, CognitionError> {
+        let deleted = self.connection().execute(
+            "DELETE FROM episodes WHERE fades_at_ms <= ?1",
+            params![now_ms],
+        )?;
+        Ok(deleted as u64)
     }
 
     /// How many communications the file keeps, and its bytes with its WAL.

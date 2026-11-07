@@ -114,6 +114,41 @@ func TestCompileWorkflowRejectsInvalidDefinitionAndDoesNotWriteStaged(t *testing
 	}
 }
 
+// A solution's WFs and agents run on one hive (cognition-hands-v1 §12.4): a check and a compile
+// refuse a definition that names an agent or a WF on another hive, naming each path, and stage
+// nothing; an IO node, a door, may be on any hive.
+func TestASolutionsAgentsAndWFsRunOnItsHive(t *testing.T) {
+	naming := func(start string, targets ...string) map[string]any {
+		definition := validWorkflowDefinition()
+		definition["start_from"] = []any{start}
+		state := definition["states"].([]any)[0].(map[string]any)
+		for _, target := range targets {
+			state["entry_actions"] = append(state["entry_actions"].([]any), map[string]any{
+				"type": "send_message", "target": target, "meta": map[string]any{"msg": "ASK"},
+				"payload": map[string]any{"text": "ready?"},
+			})
+		}
+		return definition
+	}
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: naming("IO.slack@worker1", "AI.billing@motherbee", "WF.audit@motherbee", "IO.out@worker1")}); err != nil {
+		t.Fatalf("its own hive's agents and WFs, and IO nodes anywhere: %v", err)
+	}
+
+	svc = newTestService(t)
+	away := naming("WF.client@worker1", "AI.sales@worker1", "WF.audit@motherbee")
+	const why = "a solution's WFs and agents run on one hive, this one (motherbee): start_from[0]: WF.client@worker1 is on another hive; states[0].entry_actions[1].target: AI.sales@worker1 is on another hive"
+	if _, err := svc.CheckWorkflow(CompileRequest{WorkflowName: "invoice", Definition: away}); err == nil || !strings.Contains(err.Error(), "COMPILE_ERROR") || !strings.Contains(err.Error(), why) {
+		t.Fatalf("a check refuses another hive's agent and WF: %v", err)
+	}
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: away}); err == nil || !strings.Contains(err.Error(), why) {
+		t.Fatalf("a compile refuses another hive's agent and WF: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "staged", "definition.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no staged definition, got err=%v", err)
+	}
+}
+
 // Case 4 (wf-orchestration-v1 §5.4.10): a known option compiles written by its name alone, and is
 // staged as written: the WF node's load writes the catalog's description and params in, and
 // WF_GET_CODE answers the definition as it was written. A known option written with any other field

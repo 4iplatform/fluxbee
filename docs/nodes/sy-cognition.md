@@ -1,11 +1,12 @@
 # SY.cognition
 
 SY.cognition keeps the conversational memory of a hive's AI agents. Its router copies the turns
-its `AI.*` agents send and receive; SY.cognition keeps each communication's last 20 turns, taken
-as they arrive, and tags the turns with the hive's LLM to keep the rest of its state (contexts,
-reasons, co-occurrences, scopes, memories, episodes). It publishes memory packages in a
-shared-memory region that the router attaches to deliveries to agents, and keeps its state in a
-file of its own on its hive. The agents' recent conversation comes from here: ai.generic's
+its `AI.*` agents send and receive, and what its WFs relay between people; SY.cognition keeps each
+communication's last 20 turns, taken as they arrive, and tags the turns with the hive's LLM to
+keep the rest of its state (contexts, reasons, co-occurrences, scopes, memories, feelings). It
+makes the episodes, social events between people that every hive's cognition keeps as public
+news. It publishes memory packages in a shared-memory region that the router attaches to
+deliveries to agents, and keeps its state in a file of its own on its hive. The agents' recent conversation comes from here: ai.generic's
 immediate memory stays off for them.
 
 Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls). The model
@@ -54,7 +55,8 @@ Two paths take each turn:
   at once, so the agent's next message carries the turn before it, whatever the worker's backlog.
   20 turns at most, and 48 KiB.
 - **The worker** takes the turns one at a time, with up to two model calls each (about 5 s a
-  turn), and derives the labels, memories and episodes. It loads a communication it does not hold
+  turn), and derives the labels, memories and feelings, and the episodes that pass the gate. It
+  loads a communication it does not hold
   from its file first; then it works on a copy, so the intake never waits for it, and writes the
   copy back merging the turns the intake took meanwhile, then to its file. Its communication stays
   held while it works, even when it does not fit the region.
@@ -66,7 +68,8 @@ Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 | Message | Who may send / where it goes | What it does |
 | --- | --- | --- |
 | `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, writes those to its file and rewrites the memory region; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
-| `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant |
+| `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant, or the writer's in a communication with no agent |
+| `COGNITION_EPISODE` (sent and taken) | a system broadcast to `SY.cognition@*`, taken only from a cognition (`take_episode`) | an episode it made, which every hive's cognition keeps once ([docs/reference/cognition.md](../reference/cognition.md) §4.1) |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`, `NODE_STATUS_GET` | `CONFIG_*` only from `SY.admin@motherbee` (router system policy) | control and status |
 | `VAULT_SECRET_CHANGED` | broadcast | re-probes the AI key and updates its state; it does not exit |
 
@@ -79,7 +82,7 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 
 - `cognition.db`, its own SQLite file: one row per communication with its whole state (its open
   items, scope, memories, feelings, last turns and counters), written at every intake batch and
-  after every worker turn. Only SY.cognition reads it; nothing deletes a communication
+  after every worker turn, and one per live episode. Only SY.cognition reads it; nothing deletes a communication
   ([docs/reference/cognition.md](../reference/cognition.md) §5,
   [docs/cognition-hands-v1.md](../cognition-hands-v1.md) §11).
 - In memory: the communications of the memory region; any other comes back from the file at its
@@ -94,7 +97,7 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 ## Failure behavior
 
 - Fail-open: without an AI key, or when the tagger fails, the worker skips a turn (no labels,
-  memories or episodes). Its text is in the last turns all the same: the intake needs no model.
+  memories or feelings). Its text is in the last turns all the same: the intake needs no model.
 - A communication whose file row cannot be read is skipped and counted
   (`store_load_failures_total`); a file that cannot be opened stops the node.
 - The orchestrator's boot waits up to 60 s for it to appear on the router and only warns if it

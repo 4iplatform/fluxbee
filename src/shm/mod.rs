@@ -4047,8 +4047,8 @@ fn empty_vocabulary_entry() -> VocabularyEntry {
 mod tests {
     use super::*;
     use fluxbee_sdk::protocol::{
-        EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
-        MemoryReasonSummary, MemorySummary, MemoryTurnParty,
+        FeelingSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
+        MemoryReasonSummary, MemorySummary, MemoryTurnParty, NewsSummary,
     };
     use nix::sys::mman::shm_unlink;
     use std::ffi::CString;
@@ -4104,8 +4104,8 @@ mod tests {
                         dominant_context_id: Some("context:test".to_string()),
                         dominant_reason_id: Some("reason:test".to_string()),
                     }],
-                    episodes: vec![EpisodeSummary {
-                        episode_id: "episode:test".to_string(),
+                    feelings: vec![FeelingSummary {
+                        feeling_id: "feeling:test".to_string(),
                         owner: MemoryTurnParty {
                             ilk: Some("ilk:test".to_string()),
                             name: Some("Ana".to_string()),
@@ -4119,13 +4119,29 @@ mod tests {
                         last_felt_at: "2026-11-05T10:05:00+00:00".to_string(),
                         summary: "Ana needs the refund before Friday.".to_string(),
                     }],
+                    news: vec![NewsSummary {
+                        episode_id: "episode:test".to_string(),
+                        lens: "friction".to_string(),
+                        title: "Argument over the refund".to_string(),
+                        summary: "Ana and Juan argued over the refund's delay; it is pending."
+                            .to_string(),
+                        state: "pending".to_string(),
+                        people: vec![MemoryTurnParty {
+                            ilk: Some("ilk:test".to_string()),
+                            name: Some("Ana".to_string()),
+                            kind: Some("person".to_string()),
+                        }],
+                        born_at: "2026-11-05T10:10:00+00:00".to_string(),
+                        weight: 8.0,
+                    }],
                     turns: Vec::new(),
                     truncated: Some(MemoryPackageTruncated {
                         applied: false,
                         dropped_contexts: 0,
                         dropped_reasons: 0,
                         dropped_memories: 0,
-                        dropped_episodes: 0,
+                        dropped_feelings: 0,
+                        dropped_news: 0,
                     }),
                 },
             }],
@@ -4158,7 +4174,8 @@ mod tests {
             Some("resolve urgent issue")
         );
         assert_eq!(roundtrip.threads[0].package.memories.len(), 1);
-        assert_eq!(roundtrip.threads[0].package.episodes.len(), 1);
+        assert_eq!(roundtrip.threads[0].package.feelings.len(), 1);
+        assert_eq!(roundtrip.threads[0].package.news[0].state, "pending");
 
         cleanup_shm(&name);
     }
@@ -4186,7 +4203,8 @@ mod tests {
                         dominant_context_id: None,
                         dominant_reason_id: None,
                     }],
-                    episodes: Vec::new(),
+                    feelings: Vec::new(),
+                    news: Vec::new(),
                     turns: Vec::new(),
                     truncated: None,
                 },

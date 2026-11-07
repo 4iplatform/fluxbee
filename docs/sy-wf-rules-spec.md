@@ -471,6 +471,8 @@ When `SY.wf-rules` receives a workflow definition for check, compile or compile_
 
 For the guards (CEL compilation), `SY.wf-rules` includes `cel-go` as a dependency and compiles guards in-process. The compiled programs are NOT persisted — they serve only to validate. The WF node (`wf-generic`) recompiles CEL from the JSON at boot. This avoids cross-binary compatibility issues.
 
+**A solution runs on one hive** ([cognition-hands-v1](cognition-hands-v1.md) §12.4): `loadWorkflow` also refuses a definition that names an agent (`AI.*`) or a workflow (`WF.*`) on another hive than this SY.wf-rules' own, in `start_from` or in any action's `target` (`checkSolutionOnHive`). IO nodes are the doors and may run on any hive. The apply's load of the staged or backed-up definition checks it too. A definition applied before 0.1.104 is checked at its next apply or rollback, never at start: a running WF is not stopped by it.
+
 If any check fails, the definition is NOT staged. The response includes the error code `COMPILE_ERROR` and a detail string with the path to the failing element (same pattern as wf-generic's load-time validation).
 
 ---

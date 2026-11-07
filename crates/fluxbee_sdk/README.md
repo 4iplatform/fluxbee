@@ -290,9 +290,11 @@ What happens without any node's help:
 - the router where a message enters copies it to its stream as `storage.turns`, and SY.storage keeps
   it in the table `turns`, the message log;
 - the router of an agent copies both directions of each turn with a `thread_id` as `cognition.turns`,
-  for the SY.cognition of its hive;
-- SY.cognition derives contexts, reasons, scopes, memories and feelings, keeps them in its own file
-  on its hive, and refreshes the memory region.
+  for the SY.cognition of its hive, and the router where a WF's message to an IO node enters copies
+  it too: a turn a WF relays between people;
+- SY.cognition derives contexts, reasons, scopes, memories, feelings and episodes, keeps them in its
+  own file on its hive, sends each episode to every hive's SY.cognition, and refreshes the memory
+  region.
 
 What a node must not do:
 

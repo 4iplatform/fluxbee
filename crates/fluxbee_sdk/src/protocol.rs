@@ -95,8 +95,9 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 /// The `MemoryPackage` SY.cognition writes: 3 added `turns` (2026-10-30), 4 made `episodes` a
-/// person's feelings (2026-11-05).
-pub const MEMORY_PACKAGE_VERSION: u32 = 4;
+/// person's feelings (2026-11-05), 5 named them `feelings` and added `news`, the episodes of the
+/// communication's people (2026-11-06).
+pub const MEMORY_PACKAGE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPackage {
@@ -112,8 +113,14 @@ pub struct MemoryPackage {
     pub reasons: Vec<MemoryReasonSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memories: Vec<MemorySummary>,
+    /// The people's feelings in this communication (docs/cognition-hands-v1.md §10.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub episodes: Vec<EpisodeSummary>,
+    pub feelings: Vec<FeelingSummary>,
+    /// The episodes of the communication's people that still rank, the strongest first
+    /// (docs/cognition-hands-v1.md §12.4): what happened between people, wherever it happened. The
+    /// agent takes them into account to answer, and never passes them on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub news: Vec<NewsSummary>,
     /// The communication's last turns, oldest first, as SY.cognition took them when they arrived.
     /// The message the package rides on is not among them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -214,8 +221,8 @@ pub struct MemorySummary {
 /// A person's feeling, as the package carries it (docs/cognition-hands-v1.md §10.3): whose it is,
 /// what and about what, how strong it is now, when its owner last showed it, and its text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpisodeSummary {
-    pub episode_id: String,
+pub struct FeelingSummary {
+    pub feeling_id: String,
     /// The person whose turns show it.
     pub owner: MemoryTurnParty,
     /// `anger`, `escalation` or `urgency`.
@@ -233,13 +240,37 @@ pub struct EpisodeSummary {
     pub summary: String,
 }
 
+/// An episode, as the package carries it (docs/cognition-hands-v1.md §12.4): a social event
+/// between people, public like the news, which belongs to the people it is about and fades with
+/// time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsSummary {
+    pub episode_id: String,
+    /// `friction`, `discomfort`, `appreciation` or `shame`.
+    pub lens: String,
+    pub title: String,
+    /// A paragraph: what happened, between whom, and how it stood.
+    pub summary: String,
+    /// `resolved`, `pending`, `follow_up` or `inconclusive`.
+    pub state: String,
+    /// The people it is about.
+    pub people: Vec<MemoryTurnParty>,
+    /// When it happened (RFC 3339, UTC).
+    pub born_at: String,
+    /// Its weight when the package was written, out of 10: its intensity, halved every 7 days.
+    pub weight: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryPackageTruncated {
     pub applied: bool,
     pub dropped_contexts: u32,
     pub dropped_reasons: u32,
     pub dropped_memories: u32,
-    pub dropped_episodes: u32,
+    #[serde(default)]
+    pub dropped_feelings: u32,
+    #[serde(default)]
+    pub dropped_news: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -932,6 +963,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package's `truncated` from a router or a cognition of the version before reads the counts
+    /// it lacks as none, so an upgrade never fails a whole region or message over them.
+    #[test]
+    fn a_truncated_without_its_newer_counts_reads_them_as_none() {
+        let truncated: MemoryPackageTruncated = serde_json::from_value(json!({
+            "applied": true, "dropped_contexts": 1, "dropped_reasons": 0, "dropped_memories": 2
+        }))
+        .expect("parse");
+        assert_eq!(truncated.dropped_memories, 2);
+        assert_eq!(truncated.dropped_feelings, 0);
+        assert_eq!(truncated.dropped_news, 0);
+    }
 
     #[test]
     fn config_changed_payload_hive_scope() {

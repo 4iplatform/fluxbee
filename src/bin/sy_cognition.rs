@@ -21,10 +21,11 @@ use fluxbee_sdk::message_trace;
 use fluxbee_sdk::message_writer::{self, IlkFacts};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
-    is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
+    is_system_kind, Destination, FeelingSummary, MemoryContextSummary, MemoryPackage,
     MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, MemoryTurn, MemoryTurnChoice,
-    MemoryTurnDirection, MemoryTurnParty, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MEMORY_PACKAGE_VERSION, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    MemoryTurnDirection, MemoryTurnParty, Message, Meta, NewsSummary, Routing,
+    VaultSecretChangedPayload, VaultSecretInterest, MEMORY_PACKAGE_VERSION,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::stream::{
     is_stream_node_name, stream_hive, StreamBatch, MSG_STREAM_ACK, MSG_STREAM_BATCH,
@@ -41,6 +42,8 @@ use json_router::shm::{
     MEMORY_MAX_DATA_SIZE,
 };
 
+#[path = "sy_cognition/episodes.rs"]
+mod episodes;
 #[path = "sy_cognition/narrative_summarizer_ai.rs"]
 mod narrative_summarizer_ai;
 #[path = "sy_cognition/semantic_tagger_ai.rs"]
@@ -49,7 +52,7 @@ mod semantic_tagger_ai;
 mod state_store;
 
 use narrative_summarizer_ai::{
-    run_narrative_summarizer_ai, EpisodeNarrative, NarrativeSummaries, NarrativeSummarizerAiInput,
+    run_narrative_summarizer_ai, FeelingNarrative, NarrativeSummaries, NarrativeSummarizerAiInput,
 };
 use semantic_tagger_ai::run_semantic_tagger_ai;
 use state_store::CognitionStore;
@@ -102,7 +105,7 @@ const COGNITION_PACKAGE_MAX_FEELINGS: usize = 12;
 const COGNITION_FEELING_TEXT_MAX_CHARS: usize = 300;
 const COGNITION_MAX_TAGS: usize = 12;
 const COGNITION_MAX_REASON_SIGNALS: usize = 4;
-/// The affects a turn can show its writer feels: the episode gate's words (`build_episode_candidate`).
+/// The affects a turn can show its writer feels: the feeling gate's words (`build_feeling_candidate`).
 /// The tagger names them in a closed set of their own, `affect_signals` (FINDINGS A-157); its free
 /// extra hints never named them.
 const COGNITION_AFFECT_SIGNALS: [&str; 3] = ["frustration", "escalation", "urgency"];
@@ -131,9 +134,19 @@ struct NarrativeOutcome {
     called: bool,
     failed: bool,
     invalid_output: bool,
+    /// The episode the narrator proposed, for the gate (docs/cognition-hands-v1.md §12.4).
+    episode: Option<episodes::EpisodeProposal>,
 }
 
-/// The narrative step of a turn (memory and episode text). Production asks the AI; tests
+/// What the narrator needs to propose an episode (docs/cognition-hands-v1.md §12.4): whom the turn
+/// is to, and the habit of each lens among the turn's people.
+#[derive(Debug, Clone, Default)]
+struct EpisodeAsk {
+    counterpart: Option<String>,
+    habits: Vec<(&'static str, u32)>,
+}
+
+/// The narrative step of a turn (memory and feeling text). Production asks the AI; tests
 /// answer from the input, so the whole turn path runs without a network.
 trait NarrativeSummarizer {
     fn summarize<'a>(
@@ -264,7 +277,7 @@ struct CognitionRuntimeState {
     active_threads_total: u64,
     active_scopes_total: u64,
     active_memories_total: u64,
-    active_episodes_total: u64,
+    active_feelings_total: u64,
     /// The communications loaded from the file at start (docs/cognition-hands-v1.md §11.3).
     loaded_at_start_total: u64,
     /// Turns whose agent node has no ILK in the identity shared memory: no memory for them.
@@ -283,6 +296,17 @@ struct CognitionRuntimeState {
     /// Communications written to the file, and the writes that failed.
     store_writes_total: u64,
     store_write_failures_total: u64,
+    /// The turns a WF relayed between people (docs/cognition-hands-v1.md §12.4), and those taken
+    /// twice, once for an agent and once relayed, analyzed once.
+    relay_turns_total: u64,
+    duplicate_turns_skipped_total: u64,
+    /// The episodes: kept now, made here, proposed and refused by the gate, taken from other hives,
+    /// and refused from them.
+    episodes_live_total: u64,
+    episodes_made_total: u64,
+    episodes_gated_out_total: u64,
+    episodes_received_total: u64,
+    episodes_refused_total: u64,
     shm_hot_threads_total: u64,
     shm_pruned_threads_total: u64,
     shm_payload_bytes: u64,
@@ -328,6 +352,9 @@ struct CognitionAppState {
     usage: UsageRecorder,
     /// The last record seq taken from each stream, by stream name and epoch.
     stream_seen: Mutex<HashMap<(String, u64), u64>>,
+    /// The episodes this cognition keeps, the public news of every hive (docs/cognition-hands-v1.md
+    /// §12.4): the same its file keeps.
+    episodes: std::sync::Mutex<episodes::EpisodeBook>,
 }
 
 /// A communication (docs/router-stream-v1.md §6.2): the thread between its interlocutors, owned by
@@ -339,12 +366,17 @@ struct CommunicationKey {
     agent_ilk: String,
 }
 
-/// A copy of a turn its router made for this cognition: the message, and the local agent node that
-/// owns its communication.
+/// A copy of a turn its router made for this cognition: the message, who holds its communication
+/// (`holder_of`, none for an agent without an ILK in the identity memory), whether a WF relayed it
+/// between people, its record's seq, and whether the intake found its communication held it
+/// already (`turn_key`).
 #[derive(Debug)]
 struct CognitionTurn {
     message: Message,
-    agent_node: String,
+    holder: Option<Holder>,
+    relay: bool,
+    seq: u64,
+    duplicate: bool,
 }
 
 /// A communication as this cognition holds it and writes it to its file: online state, so an item
@@ -367,9 +399,11 @@ struct ThreadCognitionState {
     cooccurrences: HashMap<String, CooccurrenceState>,
     active_scope: Option<ScopeBindingState>,
     memories: HashMap<String, MemoryState>,
-    episodes: HashMap<String, EpisodeState>,
+    feelings: HashMap<String, FeelingState>,
     /// Its last turns, oldest first (`push_recent_turn`): what its agent received and sent.
     turns: Vec<MemoryTurn>,
+    /// The keys of its last turns (`turn_key`), so one message copied twice is one turn.
+    turn_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -470,8 +504,8 @@ struct MemoryState {
 /// starts again (§11.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct EpisodeState {
-    episode_id: String,
+struct FeelingState {
+    feeling_id: String,
     /// The person whose turns show it.
     owner: MemoryTurnParty,
     affect_id: String,
@@ -496,10 +530,10 @@ struct EpisodeState {
     last_felt_at: String,
 }
 
-/// The deterministic half of an episode. Its summary and reason come from the narrative
+/// The deterministic half of a feeling. Its summary and reason come from the narrative
 /// summarizer, which must return both whenever a candidate exists.
 #[derive(Debug, Clone)]
-struct EpisodeCandidate {
+struct AffectCandidate {
     affect_id: String,
     title: String,
     base_intensity: f64,
@@ -511,7 +545,7 @@ struct EpisodeCandidate {
 /// the active scope's dominant context and reason.
 #[derive(Debug, Clone)]
 struct FeelingCandidate {
-    episode: EpisodeCandidate,
+    affect: AffectCandidate,
     scope_id: String,
     context_id: String,
     context_label: String,
@@ -598,6 +632,7 @@ async fn main() -> Result<(), CognitionError> {
     // §11.3). Without it the node does not start: the file is where its state lives.
     let store = CognitionStore::open(&runtime_paths.state_dir)
         .map_err(|err| format!("sy.cognition could not open its file: {err}"))?;
+    remove_empty_old_folders(&runtime_paths.state_dir);
     // Model D' — vault is the source of truth for the openai secret. We
     // can't know synchronously whether vault has it (probe needs an
     // ephemeral router connection). Boot starts in `Missing`; the state
@@ -648,6 +683,7 @@ async fn main() -> Result<(), CognitionError> {
         agent_ilks: Mutex::new(HashMap::new()),
         usage: UsageRecorder::start(Arc::clone(&dispatcher)),
         stream_seen: Mutex::new(HashMap::new()),
+        episodes: std::sync::Mutex::new(episodes::EpisodeBook::default()),
     });
 
     if let Ok(owner_uuid) = Uuid::parse_str(sender.uuid()) {
@@ -663,6 +699,8 @@ async fn main() -> Result<(), CognitionError> {
     }
     // Before the first batch: the region gets the most recent communications from the file, so a
     // restart or a host reboot neither blanks the packages the agents read nor starts them over.
+    // The live episodes come first, so the packages carry their news from the start.
+    load_live_episodes(&app_state).await;
     load_most_recent(&app_state).await;
 
     // The worker's task first resolves the AI key, then takes turns. Meanwhile the main loop keeps
@@ -727,6 +765,10 @@ async fn main() -> Result<(), CognitionError> {
                     take_stream_batch(&app_state, &turn_tx, &msg).await;
                     continue;
                 }
+                if msg.meta.msg.as_deref() == Some(episodes::MSG_COGNITION_EPISODE) {
+                    take_episode(&app_state, &msg).await;
+                    continue;
+                }
                 let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(
                     &sender,
@@ -740,6 +782,17 @@ async fn main() -> Result<(), CognitionError> {
     }
 }
 
+/// The folders `cache` and `shm` that cognition kept in its folder before its file (0.1.103), empty
+/// since: removed once, when empty, with a line in the log. One that holds anything stays.
+fn remove_empty_old_folders(state_dir: &Path) {
+    for name in ["cache", "shm"] {
+        let folder = state_dir.join(name);
+        if folder.is_dir() && std::fs::remove_dir(&folder).is_ok() {
+            tracing::info!(folder = %folder.display(), "sy.cognition removed an empty folder it no longer uses");
+        }
+    }
+}
+
 /// How many delivered turns may wait for their processing. Past it, a turn is dropped and counted.
 const COGNITION_TURN_QUEUE: usize = 256;
 
@@ -747,7 +800,10 @@ const COGNITION_TURN_QUEUE: usize = 256;
 /// state at most, and the region is written from them: what does not fit it is let go again
 /// (`retain_memory_hot_set`). Any other comes back at its next turn.
 async fn load_most_recent(app_state: &CognitionAppState) {
-    let loaded = match app_state.store.most_recent(2 * MEMORY_MAX_DATA_SIZE) {
+    let loaded = match app_state
+        .store
+        .most_recent(2 * MEMORY_MAX_DATA_SIZE, NO_AGENT_ILK)
+    {
         Ok(loaded) => loaded,
         Err(err) => {
             tracing::warn!(error = %err, "sy.cognition could not read its file at start");
@@ -820,6 +876,7 @@ async fn take_stream_batch(
     let (mut repeats, mut dropped) = (0u64, 0u64);
     let mut turns = Vec::new();
     let mut recent = Vec::new();
+    let mut relays = Vec::new();
     for record in batch.records {
         if record.seq <= seen {
             repeats += 1;
@@ -836,16 +893,63 @@ async fn take_stream_batch(
                 continue;
             }
         };
-        recent.extend(intake_turn(app_state, &message, &record.producer, record.ts_ms).await);
+        let relay = is_workflow_node(&record.producer);
+        let holder = match message
+            .meta
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.trim().is_empty())
+        {
+            // A relay's communication is found once this batch's agents' turns are held.
+            Some(_) if relay => {
+                relays.push((turns.len(), record.producer, record.ts_ms));
+                None
+            }
+            Some(thread_id) => holder_of(app_state, thread_id, &record.producer).await,
+            None => None,
+        };
+        if let Some(holder) = holder.as_ref() {
+            recent.extend(intake_turn(
+                app_state,
+                &message,
+                holder,
+                record.seq,
+                record.ts_ms,
+            ));
+        }
         turns.push(CognitionTurn {
             message,
-            agent_node: record.producer,
+            holder,
+            relay,
+            seq: record.seq,
+            duplicate: false,
         });
     }
     // The next message its router delivers to the agent carries these turns, whatever the
-    // worker's backlog.
-    take_recent_turns(app_state, recent).await;
-    for turn in turns {
+    // worker's backlog. A turn its communication held already is not analyzed again.
+    let mut duplicates = take_recent_turns(app_state, recent).await;
+    // A relay joins the communication whose agent served its thread last, this batch's turns
+    // included: a WF that sends one message to an agent and to a person puts both copies in one
+    // batch, whichever it sends first, and the relay is that agent's turn once
+    // (docs/cognition-hands-v1.md §12.4).
+    let mut relayed = Vec::new();
+    for (at, producer, ts_ms) in relays {
+        let turn: &mut CognitionTurn = &mut turns[at];
+        let thread_id = turn.message.meta.thread_id.clone().unwrap_or_default();
+        turn.holder = holder_of(app_state, &thread_id, &producer).await;
+        if let Some(holder) = turn.holder.as_ref() {
+            relayed.extend(intake_turn(
+                app_state,
+                &turn.message,
+                holder,
+                turn.seq,
+                ts_ms,
+            ));
+        }
+    }
+    duplicates.extend(take_recent_turns(app_state, relayed).await);
+    for mut turn in turns {
+        turn.duplicate = duplicates.contains(&turn.seq);
         match turn_tx.try_send(turn) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
@@ -879,6 +983,9 @@ async fn take_stream_batch(
 #[derive(Debug, Clone)]
 struct RecentTurn {
     key: CommunicationKey,
+    /// Its record's seq in the stream batch, and its key (`turn_key`).
+    seq: u64,
+    turn_key: String,
     agent_node: String,
     src_ilk: Option<String>,
     dst_ilk: Option<String>,
@@ -889,21 +996,21 @@ struct RecentTurn {
 /// What the intake keeps of a copy of a turn: `None` without a thread id or without an ILK for its
 /// agent node in the identity shared memory, as the worker finds it (`agent_identity_of`, the
 /// worker counts both), and without text or files.
-async fn intake_turn(
+fn intake_turn(
     app_state: &CognitionAppState,
     message: &Message,
-    agent_node: &str,
+    holder: &Holder,
+    seq: u64,
     ts_ms: u64,
 ) -> Option<RecentTurn> {
-    message
-        .meta
-        .thread_id
-        .as_deref()
-        .filter(|thread_id| !thread_id.trim().is_empty())?;
-    let agent = agent_identity_of(app_state, agent_node).await?;
-    recent_turn_of(message, agent_node, &agent.ilk, ts_ms, |ilk| {
-        message_writer::ilk_facts(&app_state.hive_id, ilk)
-    })
+    recent_turn_of(
+        message,
+        holder.agent_node(),
+        holder.agent_ilk(),
+        seq,
+        ts_ms,
+        |ilk| message_writer::ilk_facts(&app_state.hive_id, ilk),
+    )
 }
 
 /// A copy of a turn as its communication keeps it. The agent sent it (`out`) when its router names
@@ -915,6 +1022,7 @@ fn recent_turn_of(
     message: &Message,
     agent_node: &str,
     agent_ilk: &str,
+    seq: u64,
     ts_ms: u64,
     facts: impl Fn(&str) -> Option<IlkFacts>,
 ) -> Option<RecentTurn> {
@@ -970,6 +1078,8 @@ fn recent_turn_of(
             thread_id,
             agent_ilk: agent_ilk.to_string(),
         },
+        seq,
+        turn_key: turn_key(message),
         agent_node: agent_node.to_string(),
         src_ilk: message.meta.src_ilk.clone(),
         dst_ilk: message.meta.dst_ilk.clone(),
@@ -1177,9 +1287,9 @@ fn cut_chars(value: &str, max_chars: usize) -> String {
 /// The intake's turns into what is held (docs/reference/cognition.md §3.4): each communication is
 /// written to the file and the region is rewritten with them, before the turns reach the worker's
 /// queue.
-async fn take_recent_turns(app_state: &CognitionAppState, recent: Vec<RecentTurn>) {
+async fn take_recent_turns(app_state: &CognitionAppState, recent: Vec<RecentTurn>) -> Vec<u64> {
     if recent.is_empty() {
-        return;
+        return Vec::new();
     }
     let taken = recent.len() as u64;
     let mut kept: Vec<CommunicationKey> = Vec::new();
@@ -1189,8 +1299,15 @@ async fn take_recent_turns(app_state: &CognitionAppState, recent: Vec<RecentTurn
         }
     }
     let mut loads = StoreLoads::default();
+    let mut duplicates = Vec::new();
     if let Err(err) = sync_held_state(app_state, &kept, |threads| {
-        hold_recent_turns(threads, &app_state.store, recent, &mut loads)
+        hold_recent_turns(
+            threads,
+            &app_state.store,
+            recent,
+            &mut loads,
+            &mut duplicates,
+        )
     })
     .await
     {
@@ -1198,7 +1315,11 @@ async fn take_recent_turns(app_state: &CognitionAppState, recent: Vec<RecentTurn
     }
     let mut state = app_state.runtime_state.lock().await;
     state.intake_turns_total = state.intake_turns_total.saturating_add(taken);
+    state.duplicate_turns_skipped_total = state
+        .duplicate_turns_skipped_total
+        .saturating_add(duplicates.len() as u64);
     loads.count(&mut state);
+    duplicates
 }
 
 /// The loads of communications from the file one change made, for the runtime counters.
@@ -1241,6 +1362,7 @@ fn hold_recent_turns(
     store: &CognitionStore,
     recent: Vec<RecentTurn>,
     loads: &mut StoreLoads,
+    duplicates: &mut Vec<u64>,
 ) -> Vec<CommunicationKey> {
     let mut touched: Vec<CommunicationKey> = Vec::new();
     for recent in recent {
@@ -1256,7 +1378,22 @@ fn hold_recent_turns(
                 continue;
             }
         };
-        held.agent_node = recent.agent_node;
+        // One message relayed by a WF to a person and copied for an agent too is one turn, and so
+        // is the agent's own answer a WF relays in a later cycle, under that cycle's trace
+        // (docs/cognition-hands-v1.md §12.4).
+        if held.turn_keys.contains(&recent.turn_key) || echoes_own_answer(held, &recent) {
+            duplicates.push(recent.seq);
+            continue;
+        }
+        held.turn_keys.push(recent.turn_key);
+        let excess = held
+            .turn_keys
+            .len()
+            .saturating_sub(2 * COGNITION_RECENT_TURNS);
+        held.turn_keys.drain(..excess);
+        if !recent.agent_node.is_empty() {
+            held.agent_node = recent.agent_node;
+        }
         held.src_ilk = recent.src_ilk;
         held.dst_ilk = recent.dst_ilk;
         held.ich = recent.ich;
@@ -1268,12 +1405,30 @@ fn hold_recent_turns(
     touched
 }
 
-/// Adds a turn to a communication's last turns, unless they hold it already (a batch sent again).
+/// Whether a turn is its agent's own answer coming back: the agent wrote it, received it, and the
+/// communication holds an answer with its text.
+fn echoes_own_answer(held: &ThreadCognitionState, recent: &RecentTurn) -> bool {
+    recent.turn.direction == MemoryTurnDirection::In
+        && recent
+            .turn
+            .writer
+            .as_ref()
+            .and_then(|writer| writer.ilk.as_deref())
+            .is_some_and(|ilk| ilk.trim().eq_ignore_ascii_case(&recent.key.agent_ilk))
+        && held
+            .turns
+            .iter()
+            .any(|turn| turn.direction == MemoryTurnDirection::Out && turn.text == recent.turn.text)
+}
+
+/// Adds a turn to a communication's last turns, in the order they were taken, unless they hold it
+/// already (a batch sent again).
 fn push_recent_turn(turns: &mut Vec<MemoryTurn>, turn: MemoryTurn) {
     if turns.contains(&turn) {
         return;
     }
     turns.push(turn);
+    turns.sort_by_key(|turn| parse_rfc3339_epoch_ms(&turn.ts).unwrap_or_default());
     bound_recent_turns(turns);
 }
 
@@ -1316,6 +1471,7 @@ fn write_back_turn(
 ) {
     if let Some(held) = threads.get_mut(key) {
         updated.turns = merge_recent_turns(&updated.turns, &held.turns);
+        updated.turn_keys = std::mem::take(&mut held.turn_keys);
         updated.src_ilk = held.src_ilk.take();
         updated.dst_ilk = held.dst_ilk.take();
         updated.ich = held.ich.take();
@@ -1343,16 +1499,25 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         );
         return;
     };
-    let Some(agent) = agent_identity_of(&app_state, &turn.agent_node).await else {
+    let Some(holder) = turn.holder else {
         app_state.runtime_state.lock().await.no_agent_ilk_total += 1;
         tracing::debug!(
-            agent_node = %turn.agent_node,
             thread_id = %thread_id,
             "sy.cognition skipping a turn of an agent without an ILK in the identity shared memory"
         );
         return;
     };
-    let agent_ilk = agent.ilk.clone();
+    if turn.relay {
+        let mut state = app_state.runtime_state.lock().await;
+        state.relay_turns_total = state.relay_turns_total.saturating_add(1);
+    }
+    // One message copied for an agent and relayed to a person too is analyzed once
+    // (docs/cognition-hands-v1.md §12.4).
+    if turn.duplicate {
+        return;
+    }
+    let agent_node = holder.agent_node().to_string();
+    let agent_ilk = holder.agent_ilk().to_string();
     let key = CommunicationKey {
         thread_id: thread_id.clone(),
         agent_ilk: agent_ilk.clone(),
@@ -1360,7 +1525,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     // Only a turn with a person at its other end is analyzed (docs/cognition-hands-v1.md §6): a turn
     // between agents, or a WF's own text, stays among the communication's last turns, which the
     // intake took and wrote, and in `turns`.
-    if !person_at_other_end(&msg, &turn.agent_node, |ilk| {
+    if !person_at_other_end(&msg, &agent_node, |ilk| {
         message_writer::ilk_facts(&app_state.hive_id, ilk)
     }) {
         app_state
@@ -1402,8 +1567,8 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
 
     // Whose feelings the turn moves, and who spoke it for the narrator (§10.3).
     let facts = |ilk: &str| message_writer::ilk_facts(&app_state.hive_id, ilk);
-    let owner = feeling_owner(&msg, &turn.agent_node, facts);
-    let speaker = narrator_speaker(&msg, &turn.agent_node, facts);
+    let owner = feeling_owner(&msg, &agent_node, facts);
+    let speaker = narrator_speaker(&msg, &agent_node, facts);
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
     let (thresholds, semantic_tagger_config) = {
         let control_state = app_state.control_state.lock().await;
@@ -1448,15 +1613,24 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         control.ai_secret_source = CognitionAiSecretSource::LocalFile;
     }
 
-    // The communication's agent's tenant pays for the turn's calls (§7.3).
+    // Who holds the turn's result pays for its calls (§7.3, docs/cognition-hands-v1.md §12.3): the
+    // communication's agent's tenant or, in one with no agent, the writer's.
+    let Some(payer) = payer_of(&app_state.hive_id, &holder, &msg) else {
+        tracing::debug!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            "sy.cognition skipping a turn with no agent and no writer's ILK to pay for it"
+        );
+        return;
+    };
     let account = AiAccount::charge(
         app_state.usage.clone(),
         &app_state.node_name,
-        agent.tenant.clone(),
-        TenantSource::Agent,
+        payer.tenant,
+        payer.source,
     )
     .with_node_ilk(Some(app_state.self_ilk_id.clone()))
-    .with_counterpart(Some(agent_ilk.clone()))
+    .with_counterpart(Some(payer.ilk))
     .with_trace(Some(msg.routing.trace_id.clone()))
     .with_thread(Some(thread_id.clone()));
     let tagger = match run_semantic_tagger_ai(semantic_tagger_ai::SemanticTaggerAiInput {
@@ -1511,7 +1685,26 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         );
         return;
     };
-    thread_state.agent_node = turn.agent_node.clone();
+    if !agent_node.is_empty() {
+        thread_state.agent_node = agent_node.clone();
+    }
+    // Whom the turn is to, and the people an episode of it would be about (§12.4).
+    let (counterpart, people) = episode_people(
+        &msg,
+        &agent_node,
+        &agent_ilk,
+        turn.relay,
+        &thread_state.turns,
+        facts,
+    );
+    let ask = EpisodeAsk {
+        counterpart: counterpart.as_ref().and_then(party_words),
+        habits: app_state
+            .episodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .habits(&people, now_epoch_ms_i64()),
+    };
     let narrative = update_thread_state(
         &key,
         src_ilk.as_deref(),
@@ -1525,9 +1718,11 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         &semantic_tagger_config,
         &ts,
         &mut thread_state,
+        &ask,
         &AiNarrativeSummarizer,
     )
     .await;
+    let leading = leading_contexts(&thread_state.contexts);
 
     // Its file row goes with the region's rewrite, both from what is held then.
     if let Err(err) = sync_held_state(&app_state, std::slice::from_ref(&key), |threads| {
@@ -1543,6 +1738,9 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             "sy.cognition failed to sync jsr-memory"
         );
     }
+    if let Some(proposal) = narrative.episode.as_ref() {
+        publish_episode(&app_state, proposal, &leading, people, &thread_id).await;
+    }
 
     let (
         active_threads_total,
@@ -1551,7 +1749,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         open_cooccurrences_total,
         active_scopes_total,
         active_memories_total,
-        active_episodes_total,
+        active_feelings_total,
     ) = {
         let threads = app_state.thread_states.lock().await;
         let active_threads = threads.len() as u64;
@@ -1575,9 +1773,9 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             .values()
             .map(|thread| thread.memories.len() as u64)
             .sum();
-        let active_episodes = threads
+        let active_feelings = threads
             .values()
-            .map(|thread| thread.episodes.len() as u64)
+            .map(|thread| thread.feelings.len() as u64)
             .sum();
         (
             active_threads,
@@ -1586,7 +1784,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             open_cooccurrences,
             active_scopes,
             active_memories,
-            active_episodes,
+            active_feelings,
         )
     };
 
@@ -1619,7 +1817,400 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     state.open_cooccurrences_total = open_cooccurrences_total;
     state.active_scopes_total = active_scopes_total;
     state.active_memories_total = active_memories_total;
-    state.active_episodes_total = active_episodes_total;
+    state.active_feelings_total = active_feelings_total;
+}
+
+/// The key's agent ILK of a communication with no agent (docs/cognition-hands-v1.md §12.4): what
+/// people said to each other through a WF on a thread no agent served on this hive. Its package
+/// reaches no one, so the region leaves it out.
+const NO_AGENT_ILK: &str = "none";
+
+/// Who holds a copied turn's communication, and so pays for its analysis
+/// (docs/cognition-hands-v1.md §12.3).
+#[derive(Debug, Clone)]
+enum Holder {
+    /// The agent its router copied it for or, for a relay between people (a WF's message to an IO
+    /// node), the agent that served its thread last on this hive.
+    Agent {
+        node: String,
+        identity: AgentIdentity,
+    },
+    /// No agent serves the thread here: each turn's writer pays.
+    NoAgent,
+}
+
+impl Holder {
+    fn agent_node(&self) -> &str {
+        match self {
+            Self::Agent { node, .. } => node,
+            Self::NoAgent => "",
+        }
+    }
+
+    fn agent_ilk(&self) -> &str {
+        match self {
+            Self::Agent { identity, .. } => &identity.ilk,
+            Self::NoAgent => NO_AGENT_ILK,
+        }
+    }
+}
+
+/// Whether a node is a WF, whose messages to IO nodes its router copies for this cognition: a relay
+/// between people (docs/cognition-hands-v1.md §12.4).
+fn is_workflow_node(name: &str) -> bool {
+    name.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WF."))
+}
+
+/// Whose communication a copy of a turn joins (docs/cognition-hands-v1.md §12.4). Its router copies
+/// an agent's turns for that agent, and a WF's messages to IO nodes, a relay between people, for
+/// the thread. A relay joins the communication whose agent served the thread last on this hive (a
+/// solution's WF runs on its agents' hive), or else the thread's communication with no agent. None
+/// for an agent with no ILK in the identity memory.
+async fn holder_of(
+    app_state: &CognitionAppState,
+    thread_id: &str,
+    producer: &str,
+) -> Option<Holder> {
+    if !is_workflow_node(producer) {
+        let identity = agent_identity_of(app_state, producer).await?;
+        return Some(Holder::Agent {
+            node: producer.to_string(),
+            identity,
+        });
+    }
+    let held = app_state
+        .thread_states
+        .lock()
+        .await
+        .iter()
+        .filter(|(key, state)| {
+            key.thread_id == thread_id
+                && key.agent_ilk != NO_AGENT_ILK
+                && !state.agent_node.is_empty()
+        })
+        .max_by_key(|(_, state)| last_turn_epoch_ms(state))
+        .map(|(_, state)| (last_turn_epoch_ms(state), state.agent_node.clone()));
+    let stored = app_state
+        .store
+        .last_agent_on_thread(thread_id, NO_AGENT_ILK)
+        .unwrap_or_else(|err| {
+            tracing::warn!(thread_id, error = %err, "sy.cognition could not read its file for a relay's agent");
+            None
+        });
+    let node = match (held, stored) {
+        (Some((held_ms, _)), Some((stored_ms, stored_node))) if stored_ms > held_ms => stored_node,
+        (Some((_, node)), _) | (None, Some((_, node))) => node,
+        (None, None) => return Some(Holder::NoAgent),
+    };
+    match agent_identity_of(app_state, &node).await {
+        Some(identity) => Some(Holder::Agent { node, identity }),
+        None => Some(Holder::NoAgent),
+    }
+}
+
+/// Who pays for a turn's model calls (docs/cognition-hands-v1.md §12.3): the tenant the usage
+/// record claims, why, and the ILK SY.storage checks it by.
+struct Payer {
+    tenant: Option<String>,
+    source: TenantSource,
+    ilk: String,
+}
+
+/// The holder of a turn's result pays: the communication's agent, or, with no agent, the turn's
+/// writer, by their ILK. None with no agent and no writer's ILK.
+fn payer_of(hive_id: &str, holder: &Holder, message: &Message) -> Option<Payer> {
+    match holder {
+        Holder::Agent { identity, .. } => Some(Payer {
+            tenant: identity.tenant.clone(),
+            source: TenantSource::Agent,
+            ilk: identity.ilk.clone(),
+        }),
+        Holder::NoAgent => {
+            let writer = message_writer::writer_of(message.meta.context.as_ref())
+                .and_then(|writer| writer.ilk)
+                .or_else(|| message.meta.src_ilk.clone())
+                .map(|ilk| ilk.trim().to_string())
+                .filter(|ilk| !ilk.is_empty())?;
+            let tenant = fluxbee_sdk::identity::find_ilk_by_id_from_hive_id(hive_id, &writer)
+                .ok()
+                .flatten()
+                .map(|found| found.tenant_id)
+                .filter(|tenant| !tenant.trim().is_empty());
+            Some(Payer {
+                tenant,
+                source: TenantSource::Writer,
+                ilk: writer,
+            })
+        }
+    }
+}
+
+/// A turn's key: its cycle (trace id), its writer and its text. One message a WF relays to a person
+/// and is also copied for an agent keeps one key (docs/cognition-hands-v1.md §12.4).
+fn turn_key(message: &Message) -> String {
+    let writer = message_writer::writer_of(message.meta.context.as_ref())
+        .and_then(|writer| writer.ilk)
+        .or_else(|| message.meta.src_ilk.clone())
+        .unwrap_or_default();
+    let text = extract_turn_text(&message.payload).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{}|{}|{hash:016x}", message.routing.trace_id, writer.trim())
+}
+
+/// Whom a turn is to, and the ILKs of the people an episode of it would be about: its writer and
+/// whom it is to (docs/cognition-hands-v1.md §12.4). The agent's answer is to its `dst_ilk`; a turn
+/// the agent got is to the agent; a turn a WF relayed is to the last other person of the
+/// communication's turns, none when there is none yet.
+fn episode_people(
+    message: &Message,
+    agent_node: &str,
+    agent_ilk: &str,
+    relay: bool,
+    turns: &[MemoryTurn],
+    facts: impl Fn(&str) -> Option<IlkFacts>,
+) -> (Option<MemoryTurnParty>, Vec<String>) {
+    let sent = !agent_node.is_empty() && message.routing.src_l2_name.as_deref() == Some(agent_node);
+    let writer = if sent {
+        Some(agent_ilk.to_string())
+    } else {
+        turn_writer(message, &facts).and_then(|writer| writer.ilk)
+    };
+    let counterpart = if sent {
+        turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
+    } else if relay {
+        turns
+            .iter()
+            .rev()
+            .filter_map(|turn| match turn.direction {
+                MemoryTurnDirection::In => turn.writer.clone(),
+                MemoryTurnDirection::Out => turn.to.clone(),
+            })
+            .find(|party| {
+                party.ilk.is_some()
+                    && party.ilk != writer
+                    && !matches!(party.kind.as_deref(), Some("agent" | "workflow" | "system"))
+            })
+    } else if agent_ilk != NO_AGENT_ILK {
+        Some(MemoryTurnParty {
+            ilk: Some(agent_ilk.to_string()),
+            name: Some(agent_node.to_string()),
+            kind: Some("agent".to_string()),
+        })
+    } else {
+        None
+    };
+    let people = episodes::people_of(
+        writer
+            .as_deref()
+            .into_iter()
+            .chain(counterpart.as_ref().and_then(|party| party.ilk.as_deref())),
+    );
+    (counterpart, people)
+}
+
+/// The communication's two leading contexts, the heaviest: an episode rests on one of them.
+fn leading_contexts(contexts: &HashMap<String, ContextState>) -> Vec<String> {
+    let mut leading: Vec<&ContextState> = contexts.values().collect();
+    leading.sort_by(|left, right| {
+        right
+            .weight
+            .total_cmp(&left.weight)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    leading
+        .into_iter()
+        .take(2)
+        .map(|context| context.label.clone())
+        .collect()
+}
+
+/// Now, in milliseconds since the epoch, as the episodes count it.
+fn now_epoch_ms_i64() -> i64 {
+    i64::try_from(json_router::shm::now_epoch_ms()).unwrap_or(i64::MAX)
+}
+
+/// The people of a communication, whose news its package carries (docs/cognition-hands-v1.md
+/// §12.4): those its turns name, the writers of what its agent got and whom it answered, and the
+/// owners of its feelings. Not its agent, nor any ILK the identity knows as an agent's, a WF's or
+/// the system's.
+fn people_of_conversation(thread_state: &ThreadCognitionState, agent_ilk: &str) -> Vec<String> {
+    let parties = thread_state
+        .turns
+        .iter()
+        .filter_map(|turn| match turn.direction {
+            MemoryTurnDirection::In => turn.writer.as_ref(),
+            MemoryTurnDirection::Out => turn.to.as_ref(),
+        })
+        .chain(thread_state.feelings.values().map(|feeling| &feeling.owner))
+        .filter(|party| !matches!(party.kind.as_deref(), Some("agent" | "workflow" | "system")))
+        .filter_map(|party| party.ilk.as_deref())
+        .filter(|ilk| *ilk != agent_ilk);
+    episodes::distinct_ilks(parties)
+}
+
+/// An episode the narrator proposed, through the gate (`gate_episode`): kept here, in memory and in
+/// the file, and sent to every hive's cognition (docs/cognition-hands-v1.md §12.4). It must be about
+/// a person: an ILK the identity knows as no one else's, or does not know yet.
+async fn publish_episode(
+    app_state: &CognitionAppState,
+    proposal: &episodes::EpisodeProposal,
+    leading: &[String],
+    people: Vec<String>,
+    thread_id: &str,
+) {
+    let about_a_person = people.iter().any(|ilk| {
+        message_writer::ilk_facts(&app_state.hive_id, ilk)
+            .is_none_or(|facts| facts.is_person() || facts.kind().is_none())
+    });
+    let now_ms = now_epoch_ms_i64();
+    let habit = app_state
+        .episodes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .habit(&proposal.lens, &people, now_ms);
+    let Some(intensity) = about_a_person
+        .then(|| episodes::gate_episode(proposal, leading, habit))
+        .flatten()
+    else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.episodes_gated_out_total = state.episodes_gated_out_total.saturating_add(1);
+        tracing::debug!(thread_id, lens = %proposal.lens, "sy.cognition: a proposed episode did not pass the gate");
+        return;
+    };
+    let episode = episodes::episode_of(
+        Uuid::new_v4().to_string(),
+        proposal,
+        intensity,
+        now_ms,
+        people,
+        episodes::EpisodeOrigin {
+            thread_id: thread_id.to_string(),
+            node: app_state.node_name.clone(),
+        },
+    );
+    keep_episode(app_state, episode.clone()).await;
+    let sender = app_state.dispatcher.sender_snapshot();
+    let sent = match episode_broadcast(&sender, &episode) {
+        Ok(message) => sender.send(message).await.map_err(|err| err.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    if let Err(err) = sent {
+        tracing::warn!(episode_id = %episode.episode_id, error = %err, "sy.cognition could not send an episode to the other hives");
+    }
+    let mut state = app_state.runtime_state.lock().await;
+    state.episodes_made_total = state.episodes_made_total.saturating_add(1);
+    tracing::info!(
+        episode_id = %episode.episode_id,
+        lens = %episode.lens,
+        intensity = episode.intensity,
+        people = episode.people.len(),
+        thread_id,
+        "sy.cognition made an episode and sent it to every hive"
+    );
+}
+
+/// The broadcast that carries an episode to every hive's cognition: a system message, as SY.vault's
+/// notice is, its receivers checking who sent it (`take_episode`).
+fn episode_broadcast(
+    sender: &NodeSender,
+    episode: &episodes::Episode,
+) -> Result<Message, serde_json::Error> {
+    Ok(Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Broadcast,
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(episodes::MSG_COGNITION_EPISODE.to_string()),
+            target: Some(episodes::EPISODE_BROADCAST_TARGET.to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(episode)?,
+    })
+}
+
+/// Keeps an episode once, in memory and in the file, and writes the region so the packages carry
+/// it. False when it had it already.
+async fn keep_episode(app_state: &CognitionAppState, episode: episodes::Episode) -> bool {
+    if let Err(err) = app_state.store.save_episode(&episode) {
+        tracing::warn!(episode_id = %episode.episode_id, error = %err, "sy.cognition could not write an episode to its file");
+    }
+    let (kept, live) = {
+        let mut book = app_state
+            .episodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (book.insert(episode), book.len() as u64)
+    };
+    app_state.runtime_state.lock().await.episodes_live_total = live;
+    if kept {
+        if let Err(err) = sync_held_state(app_state, &[], |_| Vec::new()).await {
+            tracing::warn!(error = %err, "sy.cognition failed to write jsr-memory with an episode");
+        }
+    }
+    kept
+}
+
+/// An episode another hive's cognition made (docs/cognition-hands-v1.md §12.4): taken only from a
+/// cognition, as its router names the sender, read, checked (`Episode::checked`) and kept once.
+async fn take_episode(app_state: &CognitionAppState, msg: &Message) {
+    let from = msg.routing.src_l2_name.as_deref().unwrap_or_default();
+    let episode = from
+        .starts_with("SY.cognition@")
+        .then(|| serde_json::from_value::<episodes::Episode>(msg.payload.clone()).ok())
+        .flatten()
+        .and_then(episodes::Episode::checked);
+    let Some(episode) = episode else {
+        let mut state = app_state.runtime_state.lock().await;
+        state.episodes_refused_total = state.episodes_refused_total.saturating_add(1);
+        tracing::warn!(
+            from,
+            "sy.cognition refused an episode: not a cognition's, or it does not read"
+        );
+        return;
+    };
+    let episode_id = episode.episode_id.clone();
+    if keep_episode(app_state, episode).await {
+        let mut state = app_state.runtime_state.lock().await;
+        state.episodes_received_total = state.episodes_received_total.saturating_add(1);
+        tracing::info!(episode_id = %episode_id, from, "sy.cognition took an episode from another hive");
+    }
+}
+
+/// At start, the episodes not faded come back from the file, the faded ones leave it.
+async fn load_live_episodes(app_state: &CognitionAppState) {
+    let now_ms = now_epoch_ms_i64();
+    if let Err(err) = app_state.store.sweep_episodes(now_ms) {
+        tracing::warn!(error = %err, "sy.cognition could not sweep its faded episodes at start");
+    }
+    let found = match app_state.store.live_episodes(now_ms) {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!(error = %err, "sy.cognition could not read its episodes at start");
+            return;
+        }
+    };
+    let live = {
+        let mut book = app_state
+            .episodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for episode in found {
+            book.insert(episode);
+        }
+        book.len() as u64
+    };
+    app_state.runtime_state.lock().await.episodes_live_total = live;
+    tracing::info!(live, "sy.cognition loaded its live episodes from its file");
 }
 
 /// The agent a turn's communication belongs to: its ILK and the tenant that pays for the turn's
@@ -1724,17 +2315,50 @@ where
         }
         written
     };
-    let synced = match memory_region.as_mut() {
-        Some(region) => retain_memory_hot_set(&mut threads, &kept).and_then(|hot_set| {
-            region.write_snapshot(&hot_set.snapshot)?;
-            Ok(Some(hot_set.stats))
-        }),
-        None => Ok(None),
+    // The faded episodes leave memory and the file; the rest are the packages' news, as of now.
+    let now_ms = now_epoch_ms_i64();
+    let (synced, episodes_live) = {
+        let mut book = app_state
+            .episodes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if book.sweep(now_ms) > 0 {
+            if let Err(err) = app_state.store.sweep_episodes(now_ms) {
+                tracing::warn!(error = %err, "sy.cognition could not sweep its faded episodes");
+            }
+        }
+        let hive_id = app_state.hive_id.as_str();
+        let news_of = |key: &CommunicationKey, thread_state: &ThreadCognitionState| {
+            book.news_for(
+                &people_of_conversation(thread_state, &key.agent_ilk),
+                now_ms,
+                |ilk| {
+                    turn_party(Some(ilk), None, &|ilk: &str| {
+                        message_writer::ilk_facts(hive_id, ilk)
+                    })
+                    .unwrap_or_else(|| MemoryTurnParty {
+                        ilk: Some(ilk.to_string()),
+                        ..MemoryTurnParty::default()
+                    })
+                },
+            )
+        };
+        let synced = match memory_region.as_mut() {
+            Some(region) => {
+                retain_memory_hot_set(&mut threads, &kept, &news_of).and_then(|hot_set| {
+                    region.write_snapshot(&hot_set.snapshot)?;
+                    Ok(Some(hot_set.stats))
+                })
+            }
+            None => Ok(None),
+        };
+        (synced, book.len() as u64)
     };
     drop(threads);
     drop(memory_region);
 
     let mut state = app_state.runtime_state.lock().await;
+    state.episodes_live_total = episodes_live;
     match written {
         Ok(rows) => state.store_writes_total = state.store_writes_total.saturating_add(rows),
         Err(err) => {
@@ -1766,6 +2390,7 @@ where
 fn build_memory_hot_set_snapshot(
     threads: &HashMap<CommunicationKey, ThreadCognitionState>,
     kept: &[CommunicationKey],
+    news_of: &dyn Fn(&CommunicationKey, &ThreadCognitionState) -> (Vec<NewsSummary>, u32),
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
     let updated_at = json_router::shm::now_epoch_ms();
     let base_snapshot = MemoryShmSnapshot {
@@ -1776,7 +2401,15 @@ fn build_memory_hot_set_snapshot(
     let base_size = serde_json::to_vec(&base_snapshot)?.len();
     let mut candidates = Vec::with_capacity(threads.len());
     for (key, thread_state) in threads {
-        let package = build_memory_package_for_thread(&key.thread_id, thread_state);
+        // A communication with no agent: its package would reach no one.
+        if key.agent_ilk == NO_AGENT_ILK {
+            continue;
+        }
+        let package = build_memory_package_for_thread(
+            &key.thread_id,
+            thread_state,
+            news_of(key, thread_state),
+        );
         let entry = MemoryShmThreadEntry {
             thread_id: key.thread_id.clone(),
             agent_ilk: key.agent_ilk.clone(),
@@ -1807,6 +2440,8 @@ fn build_memory_hot_set_snapshot(
             .then_with(|| left.key.cmp(&right.key))
     });
 
+    // A communication with no agent is no candidate, so it is never counted as pruned.
+    let candidates_total = candidates.len();
     let mut selected_thread_ids = HashSet::with_capacity(candidates.len());
     let mut selected_entries = Vec::with_capacity(candidates.len());
     let mut payload_bytes = base_size;
@@ -1820,7 +2455,7 @@ fn build_memory_hot_set_snapshot(
         selected_entries.push(candidate.entry);
     }
     let selected_threads_total = selected_entries.len() as u64;
-    let pruned_threads_total = threads.len().saturating_sub(selected_entries.len()) as u64;
+    let pruned_threads_total = candidates_total.saturating_sub(selected_entries.len()) as u64;
 
     Ok(MemoryHotSetBuild {
         snapshot: MemoryShmSnapshot {
@@ -1845,8 +2480,9 @@ fn build_memory_hot_set_snapshot(
 fn retain_memory_hot_set(
     threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
     kept: &[CommunicationKey],
+    news_of: &dyn Fn(&CommunicationKey, &ThreadCognitionState) -> (Vec<NewsSummary>, u32),
 ) -> Result<MemoryHotSetBuild, json_router::shm::ShmError> {
-    let hot_set = build_memory_hot_set_snapshot(threads, kept)?;
+    let hot_set = build_memory_hot_set_snapshot(threads, kept, news_of)?;
     threads.retain(|key, _| hot_set.selected_thread_ids.contains(key) || kept.contains(key));
     Ok(hot_set)
 }
@@ -1858,7 +2494,7 @@ fn thread_live_entities_total(thread_state: &ThreadCognitionState) -> usize {
         + thread_state.reasons.len()
         + thread_state.cooccurrences.len()
         + thread_state.memories.len()
-        + thread_state.episodes.len()
+        + thread_state.feelings.len()
 }
 
 fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
@@ -1878,12 +2514,17 @@ fn thread_last_seen_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
 /// When a communication last had a turn, for the region's ranking and the file's order: the
 /// worker's last, or a later one the intake took.
 fn thread_recency_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
-    let last_turn = thread_state
+    thread_last_seen_epoch_ms(thread_state).max(last_turn_epoch_ms(thread_state))
+}
+
+/// When a router took a communication's last turn: whose agent served a thread last, whatever the
+/// worker's backlog (docs/cognition-hands-v1.md §12.4).
+fn last_turn_epoch_ms(thread_state: &ThreadCognitionState) -> i64 {
+    thread_state
         .turns
         .last()
         .and_then(|turn| parse_rfc3339_epoch_ms(&turn.ts))
-        .unwrap_or_default();
-    thread_last_seen_epoch_ms(thread_state).max(last_turn)
+        .unwrap_or_default()
 }
 
 fn parse_rfc3339_epoch_ms(value: &str) -> Option<i64> {
@@ -1972,10 +2613,11 @@ async fn resolve_cognition_resource(
 }
 
 /// A communication's memory package (docs/reference/cognition.md §7): its labels, memories and
-/// episodes from the worker, and its last turns from the intake.
+/// feelings from the worker, and its last turns from the intake.
 fn build_memory_package_for_thread(
     thread_id: &str,
     thread_state: &ThreadCognitionState,
+    (news, dropped_news): (Vec<NewsSummary>, u32),
 ) -> MemoryPackage {
     const MAX_CONTEXTS: usize = 6;
     const MAX_REASONS: usize = 6;
@@ -1991,13 +2633,13 @@ fn build_memory_package_for_thread(
     memories.sort_by(|left, right| right.weight.total_cmp(&left.weight));
 
     // The feelings, the heaviest first, and the most recently felt on a tie (§10.3).
-    let mut episodes: Vec<&EpisodeState> = thread_state.episodes.values().collect();
-    episodes.sort_by(|left, right| {
+    let mut feelings: Vec<&FeelingState> = thread_state.feelings.values().collect();
+    feelings.sort_by(|left, right| {
         right
             .weight
             .total_cmp(&left.weight)
             .then_with(|| right.last_felt_at.cmp(&left.last_felt_at))
-            .then_with(|| left.episode_id.cmp(&right.episode_id))
+            .then_with(|| left.feeling_id.cmp(&right.feeling_id))
     });
 
     let dominant_context = contexts.first().map(|context| MemoryContextSummary {
@@ -2014,7 +2656,7 @@ fn build_memory_package_for_thread(
     let dropped_contexts = contexts.len().saturating_sub(MAX_CONTEXTS) as u32;
     let dropped_reasons = reasons.len().saturating_sub(MAX_REASONS) as u32;
     let dropped_memories = memories.len().saturating_sub(MAX_MEMORIES) as u32;
-    let dropped_episodes = episodes
+    let dropped_feelings = feelings
         .len()
         .saturating_sub(COGNITION_PACKAGE_MAX_FEELINGS) as u32;
 
@@ -2052,11 +2694,11 @@ fn build_memory_package_for_thread(
                 dominant_reason_id: Some(memory.dominant_reason_id.clone()),
             })
             .collect(),
-        episodes: episodes
+        feelings: feelings
             .into_iter()
             .take(COGNITION_PACKAGE_MAX_FEELINGS)
-            .map(|feeling| EpisodeSummary {
-                episode_id: feeling.episode_id.clone(),
+            .map(|feeling| FeelingSummary {
+                feeling_id: feeling.feeling_id.clone(),
                 owner: feeling.owner.clone(),
                 affect: feeling.affect_id.clone(),
                 context: feeling.context_label.clone(),
@@ -2068,12 +2710,15 @@ fn build_memory_package_for_thread(
                 summary: turn_field(&feeling.summary, COGNITION_FEELING_TEXT_MAX_CHARS),
             })
             .collect(),
+        // The news of the communication's people (docs/cognition-hands-v1.md §12.4).
+        news,
         // Bounded at intake (`bound_recent_turns`): they all go.
         turns: thread_state.turns.clone(),
         truncated: if dropped_contexts == 0
             && dropped_reasons == 0
             && dropped_memories == 0
-            && dropped_episodes == 0
+            && dropped_feelings == 0
+            && dropped_news == 0
         {
             None
         } else {
@@ -2082,7 +2727,8 @@ fn build_memory_package_for_thread(
                 dropped_contexts,
                 dropped_reasons,
                 dropped_memories,
-                dropped_episodes,
+                dropped_feelings,
+                dropped_news,
             })
         },
     }
@@ -2313,7 +2959,7 @@ fn build_status_payload(
         "turn_behavior_on_narrative_summarizer_failure": "skip_narrative_update_fail_open",
         "notes": [
             "Without AI, SY.cognition stays live but does not produce new semantic derivations for the affected turn.",
-            "The router carrier and durable entity schemas remain unchanged while semantic capability is degraded.",
+            "The router's copies of the turns and the shape of the file's state remain unchanged while semantic capability is degraded.",
             "There is no silent fallback path as product behavior."
         ]
     });
@@ -2327,6 +2973,8 @@ fn build_status_payload(
         "no_agent_ilk_total": runtime_state.no_agent_ilk_total,
         "intake_turns_total": runtime_state.intake_turns_total,
         "turns_not_analyzed_total": runtime_state.turns_not_analyzed_total,
+        "relay_turns_total": runtime_state.relay_turns_total,
+        "duplicate_turns_skipped_total": runtime_state.duplicate_turns_skipped_total,
         "last_trace_id": runtime_state.last_trace_id,
         "last_thread_id": runtime_state.last_thread_id,
         "last_src_ilk": runtime_state.last_src_ilk,
@@ -2340,7 +2988,7 @@ fn build_status_payload(
         "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
         "active_scopes_total": runtime_state.active_scopes_total,
         "active_memories_total": runtime_state.active_memories_total,
-        "active_episodes_total": runtime_state.active_episodes_total,
+        "active_feelings_total": runtime_state.active_feelings_total,
         "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
         "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
         "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
@@ -2364,6 +3012,13 @@ fn build_status_payload(
         "load_failures_total": runtime_state.store_load_failures_total,
         "writes_total": runtime_state.store_writes_total,
         "write_failures_total": runtime_state.store_write_failures_total
+    });
+    let episodes = json!({
+        "live_total": runtime_state.episodes_live_total,
+        "made_total": runtime_state.episodes_made_total,
+        "gated_out_total": runtime_state.episodes_gated_out_total,
+        "received_total": runtime_state.episodes_received_total,
+        "refused_total": runtime_state.episodes_refused_total
     });
     let shm = json!({
         "capacity_bytes": MEMORY_MAX_DATA_SIZE,
@@ -2389,6 +3044,7 @@ fn build_status_payload(
         "turns_consumer": turns_consumer,
         "paths": paths,
         "store": store,
+        "episodes": episodes,
         "shm": shm
     })
 }
@@ -2495,6 +3151,13 @@ fn build_cognition_config_get_payload(
         "store_load_failures_total": runtime_state.store_load_failures_total,
         "store_writes_total": runtime_state.store_writes_total,
         "store_write_failures_total": runtime_state.store_write_failures_total,
+        "relay_turns_total": runtime_state.relay_turns_total,
+        "duplicate_turns_skipped_total": runtime_state.duplicate_turns_skipped_total,
+        "episodes_live_total": runtime_state.episodes_live_total,
+        "episodes_made_total": runtime_state.episodes_made_total,
+        "episodes_gated_out_total": runtime_state.episodes_gated_out_total,
+        "episodes_received_total": runtime_state.episodes_received_total,
+        "episodes_refused_total": runtime_state.episodes_refused_total,
         "last_thread_id": runtime_state.last_thread_id,
         "last_tags": runtime_state.last_tags,
         "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
@@ -2505,7 +3168,7 @@ fn build_cognition_config_get_payload(
         "open_cooccurrences_total": runtime_state.open_cooccurrences_total,
         "active_scopes_total": runtime_state.active_scopes_total,
         "active_memories_total": runtime_state.active_memories_total,
-        "active_episodes_total": runtime_state.active_episodes_total,
+        "active_feelings_total": runtime_state.active_feelings_total,
         "loaded_at_start_total": runtime_state.loaded_at_start_total,
         "shm_hot_threads_total": runtime_state.shm_hot_threads_total,
         "shm_pruned_threads_total": runtime_state.shm_pruned_threads_total,
@@ -2970,6 +3633,7 @@ async fn update_thread_state<S: NarrativeSummarizer>(
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     ts: &str,
     thread_state: &mut ThreadCognitionState,
+    ask: &EpisodeAsk,
     narrative: &S,
 ) -> NarrativeOutcome {
     if thread_state.first_seen_at.is_none() {
@@ -3030,16 +3694,17 @@ async fn update_thread_state<S: NarrativeSummarizer>(
         .and_then(|owner_ilk| {
             felt.iter()
                 .filter_map(|felt| {
-                    thread_state.episodes.get(&feeling_key(
+                    thread_state.feelings.get(&feeling_key(
                         owner_ilk,
-                        &felt.episode.affect_id,
+                        &felt.affect.affect_id,
                         &felt.context_label,
                     ))
                 })
                 .max_by(|left, right| left.weight.total_cmp(&right.weight))
         })
         .map(|feeling| (feeling.summary.clone(), feeling.reason.clone()));
-    let (narrative_outcome, feeling_text) = update_memories_and_episodes_for_thread(
+    let leading = leading_contexts(&thread_state.contexts);
+    let (narrative_outcome, feeling_text) = update_memories_and_feelings_for_thread(
         key,
         ts,
         src_ilk,
@@ -3051,6 +3716,8 @@ async fn update_thread_state<S: NarrativeSummarizer>(
         semantic_tagger_config,
         &thread_state.active_scope,
         &felt,
+        ask,
+        &leading,
         previous_text
             .as_ref()
             .map(|(summary, reason)| (summary.as_str(), reason.as_str())),
@@ -3065,7 +3732,7 @@ async fn update_thread_state<S: NarrativeSummarizer>(
             owner,
             felt,
             feeling_text.as_ref(),
-            &mut thread_state.episodes,
+            &mut thread_state.feelings,
         );
     }
     narrative_outcome
@@ -3468,7 +4135,7 @@ fn update_scope_binding_for_thread(
 /// turn's feelings (`felt`) come from, one for all of them, from the text so far. The narrator reads
 /// who spoke (`speaker`), so the memory names each person (docs/cognition-hands-v1.md §10.3), and
 /// the scope's pair. Nothing without an active scope; no feeling text when the narrator fails.
-async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
+async fn update_memories_and_feelings_for_thread<S: NarrativeSummarizer>(
     key: &CommunicationKey,
     ts: &str,
     src_ilk: Option<&str>,
@@ -3480,10 +4147,12 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
     semantic_tagger_config: &CognitionSemanticTaggerConfig,
     active_scope: &Option<ScopeBindingState>,
     felt: &[FeelingCandidate],
+    ask: &EpisodeAsk,
+    leading: &[String],
     previous_feeling_text: Option<(&str, &str)>,
     memories: &mut HashMap<String, MemoryState>,
     narrative: &S,
-) -> (NarrativeOutcome, Option<EpisodeNarrative>) {
+) -> (NarrativeOutcome, Option<FeelingNarrative>) {
     let Some(scope) = active_scope.as_ref() else {
         return (NarrativeOutcome::default(), None);
     };
@@ -3501,16 +4170,16 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
             canonical_signals: &scope.dominant_reason_signals,
             extra_signals: &tagger.reason_signals_extra,
             previous_memory_summary: memories.get(&scope.scope_id).map(|m| m.summary.as_str()),
-            episode_affects: felt
+            feeling_affects: felt
                 .iter()
-                .map(|felt| felt.episode.affect_id.as_str())
+                .map(|felt| felt.affect.affect_id.as_str())
                 .collect(),
-            episode_titles: felt
-                .iter()
-                .map(|felt| felt.episode.title.as_str())
-                .collect(),
-            previous_episode_summary: previous_feeling_text.map(|(summary, _)| summary),
-            previous_episode_reason: previous_feeling_text.map(|(_, reason)| reason),
+            feeling_titles: felt.iter().map(|felt| felt.affect.title.as_str()).collect(),
+            previous_feeling_summary: previous_feeling_text.map(|(summary, _)| summary),
+            previous_feeling_reason: previous_feeling_text.map(|(_, reason)| reason),
+            counterpart: ask.counterpart.as_deref(),
+            leading_contexts: leading,
+            episode_habits: &ask.habits,
         })
         .await
     {
@@ -3521,7 +4190,7 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
                 context = %scope.dominant_context_label,
                 reason = %scope.dominant_reason_label,
                 error = %err,
-                "sy.cognition narrative summarizer failed; skipping memory/episode synthesis for turn"
+                "sy.cognition narrative summarizer failed; skipping memory/feeling synthesis for turn"
             );
             let invalid_output = matches!(
                 err,
@@ -3532,6 +4201,7 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
                     called: true,
                     failed: !invalid_output,
                     invalid_output,
+                    episode: None,
                 },
                 None,
             );
@@ -3552,8 +4222,9 @@ async fn update_memories_and_episodes_for_thread<S: NarrativeSummarizer>(
             called: true,
             failed: false,
             invalid_output: false,
+            episode: narrative_result.episode,
         },
-        narrative_result.episode,
+        narrative_result.feeling,
     )
 }
 
@@ -3610,7 +4281,7 @@ fn feeling_key(owner_ilk: &str, affect_id: &str, context_label: &str) -> String 
 }
 
 /// The feelings a person's turn shows (docs/cognition-hands-v1.md §10.3): each affect the gate
-/// passes (`build_episode_candidates`), felt around the active scope's context and reason. None
+/// passes (`build_feeling_candidates`), felt around the active scope's context and reason. None
 /// without an active scope, as a memory needs.
 fn feeling_candidates(
     tagger: &SemanticTaggerOutput,
@@ -3619,10 +4290,10 @@ fn feeling_candidates(
     let Some(scope) = active_scope.as_ref() else {
         return Vec::new();
     };
-    build_episode_candidates(tagger, &scope.dominant_context_label)
+    build_feeling_candidates(tagger, &scope.dominant_context_label)
         .into_iter()
-        .map(|episode| FeelingCandidate {
-            episode,
+        .map(|affect| FeelingCandidate {
+            affect,
             scope_id: scope.scope_id.clone(),
             context_id: scope.dominant_context_id.clone(),
             context_label: scope.dominant_context_label.clone(),
@@ -3689,8 +4360,8 @@ fn update_feelings_for_turn(
     ts: &str,
     owner: &MemoryTurnParty,
     felt: Vec<FeelingCandidate>,
-    text: Option<&EpisodeNarrative>,
-    feelings: &mut HashMap<String, EpisodeState>,
+    text: Option<&FeelingNarrative>,
+    feelings: &mut HashMap<String, FeelingState>,
 ) {
     let Some(owner_ilk) = owner.ilk.clone() else {
         return;
@@ -3698,7 +4369,7 @@ fn update_feelings_for_turn(
     let felt: Vec<(String, FeelingCandidate)> = felt
         .into_iter()
         .map(|felt| {
-            let key = feeling_key(&owner_ilk, &felt.episode.affect_id, &felt.context_label);
+            let key = feeling_key(&owner_ilk, &felt.affect.affect_id, &felt.context_label);
             (key, felt)
         })
         .collect();
@@ -3721,10 +4392,10 @@ fn update_feelings_for_turn(
     });
 
     for (felt_key, felt) in felt {
-        let candidate = felt.episode;
-        let feeling = feelings.entry(felt_key).or_insert_with(|| EpisodeState {
-            episode_id: stable_entity_id(
-                "episode",
+        let candidate = felt.affect;
+        let feeling = feelings.entry(felt_key).or_insert_with(|| FeelingState {
+            feeling_id: stable_entity_id(
+                "feeling",
                 &[
                     &key.thread_id,
                     &key.agent_ilk,
@@ -3789,13 +4460,13 @@ fn update_feelings_for_turn(
     }
 }
 
-/// The deterministic episode gate: each affect fires on its own combination of canonical and affect
+/// The deterministic feeling gate: each affect fires on its own combination of canonical and affect
 /// signals, so one turn may show several (FINDINGS A-155). The summary and reason are the narrative
 /// summarizer's.
-fn build_episode_candidates(
+fn build_feeling_candidates(
     tagger: &SemanticTaggerOutput,
     context_label: &str,
-) -> Vec<EpisodeCandidate> {
+) -> Vec<AffectCandidate> {
     let affect_signals: HashSet<&str> = tagger.affect_signals.iter().map(String::as_str).collect();
     let canonical_signals: HashSet<&str> = tagger
         .reason_signals_canonical
@@ -3806,7 +4477,7 @@ fn build_episode_candidates(
                      title: String,
                      evidence_signals: &[&str],
                      base_intensity: f64,
-                     evidence_strength: f64| EpisodeCandidate {
+                     evidence_strength: f64| AffectCandidate {
         affect_id: affect_id.to_string(),
         title,
         base_intensity,
@@ -4135,15 +4806,15 @@ mod tests {
 
     /// The turn the intake keeps of `message`, which its router took at `ts_ms`.
     fn taken(message: &Message, ts_ms: u64) -> RecentTurn {
-        recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, ts_ms, no_facts).expect("a turn")
+        recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, 0, ts_ms, no_facts).expect("a turn")
     }
 
     fn texts(turns: &[MemoryTurn]) -> Vec<&str> {
         turns.iter().map(|turn| turn.text.as_str()).collect()
     }
 
-    /// Answers like the AI does, from the input: memory text always, episode text exactly when
-    /// the turn carries an episode candidate (the contract `parse_narrative_summaries` enforces).
+    /// Answers like the AI does, from the input: memory text always, feeling text exactly when
+    /// the turn carries a feeling candidate (the contract `parse_narrative_summaries` enforces).
     struct CannedNarrative;
 
     impl NarrativeSummarizer for CannedNarrative {
@@ -4156,15 +4827,16 @@ mod tests {
                 "Memory of {} driven by {}.",
                 input.context_label, input.reason_label
             );
-            let affects = input.episode_affects.join(", ");
-            let episode = (!affects.is_empty()).then(|| EpisodeNarrative {
-                summary: format!("AI episode summary ({affects})."),
-                reason: format!("AI episode reason ({affects})."),
+            let affects = input.feeling_affects.join(", ");
+            let feeling = (!affects.is_empty()).then(|| FeelingNarrative {
+                summary: format!("AI feeling summary ({affects})."),
+                reason: format!("AI feeling reason ({affects})."),
             });
             async move {
                 Ok(NarrativeSummaries {
                     memory_summary,
-                    episode,
+                    feeling,
+                    episode: None,
                 })
             }
         }
@@ -4258,6 +4930,7 @@ mod tests {
             &CognitionSemanticTaggerConfig::default(),
             &ts,
             thread,
+            &EpisodeAsk::default(),
             &CannedNarrative,
         )
         .await;
@@ -4307,7 +4980,18 @@ mod tests {
         store: &CognitionStore,
         recent: Vec<RecentTurn>,
     ) -> Vec<CommunicationKey> {
-        hold_recent_turns(threads, store, recent, &mut StoreLoads::default())
+        hold_recent_turns(
+            threads,
+            store,
+            recent,
+            &mut StoreLoads::default(),
+            &mut Vec::new(),
+        )
+    }
+
+    /// No news, for the region's tests that are not about them.
+    fn no_news(_: &CommunicationKey, _: &ThreadCognitionState) -> (Vec<NewsSummary>, u32) {
+        (Vec::new(), 0)
     }
 
     fn sorted_keys<V>(map: &HashMap<String, V>) -> Vec<String> {
@@ -4395,7 +5079,7 @@ mod tests {
         );
         let scope = back.active_scope.clone().expect("its scope");
         assert!(back.memories.contains_key(&scope.scope_id));
-        assert!(!back.episodes.is_empty());
+        assert!(!back.feelings.is_empty());
 
         live_turn(&mut reference, 4, turn.0, turn.1, turn.2).await;
         live_turn(&mut back, 4, turn.0, turn.1, turn.2).await;
@@ -4404,8 +5088,8 @@ mod tests {
             sorted_keys(&reference.contexts)
         );
         assert_eq!(
-            sorted_keys(&back.episodes),
-            sorted_keys(&reference.episodes)
+            sorted_keys(&back.feelings),
+            sorted_keys(&reference.feelings)
         );
         let billing = &back.contexts["billing"];
         assert_eq!(billing.weight_samples, 4);
@@ -4425,15 +5109,78 @@ mod tests {
         store
             .save([(&key(TEST_THREAD), &back), (&key("thread:older"), &older)])
             .expect("written");
-        let recent = store.most_recent(usize::MAX).expect("read");
+        let recent = store.most_recent(usize::MAX, NO_AGENT_ILK).expect("read");
         let keys: Vec<&str> = recent
             .iter()
             .map(|(key, _)| key.thread_id.as_str())
             .collect();
         assert_eq!(keys, [TEST_THREAD, "thread:older"]);
         assert_eq!(recent[0].1.turn_count, 4);
-        assert_eq!(store.most_recent(1).expect("read").len(), 1, "a byte bound");
+        assert_eq!(
+            store.most_recent(1, NO_AGENT_ILK).expect("read").len(),
+            1,
+            "a byte bound"
+        );
         assert_eq!(store.stats().expect("stats").0, 2);
+    }
+
+    /// Whose agent served a thread last is the one with the newest turn, whenever its worker last
+    /// saw it; a communication with no agent is not that, and is not loaded at start
+    /// (docs/cognition-hands-v1.md §12.4).
+    #[test]
+    fn the_file_names_the_agent_with_the_newest_turn_and_loads_no_agentless_one() {
+        let store = test_store();
+        let turn_at = |text: &str, ts: &str| MemoryTurn {
+            direction: MemoryTurnDirection::Out,
+            src_ilk: None,
+            via: None,
+            writer: None,
+            to: None,
+            text: text.to_string(),
+            attachments: 0,
+            choice: None,
+            ts: ts.to_string(),
+        };
+        // Sales' worker saw its communication last, late, but invoice's turn is the newer.
+        let sales = ThreadCognitionState {
+            agent_node: "AI.sales@motherbee".to_string(),
+            last_seen_at: Some("2026-10-30T12:10:00Z".to_string()),
+            turns: vec![turn_at("sales", "2026-10-30T12:00:00.000Z")],
+            ..ThreadCognitionState::default()
+        };
+        let invoice = ThreadCognitionState {
+            agent_node: "AI.invoice@motherbee".to_string(),
+            turns: vec![turn_at("invoice", "2026-10-30T12:05:00.000Z")],
+            ..ThreadCognitionState::default()
+        };
+        let people = ThreadCognitionState {
+            turns: vec![turn_at("people", "2026-10-30T12:20:00.000Z")],
+            ..ThreadCognitionState::default()
+        };
+        let key_of = |agent_ilk: &str| CommunicationKey {
+            thread_id: TEST_THREAD.to_string(),
+            agent_ilk: agent_ilk.to_string(),
+        };
+        store
+            .save([
+                (&key_of("ilk:sales"), &sales),
+                (&key_of("ilk:invoice"), &invoice),
+                (&key_of(NO_AGENT_ILK), &people),
+            ])
+            .expect("written");
+        let (_, node) = store
+            .last_agent_on_thread(TEST_THREAD, NO_AGENT_ILK)
+            .expect("read")
+            .expect("an agent");
+        assert_eq!(node, "AI.invoice@motherbee");
+        let mut loaded: Vec<String> = store
+            .most_recent(usize::MAX, NO_AGENT_ILK)
+            .expect("read")
+            .into_iter()
+            .map(|(key, _)| key.agent_ilk)
+            .collect();
+        loaded.sort();
+        assert_eq!(loaded, ["ilk:invoice", "ilk:sales"]);
     }
 
     /// Only this node may read its file: the folder is 0700, and the file and its WAL sidecars
@@ -4475,10 +5222,10 @@ mod tests {
             .expect("written");
         let side = rusqlite::Connection::open(store.path()).expect("a side connection");
         for (thread, version, state) in [
-            ("thread:broken", 1, "{not json"),
-            ("thread:older", 0, "{}"),
-            ("thread:newer", 2, "{\"turn_count\": 9}"),
-            ("thread:partial", 1, "{\"turn_count\": 3}"),
+            ("thread:broken", 2, "{not json"),
+            ("thread:older", 1, "{}"),
+            ("thread:newer", 3, "{\"turn_count\": 9}"),
+            ("thread:partial", 2, "{\"turn_count\": 3}"),
         ] {
             side.execute(
                 "INSERT INTO communications (thread_id, agent_ilk, last_seen_ms, state_version, state) \
@@ -4499,7 +5246,7 @@ mod tests {
             .expect("kept");
         assert_eq!(partial.turn_count, 3);
         let mut loaded: Vec<String> = store
-            .most_recent(usize::MAX)
+            .most_recent(usize::MAX, NO_AGENT_ILK)
             .expect("read")
             .into_iter()
             .map(|(key, _)| key.thread_id)
@@ -4535,7 +5282,7 @@ mod tests {
             key("thread:other"),
             thread_of_a_fifth_of_the_region(7, &["billing"]).await,
         );
-        let hot_set = retain_memory_hot_set(&mut threads, &kept).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, &kept, &no_news).expect("hot set");
         assert_eq!(hot_set.stats.selected_threads_total, 4);
         assert_eq!(threads.len(), 6, "the kept stay, the other goes");
         assert!(kept.iter().all(|key| threads.contains_key(key)));
@@ -4613,13 +5360,14 @@ mod tests {
                 taken(&other, TEST_TS + 2_000),
             ],
             &mut loads,
+            &mut Vec::new(),
         );
         assert_eq!(touched, [key(TEST_THREAD), key("thread:new")]);
         assert_eq!((loads.loaded, loads.failed), (1, 0));
         let held = &threads[&key(TEST_THREAD)];
         assert_eq!(texts(&held.turns), ["hello", "and the price?"]);
         assert_eq!(held.turn_count, 1);
-        let package = build_memory_package_for_thread(TEST_THREAD, held);
+        let package = build_memory_package_for_thread(TEST_THREAD, held, (Vec::new(), 0));
         assert_eq!(
             package.dominant_context.as_ref().map(|c| c.label.as_str()),
             Some("billing")
@@ -4660,7 +5408,7 @@ mod tests {
             threads.insert(key(&format!("thread:{index}")), thread);
         }
 
-        let hot_set = retain_memory_hot_set(&mut threads, &[]).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, &[], &no_news).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert_eq!(threads.len() as u64, hot_set.stats.selected_threads_total);
         // The oldest thread goes.
@@ -4684,7 +5432,7 @@ mod tests {
                 thread_of_a_fifth_of_the_region(seq, &topics).await,
             );
         }
-        let full = retain_memory_hot_set(&mut threads, &[]).expect("hot set");
+        let full = retain_memory_hot_set(&mut threads, &[], &no_news).expect("hot set");
         assert_eq!(full.stats.pruned_threads_total, 0);
 
         threads.insert(
@@ -4696,7 +5444,7 @@ mod tests {
                 < thread_live_entities_total(&threads[&key("thread:old:1")])
         );
         // No turn thread: the ranking alone keeps it, as at start.
-        let hot_set = retain_memory_hot_set(&mut threads, &[]).expect("hot set");
+        let hot_set = retain_memory_hot_set(&mut threads, &[], &no_news).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert!(threads.contains_key(&key("thread:new")));
         assert!(!threads.contains_key(&key("thread:old:1")));
@@ -4718,7 +5466,8 @@ mod tests {
             key("thread:turn"),
             thread_of_a_fifth_of_the_region(1, &["shipping"]).await,
         );
-        let hot_set = retain_memory_hot_set(&mut threads, &[key("thread:turn")]).expect("hot set");
+        let hot_set =
+            retain_memory_hot_set(&mut threads, &[key("thread:turn")], &no_news).expect("hot set");
         assert_eq!(hot_set.stats.pruned_threads_total, 1);
         assert!(threads.contains_key(&key("thread:turn")));
         assert!(!threads.contains_key(&key("thread:2")));
@@ -4803,21 +5552,21 @@ mod tests {
             &["frustration"],
         )
         .await;
-        assert_eq!(thread.episodes.len(), 1);
-        let episode = thread.episodes.values().next().expect("a feeling");
-        assert_eq!(episode.affect_id, "anger");
-        assert_eq!(episode.title, "Friction around billing");
-        assert_eq!(episode.summary, "AI episode summary (anger).");
-        assert_eq!(episode.reason, "AI episode reason (anger).");
-        assert_eq!(episode.base_intensity, 8.0);
-        assert_eq!(episode.evidence_strength, 9.0);
-        assert!(episode
+        assert_eq!(thread.feelings.len(), 1);
+        let feeling = thread.feelings.values().next().expect("a feeling");
+        assert_eq!(feeling.affect_id, "anger");
+        assert_eq!(feeling.title, "Friction around billing");
+        assert_eq!(feeling.summary, "AI feeling summary (anger).");
+        assert_eq!(feeling.reason, "AI feeling reason (anger).");
+        assert_eq!(feeling.base_intensity, 8.0);
+        assert_eq!(feeling.evidence_strength, 9.0);
+        assert!(feeling
             .evidence_signals
             .contains(&"frustration".to_string()));
     }
 
     #[test]
-    fn the_episode_gate_needs_its_signal_combination() {
+    fn the_feeling_gate_needs_its_signal_combination() {
         let tagger = |canonical: &[&str], affect: &[&str]| SemanticTaggerOutput {
             tags: strings(&["billing"]),
             reason_signals_canonical: strings(canonical),
@@ -4825,7 +5574,7 @@ mod tests {
             ..SemanticTaggerOutput::default()
         };
         let affects = |canonical: &[&str], affect: &[&str]| {
-            build_episode_candidates(&tagger(canonical, affect), "billing")
+            build_feeling_candidates(&tagger(canonical, affect), "billing")
                 .into_iter()
                 .map(|candidate| candidate.affect_id)
                 .collect::<Vec<_>>()
@@ -4833,7 +5582,7 @@ mod tests {
         assert!(affects(&["inform"], &["frustration"]).is_empty());
         assert!(affects(&["resolve", "challenge"], &[]).is_empty());
         let urgency =
-            build_episode_candidates(&tagger(&["resolve", "request"], &["urgency"]), "billing");
+            build_feeling_candidates(&tagger(&["resolve", "request"], &["urgency"]), "billing");
         assert_eq!(urgency.len(), 1);
         assert_eq!(urgency[0].affect_id, "urgency");
         assert_eq!(urgency[0].title, "Urgent push on billing");
@@ -4878,11 +5627,11 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(thread.episodes.len(), 3);
+        assert_eq!(thread.feelings.len(), 3);
         for affect in ["anger", "escalation"] {
             let shown = feeling(&thread, "ilk:ana", affect);
             assert_eq!(shown.weight, 2.0, "{affect}");
-            assert_eq!(shown.summary, "AI episode summary (anger, escalation).");
+            assert_eq!(shown.summary, "AI feeling summary (anger, escalation).");
         }
         let urgency = feeling(&thread, "ilk:ana", "urgency");
         assert!((urgency.weight - 1.75 * feeling_decay("urgency")).abs() < 1e-12);
@@ -4916,8 +5665,8 @@ mod tests {
         thread: &'a ThreadCognitionState,
         owner: &str,
         affect: &str,
-    ) -> &'a EpisodeState {
-        &thread.episodes[&feeling_key(owner, affect, "billing")]
+    ) -> &'a FeelingState {
+        &thread.feelings[&feeling_key(owner, affect, "billing")]
     }
 
     /// A feeling is its owner's (docs/cognition-hands-v1.md §10.3): Ana's anger stays while Pedro
@@ -4928,12 +5677,12 @@ mod tests {
         let (ana, pedro) = (person("ilk:ana", "Ana"), person("ilk:pedro", "Pedro"));
         let mut thread = ThreadCognitionState::default();
         says(&mut thread, Some(&ana), 1, ANGRY).await;
-        assert_eq!(thread.episodes.len(), 1);
+        assert_eq!(thread.feelings.len(), 1);
         let shown = feeling(&thread, "ilk:ana", "anger");
         assert_eq!(shown.owner, ana);
         assert_eq!(shown.context_label, "billing");
         assert_eq!(shown.weight, 2.0);
-        assert_eq!(shown.summary, "AI episode summary (anger).");
+        assert_eq!(shown.summary, "AI feeling summary (anger).");
 
         for seq in 2..=11 {
             says(&mut thread, Some(&pedro), seq, CALM).await;
@@ -4946,7 +5695,7 @@ mod tests {
         let mut closed_on = None;
         for calm in 1..=70u64 {
             says(&mut thread, Some(&ana), 11 + calm, CALM).await;
-            let Some(anger) = thread.episodes.get(&anger_key) else {
+            let Some(anger) = thread.feelings.get(&anger_key) else {
                 closed_on = Some(calm);
                 break;
             };
@@ -4957,7 +5706,7 @@ mod tests {
             );
         }
         assert_eq!(closed_on, Some(64));
-        assert!(thread.episodes.is_empty());
+        assert!(thread.feelings.is_empty());
     }
 
     /// A feeling that comes back builds up: anger on four turns in a row reads `strong`, once
@@ -4990,7 +5739,7 @@ mod tests {
         // One that closed and comes back starts again, from its step.
         let anger_key = feeling_key("ilk:ana", "anger", "billing");
         let mut seq = 3;
-        while thread.episodes.contains_key(&anger_key) {
+        while thread.feelings.contains_key(&anger_key) {
             says(&mut thread, Some(&ana), seq, CALM).await;
             seq += 1;
         }
@@ -5016,7 +5765,7 @@ mod tests {
         let mut thread = ThreadCognitionState::default();
         says(&mut thread, Some(&juan), 1, ANGRY).await;
         says(&mut thread, None, 2, ANGRY).await;
-        assert_eq!(thread.episodes.len(), 1);
+        assert_eq!(thread.feelings.len(), 1);
         assert_eq!(feeling(&thread, "ilk:juan", "anger").weight, 2.0);
     }
 
@@ -5026,9 +5775,9 @@ mod tests {
         context: &str,
         weight: f64,
         felt: &str,
-    ) -> EpisodeState {
-        EpisodeState {
-            episode_id: format!("episode:{owner}:{affect}:{context}"),
+    ) -> FeelingState {
+        FeelingState {
+            feeling_id: format!("feeling:{owner}:{affect}:{context}"),
             owner: person(owner, owner.trim_start_matches("ilk:")),
             affect_id: affect.to_string(),
             context_id: format!("context:{context}"),
@@ -5066,18 +5815,18 @@ mod tests {
                 1.0 + f64::from(index),
                 "2026-01-01T00:00:00Z",
             );
-            thread.episodes.insert(feeling.episode_id.clone(), feeling);
+            thread.feelings.insert(feeling.feeling_id.clone(), feeling);
         }
         let older = feeling_state("ilk:tie", "urgency", "access", 13.5, "2026-01-01T00:00:00Z");
         let newer = feeling_state("ilk:tie", "anger", "access", 13.5, "2026-01-02T00:00:00Z");
         for feeling in [older, newer] {
-            thread.episodes.insert(feeling.episode_id.clone(), feeling);
+            thread.feelings.insert(feeling.feeling_id.clone(), feeling);
         }
 
-        let package = build_memory_package_for_thread(TEST_THREAD, &thread);
+        let package = build_memory_package_for_thread(TEST_THREAD, &thread, (Vec::new(), 0));
         assert_eq!(package.package_version, MEMORY_PACKAGE_VERSION);
-        assert_eq!(package.episodes.len(), COGNITION_PACKAGE_MAX_FEELINGS);
-        let first = &package.episodes[0];
+        assert_eq!(package.feelings.len(), COGNITION_PACKAGE_MAX_FEELINGS);
+        let first = &package.feelings[0];
         assert_eq!(first.owner.ilk.as_deref(), Some("ilk:p13"));
         assert_eq!(first.weight, 14.0);
         assert_eq!(first.level, "strong");
@@ -5087,8 +5836,8 @@ mod tests {
         );
         assert_eq!(
             (
-                package.episodes[1].affect.as_str(),
-                package.episodes[2].affect.as_str()
+                package.feelings[1].affect.as_str(),
+                package.feelings[2].affect.as_str()
             ),
             ("anger", "urgency"),
             "on a tie, the most recently felt first"
@@ -5097,7 +5846,7 @@ mod tests {
             package
                 .truncated
                 .as_ref()
-                .map(|truncated| truncated.dropped_episodes),
+                .map(|truncated| truncated.dropped_feelings),
             Some(4)
         );
     }
@@ -5357,6 +6106,7 @@ mod tests {
             agent_ilks: Mutex::new(HashMap::from([(TEST_AGENT_NODE.to_string(), agent)])),
             usage: UsageRecorder::disabled(),
             stream_seen: Mutex::new(HashMap::new()),
+            episodes: std::sync::Mutex::new(episodes::EpisodeBook::default()),
         });
         (app_state, router)
     }
@@ -5531,6 +6281,434 @@ mod tests {
         unlink();
     }
 
+    /// The folders cognition kept before its file go when empty; one with anything in it stays.
+    #[test]
+    fn the_old_empty_folders_go_and_one_with_anything_stays() {
+        let dir = TestDir::new();
+        std::fs::create_dir_all(dir.0.join("cache")).expect("cache");
+        std::fs::create_dir_all(dir.0.join("shm")).expect("shm");
+        std::fs::write(dir.0.join("shm").join("left"), b"x").expect("a file");
+        remove_empty_old_folders(&dir.0);
+        assert!(!dir.0.join("cache").exists());
+        assert!(dir.0.join("shm").join("left").exists());
+    }
+
+    /// A `STREAM_BATCH` as `turns_batch`, its records copied for `producer`.
+    fn batch_of(hive_id: &str, producer: &str, records: &[(u64, u64, &Message)]) -> Message {
+        let mut batch = turns_batch(hive_id, records);
+        let mut payload: StreamBatch =
+            serde_json::from_value(batch.payload.clone()).expect("batch");
+        for record in &mut payload.records {
+            record.producer = producer.to_string();
+        }
+        batch.payload = serde_json::to_value(payload).expect("batch");
+        batch
+    }
+
+    /// What a WF relays from one person to another on `TEST_THREAD`: a forward to the other's IO
+    /// node, which keeps its writer.
+    fn relayed(writer_ilk: &str, content: &str) -> Message {
+        let mut message = turn_copy(RELAY_WF, Some(writer_ilk), text(content));
+        message.routing.dst = Destination::Unicast("IO.slack.team@motherbee".to_string());
+        message.meta.context = Some(json!({"writer": {"ilk": writer_ilk}}));
+        message
+    }
+
+    const RELAY_WF: &str = "WF.soporte@motherbee";
+
+    /// The people's part of a handover (docs/cognition-hands-v1.md §12.4): what a WF relays between
+    /// people on the thread joins the communication of the agent that served it here, each line
+    /// naming its writer; and a message copied for the agent and relayed to a person too is one
+    /// turn, analyzed once.
+    #[tokio::test]
+    async fn a_relay_between_people_joins_the_agents_communication_once() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogrelay");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+
+        let answer = agent_says("A person of the team takes your case.");
+        let batch = turns_batch(&hive_id, &[(1, TEST_TS, &answer)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let mut forwarded = answer.clone();
+        forwarded.routing.src_l2_name = Some(RELAY_WF.to_string());
+        forwarded.routing.dst = Destination::Unicast("IO.api@motherbee".to_string());
+        let juan = relayed("ilk:juan", "Hi Ana, I am issuing the credit note now.");
+        let batch = batch_of(
+            &hive_id,
+            RELAY_WF,
+            &[
+                (2, TEST_TS + 1_000, &forwarded),
+                (3, TEST_TS + 2_000, &juan),
+            ],
+        );
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+
+        let first = turn_rx.try_recv().expect("the agent's answer");
+        assert!(!first.relay && !first.duplicate);
+        let again = turn_rx
+            .try_recv()
+            .expect("the answer, relayed to the person");
+        assert!(again.relay && again.duplicate, "one message is one turn");
+        let juans = turn_rx.try_recv().expect("Juan's message");
+        assert!(juans.relay && !juans.duplicate);
+        assert_eq!(
+            juans.holder.as_ref().map(Holder::agent_node),
+            Some(TEST_AGENT_NODE)
+        );
+
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!(
+            texts(&package.turns),
+            [
+                "A person of the team takes your case.",
+                "Hi Ana, I am issuing the credit note now."
+            ]
+        );
+        assert_eq!(package.turns[1].direction, MemoryTurnDirection::In);
+        assert_eq!(
+            package.turns[1]
+                .writer
+                .as_ref()
+                .and_then(|writer| writer.ilk.as_deref()),
+            Some("ilk:juan")
+        );
+        assert_eq!(
+            app_state
+                .runtime_state
+                .lock()
+                .await
+                .duplicate_turns_skipped_total,
+            1
+        );
+        unlink();
+    }
+
+    /// A WF that sends one message to the agent and to a person in one cycle puts both copies in one
+    /// batch, in either order: the relay is the agent's turn once, analyzed once, and makes no
+    /// communication with no agent (docs/cognition-hands-v1.md §12.4).
+    #[tokio::test]
+    async fn one_message_a_wf_sends_an_agent_and_a_person_is_one_turn() {
+        for relay_first in [true, false] {
+            let dir = TestDir::new();
+            let (hive_id, region, unlink) = test_region("cogboth");
+            let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+            let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+
+            let mut to_agent = person_says("Hi, my invoice 123 was charged twice.");
+            to_agent.routing.src_l2_name = Some(RELAY_WF.to_string());
+            let mut to_person = to_agent.clone();
+            to_person.routing.dst = Destination::Unicast("IO.slack.team@motherbee".to_string());
+            let (first, second) = if relay_first {
+                (&to_person, &to_agent)
+            } else {
+                (&to_agent, &to_person)
+            };
+            let mut batch = turns_batch(&hive_id, &[(1, TEST_TS, first), (2, TEST_TS, second)]);
+            let mut payload: StreamBatch =
+                serde_json::from_value(batch.payload.clone()).expect("batch");
+            payload.records[usize::from(!relay_first)].producer = RELAY_WF.to_string();
+            batch.payload = serde_json::to_value(payload).expect("batch");
+            take_stream_batch(&app_state, &turn_tx, &batch).await;
+            next_outgoing(&mut router).await;
+
+            let mut queued = [
+                turn_rx.try_recv().expect("a copy"),
+                turn_rx.try_recv().expect("the other copy"),
+            ];
+            queued.sort_by_key(|turn| turn.relay);
+            let [agents, relay] = queued;
+            assert!(
+                !agents.relay && !agents.duplicate,
+                "relay first: {relay_first}"
+            );
+            assert!(relay.relay && relay.duplicate, "relay first: {relay_first}");
+            assert_eq!(
+                relay.holder.as_ref().map(Holder::agent_node),
+                Some(TEST_AGENT_NODE)
+            );
+            let no_agent = CommunicationKey {
+                thread_id: TEST_THREAD.to_string(),
+                agent_ilk: NO_AGENT_ILK.to_string(),
+            };
+            assert!(app_state.store.load(&no_agent).expect("read").is_none());
+            let package = region_package(&app_state)
+                .await
+                .expect("the agent's package");
+            assert_eq!(
+                texts(&package.turns),
+                ["Hi, my invoice 123 was charged twice."]
+            );
+            unlink();
+        }
+    }
+
+    /// The agent's own answer that a WF relays in a later cycle, under that cycle's trace, is the
+    /// answer its communication holds, not a second turn (docs/cognition-hands-v1.md §12.4).
+    #[tokio::test]
+    async fn the_agents_answer_relayed_in_a_later_cycle_is_not_a_second_turn() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogecho");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+
+        let answer = agent_says("Your credit note is approved.");
+        let batch = turns_batch(&hive_id, &[(1, TEST_TS, &answer)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        // A supervisor approved it, and the WF sends it on in another cycle: another trace.
+        let mut later = answer.clone();
+        later.routing.trace_id = Uuid::new_v4().to_string();
+        later.routing.src_l2_name = Some(RELAY_WF.to_string());
+        later.routing.dst = Destination::Unicast("IO.api@motherbee".to_string());
+        later.meta.context = Some(json!({"writer": {"ilk": TEST_AGENT}}));
+        let batch = batch_of(&hive_id, RELAY_WF, &[(2, TEST_TS + 60_000, &later)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+
+        assert!(!turn_rx.try_recv().expect("the answer").duplicate);
+        assert!(turn_rx.try_recv().expect("its relay").duplicate);
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!(texts(&package.turns), ["Your credit note is approved."]);
+        unlink();
+    }
+
+    /// A conversation's people are all those its turns name, however many: the news of each reaches
+    /// its package (docs/cognition-hands-v1.md §12.4). An episode is about four at most.
+    #[test]
+    fn a_conversations_people_are_all_it_names() {
+        let mut state = ThreadCognitionState::default();
+        for n in 1..=6 {
+            let ilk = format!("ilk:p{n}");
+            state.turns.push(MemoryTurn {
+                direction: MemoryTurnDirection::In,
+                src_ilk: Some(ilk.clone()),
+                via: None,
+                writer: Some(MemoryTurnParty {
+                    ilk: Some(ilk),
+                    name: None,
+                    kind: Some("person".to_string()),
+                }),
+                to: None,
+                text: format!("turn {n}"),
+                attachments: 0,
+                choice: None,
+                ts: "2026-10-30T12:00:00.000Z".to_string(),
+            });
+        }
+        assert_eq!(people_of_conversation(&state, TEST_AGENT).len(), 6);
+        assert_eq!(
+            episodes::people_of(["ilk:a", "ilk:b", "ilk:c", "ilk:d", "ilk:e"]).len(),
+            4
+        );
+    }
+
+    /// A relay on a thread no agent served on this hive (docs/cognition-hands-v1.md §12.4): its
+    /// turns make the communication with no agent, which the file keeps and the region leaves out,
+    /// and each turn's writer pays.
+    #[tokio::test]
+    async fn a_relay_on_a_thread_with_no_agent_is_its_writers_to_pay() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogpeers");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+
+        let mut juan = relayed("ilk:juan", "Pedro, the note is out.");
+        juan.meta.thread_id = Some("thread:people".to_string());
+        let batch = batch_of(&hive_id, RELAY_WF, &[(1, TEST_TS, &juan)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let queued = turn_rx.try_recv().expect("the turn");
+        assert!(matches!(queued.holder, Some(Holder::NoAgent)));
+
+        let no_agent = CommunicationKey {
+            thread_id: "thread:people".to_string(),
+            agent_ilk: NO_AGENT_ILK.to_string(),
+        };
+        let stored = app_state
+            .store
+            .load(&no_agent)
+            .expect("read")
+            .expect("in the file");
+        assert_eq!(texts(&stored.turns), ["Pedro, the note is out."]);
+        let snapshot = app_state
+            .memory_region
+            .lock()
+            .await
+            .as_ref()
+            .expect("a region")
+            .read_snapshot()
+            .expect("snapshot");
+        assert!(snapshot
+            .threads
+            .iter()
+            .all(|entry| entry.thread_id != "thread:people"));
+        assert_eq!(
+            app_state
+                .runtime_state
+                .lock()
+                .await
+                .shm_pruned_threads_total,
+            0,
+            "a communication with no agent is not pruned from the region"
+        );
+
+        let payer = payer_of(&hive_id, &Holder::NoAgent, &juan).expect("a payer");
+        assert_eq!(payer.source, TenantSource::Writer);
+        assert_eq!(payer.ilk, "ilk:juan");
+        unlink();
+    }
+
+    fn credit_note_episode() -> episodes::EpisodeProposal {
+        episodes::EpisodeProposal {
+            lens: "friction".to_string(),
+            title: "Argument over the credit note".to_string(),
+            summary: "The person and Juan argued over the credit note's delay. It is pending."
+                .to_string(),
+            state: "pending".to_string(),
+            base_intensity: 8.0,
+            novelty: 0.0,
+            evidence_signals: strings(&["escalation"]),
+            evidence_strength: 9.0,
+            evidence_contexts: strings(&["credit note"]),
+        }
+    }
+
+    /// An episode the narrator proposes (docs/cognition-hands-v1.md §12.4): through the gate, it is
+    /// kept in memory and in the file, sent to every hive's cognition, and in the package of each
+    /// conversation of its people. One the gate refuses goes nowhere.
+    #[tokio::test]
+    async fn an_episode_through_the_gate_is_kept_sent_and_in_the_package() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogepisode");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let (turn_tx, _turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        let question = person_says("Where is my credit note?");
+        let batch = turns_batch(&hive_id, &[(1, TEST_TS, &question)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+
+        let people = strings(&["ilk:person", "ilk:juan"]);
+        publish_episode(
+            &app_state,
+            &credit_note_episode(),
+            &strings(&["refunds"]),
+            people.clone(),
+            TEST_THREAD,
+        )
+        .await;
+        assert_eq!(
+            app_state
+                .runtime_state
+                .lock()
+                .await
+                .episodes_gated_out_total,
+            1
+        );
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "a refused episode goes nowhere"
+        );
+
+        let leading = strings(&["credit note", "billing"]);
+        publish_episode(
+            &app_state,
+            &credit_note_episode(),
+            &leading,
+            people,
+            TEST_THREAD,
+        )
+        .await;
+        let sent = next_outgoing(&mut router).await;
+        assert!(matches!(sent.routing.dst, Destination::Broadcast));
+        assert_eq!(
+            sent.meta.msg.as_deref(),
+            Some(episodes::MSG_COGNITION_EPISODE)
+        );
+        assert_eq!(sent.meta.target.as_deref(), Some("SY.cognition@*"));
+        let episode: episodes::Episode = serde_json::from_value(sent.payload).expect("an episode");
+        assert_eq!(episode.intensity, 8.0);
+        assert_eq!(episode.people, ["ilk:person", "ilk:juan"]);
+        assert_eq!(
+            app_state.store.live_episodes(0).expect("read"),
+            std::slice::from_ref(&episode)
+        );
+
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!(package.news.len(), 1);
+        assert_eq!(package.news[0].episode_id, episode.episode_id);
+        assert_eq!(package.news[0].state, "pending");
+        let state = app_state.runtime_state.lock().await.clone();
+        assert_eq!(
+            (state.episodes_made_total, state.episodes_live_total),
+            (1, 1)
+        );
+        unlink();
+    }
+
+    /// An episode another hive's cognition sent (docs/cognition-hands-v1.md §12.4) is taken once,
+    /// and only from a cognition; after a restart it comes back from the file.
+    #[tokio::test]
+    async fn an_episode_is_taken_once_and_only_from_a_cognition() {
+        let dir = TestDir::new();
+        let episode = episodes::episode_of(
+            "episode:from-worker2".to_string(),
+            &credit_note_episode(),
+            8.0,
+            now_epoch_ms_i64(),
+            strings(&["ilk:person", "ilk:juan"]),
+            episodes::EpisodeOrigin {
+                thread_id: "thread:elsewhere".to_string(),
+                node: "SY.cognition@worker2".to_string(),
+            },
+        );
+        let from = |name: &str| Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(name.to_string()),
+                dst: Destination::Broadcast,
+                ttl: 15,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(episodes::MSG_COGNITION_EPISODE.to_string()),
+                target: Some(episodes::EPISODE_BROADCAST_TARGET.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::to_value(&episode).expect("episode"),
+        };
+        {
+            let (app_state, _router) = test_app_state("cogtake", None, &dir.0);
+            take_episode(&app_state, &from("SY.cognition@worker2")).await;
+            take_episode(&app_state, &from("SY.cognition@worker2")).await;
+            take_episode(&app_state, &from("AI.mallory@worker1")).await;
+            let state = app_state.runtime_state.lock().await.clone();
+            assert_eq!(
+                (
+                    state.episodes_received_total,
+                    state.episodes_refused_total,
+                    state.episodes_live_total
+                ),
+                (1, 1, 1)
+            );
+        }
+        let (again, _router) = test_app_state("cogtake", None, &dir.0);
+        load_live_episodes(&again).await;
+        assert_eq!(again.runtime_state.lock().await.episodes_live_total, 1);
+    }
+
     /// A host reboot empties the memory region. The file keeps the communications, and the start
     /// writes the most recent back into the region before the first batch, so the agent's first
     /// message after the reboot carries its memory (docs/cognition-hands-v1.md §11.3).
@@ -5638,7 +6816,7 @@ mod tests {
             let mut message = supervisor_says("said");
             message.meta.src_ilk = Some("ilk:ana".to_string());
             message.meta.context.as_mut().expect("context")["writer"] = writer;
-            recent_turn_of(&message, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, known)
+            recent_turn_of(&message, TEST_AGENT_NODE, TEST_AGENT, 0, TEST_TS, known)
                 .expect("a turn")
                 .turn
         };
@@ -5670,6 +6848,7 @@ mod tests {
             &person_says("hi"),
             TEST_AGENT_NODE,
             TEST_AGENT,
+            0,
             TEST_TS,
             known,
         )
@@ -5679,7 +6858,7 @@ mod tests {
 
         let mut answer = agent_says("Your credit note is on its way");
         answer.meta.dst_ilk = Some("ilk:ana".to_string());
-        let answer = recent_turn_of(&answer, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, known)
+        let answer = recent_turn_of(&answer, TEST_AGENT_NODE, TEST_AGENT, 0, TEST_TS, known)
             .expect("a turn")
             .turn;
         assert_eq!(answer.writer, None);
@@ -5834,7 +7013,9 @@ mod tests {
             Some("ilk:person"),
             json!({"type": "event", "name": "typing"}),
         );
-        assert!(recent_turn_of(&no_text, TEST_AGENT_NODE, TEST_AGENT, TEST_TS, no_facts).is_none());
+        assert!(
+            recent_turn_of(&no_text, TEST_AGENT_NODE, TEST_AGENT, 0, TEST_TS, no_facts).is_none()
+        );
     }
 
     /// Text of more bytes a character keeps fewer turns: they stay under the bytes a package may
@@ -5882,19 +7063,27 @@ mod tests {
             &mut threads,
             &store,
             vec![
-                recent_turn_of(&to_sales, TEST_AGENT_NODE, "ilk:sales", TEST_TS, no_facts)
-                    .expect("a turn"),
+                recent_turn_of(
+                    &to_sales,
+                    TEST_AGENT_NODE,
+                    "ilk:sales",
+                    0,
+                    TEST_TS,
+                    no_facts,
+                )
+                .expect("a turn"),
                 recent_turn_of(
                     &to_invoice,
                     "AI.invoice@motherbee",
                     "ilk:invoice",
+                    0,
                     TEST_TS,
                     no_facts,
                 )
                 .expect("a turn"),
             ],
         );
-        let hot_set = build_memory_hot_set_snapshot(&threads, &[]).expect("hot set");
+        let hot_set = build_memory_hot_set_snapshot(&threads, &[], &no_news).expect("hot set");
         assert_eq!(hot_set.snapshot.threads.len(), 2);
         for (node, agent_ilk, said) in [
             (TEST_AGENT_NODE, "ilk:sales", "I want 10 Pro licenses"),
@@ -6082,6 +7271,7 @@ mod tests {
             &agent_says(""),
             TEST_AGENT_NODE,
             TEST_AGENT,
+            0,
             TEST_TS,
             no_facts
         )

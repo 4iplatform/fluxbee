@@ -28,6 +28,9 @@ pub enum TenantSource {
     Node,
     /// SY.cognition pays with the communication's agent's tenant.
     Agent,
+    /// SY.cognition pays with the tenant of the turn's writer, in a communication with no agent
+    /// (docs/cognition-hands-v1.md §12.4).
+    Writer,
     /// SY.frontdesk.gov pays with the case's tenant.
     Case,
     /// SY.architect and SY.admin's executor pay with the root tenant.
@@ -41,6 +44,7 @@ impl TenantSource {
         match self {
             Self::Node => "node",
             Self::Agent => "agent",
+            Self::Writer => "writer",
             Self::Case => "case",
             Self::Root => "root",
             Self::FallbackRoot => "fallback_root",

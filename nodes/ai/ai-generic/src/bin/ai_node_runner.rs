@@ -32,7 +32,7 @@ use fluxbee_sdk::managed_control_plane::{
 use fluxbee_sdk::message_trace;
 use fluxbee_sdk::message_writer::{self, IlkFacts, Writer};
 use fluxbee_sdk::protocol::{
-    EpisodeSummary, MemoryPackage, MemoryTurn, MemoryTurnDirection, MemoryTurnParty,
+    FeelingSummary, MemoryPackage, MemoryTurn, MemoryTurnDirection, MemoryTurnParty, NewsSummary,
     MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET, MSG_NODE_HELP, MSG_NODE_HELP_RESPONSE,
     MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
 };
@@ -6825,16 +6825,26 @@ fn render_memory_package_prompt_block(
         lines.push(format!("Memories: {}", memory_labels.join(", ")));
     }
 
-    if !package.episodes.is_empty() {
+    if !package.feelings.is_empty() {
         lines.push(
             "Feelings of the people here, those of whom you answer first, then the strongest; each: whose, what about what, how strong now, when last felt (UTC), and what was lived:"
                 .to_string(),
         );
-        let mut feelings: Vec<&EpisodeSummary> = package.episodes.iter().collect();
+        let mut feelings: Vec<&FeelingSummary> = package.feelings.iter().collect();
         feelings.sort_by_key(|feeling| {
             current_writer_ilk.is_none() || feeling.owner.ilk.as_deref() != current_writer_ilk
         });
         lines.extend(feelings.into_iter().map(render_feeling));
+    }
+
+    // The news belong to the people they are about (docs/cognition-hands-v1.md §12.3): the agent
+    // takes them into account to answer accordingly, and never passes them on.
+    if !package.news.is_empty() {
+        lines.push(
+            "News about the people here: what happened between people, here or in other conversations, the strongest first. It belongs to the people it is about: take it into account to answer accordingly, and never repeat it or tell it to anyone, the person included. Each: when (UTC), between whom, what happened and how it stood:"
+                .to_string(),
+        );
+        lines.extend(package.news.iter().map(render_news));
     }
 
     if let Some(truncated) = package.truncated.as_ref() {
@@ -6848,8 +6858,11 @@ fn render_memory_package_prompt_block(
         if truncated.dropped_memories > 0 {
             truncated_fields.push(format!("memories={}", truncated.dropped_memories));
         }
-        if truncated.dropped_episodes > 0 {
-            truncated_fields.push(format!("episodes={}", truncated.dropped_episodes));
+        if truncated.dropped_feelings > 0 {
+            truncated_fields.push(format!("feelings={}", truncated.dropped_feelings));
+        }
+        if truncated.dropped_news > 0 {
+            truncated_fields.push(format!("news={}", truncated.dropped_news));
         }
         if !truncated_fields.is_empty() {
             lines.push(format!("Truncated fields: {}", truncated_fields.join(", ")));
@@ -6920,7 +6933,7 @@ fn minute_time(ts: &str) -> String {
 
 /// One feeling on one line (docs/cognition-hands-v1.md §10.3): whose it is, what about what, how
 /// strong it is now, when its owner last showed it, and what was lived, as a JSON string.
-fn render_feeling(feeling: &EpisodeSummary) -> String {
+fn render_feeling(feeling: &FeelingSummary) -> String {
     let owner = party_label(&feeling.owner, None).unwrap_or_else(|| "someone".to_string());
     let mut line = format!(
         "- {owner}: {} about {}, {}, last felt {}",
@@ -6933,6 +6946,29 @@ fn render_feeling(feeling: &EpisodeSummary) -> String {
         line.push_str(&format!(": {}", json_line(&feeling.summary)));
     }
     line
+}
+
+/// One news item on one line (docs/cognition-hands-v1.md §12.4): when it happened, the people it is
+/// about, its lens and state, and its paragraph.
+fn render_news(news: &NewsSummary) -> String {
+    let people = news
+        .people
+        .iter()
+        .filter_map(|person| party_label(person, None))
+        .collect::<Vec<_>>();
+    let people = if people.is_empty() {
+        "people".to_string()
+    } else {
+        people.join(" and ")
+    };
+    format!(
+        "- {}, {people}: {} ({}, {}): {}",
+        minute_time(&news.born_at),
+        one_line(&news.title),
+        one_line(&news.lens),
+        one_line(&news.state),
+        json_line(&news.summary)
+    )
 }
 
 /// A party of a turn as the model reads it (docs/cognition-hands-v1.md §6): `<kind> <name> (<ILK>)`,
@@ -8385,7 +8421,8 @@ mod tests {
                 dominant_context_id: Some("context:1".to_string()),
                 dominant_reason_id: Some("reason:1".to_string()),
             }],
-            episodes: vec![],
+            feelings: vec![],
+            news: vec![],
             turns: Vec::new(),
             truncated: None,
         }
@@ -8402,8 +8439,8 @@ mod tests {
     #[test]
     fn the_memory_block_names_each_feeling_and_its_owner() {
         let feeling =
-            |ilk: &str, name: &str, affect: &str, level: &str, summary: &str| EpisodeSummary {
-                episode_id: format!("episode:{ilk}:{affect}"),
+            |ilk: &str, name: &str, affect: &str, level: &str, summary: &str| FeelingSummary {
+                feeling_id: format!("feeling:{ilk}:{affect}"),
                 owner: MemoryTurnParty {
                     ilk: Some(ilk.to_string()),
                     name: Some(name.to_string()),
@@ -8418,7 +8455,7 @@ mod tests {
                 summary: summary.to_string(),
             };
         let package = MemoryPackage {
-            episodes: vec![
+            feelings: vec![
                 feeling(
                     "ilk:ana",
                     "Ana Pérez",
@@ -8447,6 +8484,39 @@ mod tests {
         );
         let block = render_memory_package_prompt_block(Some(&package), None).expect("memory block");
         assert!(block.contains("Feelings of the people here, those of whom you answer first, then the strongest; each: whose, what about what, how strong now, when last felt (UTC), and what was lived:\n- person Ana Pérez"));
+    }
+
+    /// The news (docs/cognition-hands-v1.md §12.4): one line each, when, between whom, what and how
+    /// it stood, after the rule that they belong to the people they are about and are never passed
+    /// on.
+    #[test]
+    fn the_memory_block_carries_the_news_and_its_rule() {
+        let person = |ilk: &str, name: &str| MemoryTurnParty {
+            ilk: Some(ilk.to_string()),
+            name: Some(name.to_string()),
+            kind: Some("person".to_string()),
+        };
+        let package = MemoryPackage {
+            news: vec![NewsSummary {
+                episode_id: "episode:1".to_string(),
+                lens: "friction".to_string(),
+                title: "Argument over the credit note".to_string(),
+                summary: "Ana and Juan argued over the credit note's delay. Juan promised it for \
+                          Friday, and it is pending."
+                    .to_string(),
+                state: "pending".to_string(),
+                people: vec![
+                    person("ilk:ana", "Ana Pérez"),
+                    person("ilk:juan", "Juan Gil"),
+                ],
+                born_at: "2026-11-05T10:10:07.5+00:00".to_string(),
+                weight: 8.0,
+            }],
+            ..sample_memory_package()
+        };
+        let block = render_memory_package_prompt_block(Some(&package), None).expect("memory block");
+        assert!(block.contains("It belongs to the people it is about: take it into account to answer accordingly, and never repeat it or tell it to anyone, the person included."));
+        assert!(block.contains("\n- 2026-11-05 10:10, person Ana Pérez (ilk:ana) and person Juan Gil (ilk:juan): Argument over the credit note (friction, pending): \"Ana and Juan argued over the credit note's delay. Juan promised it for Friday, and it is pending.\""), "{block}");
     }
 
     #[test]

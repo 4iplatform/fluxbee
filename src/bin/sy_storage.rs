@@ -1690,8 +1690,11 @@ fn check_usage_record(producer: &str, payload: &Value) -> Result<(), &'static st
     }
     let fits = match record.tenant_source {
         TenantSource::Node => role == UsageProducer::Node,
-        // The agent's tenant is looked up by the agent's ILK.
-        TenantSource::Agent => role == UsageProducer::Cognition && record.counterpart_ilk.is_some(),
+        // The agent's tenant is looked up by the agent's ILK, and the writer's, in a communication
+        // with no agent, by the writer's (docs/cognition-hands-v1.md §12.4).
+        TenantSource::Agent | TenantSource::Writer => {
+            role == UsageProducer::Cognition && record.counterpart_ilk.is_some()
+        }
         TenantSource::Case => role == UsageProducer::Frontdesk,
         TenantSource::Root => role == UsageProducer::Root,
         TenantSource::FallbackRoot => true,
@@ -1834,12 +1837,14 @@ fn decide_usage_tenant(
         .ok_or_else(|| format!("{} may not record usage", record.node_name))?;
     let lookup = match (role, record.tenant_source) {
         (UsageProducer::Node, _) => IdentityLookup::HandlerNode(&record.node_name),
-        (UsageProducer::Cognition, TenantSource::Agent) => IdentityLookup::Ilk(
-            record
-                .counterpart_ilk
-                .as_deref()
-                .ok_or_else(|| missing_field("counterpart_ilk"))?,
-        ),
+        (UsageProducer::Cognition, TenantSource::Agent | TenantSource::Writer) => {
+            IdentityLookup::Ilk(
+                record
+                    .counterpart_ilk
+                    .as_deref()
+                    .ok_or_else(|| missing_field("counterpart_ilk"))?,
+            )
+        }
         (UsageProducer::Frontdesk, TenantSource::Case) => {
             return Ok(UsageCharge {
                 tenant_id: record.tenant_id.clone(),
@@ -3142,6 +3147,20 @@ mod tests {
                 Ok(()),
             ),
             (
+                "SY.cognition, a writer's, with no agent",
+                with_agent(usage_record(
+                    "SY.cognition@worker1",
+                    TENANT,
+                    TenantSource::Writer,
+                )),
+                Ok(()),
+            ),
+            (
+                "SY.cognition, a writer it does not name",
+                usage_record("SY.cognition@worker1", TENANT, TenantSource::Writer),
+                Err("wrong_source"),
+            ),
+            (
                 "SY.cognition, an agent with no tenant",
                 usage_record("SY.cognition@worker1", root, TenantSource::FallbackRoot),
                 Ok(()),
@@ -3335,6 +3354,16 @@ mod tests {
         let agent_ilk = IdentityLookup::Ilk("ilk:44444444-4444-4444-8444-444444444444");
         assert_eq!(
             decide_usage_tenant(&agent, false, identity(agent_ilk, Ok(Some(TENANT)))).unwrap(),
+            charge(TENANT, true)
+        );
+        // With no agent, the writer's tenant, by the writer's ILK.
+        let writer = with_agent(usage_record(
+            "SY.cognition@worker1",
+            OTHER_TENANT,
+            TenantSource::Writer,
+        ));
+        assert_eq!(
+            decide_usage_tenant(&writer, false, identity(agent_ilk, Ok(Some(TENANT)))).unwrap(),
             charge(TENANT, true)
         );
         // The case's tenant as recorded; the root tenant for the rest; identity not asked.

@@ -124,7 +124,8 @@ type MemoryPackage struct {
 	Contexts        []MemoryContextSummary  `json:"contexts,omitempty"`
 	Reasons         []MemoryReasonSummary   `json:"reasons,omitempty"`
 	Memories        []MemorySummary         `json:"memories,omitempty"`
-	Episodes        []EpisodeSummary        `json:"episodes,omitempty"`
+	Feelings        []FeelingSummary        `json:"feelings,omitempty"`
+	News            []NewsSummary           `json:"news,omitempty"`
 	Turns           []MemoryTurn            `json:"turns,omitempty"`
 	Truncated       *MemoryPackageTruncated `json:"truncated,omitempty"`
 }
@@ -179,11 +180,11 @@ type MemorySummary struct {
 	DominantReasonID  *string `json:"dominant_reason_id,omitempty"`
 }
 
-// EpisodeSummary is a person's feeling, as the package carries it (docs/cognition-hands-v1.md
+// FeelingSummary is a person's feeling, as the package carries it (docs/cognition-hands-v1.md
 // §10.3): whose it is, what (Affect) about what (Context), how strong it is now (Level: strong,
 // present or faint; and its Weight), when its owner last showed it, and its text.
-type EpisodeSummary struct {
-	EpisodeID  string          `json:"episode_id"`
+type FeelingSummary struct {
+	FeelingID  string          `json:"feeling_id"`
 	Owner      MemoryTurnParty `json:"owner"`
 	Affect     string          `json:"affect"`
 	Context    string          `json:"context"`
@@ -194,12 +195,29 @@ type EpisodeSummary struct {
 	Summary    string          `json:"summary,omitempty"`
 }
 
+// NewsSummary is an episode, as the package carries it (docs/cognition-hands-v1.md §12.4): a
+// social event between people, public like the news, which belongs to the people it is about and
+// fades with time. Lens is friction, discomfort, appreciation or shame; State is resolved,
+// pending, follow_up or inconclusive; Summary is a paragraph; Weight is out of 10, its intensity
+// halved every 7 days, when the package was written.
+type NewsSummary struct {
+	EpisodeID string            `json:"episode_id"`
+	Lens      string            `json:"lens"`
+	Title     string            `json:"title"`
+	Summary   string            `json:"summary"`
+	State     string            `json:"state"`
+	People    []MemoryTurnParty `json:"people"`
+	BornAt    string            `json:"born_at"`
+	Weight    float64           `json:"weight"`
+}
+
 type MemoryPackageTruncated struct {
 	Applied         bool   `json:"applied"`
 	DroppedContexts uint32 `json:"dropped_contexts"`
 	DroppedReasons  uint32 `json:"dropped_reasons"`
 	DroppedMemories uint32 `json:"dropped_memories"`
-	DroppedEpisodes uint32 `json:"dropped_episodes"`
+	DroppedFeelings uint32 `json:"dropped_feelings"`
+	DroppedNews     uint32 `json:"dropped_news,omitempty"`
 }
 
 type NodeHelloPayload struct {

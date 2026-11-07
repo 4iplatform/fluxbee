@@ -672,6 +672,11 @@ the ledger and the logbook.
     counted (`no_agent_ilk`);
   - `cognition.turns` goes only to `SY.cognition@<own hive>`, on the roles that run it (motherbee,
     worker), and is added to the stream's fixed sink list; no node may append it.
+  - **Since 0.1.104, a relay too** ([cognition-hands-v1](cognition-hands-v1.md) §12.4): a local WF
+    (`WF.*`) sends a message to an IO node, which is how it passes what one person says to
+    another. It is copied at entry, with the WF as `producer`, and cognition joins it to the
+    communication whose agent served the thread last on that hive, or to the thread's
+    communication with no agent (`copied_for_cognition_at_entry`).
   - The `storage.turns` copy (the message log, at entry, to SY.storage) does not change.
 - **The order (D18).** A communication's turns are all copied by its agent's router, so that
   router's stream orders them. Cognition numbers them with the communication's turn number

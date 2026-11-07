@@ -6,11 +6,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time;
 
+use crate::episodes::{EpisodeProposal, EPISODE_LENSES, EPISODE_STATES};
 use crate::CognitionSemanticTaggerConfig;
 
-/// The summaries are two or three sentences of JSON; the cap only bounds a runaway answer. A
-/// model that reasons spends part of it before it answers (A-69).
-const NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 1024;
+/// The summaries are a few sentences of JSON, an episode's paragraph among them; the cap only bounds
+/// a runaway answer. A model that reasons spends part of it before it answers (A-69).
+const NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS: u32 = 1536;
 
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummarizerAiInput<'a> {
@@ -30,31 +31,45 @@ pub(super) struct NarrativeSummarizerAiInput<'a> {
     pub(super) previous_memory_summary: Option<&'a str>,
     /// The affects the turn's moment shows, each with its feeling's title; the narrator writes one
     /// text for that moment. Empty when it shows none.
-    pub(super) episode_affects: Vec<&'a str>,
-    pub(super) episode_titles: Vec<&'a str>,
-    pub(super) previous_episode_summary: Option<&'a str>,
-    pub(super) previous_episode_reason: Option<&'a str>,
+    pub(super) feeling_affects: Vec<&'a str>,
+    pub(super) feeling_titles: Vec<&'a str>,
+    pub(super) previous_feeling_summary: Option<&'a str>,
+    pub(super) previous_feeling_reason: Option<&'a str>,
+    /// Whom the turn is to, as `speaker` names a party (docs/cognition-hands-v1.md §12.4); none
+    /// when no one else is known yet.
+    pub(super) counterpart: Option<&'a str>,
+    /// The communication's two leading contexts: an episode rests on one of them.
+    pub(super) leading_contexts: &'a [String],
+    /// How many live episodes of each lens the turn's people already have: what is habitual for
+    /// them makes no episode.
+    pub(super) episode_habits: &'a [(&'static str, u32)],
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawNarrativeSummaries {
     memory_summary: String,
     #[serde(default)]
-    episode_summary: Option<String>,
+    feeling_summary: Option<String>,
     #[serde(default)]
-    episode_reason: Option<String>,
+    feeling_reason: Option<String>,
+    /// Read apart (`episode_of_answer`): an episode that does not read is dropped, the memory kept.
+    #[serde(default)]
+    episode: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct NarrativeSummaries {
     pub(super) memory_summary: String,
-    /// Present exactly when the input carried an episode candidate: the parser rejects an
+    /// Present exactly when the input carried a feeling candidate: the parser rejects an
     /// answer that leaves it out, and drops one the input did not ask for.
-    pub(super) episode: Option<EpisodeNarrative>,
+    pub(super) feeling: Option<FeelingNarrative>,
+    /// The episode the narrator proposes, if any; the gate decides (docs/cognition-hands-v1.md
+    /// §12.4).
+    pub(super) episode: Option<EpisodeProposal>,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct EpisodeNarrative {
+pub(super) struct FeelingNarrative {
     pub(super) summary: String,
     pub(super) reason: String,
 }
@@ -64,7 +79,7 @@ pub(super) async fn run_narrative_summarizer_ai(
 ) -> Result<NarrativeSummaries, AiSdkError> {
     let request = LlmRequest {
         model: input.config.model.clone(),
-        system: Some(build_system_prompt(!input.episode_affects.is_empty())),
+        system: Some(build_system_prompt(!input.feeling_affects.is_empty())),
         input: build_user_prompt(&input),
         input_parts: None,
         max_output_tokens: Some(NARRATIVE_SUMMARIZER_MAX_OUTPUT_TOKENS),
@@ -95,23 +110,23 @@ pub(super) async fn run_narrative_summarizer_ai(
         ))
     })??;
 
-    parse_narrative_summaries(&response.content, !input.episode_affects.is_empty())
+    parse_narrative_summaries(&response.content, !input.feeling_affects.is_empty())
 }
 
-fn build_system_prompt(include_episode: bool) -> String {
-    let episode_rules = if include_episode {
-        "- episode_summary: 1-2 sentences describing the speaker's concrete moment of pressure or affect, naming the speaker; one text for all the affects the episode_candidate lists.\n\
-         - episode_reason: one short sentence explaining why this episode is being registered.\n"
+fn build_system_prompt(include_feeling: bool) -> String {
+    let feeling_rules = if include_feeling {
+        "- feeling_summary: 1-2 sentences describing the speaker's concrete moment of pressure or affect, naming the speaker; one text for all the affects the feeling_candidate lists.\n\
+         - feeling_reason: one short sentence explaining why this feeling is being registered.\n"
             .to_string()
     } else {
-        "- episode_summary: null.\n- episode_reason: null.\n".to_string()
+        "- feeling_summary: null.\n- feeling_reason: null.\n".to_string()
     };
     format!(
         concat!(
             "You are the internal narrative summarizer for SY.cognition.\n",
             "Return exactly one JSON object and nothing else.\n",
             "Schema:\n",
-            "{{\"memory_summary\":string,\"episode_summary\":string|null,\"episode_reason\":string|null}}\n",
+            "{{\"memory_summary\":string,\"feeling_summary\":string|null,\"feeling_reason\":string|null,\"episode\":null|{{\"lens\":string,\"title\":string,\"summary\":string,\"state\":string,\"base_intensity\":number,\"novelty\":number,\"evidence_signals\":[string],\"evidence_strength\":number,\"evidence_contexts\":[string]}}}}\n",
             "Rules:\n",
             "- memory_summary: concise narrative synthesis of recurring thread pattern, 1-2 sentences.\n",
             "- speaker is who spoke this turn. Name people as the speaker names them; when the thread has several people, the memory_summary says who said or sought what.\n",
@@ -119,10 +134,16 @@ fn build_system_prompt(include_episode: bool) -> String {
             "- use only the supplied evidence. Do not invent facts, names, or timeline details.\n",
             "- mention context and dominant reason naturally.\n",
             "- keep tone neutral, factual, and useful for future retrieval.\n",
-            "{episode_rules}",
+            "{feeling_rules}",
+            "- episode: null, or one social event between the people of this turn worth remembering, public like the news: what happened between speaker and counterpart, never what someone feels. Only for a break in the pattern: what is routine for these people is null (episode_habits counts the live episodes of each lens they already have). Conservative: when in doubt, null.\n",
+            "  - lens: one of {lenses}: friction is conflict or hostility that can harm the bond; discomfort is tension, uncertainty, delay or silence; appreciation is recognition or genuine thanks; shame is being judged, exposed or rejected.\n",
+            "  - title: a few words. summary: a paragraph of two to four sentences, impersonal: what happened, between whom (named as speaker and counterpart name them), and how it stood; no feelings, no private details.\n",
+            "  - state: one of {states}. base_intensity: 0-10. novelty: -2 to 2, how far it breaks the pattern. evidence_signals: the signals it rests on. evidence_strength: 0-10. evidence_contexts: the labels among leading_contexts it rests on.\n",
             "- no markdown, no code fences, no extra keys.\n"
         ),
-        episode_rules = episode_rules
+        feeling_rules = feeling_rules,
+        lenses = EPISODE_LENSES.join(", "),
+        states = EPISODE_STATES.join(", ")
     )
 }
 
@@ -141,20 +162,27 @@ fn build_user_prompt(input: &NarrativeSummarizerAiInput<'_>) -> String {
         },
         "previous": {
             "memory_summary": input.previous_memory_summary,
-            "episode_summary": input.previous_episode_summary,
-            "episode_reason": input.previous_episode_reason,
+            "feeling_summary": input.previous_feeling_summary,
+            "feeling_reason": input.previous_feeling_reason,
         },
-        "episode_candidate": {
-            "affects": input.episode_affects,
-            "titles": input.episode_titles,
-        }
+        "feeling_candidate": {
+            "affects": input.feeling_affects,
+            "titles": input.feeling_titles,
+        },
+        "counterpart": input.counterpart,
+        "leading_contexts": input.leading_contexts,
+        "episode_habits": input
+            .episode_habits
+            .iter()
+            .map(|(lens, count)| ((*lens).to_string(), json!(count)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
     });
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn parse_narrative_summaries(
     raw: &str,
-    expect_episode: bool,
+    expect_feeling: bool,
 ) -> Result<NarrativeSummaries, AiSdkError> {
     let json_slice = extract_json_object(raw).ok_or_else(|| {
         AiSdkError::Protocol("narrative summarizer response missing JSON object".into())
@@ -167,24 +195,40 @@ fn parse_narrative_summaries(
         ));
     }
 
-    if !expect_episode {
+    let episode = episode_of_answer(parsed.episode);
+    if !expect_feeling {
         return Ok(NarrativeSummaries {
             memory_summary,
-            episode: None,
+            feeling: None,
+            episode,
         });
     }
-    let summary = normalize_sentence(parsed.episode_summary.as_deref().unwrap_or_default());
-    let reason = normalize_sentence(parsed.episode_reason.as_deref().unwrap_or_default());
+    let summary = normalize_sentence(parsed.feeling_summary.as_deref().unwrap_or_default());
+    let reason = normalize_sentence(parsed.feeling_reason.as_deref().unwrap_or_default());
     if summary.is_empty() || reason.is_empty() {
         return Err(AiSdkError::Protocol(
-            "narrative summarizer returned incomplete episode narrative".into(),
+            "narrative summarizer returned incomplete feeling narrative".into(),
         ));
     }
 
     Ok(NarrativeSummaries {
         memory_summary,
-        episode: Some(EpisodeNarrative { summary, reason }),
+        feeling: Some(FeelingNarrative { summary, reason }),
+        episode,
     })
+}
+
+/// The episode an answer proposes: none for `null`, and none, with a warning, for one that does not
+/// read as an episode. The memory and the feeling stand either way.
+fn episode_of_answer(value: Option<serde_json::Value>) -> Option<EpisodeProposal> {
+    let value = value.filter(|value| !value.is_null())?;
+    match serde_json::from_value::<EpisodeProposal>(value) {
+        Ok(proposal) => Some(proposal),
+        Err(err) => {
+            tracing::warn!(error = %err, "sy.cognition narrator proposed an episode that does not read; it is dropped");
+            None
+        }
+    }
 }
 
 fn extract_json_object(raw: &str) -> Option<&str> {
@@ -219,11 +263,11 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct NarrativeCase {
         name: String,
-        expect_episode: bool,
+        expect_feeling: bool,
         raw_output: String,
         memory_summary_contains: Vec<String>,
-        episode_summary_contains: Vec<String>,
-        episode_reason_contains: Vec<String>,
+        feeling_summary_contains: Vec<String>,
+        feeling_reason_contains: Vec<String>,
     }
 
     fn load_golden_corpus() -> GoldenCorpus {
@@ -233,20 +277,94 @@ mod tests {
 
     #[test]
     fn parses_memory_only_narrative() {
-        let raw = r#"{"memory_summary":"Recurring billing friction with pressure for resolution.","episode_summary":null,"episode_reason":null}"#;
+        let raw = r#"{"memory_summary":"Recurring billing friction with pressure for resolution.","feeling_summary":null,"feeling_reason":null}"#;
         let parsed = parse_narrative_summaries(raw, false).expect("parse");
         assert_eq!(
             parsed.memory_summary,
             "Recurring billing friction with pressure for resolution."
         );
-        assert!(parsed.episode.is_none());
+        assert!(parsed.feeling.is_none());
     }
 
     #[test]
-    fn rejects_missing_episode_fields_when_episode_expected() {
-        let raw = r#"{"memory_summary":"Recurring billing friction.","episode_summary":"Pressure escalated.","episode_reason":null}"#;
+    fn rejects_missing_feeling_fields_when_feeling_expected() {
+        let raw = r#"{"memory_summary":"Recurring billing friction.","feeling_summary":"Pressure escalated.","feeling_reason":null}"#;
         let err = parse_narrative_summaries(raw, true).expect_err("should fail");
-        assert!(err.to_string().contains("incomplete episode narrative"));
+        assert!(err.to_string().contains("incomplete feeling narrative"));
+    }
+
+    /// An episode the narrator proposes comes back for the gate (docs/cognition-hands-v1.md
+    /// §12.4); `null` is none, and one that does not read is dropped with the memory kept.
+    #[test]
+    fn reads_the_episode_the_narrator_proposes() {
+        let raw = r#"{"memory_summary":"Ana and Juan on the credit note.","feeling_summary":null,"feeling_reason":null,"episode":{"lens":"friction","title":"Argument over the credit note","summary":"Ana and Juan argued over the delay. It is pending.","state":"pending","base_intensity":8,"novelty":1,"evidence_signals":["escalation"],"evidence_strength":9,"evidence_contexts":["credit note"]}}"#;
+        let episode = parse_narrative_summaries(raw, false)
+            .expect("parse")
+            .episode
+            .expect("an episode");
+        assert_eq!(episode.lens, "friction");
+        assert_eq!(episode.state, "pending");
+        assert_eq!(episode.base_intensity, 8.0);
+        assert_eq!(episode.evidence_contexts, ["credit note"]);
+
+        let none = r#"{"memory_summary":"Billing.","feeling_summary":null,"feeling_reason":null,"episode":null}"#;
+        assert!(parse_narrative_summaries(none, false)
+            .expect("parse")
+            .episode
+            .is_none());
+        let unreadable = r#"{"memory_summary":"Billing.","feeling_summary":null,"feeling_reason":null,"episode":{"lens":["friction"]}}"#;
+        let parsed = parse_narrative_summaries(unreadable, false).expect("the memory stands");
+        assert_eq!(parsed.memory_summary, "Billing.");
+        assert!(parsed.episode.is_none());
+    }
+
+    /// The narrator reads whom the turn is to, the leading contexts and the habits, and the
+    /// episode's rules name every lens and state.
+    #[test]
+    fn the_prompt_carries_what_an_episode_needs() {
+        let system = build_system_prompt(false);
+        for word in EPISODE_LENSES.iter().chain(EPISODE_STATES.iter()) {
+            assert!(system.contains(word), "{word}");
+        }
+        assert!(system.contains("never what someone feels"));
+        let account = AiAccount::charge(
+            fluxbee_ai_sdk::UsageRecorder::disabled(),
+            "SY.cognition@worker1",
+            None,
+            fluxbee_ai_sdk::TenantSource::Agent,
+        );
+        let config = crate::CognitionSemanticTaggerConfig::default();
+        let leading = vec!["credit note".to_string(), "billing".to_string()];
+        let habits = [
+            ("friction", 2u32),
+            ("discomfort", 0),
+            ("appreciation", 0),
+            ("shame", 0),
+        ];
+        let prompt = build_user_prompt(&NarrativeSummarizerAiInput {
+            api_key: "",
+            account: &account,
+            config: &config,
+            thread_id: "thread:1",
+            speaker: Some("person Ana (ilk:ana)"),
+            context_label: "credit note",
+            context_tags: &[],
+            reason_label: "complaint",
+            canonical_signals: &[],
+            extra_signals: &[],
+            previous_memory_summary: None,
+            feeling_affects: Vec::new(),
+            feeling_titles: Vec::new(),
+            previous_feeling_summary: None,
+            previous_feeling_reason: None,
+            counterpart: Some("person Juan (ilk:juan)"),
+            leading_contexts: &leading,
+            episode_habits: &habits,
+        });
+        let body: serde_json::Value = serde_json::from_str(&prompt).expect("json");
+        assert_eq!(body["counterpart"], "person Juan (ilk:juan)");
+        assert_eq!(body["leading_contexts"][0], "credit note");
+        assert_eq!(body["episode_habits"]["friction"], 2);
     }
 
     #[test]
@@ -254,7 +372,7 @@ mod tests {
         let corpus = load_golden_corpus();
         for case in corpus.narrative_cases {
             let parsed =
-                parse_narrative_summaries(&case.raw_output, case.expect_episode).expect("parse");
+                parse_narrative_summaries(&case.raw_output, case.expect_feeling).expect("parse");
             for expected in case.memory_summary_contains {
                 assert!(
                     parsed.memory_summary.contains(&expected),
@@ -263,24 +381,24 @@ mod tests {
                     expected
                 );
             }
-            for expected in case.episode_summary_contains {
+            for expected in case.feeling_summary_contains {
                 assert!(
                     parsed
-                        .episode
+                        .feeling
                         .as_ref()
-                        .is_some_and(|episode| episode.summary.contains(&expected)),
-                    "narrative case {} missing episode summary fragment {}",
+                        .is_some_and(|feeling| feeling.summary.contains(&expected)),
+                    "narrative case {} missing feeling summary fragment {}",
                     case.name,
                     expected
                 );
             }
-            for expected in case.episode_reason_contains {
+            for expected in case.feeling_reason_contains {
                 assert!(
                     parsed
-                        .episode
+                        .feeling
                         .as_ref()
-                        .is_some_and(|episode| episode.reason.contains(&expected)),
-                    "narrative case {} missing episode reason fragment {}",
+                        .is_some_and(|feeling| feeling.reason.contains(&expected)),
+                    "narrative case {} missing feeling reason fragment {}",
                     case.name,
                     expected
                 );

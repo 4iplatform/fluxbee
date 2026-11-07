@@ -287,7 +287,10 @@ a turn and that has a `thread_id`, it attaches the package it finds for `(thread
 `/jsr-memory-<hive>`, which SY.cognition writes (`deliver_locally`, `package_for`). A package the
 sender put is removed for every destination (`prepare_local_delivery`). The fields are
 `MemoryPackage {package_version, thread_id, dominant_context, dominant_reason, contexts, reasons,
-memories, episodes, truncated}` (`protocol.rs`); see [the cognition reference](cognition.md).
+memories, feelings, news, turns, truncated}` (`protocol.rs`), version 5; see [the cognition
+reference](cognition.md). The `news` are the episodes about the communication's people, which
+every hive's cognition gets as a system broadcast, `COGNITION_EPISODE` to `SY.cognition@*`, from
+the cognition that made each (cognition reference §4.1).
 
 ### 5.4 VPN and edge gates
 
