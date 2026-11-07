@@ -132,6 +132,12 @@ bash "$PUBLISH" --runtime io.api --version 9.9.10 --binary "$WORK/t2d-src/io-api
   --dist-root "$D2c" --set-current >/dev/null
 check "the hand publish is current" "$(q "$M2c" "d['runtimes']['io.api']['current']")" "9.9.10"
 check "the package version survives it" "$(q "$M2c" "d['runtimes']['io.api']['package_version']")" "$VER"
+mkdir -p "$WORK/t2d-other"; printf '#!/bin/sh\nfalse\n' >"$WORK/t2d-other/io-api"; chmod 0755 "$WORK/t2d-other/io-api"
+rc=0
+bash "$PUBLISH" --runtime io.api --version "$VER" --binary "$WORK/t2d-other/io-api" \
+  --dist-root "$D2c" --set-current >/dev/null 2>&1 || rc=$?
+check "a hand publish over the package's own version is refused" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+check "and its files stay the package's" "$(cmp -s "$WORK/t2d-other/io-api" "$D2c/runtimes/io.api/$VER/bin/io-api" && echo replaced || echo kept)" "kept"
 
 echo "== T3: steady state — manifest present, no snapshot =="
 D3="$WORK/t3"; seed_artifacts "$D3" "$VER"

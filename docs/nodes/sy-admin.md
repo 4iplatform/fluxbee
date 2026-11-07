@@ -139,7 +139,7 @@ caller and the action; a command with no stamped caller is refused too.
 | Caller | May ask for | Checked in |
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
-| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`) | `authorize_llm_usage_scope` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`, `reset_base_runtime`) | `authorize_llm_usage_scope` |
 | `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
@@ -159,9 +159,11 @@ caller and the action; a command with no stamped caller is refused too.
   warning for each one that gets none (`log_registry_caller_roles`).
 - **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
   `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
-- **Closed to the whole mesh,** Archi included: `cognition_clear` (`MeshAccess::Nobody`). The
-  operator asks for it on loopback, or Archi stages it in a plan the operator confirms and the
-  executor runs ([A hive's cognition](#a-hives-cognition-the-clear)).
+- **Closed to the whole mesh,** Archi included: `cognition_clear` and `reset_base_runtime`
+  (`MeshAccess::Nobody`). The operator asks for them on loopback, or Archi stages them in a plan
+  the operator confirms and the executor runs ([A hive's cognition](#a-hives-cognition-the-clear)).
+- **`remove_runtime_version` keeps a base runtime's `package_version`** (`RUNTIME_PACKAGE_VERSION`):
+  it is the way back with `reset_base_runtime` (FINDINGS A-122).
 - **SY.wf-rules@H's packages**, with only the fields its deploys and deletes send
   (`go/sy-wf-rules/node/admin.go`):
   - `publish_runtime_package` `{source: {kind, files}, set_current}`: only an inline package

@@ -362,10 +362,14 @@ def cmd_deploy(a):
     snapshot_all(a.snapshot, a.drop)
 
     print("== apt install fluxbee=%s on %s" % (v, PRIMARY))
+    # The seed's NOTE lines say which base runtime keeps a hand-published current (FINDINGS A-122).
     code, out, _ = vm_bash(hives()[PRIMARY], (
         "apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive "
-        "apt-get install -y -qq fluxbee=%s >/dev/null 2>&1; dpkg-query -W fluxbee" % v))
-    print("  " + out.strip())
+        "apt-get install -y -qq fluxbee=%s >/tmp/fluxbee-install.log 2>&1; "
+        "grep -h 'NOTE: base runtime' /tmp/fluxbee-install.log | sed 's/^ *//'; "
+        "dpkg-query -W fluxbee" % v))
+    for line in out.strip().splitlines():
+        print("  " + line)
     if code or v not in out:
         sys.exit("install failed")
 

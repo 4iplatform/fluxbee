@@ -334,8 +334,9 @@ struct AdminContext {
     publication_ledger_path: PathBuf,
     publication_lock: Arc<Mutex<()>>,
     /// Serializes the writers of the motherbee's runtime manifest (publish_runtime_package,
-    /// remove_runtime_version), held across their awaits: each reads, decides and rewrites the
-    /// whole file, and since every mesh command runs in its own task (A-68) two can overlap.
+    /// remove_runtime_version, reset_base_runtime), held across their awaits: each reads, decides
+    /// and rewrites the whole file, and since every mesh command runs in its own task (A-68) two
+    /// can overlap.
     runtime_manifest_lock: Arc<Mutex<()>>,
     /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
     command_log_lock: Arc<std::sync::Mutex<()>>,
@@ -14847,8 +14848,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "A base runtime is one the installed Fluxbee package brought. The package's seed records its version as package_version at every install, and list_runtimes and get_runtime show it. A current that differs is a hand publish, which the seed keeps through every upgrade while its directory is on disk (FINDINGS A-122).",
             "Motherbee-only (409 NOT_PRIMARY elsewhere): it writes the runtimes manifest, which the other hives receive through the dist folder. Takes no body: the runtime comes from the path in HTTP, and the executor step's args are hive and runtime.",
             "The answer: payload {runtime, previous_current, current, package_version, changed, manifest_version, manifest_hash}. changed is false, and nothing is written, when current already is the package's version.",
-            "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove it afterwards with remove_runtime_version, once no node runs it.",
-            "404 RUNTIME_NOT_FOUND; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not published and on disk (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID or RUNTIME_MANIFEST_MISSING.",
+            "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove_runtime_version deletes it once no node runs it, except on a base that packages are built on (wf.engine with deployed workflows, ai.generic with config-only packages), which refuses it with RUNTIME_HAS_DEPENDENTS; it then stays unused, and costs only its disk. The package's own version is never removed (RUNTIME_PACKAGE_VERSION).",
+            "400 INVALID_REQUEST for a missing or invalid runtime; 404 RUNTIME_NOT_FOUND for a runtime the manifest does not have, or names in two cases; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not on disk or cannot run (reinstall the package), or is on disk but not published (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID, RUNTIME_MANIFEST_MISSING or RUNTIME_RESET_FAILED; 502 SERVICE_FAILED when the written manifest cannot be read back.",
         ],
         "cognition_clear" => vec![
             "It cannot be undone: confirm with the operator first. The hive's agents lose the memory of every conversation (contexts, reasons, scopes, memories, feelings and last turns), and the hive loses every episode it kept, its own and those other hives sent it.",
@@ -15530,6 +15531,16 @@ fn runtime_versions_from_manifest_entry_local(entry: &RuntimeManifestEntry) -> V
     out
 }
 
+/// Whether `runtime_version` is the version the installed package brought for this runtime, which
+/// its seed records as `package_version` (FINDINGS A-122).
+fn is_package_version_local(entry: &RuntimeManifestEntry, runtime_version: &str) -> bool {
+    entry
+        .extra
+        .get("package_version")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.trim() == runtime_version)
+}
+
 fn can_remove_current_runtime_version_local(
     entry: &RuntimeManifestEntry,
     runtime_version: &str,
@@ -15693,6 +15704,34 @@ fn remove_runtime_version_from_manifest_local(
     Ok(updated)
 }
 
+/// Whether a base runtime's version can run, as the orchestrator judges a version a publish script
+/// wrote before it moves a node there (`start_script_entry` and `runtime_version_not_ready`,
+/// src/bin/sy_orchestrator.rs): an executable start script whose line
+/// `exec "$SCRIPT_DIR/<binary>" "$@"` names an executable binary next to it.
+fn base_runtime_version_ready(version_dir: &Path) -> bool {
+    let executable = |path: &Path| {
+        fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    let start_script = version_dir.join("bin").join("start.sh");
+    let small = fs::metadata(&start_script).is_ok_and(|meta| meta.len() <= 64 * 1024);
+    if !small || !executable(&start_script) {
+        return false;
+    }
+    let Ok(script) = fs::read_to_string(&start_script) else {
+        return false;
+    };
+    script
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("exec \"$SCRIPT_DIR/")?
+                .strip_suffix("\" \"$@\"")
+        })
+        .filter(|binary| !matches!(*binary, "" | "." | "..") && !binary.contains('/'))
+        .is_some_and(|binary| executable(&version_dir.join("bin").join(binary)))
+}
+
 /// What `reset_base_runtime` makes of a runtime's entry (FINDINGS A-122).
 #[derive(Debug)]
 struct BaseRuntimeReset {
@@ -15739,13 +15778,21 @@ fn reset_base_runtime_in_manifest_local(
                 ),
             )
         })?;
-    let published = runtime_versions_from_manifest_entry_local(entry).contains(&package_version);
-    if !published || !version_ready(&runtime_key, &package_version) {
+    if !version_ready(&runtime_key, &package_version) {
         return Err((
             409,
             "RUNTIME_NOT_PRESENT",
             format!(
-                "the package's version '{package_version}' of runtime '{runtime_key}' is not published and on disk: run sudo fluxbee-seed-runtimes on the motherbee"
+                "the package's version '{package_version}' of runtime '{runtime_key}' is not on disk, or cannot run: reinstall the package on the motherbee (sudo apt-get install --reinstall fluxbee)"
+            ),
+        ));
+    }
+    if !runtime_versions_from_manifest_entry_local(entry).contains(&package_version) {
+        return Err((
+            409,
+            "RUNTIME_NOT_PRESENT",
+            format!(
+                "the package's version '{package_version}' of runtime '{runtime_key}' is on disk but not published: run sudo fluxbee-seed-runtimes on the motherbee"
             ),
         ));
     }
@@ -16404,6 +16451,25 @@ async fn handle_remove_runtime_version(
         ));
     }
 
+    // The version the installed package brought stays: it is the way back (`reset_base_runtime`),
+    // its files are the package's, and the next package replaces it (FINDINGS A-122).
+    if is_package_version_local(entry, runtime_version) {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_PACKAGE_VERSION",
+                "error_detail": format!(
+                    "version '{}' is the one the installed package brought for runtime '{}' (its package_version): it stays, as the way back with reset_base_runtime, and the next package replaces it",
+                    runtime_version, runtime
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
     let version_exists = runtime_versions_from_manifest_entry_local(entry)
         .iter()
         .any(|value| value == runtime_version);
@@ -16718,12 +16784,9 @@ async fn handle_reset_base_runtime(
     };
     let reset =
         match reset_base_runtime_in_manifest_local(&manifest, runtime, |runtime, version| {
-            Path::new(DIST_RUNTIME_ROOT_DIR)
-                .join(runtime)
-                .join(version)
-                .join("bin")
-                .join("start.sh")
-                .is_file()
+            base_runtime_version_ready(
+                &Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime).join(version),
+            )
         }) {
             Ok(reset) => reset,
             Err((status, code, detail)) => return refuse(status, code, detail),
@@ -28511,6 +28574,117 @@ mod tests {
                 .map_err(|(status, code, _)| (status, code)),
             Err((409, "RUNTIME_NOT_PRESENT"))
         );
+    }
+
+    /// The details tell the two repairs apart: a version not on disk needs the package again, one
+    /// on disk but not published needs the seed.
+    #[test]
+    fn reset_base_runtime_says_which_repair_fits() {
+        let manifest = manifest_with_a_hand_published_base_runtime("0.1.88-gate1");
+        let detail = |manifest: &RuntimeManifest, ready: bool| {
+            reset_base_runtime_in_manifest_local(manifest, "ai.generic", |_, _| ready)
+                .err()
+                .map(|(_, _, detail)| detail)
+                .expect("refused")
+        };
+        assert!(detail(&manifest, false).contains("reinstall the package"));
+        let mut unpublished = manifest.clone();
+        unpublished.runtimes["ai.generic"]["available"] = json!(["0.1.88-gate1"]);
+        assert!(detail(&unpublished, true).contains("fluxbee-seed-runtimes"));
+    }
+
+    /// A version is ready to run as the orchestrator judges it: an executable start script whose
+    /// exec line names an executable binary next to it.
+    #[test]
+    fn a_base_runtimes_version_is_ready_when_its_start_script_can_run_its_binary() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-base-ready-{}", Uuid::new_v4()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let write = |name: &str, body: &str, mode: u32| {
+            fs::write(bin.join(name), body).expect("write");
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        let script = "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"$SCRIPT_DIR/ai_node_runner\" \"$@\"\n";
+        write("start.sh", script, 0o755);
+        assert!(!base_runtime_version_ready(&dir), "no binary yet");
+        write("ai_node_runner", "binary", 0o755);
+        assert!(base_runtime_version_ready(&dir));
+        write("ai_node_runner", "binary", 0o644);
+        assert!(
+            !base_runtime_version_ready(&dir),
+            "a binary that cannot run"
+        );
+        write("ai_node_runner", "binary", 0o755);
+        write("start.sh", script, 0o644);
+        assert!(
+            !base_runtime_version_ready(&dir),
+            "a start script that cannot run"
+        );
+        write("start.sh", "#!/bin/sh\nexec ./ai_node_runner\n", 0o755);
+        assert!(
+            !base_runtime_version_ready(&dir),
+            "no exec line a publish script writes"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The version the installed package brought is never removed: it is the way back.
+    #[test]
+    fn the_packages_own_version_is_never_removed() {
+        let manifest = manifest_with_a_hand_published_base_runtime("0.1.88-gate1");
+        let entries = runtime_manifest_entry_map_local(&manifest).expect("entries");
+        let base = &entries["ai.generic"];
+        assert!(is_package_version_local(base, "0.1.89"));
+        assert!(!is_package_version_local(base, "0.1.88-gate1"));
+        assert!(!is_package_version_local(&entries["wf.router"], "0.0.4"));
+    }
+
+    /// The executor runs it as the operator, and no mesh caller reaches it, Archi included.
+    #[tokio::test]
+    async fn reset_base_runtime_runs_from_the_executor_and_never_from_the_mesh() {
+        let (ctx, mut harness) = opa_test_admin("reset-base-runtime-origin");
+        // A runtime no manifest has: the executor reaches the handler, which answers about the
+        // manifest, and never changes one.
+        let payload = json!({ "runtime": "ai.resettest9z" });
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "reset_base_runtime",
+            Some("motherbee"),
+            payload.clone(),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+
+        let ran = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "reset_base_runtime",
+            Some("motherbee"),
+            payload,
+            AdminOrigin::Executor,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(
+            ran.envelope["action"],
+            json!("reset_base_runtime"),
+            "{}",
+            ran.envelope
+        );
+        let code = ran.envelope["error_code"].as_str().unwrap_or_default();
+        assert!(
+            matches!(code, "RUNTIME_MANIFEST_MISSING" | "RUNTIME_NOT_FOUND"),
+            "{}",
+            ran.envelope
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

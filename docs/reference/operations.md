@@ -254,8 +254,10 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   `current` that differs is a hand publish, kept through every upgrade (the seed's NOTE says so in
   dpkg's output). `reset_base_runtime` (`POST /hives/motherbee/runtimes/<runtime>/reset`, or Archi
   behind the operator's CONFIRM) makes `package_version` current again; the orchestrators move the
-  runtime's nodes within their next pass, and `remove_runtime_version` can then delete the hand
-  publish.
+  runtime's nodes within their next pass. `remove_runtime_version` can then delete the hand
+  publish, except on a base that packages are built on (`RUNTIME_HAS_DEPENDENTS`: it stays,
+  unused). It never deletes `package_version` itself (`RUNTIME_PACKAGE_VERSION`), and
+  `publish-runtime.sh` refuses a hand publish under that version.
 
 ### How dist reaches the other hives
 

@@ -1294,8 +1294,11 @@ through every upgrade while its directory is on disk (FINDINGS A-122).
   It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
 - Each hive's orchestrator moves the running nodes within its next reconcile pass (60 s); a node
   pinned to a version stays.
-- The hand-published version stays available. Remove it afterwards with `remove_runtime_version`,
-  once no node runs it, if the operator wants it gone.
+- The hand-published version stays available. If the operator wants it gone,
+  `remove_runtime_version` deletes it once no node runs it. A base that packages are built on
+  (`wf.engine` with deployed workflows, `ai.generic` with config-only packages) refuses that with
+  `RUNTIME_HAS_DEPENDENTS`: the version then stays, unused, and costs only its disk.
+- The package's own version is never removed (`RUNTIME_PACKAGE_VERSION`): it is the way back.
 
 ---
 

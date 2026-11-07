@@ -173,6 +173,29 @@ BIN_DIR="$RUNTIME_DIR/bin"
 MANIFEST_PATH="$RUNTIMES_ROOT/manifest.json"
 START_SH="$BIN_DIR/start.sh"
 
+# The version the installed package brought is the way back from a hand publish
+# (reset_base_runtime, FINDINGS A-122): only the package's seed (--package) writes over it. A hand
+# publish under the same version would replace the package's files and hide itself, current then
+# being package_version.
+if [[ "$PACKAGE" != "1" && -f "$MANIFEST_PATH" ]]; then
+  package_version="$(python3 - "$MANIFEST_PATH" "$RUNTIME" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+try:
+    entry = (json.load(open(sys.argv[1], encoding="utf-8")).get("runtimes") or {}).get(sys.argv[2])
+except Exception:
+    raise SystemExit(0)
+print((entry or {}).get("package_version") or "")
+PY
+)"
+  if [[ -n "$package_version" && "$package_version" == "$VERSION" ]]; then
+    echo "Error: $RUNTIME $VERSION is the version the installed package brought; publish under" \
+      "another version (for example $VERSION-gate1)" >&2
+    exit 1
+  fi
+fi
+
 $SUDO install -d "$BIN_DIR"
 # `--binary` may already BE the destination: the .deb ships the artifact tree and then
 # registers it in place at install time (packaging/fluxbee-seed-runtimes). GNU install
