@@ -15706,7 +15706,7 @@ fn reset_base_runtime_in_manifest_local(
         runtime_manifest_entry_map_local(manifest).map_err(|err| (409, "MANIFEST_INVALID", err))?;
     let runtime_key = resolve_runtime_key_local(&runtime_map, runtime)
         .map_err(|err| (404, "RUNTIME_NOT_FOUND", err))?;
-    let mut entry = runtime_map.get(&runtime_key).cloned().ok_or_else(|| {
+    let entry = runtime_map.get(&runtime_key).ok_or_else(|| {
         (
             404,
             "RUNTIME_NOT_FOUND",
@@ -15729,7 +15729,7 @@ fn reset_base_runtime_in_manifest_local(
                 ),
             )
         })?;
-    let published = runtime_versions_from_manifest_entry_local(&entry).contains(&package_version);
+    let published = runtime_versions_from_manifest_entry_local(entry).contains(&package_version);
     if !published || !version_ready(&runtime_key, &package_version) {
         return Err((
             409,
@@ -15754,26 +15754,20 @@ fn reset_base_runtime_in_manifest_local(
         });
     }
 
-    entry.current = Some(package_version.clone());
-    let entry = serde_json::to_value(entry).map_err(|err| {
-        (
-            409,
-            "MANIFEST_INVALID",
-            format!("serialize runtime '{runtime_key}' failed: {err}"),
-        )
-    })?;
+    // Only `current` changes: the entry keeps every other field as it was written.
     let mut updated = manifest.clone();
     updated
         .runtimes
-        .as_object_mut()
+        .get_mut(&runtime_key)
+        .and_then(|value| value.as_object_mut())
         .ok_or_else(|| {
             (
                 409,
                 "MANIFEST_INVALID",
-                "runtime manifest invalid: runtimes must be object".to_string(),
+                format!("runtime manifest invalid entry for '{runtime_key}'"),
             )
         })?
-        .insert(runtime_key.clone(), entry);
+        .insert("current".to_string(), serde_json::json!(package_version));
     let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
     updated.version = next_runtime_manifest_version_ms(now_ms, updated.version);
     updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
