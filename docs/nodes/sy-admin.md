@@ -466,8 +466,10 @@ other hives keep theirs.
   `TRANSPORT_ERROR`, `NODE_NOT_FOUND` in the detail; a cognition that does not answer, `TIMEOUT`.
 - **After it** the cognition keeps running, empty: its `STATUS` shows its file and region empty,
   and the clear in `clears.total` and `clears.last_at`.
-- **The factory reset** runs it on every hive that runs SY.cognition but the motherbee, whose file
-  it removes with the node stopped (`clear_cognitions` in `packaging/fluxbee-factory-reset`).
+- **The factory reset** runs it on every hive that runs SY.cognition, the motherbee included
+  (`clear_cognitions` in `packaging/fluxbee-factory-reset`).
+- **Only this action clears:** `send_node_message` refuses a `COGNITION_CLEAR`, which would pass as
+  SY.admin's own message without its name or its confirmation.
 
 ```json
 {

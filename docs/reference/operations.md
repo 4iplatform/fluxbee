@@ -415,11 +415,11 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
    `storage_postgres_url`, `edge_channel_secret:*` and `edge_tls*`, marks and purges every tenant
    but the root;
 4. clears the user OPA policy on every hive;
-5. truncates every table of `fluxbee_storage` with SY.storage and SY.cognition stopped, removes
-   the motherbee's SY.cognition file and memory region and the nodes' conversation state, and
-   clears Archi's sessions. Every other hive that runs SY.cognition drops its own through
-   SY.admin's `cognition_clear` (FINDINGS A-160), while the motherbee's is stopped; the dry run
-   lists those hives, and each answer is printed.
+5. has every hive that runs SY.cognition drop its state through SY.admin's `cognition_clear`, the
+   motherbee's included (FINDINGS A-160); truncates every table of `fluxbee_storage` with
+   SY.storage and the frontdesk held down (masked for the boot, then started again); removes the
+   nodes' conversation state; and clears Archi's sessions. The dry run lists the cognition hives,
+   and each answer is printed.
 
 It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes (with their SSH
 and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history.

@@ -14803,7 +14803,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin sends COGNITION_CLEAR to SY.cognition@<hive>, which takes it only from SY.admin@motherbee. It deletes every row of its file (cognition.db) and rebuilds the file without them, drops what it holds in memory and writes its memory region empty, then keeps running, empty: the next turns start new communications.",
             "The answer is SY.cognition's as it is: payload {ok: true, node_name, removed: {file: {communications, episodes}, memory: {communications, episodes}}, region: \"written_empty\" (or \"none\" for a cognition with no memory region)}. Its STATUS then shows the file and the region empty, and the clear in clears.total and clears.last_at.",
             "A file it cannot clear answers 502 STORE_ERROR, and nothing is removed; a memory region it cannot write answers 502 REGION_ERROR with what it removed, the file and its memory clear. A node that does not answer is TIMEOUT or TRANSPORT_ERROR.",
-            "Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler, one step per hive, and the executor runs it once the operator confirms. The factory reset runs it on every hive that runs SY.cognition but the motherbee, whose file the reset removes with the node stopped.",
+            "Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler, one step per hive, and the executor runs it once the operator confirms. The factory reset runs it on every hive that runs SY.cognition, the motherbee included.",
         ],
         "set_storage" => vec![
             "This persists the local storage path in hive.yaml on the target hive.",
@@ -16778,6 +16778,16 @@ async fn handle_send_node_message(
     let ttl = req.ttl.unwrap_or(16).max(1);
     let trace_id = Uuid::new_v4().to_string();
     let src_ilk = req.src_ilk.clone();
+    // A cognition's clear goes only through `cognition_clear`, closed to the mesh and confirmed by
+    // its name: sent as a plain message it would pass as SY.admin's own (FINDINGS A-160).
+    if req
+        .msg
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|msg| msg.eq_ignore_ascii_case(MSG_COGNITION_CLEAR))
+    {
+        return invalid("COGNITION_CLEAR is sent only by cognition_clear");
+    }
     let msg_name = req.msg.clone();
     let msg_type = req.msg_type.trim().to_string();
     let message = Message {
@@ -17244,8 +17254,8 @@ const MSG_COGNITION_CLEAR_RESPONSE: &str = "COGNITION_CLEAR_RESPONSE";
 /// `cognition_clear` (FINDINGS A-160): the hive's SY.cognition drops every communication and every
 /// episode it keeps, in memory, in its file and in its memory region, and answers what it removed
 /// (`take_clear` in src/bin/sy_cognition.rs); its answer goes as it is (`node_verb_answer`). It
-/// takes no parameters. The factory reset asks it of every hive that runs SY.cognition but the
-/// motherbee, whose file the reset removes with the node stopped.
+/// takes no parameters. The factory reset asks it of every hive that runs SY.cognition, the
+/// motherbee included.
 async fn handle_cognition_clear(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -28099,6 +28109,29 @@ mod tests {
     /// POST /hives/{hive}/cognition/clear sends COGNITION_CLEAR, with nothing in it, to the hive's
     /// SY.cognition and answers its payload as it is; the cognition's refusal gives the envelope's
     /// error, its payload kept. A body with any field is refused before anything is sent.
+    /// A cognition's clear cannot go as a plain message: `send_node_message` refuses it, in any
+    /// case, before anything is sent.
+    #[tokio::test]
+    async fn send_node_message_never_carries_a_cognitions_clear() {
+        let (ctx, _harness) = opa_test_admin("cognition-clear-by-message");
+        for msg in ["COGNITION_CLEAR", " cognition_clear "] {
+            let (status, body) = handle_send_node_message(
+                &ctx,
+                &ctx.rpc,
+                json!({"node_name": "SY.cognition@worker1", "msg_type": "system", "msg": msg}),
+                Some("worker1".to_string()),
+            )
+            .await
+            .expect("answered");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(body["error_code"], json!("INVALID_REQUEST"));
+            assert!(body["error_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("cognition_clear")));
+        }
+    }
+
     #[tokio::test]
     async fn cognition_clear_asks_the_hives_cognition_and_answers_what_it_removed() {
         let (ctx, mut harness) = opa_test_admin("cognition-clear");

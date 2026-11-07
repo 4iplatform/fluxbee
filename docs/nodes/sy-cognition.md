@@ -94,9 +94,9 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
   carries its communication's last turns, so the region holds some 90 communications when every
   turn is 2,000 characters long. It does not survive a host reboot: the start fills it again from
   the file.
-- `fluxbee-factory-reset` removes the motherbee's file and region with the node stopped
-  (`cognition_paths`), and has every other hive's SY.cognition drop its own through SY.admin's
-  `cognition_clear` (`clear_cognitions`, FINDINGS A-160).
+- `fluxbee-factory-reset` has every hive's SY.cognition drop its own through SY.admin's
+  `cognition_clear`, the motherbee's included, the node running (`clear_cognitions`, FINDINGS
+  A-160): a stopped system unit is started again within seconds by SY.orchestrator's watchdog.
 
 ## Failure behavior
 

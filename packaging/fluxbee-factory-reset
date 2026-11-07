@@ -18,9 +18,9 @@ REMOVED (operator decisions, 2026-09-28):
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
   - the message log: every table of the fluxbee_storage DB (turns, inbox, usage...)
-    + SY.cognition's state on every hive that runs it: this hive's removed with the unit
-    stopped (its file, cognition.db, and its SHM), every other's through cognition_clear (its
-    file, its memory and its memory region, the node running) + the conversation state of the
+    + SY.cognition's state on every hive that runs it, this one included, through
+    cognition_clear (its file, its memory and its memory region, the node running) + the
+    conversation state of the
     base AI nodes and of the frontdesk (thread-state/, immediate-memory/) + the Architect chat
     sessions;
   - every vault secret except infrastructure (INFRA_KEYS / INFRA_PREFIXES below) -- including
@@ -300,22 +300,16 @@ def conversation_dirs():
     return sorted(found)
 
 
-def cognition_paths(hive):
-    node_dir = os.path.join(STATE_DIR, "nodes", "SY", "SY.cognition@%s" % hive)
-    files = ("cognition.db", "cognition.db-wal", "cognition.db-shm", "cache", "shm")
-    paths = [os.path.join(node_dir, p) for p in files]
-    paths.append("/dev/shm/jsr-memory-%s" % hive)
-    return [p for p in paths if os.path.exists(p)]
-
-
 def cognition_hives(local_hive):
-    """The other hives that run SY.cognition. Each keeps its state in a file of its own (A-158),
-    which this box cannot reach: SY.admin's cognition_clear has the node drop it (FINDINGS A-160)."""
-    out = []
+    """The hives that run SY.cognition, this one included. Each keeps its state in a file of its
+    own (A-158), and SY.admin's cognition_clear has the node drop it, running (FINDINGS A-160): a
+    stopped system unit does not stay stopped, SY.orchestrator's watchdog starts it again within
+    seconds, so no file is removed by hand under a node that may have opened it again."""
+    out = {local_hive}
     for h in hives_raw():
         hive = h.get("hive_id") or h.get("name")
-        if hive and hive != local_hive and (h.get("role") or "") in COGNITION_HIVE_ROLES:
-            out.append(hive)
+        if hive and (h.get("role") or "") in COGNITION_HIVE_ROLES:
+            out.add(hive)
     return sorted(out)
 
 
@@ -422,11 +416,21 @@ def delete_until_empty(label, lister, deleter, ident):
     return failed
 
 
-def systemctl(action, units):
+def hold_down(units):
+    """Stop these system units and keep them down until `release`: SY.orchestrator's watchdog
+    starts an inactive system unit again within seconds, so each is masked for this boot first.
+    A reset killed before `release` leaves them masked until the next boot."""
     units = [u for u in units if sh(["systemctl", "cat", u], check=False).returncode == 0]
     if units:
-        sh(["systemctl", action] + units)
+        sh(["systemctl", "mask", "--runtime"] + units)
+        sh(["systemctl", "stop"] + units)
     return units
+
+
+def release(units):
+    if units:
+        sh(["systemctl", "unmask", "--runtime"] + units, check=False)
+        sh(["systemctl", "start"] + units)
 
 
 # ---------------------------------------------------------------- main
@@ -461,7 +465,6 @@ def main():
     tables = storage_tables() if can_db else []
     counts = storage_counts(tables) if can_db else {}
     conv = conversation_dirs()
-    cog = cognition_paths(hive_id)
     cog_hives = cognition_hives(hive_id)
     tenants = user_tenants(hive_id)
     opa_versions = opa_user_policy_versions()
@@ -493,8 +496,7 @@ def main():
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
         print("[6] message log (%s): run as root to see the row counts" % STORAGE_DB)
-    print("    + SY.cognition state on this hive (removed, the unit stopped): %s" % (", ".join(cog) or "none"))
-    print("    + SY.cognition on the other hives (cognition_clear: its file, its memory and its memory region): %s"
+    print("    + SY.cognition on every hive that runs it (cognition_clear: its file, its memory and its memory region): %s"
           % (", ".join(cog_hives) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
@@ -565,35 +567,34 @@ def main():
     print("  %s" % ("no user policy left on any hive" if not opa_fail
                     else "FAIL user policy still loaded: %s" % left_opa))
     print("== [6/7] message log")
-    # SY.* are real systemd units. The base AI nodes are orchestrator-managed TRANSIENT units: a
-    # `systemctl stop` makes them vanish (a later start finds nothing), so their lifecycle goes
-    # through the orchestrator -- kill_node WITHOUT purge (keeps config + ILK) / start_node.
-    stopped = systemctl("stop", ["sy-cognition.service", "sy-storage.service", "sy-frontdesk-gov.service"])
+    # Every hive's SY.cognition drops what it keeps through cognition_clear, running, this one's
+    # included (`cognition_hives`). No episode can be made meanwhile: the AI keys went at [3].
+    cog_fail = clear_cognitions(cog_hives)
+    # SY.* are real systemd units, held down for the truncate (`hold_down`). The base AI nodes are
+    # orchestrator-managed TRANSIENT units: a `systemctl stop` makes them vanish (a later start finds
+    # nothing), so their lifecycle goes through the orchestrator -- kill_node WITHOUT purge (keeps
+    # config + ILK) / start_node.
+    held = hold_down(["sy-storage.service", "sy-frontdesk-gov.service"])
     ai_nodes = [n for n in sorted(base) if n.startswith("AI.")]
     for n in ai_nodes:
         status, resp = api("DELETE", "/hives/%s/nodes/%s" % (q(hive_id), q(n)),
                            {"force": False, "purge_instance": False}, timeout=120)
         if not ok(status, resp):
             print("  WARN could not stop %s (%s): %s" % (n, status, str(resp)[:160]))
-    cog_fail = []
     try:
         tables = storage_tables()
         if tables:
             psql("TRUNCATE %s RESTART IDENTITY CASCADE" % ", ".join('"%s"' % t for t in tables))
-        # The other hives' cognition is cleared while this hive's is stopped: an episode one of
-        # them made before its clear, sent to every hive's cognition, cannot reach the file this
-        # one starts again with.
-        cog_fail = clear_cognitions(cog_hives)
-        for p in cognition_paths(hive_id) + conversation_dirs():
+        for p in conversation_dirs():
             rm_path(p)
     finally:
-        systemctl("start", stopped)
+        release(held)
         for n in ai_nodes:
             status, resp = api("POST", "/hives/%s/nodes/%s/start" % (q(hive_id), q(n)), {}, timeout=120)
             if not ok(status, resp):
                 print("  WARN could not start %s (%s): %s" % (n, status, str(resp)[:160]))
     left = {t: c for t, c in storage_counts(storage_tables()).items() if c}
-    print("  %d tables truncated%s; this hive's cognition state and %d conversation dirs removed"
+    print("  %d tables truncated%s; %d conversation dirs removed"
           % (len(tables), (" -- NOT EMPTY: %s" % left) if left else "", len(conv)))
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
