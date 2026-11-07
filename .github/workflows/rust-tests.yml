@@ -65,6 +65,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "${{ matrix.workspace }} -> target"
+          # Saved on main only, and every branch reads main's: the repo's caches are capped at
+          # 10 GB and each branch kept its own copy, about 2 GB (lab/logbook/METHOD.md §9).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --all -- --check
