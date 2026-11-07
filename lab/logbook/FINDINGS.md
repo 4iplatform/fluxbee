@@ -32,7 +32,9 @@ no change required
 🧠 marks what closes cognition (A-137).
 
 1. **First release, 0.1.106** (fixes already defined):
-   1. PENDING-BUGS' six August rows: checked, then closed or brought here (docs only).
+   1. PENDING-BUGS' six August rows: checked, then closed or brought here (docs only). ✅
+      2026-11-07: PB-1 and PB-5 were closed already, U-12 needed no change, and PB-3, PB-6 and U-6
+      came here as A-164, A-165 and A-166.
    2. A-80 [General/identity]: a restore looks the email up in the person's own tenant
       (SY.identity).
    3. 🧠 A-163 [WF]: the episode gate says which rule turned a proposal down, with its numbers
@@ -166,8 +168,12 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
   A-158).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
-- [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
-  U-12): to check, then bring here or close.
+- A-164 🔵 The vault's resource types leave out four the product uses (PENDING-BUGS PB-3).
+- A-165 🟡 After a join over the password channel, password logins stay on (PENDING-BUGS PB-6).
+- A-166 🔵 To verify: whether every join pushes the vendor before its folder syncs (PENDING-BUGS
+  U-6).
+- [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
+  already closed, U-12 needed no change, and the other three came here.
 
 ### Infrastructure and the lab (section B)
 
@@ -1238,6 +1244,39 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-166 [General/add_hive] 🔵 TO VERIFY (PENDING-BUGS U-6, found 2026-07-30; read in the code 2026-11-07) — Whether every join pushes the vendor before its folder syncs
+
+- **What happened:** the first `add_hive role=ingress` of 2026-07-30 failed with
+  `SYNC_SETUP_FAILED`: the vendor pushed over SSH and Syncthing wrote the same file at once
+  ([PENDING-BUGS](PENDING-BUGS.md) U-6). A retry passed.
+- **Read now:** the ingress flow pushes the vendor, awaited and fatal, before the motherbee's public
+  Syncthing setup (`sync_vendor_to_worker`, then `ensure_blob_sync_runtime`, in
+  `add_ingress_hive_flow`, src/bin/sy_orchestrator.rs): the order U-6 proposed. The worker and
+  egress flows push it too, fatal; their order against the new hive's folders was not read through.
+- **To do:** read those two flows through, or watch the next joins, then close.
+
+### A-165 [General/add_hive] 🟡 OPEN (PENDING-BUGS PB-6, found in August; read in the code 2026-11-07) — After a join over the password channel, password logins stay on
+
+- **What happens:** `add_hive`'s `ssh_password` channel leaves `PasswordAuthentication yes` on the
+  new box unless the request sets `harden_ssh: true`, which defaults to `false`
+  (`resolve_add_hive_harden_ssh`, src/bin/sy_orchestrator.rs). Since 0.1.81 (A-2) the join's answer
+  warns about it and says how to close it.
+- **Since August:** closing it through `ssh_access=key_only_persist` left with that mode in 0.1.61
+  (D32). Turning `harden_ssh` on by default would leave a box with no way in
+  ([PENDING-BUGS](PENDING-BUGS.md) PB-6).
+- **The operator's call:** whether the channel closes by itself, and how, with no lockout.
+
+### A-164 [General/vault] 🔵 TO EVALUATE (PENDING-BUGS PB-3, found in August; read in the code 2026-11-07) — The vault's resource types leave out four the product uses
+
+- **What happens:** `ResourceType` (crates/fluxbee_sdk/src/vault.rs) names neither `tls`, `ssh`,
+  `whatsapp` nor `linkedhelper_adapter`, which the product writes and reads, and
+  `known_wire_values()` has no callers.
+- **No functional impact:** the vault matches the normalized string, and a `Custom` type behaves as a
+  named one ([PENDING-BUGS](PENDING-BUGS.md) PB-3).
+- **Fix, one of:** name the four and use `known_wire_values()`, with a warning when the admin falls
+  into `Custom`; or make `vault_put`'s help treat a normalized custom type as a path of its own,
+  with each type's value shape.
 
 ### A-163 [WF] 🔴 OPEN (found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
 

@@ -22,12 +22,12 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 
 | id | state | topic | blocks |
 |---|---|---|---|
-| [PB-1](#pb-1) | 🟡 mitigated | SY.edge does not reload the TLS cert when it rotates in the vault | no |
+| [PB-1](#pb-1) | ✅ **closed and VALIDATED live** (0.1.82) | SY.edge does not reload the TLS cert when it rotates in the vault | no |
 | [PB-2](#pb-2) | ✅ **closed and VALIDATED live** | Completeness of the TLS chain · `chain_len=4` served, `verify=0` from the internet | — |
-| [PB-3](#pb-3) | 🟢 cosmetic | The `ResourceType` enum drifted · **no functional impact** | no |
+| [PB-3](#pb-3) | ↪ in FINDINGS as A-164 (2026-11-07) | The `ResourceType` enum drifted · **no functional impact** | no |
 | [PB-4](#pb-4) | ✅ **CLOSED** | The cold start **looked** like a failure: the edge blamed the vault for no reason | — |
-| [PB-5](#pb-5) | 🟡 rewritten | The egress reports `nat_applied: true` without verifying its LAN leg | no |
-| [PB-6](#pb-6) | 🟡 rewritten | `ssh_password` does not close by itself · **⛔ inverting the default leaves boxes without access** | no |
+| [PB-5](#pb-5) | ✅ **CLOSED** (0.1.81, FINDINGS A-1) | The egress reports `nat_applied: true` without verifying its LAN leg | no |
+| [PB-6](#pb-6) | ↪ in FINDINGS as A-165 (2026-11-07) | `ssh_password` does not close by itself · **⛔ inverting the default leaves boxes without access** | no |
 | [PB-6b](#pb-6b) | ✅ **CLOSED** | `harden_ssh_applied` was an echo of the request: it reported `false` with password auth already off | — |
 | [PB-7](#pb-7) | ✅ **CLOSED** | `add_hive` (>6 min) overflows the admin's window (180 s) **and blocks the channel** | no |
 | [PB-8](#pb-8) | ✅ **closed and VALIDATED live** | Egress for motherbee · **only reports**, does not touch the route (`EGRESS_MOTHERBEE_BYPASS`) | — |
@@ -44,7 +44,7 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 | [U-4b](#u-4b) | ✅ **closed and VALIDATED live** | The drift-alerts were never written · now there is a writer, and the synthesis was deleted | — |
 | [U-5](#u-5) | ✅ **closed and VALIDATED live** | `core_rollback` with sealed generations, a health gate and a cross-hive forward | — |
 | [U-5b](#u-5b) | ✅ **CLOSED** | Core backups piled up without GC **and were created empty on every no-op** | — |
-| [U-6](#u-6) | 🟡 mitigated | The race was **the orchestrator against itself**: a non-atomic 35 MB write | — |
+| [U-6](#u-6) | ↪ in FINDINGS as A-166 (2026-11-07) | The race was **the orchestrator against itself**: a non-atomic 35 MB write | — |
 | [U-7](#u-7) | ✅ **closed** | The watchdog restarted syncthing every ~7 s because of a nonexistent folder | — |
 | [U-8a](#u-8a) | ✅ **closed and VALIDATED live** (`9f86c12`, with PB-7) | The admin API had no contract for long operations | — |
 | [U-8b](#u-8b) | ✅ **closed** (0.1.55) | `update category=core` returned TIMEOUT: now it replies before restarting | — |
@@ -52,7 +52,7 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 | [U-9](#u-9) | ✅ **CLOSED** | The catch-all broke the envelope **and returned 404 where 405 was due** | — |
 | [U-10](#u-10) | ✅ **closed and VALIDATED live** | A `.deb` upgrade left every runtime node orphaned | — |
 | [U-11](#u-11) | ✅ **closed and VALIDATED live** | IO.cloud could not self-publish its channel | — |
-| [U-12](#u-12) | 🟡 corrected | The race exists, but **there is an atomic call that avoids it** and I did not find it | no |
+| [U-12](#u-12) | ✅ **closed**, no change required: `kill_node` with `purge_instance` (HANDBOOK) | The race exists, but **there is an atomic call that avoids it** and I did not find it | no |
 | [U-13](#u-13) | ✅ **closed and VALIDATED live** | `sy-storage` lost the startup race against the vault and **did not retry** | — |
 
 ---
@@ -179,6 +179,9 @@ strict clients.
 
 <a id="pb-3"></a>
 ## PB-3 🟢 — The `ResourceType` enum drifted from what the product itself writes
+> **2026-11-07:** checked in the code (the enum still leaves the four out, and `known_wire_values()`
+> still has no callers), and carried to [FINDINGS](FINDINGS.md) as A-164.
+
 
 > **Downgraded from 🔴 to cosmetic/documentation on 2026-08-03.** It has no functional impact.
 
@@ -286,6 +289,9 @@ name **at runtime**, so the absence of the NIC does **not** make `nft -f` fail �
 
 <a id="pb-6"></a>
 ## PB-6 🟡 PARTIAL (0.1.81: the join warns) — The `ssh_password` bootstrap channel does not close by itself — and plain `harden_ssh` is **not** the answer
+> **2026-11-07:** carried to [FINDINGS](FINDINGS.md) as A-165, still open: option (a) below left
+> with `key_only_persist` in 0.1.61.
+
 
 > **0.1.81 (2026-10-20), FINDINGS A-2:** option (b) shipped: when the join's password fallback ran
 > and the box was not hardened, the join answers a `warnings` entry saying password logins stay on
@@ -883,6 +889,9 @@ the real state dir. Two tests: that it keeps the newest ones and respects what i
 
 <a id="u-6"></a>
 ## U-6 🟡 MITIGATED — `add_hive` runs a race between the vendor push over SSH and the syncthing folder
+> **2026-11-07:** carried to [FINDINGS](FINDINGS.md) as A-166, to verify: the ingress flow now pushes
+> the vendor before the motherbee's public Syncthing setup, the order proposed below.
+
 
 **Found live** while rebuilding prod (2026-07-30), on the first `add_hive role=ingress`:
 
@@ -1301,6 +1310,9 @@ from the internet: without a credential `401`, with a bearer a complete `create_
 
 <a id="u-12"></a>
 ## U-12 🟡 — The race exists, but the atomic operation IS ALREADY BUILT
+> **Closed on 2026-11-07, no change required:** the HANDBOOK's recipe uses `kill_node` with
+> `purge_instance` and warns against the two calls.
+
 
 **Corrected on 2026-08-04, the same day I reported it.** I framed it wrong.
 
