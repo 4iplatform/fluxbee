@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ live, checked on 8.x; its gate found A-163 | snap `pre-relayto-0-1-105` (all 4 VMs) · `apt install fluxbee=0.1.104` + core-update of the spokes |
+| **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ live, checked on 8.x; its gate found A-167 | snap `pre-train1-0-1-106` (all 4 VMs) · `apt install fluxbee=0.1.105` + core-update of the spokes |
+| **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ replaced by 0.1.106 | snap `pre-relayto-0-1-105` (deleted 2026-11-07) · `apt install fluxbee=0.1.104` + core-update of the spokes |
 | **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ replaced by 0.1.105 | snap `pre-news-0-1-104` (deleted 2026-11-07) · `apt install fluxbee=0.1.103` + core-update of the spokes |
 | **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ replaced by 0.1.104 | snap `pre-cogstate-0-1-103` (deleted 2026-11-06) · `apt install fluxbee=0.1.102` + core-update of the spokes |
 | **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ replaced by 0.1.103 | snap `pre-feelings-0-1-102` (deleted 2026-11-06) · `apt install fluxbee=0.1.101` + core-update of the spokes |
@@ -112,6 +113,71 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.106 — The sprint's first release: the episode gate says why (A-163), Archi takes a page down (A-120), a restore minds its own tenant (A-80), the tool cards say the code's values (A-103)
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.105 · **Commit:** `9f19bcc5`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the first release of the sprint of 2026-11-07, by the new method
+  ([METHOD](logbook/METHOD.md) §9): four changes that touch different binaries, each on its own
+  branch and with its own gate (FINDINGS A-163, A-120, A-80 and A-103).
+- **What changed:**
+  - **SY.cognition (A-163):** the episode gate says the first condition a proposal misses, and
+    SY.cognition logs it at info with the gate's numbers: the base intensity, the novelty, the
+    habit, the final intensity, the evidence's strength, and its contexts beside the leading ones.
+    Never the proposal's title or summary, nor a model's free text.
+  - **SY.admin (A-120):** the executor Archi runs confirmed plans through may run
+    `unpublish_artifact` as the operator, for any page, after the operator's CONFIRM. An AI node
+    keeps its own path, on its own pages. The executor's run log keeps a link's key only as its
+    SHA-256, as the command log does, and a plan's step names its action with no surrounding
+    whitespace.
+  - **SY.architect (A-120's review):** Archi's journal keeps a link's key only as its SHA-256, and
+    redacts an admin answer's secret fields as it did the request's.
+  - **SY.identity (A-80):** restoring a person looks their email up in their own tenant, as
+    registration does.
+  - **ai.generic (A-103):** the tool cards' values come from the code's constants, or a test holds
+    them. The publish card says "up to 120 s" where it said "two minutes".
+- **Checks before the release:**
+  - on the Mac, clippy of what each change touched, and no test suite (METHOD §9);
+  - GitHub's CI green on each change's branch and on the integrated heads, `543e0fad` and then
+    `9f19bcc5`: fmt, clippy with warnings denied and every test of both Rust workspaces, the admin
+    catalog's parity, and the posture and dispatcher guards, in about 3.5 min each;
+  - the review round (one reviewer, over the four): one medium and three lows, all fixed in
+    `9f19bcc5`:
+    - the link's key reached Archi's journal (A-120);
+    - the run log's match did not trim an action's name (A-120);
+    - the refusal's log line could carry a model's free text (A-163);
+    - the XLSX card's 31 characters were restated by hand (A-103).
+- **Deploy:**
+  - build of `543e0fad` in 13 min, then of `9f19bcc5`, with the review's fixes, in 12 min;
+  - publish in 17 s; the repo dropped 0.1.96;
+  - snapshot `pre-train1-0-1-106` taken on all 4 VMs, `pre-relayto-0-1-105` dropped;
+  - 0.1.106 on all 4 in 255 s (manifest `bec1193a73915b76`), health clean.
+- **Checked on 8.x:**
+  - **A-163** (gate0206 again, thread `gate0206-handover4`): the narrator proposed 2 episodes on
+    A's quarrel with B.
+    - One passed: friction, intensity 9, about A and B (A accused B of lying; unresolved). It was
+      made on worker1 and taken by the motherbee's cognition.
+    - One was turned down, and the log said why: `refused="weak_evidence" base_intensity=5.0
+      novelty=1.0 habit=1 intensity=6.0 evidence_strength=7.0 evidence_contexts=["billing",
+      "credit note"] leading_contexts=["billing", "credit note"]`.
+  - **A-120:** AI.pruebas published a page, 200 from outside.
+    - Asked to take it down, Archi staged a one-step plan and ran nothing until CONFIRM. Then the
+      link answered 404.
+    - The command log shows `origin: executor` with only `key_sha256`.
+    - The raw key is in no journal (Archi's, SY.admin's, the edge's) and in no executor run log.
+  - **A-103:** AI.pruebas' help returns the catalog of its 17 tools, equal to
+    `docs/reference/agent-tools.json`, with "Publishing takes up to 120 s."
+  - **A-80:** by its test on GitHub's CI. A person is restored while another tenant holds the same
+    email, and an active holder in the person's own tenant still blocks it.
+- **Found in the checks:**
+  - **A-167** 🟡: the episode calls B "the agent". It has A threatening "to have the agent
+    removed from the account", a line A said to B after B had written; the same summary names B,
+    rightly, for the accusation.
+- **Rollback:** `apt install fluxbee=0.1.105` on the motherbee, then a core-update of the spokes.
+  Nothing 0.1.106 writes changes form.
 
 ---
 

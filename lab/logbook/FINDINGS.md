@@ -31,20 +31,20 @@ no change required
 
 🧠 marks what closes cognition (A-137).
 
-1. **First release, 0.1.106** (fixes already defined):
+1. **First release, 0.1.106** ✅ live and checked on 8.x (2026-11-07); its gate found A-167:
    1. PENDING-BUGS' six August rows: checked, then closed or brought here (docs only). ✅
       2026-11-07: PB-1 and PB-5 were closed already, U-12 needed no change, and PB-3, PB-6 and U-6
       came here as A-164, A-165 and A-166.
    2. A-80 [General/identity]: a restore looks the email up in the person's own tenant
-      (SY.identity).
+      (SY.identity). ✅ by its test.
    3. 🧠 A-163 [WF]: the episode gate says which rule turned a proposal down, with its numbers
-      (SY.cognition).
+      (SY.cognition). ✅ on 8.x.
    4. A-103 [General/agent tools]: the tool cards stop restating the code's values by hand
-      (ai.generic).
-   5. A-120 [Archi]: Archi takes a page down, through its confirmation (SY.admin).
+      (ai.generic). ✅ on 8.x.
+   5. A-120 [Archi]: Archi takes a page down, through its confirmation (SY.admin). ✅ on 8.x.
 2. **Second release, 0.1.107:**
    1. 🧠 Cognition's numbers, on A-163's output: whether a quarrel between two people is news, and
-      whether the gate's thresholds become configuration. The operator's call first.
+      whether the gate's thresholds become configuration. The operator's call first, with A-167.
    2. 🧠 A-160 [General/ops]: the factory reset clears the workers' cognition too (SY.admin and
       SY.cognition; one branch with the numbers, the same binary).
    3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
@@ -122,8 +122,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
   A-156's first); the rest agreed in the chat of 2026-11-06 and out in 0.1.104
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
-  news), and its gate's A-161 ✅ 0.1.105.*
-- A-163 🔴 The episode gate turns a proposal down without saying why (0.1.105's gate).
+  news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
+- A-167 🟡 An episode between two people calls one of them "the agent" (0.1.106's gate).
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -136,7 +136,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
-- A-120 🟡 Archi cannot take a page down.
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
   §5.5.3): where a solution lives, with its manifest and its deployment; Archi keeps no definition
   across chat turns; the atoms become a document of their own.
@@ -160,9 +159,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 ### General
 
 - A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
-- A-80 🟡 A restore is refused when another tenant holds the same email.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
-- A-103 🔵 The tool cards restate constants by hand.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
 - A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
@@ -1245,6 +1242,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-167 [WF] 🟡 OPEN (found 2026-11-07, 0.1.106's gate on 8.x; read in the episode and the turns) — An episode between two people calls one of them "the agent"
+
+- **What happens:** the episode made of A's quarrel with B (`gate0206-handover4`, friction,
+  intensity 9, about A and B) says A accused B, named by ILK, of lying, rightly. It then says A
+  *"threatened to have the agent removed from the account"*. Both come from one message A sent B
+  (*"… Voy a pedir que te saquen de mi cuenta"*) after B had written, so the narrator read it as
+  said to B (cognition-hands-v1 §12.9). It called B, the billing person, "the agent".
+- **Why it matters:** an episode is public news on every hive for about 15 days. An agent reading
+  "the agent" may take it as itself, as A-161 showed with relayed lines.
+- **Proposed fix:** the narrator's rule: an episode names its people by name or ILK, and says "the
+  agent" only of the AI agent, which an episode between two people does not involve. With the
+  operator's call on whether such a quarrel is news.
+
 ### A-166 [General/add_hive] 🔵 TO VERIFY (PENDING-BUGS U-6, found 2026-07-30; read in the code 2026-11-07) — Whether every join pushes the vendor before its folder syncs
 
 - **What happened:** the first `add_hive role=ingress` of 2026-07-30 failed with
@@ -1278,7 +1288,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   into `Custom`; or make `vault_put`'s help treat a normalized custom type as a path of its own,
   with each type's value shape.
 
-### A-163 [WF] 🔴 OPEN (found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
+### A-163 [WF] ✅ VALIDATED ON 8.x (0.1.106, 2026-11-07; found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
 
 - **What happens:** SY.cognition turns down a proposed episode about no person
   (`publish_episode`, src/bin/sy_cognition.rs), or one that `gate_episode`
@@ -1297,6 +1307,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   info with the proposal's lens, its numbers (base intensity, novelty, habit, evidence strength)
   and its contexts beside the leading ones. Then gate0206 again, and the operator's call on
   whether such a quarrel is news.
+- **Fixed in 0.1.106:** `gate_episode` answers the first condition a proposal misses
+  (`GateRefusal`), and SY.cognition logs it at info with the gate's numbers. The line shows a lens
+  only when it is one of the four, and at most 4 context labels of 40 characters each: never the
+  proposal's title or summary, nor a model's free text (the review round).
+- **Validated on 8.x** (gate0206, thread `gate0206-handover4`): the narrator proposed 2 episodes on
+  A's quarrel with B. One passed (friction, intensity 9, about A and B) and reached the motherbee's
+  cognition. The other was turned down, and the line said why: `refused="weak_evidence"
+  base_intensity=5.0 novelty=1.0 habit=1 intensity=6.0 evidence_strength=7.0`, its contexts the
+  two leading ones. The model's proposals vary from run to run: 0.1.105's 3 were all turned
+  down. The episode found A-167.
 
 ### A-161 [WF] ✅ VALIDATED ON 8.x (0.1.105, 2026-11-07; found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A line a WF relays between two people names no one it was said to, so the agent and cognition read it as said to the agent
 
@@ -2350,8 +2370,12 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     takes another person's failure as its own, and cognition reads the quarrel as between A and
     B. That gate found A-163: the episode gate turned the quarrel's 3 proposals down, saying
     nothing of why.
-  - **Open:** A-163; §12.6 keeps handing over between agents, a conversation that reaches an agent
-    late, and the numbers.
+  - **A-163** went out in 0.1.106 (2026-11-07): the gate says why it turns a proposal down. Its
+    gate made one episode of A's quarrel with B, intensity 9, and turned one down for weak evidence;
+    the episode found A-167.
+  - **Open:** the operator's call on the numbers, whether a quarrel between two people is news
+    (§12.6); A-167; A-160; §12.6's handing over between agents, a conversation that reaches an
+    agent late, and a message split in two batches on a new thread.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
@@ -2824,7 +2848,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
 - **Status:** the orchestrator's tests cover it. It was not exercised on 8.x, because that needs
   SY.timer down.
 
-### A-120 [Archi] 🟡 OPEN (found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
+### A-120 [Archi] ✅ VALIDATED ON 8.x (0.1.106, 2026-11-07; found 2026-10-27, 0.1.89 review) — Archi cannot take a page down
 
 - **What happens:** `unpublish_artifact` is reachable only:
   - by an AI node, on its own pages, over the mesh;
@@ -2835,6 +2859,13 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   va a mandar curls nunca más"*.
 - **Fix:** later, with Archi's admin actions. Taking down any page is an operator power, so it goes
   through Archi's confirmation flow.
+- **Fixed in 0.1.106:** SY.admin's executor, which Archi runs confirmed plans through, runs
+  `unpublish_artifact` as the operator, for any page; the action needs the operator's CONFIRM. An
+  AI node keeps its own path, on its own pages. A link's key is kept only as its SHA-256 in the
+  command log, the executor's run log and, after the review round, Archi's journal.
+- **Validated on 8.x:** AI.pruebas published a page. Asked to take it down, Archi staged a
+  one-step plan and ran nothing until CONFIRM; then the link answered 404. The command log shows
+  `origin: executor` and `key_sha256`, and no journal or run log holds the raw key.
 
 ### A-119 ✅ VALIDATED ON 8.x (0.1.90, 2026-10-29) — The WF engine's control verbs and timer fires accept anyone
 
@@ -3302,7 +3333,7 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   - the examples, Archi's prompts and its versioned cookbook seeds name neither provider nor model.
 - **Validated:** a `config-set` with neither was accepted, with `claude-sonnet-5-5` from the hive.
 
-### A-103 [General/agent tools] 🔵 TO EVALUATE (found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
+### A-103 [General/agent tools] ✅ VALIDATED ON 8.x (0.1.106, 2026-11-07; found 2026-10-26, 0.1.86 review) — The tool cards restate constants by hand
 
 - **What happens:** the cards repeat values that live elsewhere in the code:
   - the 128-byte filename limit;
@@ -3313,6 +3344,16 @@ operations); fixed in `89848d8`. Covered by tests; the ones marked *live* were s
   The catalog's golden test compares the cards with themselves, so it cannot catch a change to any
   of those values.
 - **Fix:** build the card text from the constants, or test the text against them.
+- **Fixed in 0.1.106:** both, by where a value lives:
+  - built from ai.generic's constants where code writes the card: the filename's 128 bytes, the
+    publish wait (the card now says "up to 120 s"), the image sizes, `read_blob`'s numbers;
+  - held by a test where the text is static, or the value is another binary's: the 24 h is SY.admin's,
+    checked by a test-only addition there; the XLSX sheet name's 31 characters (the review round).
+- **Validated on 8.x:** AI.pruebas' help returns the catalog of its 17 tools, equal to
+  `docs/reference/agent-tools.json`.
+- **Noted, left:** SY.admin's `publish_artifact` help spells its own default and range out by hand
+  (86400; 60 to 2592000), the comment on `PUBLISH_ARTIFACT_BUDGET` restates ai.generic's 120 s,
+  and no test holds SY.admin's 110 s budget under that wait.
 
 ### A-102 ✅ RESOLVED (0.1.88; covered by tests) — A stopped node's first start can race the T9 conversion
 
@@ -3672,12 +3713,15 @@ operations); fixed in `95bacd3`. Covered by tests; the ones marked *live* were s
   on `fluxbee-blob` (`wait_for_idle: false`) and waits up to 30 s for the file in the motherbee's
   `active/`; IO.blob never waits in its message loop; any curate error releases what was curated.
 
-### A-80 [General/identity] 🟡 OPEN (found 2026-10-22) — A restore is refused when another tenant holds the same email
+### A-80 [General/identity] ✅ VALIDATED BY TESTS (0.1.106, 2026-11-07; found 2026-10-22) — A restore is refused when another tenant holds the same email
 
 - **What happens:** `check_ilk_restorable` (src/bin/sy_identity.rs) looks the person's vouched
   email up across every tenant, while emails are unique per tenant. Restoring a marked person is
   refused with `ILK_KEY_CONFLICT` when someone in another tenant holds the same email.
 - **Fix:** look the email up in the person's own tenant, as registration does.
+- **Fixed in 0.1.106** (`check_ilk_restorable` with `ilk_holding_email`): validated by its test on
+  GitHub's CI, `restoring_minds_the_email_only_in_the_persons_own_tenant`. Not tried live: that
+  takes people with emails in two tenants.
 
 ### A-79 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22) — What the hardening reviews found besides A-62, A-20, A-22 and A-42
 

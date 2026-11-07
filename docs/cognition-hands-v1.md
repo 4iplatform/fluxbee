@@ -19,7 +19,9 @@
   released in 0.1.104. Its gate on 8.x found that a line a WF relays between two people names no
   one it was said to (§12.8, A-161): the fix, the operator's choice, built on 2026-11-07 and
   released in 0.1.105 (§12.9), checked on 8.x (§12.10). That gate found that the episode gate
-  turns a proposal down without saying why (A-163).
+  turns a proposal down without saying why (A-163): it says why since 0.1.106, checked on 8.x
+  (§12.11), which found that an episode between two people can call one of them "the agent"
+  (A-167).
 
 This is the single place for the topic.
 
@@ -1024,3 +1026,19 @@ run was deleted from both hives' files. The ledger's 0.1.105 has each number.
   3 down. It says nothing of why: one debug line, with the lens. In 0.1.104 the same lines, read as
   said to the agent, made one of intensity 9. Which rule held these back, and whether such a
   quarrel is news, cannot be told until the gate says why.
+
+### 12.11 Checked on 8.x (0.1.106, 2026-11-07)
+
+gate0206 again, thread `gate0206-handover4`, with the gate saying why (A-163). The ledger's 0.1.106
+has each number.
+
+- **The gate says why:** the narrator proposed 2 episodes on A's quarrel with B. One was turned
+  down, and SY.cognition's log said so: `refused="weak_evidence" base_intensity=5.0 novelty=1.0
+  habit=1 intensity=6.0 evidence_strength=7.0`, its contexts the two leading ones.
+- **The other passed:** friction, intensity 9, about A and B, made on worker1 and taken by the
+  motherbee's cognition. It says A accused B of lying, and the matter stayed unresolved. A quarrel
+  between two people can be news today, when the narrator rates it high: the operator's call
+  (§12.6).
+- **Found, A-167:** the same episode says A threatened *"to have the agent removed from the
+  account"*, a line A said to B after B had written. The narrator called B, the billing person,
+  "the agent".
