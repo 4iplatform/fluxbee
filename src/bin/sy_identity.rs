@@ -1905,7 +1905,14 @@ impl IdentityStore {
         }
         for key in ["node_name", "email"] {
             if let Some(value) = identification_str(&entry.identification, key) {
-                if let Some(other) = self.find_active_ilk_by_identification_key(key, value) {
+                // A node's name is unique across the installation; an email only within its tenant,
+                // the scope registration checks.
+                let holder = if key == "email" {
+                    self.ilk_holding_email(&entry.tenant_id, value, false)
+                } else {
+                    self.find_active_ilk_by_identification_key(key, value)
+                };
+                if let Some(other) = holder {
                     if other != ilk_id {
                         return Err(lifecycle_error(
                             "ILK_KEY_CONFLICT",
@@ -13361,6 +13368,53 @@ mod tests {
             )),
             Some(&ana)
         );
+    }
+
+    #[test]
+    fn restoring_minds_the_email_only_in_the_persons_own_tenant() {
+        let mut store = sc_store();
+        let kim = rg_provision(&mut store, LC_TENANT, "slack", "U-KIM");
+        rg_register(
+            &mut store,
+            &kim,
+            LC_TENANT,
+            json!({"display_name": "Kim", "email": "kim@acme.com"}),
+        )
+        .expect("register");
+        store.delete_ilk(lc_ilk(&kim), 1).expect("mark");
+        // Emails are unique per tenant, so another tenant may hold the same one meanwhile.
+        let other = rg_provision(&mut store, SC_OTHER, "slack", "U-KIM-GLOBEX");
+        rg_register(
+            &mut store,
+            &other,
+            SC_OTHER,
+            json!({"display_name": "Kim", "email": "kim@acme.com"}),
+        )
+        .expect("another tenant holds the same email");
+        store.restore_ilk(lc_ilk(&kim)).expect("restore");
+
+        // In the person's own tenant an active holder still blocks it: data from before the
+        // reservation, which a marked person's keys have now.
+        store.delete_ilk(lc_ilk(&kim), 2).expect("mark again");
+        let holder = "ilk:99999999-9999-4999-8999-999999999999".to_string();
+        store.ilks.insert(
+            holder.clone(),
+            IlkRecord {
+                ilk_id: holder.clone(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: LC_TENANT.to_string(),
+                identification: json!({"email": "kim@acme.com"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+                deleted_reason: None,
+            },
+        );
+        let err = store
+            .restore_ilk(lc_ilk(&kim))
+            .expect_err("held in its own tenant");
+        assert_eq!(lc_code(err), "ILK_KEY_CONFLICT");
     }
 
     #[test]
