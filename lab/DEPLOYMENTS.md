@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ live, checked on 8.x; its gate found A-167 | snap `pre-train1-0-1-106` (all 4 VMs) · `apt install fluxbee=0.1.105` + core-update of the spokes |
+| **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ live, checked on 8.x | snap `pre-train2-0-1-107` (all 4 VMs) · `apt install fluxbee=0.1.106` + core-update of the spokes |
+| **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ replaced by 0.1.107 | snap `pre-train1-0-1-106` (deleted 2026-11-07) · `apt install fluxbee=0.1.105` + core-update of the spokes |
 | **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ replaced by 0.1.106 | snap `pre-relayto-0-1-105` (deleted 2026-11-07) · `apt install fluxbee=0.1.104` + core-update of the spokes |
 | **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ replaced by 0.1.105 | snap `pre-news-0-1-104` (deleted 2026-11-07) · `apt install fluxbee=0.1.103` + core-update of the spokes |
 | **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ replaced by 0.1.104 | snap `pre-cogstate-0-1-103` (deleted 2026-11-06) · `apt install fluxbee=0.1.102` + core-update of the spokes |
@@ -113,6 +114,60 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.107 — The sprint's second release: "the agent" is only the AI agent (A-167), and the factory reset clears every hive's cognition (A-160)
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.106 · **Commit:** `6c107a9b`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's second release, after the operator's call on cognition's numbers (a
+  quarrel the gate passes is news; the gate stays as it is): 0.1.106's gate found an episode
+  calling a person "the agent" (A-167), and a worker's cognition outlived the factory reset
+  (A-160). Both touch SY.cognition, so they went on one branch.
+- **What changed:**
+  - **SY.cognition (A-167):** a narrator's rule for everything it writes: "the agent" is only the AI
+    agent, never a person, even one who answers for a company.
+  - **SY.cognition (A-160):** `COGNITION_CLEAR`, taken only from SY.admin@motherbee: it drops every
+    communication and episode it keeps, in memory, in its file (then VACUUM and a WAL checkpoint)
+    and in its region, keeps running, and answers what it removed.
+  - **SY.admin (A-160):** `cognition_clear` (`POST /hives/{hive}/cognition/clear`), behind the
+    operator's CONFIRM, run by the executor, closed to the mesh; `send_node_message` refuses a
+    `COGNITION_CLEAR`. The action registry is at version 19.
+  - **The factory reset (A-160):** every hive's cognition is cleared through the action before
+    anything stops, the motherbee's included; SY.storage and the frontdesk stay down, masked, for
+    the truncate.
+- **Checks before the release:**
+  - on the Mac, clippy of what changed; GitHub's CI green on the branch and on the integrated heads
+    (`4c978e26`, then `6c107a9b`): every test of both Rust workspaces, the catalog's parity and
+    the guards;
+  - the review round (one reviewer): one medium and two lows, all fixed in `6c107a9b`:
+    - the reset's stopped cognition could be started again by the orchestrator's watchdog before
+      its file went;
+    - `send_node_message` could carry a `COGNITION_CLEAR` past the action's name;
+    - A-167's rule covered the episode only, not the memory and the feeling.
+- **Deploy:**
+  - build of `4c978e26` in 9 min, then of `6c107a9b`, with the review's fixes, in 9 min;
+  - publish in 13 s;
+  - snapshot `pre-train2-0-1-107` taken on all 4 VMs, `pre-train1-0-1-106` dropped;
+  - 0.1.107 on all 4 in 222 s (manifest `1d766812f0b07fdf`), health clean.
+- **Checked on 8.x:**
+  - **A-167** (gate0206, thread `gate0206-handover5`): the episode made of the quarrel (friction,
+    intensity 8, about A and B) has A accusing *"the billing representative"* of lying and
+    intending *"to have the representative removed from the account"*. "The agent" stays only
+    where the AI agent is meant, in the memory. A second proposal was turned down
+    (`weak_evidence`, evidence 7, habit 2, intensity 5).
+  - **A-160** (the action; the reset itself is not run on 8.x):
+    - Archi staged one `cognition_clear` step on worker1, said it cannot be undone, and ran it
+      on CONFIRM.
+    - Worker1's cognition removed 9 communications and 2 episodes from its file (6 and 2 held).
+      Its file was left with no rows and an empty WAL.
+    - The command log shows `origin: executor`.
+    - AI.pruebas' next turn started a fresh communication, and the motherbee kept its copies of
+      the episodes.
+    - Worker1's cognition held only test data: the gates' threads and one pruebas thread.
+- **Rollback:** `apt install fluxbee=0.1.106` on the motherbee, then a core-update of the spokes.
+  0.1.106 does not know `COGNITION_CLEAR` and ignores the counters' new fields.
 
 ---
 

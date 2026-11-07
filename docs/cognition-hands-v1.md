@@ -21,7 +21,8 @@
   released in 0.1.105 (§12.9), checked on 8.x (§12.10). That gate found that the episode gate
   turns a proposal down without saying why (A-163): it says why since 0.1.106, checked on 8.x
   (§12.11), which found that an episode between two people can call one of them "the agent"
-  (A-167).
+  (A-167). The operator's call on the numbers (§12.6), A-167's fix and the factory reset's clear
+  of every hive's cognition (A-160) went out in 0.1.107 (§12.12).
 
 This is the single place for the topic.
 
@@ -1049,3 +1050,15 @@ has each number.
   "the agent". The operator agreed on the fix the same day: the narrator's rule, for 0.1.107. An
   episode names its people by name or ILK, and says "the agent" only of the AI agent, never of a
   person, even one who answers for a company. A turn between people is not the agent's.
+
+### 12.12 Checked on 8.x (0.1.107, 2026-11-07)
+
+- **A-167:** gate0206 again, thread `gate0206-handover5`. The episode made of A's quarrel with B
+  (friction, intensity 8) has A accusing *"the billing representative"* of lying and intending
+  *"to have the representative removed from the account"*. "The agent" stays only where the AI
+  agent is meant: in the memory, *"the agent had already told [A] that billing promised to send the
+  credit note today"*.
+- **A-160:** SY.admin's `cognition_clear`, run by Archi on CONFIRM, had worker1's cognition drop
+  its 9 communications and 2 episodes; the next turn started fresh. Since 0.1.107 the factory
+  reset clears every hive's cognition this way, so §11.5's and §12.5's "a worker's file stays" no
+  longer holds.

@@ -42,7 +42,7 @@ no change required
    4. A-103 [General/agent tools]: the tool cards stop restating the code's values by hand
       (ai.generic). ✅ on 8.x.
    5. A-120 [Archi]: Archi takes a page down, through its confirmation (SY.admin). ✅ on 8.x.
-2. **Second release, 0.1.107:**
+2. **Second release, 0.1.107** ✅ live and checked on 8.x (2026-11-07):
    1. 🧠 Cognition's numbers, on A-163's output: whether a quarrel between two people is news, and
       whether the gate's thresholds become configuration. ✅ The operator's call (2026-11-07): the
       gate stays as it is, a quarrel it passes is news, and the thresholds wait for an automatic
@@ -50,10 +50,11 @@ no change required
       rule.
    2. 🧠 A-167 [WF]: an episode names its people, and says "the agent" only of the AI agent (the
       narrator's rule, SY.cognition), with A-160 [General/ops]: the factory reset clears the
-      workers' cognition too (SY.admin and SY.cognition). One branch: the same binary.
+      workers' cognition too (SY.admin and SY.cognition). One branch: the same binary. ✅ on 8.x.
    3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
-      loop (ai.generic; alone if the fix reaches the shared AI SDK).
-3. **Third release, 0.1.108:**
+      loop (ai.generic; alone if the fix reaches the shared AI SDK). Both providers can; the fix
+      reaches the shared AI SDK, so it goes alone, as 0.1.108.
+3. **Third release, 0.1.109:**
    1. A-122 [General/upgrade]: an action, reachable by Archi, that returns a base runtime to its
       package's version (SY.admin and the package's seed).
    2. 🧠 What stays open of A-137 ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §12.6),
@@ -127,8 +128,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   A-156's first); the rest agreed in the chat of 2026-11-06 and out in 0.1.104
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
-- A-167 🟡 An episode between two people calls one of them "the agent" (0.1.106's gate).
-- A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
+- A-150 🔵 With tools, an agent's response contract is not enforced by the provider. *Built for
+  0.1.108, alone: it touches the shared AI SDK.*
 
 ### io.web
 
@@ -166,8 +167,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
-- A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
-  A-158).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - A-164 🔵 The vault's resource types leave out four the product uses (PENDING-BUGS PB-3).
 - A-165 🟡 After a join over the password channel, password logins stay on (PENDING-BUGS PB-6).
@@ -1246,7 +1245,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-167 [WF] 🟡 OPEN (found 2026-11-07, 0.1.106's gate on 8.x; read in the episode and the turns) — An episode between two people calls one of them "the agent"
+### A-167 [WF] ✅ VALIDATED ON 8.x (0.1.107, 2026-11-07; found 2026-11-07, 0.1.106's gate on 8.x; read in the episode and the turns) — An episode between two people calls one of them "the agent"
 
 - **What happens:** the episode made of A's quarrel with B (`gate0206-handover4`, friction,
   intensity 9, about A and B) says A accused B, named by ILK, of lying, rightly. It then says A
@@ -1260,6 +1259,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   operator's call on whether such a quarrel is news.
 - **The operator (2026-11-07):** the rule agreed, for 0.1.107. A quarrel the gate passes stays
   news.
+- **Fixed in 0.1.107:** a narrator's rule for everything it writes (the memory, the feeling and the
+  episode): "the agent" is only the AI agent, never a person, even one who answers for a company or
+  whom the speaker calls an agent; a turn between people is not the agent's (the review round
+  widened it from the episode alone).
+- **Validated on 8.x** (gate0206, thread `gate0206-handover5`): the episode made of the same
+  quarrel (friction, intensity 8, about A and B) has A accusing *"the billing representative"* of
+  lying and intending *"to have the representative removed from the account"*. "The agent" stays
+  only where the AI agent is meant, in the memory: *"the agent had already told [A] that billing
+  promised to send the credit note today"*.
 
 ### A-166 [General/add_hive] 🔵 TO VERIFY (PENDING-BUGS U-6, found 2026-07-30; read in the code 2026-11-07) — Whether every join pushes the vendor before its folder syncs
 
@@ -1487,7 +1495,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   1000 pages. This is as designed, and small beside the turn's two model calls.
 - **Status:** closed. The factory reset on the workers stays open as A-160.
 
-### A-160 [General/ops] 🟡 OPEN (found 2026-11-06, building A-158; read in the code) — The factory reset clears the motherbee's cognition, not a worker's
+### A-160 [General/ops] ✅ VALIDATED ON 8.x (0.1.107, 2026-11-07, the action; found 2026-11-06, building A-158; read in the code) — The factory reset clears the motherbee's cognition, not a worker's
 
 - **What it does:** `fluxbee-factory-reset` runs on the motherbee. It truncates every table of
   `fluxbee_storage` and removes this hive's SY.cognition state (`cognition_paths`).
@@ -1499,6 +1507,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **A fix for later:** an explicit SY.admin action that tells a hive's SY.cognition to drop its
   communications, which the reset calls for each worker.
 - **Status:** recorded; the reset's docstring says it. The operator's call on when.
+- **Fixed in 0.1.107:**
+  - SY.admin's `cognition_clear` (`POST /hives/{hive}/cognition/clear`): it needs the operator's
+    CONFIRM, the executor runs it, and it is closed to the mesh (`MeshAccess::Nobody`);
+    `send_node_message` refuses a `COGNITION_CLEAR`.
+  - SY.cognition takes `COGNITION_CLEAR` only from SY.admin@motherbee. It drops every communication
+    and episode it keeps, in memory, in its file (then VACUUM and a WAL checkpoint) and in its
+    region, keeps running, and answers what it removed; a turn in flight brings nothing back.
+  - The factory reset clears every hive's cognition, the motherbee's included, through the action
+    and before it stops anything; SY.storage and the frontdesk stay down, masked, for the truncate,
+    since the orchestrator's watchdog starts a stopped unit again (the review round).
+- **Validated on 8.x** (the action; the reset itself is not run on 8.x): asked by the operator,
+  Archi staged one step on worker1, said it cannot be undone, and ran it on CONFIRM. Worker1's
+  cognition removed 9 communications and 2 episodes from its file (6 and 2 held), and its file
+  kept no row and an empty WAL. The command log shows `origin: executor`. AI.pruebas' next turn
+  started a fresh communication, and the motherbee kept its copies of the episodes.
 
 ### A-159 [General/identity] 🔵 TO DESIGN, a chapter of its own (the operator, 2026-11-06, reviewing where cognition keeps its state) — An ILK is deleted for good while data elsewhere refers to it
 
@@ -1811,6 +1834,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **What it breaks:** an agent with tools can answer outside its contract. The answer is then
   `invalid_structured_output`, and the WF's catch takes it.
 - **To evaluate:** whether the provider can enforce the schema inside the tool loop.
+- **Evaluated and built (2026-11-07), for 0.1.108, alone:** it touches the shared AI SDK.
+  - Both providers can. Anthropic holds the text to `output_config.format` next to `tools`; OpenAI
+    holds it to `text.format` when the contract is `strict`, which needs every property required.
+  - The SDK sends the contract's schema on every tool turn. A 400 that refuses it, from either
+    provider, has that turn asked again without it (the review round added OpenAI's).
+  - **What it does not reach:** a WF asks an agent with a menu (§5.3.1), which has no schema, and
+    wfcel refuses a `response_envelope` in a WF's action. The fix reaches a contract that a caller
+    other than a WF writes, or that a WF's `forward` keeps. Whether a menu becomes a schema is the
+    operator's call: Anthropic can hold a root `anyOf`, and OpenAI's strict mode cannot.
 
 ### A-149 [IO] 🟡 OPEN (read 2026-10-16 in the A-68 analysis, checked again 2026-11-03; recorded at the WF close) — The IO family has no written standard, and its nodes answer health and config each their own way
 
@@ -2379,9 +2411,11 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **A-163** went out in 0.1.106 (2026-11-07): the gate says why it turns a proposal down. Its
     gate made one episode of A's quarrel with B, intensity 9, and turned one down for weak evidence;
     the episode found A-167.
-  - **Open:** the operator's call on the numbers, whether a quarrel between two people is news
-    (§12.6); A-167; A-160; §12.6's handing over between agents, a conversation that reaches an
-    agent late, and a message split in two batches on a new thread.
+  - **The operator's call on the numbers** (2026-11-07): a quarrel the gate passes is news, and the
+    gate stays as it is (§12.6). **A-167 and A-160** went out in 0.1.107: the narrator says "the
+    agent" only of the AI agent, and the factory reset clears every hive's cognition.
+  - **Open:** §12.6's handing over between agents, a conversation that reaches an agent late, and a
+    message split in two batches on a new thread.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
