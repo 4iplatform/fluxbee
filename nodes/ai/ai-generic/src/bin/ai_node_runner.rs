@@ -73,6 +73,10 @@ const READ_BLOB_WAIT: Duration = Duration::from_secs(20);
 /// more, its text included. Its other two limits, 20 MiB a file and 40 MiB in all, are out of the
 /// generators' reach: a file holds what the model wrote in one call.
 const REPLY_FILES_MAX: usize = 8;
+/// The longest name, in bytes, of a file a tool makes: the AI SDK's `AiUserArtifact` refuses a
+/// longer one. The SDK keeps its limit private, so the cards say this one, and a test holds it to
+/// the SDK's check (FINDINGS A-103).
+const ARTIFACT_FILENAME_MAX_BYTES: usize = 128;
 /// The prompt of an agent with no definition: its ILK has no hashes, none of its assets loaded, or
 /// the node has not found its agent ILK (yet). The model then only answers that it is unconfigured.
 const DEFAULT_UNCONFIGURED_AGENT_PROMPT: &str = r#"You are an AI agent that has not yet received its operational configuration.
@@ -3762,14 +3766,26 @@ fn color_from_seed(seed: &str) -> [u8; 3] {
     ]
 }
 
+// The images `build_raster_bytes` draws, in pixels: the width and the height an image has when
+// the model gives none, and the range each is kept in. The PNG and JPEG cards say them: their
+// input schema is built from these, and a test holds their limit's text to them (FINDINGS A-103).
+const RASTER_DEFAULT_WIDTH: u32 = 1200;
+const RASTER_DEFAULT_HEIGHT: u32 = 800;
+const RASTER_SIDE_MIN: u32 = 64;
+const RASTER_SIDE_MAX: u32 = 2400;
+
 fn build_raster_bytes(
     bands: &[String],
     width: Option<u32>,
     height: Option<u32>,
     format: image::ImageFormat,
 ) -> fluxbee_ai_sdk::Result<Vec<u8>> {
-    let width = width.unwrap_or(1200).clamp(64, 2400);
-    let height = height.unwrap_or(800).clamp(64, 2400);
+    let width = width
+        .unwrap_or(RASTER_DEFAULT_WIDTH)
+        .clamp(RASTER_SIDE_MIN, RASTER_SIDE_MAX);
+    let height = height
+        .unwrap_or(RASTER_DEFAULT_HEIGHT)
+        .clamp(RASTER_SIDE_MIN, RASTER_SIDE_MAX);
     let mut image = image::RgbImage::from_pixel(width, height, image::Rgb([245, 245, 245]));
     let effective_bands = if bands.is_empty() {
         vec!["generated".to_string()]
@@ -3871,8 +3887,17 @@ fn artifact_tool_limit() -> String {
 /// `extensions`.
 fn filename_rules(extensions: &str) -> String {
     format!(
-        "it ends in {extensions}, with at most 128 bytes and no `/`, `\\`, `..` or control \
-         character"
+        "it ends in {extensions}, with at most {ARTIFACT_FILENAME_MAX_BYTES} bytes and no `/`, \
+         `\\`, `..` or control character"
+    )
+}
+
+/// What `artifact_filename_invalid` means, for a file whose name ends in `extensions`;
+/// `outcome` says what the call did not do.
+fn filename_invalid_meaning(extensions: &str, outcome: &str) -> String {
+    format!(
+        "`filename` is empty, longer than {ARTIFACT_FILENAME_MAX_BYTES} bytes, has `/`, `\\`, \
+         `..` or a control character, or does not end in {extensions}. {outcome}"
     )
 }
 
@@ -3932,10 +3957,7 @@ fn artifact_tool_card(spec: ArtifactToolSpec) -> ToolCard {
         errors: vec![
             ToolErrorCode::new(
                 "artifact_filename_invalid",
-                format!(
-                    "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a control \
-                     character, or does not end in {extensions}. No file was made."
-                ),
+                filename_invalid_meaning(extensions, "No file was made."),
             ),
             ToolErrorCode::new(
                 "reply_files_full",
@@ -3981,20 +4003,21 @@ fn raster_properties() -> Value {
         "bands": strings_schema("One horizontal band per entry, top to bottom."),
         "width": {
             "type": "integer",
-            "minimum": 64,
-            "maximum": 2400,
-            "description": "Pixels; 1200 by default."
+            "minimum": RASTER_SIDE_MIN,
+            "maximum": RASTER_SIDE_MAX,
+            "description": format!("Pixels; {RASTER_DEFAULT_WIDTH} by default.")
         },
         "height": {
             "type": "integer",
-            "minimum": 64,
-            "maximum": 2400,
-            "description": "Pixels; 800 by default."
+            "minimum": RASTER_SIDE_MIN,
+            "maximum": RASTER_SIDE_MAX,
+            "description": format!("Pixels; {RASTER_DEFAULT_HEIGHT} by default.")
         }
     })
 }
 
-/// What the PNG and JPEG generators can draw.
+/// What the PNG and JPEG generators can draw. `ArtifactToolSpec` takes a generator's limits as
+/// static text, so a test holds the sizes this says to the `RASTER_*` constants.
 const RASTER_TOOL_LIMITS: &[&str] = &[
     "It draws only horizontal bands of color, one per entry of `bands`, top to bottom: each \
      entry's text picks its color and is not drawn. Without `bands`, one color fills the image.",
@@ -4221,11 +4244,18 @@ fn publish_tool_error(message: &str, retryable: bool) -> Value {
     })
 }
 
+/// How long `publish_html_page` waits for SY.admin's `publish_artifact`, as its card says. SY.admin
+/// gives one publication less (`PUBLISH_ARTIFACT_BUDGET`), so its answer comes before the wait
+/// ends.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[async_trait]
 impl AgentTool for PublishHtmlTool {
     /// The link's life and the sandbox are SY.admin's and the edge's: `publish_artifact` without
-    /// `expires_in_secs` (PUBLICATION_DEFAULT_EXPIRES_SECS, 24 h) and the edge's
-    /// `sandboxed-html-v1` CSP.
+    /// `expires_in_secs`, so SY.admin's `PUBLICATION_DEFAULT_EXPIRES_SECS`, and the edge's
+    /// `sandboxed-html-v1` CSP. SY.admin's test
+    /// `the_publish_html_page_card_says_the_default_lifetime` holds the hours the card says to
+    /// that default, in the repository's catalog (FINDINGS A-103).
     fn card() -> ToolCard {
         ToolCard {
             name: "publish_html_page".to_string(),
@@ -4233,20 +4263,23 @@ impl AgentTool for PublishHtmlTool {
             when_to_use: "Only when the user asks for a page to open or share by link. To hand \
                 over a file instead, use `generate_html_artifact`."
                 .to_string(),
-            limits: [
+            limits: vec![
                 "One self-contained HTML file, served under a sandbox: its inline scripts and \
                  styles run, but it loads nothing from the network (no fetch, no outside \
                  scripts, stylesheets, fonts or images); images and fonts only inline, as \
-                 `data:` URLs; forms do not submit.",
+                 `data:` URLs; forms do not submit."
+                    .to_string(),
                 "The link is the key: anyone who has it can open the page, so put nothing \
                  private in it. It expires 24 hours after publishing, and you cannot extend it; \
-                 `unpublish_html_page` takes it down sooner.",
-                "Publishing takes up to two minutes. Your reply is the text you write after your \
-                 last tool call; text written alongside a call is not sent. Give the link there: a \
-                 reply without it gets it added, on a line of its own.",
-            ]
-            .map(String::from)
-            .into(),
+                 `unpublish_html_page` takes it down sooner."
+                    .to_string(),
+                format!(
+                    "Publishing takes up to {} s. Your reply is the text you write after your \
+                     last tool call; text written alongside a call is not sent. Give the link \
+                     there: a reply without it gets it added, on a line of its own.",
+                    PUBLISH_TIMEOUT.as_secs()
+                ),
+            ],
             present_when: "the node has its identity: it was launched with its ILK".to_string(),
             input: json!({
                 "type": "object",
@@ -4291,8 +4324,7 @@ impl AgentTool for PublishHtmlTool {
             errors: vec![
                 ToolErrorCode::new(
                     "artifact_filename_invalid",
-                    "`filename` is empty, longer than 128 bytes, has `/`, `\\`, `..` or a \
-                     control character, or does not end in .html or .htm. Nothing was published.",
+                    filename_invalid_meaning(".html or .htm", "Nothing was published."),
                 ),
                 ToolErrorCode::new(
                     "publish_failed",
@@ -4356,7 +4388,7 @@ impl AgentTool for PublishHtmlTool {
                 target: None,
                 params: json!({ "blob_ref": blob_ref }),
                 request_id: None,
-                timeout: std::time::Duration::from_secs(120),
+                timeout: PUBLISH_TIMEOUT,
             })
             .await
         {
@@ -5146,6 +5178,20 @@ fn text_piece(text: &str, offset: u64, max_bytes: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// A size as the model reads it, in a card or a tool's message: in MiB or KiB when it is a whole
+/// number of them, else in bytes, so a limit is never rounded into another.
+fn readable_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 #[async_trait]
 impl AgentTool for ReadBlobTool {
     /// It reads with the SDK's `read_blob_by_name`: no link followed, the bytes checked against the
@@ -5162,17 +5208,26 @@ impl AgentTool for ReadBlobTool {
                 again: every attachment shows its blob name, `<name>_<hash16>.<ext>`, and a cut \
                 one also the offset to read on from. Read a long file a piece at a time."
                 .to_string(),
-            limits: [
+            limits: vec![
                 "A text file (csv, json, md, html, txt, logs…), judged by its content, whatever \
                  its name: a piece with a NUL byte, as binary files have, is `not_text`. Bytes \
-                 that are not UTF-8 become U+FFFD, as in an attachment.",
-                "Files up to 10 MiB. Each call returns up to 64 KiB of text from `offset`, in bytes \
-                 of the text, cut where a character starts; read on from `next_offset`.",
-                "Up to 192 KiB of text in all for one message, over all its calls.",
-                "It waits up to 20 s for a blob still on its way from another hive.",
-            ]
-            .map(String::from)
-            .into(),
+                 that are not UTF-8 become U+FFFD, as in an attachment."
+                    .to_string(),
+                format!(
+                    "Files up to {}. Each call returns up to {} of text from `offset`, in bytes \
+                     of the text, cut where a character starts; read on from `next_offset`.",
+                    readable_size(READ_BLOB_MAX_BYTES),
+                    readable_size(READ_BLOB_PIECE_BYTES as u64)
+                ),
+                format!(
+                    "Up to {} of text in all for one message, over all its calls.",
+                    readable_size(READ_BLOB_BUDGET_BYTES as u64)
+                ),
+                format!(
+                    "It waits up to {} s for a blob still on its way from another hive.",
+                    READ_BLOB_WAIT.as_secs()
+                ),
+            ],
             present_when: "always: every hive with agents has a blob store".to_string(),
             input: json!({
                 "type": "object",
@@ -5246,18 +5301,27 @@ impl AgentTool for ReadBlobTool {
                 ),
                 ToolErrorCode::new(
                     "not_found",
-                    "No blob of this hive has that name, after waiting 20 s for one on its way, \
-                     or what is there is not that blob.",
+                    format!(
+                        "No blob of this hive has that name, after waiting {} s for one on its \
+                         way, or what is there is not that blob.",
+                        READ_BLOB_WAIT.as_secs()
+                    ),
                 ),
                 ToolErrorCode::new(
                     "too_large",
-                    "The file is over 10 MiB, the most it reads.",
+                    format!(
+                        "The file is over {}, the most it reads.",
+                        readable_size(READ_BLOB_MAX_BYTES)
+                    ),
                 ),
                 ToolErrorCode::new(
                     "read_budget_exhausted",
-                    "This message has read 192 KiB of blob text, the most one message reads. Not \
-                     retryable within this message: answer with what you have read; a later \
-                     message can read on.",
+                    format!(
+                        "This message has read {} of blob text, the most one message reads. Not \
+                         retryable within this message: answer with what you have read; a later \
+                         message can read on.",
+                        readable_size(READ_BLOB_BUDGET_BYTES as u64)
+                    ),
                 ),
             ],
         }
@@ -5272,9 +5336,9 @@ impl AgentTool for ReadBlobTool {
             failed(
                 "read_budget_exhausted",
                 &format!(
-                    "this message has read {} KiB of blob text, the most one message reads; \
-                     answer with what you have read",
-                    READ_BLOB_BUDGET_BYTES / 1024
+                    "this message has read {} of blob text, the most one message reads; answer \
+                     with what you have read",
+                    readable_size(READ_BLOB_BUDGET_BYTES as u64)
                 ),
             )
         };
@@ -5302,7 +5366,10 @@ impl AgentTool for ReadBlobTool {
             Err(fluxbee_sdk::blob::BlobError::TooLarge { size, .. }) => {
                 return failed(
                     "too_large",
-                    &format!("'{blob_name}' has {size} bytes; the most it reads is 10 MiB"),
+                    &format!(
+                        "'{blob_name}' has {size} bytes; the most it reads is {}",
+                        readable_size(READ_BLOB_MAX_BYTES)
+                    ),
                 );
             }
             Err(fluxbee_sdk::blob::BlobError::NotFound(_)) => {
@@ -9646,6 +9713,7 @@ mod tests {
 
         // The card says what the code does.
         let card = GeneratePdfArtifactTool::card();
+        assert!(card.limits[0].contains(&format!("Helvetica {PDF_FONT_SIZE} pt")));
         assert!(card.limits[0].contains(&format!("{PDF_LINES_PER_PAGE} lines a page")));
     }
 
@@ -11851,13 +11919,74 @@ mod tests {
             );
             assert_eq!(card.validate(), Ok(()), "{}", card.name);
         }
+        let limit = format!("{ARTIFACT_FILENAME_MAX_BYTES} bytes");
         for card in [GeneratePdfArtifactTool::card(), PublishHtmlTool::card()] {
             let filename = card.input["properties"]["filename"]["description"]
                 .as_str()
                 .expect("the filename's description");
-            assert!(filename.contains("at most 128 bytes"), "{filename}");
-            assert!(!card.model_definition().description.contains("128 bytes"));
+            assert!(filename.contains(&format!("at most {limit}")), "{filename}");
+            assert!(!card.model_definition().description.contains(&limit));
         }
+    }
+
+    // --- The cards say the code's values (FINDINGS A-103) ---
+
+    /// The cards' limit on a file's name is the AI SDK's, which the SDK keeps private: a name of
+    /// exactly `ARTIFACT_FILENAME_MAX_BYTES` bytes makes its file, and one a byte longer does not,
+    /// though its two-byte letters make it far fewer characters: the SDK counts bytes, as the
+    /// cards say.
+    #[tokio::test]
+    async fn the_cards_filename_limit_is_the_sdks() {
+        let tool = GenerateTextArtifactTool {
+            files: Arc::new(ReplyFiles::default()),
+        };
+        let stem_bytes = ARTIFACT_FILENAME_MAX_BYTES - ".txt".len();
+        let stem = format!(
+            "{}{}",
+            "ñ".repeat(stem_bytes / 2),
+            "a".repeat(stem_bytes % 2)
+        );
+        let longest = format!("{stem}.txt");
+        let too_long = format!("{stem}a.txt");
+        assert_eq!(longest.len(), ARTIFACT_FILENAME_MAX_BYTES);
+        assert!(too_long.chars().count() < ARTIFACT_FILENAME_MAX_BYTES);
+
+        let made = tool
+            .call(json!({"filename": longest, "content": "hola"}))
+            .await
+            .expect("the tool");
+        assert_eq!(made["status"], json!("ok"), "{made}");
+        let refused = tool
+            .call(json!({"filename": too_long, "content": "hola"}))
+            .await
+            .expect("the tool");
+        assert_eq!(
+            refused["error_code"],
+            json!("artifact_filename_invalid"),
+            "{refused}"
+        );
+    }
+
+    /// The PNG and JPEG cards say the sizes `build_raster_bytes` draws: their limits are static
+    /// text, so this holds them to the constants the drawing and the input schema use.
+    #[test]
+    fn the_raster_cards_say_the_sizes_drawn() {
+        let says = |text: String| RASTER_TOOL_LIMITS.iter().any(|limit| limit.contains(&text));
+        assert!(says(format!(
+            "{RASTER_DEFAULT_WIDTH} x {RASTER_DEFAULT_HEIGHT} pixels by default"
+        )));
+        assert!(says(format!(
+            "kept between {RASTER_SIDE_MIN} and {RASTER_SIDE_MAX}"
+        )));
+    }
+
+    /// A size the model reads is in the largest unit it is a whole number of, never rounded.
+    #[test]
+    fn a_size_reads_in_whole_units() {
+        assert_eq!(readable_size(10 * 1024 * 1024), "10 MiB");
+        assert_eq!(readable_size(192 * 1024), "192 KiB");
+        assert_eq!(readable_size(1024 * 1024 + 1024), "1025 KiB");
+        assert_eq!(readable_size(1500), "1500 bytes");
     }
 
     // --- Who runs the control plane ---
@@ -12550,6 +12679,11 @@ mod tests {
         let admin = async {
             let publish = harness.next_outgoing().await.expect("publish_artifact");
             assert_eq!(publish.meta.action.as_deref(), Some("publish_artifact"));
+            // No lifetime of the tool's own: the page lives SY.admin's default, the hours its
+            // card says (FINDINGS A-103).
+            let params = &publish.payload["params"];
+            assert!(params["blob_ref"].is_object(), "{params}");
+            assert_eq!(params.get("expires_in_secs"), None, "{params}");
             let answer = admin_reply(
                 &harness,
                 &publish,

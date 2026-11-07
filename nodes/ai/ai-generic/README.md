@@ -294,6 +294,11 @@ rendered from the card, and so are the catalog and the `NODE_HELP` answer.
   `dist/runtimes/ai.generic/<version>/tools.json`. A test (`the_tool_catalog_matches_the_cards`)
   fails when they differ from the code; it writes them again with
   `UPDATE_AGENT_TOOLS_CATALOG=1`.
+- **A card's values are the code's** (FINDINGS A-103): a limit, a size or a wait that a card
+  states is written from the constant the tool uses. Where the card's text is static, or the value
+  is another component's, a test holds the text to it: the AI SDK's limit on a file's name, which
+  the SDK keeps private, is tested at its edge, and SY.admin's default lifetime of a published page
+  by a test of SY.admin's that reads the catalog.
 - **Which tools a message gets:**
   - always the ten file generators, csv, text, json, markdown, html, pdf, xlsx, docx, png and
     jpeg. Each keeps its file for the reply and answers the model only the file's name, type and

@@ -28028,6 +28028,45 @@ mod tests {
         assert_eq!(time_left(now, Duration::from_secs(30)), None);
     }
 
+    /// ai.generic's `publish_html_page` asks `publish_artifact` for no lifetime, so its pages live
+    /// this default, and its card says how long in hours. ai.generic cannot read a constant of
+    /// SY.admin's, so the check is here, against the repository's tool catalog, which ai.generic's
+    /// tests keep equal to its cards (FINDINGS A-103).
+    #[test]
+    fn the_publish_html_page_card_says_the_default_lifetime() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../docs/reference/agent-tools.json"))
+                .expect("the tool catalog");
+        let limits = catalog["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"] == "publish_html_page")
+            })
+            .map(|card| card["limits"].clone())
+            .expect("publish_html_page's card");
+        assert!(
+            PUBLICATION_DEFAULT_EXPIRES_SECS.is_multiple_of(3600),
+            "the card says whole hours"
+        );
+        let says = format!(
+            "It expires {} hours after publishing",
+            PUBLICATION_DEFAULT_EXPIRES_SECS / 3600
+        );
+        assert!(
+            limits
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|limit| limit.contains(&says)),
+            "publish_html_page's card does not say \"{says}\": change the card in \
+             nodes/ai/ai-generic, then write the catalog again (its test \
+             the_tool_catalog_matches_the_cards): {limits}"
+        );
+    }
+
     /// The scan is a nudge: a worker that does not take it still gets its blob awaited.
     #[tokio::test]
     async fn a_scan_that_fails_still_awaits_the_blob() {

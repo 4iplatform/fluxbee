@@ -1525,7 +1525,7 @@ Publish an HTML page at a public link, and get the link.
 - **Limits:**
   - One self-contained HTML file, served under a sandbox: its inline scripts and styles run, but it loads nothing from the network (no fetch, no outside scripts, stylesheets, fonts or images); images and fonts only inline, as `data:` URLs; forms do not submit.
   - The link is the key: anyone who has it can open the page, so put nothing private in it. It expires 24 hours after publishing, and you cannot extend it; `unpublish_html_page` takes it down sooner.
-  - Publishing takes up to two minutes. Your reply is the text you write after your last tool call; text written alongside a call is not sent. Give the link there: a reply without it gets it added, on a line of its own.
+  - Publishing takes up to 120 s. Your reply is the text you write after your last tool call; text written alongside a call is not sent. Give the link there: a reply without it gets it added, on a line of its own.
 - **Returns:** `{status: "ok", url, publication_id, expires_at}`: the public link, the publication's id and when it expires (Unix seconds).
 - **Errors:**
   - `artifact_filename_invalid`: `filename` is empty, longer than 128 bytes, has `/`, `\`, `..` or a control character, or does not end in .html or .htm. Nothing was published.
