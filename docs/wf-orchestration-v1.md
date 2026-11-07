@@ -616,8 +616,8 @@ todo probado"*.
      the contract invalid (`ai_runtime_error`).
    - The history keeps the whole object as the agent's turn, so a blank text never leaves a blank
      turn (Anthropic refuses one).
-   - With tools, the contract is an instruction in the system prompt, checked afterwards; the
-     provider enforces it only on the call without tools. The instruction asks for a value of its
+   - With tools, the contract is an instruction in the system prompt; until FINDINGS A-150 the
+     provider enforced it only on the call without tools. The instruction asks for a value of its
      type in every field, never null.
    - **Since FINDINGS A-150** the provider enforces it inside the tool loop too: every turn of the
      loop asks for the contract's schema next to the tools, as the call without tools does
@@ -627,10 +627,13 @@ todo probado"*.
        thinking). A model without structured outputs refuses it with a 400: that turn is asked
        again without it, as before.
      - OpenAI takes it as `text.format` next to `tools`, and holds the text to it only when the
-       contract is `strict`, which OpenAI accepts only with every property required.
-     - The instruction and the check afterwards stay: the instruction for OpenAI without
-       `strict` and for a model without structured outputs, the check as the backstop, since a
-       refusal may still miss the schema (a cut answer is an error of its own).
+       contract is `strict`, which OpenAI accepts only with every property required. A 400 that
+       names `text.format` (a strict contract with an optional property, or a model without
+       `json_schema`) has that turn asked again without it.
+     - The instruction stays, for OpenAI without `strict` and for a model without structured
+       outputs. With tools, the object is checked afterwards only when the contract names a
+       `text_field`; without one, the reply is the model's text as it is, which a refusal may
+       leave outside the schema (a cut answer is an error of its own).
      - It reaches a contract that a caller other than a WF writes, or that a WF's `forward` keeps
        from the message it forwards: since Case 3 a WF asks an agent with a menu (§5.3.1), which
        has no schema, and wfcel refuses a `response_envelope` in a WF's action.

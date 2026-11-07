@@ -139,10 +139,12 @@ let answer = result.final_assistant_text;
     text to the schema and leave its tool calls and its thinking free. A model that refuses
     `output_config` with a 400 has that turn asked again without it.
   - OpenAI gets `text.format`, and holds the text to it only when `spec` is `strict`, which OpenAI
-    accepts only with every property required.
-  - The runner does not check the answer, and adds no instruction: the caller does both, as
-    ai.generic does with a response contract (`build_output_schema_fallback_instruction` in its
-    system prompt, the object checked afterwards).
+    accepts only with every property required. A 400 that names `text.format` (a strict schema
+    with an optional property, or a model without `json_schema`) has that turn asked again without
+    it.
+  - The runner does not check the answer, and adds no instruction: the caller does, as ai.generic
+    does with a response contract (`build_output_schema_fallback_instruction` in its system prompt;
+    the object checked afterwards only when the contract names a `text_field`).
   - The schema is the same on every turn of a run, so the turns still read Anthropic's prompt
     cache; a different `output_config` invalidates it.
 

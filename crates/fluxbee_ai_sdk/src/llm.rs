@@ -939,34 +939,55 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             });
         }
 
-        let auth = format!("Bearer {}", self.client.api_key);
-        let mut call =
-            self.client
-                .account
-                .begin(AiProvider::OpenAi, &self.model, UsageKind::FunctionTurn);
-        let response = match self
-            .client
-            .http
-            .post(&self.client.base_url)
-            .header(AUTHORIZATION, auth)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                call.failed();
-                return Err(err.into());
+        let mut asked_without_format = false;
+        let value = loop {
+            let auth = format!("Bearer {}", self.client.api_key);
+            let mut call =
+                self.client
+                    .account
+                    .begin(AiProvider::OpenAi, &self.model, UsageKind::FunctionTurn);
+            let response = match self
+                .client
+                .http
+                .post(&self.client.base_url)
+                .header(AUTHORIZATION, auth)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    call.failed();
+                    return Err(err.into());
+                }
+            };
+            let (status, value) = openai_read_answer(&mut call, response).await?;
+            if status.is_success() {
+                break value;
             }
-        };
-
-        let (status, value) = openai_read_answer(&mut call, response).await?;
-        if !status.is_success() {
+            // A schema OpenAI cannot hold, a strict one with an optional property or one a model
+            // without `json_schema` refuses, comes back as a 400 that names `text.format`: the
+            // turn is asked again without it, and the schema reaches the model only as its
+            // caller's instruction, as on every tool turn before FINDINGS A-150 and as Anthropic's
+            // turn does with `output_config`.
+            if !asked_without_format
+                && body.get("text").is_some()
+                && openai_text_format_refused(status.as_u16(), &value)
+            {
+                asked_without_format = true;
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("text");
+                }
+                tracing::warn!(
+                    "openai model refused text.format on a tool turn; retrying without it"
+                );
+                continue;
+            }
             // Same clean format as the Responses path (audit B6/M3): no raw body (key echo), and
             // it carries type/param/message so the consumer can classify + scrub.
             return Err(openai_status_error(status.as_u16(), &value));
-        }
+        };
         // A turn cut at the token limit can end inside a tool call's arguments: it is an error,
         // as on the plain path and on Anthropic's turns, never a turn to act on.
         openai_check_truncation(&value)?;
@@ -1374,6 +1395,15 @@ fn truncated_answer_error(provider: AiProvider, limit: &str) -> AiSdkError {
 /// structured-outputs feature (audit M4), so `generate` can retry once with a prompt-instruction
 /// fallback instead of surfacing the raw 400, and a tool turn once without it. Conservative — only
 /// a 400 that names the feature.
+/// An OpenAI 400 that refuses the `text.format` a tool turn sent: its `param` names it.
+fn openai_text_format_refused(status: u16, body: &Value) -> bool {
+    status == 400
+        && body
+            .pointer("/error/param")
+            .and_then(Value::as_str)
+            .is_some_and(|param| param.starts_with("text.format"))
+}
+
 fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
     let AiSdkError::Protocol(msg) = err else {
         return false;
@@ -3201,6 +3231,60 @@ providers:
 
         let (body, _) = anthropic_tool_turn(Some("You are AI.sales."), ask(), tools(), None).await;
         assert_eq!(body.get("output_config"), None);
+    }
+
+    /// A strict schema with an optional property is one OpenAI refuses, naming `text.format`: the
+    /// turn is asked again without it, the caller's instruction all that steers the answer.
+    #[tokio::test]
+    async fn an_openai_tool_turn_is_asked_again_without_a_schema_it_refuses() {
+        let (base_url, bodies, handle) = spawn_responses_server(vec![
+            (
+                "400 Bad Request",
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "param": "text.format.schema",
+                    "message": "Invalid schema: 'required' must list every key in properties."
+                }}),
+            ),
+            (
+                "200 OK",
+                json!({"id": "resp_2", "status": "completed", "output_text": "listo"}),
+            ),
+        ]);
+        let turn = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model("gpt-5.5", None, ModelSettings::default())
+            .run_turn(FunctionModelTurnRequest {
+                items: vec![FunctionLoopItem::UserText {
+                    content: "the report, please".to_string(),
+                }],
+                tools: vec![tool_definition("thread_state_get")],
+                output_schema: Some(answer_schema()),
+            })
+            .await
+            .expect("the turn, asked again");
+        handle.join().expect("server thread");
+        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+
+        let mut refused = bodies.recv().expect("the refused request");
+        let asked_again = bodies.recv().expect("the request asked again");
+        assert!(refused
+            .as_object_mut()
+            .and_then(|body| body.remove("text"))
+            .is_some());
+        assert_eq!(asked_again, refused);
+        assert!(openai_text_format_refused(
+            400,
+            &json!({"error": {"param": "text.format.schema"}})
+        ));
+        assert!(!openai_text_format_refused(
+            400,
+            &json!({"error": {"param": "input"}})
+        ));
+        assert!(!openai_text_format_refused(
+            429,
+            &json!({"error": {"param": "text.format"}})
+        ));
     }
 
     /// A model without structured outputs refuses `output_config` with a 400 that names it: the
