@@ -158,6 +158,17 @@ If a worker hive does not exist yet, include topology/VPN creation in desired st
 
 **Egress hives.** When internal hives have no internet access and need outbound HTTPS, provision a hive with `add_hive role=egress`. It runs a minimal profile (only `SY.config.routes` plus the implicit `RT.gateway`/`SY.orchestrator`) and applies OS-level NAT so internal hives can reach the internet through it. Egress provisioning requires host-specific params in the `add_hive` body under `egress` (`lan_cidr`, `wan_iface`, `lan_iface`; optional `edge_ip`/`ipv6`) — query `get_admin_action_help add_hive` for the field contract. If the deployment already has a physical router for internet, do **not** create an egress hive; instead workers receive the gateway route automatically once motherbee declares `egress.gateway_ip`.
 
+**A join over a password asks the operator one thing first** (FINDINGS A-165). A join that logs in
+with `ssh_password` revokes its own access at its end, and nothing else closes password logins on
+the box. So with `ssh_password`, `add_hive` requires `harden_ssh`, and refuses the request without
+it:
+- `true` turns password logins off at the join's end. Afterwards only the hypervisor's console,
+  or a key of the operator's own, gets in.
+- `false` leaves them on, and the join's answer warns about it.
+
+Ask the operator which, with that consequence, and never choose for them. A join with `ssh_key`
+needs no such answer.
+
 ---
 
 ## 4. Node Family Guidance

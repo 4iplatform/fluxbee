@@ -504,14 +504,15 @@ POST /hives                          // action: add_hive  (NOT /hives/<hive>/hiv
   "address": "10.10.10.20",
   "ssh_user": "fluxops",
   "ssh_password": "<template credential>",   // or ssh_key
-  "harden_ssh": true                 // <-- NOT THE DEFAULT. Always set it.
+  "harden_ssh": true                 // required with ssh_password since 0.1.109 (A-165)
 }
 ```
 
-### ⚠️ `harden_ssh` comes as `false`
+### ⚠️ `harden_ssh` with a password
 
-The hardening works perfectly when it is requested (we verified it node by node). But you have to
-**remember it**. An insecure default on the happy path → [PB-6](PENDING-BUGS.md#pb-6).
+The hardening works perfectly when it is requested (we verified it node by node). Since 0.1.109 a
+join with `ssh_password` must say it, `true` or `false`, or it is refused (FINDINGS A-165, which
+closed [PB-6](PENDING-BUGS.md#pb-6)). `true` leaves only the console or a key of your own.
 
 ### What to verify after each join — **do not settle for what it reports**
 

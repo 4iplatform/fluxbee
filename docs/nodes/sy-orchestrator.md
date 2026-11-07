@@ -356,8 +356,12 @@ With neither, the egress gets none and does not probe. A worker join copies the 
 `reachability_url` into the worker's `egress` section along with `gateway_ip`
 (`render_worker_egress_yaml`).
 
+A request with `ssh_password` must say what happens to password logins at the join's end:
+`harden_ssh` true turns them off, false leaves them on (`require_password_logins_choice`, FINDINGS
+A-165). Without it the join is refused with `INVALID_REQUEST` before anything starts.
+
 A successful join answers `warnings`. A join that logged in with `ssh_password` (its key-first
-probe failed and the password seeded the motherbee key) and did not harden SSH says there that
+probe failed and the password seeded the motherbee key) with `harden_ssh: false` says there that
 password logins stay enabled on the box, and how to close them (`add_hive_ssh_warnings`, FINDINGS
 A-2): removing the motherbee key does not.
 

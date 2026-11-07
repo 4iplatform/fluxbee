@@ -24848,6 +24848,9 @@ async fn accept_add_hive(
     if let Err(message) = reject_removed_add_hive_fields(payload) {
         return invalid(message);
     }
+    if let Err(message) = require_password_logins_choice(payload) {
+        return invalid(message);
+    }
     let require_dist_sync = resolve_add_hive_require_dist_sync(payload);
     let dist_sync_probe_timeout_secs = resolve_add_hive_dist_sync_probe_timeout_secs(payload);
     let creds = match resolve_add_hive_ssh_creds(payload) {
@@ -28029,6 +28032,31 @@ fn reject_removed_add_hive_fields(payload: &serde_json::Value) -> Result<(), Str
     Ok(())
 }
 
+/// FINDINGS A-165: a join over `ssh_password` says what happens to password logins at its end,
+/// since nothing else closes them once it revokes its own access (D32). `harden_ssh: true` turns
+/// them off, and afterwards only the hypervisor's console or a key of the operator's own gets in;
+/// `harden_ssh: false` leaves them on, and the answer warns. A request that does not say is
+/// refused before anything touches the box.
+fn require_password_logins_choice(payload: &serde_json::Value) -> Result<(), String> {
+    let password = payload
+        .get("ssh_password")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    let chosen = payload
+        .get("harden_ssh")
+        .and_then(parse_bool_value)
+        .is_some();
+    if password && !chosen {
+        return Err(
+            "add_hive with ssh_password must say what happens to password logins at its end: \
+             harden_ssh true turns them off (afterwards only the hypervisor's console or a key of \
+             your own gets in), harden_ssh false leaves them on"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Role requested by `add_hive` (default worker). Egress provisioning takes a
 /// distinct, minimal path (see `add_egress_hive_flow`).
 fn resolve_add_hive_role(payload: &serde_json::Value) -> Result<HiveRole, OrchestratorError> {
@@ -28060,7 +28088,7 @@ struct BootstrapCreds {
 /// FINDINGS A-2: a join that logged in with `ssh_password` (its key-first probe failed and the
 /// password seeded the motherbee key) and did not harden SSH leaves the box taking passwords;
 /// removing the motherbee key at its end does not change that. The answer says so, and what closes
-/// it, instead of leaving it to the operator to remember `harden_ssh`.
+/// it. Since A-165 the request chose it: `harden_ssh: false`.
 fn add_hive_ssh_warnings(
     password_login: bool,
     harden_ssh_applied: bool,
@@ -28070,8 +28098,8 @@ fn add_hive_ssh_warnings(
         return Vec::new();
     }
     vec![format!(
-        "PasswordAuthentication stays enabled on {address}: the join used ssh_password and \
-         harden_ssh was not set, and removing the motherbee key at its end does not close password \
+        "PasswordAuthentication stays enabled on {address}: the join used ssh_password with \
+         harden_ssh false, and removing the motherbee key at its end does not close password \
          logins. To close them, set `PasswordAuthentication no` on that host in \
          /etc/ssh/sshd_config.d/00-fluxbee-hardening.conf (sshd keeps the first value it reads, \
          and a 00- file comes before 50-cloud-init.conf) and restart ssh; a join with harden_ssh: \
@@ -33109,6 +33137,62 @@ mod tests {
         assert_eq!(reply["error_code"], "INVALID_REQUEST", "{reply}");
         assert!(
             reply["message"].as_str().is_some_and(|m| m.contains("D32")),
+            "{reply}"
+        );
+        assert!(!state.any_hive_topology_busy());
+    }
+
+    /// A-165: a join over a password says what happens to password logins at its end.
+    #[test]
+    fn a_password_join_says_what_happens_to_password_logins() {
+        let refused = |payload: serde_json::Value| require_password_logins_choice(&payload);
+        let err = refused(serde_json::json!({"ssh_user": "admin", "ssh_password": "secret"}))
+            .unwrap_err();
+        assert!(err.contains("harden_ssh"), "{err}");
+        for harden_ssh in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!("no"),
+        ] {
+            assert!(refused(serde_json::json!({
+                "ssh_user": "admin",
+                "ssh_password": "secret",
+                "harden_ssh": harden_ssh,
+            }))
+            .is_ok());
+        }
+        // A word that is no boolean says nothing.
+        assert!(refused(serde_json::json!({
+            "ssh_user": "admin",
+            "ssh_password": "secret",
+            "harden_ssh": "maybe",
+        }))
+        .is_err());
+        // No password, nothing to choose: the key channel, or a password left blank.
+        assert!(refused(serde_json::json!({"ssh_user": "admin"})).is_ok());
+        assert!(refused(serde_json::json!({"ssh_user": "admin", "ssh_password": "  "})).is_ok());
+    }
+
+    /// A-165: the admin action itself refuses a password join that does not choose, with nothing
+    /// started.
+    #[tokio::test]
+    async fn accept_add_hive_refuses_a_password_join_that_does_not_choose() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let reply = accept_add_hive(
+            &state,
+            &serde_json::json!({
+                "hive_id": "worker9",
+                "address": "10.0.0.9",
+                "ssh_user": "admin",
+                "ssh_password": "secret",
+            }),
+        )
+        .await;
+        assert_eq!(reply["error_code"], "INVALID_REQUEST", "{reply}");
+        assert!(
+            reply["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("harden_ssh")),
             "{reply}"
         );
         assert!(!state.any_hive_topology_busy());

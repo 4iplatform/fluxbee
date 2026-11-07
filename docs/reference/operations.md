@@ -127,7 +127,7 @@ exposure model is in [docs/host-posture-and-exposure-spec-v1.md](../host-posture
 | `role` | `worker` (default), `egress` or `ingress` (`resolve_add_hive_role`) |
 | `ssh_allow_from` | only with `role: ingress`: the networks besides the motherbee that may reach SSH on the ingress host, each an IPv4 or IPv6 address or a CIDR with its host bits clear; written into its hive.yaml as `ingress.ssh_allow_from`. SY.admin refuses it on another role or malformed (`INVALID_REQUEST`, `add_hive_ssh_allow_from_error`) |
 | `egress.ssh_from_wan` | only with `role: egress`: `false` drops SSH arriving on the egress's `wan_iface` (default `true`); written into its hive.yaml |
-| `harden_ssh`, `restrict_ssh` | SSH hardening after the join (both default to false; `restrict_ssh` follows `harden_ssh`) |
+| `harden_ssh`, `restrict_ssh` | SSH hardening after the join (`restrict_ssh` follows `harden_ssh`). With `ssh_password`, `harden_ssh` is required: `true` turns password logins off at the join's end, `false` leaves them on (A-165). Without it both default to false |
 | `require_dist_sync`, `dist_sync_probe_timeout_secs` | fail the join if the dist folders do not sync (probe default 45 s) |
 
 Checks before anything starts: `INVALID_HIVE_ID`, `INVALID_ADDRESS`, `MISSING_WAN_LISTEN` (the
@@ -194,9 +194,18 @@ egress join takes `egress.reachability_url` from the request, else the motherbee
 anything but an `https://` URL; a worker join copies the motherbee's with `gateway_ip`. A hive
 joined before gets it by adding the line to its hive.yaml and restarting `sy-orchestrator`.
 
+**A join over a password chooses what happens to password logins (A-165).** Since D32 the join
+revokes its own key and sudoers entry at its end, and nothing else closes password logins on the
+box. So a request with `ssh_password` must carry `harden_ssh`, or it is refused with
+`INVALID_REQUEST` before anything touches the box:
+
+- `harden_ssh: true` turns password logins off at the join's end. Afterwards only the hypervisor's
+  console, or a key of the operator's own in the user's `authorized_keys`, gets in.
+- `harden_ssh: false` leaves them on.
+
 A successful join's result (`join.result` in `GET /hives/<id>`) carries `warnings`. A join that
 logged in with `ssh_password` (its key-first probe failed and the password seeded the motherbee
-key) and did not harden SSH says there that password logins stay enabled on the box, and how to
+key) with `harden_ssh: false` says there that password logins stay enabled on the box, and how to
 close them: `PasswordAuthentication no` in
 `/etc/ssh/sshd_config.d/00-fluxbee-hardening.conf` and a restart of ssh, which is what
 `harden_ssh: true` does.

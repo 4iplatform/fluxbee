@@ -321,8 +321,9 @@ add_hive_expect_ok() {
   local hive_id="$1"
   local hive_addr="$2"
   local payload
-  # ssh_user required by the add_hive contract; ssh_password optional (key-first).
-  payload="$(printf '{"hive_id":"%s","address":"%s","ssh_user":"%s","ssh_password":"%s"}' "$hive_id" "$hive_addr" "$SSH_USER" "$SSH_PASSWORD")"
+  # ssh_user required by the add_hive contract; ssh_password optional (key-first), and with it
+  # harden_ssh (FINDINGS A-165).
+  payload="$(printf '{"hive_id":"%s","address":"%s","ssh_user":"%s","ssh_password":"%s","harden_ssh":%s}' "$hive_id" "$hive_addr" "$SSH_USER" "$SSH_PASSWORD" "${HARDEN_SSH:-false}")"
   local http
   http="$(http_call "POST" "$BASE/hives" "$add_body" "$payload")"
   # PB-7: add_hive returns 202/accepted and joins in the background; poll for the outcome.

@@ -217,7 +217,7 @@ fi
 
 # 2) add_hive + WAN freshness gate
 add_body="$tmpdir/add.json"
-add_payload="{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\",\"ssh_user\":\"$SSH_USER\",\"ssh_password\":\"$SSH_PASSWORD\"}"
+add_payload="{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\",\"ssh_user\":\"$SSH_USER\",\"ssh_password\":\"$SSH_PASSWORD\",\"harden_ssh\":${HARDEN_SSH:-false}}"
 status="$(http_call "POST" "$BASE/hives" "$add_body" "$add_payload")"
 log_http_response "$status" "$add_body"
 # PB-7: add_hive ACCEPTS (202) and runs the join in the background, so the join's own result is
