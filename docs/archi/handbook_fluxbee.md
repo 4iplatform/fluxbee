@@ -870,6 +870,12 @@ its errors, and the answers that arrive after their wait.
 - **Late events:** handle a message where it can arrive. Use an internal transition when it must
   not leave the state, and guard the catch with a state variable when it must not move the
   instance.
+- **A handover between agents carries nothing by itself.** The agent that takes a conversation
+  sees its own turns with the person, and what people said to each other while it held the
+  conversation; never another agent's turns, so no agent takes over another's role. When it must
+  know something to go on (a state, a result, an order's number), the workflow passes it on in the
+  message it sends, as Case 4's `handback` carries its `note`. Otherwise the person tells it, or it
+  asks.
 
 #### 4.2.7 Checking, deploying and operating a WF
 

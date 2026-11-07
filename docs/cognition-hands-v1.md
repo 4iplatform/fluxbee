@@ -854,9 +854,23 @@ At 10:17 sales' package carries:
 
 ### 12.6 Open
 
-- **Handing over between agents:** when sales takes the conversation back from invoice, it does
-  not see invoice's turns, since two agents on one thread are two communications (A-70). Does
-  the same rule as Juan's part apply?
+- **Handing over between agents, decided (the operator, 2026-11-07):** when sales takes the
+  conversation back from invoice, it does not see invoice's turns. *"no sé si sea bueno que el de
+  ventas se meta con facturación, si la persona le cuenta algo perfecto.. sino no veo bueno porque
+  puede haber cambio de roles.. es problema del otro y es mejor que no se meta ventas"*.
+  - **Each agent sees only its own conversation:** what it said, what the person said to it, and
+    what people said to each other while it held the conversation (Juan's part, §12.3, 1). Never
+    another agent's turns.
+  - **What crosses between agents:** what the person tells it; what the WF passes on by design,
+    *"si hay algo importante que saber (estado de algo.. lo que sea), que esté programado en el WF,
+    sino que el humano pregunte"*; and the news, which are public (§12.3, 4 and 10).
+  - **Nothing to build:** two agents on one thread are two communications (A-70), and each
+    package carries its own.
+  - **A consequence, verified in the code** (`holder_of`, src/bin/sy_cognition.rs): people's turns
+    join the agent that served the thread last. In sales → invoice → Juan → sales, Juan's part
+    stays with invoice, and sales gets only Juan's hand-back note. That fits the rule: Juan worked
+    invoice's part.
+  - Archi's handbook states it among the WF chapter's rules across atoms.
 - **A conversation that starts among people and later reaches an agent:** does the agent's
   communication start from the one with no agent?
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the

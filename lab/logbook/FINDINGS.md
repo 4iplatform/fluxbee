@@ -58,10 +58,15 @@ no change required
    1. A-122 [General/upgrade]: an action, reachable by Archi, that returns a base runtime to its
       package's version (SY.admin and the package's seed).
    2. 🧠 What stays open of A-137 ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §12.6),
-      talked first: an agent taking a conversation back from another sees none of its turns; a
-      conversation among people that later reaches an agent; a message and its copy split in two
-      batches on a new thread. Then A-137's case closes: gate0206 run once from zero, and taken
-      down.
+      talked first, one at a time:
+      1. An agent taking a conversation back from another sees none of its turns. ✅ The
+         operator's call (2026-11-07): it stays so, so roles do not mix; what matters crosses
+         only through the WF, or the person tells it. Nothing to build; Archi's handbook states
+         the rule.
+      2. A conversation among people that later reaches an agent.
+      3. A message and its copy split in two batches on a new thread.
+
+      Then A-137's case closes: gate0206 run once from zero, and taken down.
 4. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
@@ -2429,8 +2434,11 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **The operator's call on the numbers** (2026-11-07): a quarrel the gate passes is news, and the
     gate stays as it is (§12.6). **A-167 and A-160** went out in 0.1.107: the narrator says "the
     agent" only of the AI agent, and the factory reset clears every hive's cognition.
-  - **Open:** §12.6's handing over between agents, a conversation that reaches an agent late, and a
-    message split in two batches on a new thread.
+  - **The operator's call on handing over between agents** (2026-11-07): an agent never sees
+    another agent's turns, so roles do not mix; what matters crosses only through the WF, or the
+    person tells it (§12.6). Nothing to build.
+  - **Open:** §12.6's conversation that reaches an agent late, and a message split in two batches
+    on a new thread.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
