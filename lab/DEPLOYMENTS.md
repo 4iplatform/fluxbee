@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ live, checked on 8.x | snap `pre-cogstate-0-1-103` (all 4 VMs) · `apt install fluxbee=0.1.102` + core-update of the spokes |
+| **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ live, checked on 8.x; its gate found A-161, for 0.1.105 | snap `pre-news-0-1-104` (all 4 VMs) · `apt install fluxbee=0.1.103` + core-update of the spokes |
+| **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ replaced by 0.1.104 | snap `pre-cogstate-0-1-103` (deleted 2026-11-06) · `apt install fluxbee=0.1.102` + core-update of the spokes |
 | **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ replaced by 0.1.103 | snap `pre-feelings-0-1-102` (deleted 2026-11-06) · `apt install fluxbee=0.1.101` + core-update of the spokes |
 | **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ replaced by 0.1.102 | snap `pre-writer-0-1-101` (deleted 2026-11-06) · `apt install fluxbee=0.1.100` + core-update of the spokes |
 | **0.1.100** | 2026-11-05 | `b052722b` | motherbee + spokes (core): the sprint's block 3, the message trace (A-138) with the frontdesk's identity note, SY.timer 1.3's `TIMER_LIST` in pages (A-151), Archi's confirm sentence once (A-152) | ✅ replaced by 0.1.101 | snap `pre-trace-0-1-100` (deleted 2026-11-05) · `apt install fluxbee=0.1.99` + core-update of the spokes |
@@ -110,6 +111,98 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.104 — The rest of A-137: the lines a WF relays between people, cognition for people with no agent, episodes as public news, a solution on one hive
+
+- **Date:** 2026-11-06 (ART) · **Previous version:** 0.1.103 · **Commit:** `1a3fe3ce`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the rest of A-137, agreed with the operator in the chat of 2026-11-06
+  ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12):
+  - whoever takes a conversation back sees what was said meanwhile, each line naming its writer;
+  - cognition analyzes people's turns with no agent, on the paths that exist;
+  - an episode is a social event between people, public like the news, and fades with time;
+  - the ILK that holds an analysis's result pays for it;
+  - the operator's four calls (§12.3): a solution, WF and agents, runs on one hive; the news
+    belongs to its protagonist and the agent never repeats it; cognition broadcasts its episodes;
+    a news item is a paragraph, never a topic.
+- **What changed:**
+  - **The router:** what a local WF sends an IO node goes to its hive's cognition at entry, a
+    relay between people.
+  - **SY.cognition:**
+    - a relay joins the communication of the agent that served its thread last on its hive, or
+      the thread's communication with no agent, `(thread, none)`, whose writer pays
+      (`TenantSource::Writer`);
+    - one message copied twice is one turn, analyzed once;
+    - the narrator may propose an episode, gated as in the lab's POC; a kept episode goes to every
+      hive's cognition by the router's broadcast, and lives in its file until it fades;
+    - the package is version 5: each person's `feelings`, and up to 5 `news`, the episodes of the
+      people in the conversation;
+    - the file's rows are of state version 2.
+  - **ai.generic:** reads the news, and its rule says it never repeats them.
+  - **SY.wf-rules:** refuses a definition that names an agent or a WF on another hive; the
+    handbook states it as a rule (§4.2.7).
+  - **The usage records** name `tenant_source` `writer`.
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test;
+  - Go: gofmt, vet and the tests of the six modules;
+  - GitHub's CI green on `1a3fe3ce`: the Rust and Go tests, the posture guards and the router's
+    dispatcher guards;
+  - the review round (one, two reviewers): a medium and five lows, all fixed (cognition-hands-v1
+    §12.7).
+- **Deploy:**
+  - build of `1a3fe3ce` in 25 min;
+  - publish in 13 s; the repo dropped 0.1.94;
+  - snapshot `pre-news-0-1-104` taken on all 4 VMs, `pre-cogstate-0-1-103` dropped;
+  - 0.1.104 on all 4 in 278 s (manifest `f50469fc904dd3e8`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - SY.cognition loaded no communication at its start on either hive: worker1's one row of
+    0.1.103 is of state version 1, and starts again at its next turn.
+- **Checked on 8.x** (FINDINGS A-137 and A-161), with the gate gate0206 on worker1:
+  - **The setup:** `WF.gate0206@worker1`, a solution on one hive with `AI.pruebas@worker1`, and
+    two clients standing for two people's IO nodes: A, a registered person of the tenant
+    `pruebas`, and B, a temporary one. The WF sends A's messages to the agent, or to B when a
+    message asks for a person, and back to the agent when A asks.
+  - **One solution, one hive:** gate0207, which names `AI.pruebas@motherbee`, was refused with
+    `COMPILE_ERROR` *"a solution's WFs and agents run on one hive, this one (worker1)"*.
+  - **The handover** (thread `gate0206-handover2`, 7 turns): A with the agent; A asks for billing
+    and the WF hands the conversation to B; A angry at B; B apologizes; A back with the agent; A
+    asks it to copy its lines.
+    - The agent's communication kept its 10 turns in order, each once. The 4 lines between A and
+      B, the relays, came with their writers and the IO nodes they came in through.
+    - The agent's answers that the WF sent on to A were not turns again: 4 copies skipped, 3 of
+      this run's and 1 of a first run cut short by the gate's tool.
+    - The agent's copy showed A's lines of the meanwhile. It left out B's two, *"que escribió
+      por otro canal"* (A-161).
+  - **The episode:** one made on worker1 (friction, intensity 9, about A and B, fading in 15
+    days), one gated out. The motherbee's cognition received it, both files keep it, and the
+    agent's package (version 5) carried it as news.
+  - **No agent** (thread `gate0206-noagent`, 2 turns between A and B): its communication
+    `(thread, none)` kept both, and the writers paid: 2 model calls on A and 2 on B,
+    `tenant_source` `writer`, the tenant `pruebas`.
+  - **The cost:** the handover's calls were the agent's tenant's, 19 for its 10 turns. One turn's
+    tagger answer came back with no text (A-162), so that turn was not analyzed.
+  - **The file:** the folder 0700 and its files 0600 on both hives, the rows of state version 2
+    beside the one of version 1, and no cache or shm folder.
+- **Found in the checks:**
+  - **A-161** 🔴: a line a WF relays between two people names no one it was said to, so the agent
+    and cognition read it as said to the agent:
+    - the agent took B's failure as its own: *"Ya me pasó de darle un dato sin respaldo, y no voy
+      a repetirlo"*;
+    - the episode says A *"threatened to have the agent removed from the account"*; A said it to
+      B.
+    - The operator chose the fix on 2026-11-07: a relay names where it went. It is for 0.1.105.
+  - **A-162** 🔴: a model's answer with no text fails without saying why (its `stop_reason`). For
+    0.1.105.
+  - The gate's own client stopped on its first run: it printed a trace entry's `act` as a word,
+    and `act` is a list (docs/message-trace-v1.md). The client was fixed and the run repeated on a
+    new thread; the first thread keeps its one exchange.
+- **Rollback:**
+  - `apt install fluxbee=0.1.103` on the motherbee, then a core-update of the spokes.
+  - 0.1.103 reads the file's rows of state version 2 as newer: it keeps them as they are and
+    skips their communications' turns. Its packages are version 4 again, and the episodes' table
+    stays unread.
 
 ---
 

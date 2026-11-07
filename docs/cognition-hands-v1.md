@@ -15,8 +15,9 @@
   and released in 0.1.103, checked on 8.x (§11.6).
 - The rest, chats of 2026-11-06 (§12): whoever takes a conversation back sees what was said
   meanwhile; cognition analyzes people's turns with no agent; and episodes are public news that
-  fade with time. Agreed in the chat, its design reviewed by the operator the same day:
-  building, for 0.1.104.
+  fade with time. Agreed in the chat, its design reviewed by the operator the same day, and
+  released in 0.1.104. Its gate on 8.x found that a line a WF relays between two people names no
+  one it was said to (§12.8, A-161): the fix, the operator's choice, is for 0.1.105.
 
 This is the single place for the topic.
 
@@ -240,7 +241,7 @@ The rest of A-137, one topic at a time:
   Agreed 2026-11-05 (§10), released in 0.1.102.
 - **Where cognition keeps its state:** agreed 2026-11-06 (§11), released in 0.1.103.
 - **A conversation with no agent, handing over, and who pays:** agreed 2026-11-06 with the
-  episodes as public news (§12), building for 0.1.104. §12.6 keeps what is still open.
+  episodes as public news (§12), released in 0.1.104 (§12.8). §12.6 keeps what is still open.
 
 ---
 
@@ -907,3 +908,35 @@ At 10:17 sales' package carries:
 - **Noted, not changed:** SY.wf-rules checks a definition applied before 0.1.104 at its next apply
   or rollback, never at start, so a running WF is never stopped by the rule. No WF was deployed
   on 8.x (2026-11-06).
+
+### 12.8 Checked on 8.x (0.1.104, 2026-11-07)
+
+The gate gate0206 on worker1: a solution on one hive, `WF.gate0206@worker1` with
+`AI.pruebas@worker1`, and two clients standing for two people's IO nodes, A and B of the tenant
+`pruebas`. The WF sends A's messages to the agent, or to B when a message asks for a person, and
+back to the agent when A asks. The ledger's 0.1.104 has each number.
+
+- **Held:**
+  - a definition naming `AI.pruebas@motherbee` was refused: a solution runs on one hive;
+  - the handover: the agent's communication kept its 10 turns in order, each once, the lines
+    between A and B with their writers; its answers relayed to A were not turns again;
+  - the episode: made on worker1, received by the motherbee's cognition, carried as news;
+  - with no agent: the communication `(thread, none)`, paid by its writers.
+- **Found, A-161:** a relayed line names no one it was said to. The agent reads
+  `person A (<ILK>) via IO.a: "Otra vez vos? ... Voy a pedir que te saquen de mi cuenta."`,
+  exactly as a line said to itself; only its own lines name whom they were to. So:
+  - the agent took B's failure as its own: *"Ya me pasó de darle un dato sin respaldo, y no voy a
+    repetirlo"*;
+  - the episode says A *"threatened to have the agent removed from the account"*;
+  - the agent left B's lines out of a copy A asked for: *"que escribió por otro canal"*.
+  - The WF names the person as `dst_ilk` only toward the IO node of whoever started it (A-139),
+    and toward any other IO node it names no one: it does not know who is there.
+- **The fix, the operator's choice (2026-11-07): name the destination.**
+  - A relay keeps where it went: the IO node always, and the person when the message names them
+    (its `dst_ilk`).
+  - The agent reads `person A (<ILK>) via IO.a, to IO.b: "..."`, and its rule says that a line
+    said to someone else was not said to it.
+  - Cognition's tagger and narrator read the same, so an episode names whom it was between.
+  - For 0.1.105, and this gate again on a new thread, once the wrong episode is gone.
+- **Found, A-162:** one tagger call got an answer with no text, and the SDK's error does not say
+  its `stop_reason`. That turn went unanalyzed. The error will name it, in 0.1.105.

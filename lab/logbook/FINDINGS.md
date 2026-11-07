@@ -62,7 +62,8 @@ no change required
       gate on 8.x (2026-11-06). Where cognition keeps its state, reviewed whole and agreed on
       2026-11-06 (§11), built as A-158 with A-156's first: ✅ 0.1.103, its gate on 8.x
       (2026-11-06). The rest, agreed in the chat of 2026-11-06 (§12), built the same day with
-      its review round's fixes, for 0.1.104.
+      its review round's fixes, went out in 0.1.104 (2026-11-07); its gate on 8.x found A-161,
+      whose fix, with A-162, is for 0.1.105.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
@@ -75,9 +76,11 @@ in 0.1.103 (2026-11-06), checked on 8.x.
 
 - A-137 🔵 Cognition follows only the conversations an agent is in. *Sprint: its first part ✅
   0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
-  A-156's first); the rest agreed in the chat of 2026-11-06 and built for 0.1.104
+  A-156's first); the rest agreed in the chat of 2026-11-06 and out in 0.1.104
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
-  news).*
+  news), its gate's A-161 fixed for 0.1.105.*
+- A-161 🔴 A line a WF relays between two people names no one it was said to (0.1.104's gate; the
+  fix agreed, for 0.1.105).
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -121,6 +124,7 @@ in 0.1.103 (2026-11-06), checked on 8.x.
   later (the operator, 2026-11-06).
 - A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
   A-158).
+- A-162 🔴 A model's answer with no text fails without saying why (0.1.104's gate; for 0.1.105).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
   U-12): to check, then bring here or close.
@@ -1195,6 +1199,52 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-161 [WF] 🔴 OPEN, the fix agreed for 0.1.105 (found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A line a WF relays between two people names no one it was said to, so the agent and cognition read it as said to the agent
+
+- **What happens:**
+  - a relay, what a WF sends a person's IO node, joins the agent's communication as a turn the
+    agent got (`in`), with its writer and the IO node it came in through (`recent_turn_of`,
+    src/bin/sy_cognition.rs). Only an answer the agent sent names whom it was to (`to`);
+  - the agent reads it as said to itself: `person A (<ILK>) via IO.a: "..."`
+    (`render_memory_turn`, nodes/ai/ai-generic/src/bin/ai_node_runner.rs);
+  - cognition's tagger reads its text with no word of whom it was written to (`identity_hints`,
+    src/bin/sy_cognition/semantic_tagger_ai.rs).
+- **Seen in the gate** (gate0206 on worker1, 2026-11-07): A asked the agent about a double charge,
+  asked for billing, and the WF handed the conversation to B. A told B *"Otra vez vos? ... Me
+  mentiste en la cara ... Voy a pedir que te saquen de mi cuenta"*, B apologized, and A went back
+  to the agent:
+  - the agent took B's failure as its own: *"Ya me pasó de darle un dato sin respaldo, y no voy a
+    repetirlo"*;
+  - the episode, public news for 15 days on every hive, says A *"threatened to have the agent
+    removed from the account"*;
+  - asked to copy its lines, the agent left out B's two, *"que escribió por otro canal"*, though
+    they were said to A.
+- **Why the WF names only a node:** a WF names the person as `dst_ilk` only on what it sends the
+  person's own IO node, the one that started it (`toPerson`,
+  go/nodes/wf/wf-generic/node/actions.go, A-139). To any other IO node it names no one: it does
+  not know who is there.
+- **The fix, the operator's choice (2026-11-07, "name the destination"):**
+  - a relay keeps where it went: the IO node always (`to_via`), and the person when the message
+    names them (`to`, its `dst_ilk`);
+  - the agent reads `person A via IO.a, to IO.b: "..."`, and its rule says that a line said to
+    someone else was not said to it;
+  - cognition's tagger and narrator read the same, so an episode names whom it was between;
+  - for 0.1.105, with A-162, and 0.1.104's gate again on a new thread. The wrong episode, about
+    the test people only, is deleted from both hives' files before that run.
+
+### A-162 [General/ai-sdk] 🔴 OPEN, for 0.1.105 (found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A model's answer with no text fails without saying why
+
+- **What happens:** the Anthropic client takes a response's text blocks, and with none it returns
+  `anthropic response missing text content` (`anthropic_response_text`,
+  crates/fluxbee_ai_sdk/src/llm.rs). The error omits the response's `stop_reason`, so a refusal
+  and an empty answer read the same. A cut by `max_tokens` is caught before, with its own error.
+  The OpenAI client's `responses payload missing text output` omits the response's `status` the
+  same way.
+- **Seen in the gate:** cognition's tagger got such an answer on the turn that asked the agent to
+  copy its lines. That turn went unanalyzed (`semantic_tagger_invalid_outputs_total` 1), and the
+  journal cannot say why.
+- **The fix:** each error names the response's `stop_reason` or `status`. For 0.1.105, with A-161.
+
 ### A-158 [WF] ✅ VALIDATED ON 8.x (0.1.103, 2026-11-06; found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
 
 - **Cognition keeps nothing on its own disk but its config.** 12-cognition-v2 §10.2 planned a
@@ -2149,8 +2199,14 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
       to the agent and to another person at once had it analyzed and paid twice, and five lows;
       all fixed, each with its test, but one noted (a definition applied before is checked at its
       next apply).
-  - **Open:** §12.6 keeps handing over between agents, a conversation that reaches an agent late,
-    and the numbers.
+  - **Deployed** in 0.1.104 (2026-11-07) and checked on 8.x with the gate gate0206 on worker1 (the
+    ledger's 0.1.104 has each check): one solution on one hive, the handover's lines, a relayed
+    answer not doubled, the episode on both hives and in the package, and a conversation with no
+    agent paid by its writers. The gate found A-161: a line a WF relays between two people names
+    no one it was said to, so the agent took the blame for B, and the episode names the agent.
+    The fix, agreed with the operator, is for 0.1.105, with A-162.
+  - **Open:** A-161; §12.6 keeps handing over between agents, a conversation that reaches an agent
+    late, and the numbers.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
 
