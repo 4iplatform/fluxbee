@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ live, checked on 8.x | snap `pre-train2-0-1-107` (all 4 VMs) · `apt install fluxbee=0.1.106` + core-update of the spokes |
+| **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ live, checked on 8.x | snap `pre-contract-0-1-108` (all 4 VMs) · `apt install fluxbee=0.1.107` + core-update of the spokes |
+| **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ replaced by 0.1.108 | snap `pre-train2-0-1-107` (deleted 2026-11-07) · `apt install fluxbee=0.1.106` + core-update of the spokes |
 | **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ replaced by 0.1.107 | snap `pre-train1-0-1-106` (deleted 2026-11-07) · `apt install fluxbee=0.1.105` + core-update of the spokes |
 | **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ replaced by 0.1.106 | snap `pre-relayto-0-1-105` (deleted 2026-11-07) · `apt install fluxbee=0.1.104` + core-update of the spokes |
 | **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ replaced by 0.1.105 | snap `pre-news-0-1-104` (deleted 2026-11-07) · `apt install fluxbee=0.1.103` + core-update of the spokes |
@@ -114,6 +115,42 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.108 — The provider holds a response contract inside the tool loop too (A-150)
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.107 · **Commit:** `7f18a610`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** with tools, an agent's response contract was an instruction checked afterwards, never
+  held by the provider (FINDINGS A-150). Both providers can hold it with tools; the fix reaches the
+  shared AI SDK, so it went alone ([METHOD](logbook/METHOD.md) §9).
+- **What changed:**
+  - **The AI SDK:** a tool turn carries the run's answer schema next to the tools: Anthropic's
+    `output_config.format`, OpenAI's `text.format`. A 400 that refuses it has that turn asked
+    again without it, from either provider. Every other caller (SY.cognition, SY.architect,
+    SY.admin's executor, the frontdesk) sends the same requests as before.
+  - **ai.generic:** the tool loop passes the contract's schema; the journal says
+    `output_contract_mode=structured_output`. The instruction and the check under a `text_field`
+    stay.
+- **Checks before the release:** on the Mac, clippy of the SDK and ai.generic; GitHub's CI green on
+  the branch and on the integrated head; the review round (one reviewer): one medium (OpenAI
+  refuses a strict schema with an optional property, now asked again without it) and one low (the
+  docs promised a check the tool loop makes only under a `text_field`), both fixed.
+- **Deploy:**
+  - build of `7f18a610` in 31 min: the shared SDK rebuilt nearly every binary;
+  - publish in 12 s;
+  - snapshot `pre-contract-0-1-108` taken on all 4 VMs, `pre-train2-0-1-107` dropped;
+  - 0.1.108 on all 4 in 270 s (manifest `43c23a984b37f817`), health clean.
+- **Checked on 8.x** (three runs, `a150_gate.py`):
+  - AI.pruebas, asked for a poem in prose and a saved text file under a contract (`reply`, and
+    `mood` in an enum), logged `contract="envelope" tool_count=14
+    output_contract_mode="structured_output"` on Anthropic (`claude-sonnet-5-5`).
+  - Each answer was the contract's object, with `mood` in its enum, its text the `reply` and the
+    file attached; no schema warning and no retry.
+- **Found:** A-168 🔵, from the evaluation. A WF asks an agent with a menu, which has no schema, so
+  this release does not reach it. Whether a menu becomes one is the operator's call.
+- **Rollback:** `apt install fluxbee=0.1.107` on the motherbee, then a core-update of the spokes.
 
 ---
 

@@ -53,7 +53,7 @@ no change required
       workers' cognition too (SY.admin and SY.cognition). One branch: the same binary. ✅ on 8.x.
    3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
       loop (ai.generic; alone if the fix reaches the shared AI SDK). Both providers can; the fix
-      reaches the shared AI SDK, so it goes alone, as 0.1.108.
+      reaches the shared AI SDK, so it went alone: ✅ 0.1.108, checked on 8.x (2026-11-07).
 3. **Third release, 0.1.109:**
    1. A-122 [General/upgrade]: an action, reachable by Archi, that returns a base runtime to its
       package's version (SY.admin and the package's seed).
@@ -128,8 +128,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   A-156's first); the rest agreed in the chat of 2026-11-06 and out in 0.1.104
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
-- A-150 🔵 With tools, an agent's response contract is not enforced by the provider. *Built for
-  0.1.108, alone: it touches the shared AI SDK.*
+- A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
 
 ### io.web
 
@@ -1245,6 +1244,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-168 [WF] 🔵 TO DESIGN (found 2026-11-07, A-150's evaluation; read in the code) — A WF's menu has no schema, so no provider holds an agent's answer to it
+
+- **What happens:** since Case 3 a WF asks an agent with a menu (wf-orchestration-v1 §5.3.1), and
+  wfcel refuses a `response_envelope` in a WF's action (`validateSentContext`,
+  go/pkg/wfcel/validate.go). The menu reaches the model as an instruction, and ai.generic checks
+  the answer afterwards. Since 0.1.108 (A-150) a provider holds an answer to a response contract,
+  with tools too, and a menu is not one.
+- **The operator's call:** whether a menu becomes a schema the provider holds. Anthropic can hold a
+  root `anyOf` of the options, each with its `const` and its params; OpenAI's strict mode refuses a
+  root `anyOf`, so with OpenAI each option could not be tied to its params.
+
 ### A-167 [WF] ✅ VALIDATED ON 8.x (0.1.107, 2026-11-07; found 2026-11-07, 0.1.106's gate on 8.x; read in the episode and the turns) — An episode between two people calls one of them "the agent"
 
 - **What happens:** the episode made of A's quarrel with B (`gate0206-handover4`, friction,
@@ -1825,7 +1835,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The throwaway timers were cancelled. They stay in SY.timer's history until its GC, at its
     first start after 7 days (docs/sy-timer.md §5.2).
 
-### A-150 [WF] 🔵 TO EVALUATE (kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
+### A-150 [WF] ✅ VALIDATED ON 8.x (0.1.108, 2026-11-07; kept open since WF Case 1, 2026-10-29; recorded at the WF close, 2026-11-04) — With tools, an agent's response contract is an instruction checked afterwards, not enforced by the provider
 
 - **What happens:** a WF's response contract (`response_envelope`) reaches the provider as an
   output schema it enforces only on a call without tools. With tools, the contract is an
@@ -1842,7 +1852,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **What it does not reach:** a WF asks an agent with a menu (§5.3.1), which has no schema, and
     wfcel refuses a `response_envelope` in a WF's action. The fix reaches a contract that a caller
     other than a WF writes, or that a WF's `forward` keeps. Whether a menu becomes a schema is the
-    operator's call: Anthropic can hold a root `anyOf`, and OpenAI's strict mode cannot.
+    operator's call: Anthropic can hold a root `anyOf`, and OpenAI's strict mode cannot (A-168).
+- **Validated on 8.x** (0.1.108, three runs): AI.pruebas, asked for a poem in prose and a saved
+  text file under a contract (`reply`, and `mood` in an enum, `text_field` `reply`), logged
+  `contract="envelope" tool_count=14 output_contract_mode="structured_output"` on Anthropic
+  (`claude-sonnet-5-5`). Each answer was the contract's object, its text the `reply`, with the file
+  attached; no schema warning and no retry.
 
 ### A-149 [IO] 🟡 OPEN (read 2026-10-16 in the A-68 analysis, checked again 2026-11-03; recorded at the WF close) — The IO family has no written standard, and its nodes answer health and config each their own way
 
