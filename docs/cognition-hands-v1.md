@@ -859,9 +859,14 @@ At 10:17 sales' package carries:
 - **A conversation that starts among people and later reaches an agent:** does the agent's
   communication start from the one with no agent?
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
-  lenses. The gate says why it turns a proposal down (A-163, §12.10, built for 0.1.106):
-  SY.cognition's log names, at info, the condition missed and the gate's numbers. Whether a
-  quarrel between two people is news is the operator's call, on those numbers.
+  lenses. The gate says why it turns a proposal down (A-163, since 0.1.106): SY.cognition's log
+  names, at info, the condition missed and the gate's numbers.
+  - **The operator's call (2026-11-07), on 0.1.106's gate (§12.11):** a quarrel between two people
+    is news when the gate passes it. Everything that happens carries a weight, and the gate decides
+    what gets attention, so the gate stays as it is.
+  - **Tuned later:** the operator pictures another AI judging whether a piece of gossip serves the
+    activity and whether spreading it could harm. The thresholds will get an automatic mechanism,
+    so they do not become configuration now.
 - **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
   hive.
 - **Known limits of the build** (its review round):

@@ -44,9 +44,13 @@ no change required
    5. A-120 [Archi]: Archi takes a page down, through its confirmation (SY.admin). ✅ on 8.x.
 2. **Second release, 0.1.107:**
    1. 🧠 Cognition's numbers, on A-163's output: whether a quarrel between two people is news, and
-      whether the gate's thresholds become configuration. The operator's call first, with A-167.
-   2. 🧠 A-160 [General/ops]: the factory reset clears the workers' cognition too (SY.admin and
-      SY.cognition; one branch with the numbers, the same binary).
+      whether the gate's thresholds become configuration. ✅ The operator's call (2026-11-07): the
+      gate stays as it is, a quarrel it passes is news, and the thresholds wait for an automatic
+      mechanism, not configuration (cognition-hands-v1 §12.6). A-167's fix agreed: the narrator's
+      rule.
+   2. 🧠 A-167 [WF]: an episode names its people, and says "the agent" only of the AI agent (the
+      narrator's rule, SY.cognition), with A-160 [General/ops]: the factory reset clears the
+      workers' cognition too (SY.admin and SY.cognition). One branch: the same binary.
    3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
       loop (ai.generic; alone if the fix reaches the shared AI SDK).
 3. **Third release, 0.1.108:**
@@ -1254,6 +1258,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Proposed fix:** the narrator's rule: an episode names its people by name or ILK, and says "the
   agent" only of the AI agent, which an episode between two people does not involve. With the
   operator's call on whether such a quarrel is news.
+- **The operator (2026-11-07):** the rule agreed, for 0.1.107. A quarrel the gate passes stays
+  news.
 
 ### A-166 [General/add_hive] 🔵 TO VERIFY (PENDING-BUGS U-6, found 2026-07-30; read in the code 2026-11-07) — Whether every join pushes the vendor before its folder syncs
 
