@@ -22,8 +22,49 @@ no change required
 > Each open item of section A carries its track in brackets after its id (`A-136 [IO/io.slack]`),
 > and a new finding gets one when it is written. An item leaves the board when it closes; the
 > sections below keep their order.
+>
+> **Since 2026-11-07 (the operator):** a sprint runs several tracks at once, in releases of
+> changes that touch different binaries, each with its own gate, simplest first
+> ([METHOD](METHOD.md) §9).
 
-### This sprint (2026-11-04)
+### This sprint (2026-11-07), by releases, simplest first
+
+🧠 marks what closes cognition (A-137).
+
+1. **First release, 0.1.106** (fixes already defined):
+   1. PENDING-BUGS' six August rows: checked, then closed or brought here (docs only).
+   2. A-80 [General/identity]: a restore looks the email up in the person's own tenant
+      (SY.identity).
+   3. 🧠 A-163 [WF]: the episode gate says which rule turned a proposal down, with its numbers
+      (SY.cognition).
+   4. A-103 [General/agent tools]: the tool cards stop restating the code's values by hand
+      (ai.generic).
+   5. A-120 [Archi]: Archi takes a page down, through its confirmation (SY.admin).
+2. **Second release, 0.1.107:**
+   1. 🧠 Cognition's numbers, on A-163's output: whether a quarrel between two people is news, and
+      whether the gate's thresholds become configuration. The operator's call first.
+   2. 🧠 A-160 [General/ops]: the factory reset clears the workers' cognition too (SY.admin and
+      SY.cognition; one branch with the numbers, the same binary).
+   3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
+      loop (ai.generic; alone if the fix reaches the shared AI SDK).
+3. **Third release, 0.1.108:**
+   1. A-122 [General/upgrade]: an action, reachable by Archi, that returns a base runtime to its
+      package's version (SY.admin and the package's seed).
+   2. 🧠 What stays open of A-137 ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §12.6),
+      talked first: an agent taking a conversation back from another sees none of its turns; a
+      conversation among people that later reaches an agent; a message and its copy split in two
+      batches on a new thread. Then A-137's case closes: gate0206 run once from zero, and taken
+      down.
+4. **Design first, one at a time, the largest:**
+   1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
+   2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
+      io.blob's tenant (A-106).
+   3. io.web's stage 2, on the operator's definition of its security.
+   4. A-159: deleting an ILK that other data names, the episodes now among them; a chapter of
+      its own.
+   5. A-96: how the SY nodes' tokens are measured per message.
+
+### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
 1. **Small, from the tests** (1 to 3 ✅ validated on 8.x with 0.1.99, 2026-11-04; 4 and 5, found
    on the way, ✅ with 0.1.100, 2026-11-05; 6 and 7, from 5's talk, ✅ validated on 8.x with
