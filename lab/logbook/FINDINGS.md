@@ -1221,8 +1221,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     they were said to A.
 - **Why the WF names only a node:** a WF names the person as `dst_ilk` only on what it sends the
   person's own IO node, the one that started it (`toPerson`,
-  go/nodes/wf/wf-generic/node/actions.go, A-139). To any other IO node it names no one: it does
-  not know who is there.
+  go/nodes/wf/wf-generic/node/actions.go, A-139). Toward any other IO node it does not know who is
+  there: its `send_message` names no one, and its `forward` keeps the `dst_ilk` the message had,
+  none for a person's message.
 - **The fix, the operator's choice (2026-11-07, "name the destination"):**
   - a relay keeps where it went: the IO node always (`to_via`), and the person when the message
     names them (`to`, its `dst_ilk`);
@@ -1231,6 +1232,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - cognition's tagger and narrator read the same, so an episode names whom it was between;
   - for 0.1.105, with A-162, and 0.1.104's gate again on a new thread. The wrong episode, about
     the test people only, is deleted from both hives' files before that run.
+- **Built** (2026-11-07), for 0.1.105 ([cognition-hands-v1](../../docs/cognition-hands-v1.md)
+  §12.9):
+  - `MemoryTurn.to_via`, the IO node a relay went to (`relay_destination`), and `to`, the person
+    its message names; in the Rust and Go SDKs, optional, so the package's version stays 5;
+  - ai.generic: `<writer>, to <person> via <node>`, or `<writer>, to <node>`, and the rule line
+    ahead of the turns when any is a relay;
+  - the tagger reads whom a relay was written to (`identity_hints.to`), the narrator's rule names
+    the counterpart as whom the turn was written to, and an episode of a relay is between its
+    writer and the person its message names;
+  - the review round (one, one reviewer): two mediums and four lows, all fixed but one noted
+    (cognition-hands-v1 §12.9):
+    - the agent's own copy of a message a WF also relayed, coming in a later batch, makes the turn
+      the agent's, and the worker's write-back keeps it so;
+    - a relay whose message names no one is to the last other person who wrote through the IO node
+      it went to, else to that node;
+    - the narrator's rule names the agent's own answer too; an OpenAI answer cut for another reason
+      says it; three tests more;
+    - noted: a `forward` keeps the `dst_ilk` of the message it forwards toward any IO node other
+      than the person's.
 
 ### A-162 [General/ai-sdk] 🔴 OPEN, for 0.1.105 (found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A model's answer with no text fails without saying why
 
@@ -1244,6 +1264,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   copy its lines. That turn went unanalyzed (`semantic_tagger_invalid_outputs_total` 1), and the
   journal cannot say why.
 - **The fix:** each error names the response's `stop_reason` or `status`. For 0.1.105, with A-161.
+- **Built** (2026-11-07), for 0.1.105: `anthropic response missing text content
+  (stop_reason=refusal)`, and the Responses payload's `status`, with the reason of an incomplete
+  one and `refused` when a message refused (`openai_no_text_reason`).
 
 ### A-158 [WF] ✅ VALIDATED ON 8.x (0.1.103, 2026-11-06; found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
 
