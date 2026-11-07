@@ -4202,7 +4202,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "19";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "20";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4282,6 +4282,13 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "remove_runtime_version",
         route: InternalActionRoute::Command("remove_runtime_version"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    // A base runtime goes back to its package's version (`handle_reset_base_runtime`).
+    InternalActionSpec {
+        action: "reset_base_runtime",
+        route: InternalActionRoute::Command("reset_base_runtime"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4930,6 +4937,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         // A hive's cognition forgets every conversation: only behind the operator's word
         // (FINDINGS A-160).
         "cognition_clear" => MeshAccess::Nobody,
+        // Every node that follows a base runtime moves onto another build: the operator's word
+        // (FINDINGS A-122).
+        "reset_base_runtime" => MeshAccess::Nobody,
         // Off the catalog: the executor, which runs every step as the operator.
         "executor_validate_plan" | "executor_execute_plan" => MeshAccess::Archi,
         "hive_status"
@@ -10242,6 +10252,15 @@ async fn handle_hive_paths(
                     .await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["runtimes", runtime, "reset"]) => {
+            let payload = serde_json::json!({
+                "runtime": decode_percent(runtime),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "reset_base_runtime", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
         ("DELETE", ["runtimes", runtime, "versions", version]) => {
             let mut payload = serde_json::json!({
                 "runtime": decode_percent(runtime),
@@ -12290,6 +12309,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "remove_node_instance"
             | "teardown_node"
             | "remove_runtime_version"
+            | "reset_base_runtime"
             | "set_node_config"
             | "node_control_config_set"
             | "send_node_message"
@@ -12332,6 +12352,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_node_instance"
             | "teardown_node"
             | "remove_runtime_version"
+            // Every node that follows the runtime's current moves onto another build.
+            | "reset_base_runtime"
             | "set_ilk_definition"
             | "delete_ilk"
             | "restore_ilk"
@@ -12459,6 +12481,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_runtime" => "Read one runtime definition in a hive: its versions, readiness, materialization, health and usage, and as tool_catalog the tool cards its version ships (ai.generic's base tools; null for a runtime that ships none).",
         "remove_runtime_version" => {
             "Delete one published runtime version from motherbee dist/manifest."
+        }
+        "reset_base_runtime" => {
+            "Return a base runtime to the version the installed Fluxbee package brought (its package_version): its current becomes that version, and every node that follows current moves onto it."
         }
         "list_routes" => "List route rules for a hive.",
         "list_vpns" => "List VPN patterns for a hive.",
@@ -12702,6 +12727,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "remove_runtime_version" => {
             vec!["DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}"]
         }
+        "reset_base_runtime" => vec!["POST /hives/{hive}/runtimes/{runtime}/reset"],
         "list_routes" => vec!["GET /hives/{hive}/routes"],
         "list_vpns" => vec!["GET /hives/{hive}/vpns"],
         "get_storage" => vec!["GET /config/storage"],
@@ -12931,6 +12957,14 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
+        ],
+        "reset_base_runtime" => vec![
+            admin_action_path_param("hive", "string", "The motherbee, where the runtimes manifest lives."),
+            admin_action_path_param(
+                "runtime",
+                "string",
+                "A base runtime, one the installed package brought: for example ai.generic.",
+            ),
         ],
         "get_ilk" | "set_ilk_definition" | "delete_ilk" | "restore_ilk" | "set_ilk_tenant"
         | "purge_ilk" => vec![
@@ -14279,6 +14313,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_runtime_version" => {
             "curl -X DELETE /hives/motherbee/runtimes/ai.generic/versions/1.2.3"
         }
+        "reset_base_runtime" => "curl -X POST /hives/motherbee/runtimes/ai.generic/reset",
         "list_routes" => "curl -X GET /hives/motherbee/routes",
         "add_route" => {
             r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.sales.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
@@ -14796,6 +14831,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin sends WF_CANCEL_INSTANCE {instance_id, reason} to the node. When the definition has a cancelled state, the engine runs the exit actions of the instance's state and then the entry actions of cancelled; either way it cancels the instance's timers and ends it cancelled. Nothing the instance already did or sent is undone.",
             "The answer is the engine's WF_CANCEL_INSTANCE_RESPONSE as it is: payload {ok: true, instance_id, status: \"cancelled\"}. An instance already ended answers 409 INSTANCE_ALREADY_TERMINATED; one the node does not have, 404 INSTANCE_NOT_FOUND.",
             WF_INSTANCE_ERRORS_NOTE,
+        ],
+        "reset_base_runtime" => vec![
+            "Confirm with the operator first: every node that follows the runtime's current moves onto the package's version, the WF and config-only packages built on it with them.",
+            "A base runtime is one the installed Fluxbee package brought. The package's seed records its version as package_version at every install, and list_runtimes and get_runtime show it. A current that differs is a hand publish, which the seed keeps through every upgrade while its directory is on disk (FINDINGS A-122).",
+            "Motherbee-only (409 NOT_PRIMARY elsewhere): it writes the runtimes manifest, which the other hives receive through the dist folder. Takes no body: the runtime comes from the path in HTTP, and the executor step's args are hive and runtime.",
+            "The answer: payload {runtime, previous_current, current, package_version, changed, manifest_version, manifest_hash}. changed is false, and nothing is written, when current already is the package's version.",
+            "Each hive's orchestrator moves the running nodes that follow current within its next reconcile pass (60 s), once the version is ready there; a node pinned to a version stays. The hand-published version stays available: remove it afterwards with remove_runtime_version, once no node runs it.",
+            "404 RUNTIME_NOT_FOUND; 409 NOT_A_BASE_RUNTIME for a runtime with no package_version (one the package did not bring); 409 RUNTIME_NOT_PRESENT when the package's version is not published and on disk (run sudo fluxbee-seed-runtimes on the motherbee); 409 MANIFEST_INVALID or RUNTIME_MANIFEST_MISSING.",
         ],
         "cognition_clear" => vec![
             "It cannot be undone: confirm with the operator first. The hive's agents lose the memory of every conversation (contexts, reasons, scopes, memories, feelings and last turns), and the hive loses every episode it kept, its own and those other hives sent it.",
@@ -15638,6 +15681,109 @@ fn remove_runtime_version_from_manifest_local(
     updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
     updated.hash = None;
     Ok(updated)
+}
+
+/// What `reset_base_runtime` makes of a runtime's entry (FINDINGS A-122).
+#[derive(Debug)]
+struct BaseRuntimeReset {
+    runtime: String,
+    previous_current: Option<String>,
+    package_version: String,
+    /// The manifest to write; None when `current` already is the package's version.
+    updated: Option<RuntimeManifest>,
+}
+
+/// `reset_base_runtime` on the manifest: the runtime's `current` becomes the version its package
+/// brought, which the package's seed records as `package_version` at every install
+/// (packaging/fluxbee-seed-runtimes). That version must be published and on disk
+/// (`version_ready`). An error is its HTTP status, its code and its detail.
+fn reset_base_runtime_in_manifest_local(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    version_ready: impl Fn(&str, &str) -> bool,
+) -> Result<BaseRuntimeReset, (u16, &'static str, String)> {
+    let runtime_map =
+        runtime_manifest_entry_map_local(manifest).map_err(|err| (409, "MANIFEST_INVALID", err))?;
+    let runtime_key = resolve_runtime_key_local(&runtime_map, runtime)
+        .map_err(|err| (404, "RUNTIME_NOT_FOUND", err))?;
+    let mut entry = runtime_map.get(&runtime_key).cloned().ok_or_else(|| {
+        (
+            404,
+            "RUNTIME_NOT_FOUND",
+            format!("runtime '{runtime_key}' not found"),
+        )
+    })?;
+    let package_version = entry
+        .extra
+        .get("package_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| valid_runtime_token(value))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                409,
+                "NOT_A_BASE_RUNTIME",
+                format!(
+                    "runtime '{runtime_key}' records no package_version: only a base runtime has one, which the installed package's seed records at every install"
+                ),
+            )
+        })?;
+    let published = runtime_versions_from_manifest_entry_local(&entry).contains(&package_version);
+    if !published || !version_ready(&runtime_key, &package_version) {
+        return Err((
+            409,
+            "RUNTIME_NOT_PRESENT",
+            format!(
+                "the package's version '{package_version}' of runtime '{runtime_key}' is not published and on disk: run sudo fluxbee-seed-runtimes on the motherbee"
+            ),
+        ));
+    }
+    let previous_current = entry
+        .current
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if previous_current.as_deref() == Some(package_version.as_str()) {
+        return Ok(BaseRuntimeReset {
+            runtime: runtime_key,
+            previous_current,
+            package_version,
+            updated: None,
+        });
+    }
+
+    entry.current = Some(package_version.clone());
+    let entry = serde_json::to_value(entry).map_err(|err| {
+        (
+            409,
+            "MANIFEST_INVALID",
+            format!("serialize runtime '{runtime_key}' failed: {err}"),
+        )
+    })?;
+    let mut updated = manifest.clone();
+    updated
+        .runtimes
+        .as_object_mut()
+        .ok_or_else(|| {
+            (
+                409,
+                "MANIFEST_INVALID",
+                "runtime manifest invalid: runtimes must be object".to_string(),
+            )
+        })?
+        .insert(runtime_key.clone(), entry);
+    let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    updated.version = next_runtime_manifest_version_ms(now_ms, updated.version);
+    updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    updated.hash = None;
+    Ok(BaseRuntimeReset {
+        runtime: runtime_key,
+        previous_current,
+        package_version,
+        updated: Some(updated),
+    })
 }
 
 fn quarantine_runtime_version_dir_local(
@@ -16513,6 +16659,117 @@ async fn handle_remove_runtime_version(
     ))
 }
 
+/// `reset_base_runtime` (FINDINGS A-122): a base runtime goes back to the version the installed
+/// package brought. A hand publish stays current through every upgrade while its directory is on
+/// disk (the package's seed keeps it); this is the way back, behind the operator's confirmation.
+/// Motherbee-only, like every write of the runtimes manifest; each hive's orchestrator then moves
+/// the nodes that follow `current` within its next reconcile pass.
+async fn handle_reset_base_runtime(
+    ctx: &AdminContext,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let action = "reset_base_runtime";
+    let refuse = |status: u16, code: &str, detail: String| -> Result<(u16, String), AdminError> {
+        Ok((
+            status,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": code,
+                "error_detail": detail,
+            })
+            .to_string(),
+        ))
+    };
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    if ctx.hive_id != PRIMARY_HIVE_ID || target_hive != PRIMARY_HIVE_ID {
+        return refuse(409, "NOT_PRIMARY", format!("{action} is motherbee-only"));
+    }
+    let runtime = payload
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if runtime.is_empty() || !valid_runtime_token(runtime) {
+        return refuse(
+            400,
+            "INVALID_REQUEST",
+            "missing or invalid runtime".to_string(),
+        );
+    }
+
+    let _manifest_guard = ctx.runtime_manifest_lock.lock().await;
+    let manifest = match load_local_runtime_manifest() {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            return refuse(
+                409,
+                "RUNTIME_MANIFEST_MISSING",
+                "runtime manifest not found".to_string(),
+            )
+        }
+        Err(err) => return refuse(409, "MANIFEST_INVALID", err),
+    };
+    let reset =
+        match reset_base_runtime_in_manifest_local(&manifest, runtime, |runtime, version| {
+            Path::new(DIST_RUNTIME_ROOT_DIR)
+                .join(runtime)
+                .join(version)
+                .join("bin")
+                .join("start.sh")
+                .is_file()
+        }) {
+            Ok(reset) => reset,
+            Err((status, code, detail)) => return refuse(status, code, detail),
+        };
+    let manifest_path = Path::new(DIST_RUNTIME_MANIFEST_PATH);
+    if let Some(updated) = reset.updated.as_ref() {
+        if let Err(err) = write_runtime_manifest_file_atomic(
+            manifest_path,
+            updated,
+            runtime_manifest_write_v2_gate_enabled_from_env(),
+        ) {
+            return refuse(
+                409,
+                "RUNTIME_RESET_FAILED",
+                format!("failed to update runtime manifest: {err}"),
+            );
+        }
+        tracing::info!(
+            runtime = %reset.runtime,
+            previous_current = reset.previous_current.as_deref().unwrap_or(""),
+            current = %reset.package_version,
+            "base runtime returned to its package's version"
+        );
+    }
+    let (manifest_version, manifest_hash) =
+        match local_runtime_manifest_meta_from_file(manifest_path) {
+            Ok(meta) => meta,
+            Err(err) => return refuse(502, "SERVICE_FAILED", err),
+        };
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": {
+                "runtime": reset.runtime,
+                "previous_current": reset.previous_current,
+                "current": reset.package_version,
+                "package_version": reset.package_version,
+                "changed": reset.updated.is_some(),
+                "manifest_version": manifest_version,
+                "manifest_hash": manifest_hash,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
 /// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
 /// directly (origin "http"); the internal L2 dispatch and the executor call
 /// `handle_admin_command_with_origin` with their origin. Every call is appended to the command
@@ -16649,6 +16906,9 @@ async fn handle_admin_command_inner(
     }
     if matches!(action, "remove_runtime_version") {
         return handle_remove_runtime_version(ctx, client, payload, hive).await;
+    }
+    if action == "reset_base_runtime" {
+        return handle_reset_base_runtime(ctx, payload, hive).await;
     }
     if matches!(action, "send_node_message") {
         return handle_send_node_message(ctx, client, payload, hive).await;
@@ -28076,7 +28336,170 @@ mod tests {
             );
         }
         assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"cognition_clear"));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "19");
+    }
+
+    /// A base runtime goes back to its package's version only behind the operator's word (FINDINGS
+    /// A-122): an action of the catalog with its route, help and example, mutating and confirmed
+    /// first, one the executor runs and Archi stages, and closed to the whole mesh, Archi included.
+    #[test]
+    fn reset_base_runtime_is_the_operators_and_confirmed() {
+        let spec = resolve_internal_action_spec("reset_base_runtime").expect("reset_base_runtime");
+        assert!(matches!(
+            spec.route,
+            InternalActionRoute::Command("reset_base_runtime")
+        ));
+        assert!(spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["POST /hives/{hive}/runtimes/{runtime}/reset"])
+        );
+        assert_ne!(doc["summary"], json!("Admin action."));
+        assert_eq!(doc["request_contract"]["body"]["kind"], json!("none"));
+        assert!(admin_action_example_scmd("reset_base_runtime").is_some());
+        assert!(admin_action_request_notes("reset_base_runtime").len() >= 5);
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/motherbee/runtimes/ai.generic/reset"),
+            vec!["POST"]
+        );
+        // The hive and the runtime are the step's args.
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(schema["required"], json!(["hive", "runtime"]));
+        assert_eq!(
+            schema["properties"].as_object().map(serde_json::Map::len),
+            Some(2)
+        );
+        let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+        assert!(executor_actions.contains(&"reset_base_runtime"));
+
+        assert_eq!(mesh_access("reset_base_runtime"), Some(MeshAccess::Nobody));
+        for caller in [
+            "SY.architect@motherbee",
+            "IO.cloud@motherbee",
+            "SY.orchestrator@worker1",
+            "SY.wf-rules@worker1",
+            "AI.support@worker1",
+        ] {
+            assert!(
+                mesh_admits(
+                    caller,
+                    "reset_base_runtime",
+                    Some("motherbee"),
+                    &json!({ "runtime": "ai.generic" })
+                )
+                .is_err(),
+                "{caller}"
+            );
+        }
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"reset_base_runtime"));
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "20");
+    }
+
+    /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over
+    /// the package's `0.1.89`, next to a runtime the package did not bring.
+    fn manifest_with_a_hand_published_base_runtime(current: &str) -> RuntimeManifest {
+        RuntimeManifest {
+            schema_version: 1,
+            version: 5,
+            updated_at: None,
+            runtimes: json!({
+                "ai.generic": {
+                    "available": ["0.1.88-gate1", "0.1.89"],
+                    "current": current,
+                    "package_version": "0.1.89",
+                },
+                "wf.router": { "available": ["0.0.4"], "current": "0.0.4" },
+            }),
+            hash: None,
+        }
+    }
+
+    #[test]
+    fn a_base_runtime_returns_to_its_packages_version() {
+        let manifest = manifest_with_a_hand_published_base_runtime("0.1.88-gate1");
+        let reset = reset_base_runtime_in_manifest_local(&manifest, "AI.Generic", |_, _| true)
+            .expect("reset");
+        assert_eq!(reset.runtime, "ai.generic");
+        assert_eq!(reset.previous_current.as_deref(), Some("0.1.88-gate1"));
+        assert_eq!(reset.package_version, "0.1.89");
+        let updated = reset.updated.expect("a manifest to write");
+        assert!(updated.version > manifest.version);
+        assert_eq!(
+            updated.runtimes["ai.generic"],
+            json!({
+                "available": ["0.1.88-gate1", "0.1.89"],
+                "current": "0.1.89",
+                "package_version": "0.1.89",
+            })
+        );
+        assert_eq!(
+            updated.runtimes["wf.router"],
+            manifest.runtimes["wf.router"]
+        );
+
+        let already = manifest_with_a_hand_published_base_runtime("0.1.89");
+        let reset = reset_base_runtime_in_manifest_local(&already, "ai.generic", |_, _| true)
+            .expect("reset");
+        assert_eq!(reset.previous_current.as_deref(), Some("0.1.89"));
+        assert!(reset.updated.is_none(), "nothing to write");
+    }
+
+    #[test]
+    fn reset_base_runtime_refuses_what_it_cannot_return() {
+        let manifest = manifest_with_a_hand_published_base_runtime("0.1.88-gate1");
+        let refused = |runtime: &str, ready: bool| {
+            reset_base_runtime_in_manifest_local(&manifest, runtime, |_, _| ready)
+                .map(|_| ())
+                .map_err(|(status, code, _)| (status, code))
+        };
+        assert_eq!(refused("ai.nothing", true), Err((404, "RUNTIME_NOT_FOUND")));
+        assert_eq!(refused("wf.router", true), Err((409, "NOT_A_BASE_RUNTIME")));
+        assert_eq!(
+            refused("ai.generic", false),
+            Err((409, "RUNTIME_NOT_PRESENT"))
+        );
+
+        let mut unpublished = manifest.clone();
+        unpublished.runtimes["ai.generic"]["available"] = json!(["0.1.88-gate1"]);
+        assert_eq!(
+            reset_base_runtime_in_manifest_local(&unpublished, "ai.generic", |_, _| true)
+                .map(|_| ())
+                .map_err(|(status, code, _)| (status, code)),
+            Err((409, "RUNTIME_NOT_PRESENT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_base_runtime_runs_on_the_motherbee_alone() {
+        let (ctx, _harness) = opa_test_admin("reset-base-runtime");
+        let no_query = HashMap::new();
+        for (path, status, code) in [
+            (
+                "/hives/worker1/runtimes/ai.generic/reset",
+                409,
+                "NOT_PRIMARY",
+            ),
+            (
+                "/hives/motherbee/runtimes/ai%20generic/reset",
+                400,
+                "INVALID_REQUEST",
+            ),
+        ] {
+            let (served, body) = handle_hive_paths("POST", path, &no_query, &[], &ctx, &ctx.rpc)
+                .await
+                .expect("route")
+                .expect("served");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(served, status, "{path}: {body}");
+            assert_eq!(body["action"], json!("reset_base_runtime"));
+            assert_eq!(body["error_code"], json!(code), "{path}");
+        }
     }
 
     /// The plan Archi stages: one step that names the hive, and nothing else.

@@ -240,6 +240,13 @@ listed in `dist/runtimes/manifest.json` with `available` versions and a `current
   hot-published `current` alone when its directory still exists, restores the snapshot only if
   the live manifest is missing or unreadable, and fails if it registered nothing. Repair:
   `sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator`.
+- **The way back from a hand publish (A-122).** The seed records the version the package brought
+  as each base runtime's `package_version`, which `list_runtimes` and `get_runtime` show. A
+  `current` that differs is a hand publish, kept through every upgrade (the seed's NOTE says so in
+  dpkg's output). `reset_base_runtime` (`POST /hives/motherbee/runtimes/<runtime>/reset`, or Archi
+  behind the operator's CONFIRM) makes `package_version` current again; the orchestrators move the
+  runtime's nodes within their next pass, and `remove_runtime_version` can then delete the hand
+  publish.
 
 ### How dist reaches the other hives
 

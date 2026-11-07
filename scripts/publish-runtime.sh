@@ -24,6 +24,10 @@ Options:
   --prune-missing          Drop `available` versions of THIS runtime whose directory is gone
                            (requires --set-current). Used by the .deb install-time seed to
                            retire the base version dpkg just removed during unpack.
+  --package                Record this version as manifest.runtimes.<runtime>.package_version:
+                           the version the installed Fluxbee package brought. Used by the .deb
+                           install-time seed; SY.admin's reset_base_runtime returns `current`
+                           to it.
   --sudo                   Use sudo for writes to dist paths
   -h, --help               Show this help
 
@@ -53,6 +57,7 @@ START_SCRIPT=""
 FILES=()
 SET_CURRENT=0
 PRUNE_MISSING=0
+PACKAGE=0
 USE_SUDO=0
 
 while [[ $# -gt 0 ]]; do
@@ -87,6 +92,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --set-current)
       SET_CURRENT=1
+      shift
+      ;;
+    --package)
+      PACKAGE=1
       shift
       ;;
     --sudo)
@@ -193,7 +202,7 @@ done
 # The manifest last: from here on SY.orchestrator may launch the version, and Syncthing carries
 # it to the workers.
 tmp_manifest="$(mktemp)"
-python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" >"$tmp_manifest" <<'PY'
+python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" "$PACKAGE" >"$tmp_manifest" <<'PY'
 import datetime
 import json
 import pathlib
@@ -257,6 +266,11 @@ entry["available"] = sorted(set(available))
 
 if set_current or not isinstance(entry.get("current"), str) or not entry.get("current"):
     entry["current"] = version
+
+# --package: the version the installed package brought, which SY.admin's reset_base_runtime
+# returns `current` to (FINDINGS A-122). Any other publish keeps the one recorded.
+if len(sys.argv) > 7 and sys.argv[7] == "1":
+    entry["package_version"] = version
 
 runtimes[runtime] = entry
 

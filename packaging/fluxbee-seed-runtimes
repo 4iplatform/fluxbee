@@ -7,6 +7,10 @@
 # (dist/runtimes/<runtime>/<version>/bin/) and REGISTERS it here, at install time, against the
 # live root — merging instead of replacing.
 #
+# Each base runtime's entry records the version this package brought as `package_version`
+# (`--package`), kept current or not: SY.admin's reset_base_runtime returns `current` to it after a
+# hand publish (FINDINGS A-122).
+#
 # It does not merge anything itself. It calls scripts/publish-runtime.sh, the merger every
 # runtime publish uses; the .deb used to run that same loop at BUILD time against the staged
 # tree (where there is never anything to merge with). There are already two mergers in this
@@ -126,13 +130,14 @@ while IFS=$'\t' read -r rt bin; do
   if [ -n "$was" ] && [ "$was" != "$VER" ] && [ -d "$RUNTIMES_ROOT/$rt/$was" ]; then
     set_current_args=""
     echo "  NOTE: base runtime $rt keeps its hot-published current $was (its directory is intact);" \
-         "publishing $VER as available only"
+         "publishing $VER as available only. SY.admin's reset_base_runtime returns it to $VER."
   fi
   if bash "$PUBLISH" \
       --runtime "$rt" \
       --version "$VER" \
       --binary "$bin_path" \
       --dist-root "$DIST_ROOT" \
+      --package \
       $set_current_args >/dev/null; then
     published=$((published + 1))
     # ONLY when current was actually moved. Guarded by the same condition as the decision

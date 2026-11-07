@@ -71,6 +71,8 @@ M1="$D1/runtimes/manifest.json"
 check "manifest created" "$([ -f "$M1" ] && echo yes || echo no)" "yes"
 check "io.api current" "$(q "$M1" "d['runtimes']['io.api']['current']")" "$VER"
 check "ai.generic current" "$(q "$M1" "d['runtimes']['ai.generic']['current']")" "$VER"
+check "io.api records the package's version" "$(q "$M1" "d['runtimes']['io.api']['package_version']")" "$VER"
+check "ai.generic records the package's version" "$(q "$M1" "d['runtimes']['ai.generic']['package_version']")" "$VER"
 
 echo "== T2: THE U-3 CASE — dpkg deleted the manifest, a hot runtime must survive =="
 D2="$WORK/t2"; seed_artifacts "$D2" "$VER"
@@ -93,6 +95,7 @@ check "hot runtime dir intact" "$([ -d "$D2/runtimes/wf.router/0.0.4" ] && echo 
 check "base runtime advanced" "$(q "$M2" "d['runtimes']['io.api']['current']")" "$VER"
 check "the version dpkg removed is pruned" "$(q "$M2" "'0.1.2' in d['runtimes']['io.api']['available']")" "False"
 check "manifest version advanced" "$(q "$M2" "d['version'] > 1")" "True"
+check "a hot runtime the package did not bring has no package version" "$(q "$M2" "'package_version' in d['runtimes']['wf.router']")" "False"
 check "snapshot consumed on success" "$([ -f "$SNAP2" ] && echo yes || echo no)" "no"
 
 echo "== T2b: --prune-missing retires a base version whose directory dpkg removed =="
@@ -121,6 +124,14 @@ run_seed "$D2c" >/dev/null
 M2c="$D2c/runtimes/manifest.json"
 check "hot-published current preserved" "$(q "$M2c" "d['runtimes']['io.api']['current']")" "9.9.9"
 check "the package version is still offered" "$(q "$M2c" "'$VER' in d['runtimes']['io.api']['available']")" "True"
+check "the package version is recorded, the way back (A-122)" "$(q "$M2c" "d['runtimes']['io.api']['package_version']")" "$VER"
+
+echo "== T2d: a hand publish keeps the package version the seed recorded (A-122) =="
+mkdir -p "$WORK/t2d-src"; printf '#!/bin/sh\ntrue\n' >"$WORK/t2d-src/io-api"; chmod 0755 "$WORK/t2d-src/io-api"
+bash "$PUBLISH" --runtime io.api --version 9.9.10 --binary "$WORK/t2d-src/io-api" \
+  --dist-root "$D2c" --set-current >/dev/null
+check "the hand publish is current" "$(q "$M2c" "d['runtimes']['io.api']['current']")" "9.9.10"
+check "the package version survives it" "$(q "$M2c" "d['runtimes']['io.api']['package_version']")" "$VER"
 
 echo "== T3: steady state — manifest present, no snapshot =="
 D3="$WORK/t3"; seed_artifacts "$D3" "$VER"

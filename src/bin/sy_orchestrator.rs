@@ -13503,6 +13503,9 @@ fn runtime_api_entry(
         "available": entry.available,
         "type": runtime_package_type(entry),
         "runtime_base": entry.runtime_base,
+        // A base runtime's version as the installed package brought it (its seed records it); a
+        // `current` that differs is a hand publish, which reset_base_runtime undoes (A-122).
+        "package_version": entry.extra.get("package_version"),
         "readiness": runtime_readiness_for_entry(runtime, entry, runtime_entries),
         "materialization_summary": runtime_materialization_summary_for_entry(
             runtime,
@@ -40282,6 +40285,28 @@ blob:
         assert!(item.get("runtime_present").is_some());
         assert!(item.get("start_sh_executable").is_some());
         assert!(item.get("base_runtime_ready").is_some());
+    }
+
+    #[test]
+    fn a_runtime_shows_the_version_its_package_brought() {
+        let runtime = format!("ai.view.{}", Uuid::new_v4().simple());
+        let entry = |extra: BTreeMap<String, serde_json::Value>| RuntimeManifestEntry {
+            available: vec!["0.1.88-gate1".to_string(), "0.1.89".to_string()],
+            current: Some("0.1.88-gate1".to_string()),
+            package_type: None,
+            runtime_base: None,
+            extra,
+        };
+        let base = entry(BTreeMap::from([(
+            "package_version".to_string(),
+            serde_json::json!("0.1.89"),
+        )]));
+        let view = runtime_api_entry(&runtime, &base, None);
+        assert_eq!(view["current"], serde_json::json!("0.1.88-gate1"));
+        assert_eq!(view["package_version"], serde_json::json!("0.1.89"));
+
+        let hand_published = runtime_api_entry(&runtime, &entry(BTreeMap::new()), None);
+        assert!(hand_published["package_version"].is_null());
     }
 
     #[test]

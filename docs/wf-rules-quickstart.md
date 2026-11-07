@@ -10,7 +10,8 @@ curl -sS "http://127.0.0.1:8080/hives/motherbee/runtimes/wf.engine" | jq .payloa
 ```
 
 Do not publish `wf.engine` by hand on a packaged install: a base runtime published by hand keeps
-`current` through every upgrade (FINDINGS A-122), so every WF node would stay on that build.
+`current` through every upgrade (FINDINGS A-122), so every WF node would stay on that build until
+`reset_base_runtime` returns it to the package's version.
 `scripts/publish-wf-runtime.sh` is for a dev checkout without the package only:
 
 ```bash

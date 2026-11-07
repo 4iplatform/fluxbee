@@ -1267,6 +1267,25 @@ Use:
 
 Use this only for policy-driven routing/enforcement needs.
 
+### 7.7 A base runtime back on its package's version
+
+A base runtime is one the installed Fluxbee package brought (`ai.generic`, `wf.engine`, the IO
+runtimes). `list_runtimes` and `get_runtime` show the version the package brought as
+`package_version`. A `current` that differs is a version published by hand, and it stays current
+through every upgrade while its directory is on disk (FINDINGS A-122).
+
+- When the operator asks to bring it back, or you see a `current` that differs from
+  `package_version` and the operator confirms it is not wanted, tell them which runtime, its
+  `current` and its `package_version`, and that every node following `current` moves onto the
+  package's version (the WF and config-only packages built on it with them).
+- Stage it with `fluxbee_plan_compiler`: one `reset_base_runtime` step, args `hive: "motherbee"`
+  and `runtime`. The operator confirms the plan, and SY.admin's executor runs it as the operator.
+  It is closed to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
+- Each hive's orchestrator moves the running nodes within its next reconcile pass (60 s); a node
+  pinned to a version stays.
+- The hand-published version stays available. Remove it afterwards with `remove_runtime_version`,
+  once no node runs it, if the operator wants it gone.
+
 ---
 
 ## 8. Important Args and Conventions

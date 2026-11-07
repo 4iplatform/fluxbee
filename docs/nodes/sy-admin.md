@@ -883,9 +883,9 @@ the same entries (`caller_hive_role`).
 - `/var/lib/fluxbee/state/runtime-package-staging/`: staging for `publish_runtime_package`.
 - `/var/lib/fluxbee/nodes/SY/SY.admin@motherbee/config.json`: executor catalog config.
 - `<storage.path>/modules/`: the `/modules` store.
-- `publish_runtime_package` and `remove_runtime_version` rewrite the motherbee's
-  `dist/runtimes` manifest under one lock (`runtime_manifest_lock`); both refuse to run off the
-  motherbee (`NOT_PRIMARY`).
+- `publish_runtime_package`, `remove_runtime_version` and `reset_base_runtime` rewrite the
+  motherbee's `dist/runtimes` manifest under one lock (`runtime_manifest_lock`); each refuses to
+  run off the motherbee (`NOT_PRIMARY`).
 
 ## Failure behavior
 
@@ -931,6 +931,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
 | `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive; `tool_catalog` is the tool catalog its version ships (ai.generic's base tools), or null. |
 | `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}` | Delete one published runtime version from motherbee dist/manifest. |
+| `reset_base_runtime` | `POST /hives/{hive}/runtimes/{runtime}/reset` | Return a base runtime to the version the installed package brought, its `package_version`: `current` becomes that version, and every node that follows `current` moves onto it. Motherbee-only, closed to the mesh, confirmed by the operator (FINDINGS A-122). |
 | `list_routes` | `GET /hives/{hive}/routes` | List route rules for a hive. |
 | `list_vpns` | `GET /hives/{hive}/vpns` | List VPN patterns for a hive. |
 | `list_nodes` | `GET /hives/{hive}/nodes` | List nodes for one hive only. Use inventory for system-wide node visibility. |
