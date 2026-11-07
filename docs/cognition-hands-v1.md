@@ -17,8 +17,9 @@
   meanwhile; cognition analyzes people's turns with no agent; and episodes are public news that
   fade with time. Agreed in the chat, its design reviewed by the operator the same day, and
   released in 0.1.104. Its gate on 8.x found that a line a WF relays between two people names no
-  one it was said to (§12.8, A-161): the fix, the operator's choice, built on 2026-11-07 for
-  0.1.105 (§12.9).
+  one it was said to (§12.8, A-161): the fix, the operator's choice, built on 2026-11-07 and
+  released in 0.1.105 (§12.9), checked on 8.x (§12.10). That gate found that the episode gate
+  turns a proposal down without saying why (A-163).
 
 This is the single place for the topic.
 
@@ -856,7 +857,8 @@ At 10:17 sales' package carries:
 - **A conversation that starts among people and later reaches an agent:** does the agent's
   communication start from the one with no agent?
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
-  lenses.
+  lenses. The gate must first say why it turns a proposal down (A-163, §12.10): whether a quarrel
+  between two people is news is the operator's call, on those numbers.
 - **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
   hive.
 - **Known limits of the build** (its review round):
@@ -994,3 +996,30 @@ back to the agent when A asks. The ledger's 0.1.104 has each number.
     `dst_ilk` its message had, so a relay of an agent's answer names whom the agent answered,
     wherever the copy went. Only a communication of another agent than the one that answered
     would show it, and the docs say what a forward keeps.
+
+### 12.10 Checked on 8.x (0.1.105, 2026-11-07)
+
+gate0206 again, as in §12.8, the same lines on new threads, after the wrong episode of 0.1.104's
+run was deleted from both hives' files. The ledger's 0.1.105 has each number.
+
+- **Held (A-161):**
+  - asked to copy its lines, the agent showed all 8 of the meanwhile, in order and each once, B's
+    two included, each relay naming whom it was said to:
+
+    ```text
+    - [2026-11-07 09:15] person A (ilk:…) via IO.gate0206a@worker1, to IO.gate0206b@worker1: "Prefiero hablar con alguien de facturacion, por favor."
+    - [2026-11-07 09:16] person ilk:… via IO.gate0206b@worker1, to person A (ilk:…) via IO.gate0206a@worker1: "Hola, soy de facturacion. …"
+    ```
+
+  - back with A, the agent no longer took B's failure as its own: *"Lo que sé es que el compañero
+    de facturación se comprometió hoy a emitirla y mandártela"*;
+  - cognition's feeling, which in 0.1.104 had A *"threatening to have the agent removed from the
+    account"*, now has A *"angry and escalating toward the counterpart"*;
+  - with no agent, the communication `(thread, none)` keeps where each turn went, and its writers
+    pay.
+- **Held (A-162):** the tagger's one failed call says why, `stop_reason=refusal`: the model refused
+  the turn that asks the agent to copy its prompt's lines, the gate's own probe.
+- **Found, A-163:** the narrator proposed 3 episodes on A's quarrel with B, and the gate turned all
+  3 down. It says nothing of why: one debug line, with the lens. In 0.1.104 the same lines, read as
+  said to the agent, made one of intensity 9. Which rule held these back, and whether such a
+  quarrel is news, cannot be told until the gate says why.

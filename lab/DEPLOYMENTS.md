@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ live, checked on 8.x; its gate found A-161, for 0.1.105 | snap `pre-news-0-1-104` (all 4 VMs) · `apt install fluxbee=0.1.103` + core-update of the spokes |
+| **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ live, checked on 8.x; its gate found A-163 | snap `pre-relayto-0-1-105` (all 4 VMs) · `apt install fluxbee=0.1.104` + core-update of the spokes |
+| **0.1.104** | 2026-11-06 | `1a3fe3ce` | motherbee + spokes (core): the rest of A-137 ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12): the lines a WF relays between people reach the agent that takes the conversation back, cognition analyzes people's turns with no agent and their writers pay, episodes are public news on every hive and the agent's package carries them, and SY.wf-rules keeps a solution on one hive | ✅ replaced by 0.1.105 | snap `pre-news-0-1-104` (deleted 2026-11-07) · `apt install fluxbee=0.1.103` + core-update of the spokes |
 | **0.1.103** | 2026-11-06 | `8af07c3d` | motherbee + spokes (core): SY.cognition keeps its state in its own file on its hive (A-158; [cognition-hands-v1](../docs/cognition-hands-v1.md) §11): closed items leave it, SY.storage drops the cognition tables, and the router's stream and the SDK lose `storage.cognition.*` | ✅ replaced by 0.1.104 | snap `pre-cogstate-0-1-103` (deleted 2026-11-06) · `apt install fluxbee=0.1.102` + core-update of the spokes |
 | **0.1.102** | 2026-11-06 | `476bf231` | motherbee + spokes (core): A-137's feelings, each person's and fading with their own turns, read by the agent (A-155; [cognition-hands-v1](../docs/cognition-hands-v1.md) §10), the tagger's affect signals (A-157), the averages and `last_seen_at` (two of A-156's three), and a person with no name | ✅ replaced by 0.1.103 | snap `pre-feelings-0-1-102` (deleted 2026-11-06) · `apt install fluxbee=0.1.101` + core-update of the spokes |
 | **0.1.101** | 2026-11-05 | `abf2a8d4` | motherbee + spokes (core): A-137's first part, who wrote each message and which turns cognition analyzes ([cognition-hands-v1](../docs/cognition-hands-v1.md)), at most 10 timers in a WF definition (A-153), a quiet WF conversation that closes on its own (A-154), and the empty `wf: {}` block | ✅ replaced by 0.1.102 | snap `pre-writer-0-1-101` (deleted 2026-11-06) · `apt install fluxbee=0.1.100` + core-update of the spokes |
@@ -111,6 +112,79 @@
 > This ledger starts at **0.1.20** (the first version formally recorded). The earlier
 > versions (0.1.0–0.1.19) were deployed without a ledger; the apt repo on fb-build keeps them
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
+
+---
+
+## 0.1.105 — A line a WF relays between two people names where it went (A-161), and an answer with no text says why (A-162)
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.104 · **Commit:** `f4d1c0f4`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** 0.1.104's gate on 8.x (FINDINGS A-161 and A-162):
+  - a line a WF relays between two people named no one it was said to, so the agent took another
+    person's failure as its own, and an episode said a person threatened the agent;
+  - a model's answer with no text failed without saying why.
+  - The operator chose the fix on 2026-11-07: a relay names where it went.
+- **What changed** ([cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9):
+  - **The SDKs, Rust and Go:** a package's turn may name where a relay went, `to_via`, the IO node,
+    with `to`, the person its message names. The field is optional, and the package stays version
+    5.
+  - **SY.cognition:**
+    - a relay keeps where it went, and the tagger reads whom it was written to;
+    - the narrator's counterpart is whom a turn was written to;
+    - an episode of a relay is between its writer and the person its message names, else the last
+      other person who wrote through the IO node it went to;
+    - the agent's own copy of a message a WF also relayed, coming in a later batch, makes the turn
+      the agent's.
+  - **ai.generic:** a relay's line names whom it was said to (`, to ...`), with a rule line ahead of
+    the turns: a line said to someone else was not said to the agent.
+  - **The AI SDK:** an answer with no text names its `stop_reason` (Anthropic), or the Responses
+    payload's `status` (OpenAI).
+- **Checks before the release:**
+  - both Rust workspaces: fmt, clippy with warnings denied, and every test (1907 and 305);
+  - Go: gofmt, vet and the tests of the six modules;
+  - GitHub's CI green on `f4d1c0f4`: the Rust and Go tests, the posture guards and the router's
+    dispatcher guards;
+  - the review round (one, one reviewer): two mediums and four lows, all fixed but one noted
+    (cognition-hands-v1 §12.9).
+- **Deploy:**
+  - build of `f4d1c0f4` in 23 min;
+  - publish in 15 s; the repo dropped 0.1.95;
+  - snapshot `pre-relayto-0-1-105` taken on all 4 VMs, `pre-news-0-1-104` dropped;
+  - 0.1.105 on all 4 in 259 s (manifest `e1108ed0fe4271b0`), health clean;
+  - the web route `acknowledged`, upstream `ready`;
+  - SY.cognition loaded its file at start: on worker1 its 2 most recent communications, and on
+    each hive the one live episode of 0.1.104's gate.
+  - That episode, the wrong one (A-161), about the test people only, was deleted from both files
+    with SY.cognition stopped. Each started again with no live episode.
+- **Checked on 8.x** (FINDINGS A-161 and A-162), with gate0206 on worker1 as in 0.1.104, on new
+  threads:
+  - **The handover** (thread `gate0206-handover3`, 7 turns, the same lines as 0.1.104's):
+    - asked to copy its lines, the agent showed all 8 of the meanwhile, in order and each once,
+      B's two included;
+    - each relay names whom it was said to: A's lines to B read `, to IO.gate0206b@worker1`,
+      since the WF names no one there; B's read `, to person A (<ILK>) via IO.gate0206a@worker1`;
+    - back with A, the agent no longer took B's failure as its own: *"Lo que sé es que el
+      compañero de facturación se comprometió hoy a emitirla y mandártela"*;
+    - cognition's feeling, which in 0.1.104 had A *"threatening to have the agent removed from
+      the account"*, now has A *"angry and escalating toward the counterpart"*;
+    - the file keeps 10 turns, each once, with each relay's `to_via`, and `to` on B's two. The
+      agent's 3 answers that the WF sent on to A were skipped as copies.
+  - **No agent** (thread `gate0206-noagent2`): `(thread, none)` kept its 2 turns, each with where
+    it went, and the writers paid: 2 model calls each, `tenant_source` `writer`.
+  - **A-162:** the tagger's one failed call says why: `anthropic response missing text content
+    (stop_reason=refusal)`. The model refused the turn that asks the agent to copy its prompt's
+    lines, the gate's own probe, and that turn went unanalyzed.
+  - **Episodes:** the narrator proposed 3 and the gate turned all 3 down, so none was made. The
+    gate says nothing of why (A-163).
+  - **The cost:** the handover's 19 model calls were the agent's tenant's, as in 0.1.104.
+- **Found in the checks:**
+  - **A-163** 🔴: the episode gate turns a proposal down without saying why: one debug line, with
+    its lens. Whether A's quarrel with B should have been news, and which rule held it back,
+    cannot be told.
+- **Rollback:**
+  - `apt install fluxbee=0.1.104` on the motherbee, then a core-update of the spokes.
+  - 0.1.104 reads the file's rows as they are: it does not know `to_via`, and drops it at its next
+    write. Relays read again as said to the agent (A-161).
 
 ---
 

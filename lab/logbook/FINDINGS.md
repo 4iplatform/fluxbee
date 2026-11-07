@@ -63,14 +63,15 @@ no change required
       2026-11-06 (§11), built as A-158 with A-156's first: ✅ 0.1.103, its gate on 8.x
       (2026-11-06). The rest, agreed in the chat of 2026-11-06 (§12), built the same day with
       its review round's fixes, went out in 0.1.104 (2026-11-07); its gate on 8.x found A-161,
-      whose fix, with A-162, is for 0.1.105.
+      fixed with A-162: ✅ 0.1.105, the same gate on 8.x (2026-11-07), which found A-163.
 
 Blocks 1 and 2 went out in 0.1.99 (2026-11-04), checked on 8.x. Block 3's A-138, with A-151 and
 A-152, went out in 0.1.100 (2026-11-05), checked on 8.x. A-153, A-154, A-137's first part and the
 empty-block fix went out in 0.1.101 (2026-11-05), checked on 8.x. A-137's feelings, with A-155,
 A-157, two of A-156's three and the fix of a person with no name, went out in 0.1.102
 (2026-11-06), checked on 8.x. Where cognition keeps its state, A-158 with A-156's first, went out
-in 0.1.103 (2026-11-06), checked on 8.x.
+in 0.1.103 (2026-11-06), checked on 8.x. The rest of A-137 went out in 0.1.104 (2026-11-07), and
+A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### WF
 
@@ -78,9 +79,8 @@ in 0.1.103 (2026-11-06), checked on 8.x.
   0.1.101, the feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 (A-158, with
   A-156's first); the rest agreed in the chat of 2026-11-06 and out in 0.1.104
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
-  news), its gate's A-161 fixed for 0.1.105.*
-- A-161 🔴 A line a WF relays between two people names no one it was said to (0.1.104's gate; the
-  fix agreed, for 0.1.105).
+  news), and its gate's A-161 ✅ 0.1.105.*
+- A-163 🔴 The episode gate turns a proposal down without saying why (0.1.105's gate).
 - A-150 🔵 With tools, an agent's response contract is not enforced by the provider.
 
 ### io.web
@@ -124,7 +124,6 @@ in 0.1.103 (2026-11-06), checked on 8.x.
   later (the operator, 2026-11-06).
 - A-160 🟡 The factory reset clears the motherbee's cognition, not a worker's (found building
   A-158).
-- A-162 🔴 A model's answer with no text fails without saying why (0.1.104's gate; for 0.1.105).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - [PENDING-BUGS.md](PENDING-BUGS.md) keeps six rows of August open (PB-1, PB-3, PB-5, PB-6, U-6,
   U-12): to check, then bring here or close.
@@ -1199,7 +1198,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-161 [WF] 🔴 OPEN, the fix agreed for 0.1.105 (found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A line a WF relays between two people names no one it was said to, so the agent and cognition read it as said to the agent
+### A-163 [WF] 🔴 OPEN (found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
+
+- **What happens:** SY.cognition turns down a proposed episode about no person
+  (`publish_episode`, src/bin/sy_cognition.rs), or one that `gate_episode`
+  (src/bin/sy_cognition/episodes.rs) refuses:
+  - an unknown lens, or no title, summary or evidence;
+  - evidence under 8;
+  - none of its contexts among the communication's two leading ones;
+  - an intensity under 7, once the habit and the novelty count.
+  - It counts it (`episodes_gated_out_total`) and logs one debug line with its lens. Neither says
+    which rule, nor the proposal's numbers.
+- **Seen in the gate** (`gate0206-handover3`, 2026-11-07): A's quarrel with B, the same lines as
+  0.1.104's, now read as between A and B. The narrator proposed 3 episodes and the gate turned
+  all 3 down. In 0.1.104 the same lines, read as said to the agent, made one of intensity 9.
+  Which rule held these back, and whether such a quarrel should be news, cannot be told.
+- **Proposed fix:** the gate says which rule turned a proposal down, and SY.cognition logs it at
+  info with the proposal's lens, its numbers (base intensity, novelty, habit, evidence strength)
+  and its contexts beside the leading ones. Then gate0206 again, and the operator's call on
+  whether such a quarrel is news.
+
+### A-161 [WF] ✅ VALIDATED ON 8.x (0.1.105, 2026-11-07; found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A line a WF relays between two people names no one it was said to, so the agent and cognition read it as said to the agent
 
 - **What happens:**
   - a relay, what a WF sends a person's IO node, joins the agent's communication as a turn the
@@ -1251,8 +1270,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
       says it; three tests more;
     - noted: a `forward` keeps the `dst_ilk` of the message it forwards toward any IO node other
       than the person's.
+- **Validated on 8.x** (0.1.105, 2026-11-07; the ledger's 0.1.105): gate0206 again, the same lines
+  on a new thread (`gate0206-handover3`), after the wrong episode was deleted from both hives'
+  files:
+  - asked to copy its lines, the agent showed all 8 of the meanwhile, in order and each once, B's
+    two included. A's lines to B read `, to IO.gate0206b@worker1`, since the WF names no one
+    there; B's read `, to person A (<ILK>) via IO.gate0206a@worker1`;
+  - back with A, the agent no longer took B's failure as its own: *"Lo que sé es que el compañero
+    de facturación se comprometió hoy a emitirla y mandártela"*;
+  - cognition's feeling, which in 0.1.104 had A *"threatening to have the agent removed from the
+    account"*, now has A *"angry and escalating toward the counterpart"*;
+  - the file keeps each relay's `to_via`, and `to` on B's two; with no agent
+    (`gate0206-noagent2`), the same, and the writers paid.
+  - No episode was made: the narrator proposed 3 and the gate turned them all down, saying nothing
+    of why (A-163).
 
-### A-162 [General/ai-sdk] 🔴 OPEN, for 0.1.105 (found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A model's answer with no text fails without saying why
+### A-162 [General/ai-sdk] ✅ VALIDATED ON 8.x (0.1.105, 2026-11-07; found 2026-11-07, 0.1.104's gate on 8.x; read in the code) — A model's answer with no text fails without saying why
 
 - **What happens:** the Anthropic client takes a response's text blocks, and with none it returns
   `anthropic response missing text content` (`anthropic_response_text`,
@@ -1267,6 +1300,10 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Built** (2026-11-07), for 0.1.105: `anthropic response missing text content
   (stop_reason=refusal)`, and the Responses payload's `status`, with the reason of an incomplete
   one and `refused` when a message refused (`openai_no_text_reason`).
+- **Validated on 8.x** (0.1.105, 2026-11-07, `gate0206-handover3`): the tagger's one failed call
+  says `anthropic response missing text content (stop_reason=refusal)`. The model refused the
+  turn that asks the agent to copy its prompt's lines, the gate's own probe, and that turn went
+  unanalyzed, as any turn whose analysis fails.
 
 ### A-158 [WF] ✅ VALIDATED ON 8.x (0.1.103, 2026-11-06; found 2026-11-06, reviewing where cognition keeps its state with the operator; read in the code) — Cognition keeps its state in SY.storage on the motherbee: a worker's cognition depends on it, and a host reboot leaves each conversation's first message with no memory
 
@@ -2000,7 +2037,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   another WF never goes on (`withWFBlock`; test `TestAForwardCarriesNoOtherWFsBlock`). Two
   comments in `wfcel` still named the trail.
 
-### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part ✅ 0.1.101, its feelings ✅ 0.1.102 and where cognition keeps its state ✅ 0.1.103, validated on 8.x, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
+### A-137 [WF] 🔵 IN PROGRESS, its own topic (found 2026-10-31, the WF Case 4 design chat; its first part ✅ 0.1.101, its feelings ✅ 0.1.102, where cognition keeps its state ✅ 0.1.103 and the rest ✅ 0.1.104 with A-161's fix in 0.1.105, validated on 8.x, [cognition-hands-v1](../../docs/cognition-hands-v1.md)) — Cognition follows only the conversations an agent is in, so whoever takes over a conversation does not see what was said meanwhile
 
 - **What happens:**
   - **Every user message is stored,** whoever speaks. SY.storage's `turns` keeps who sent it, to
@@ -2228,7 +2265,12 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     agent paid by its writers. The gate found A-161: a line a WF relays between two people names
     no one it was said to, so the agent took the blame for B, and the episode names the agent.
     The fix, agreed with the operator, is for 0.1.105, with A-162.
-  - **Open:** A-161; §12.6 keeps handing over between agents, a conversation that reaches an agent
+  - **A-161 and A-162** went out in 0.1.105 (2026-11-07) and were checked on 8.x with the same
+    gate on new threads: each line a WF relays names whom it was said to, the agent no longer
+    takes another person's failure as its own, and cognition reads the quarrel as between A and
+    B. That gate found A-163: the episode gate turned the quarrel's 3 proposals down, saying
+    nothing of why.
+  - **Open:** A-163; §12.6 keeps handing over between agents, a conversation that reaches an agent
     late, and the numbers.
 
 ### A-136 [IO/io.slack] 🟡 OPEN (found 2026-10-31, the WF Case 4 design chat; for the IO track) — io.slack splits one interlocutor's conversation by where they write in Slack
