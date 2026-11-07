@@ -429,7 +429,12 @@ belongs to the people it is about (`src/bin/sy_cognition/episodes.rs`; docs/cogn
   - evidence of 8 or more (`EPISODE_MIN_EVIDENCE`), anchored in one of the communication's two
     leading contexts;
   - and it must be about a person: an ILK the identity knows as no one else's, or does not know.
-  A refused proposal counts in `episodes.gated_out_total`.
+  A refused proposal counts in `episodes.gated_out_total`, and SY.cognition's log says at info
+  which condition it missed (`refused`: `not_about_a_person`, `unknown_lens`, `no_title`,
+  `no_summary`, `no_evidence_signals`, `weak_evidence`, `off_the_leading_contexts` or
+  `below_intensity`) with the gate's numbers: the base intensity, the novelty, the habit, the
+  final intensity, the evidence's strength and contexts, and the communication's leading
+  contexts. Never its title or summary.
 - **Its fields** (`Episode`): an id, the lens, a title, a summary (a paragraph: what happened,
   between whom and how it stood, never what someone feels), its state (`resolved`, `pending`,
   `follow_up` or `inconclusive`), its intensity, its birth time, the ILKs of its people (the

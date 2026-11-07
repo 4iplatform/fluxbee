@@ -857,8 +857,9 @@ At 10:17 sales' package carries:
 - **A conversation that starts among people and later reaches an agent:** does the agent's
   communication start from the one with no agent?
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
-  lenses. The gate must first say why it turns a proposal down (A-163, §12.10): whether a quarrel
-  between two people is news is the operator's call, on those numbers.
+  lenses. The gate says why it turns a proposal down (A-163, §12.10, built for 0.1.106):
+  SY.cognition's log names, at info, the condition missed and the gate's numbers. Whether a
+  quarrel between two people is news is the operator's call, on those numbers.
 - **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
   hive.
 - **Known limits of the build** (its review round):

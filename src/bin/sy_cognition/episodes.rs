@@ -114,26 +114,74 @@ pub(crate) struct EpisodeProposal {
     pub(crate) evidence_contexts: Vec<String>,
 }
 
-/// The deterministic gate, the lab's (§12.4): the final intensity, once `habit` (how many live
-/// episodes of its lens these people already have) takes a point off for every two, up to five, and
-/// the novelty adds or takes up to two. An episode is made at `EPISODE_MIN_INTENSITY` or more, with
-/// a known lens, a title and a summary, evidence of `EPISODE_MIN_EVIDENCE` or more, and one of its
-/// contexts among the communication's two leading ones (`leading`). None otherwise.
+/// Why the gate turned a proposal down: the first of its conditions the proposal misses, in the
+/// order `gate_episode` checks them, or that it is about no person (`publish_episode`'s own check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateRefusal {
+    NotAboutAPerson,
+    UnknownLens,
+    NoTitle,
+    NoSummary,
+    NoEvidenceSignals,
+    WeakEvidence,
+    OffTheLeadingContexts,
+    BelowIntensity,
+}
+
+impl GateRefusal {
+    /// The word a log line names it by.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAboutAPerson => "not_about_a_person",
+            Self::UnknownLens => "unknown_lens",
+            Self::NoTitle => "no_title",
+            Self::NoSummary => "no_summary",
+            Self::NoEvidenceSignals => "no_evidence_signals",
+            Self::WeakEvidence => "weak_evidence",
+            Self::OffTheLeadingContexts => "off_the_leading_contexts",
+            Self::BelowIntensity => "below_intensity",
+        }
+    }
+}
+
+/// A proposal's final intensity, out of 10, rounded: its base, less a point for every two live
+/// episodes of its lens these people already have (`habit`, up to five points), plus its novelty
+/// (up to two either way). Computed whether or not the rest of the gate holds, so that a refusal
+/// can show it.
+pub(crate) fn final_intensity(proposal: &EpisodeProposal, habit: u32) -> f64 {
+    let habit_penalty = f64::from((habit / 2).min(5));
+    (proposal.base_intensity.clamp(0.0, 10.0) - habit_penalty + proposal.novelty.clamp(-2.0, 2.0))
+        .round()
+        .clamp(0.0, 10.0)
+}
+
+/// The deterministic gate, the lab's (§12.4). An episode is made at `EPISODE_MIN_INTENSITY` or more
+/// of final intensity (`final_intensity`), with a known lens, a title and a summary, evidence of
+/// `EPISODE_MIN_EVIDENCE` or more, and one of its contexts among the communication's two leading
+/// ones (`leading`). Otherwise the first condition it misses says why.
 pub(crate) fn gate_episode(
     proposal: &EpisodeProposal,
     leading: &[String],
     habit: u32,
-) -> Option<f64> {
-    if !EPISODE_LENSES.contains(&proposal.lens.as_str())
-        || proposal.title.trim().is_empty()
-        || proposal.summary.trim().is_empty()
-        || proposal
-            .evidence_signals
-            .iter()
-            .all(|signal| signal.trim().is_empty())
-        || proposal.evidence_strength < EPISODE_MIN_EVIDENCE
+) -> Result<f64, GateRefusal> {
+    if !EPISODE_LENSES.contains(&proposal.lens.as_str()) {
+        return Err(GateRefusal::UnknownLens);
+    }
+    if proposal.title.trim().is_empty() {
+        return Err(GateRefusal::NoTitle);
+    }
+    if proposal.summary.trim().is_empty() {
+        return Err(GateRefusal::NoSummary);
+    }
+    if proposal
+        .evidence_signals
+        .iter()
+        .all(|signal| signal.trim().is_empty())
     {
-        return None;
+        return Err(GateRefusal::NoEvidenceSignals);
+    }
+    if proposal.evidence_strength < EPISODE_MIN_EVIDENCE {
+        return Err(GateRefusal::WeakEvidence);
     }
     let anchored = proposal.evidence_contexts.iter().any(|context| {
         leading
@@ -141,14 +189,13 @@ pub(crate) fn gate_episode(
             .any(|label| label.trim().eq_ignore_ascii_case(context.trim()))
     });
     if !anchored {
-        return None;
+        return Err(GateRefusal::OffTheLeadingContexts);
     }
-    let habit_penalty = f64::from((habit / 2).min(5));
-    let final_intensity = (proposal.base_intensity.clamp(0.0, 10.0) - habit_penalty
-        + proposal.novelty.clamp(-2.0, 2.0))
-    .round()
-    .clamp(0.0, 10.0);
-    (final_intensity >= EPISODE_MIN_INTENSITY).then_some(final_intensity)
+    let intensity = final_intensity(proposal, habit);
+    if intensity < EPISODE_MIN_INTENSITY {
+        return Err(GateRefusal::BelowIntensity);
+    }
+    Ok(intensity)
 }
 
 /// The episode a proposal that passed the gate makes.
@@ -362,46 +409,104 @@ mod tests {
     #[test]
     fn the_gate_is_the_labs() {
         let leading = vec!["credit note".to_string(), "billing".to_string()];
-        assert_eq!(gate_episode(&proposal(), &leading, 0), Some(8.0));
+        assert_eq!(gate_episode(&proposal(), &leading, 0), Ok(8.0));
         // The habit takes a point off for every two live episodes of the lens, up to five.
-        assert_eq!(gate_episode(&proposal(), &leading, 2), Some(7.0));
-        assert_eq!(gate_episode(&proposal(), &leading, 4), None);
+        assert_eq!(gate_episode(&proposal(), &leading, 2), Ok(7.0));
+        assert_eq!(
+            gate_episode(&proposal(), &leading, 4),
+            Err(GateRefusal::BelowIntensity)
+        );
         // The novelty adds up to two.
         let novel = EpisodeProposal {
             novelty: 5.0,
             ..proposal()
         };
-        assert_eq!(gate_episode(&novel, &leading, 20), None);
-        assert_eq!(gate_episode(&novel, &leading, 4), Some(8.0));
-        // Each other condition alone refuses it.
-        for refused in [
-            EpisodeProposal {
-                lens: "joy".to_string(),
-                ..proposal()
-            },
-            EpisodeProposal {
-                evidence_strength: 7.9,
-                ..proposal()
-            },
-            EpisodeProposal {
-                evidence_signals: vec![" ".to_string()],
-                ..proposal()
-            },
-            EpisodeProposal {
-                evidence_contexts: vec!["refunds".to_string()],
-                ..proposal()
-            },
-            EpisodeProposal {
-                summary: " ".to_string(),
-                ..proposal()
-            },
-            EpisodeProposal {
-                base_intensity: 6.4,
-                ..proposal()
-            },
+        assert_eq!(
+            gate_episode(&novel, &leading, 20),
+            Err(GateRefusal::BelowIntensity)
+        );
+        assert_eq!(gate_episode(&novel, &leading, 4), Ok(8.0));
+        // Each other condition alone refuses it, and says which.
+        for (refused, why) in [
+            (
+                EpisodeProposal {
+                    lens: "joy".to_string(),
+                    ..proposal()
+                },
+                GateRefusal::UnknownLens,
+            ),
+            (
+                EpisodeProposal {
+                    title: " ".to_string(),
+                    ..proposal()
+                },
+                GateRefusal::NoTitle,
+            ),
+            (
+                EpisodeProposal {
+                    summary: " ".to_string(),
+                    ..proposal()
+                },
+                GateRefusal::NoSummary,
+            ),
+            (
+                EpisodeProposal {
+                    evidence_signals: vec![" ".to_string()],
+                    ..proposal()
+                },
+                GateRefusal::NoEvidenceSignals,
+            ),
+            (
+                EpisodeProposal {
+                    evidence_strength: 7.9,
+                    ..proposal()
+                },
+                GateRefusal::WeakEvidence,
+            ),
+            (
+                EpisodeProposal {
+                    evidence_contexts: vec!["refunds".to_string()],
+                    ..proposal()
+                },
+                GateRefusal::OffTheLeadingContexts,
+            ),
+            (
+                EpisodeProposal {
+                    base_intensity: 6.4,
+                    ..proposal()
+                },
+                GateRefusal::BelowIntensity,
+            ),
         ] {
-            assert_eq!(gate_episode(&refused, &leading, 0), None, "{refused:?}");
+            assert_eq!(gate_episode(&refused, &leading, 0), Err(why), "{refused:?}");
         }
+        // With several missed, the first in the gate's order says why.
+        let weak_and_unknown = EpisodeProposal {
+            lens: "joy".to_string(),
+            evidence_strength: 1.0,
+            ..proposal()
+        };
+        assert_eq!(
+            gate_episode(&weak_and_unknown, &leading, 0),
+            Err(GateRefusal::UnknownLens)
+        );
+    }
+
+    #[test]
+    fn a_refused_proposal_still_has_its_final_intensity() {
+        // What a refusal's log line shows: the base, less the habit, plus the novelty.
+        assert_eq!(final_intensity(&proposal(), 0), 8.0);
+        assert_eq!(final_intensity(&proposal(), 4), 6.0);
+        let off_the_contexts = EpisodeProposal {
+            evidence_contexts: vec!["refunds".to_string()],
+            novelty: -0.6,
+            ..proposal()
+        };
+        assert_eq!(final_intensity(&off_the_contexts, 0), 7.0);
+        assert_eq!(
+            GateRefusal::OffTheLeadingContexts.as_str(),
+            "off_the_leading_contexts"
+        );
     }
 
     #[test]

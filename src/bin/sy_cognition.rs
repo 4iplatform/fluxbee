@@ -2177,14 +2177,33 @@ async fn publish_episode(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .habit(&proposal.lens, &people, now_ms);
-    let Some(intensity) = about_a_person
-        .then(|| episodes::gate_episode(proposal, leading, habit))
-        .flatten()
-    else {
-        let mut state = app_state.runtime_state.lock().await;
-        state.episodes_gated_out_total = state.episodes_gated_out_total.saturating_add(1);
-        tracing::debug!(thread_id, lens = %proposal.lens, "sy.cognition: a proposed episode did not pass the gate");
-        return;
+    let verdict = if about_a_person {
+        episodes::gate_episode(proposal, leading, habit)
+    } else {
+        Err(episodes::GateRefusal::NotAboutAPerson)
+    };
+    let intensity = match verdict {
+        Ok(intensity) => intensity,
+        Err(refusal) => {
+            let mut state = app_state.runtime_state.lock().await;
+            state.episodes_gated_out_total = state.episodes_gated_out_total.saturating_add(1);
+            // At info, with the gate's numbers: whether such a proposal should be news is the
+            // operator's call on them (docs/cognition-hands-v1.md §12.6). Never its title or summary.
+            tracing::info!(
+                thread_id,
+                lens = %proposal.lens,
+                refused = refusal.as_str(),
+                base_intensity = proposal.base_intensity,
+                novelty = proposal.novelty,
+                habit,
+                intensity = episodes::final_intensity(proposal, habit),
+                evidence_strength = proposal.evidence_strength,
+                evidence_contexts = ?proposal.evidence_contexts,
+                leading_contexts = ?leading,
+                "sy.cognition: a proposed episode did not pass the gate"
+            );
+            return;
+        }
     };
     let episode = episodes::episode_of(
         Uuid::new_v4().to_string(),
