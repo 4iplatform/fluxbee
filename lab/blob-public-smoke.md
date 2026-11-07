@@ -97,6 +97,10 @@ curl -sS -X POST http://127.0.0.1:<admin>/artifacts/unpublish \
 Verify: `curl` to `/public/<key>` → 404; admin ledger `status="unpublished"`, `released_at` set.
 Idempotent: repeating it returns `unpublished:false` (it already was).
 
+Or through Archi (A-120), as the operator works: ask it to take the page down by its link. It
+stages one `unpublish_artifact` step with the link's key, and `CONFIRM` runs it in SY.admin's
+executor: the command log shows it with `origin: executor` and the key only as `key_sha256`.
+
 ## 5. Success criteria
 
 - [ ] publish via the tool returns a URL and the `curl` serves it (200 + correct HTML).

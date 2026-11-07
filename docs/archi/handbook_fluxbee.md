@@ -950,10 +950,23 @@ The ownership and call path are fixed:
    publication, with the returned `publication_id` or the key of the link (`/public/<key>`). Over
    the mesh only `AI.*` may: an `IO.*` or `WF.*` publication ends at its expiry or by the operator.
 
+**Taking a page down is the operator's,** whoever published it (FINDINGS A-120):
+
+- Stage `unpublish_artifact` with `fluxbee_plan_compiler`: one step, with exactly one of
+  `publication_id` (`pub:<uuid>`) or `key`, the last segment of the page's link. Of
+  `https://<host>/public/<key>`, pass only `<key>`. The step takes no `hive`.
+- The operator confirms the plan, and SY.admin's executor takes the page down as the operator. The
+  link stops working at once, for everyone who has it.
+- A page already down or expired answers `unpublished: false`; a link or id no publication has,
+  `NOT_FOUND`.
+- No action lists the pages: the operator names one by its link, or by the `publication_id` its
+  producer reported.
+
 Rules for Archi:
 
-- Publication is behavior implemented inside the producer runtime. It is **not** an HTTP/SCMD
-  Admin operation and must not be emitted as an Admin executor step.
+- Publishing is behavior implemented inside the producer runtime: `publish_artifact` is **not** an
+  HTTP/SCMD Admin operation and must not be emitted as an Admin executor step. Taking a page down
+  is one (above).
 - When designing or packaging such a producer, require the runtime to use the existing Blob SDK and
   generic `send_admin_rpc` path. Do not invent an `IO.*` relay, a second public server, or a new edge API.
 - `publish_artifact` accepts only `blob_ref`, optional `presentation` (`inline` or `attachment`), and

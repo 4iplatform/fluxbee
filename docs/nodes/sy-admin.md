@@ -185,8 +185,11 @@ Other checks:
   sets the executor catalog. Over the mesh only Archi asks for those two and for
   `send_node_message`.
 - Fanout `externalize` (with `fanout_family`) is operator-only (`handle_externalize`).
-- The HTTP route `POST /artifacts/unpublish` may revoke any tenant's publication
-  (`handle_unpublish_artifact` with no caller).
+- The operator's `unpublish_artifact` may revoke any tenant's publication
+  (`handle_unpublish_artifact` with no caller): over HTTP, `POST /artifacts/unpublish`, or as a
+  step of an executor plan. Archi takes a page down that way, with a plan the operator confirms,
+  never with an `ADMIN_COMMAND` of its own, which the handler refuses: Archi is no producer
+  (FINDINGS A-120).
 - What SY.admin sends as SYSTEM messages passes the router's system policy
   (`policy/system.rego`): rule (1) lets `SY.admin@motherbee` send the `EDGE_*` commands, rule (2)
   `CONFIG_GET`, `CONFIG_SET`, `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT` and `CONFIG_CHANGED` to any
@@ -484,7 +487,9 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   gates, with margin. The step's output stays the add_hive answer.
 - **Result**: `{status: done|failed, execution_id, events, summary}`; HTTP-style status 200 when
   done, 409 otherwise. A redacted copy is written to
-  `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`.
+  `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`. Of an
+  `unpublish_artifact` step it keeps the args as the command log does, a link's key only as
+  `key_sha256` (`executor_log_step_args`).
 - **Model and key**: provider and model from the hive.yaml `ai` section (fallback provider when
   it is absent); the key from SY.vault, resource type = the provider, root tenant
   (`build_admin_executor_ai_runtime`). At boot the read waits for the vault, up to 60 s, in a task
@@ -528,8 +533,11 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `publication_id` is read in the form the ledger keeps, lowercase and hyphenated, whatever form
   of the UUID it comes in (`canonical_publication_id`). Over the mesh only an `AI.*` node may ask
   (A-62), and only for its own publication: the record's publisher must be its exact
-  router-stamped name, else `403 UNAUTHORIZED`. The operator's `POST /artifacts/unpublish` takes
-  either field for any publication. Under the publication lock:
+  router-stamped name, else `403 UNAUTHORIZED`. The operator takes down any publication by either
+  field (FINDINGS A-120): `POST /artifacts/unpublish`, or a step of an executor plan, which
+  Archi's plan compiler stages and which runs only once the operator confirms it. The action is
+  `confirmation_required`, and takes no hive: the publication names its edge. Under the
+  publication lock:
   - a publication the ledger does not hold answers `404 NOT_FOUND`;
   - one already down answers ok, `unpublished: false`, and asks no one: `unpublished`, `expired`,
     or past its `expires_at`, which the edge no longer serves. That last one keeps its row for the
@@ -545,7 +553,7 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   that is not one included, it keeps the field's name with the value `***REDACTED***`, and of
   params that are neither an object nor null only `***REDACTED***`
   (`unpublish_artifact_log_params`). So the command log carries no live link, refused requests
-  included (A-95).
+  included (A-95), and neither does the executor's run log of a plan that took a page down.
 - **Audit log.** Commands are appended to
   `/var/lib/fluxbee/state/sy-admin/command-log/commands.jsonl`: one JSON line with time, action,
   hive, origin (`http`, `l2:<caller>` or `executor`), redacted params (cut at 2048
@@ -871,7 +879,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
-| `unpublish_artifact` | — (mesh only) | Revoke a public artifact the calling AI.* producer published, by its publication_id or the key of its link. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish. |
+| `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
@@ -985,7 +993,6 @@ Served by `handle_http`, `handle_hive_paths` and `handle_modules_paths` but not 
 | `GET /health` | Liveness, answered locally |
 | `GET /admin/executor/functions` | The executor's function catalog |
 | `POST /channels/externalize`, `POST /channels/unexternalize`, `GET /channels/externalized?edge_node=` | Edge channels as the operator (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) |
-| `POST /artifacts/unpublish` | Revoke any publication, body `{"publication_id": "pub:<uuid>"}` or `{"key": "<key>"}`, the key of its `/public/<key>` link |
 | `GET /config/storage/metrics` | SY.storage inbox metrics |
 | `GET /inventory/nodes` | Global inventory, nodes |
 | `GET /versions?hive=`, `GET /deployments?hive=`, `GET /drift-alerts?hive=` | The per-hive form of the global route |

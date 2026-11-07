@@ -330,6 +330,8 @@ stream. HTML gets the fixed CSP of section 6; no header comes from the producer.
    `run_publication_expiry_sweep` (every 600s: `MSG_EDGE_UNPUBLISH_BLOB` + `MSG_BLOB_RELEASE`,
    ledger→`expired`, idempotent); operator route `POST /artifacts/unpublish` (revokes any
    tenant, D2); and durable audit of `publish_artifact`/`unpublish_artifact` in the command-log.
+   Since FINDINGS A-120 `unpublish_artifact` is also a step of the operator's executor, which
+   Archi stages and the operator confirms; only `publish_artifact` stays outside it.
 7. **[PENDING PRODUCER SMOKE]** A real AI/IO generates HTML and goes through `publish_artifact`, expiry and
    `unpublish_artifact` over the installed mesh. Runbook: `lab/blob-public-smoke.md`.
 8. **[FUTURE]** `mint_artifact_access` for per-access tenant validation through Cloud.

@@ -2076,6 +2076,18 @@ fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// What the executor's run log keeps of the args of a step of `action`, before
+/// `redact_executor_log_value`. An `unpublish_artifact` can name its page by the key of its link,
+/// the permission to read it, so the run log keeps what the command log keeps
+/// (`unpublish_artifact_log_params`, A-95); any other step's args go as they are.
+fn executor_log_step_args(action: &str, args: &serde_json::Value) -> serde_json::Value {
+    if action == "unpublish_artifact" {
+        unpublish_artifact_log_params(args)
+    } else {
+        args.clone()
+    }
+}
+
 fn persist_admin_executor_run_log(
     ctx: &AdminContext,
     execution_id: &str,
@@ -2086,15 +2098,36 @@ fn persist_admin_executor_run_log(
     let dir = admin_executor_log_dir(&ctx.state_dir, &ctx.hive_id);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{execution_id}.json"));
+    let mut plan = request.plan.clone();
+    for step in &mut plan.execution.steps {
+        step.args = executor_log_step_args(&step.action, &step.args);
+    }
+    let events: Vec<AdminExecutorStepEvent> = events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            // The step's own call carries its args; its help lookup, only the action's name.
+            if event
+                .tool_name
+                .as_deref()
+                .is_none_or(|tool| tool == event.step_action)
+            {
+                let args = event.tool_args_preview.take();
+                event.tool_args_preview =
+                    args.map(|args| executor_log_step_args(&event.step_action, &args));
+            }
+            event
+        })
+        .collect();
     let body = serde_json::json!({
         "execution_id": execution_id,
         "request": {
             "execution_id": request.execution_id,
-            "plan": redact_executor_log_value(&serde_json::to_value(&request.plan).unwrap_or_else(|_| serde_json::json!({}))),
+            "plan": redact_executor_log_value(&serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}))),
             "executor_options": redact_executor_log_value(&serde_json::to_value(&request.executor_options).unwrap_or_else(|_| serde_json::json!({}))),
             "labels": redact_executor_log_value(&serde_json::to_value(&request.labels).unwrap_or_else(|_| serde_json::json!({}))),
         },
-        "events": redact_executor_log_value(&serde_json::to_value(events).unwrap_or_else(|_| serde_json::json!([]))),
+        "events": redact_executor_log_value(&serde_json::to_value(&events).unwrap_or_else(|_| serde_json::json!([]))),
         "summary": redact_executor_log_value(&serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}))),
         "written_at": now_epoch_ms(),
     });
@@ -5814,10 +5847,11 @@ async fn handle_unpublish_artifact(
     // Producer path (mesh, caller_l2_name = Some): the A-62 table lets only an AI.* node ask
     // (`MeshAccess::AiPublisher`; Archi, which it admits to every action, is no producer and is
     // refused here), and only for its own publication: the exact router-stamped name that
-    // published it, checked below. Operator path (caller_l2_name = None, the trusted localhost
-    // HTTP server): may unpublish ANY publication (D2 — a deliberate operator escape hatch so a
-    // retired/renamed producer's publication can still be revoked; mirrors the None-bypass of
-    // the channel/externalize seams).
+    // published it, checked below. Operator path (caller_l2_name = None): the trusted localhost
+    // HTTP server, or the executor running a step of a plan the operator confirmed in Archi,
+    // which is how Archi takes a page down (A-120). It may unpublish ANY publication (D2 — a
+    // deliberate operator power, so a retired/renamed producer's publication can still be
+    // revoked; mirrors the None-bypass of the channel/externalize seams).
     let caller: Option<String> = match caller_l2_name {
         Some(_) => match authorize_artifact_publisher(caller_l2_name) {
             Ok(caller) => Some(caller),
@@ -8951,9 +8985,10 @@ async fn handle_http(
             .await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
-        // Operator revoke of a public artifact (D2). The HTTP origin has no caller, which routes to
-        // handle_unpublish_artifact's operator escape hatch: the localhost HTTP path may
-        // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
+        // Operator revoke of a public artifact (D2), unpublish_artifact's route in the catalog. The
+        // HTTP origin has no caller, which routes to handle_unpublish_artifact's operator path, as
+        // the executor's does: the operator may unpublish ANY tenant's publication (a
+        // retired/renamed producer can't be asked to).
         // Body: {"publication_id":"pub:<uuid>"} or {"key":"<key>"}, the key of its /public/<key>.
         ("POST", "/artifacts/unpublish") => {
             let payload: serde_json::Value = if body.is_empty() {
@@ -12177,8 +12212,13 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
     })
 }
 
+/// An action only a producer asks for, over the mesh: the router-stamped caller is the publisher,
+/// so it has no HTTP route, and the executor, which runs every step as the operator, has no
+/// producer to act for. Taking a page down is not one (A-120): the operator takes down any page,
+/// on loopback or through a plan Archi stages and the operator confirms, and an AI node still asks
+/// over the mesh for its own.
 fn admin_action_is_mesh_only(action: &str) -> bool {
-    matches!(action, "publish_artifact" | "unpublish_artifact")
+    action == "publish_artifact"
 }
 
 fn admin_action_executor_available(action: &str) -> bool {
@@ -12287,6 +12327,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "wf_cancel_instance"
             | "acme_renew"
             | "acme_test"
+            // It takes down a page that people may be reading, whoever published it.
+            | "unpublish_artifact"
     )
 }
 
@@ -12303,7 +12345,7 @@ fn admin_action_summary(action: &str) -> &'static str {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner."
         }
         "unpublish_artifact" => {
-            "Revoke a public artifact the calling AI.* producer published, by its publication_id or the key of its link. Mesh-only and identity-bound; the operator revokes any with POST /artifacts/unpublish."
+            "Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own."
         }
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
@@ -12557,6 +12599,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_admin_action_help" => vec!["GET /admin/actions/{action}"],
         "publish_runtime_package" => vec!["POST /admin/runtime-packages/publish"],
         "publish_cloud_endpoint" => vec!["POST /hives/{hive}/cloud/endpoint"],
+        "unpublish_artifact" => vec!["POST /artifacts/unpublish"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
@@ -13234,7 +13277,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "key",
                 "string",
-                "The key of the publication's link, the last segment of /public/<key>: 64 lowercase hex characters. Exactly one of publication_id or key.",
+                "The key of the publication's link, the last segment of /public/<key>: 64 lowercase hex characters. Of a whole link, https://<host>/public/<key>, only <key>. Exactly one of publication_id or key.",
             ),
         ],
         "publish_runtime_package" => vec![
@@ -14072,6 +14115,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "publish_runtime_package" => {
             r#"curl -X POST /admin/runtime-packages/publish -d '{"source":{"kind":"bundle_upload","blob_path":"packages/incoming/ai-support-demo-0.1.0.zip"},"set_current":true,"sync_to":["worker-220"],"update_to":["worker-220"]}'"#
         }
+        "unpublish_artifact" => {
+            r#"curl -X POST /artifacts/unpublish -d '{"publication_id":"pub:550e8400-e29b-41d4-a716-446655440000"}'"#
+        }
         "hive_status" => "curl -X GET /hive/status",
         "list_hives" => "curl -X GET /hives",
         "get_hive" => "curl -X GET /hives/worker-220",
@@ -14310,7 +14356,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
             "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node on a worker or the motherbee (A-62: a node of an ingress or egress hive asks SY.admin for nothing). The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
-            "Over the mesh only an AI.* producer may unpublish: an IO.* or WF.* publication ends at its expiry or by the operator (POST /artifacts/unpublish).",
+            "Over the mesh only an AI.* producer may unpublish: an IO.* or WF.* publication ends at its expiry or by the operator's unpublish_artifact (POST /artifacts/unpublish, or a plan Archi stages and the operator confirms).",
             "Call RouterDispatcher::send_admin_rpc with target=None. Do not send tenant_id, publisher_l2_name, path, public key, sha256, raw headers or CSP.",
             "blob_ref must already identify promoted active content available to IO.blob; bytes never travel in ADMIN_COMMAND.",
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
@@ -14325,11 +14371,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
         ],
         "unpublish_artifact" => vec![
-            "Mesh-only producer operation for AI.* nodes (A-62); the operator revokes any publication with POST /artifacts/unpublish, and there is no SCMD or admin-executor unpublish.",
-            "Only the same router-stamped producer L2 name that created the publication may revoke it; any other caller gets 403 UNAUTHORIZED.",
-            "Call RouterDispatcher::send_admin_rpc with target=None and exactly one of publication_id (returned by publish_artifact) or key (the last segment of the page's /public/<key> link).",
+            "The operator takes down any page, whoever published it: POST /artifacts/unpublish on loopback, or a step of an executor plan, which Archi stages with fluxbee_plan_compiler and SY.admin runs only after the operator confirms it (A-120).",
+            "Over the mesh only an AI.* node may ask (A-62), with RouterDispatcher::send_admin_rpc and target=None, and only for a page it published: the same router-stamped L2 name, else 403 UNAUTHORIZED. Archi takes a page down through the executor, never with an ADMIN_COMMAND of its own.",
+            "Name the page by exactly one of publication_id (pub:<uuid>, returned by publish_artifact) or key, the last segment of its link: of https://<host>/public/<key>, only <key>. It takes no hive: the publication names its edge.",
             "A publication that does not exist answers 404 NOT_FOUND.",
             "A publication already unpublished, or expired (past its expires_at, swept or not), answers ok with unpublished: false. Otherwise the edge removes the page and IO.blob releases its copy before the answer, unpublished: true; a failed step answers EDGE_UNPUBLISH_FAILED or BLOB_RELEASE_FAILED and may be retried.",
+            "No log keeps a link's key: the command log and the executor's run log keep it as its SHA-256, key_sha256.",
         ],
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
@@ -24931,15 +24978,11 @@ mod tests {
     }
 
     #[test]
-    fn public_artifact_actions_expose_mesh_only_help_and_stay_out_of_executor() {
+    fn publishing_is_mesh_only_and_stays_out_of_the_executor() {
         let publish =
             resolve_internal_action_spec("publish_artifact").expect("publish action must exist");
-        let unpublish = resolve_internal_action_spec("unpublish_artifact")
-            .expect("unpublish action must exist");
         assert!(!publish.requires_target);
-        assert!(!unpublish.requires_target);
         assert!(!admin_action_is_read_only("publish_artifact"));
-        assert!(!admin_action_is_read_only("unpublish_artifact"));
 
         let doc = build_admin_action_doc(publish);
         assert_eq!(doc["name"], json!("publish_artifact"));
@@ -24966,15 +25009,8 @@ mod tests {
         assert_eq!(optional.len(), 2);
         assert_eq!(optional[0]["name"], json!("presentation"));
         assert_eq!(optional[1]["name"], json!("expires_in_secs"));
-        // Exactly one of the two names a publication, so neither is required alone.
-        assert!(admin_action_body_required_fields("unpublish_artifact").is_empty());
-        let names: Vec<Value> = admin_action_body_optional_fields("unpublish_artifact")
-            .into_iter()
-            .map(|field| field["name"].clone())
-            .collect();
-        assert_eq!(names, vec![json!("publication_id"), json!("key")]);
 
-        let (status, body) = build_admin_action_help_response("unpublish_artifact");
+        let (status, body) = build_admin_action_help_response("publish_artifact");
         assert_eq!(status, 200);
         let body: Value = serde_json::from_str(&body).expect("valid action help response");
         assert_eq!(
@@ -24984,7 +25020,7 @@ mod tests {
         );
         assert_eq!(
             body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],
-            json!("unpublish_artifact")
+            json!("publish_artifact")
         );
 
         let executor_actions: Vec<&str> = executor_visible_action_specs(None)
@@ -24992,7 +25028,75 @@ mod tests {
             .map(|spec| spec.action)
             .collect();
         assert!(!executor_actions.contains(&"publish_artifact"));
-        assert!(!executor_actions.contains(&"unpublish_artifact"));
+    }
+
+    /// Taking a page down is the operator's (A-120): an action of its catalog with its HTTP route,
+    /// one the executor runs and Archi stages, behind the operator's confirmation. Over the mesh
+    /// it stays an AI node's, on its own pages.
+    #[test]
+    fn taking_a_page_down_is_an_operator_action_the_executor_runs() {
+        let spec = resolve_internal_action_spec("unpublish_artifact")
+            .expect("unpublish action must exist");
+        assert!(!spec.requires_target);
+        assert!(!admin_action_is_read_only("unpublish_artifact"));
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(doc["execution_preference"], json!("example_scmd"));
+        assert_eq!(doc["path_patterns"], json!(["POST /artifacts/unpublish"]));
+        assert_ne!(doc["summary"], json!("Admin action."));
+        let contract = &doc["request_contract"];
+        assert_eq!(contract["transport"], json!("http_via_sy_admin"));
+        assert_eq!(contract["method"], json!("POST"));
+        assert_eq!(contract["path_params"], json!([]));
+        assert!(admin_action_example_scmd("unpublish_artifact").is_some());
+        assert!(admin_action_request_notes("unpublish_artifact").len() >= 5);
+        assert_eq!(
+            admin_methods_allowed_for_path("/artifacts/unpublish"),
+            vec!["POST"]
+        );
+
+        // Exactly one of the two names a publication, so neither is required alone; it takes no
+        // hive, since the publication names its edge.
+        assert!(admin_action_body_required_fields("unpublish_artifact").is_empty());
+        let names: Vec<Value> = admin_action_body_optional_fields("unpublish_artifact")
+            .into_iter()
+            .map(|field| field["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("publication_id"), json!("key")]);
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(
+            doc["executor_contract"]["kind"],
+            json!("flat_function_args")
+        );
+        assert_eq!(schema["required"], json!([]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        for field in ["publication_id", "key"] {
+            assert_eq!(
+                schema["properties"][field]["type"],
+                json!(["string", "null"]),
+                "{field}"
+            );
+        }
+        assert!(schema["properties"].get("hive").is_none());
+        validate_value_against_schema(
+            &admin_action_example_payload("unpublish_artifact"),
+            schema,
+            "example",
+        )
+        .expect("the example is a step's args");
+
+        let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+        assert!(executor_actions.contains(&"unpublish_artifact"));
+        assert_eq!(
+            mesh_access("unpublish_artifact"),
+            Some(MeshAccess::AiPublisher)
+        );
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"unpublish_artifact"));
     }
 
     #[test]
@@ -25019,6 +25123,36 @@ mod tests {
 
         assert!(err.contains("mesh-only"));
         assert!(err.contains("cannot run through the admin executor"));
+    }
+
+    /// The plan Archi stages to take a page down (A-120): one step, naming the page by its id or
+    /// by its link's key, and nothing else, a hive included.
+    #[test]
+    fn an_executor_plan_takes_a_page_down_by_its_id_or_its_links_key() {
+        let plan = |args: Value| {
+            parse_executor_plan(json!({
+                "plan_version": ADMIN_EXECUTOR_PLAN_VERSION,
+                "kind": ADMIN_EXECUTOR_PLAN_KIND,
+                "metadata": { "name": "take_page_down", "target_hive": PRIMARY_HIVE_ID },
+                "execution": {
+                    "strict": true,
+                    "stop_on_error": true,
+                    "allow_help_lookup": true,
+                    "steps": [{ "id": "s1", "action": "unpublish_artifact", "args": args }]
+                }
+            }))
+        };
+        let publication_id = format!("pub:{}", Uuid::new_v4());
+        let key = mint_public_capability();
+        for args in [
+            json!({ "publication_id": publication_id }),
+            json!({ "key": key }),
+        ] {
+            assert!(plan(args.clone()).is_ok(), "{args}");
+        }
+        let refused = plan(json!({ "key": key, "hive": PRIMARY_HIVE_ID }))
+            .expect_err("unpublish_artifact takes no hive");
+        assert!(refused.contains("unexpected field 'hive'"), "{refused}");
     }
 
     #[test]
@@ -28440,6 +28574,121 @@ mod tests {
             .next_outgoing_within(Duration::from_millis(200))
             .await
             .is_none());
+    }
+
+    /// Archi takes any page down one way (A-120): a step of a plan the operator confirmed, which
+    /// the executor runs as the operator. An ADMIN_COMMAND of its own is refused, Archi being no
+    /// producer. Neither the command log nor the executor's run log keeps the link's key.
+    #[tokio::test]
+    async fn the_executor_takes_any_page_down_as_the_operator() {
+        let (ctx, mut harness) = opa_test_admin("unpublish-executor");
+        let page = published_page(PAGE_PUBLISHER);
+        seed_publications(&ctx, &[&page]);
+        let args = json!({ "key": page.key });
+
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "unpublish_artifact",
+            None,
+            args.clone(),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert_eq!(refused.envelope["error_code"], "UNAUTHORIZED");
+        assert_eq!(publication_status(&ctx, &page.publication_id), "published");
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let plan = parse_executor_plan(json!({
+            "plan_version": ADMIN_EXECUTOR_PLAN_VERSION,
+            "kind": ADMIN_EXECUTOR_PLAN_KIND,
+            "metadata": { "name": "take_page_down", "target_hive": PRIMARY_HIVE_ID },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{ "id": "s1", "action": "unpublish_artifact", "args": args }]
+            }
+        }))
+        .expect("a plan the executor runs");
+        let client = Arc::clone(&ctx.rpc);
+        let dispatch = execute_admin_executor_step_fallback(
+            &ctx,
+            &client,
+            "run-1",
+            0,
+            &plan.execution.steps[0],
+            ExecutorDirectDispatch::AsPlanned,
+        );
+        let ((event, failure), ()) =
+            tokio::join!(dispatch, take_down(&mut harness, &page.publication_id));
+        assert!(failure.is_none(), "{failure:?}");
+        assert_eq!(event.status, "done");
+        assert_eq!(
+            event.result_preview.as_ref().expect("the step's answer")["payload"],
+            json!({ "publication_id": page.publication_id, "unpublished": true })
+        );
+        assert_eq!(
+            publication_status(&ctx, &page.publication_id),
+            "unpublished"
+        );
+
+        let key_sha256 = format!("{:x}", Sha256::digest(page.key.as_bytes()));
+        let command_log = fs::read_to_string(admin_command_log_path(&ctx.state_dir)).expect("log");
+        assert!(!command_log.contains(&page.key), "{command_log}");
+        let entry: Value =
+            serde_json::from_str(command_log.lines().last().expect("an entry")).expect("JSON");
+        assert_eq!(entry["action"], "unpublish_artifact");
+        assert_eq!(entry["origin"], "executor");
+        assert_eq!(entry["params"], json!({ "key_sha256": key_sha256 }));
+
+        // The run log of that plan, its help lookup included, which names only the action.
+        let help = AdminExecutorStepEvent {
+            status: "help_lookup".to_string(),
+            tool_name: Some("get_admin_action_help".to_string()),
+            tool_args_preview: Some(json!({ "action_name": "unpublish_artifact" })),
+            ..event.clone()
+        };
+        let request = AdminExecutorRunRequest {
+            execution_id: "run-1".to_string(),
+            plan,
+            executor_options: AdminExecutorRunOptions::default(),
+            labels: BTreeMap::new(),
+        };
+        let summary = AdminExecutorRunSummary {
+            execution_id: "run-1".to_string(),
+            status: "done".to_string(),
+            total_steps: 1,
+            completed_steps: 1,
+            failed_step_id: None,
+            failed_step_action: None,
+            failure: None,
+            log_path: None,
+            final_message: "Execution completed successfully".to_string(),
+        };
+        let path =
+            persist_admin_executor_run_log(&ctx, "run-1", &request, &[help, event], &summary)
+                .expect("the run log");
+        let run_log = fs::read_to_string(path).expect("the run log");
+        assert!(!run_log.contains(&page.key), "{run_log}");
+        let run_log: Value = serde_json::from_str(&run_log).expect("JSON");
+        assert_eq!(
+            run_log["request"]["plan"]["execution"]["steps"][0]["args"],
+            json!({ "key_sha256": key_sha256 })
+        );
+        assert_eq!(
+            run_log["events"][0]["tool_args_preview"],
+            json!({ "action_name": "unpublish_artifact" })
+        );
+        assert_eq!(
+            run_log["events"][1]["tool_args_preview"],
+            json!({ "key_sha256": key_sha256 })
+        );
     }
 
     /// Exactly one of `publication_id` or `key`, each in the form SY.admin mints it; an id written
