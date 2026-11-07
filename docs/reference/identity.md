@@ -516,7 +516,10 @@ with a role only works on the motherbee.
 A replica answers them with `NOT_PRIMARY`; it does not forward them. The callers target
 `SY.identity@motherbee` directly (`IdentityProvisionConfig` in `nodes/io/common/src/provision.rs`;
 `resolve_identity_primary_hive_id` in the orchestrator). A replica answers the reads
-(`ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET`) from its copy.
+(`ILK_LIST`, `ILK_GET`, `TNT_LIST`, `TNT_GET`) from its copy, to its own hive's callers: it takes
+no admin request from another hive's SY.admin (F-07). So SY.admin sends every identity action,
+reads included, to the primary, whatever hive the path names (`identity_command_hive`, A-143 and
+2026-11-07); every replica holds the primary's identities.
 
 ### 5.4 Sync on port 9100
 

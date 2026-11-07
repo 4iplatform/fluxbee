@@ -11082,6 +11082,12 @@ async fn respond_bytes(
 }
 
 fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
+    // Read, decide and write as one step: every mesh command runs in its own task (A-68), and two
+    // OPA writes at once must not take the same version.
+    static COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _counter = COUNTER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = json_router::paths::opa_version_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -11101,7 +11107,10 @@ fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
         }
         None => current + 1,
     };
-    fs::write(&path, next.to_string())?;
+    // A write cut short leaves the counter as it was, never empty: an empty one reads as 0.
+    let staged = path.with_extension("next");
+    fs::write(&staged, next.to_string())?;
+    fs::rename(&staged, &path)?;
     Ok(next)
 }
 
@@ -13357,7 +13366,9 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "expires_in_secs",
                 "u64",
-                "Capability lifetime in seconds. Defaults to 86400 and is clamped to 60..2592000.",
+                &format!(
+                    "Capability lifetime in seconds. Defaults to {PUBLICATION_DEFAULT_EXPIRES_SECS} and is clamped to {PUBLICATION_MIN_EXPIRES_SECS}..{PUBLICATION_MAX_EXPIRES_SECS}."
+                ),
             ),
         ],
         "unpublish_artifact" => vec![
@@ -13883,7 +13894,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "spool_day": "2026-07-17"
             },
             "presentation": "inline",
-            "expires_in_secs": 86400
+            "expires_in_secs": PUBLICATION_DEFAULT_EXPIRES_SECS
         }),
         "unpublish_artifact" => serde_json::json!({
             "publication_id": "pub:550e8400-e29b-41d4-a716-446655440000"
@@ -17627,7 +17638,7 @@ async fn handle_identity_query(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let target_hive = identity_command_hive(&ctx.hive_id, action, hive);
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE"),
@@ -17738,15 +17749,13 @@ async fn purge_tenant_vault_block(
     }
 }
 
-/// The hive whose SY.identity takes an identity command: a read (`get_ilk`, `get_tenant`) goes to
-/// the path's hive, whose replica answers it; anything else writes, and only the primary, this
-/// hive's, writes an ILK or a tenant (A-143). A spoke's replica refuses SY.admin of another hive
-/// (F-07), so a write there failed with UNAUTHORIZED_REGISTRAR, naming no cause.
-fn identity_command_hive(admin_hive: &str, action: &str, path_hive: Option<String>) -> String {
-    match path_hive {
-        Some(hive) if matches!(action, "get_ilk" | "get_tenant") => hive,
-        _ => admin_hive.to_string(),
-    }
+/// The hive whose SY.identity takes an identity action: the primary, SY.admin's own hive, whatever
+/// hive the path names. Only the primary writes an ILK or a tenant (A-143), and a spoke's replica
+/// takes no request from SY.admin of another hive (F-07), reads included: a read sent there failed
+/// with UNAUTHORIZED_REGISTRAR. Every replica holds the primary's identities, so the primary
+/// answers a read for any hive.
+fn identity_command_hive(admin_hive: &str, _action: &str, _path_hive: Option<String>) -> String {
+    admin_hive.to_string()
 }
 
 async fn handle_identity_command(
@@ -23299,17 +23308,22 @@ mod tests {
         assert_eq!(http_status_line(202), "HTTP/1.1 202 Accepted");
     }
 
-    /// Only the primary, SY.admin's own hive, writes an ILK or a tenant: a write that names a
-    /// spoke goes there anyway, and a read goes to the replica the path names (A-143, WF Case 5's
-    /// gate: Archi assigned a worker's agents their roles with `hive: worker1`).
+    /// Only the primary, SY.admin's own hive, writes an ILK or a tenant, and a spoke's replica
+    /// takes no request from it: every identity action that names a spoke goes to the primary
+    /// (A-143, WF Case 5's gate: Archi assigned a worker's agents their roles with
+    /// `hive: worker1`; and 2026-11-07, a read of worker1's ILKs refused on 8.x).
     #[test]
-    fn identity_writes_go_to_the_primary_whatever_hive_the_path_names() {
+    fn identity_actions_go_to_the_primary_whatever_hive_the_path_names() {
         for write in [
             "set_ilk_definition",
             "delete_ilk",
             "set_ilk_tenant",
             "purge_tenant",
             "create_tenant",
+            "get_ilk",
+            "get_tenant",
+            "list_ilks",
+            "list_tenants",
         ] {
             assert_eq!(
                 identity_command_hive("motherbee", write, Some("worker1".to_string())),
@@ -23322,18 +23336,41 @@ mod tests {
                 "{write}"
             );
         }
-        for read in ["get_ilk", "get_tenant"] {
-            assert_eq!(
-                identity_command_hive("motherbee", read, Some("worker1".to_string())),
-                "worker1",
-                "{read}"
-            );
-            assert_eq!(
-                identity_command_hive("motherbee", read, None),
-                "motherbee",
-                "{read}"
-            );
-        }
+    }
+
+    /// A read of a spoke's identities asks the primary, and answers what it says (2026-11-07: on
+    /// 8.x `GET /hives/worker1/identity/ilks` answered UNAUTHORIZED_REGISTRAR from the replica).
+    #[tokio::test]
+    async fn a_read_of_a_spokes_identities_asks_the_primary() {
+        let (ctx, mut harness) = opa_test_admin("identity-read-primary");
+        let no_query = HashMap::new();
+        let ilks = json!({ "status": "ok", "ilks": [] });
+        let answered = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("ILK_LIST");
+            harness
+                .inject(reply_to(&sent, "ILK_LIST_RESPONSE", ilks.clone()))
+                .await
+                .unwrap();
+            sent
+        };
+        let (served, sent) = tokio::join!(
+            handle_hive_paths(
+                "GET",
+                "/hives/worker1/identity/ilks",
+                &no_query,
+                &[],
+                &ctx,
+                &ctx.rpc
+            ),
+            answered
+        );
+        assert_eq!(sent.meta.msg.as_deref(), Some("ILK_LIST"));
+        assert_eq!(dst_of(&sent), json!("SY.identity@motherbee"));
+        let (status, body) = served.expect("route").expect("served");
+        assert_eq!(status, 200, "{body}");
     }
 
     /// The direct dispatch routes every action the executor may run, a workflow's deploy included

@@ -15416,17 +15416,7 @@ fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, Orche
             .map(|value| value == state.hive_id)
             .unwrap_or(false)
     }) {
-        let local_role = if state.is_motherbee {
-            "motherbee"
-        } else {
-            "worker"
-        };
-        out.push(serde_json::json!({
-            "hive_id": state.hive_id,
-            "role": local_role,
-            "status": "alive",
-            "is_local": true,
-        }));
+        out.push(local_hive_entry(state));
     }
     out.sort_by(|a, b| {
         let a = a.get("hive_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -15434,6 +15424,17 @@ fn list_hives(state: &OrchestratorState) -> Result<Vec<serde_json::Value>, Orche
         a.cmp(b)
     });
     Ok(out)
+}
+
+/// This hive in its own list when the registry has no entry for it: its role is the one it runs as,
+/// an egress or an ingress included (an audit's F19: both read "worker").
+fn local_hive_entry(state: &OrchestratorState) -> serde_json::Value {
+    serde_json::json!({
+        "hive_id": state.hive_id,
+        "role": state.role.as_str(),
+        "status": "alive",
+        "is_local": true,
+    })
 }
 
 fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, OrchestratorError> {
@@ -33140,6 +33141,22 @@ mod tests {
             "{reply}"
         );
         assert!(!state.any_hive_topology_busy());
+    }
+
+    /// A hive lists itself with the role it runs as (an audit's F19: an egress and an ingress read
+    /// "worker").
+    #[test]
+    fn a_hive_lists_itself_with_its_own_role() {
+        let mut state = sample_orchestrator_state_for_tests();
+        for role in [
+            HiveRole::Motherbee,
+            HiveRole::Worker,
+            HiveRole::Egress,
+            HiveRole::Ingress,
+        ] {
+            state.role = role;
+            assert_eq!(local_hive_entry(&state)["role"], role.as_str());
+        }
     }
 
     /// A-165: a join over a password says what happens to password logins at its end.
