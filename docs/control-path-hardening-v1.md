@@ -54,7 +54,7 @@ types a registered person's email is merged into that person.
 | Caller | Admitted |
 | --- | --- |
 | any caller on an ingress or egress hive | nothing (checked before every row below) |
-| `SY.architect@motherbee` | everything (the operator's agent) |
+| `SY.architect@motherbee` | everything (the operator's agent), but what is closed to the mesh: since A-160, `cognition_clear`, which Archi stages in a plan the operator confirms |
 | `IO.cloud@motherbee` | the Cloud-exposed actions; externalize, unexternalize and list for its own channel |
 | `SY.wf-rules@H` | node actions; package actions; `sync_hint` (detailed below) |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` (new, below) |

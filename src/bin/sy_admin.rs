@@ -4202,7 +4202,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "18";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "19";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4312,6 +4312,13 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "get_llm_usage",
         route: InternalActionRoute::LlmUsage,
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    // A hive's SY.cognition drops everything it keeps (`handle_cognition_clear`).
+    InternalActionSpec {
+        action: "cognition_clear",
+        route: InternalActionRoute::Command("cognition_clear"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4880,8 +4887,9 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 /// A-62: who on the mesh may ask for an action (docs/control-path-hardening-v1.md §2). The HTTP
 /// API and the executor are not mesh callers and reach every action. Over the mesh,
 /// `SY.architect@motherbee` (Archi, the operator's agent) may ask for every action listed in
-/// `mesh_access`, `IO.cloud@motherbee` for each of `CLOUD_EXPOSED_ACTIONS`, and the access of the
-/// action names who else may. A caller on an ingress or egress hive may ask for nothing.
+/// `mesh_access` but those closed to the mesh (`Nobody`), `IO.cloud@motherbee` for each of
+/// `CLOUD_EXPOSED_ACTIONS`, and the access of the action names who else may. A caller on an ingress
+/// or egress hive may ask for nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeshAccess {
     /// Archi alone.
@@ -4900,6 +4908,9 @@ enum MeshAccess {
     Publisher,
     /// `AI.*@H`, on its own publications (`handle_unpublish_artifact`).
     AiPublisher,
+    /// Nobody, Archi included: the operator's alone, on loopback or as a step of a plan Archi
+    /// stages and the operator confirms (the executor is no mesh caller).
+    Nobody,
 }
 
 /// The mesh decision of each action of the catalog and of each mesh command off it. `None`, an
@@ -4916,6 +4927,9 @@ fn mesh_access(action: &str) -> Option<MeshAccess> {
         "externalize" | "unexternalize" | "list_externalized" => MeshAccess::OwnChannel,
         "publish_artifact" => MeshAccess::Publisher,
         "unpublish_artifact" => MeshAccess::AiPublisher,
+        // A hive's cognition forgets every conversation: only behind the operator's word
+        // (FINDINGS A-160).
+        "cognition_clear" => MeshAccess::Nobody,
         // Off the catalog: the executor, which runs every step as the operator.
         "executor_validate_plan" | "executor_execute_plan" => MeshAccess::Archi,
         "hive_status"
@@ -5115,8 +5129,8 @@ enum MeshAdmission {
 /// first in `dispatch_internal_admin_command`. `caller` is the router-stamped `src_l2_name`,
 /// never a field of the params, and `caller_hive` the role of its hive (`caller_hive_role`). In
 /// order: a caller on an ingress or egress hive, or on a hive the registry does not hold, gets
-/// nothing; Archi gets every listed action; IO.cloud the Cloud-exposed ones; then the action's own
-/// `MeshAccess`.
+/// nothing; nobody gets an action closed to the mesh (`MeshAccess::Nobody`); Archi gets every other
+/// listed action; IO.cloud the Cloud-exposed ones; then the action's own `MeshAccess`.
 fn authorize_mesh_caller(
     caller: &str,
     caller_hive: Option<CallerHive>,
@@ -5148,8 +5162,11 @@ fn authorize_mesh_caller(
             ));
         }
     }
-    let Some(access) = mesh_access(action) else {
-        return Err(format!("'{action}' is open to no mesh caller"));
+    let access = match mesh_access(action) {
+        Some(MeshAccess::Nobody) | None => {
+            return Err(format!("'{action}' is open to no mesh caller"));
+        }
+        Some(access) => access,
     };
     if caller == format!("SY.architect@{admin_hive}")
         || (caller == format!("IO.cloud@{admin_hive}")
@@ -10201,6 +10218,16 @@ async fn handle_hive_paths(
             };
             Ok(Some((status, resp)))
         }
+        ("POST", ["cognition", "clear"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "cognition_clear", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["runtimes"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_runtimes", Some(hive)).await?;
@@ -10885,11 +10912,13 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
         "WORKFLOW_NOT_FOUND" => 404,
-        // A WF engine's refusals of its instance verbs (`wf_instance_answer`): an instance it does
-        // not have, one already ended, and its store failing.
+        // A WF engine's refusals of its instance verbs (`node_verb_answer`): an instance it does
+        // not have, and one already ended.
         "INSTANCE_NOT_FOUND" => 404,
         "INSTANCE_ALREADY_TERMINATED" => 409,
-        "STORE_ERROR" => 502,
+        // A store that failed: the WF engine's, or the file SY.cognition could not clear; and the
+        // memory region SY.cognition could not write once its file was cleared (`cognition_clear`).
+        "STORE_ERROR" | "REGION_ERROR" => 502,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
@@ -12284,6 +12313,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "wf_rules_rollback"
             | "wf_rules_delete"
             | "wf_cancel_instance"
+            | "cognition_clear"
             | "acme_renew"
             | "acme_test"
             | "acme_reload"
@@ -12336,6 +12366,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "acme_test"
             // It takes down a page that people may be reading, whoever published it.
             | "unpublish_artifact"
+            // A hive's cognition forgets every conversation, and it cannot be undone.
+            | "cognition_clear"
     )
 }
 
@@ -12365,6 +12397,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_llm_usage" => {
             "Read the LLM usage records, one per model call, of one tenant or of every tenant: a period grouped by day, model, node or tenant or record by record, or the records stored since a cursor."
+        }
+        "cognition_clear" => {
+            "Make one hive's SY.cognition drop every communication and every episode it keeps (in memory, in its file and in its memory region) and answer what it removed. It cannot be undone."
         }
         "list_tenant_nodes" => {
             "List the managed nodes charged to one tenant on every hive, with their runtime, state and who launched them."
@@ -12613,6 +12648,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
         "list_streams" => vec!["GET /hives/{hive}/streams"],
         "get_llm_usage" => vec!["GET /hives/{hive}/usage"],
+        "cognition_clear" => vec!["POST /hives/{hive}/cognition/clear"],
         "list_tenant_nodes" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}/nodes"],
         "get_node_status" => vec!["GET /hives/{hive}/nodes/{node_name}/status"],
         "node_help" => vec!["GET /hives/{hive}/nodes/{node_name}/help"],
@@ -12814,6 +12850,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "hive",
             "string",
             "The motherbee, where the usage records live.",
+        )],
+        "cognition_clear" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "The hive whose SY.cognition drops everything it keeps: the motherbee or a worker.",
         )],
         "list_nodes" | "list_streams" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "list_taps" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
@@ -14134,6 +14175,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",
         "list_streams" => "curl -X GET /hives/worker-220/streams",
+        "cognition_clear" => "curl -X POST /hives/worker1/cognition/clear",
         "get_llm_usage" => {
             "curl -X GET '/hives/motherbee/usage?tenant_id=tnt:43d576a3-d712-4d91-9245-5d5463dd693e&from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z&group_by=day'"
         }
@@ -14354,7 +14396,7 @@ const WF_RULES_DEFINITION_NOTE: &str = "A definition requires start_from: the no
 const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a bare name is qualified with it (AI.sales on /hives/worker1 is AI.sales@worker1), and a name of another hive is refused with INVALID_REQUEST.";
 
 /// What the instance actions say of the node they act on, and of the engine's refusals
-/// (`wf_instance_answer`).
+/// (`node_verb_answer`).
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
 const WF_INSTANCE_ERRORS_NOTE: &str = "The engine answers its instance verbs only to SY.admin@motherbee and to its hive's SY.wf-rules. A refusal, {ok: false, error, detail}, keeps that payload and gives error_code and error_detail: INVALID_REQUEST 400, node_not_configured 409 (a WF node without its definition in use), STORE_ERROR 502. A node that does not answer is TIMEOUT or TRANSPORT_ERROR (the detail says NODE_NOT_FOUND when the router knows no such node).";
 
@@ -14754,6 +14796,14 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "SY.admin sends WF_CANCEL_INSTANCE {instance_id, reason} to the node. When the definition has a cancelled state, the engine runs the exit actions of the instance's state and then the entry actions of cancelled; either way it cancels the instance's timers and ends it cancelled. Nothing the instance already did or sent is undone.",
             "The answer is the engine's WF_CANCEL_INSTANCE_RESPONSE as it is: payload {ok: true, instance_id, status: \"cancelled\"}. An instance already ended answers 409 INSTANCE_ALREADY_TERMINATED; one the node does not have, 404 INSTANCE_NOT_FOUND.",
             WF_INSTANCE_ERRORS_NOTE,
+        ],
+        "cognition_clear" => vec![
+            "It cannot be undone: confirm with the operator first. The hive's agents lose the memory of every conversation (contexts, reasons, scopes, memories, feelings and last turns), and the hive loses every episode it kept, its own and those other hives sent it.",
+            "Takes no body: the hive comes from the /hives/{hive} path in HTTP, and it is the executor step's only arg. SY.cognition runs on the motherbee and the workers; a hive without one (an ingress, an egress) answers TRANSPORT_ERROR, its detail saying NODE_NOT_FOUND.",
+            "SY.admin sends COGNITION_CLEAR to SY.cognition@<hive>, which takes it only from SY.admin@motherbee. It deletes every row of its file (cognition.db) and rebuilds the file without them, drops what it holds in memory and writes its memory region empty, then keeps running, empty: the next turns start new communications.",
+            "The answer is SY.cognition's as it is: payload {ok: true, node_name, removed: {file: {communications, episodes}, memory: {communications, episodes}}, region: \"written_empty\" (or \"none\" for a cognition with no memory region)}. Its STATUS then shows the file and the region empty, and the clear in clears.total and clears.last_at.",
+            "A file it cannot clear answers 502 STORE_ERROR, and nothing is removed; a memory region it cannot write answers 502 REGION_ERROR with what it removed, the file and its memory clear. A node that does not answer is TIMEOUT or TRANSPORT_ERROR.",
+            "Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler, one step per hive, and the executor runs it once the operator confirms. The factory reset runs it on every hive that runs SY.cognition but the motherbee, whose file the reset removes with the node stopped.",
         ],
         "set_storage" => vec![
             "This persists the local storage path in hive.yaml on the target hive.",
@@ -16615,6 +16665,9 @@ async fn handle_admin_command_inner(
     if wf_instance_verb(action).is_some() {
         return handle_wf_instance_command(ctx, client, action, payload, hive).await;
     }
+    if action == "cognition_clear" {
+        return handle_cognition_clear(ctx, client, payload, hive).await;
+    }
     if matches!(
         action,
         "get_ilk"
@@ -17089,10 +17142,11 @@ fn wf_instance_request(
     })
 }
 
-/// The engine's answer in the admin's envelope, its payload as it is: `ok: true` is a success, and
-/// a refusal, `{ok: false, error: <code>, detail}`, gives the envelope's error_code and
-/// error_detail.
-fn wf_instance_answer(
+/// A node's answer to the verb SY.admin sent it, in the admin's envelope, its payload as it is:
+/// `ok: true` is a success, and a refusal, `{ok: false, error: <code>, detail}`, gives the
+/// envelope's error_code and error_detail. The WF engine answers its instance verbs so, and
+/// SY.cognition its clear.
+fn node_verb_answer(
     action: &str,
     response: Result<serde_json::Value, AdminError>,
 ) -> (u16, String) {
@@ -17179,7 +17233,54 @@ async fn handle_wf_instance_command(
         timeout_window,
     )
     .await;
-    Ok(wf_instance_answer(action, response))
+    Ok(node_verb_answer(action, response))
+}
+
+/// What SY.admin sends a hive's SY.cognition to have it drop everything it keeps, and its answer
+/// (`MSG_COGNITION_CLEAR` in src/bin/sy_cognition.rs, taken only from SY.admin@motherbee).
+const MSG_COGNITION_CLEAR: &str = "COGNITION_CLEAR";
+const MSG_COGNITION_CLEAR_RESPONSE: &str = "COGNITION_CLEAR_RESPONSE";
+
+/// `cognition_clear` (FINDINGS A-160): the hive's SY.cognition drops every communication and every
+/// episode it keeps, in memory, in its file and in its memory region, and answers what it removed
+/// (`take_clear` in src/bin/sy_cognition.rs); its answer goes as it is (`node_verb_answer`). It
+/// takes no parameters. The factory reset asks it of every hive that runs SY.cognition but the
+/// motherbee, whose file the reset removes with the node stopped.
+async fn handle_cognition_clear(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let action = "cognition_clear";
+    if let Some(field) = unexpected_parameter(&payload) {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": action,
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": format!("{action} takes no parameters (got {field})"),
+            })
+            .to_string(),
+        ));
+    }
+    let hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    // Answered before the caller's own wait for the admin ends, as the node control routes are.
+    let timeout_window = admin_action_timeout(action)
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(|| Duration::from_secs(25));
+    let response = send_system_request(
+        client,
+        &format!("SY.cognition@{hive}"),
+        MSG_COGNITION_CLEAR,
+        MSG_COGNITION_CLEAR_RESPONSE,
+        serde_json::json!({}),
+        timeout_window,
+    )
+    .await;
+    Ok(node_verb_answer(action, response))
 }
 
 async fn handle_identity_query(
@@ -19800,16 +19901,17 @@ mod tests {
         assert!(mesh_admits("SY.architect@motherbee", "a_new_action", None, &json!({})).is_err());
     }
 
-    /// Archi, the operator's agent on the motherbee, may ask for every listed action; Archi's name
-    /// on another hive is no one's agent.
+    /// Archi, the operator's agent on the motherbee, may ask for every listed action but those
+    /// closed to the mesh, which no caller may; Archi's name on another hive is no one's agent.
     #[test]
     fn archi_on_the_motherbee_may_ask_for_every_listed_action() {
         for action in every_mesh_action() {
-            assert_eq!(
-                mesh_admits("SY.architect@motherbee", action, None, &json!({})),
-                Ok(MeshAdmission::Admitted),
-                "{action}"
-            );
+            let archi = mesh_admits("SY.architect@motherbee", action, None, &json!({}));
+            if mesh_access(action) == Some(MeshAccess::Nobody) {
+                assert!(archi.is_err(), "{action}");
+            } else {
+                assert_eq!(archi, Ok(MeshAdmission::Admitted), "{action}");
+            }
             assert!(
                 mesh_admits("SY.architect@worker1", action, None, &json!({})).is_err(),
                 "{action}"
@@ -27869,7 +27971,261 @@ mod tests {
             schema("wf_cancel_instance")["required"],
             json!(["hive", "node_name", "instance_id", "reason"])
         );
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "18");
+    }
+
+    // --- A-160: a hive's cognition drops everything it keeps -----------------------------------
+
+    /// SY.cognition@worker1's answer when it cleared everything it kept.
+    fn cognition_cleared() -> Value {
+        json!({
+            "ok": true,
+            "node_name": "SY.cognition@worker1",
+            "removed": {
+                "file": { "communications": 12, "episodes": 3 },
+                "memory": { "communications": 5, "episodes": 3 },
+            },
+            "region": "written_empty",
+        })
+    }
+
+    /// The clear `run` sends, answered by the hive's cognition with `answer`: what the admin sent,
+    /// and what `run` gave back.
+    async fn cognition_clear_answered<T>(
+        harness: &mut fluxbee_sdk::RouterDispatcherTestHarness,
+        run: impl std::future::Future<Output = T>,
+        answer: Value,
+    ) -> (Message, T) {
+        let cognition = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("COGNITION_CLEAR");
+            harness
+                .inject(reply_to(&sent, MSG_COGNITION_CLEAR_RESPONSE, answer))
+                .await
+                .unwrap();
+            sent
+        };
+        let (result, sent) = tokio::join!(run, cognition);
+        (sent, result)
+    }
+
+    /// A hive's cognition forgets every conversation only behind the operator's word (FINDINGS
+    /// A-160): an action of the catalog with its route, help and example, mutating and confirmed
+    /// first, one the executor runs and Archi stages, and closed to the whole mesh, Archi included.
+    #[test]
+    fn cognition_clear_is_the_operators_and_closed_to_the_mesh() {
+        let spec = resolve_internal_action_spec("cognition_clear").expect("cognition_clear");
+        assert!(matches!(
+            spec.route,
+            InternalActionRoute::Command("cognition_clear")
+        ));
+        assert!(spec.requires_target);
+        let doc = build_admin_action_doc(spec);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["confirmation_required"], json!(true));
+        assert_eq!(doc["executor_available"], json!(true));
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["POST /hives/{hive}/cognition/clear"])
+        );
+        assert_ne!(doc["summary"], json!("Admin action."));
+        assert_eq!(doc["request_contract"]["body"]["kind"], json!("none"));
+        assert!(admin_action_example_scmd("cognition_clear").is_some());
+        assert!(admin_action_request_notes("cognition_clear").len() >= 5);
+        assert_eq!(
+            admin_methods_allowed_for_path("/hives/worker1/cognition/clear"),
+            vec!["POST"]
+        );
+        // The hive is the step's one arg.
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(schema["required"], json!(["hive"]));
+        assert_eq!(
+            schema["properties"].as_object().map(serde_json::Map::len),
+            Some(1)
+        );
+        let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+        assert!(executor_actions.contains(&"cognition_clear"));
+
+        assert_eq!(mesh_access("cognition_clear"), Some(MeshAccess::Nobody));
+        for caller in [
+            "SY.architect@motherbee",
+            "IO.cloud@motherbee",
+            "SY.admin@motherbee",
+            "SY.orchestrator@worker1",
+            "SY.wf-rules@worker1",
+            "SY.cognition@worker1",
+            "AI.support@worker1",
+        ] {
+            assert!(
+                mesh_admits(caller, "cognition_clear", Some("worker1"), &json!({})).is_err(),
+                "{caller}"
+            );
+        }
+        assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"cognition_clear"));
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "19");
+    }
+
+    /// The plan Archi stages: one step that names the hive, and nothing else.
+    #[test]
+    fn an_executor_plan_clears_a_cognition_by_its_hive_alone() {
+        let plan = |args: Value| {
+            parse_executor_plan(json!({
+                "plan_version": ADMIN_EXECUTOR_PLAN_VERSION,
+                "kind": ADMIN_EXECUTOR_PLAN_KIND,
+                "metadata": { "name": "clear_cognition", "target_hive": "worker1" },
+                "execution": {
+                    "strict": true,
+                    "stop_on_error": true,
+                    "allow_help_lookup": true,
+                    "steps": [{ "id": "s1", "action": "cognition_clear", "args": args }]
+                }
+            }))
+        };
+        assert!(plan(json!({ "hive": "worker1" })).is_ok());
+        let missing = plan(json!({})).expect_err("the hive is required");
+        assert!(
+            missing.contains("missing required field 'hive'"),
+            "{missing}"
+        );
+        let extra = plan(json!({ "hive": "worker1", "episodes": false }))
+            .expect_err("it takes nothing but the hive");
+        assert!(extra.contains("unexpected field 'episodes'"), "{extra}");
+    }
+
+    /// POST /hives/{hive}/cognition/clear sends COGNITION_CLEAR, with nothing in it, to the hive's
+    /// SY.cognition and answers its payload as it is; the cognition's refusal gives the envelope's
+    /// error, its payload kept. A body with any field is refused before anything is sent.
+    #[tokio::test]
+    async fn cognition_clear_asks_the_hives_cognition_and_answers_what_it_removed() {
+        let (ctx, mut harness) = opa_test_admin("cognition-clear");
+        let path = "/hives/worker1/cognition/clear";
+        let no_query = HashMap::new();
+        let (sent, served) = cognition_clear_answered(
+            &mut harness,
+            handle_hive_paths("POST", path, &no_query, &[], &ctx, &ctx.rpc),
+            cognition_cleared(),
+        )
+        .await;
+        let (status, body) = served.expect("route").expect("served");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(sent.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(sent.meta.msg.as_deref(), Some(MSG_COGNITION_CLEAR));
+        assert_eq!(dst_of(&sent), json!("SY.cognition@worker1"));
+        assert_eq!(sent.payload, json!({}));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], json!("ok"));
+        assert_eq!(body["action"], json!("cognition_clear"));
+        assert_eq!(body["payload"], cognition_cleared());
+
+        for (answer, code, http_status) in [
+            (
+                json!({
+                    "ok": false,
+                    "error": "UNAUTHORIZED",
+                    "detail": "COGNITION_CLEAR not authorized from SY.admin@worker1",
+                }),
+                "UNAUTHORIZED",
+                403,
+            ),
+            (
+                json!({
+                    "ok": false,
+                    "error": "STORE_ERROR",
+                    "detail": "its file could not be cleared, and nothing was: disk I/O error",
+                }),
+                "STORE_ERROR",
+                502,
+            ),
+            (
+                json!({
+                    "ok": false,
+                    "error": "REGION_ERROR",
+                    "detail": "its file and memory are cleared, and its memory region could not be written",
+                    "removed": cognition_cleared()["removed"].clone(),
+                }),
+                "REGION_ERROR",
+                502,
+            ),
+        ] {
+            let (_, served) = cognition_clear_answered(
+                &mut harness,
+                handle_hive_paths("POST", path, &no_query, b"{}", &ctx, &ctx.rpc),
+                answer.clone(),
+            )
+            .await;
+            let (status, body) = served.expect("route").expect("served");
+            let body: Value = serde_json::from_str(&body).expect("body");
+            assert_eq!(status, http_status, "{body}");
+            assert_eq!(body["error_code"], json!(code), "{body}");
+            assert_eq!(body["error_detail"], answer["detail"], "{body}");
+            assert_eq!(body["payload"], answer, "{body}");
+        }
+
+        let (status, body) = handle_hive_paths(
+            "POST",
+            path,
+            &no_query,
+            br#"{"episodes":false}"#,
+            &ctx,
+            &ctx.rpc,
+        )
+        .await
+        .expect("route")
+        .expect("served");
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body.contains("takes no parameters (got episodes)"),
+            "{body}"
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// The executor runs it as the operator, the step's hive its target. Over the mesh nobody may
+    /// ask for it, Archi included, and nothing is sent.
+    #[tokio::test]
+    async fn cognition_clear_runs_from_the_executor_and_never_from_the_mesh() {
+        let (ctx, mut harness) = opa_test_admin("cognition-clear-origin");
+        let refused = dispatch_internal_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "cognition_clear",
+            Some("worker1"),
+            json!({}),
+            AdminOrigin::Mesh("SY.architect@motherbee"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(refused.http_status, 403, "{}", refused.envelope);
+        assert_eq!(refused.envelope["error_code"], json!("UNAUTHORIZED"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+
+        let (sent, ran) = cognition_clear_answered(
+            &mut harness,
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "cognition_clear",
+                Some("worker1"),
+                json!({}),
+                AdminOrigin::Executor,
+            ),
+            cognition_cleared(),
+        )
+        .await;
+        let ran = ran.expect("answered");
+        assert_eq!(dst_of(&sent), json!("SY.cognition@worker1"));
+        assert_eq!(ran.http_status, 200, "{}", ran.envelope);
+        assert_eq!(ran.envelope["payload"], cognition_cleared());
     }
 
     // --- A-127: a bare node name is a node of the path's hive ----------------------------------

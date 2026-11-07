@@ -998,6 +998,25 @@ Normal operator requests should not create or redesign these.
 
 - `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.
 
+### 4.4.2 Clearing a hive's cognition
+
+`cognition_clear` makes one hive's `SY.cognition` drop everything it keeps, in memory, in its
+file and in its memory region: every communication (contexts, reasons, scopes, memories,
+feelings and last turns) and every episode (FINDINGS A-160). It cannot be undone: the hive's
+agents lose the memory of every conversation.
+
+- Use it only when the operator asks to forget a hive's conversations. Tell the operator which
+  hive and what goes, then stage it with `fluxbee_plan_compiler`: one step per hive, whose only
+  arg is `hive`.
+- The operator confirms the plan, and SY.admin's executor runs it as the operator. It is closed to
+  the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
+- Only the motherbee and the workers run a cognition; an ingress or an egress has none.
+- The answer says what it removed: `removed.file` and `removed.memory`, each with
+  `communications` and `episodes`. The cognition keeps running, empty: a thread's next turn starts
+  its communication again.
+- Each hive keeps its own copy of each episode: clearing one hive leaves the other hives' copies.
+- The factory reset clears every hive's cognition itself.
+
 ### 4.5 Secrets and vault (Model D')
 
 `SY.vault` is the canonical secret backend. Secrets live **entirely** in vault — nodes never receive plaintext secrets through `CONFIG_SET` and never persist them locally. Consumers discover their secret at boot/refresh by querying vault for a `resource_type` (e.g. `openai`, `postgres`, `slack`).

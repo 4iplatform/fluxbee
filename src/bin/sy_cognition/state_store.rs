@@ -278,6 +278,34 @@ impl CognitionStore {
         Ok(deleted as u64)
     }
 
+    /// Deletes every communication and every episode, in one transaction, and returns how many of
+    /// each (FINDINGS A-160). The file is then rebuilt without the pages they freed and its WAL
+    /// emptied, so what was deleted stays neither in the file nor beside it. That second step
+    /// failing is logged: the rows are gone all the same.
+    pub(crate) fn clear(&self) -> Result<(u64, u64), CognitionError> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let communications = tx.execute("DELETE FROM communications", [])?;
+        let episodes = tx.execute("DELETE FROM episodes", [])?;
+        tx.commit()?;
+        let compacted = conn.execute("VACUUM", []).and_then(|_| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+        match compacted {
+            Ok(0) => {}
+            Ok(_) => tracing::warn!(
+                "sy.cognition cleared its file, and its WAL could not be emptied: a reader held it"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "sy.cognition cleared its file, and could not rebuild it without the freed pages"
+            ),
+        }
+        Ok((communications as u64, episodes as u64))
+    }
+
     /// How many communications the file keeps, and its bytes with its WAL.
     pub(crate) fn stats(&self) -> Result<(u64, u64), CognitionError> {
         let communications: i64 =

@@ -48,6 +48,9 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   (§5); SY.storage keeps the messages, not cognition's state.
 - **The cost:** up to two model calls per turn, charged to the tenant of whoever holds the
   result: the agent's, or the writer's in a communication with no agent (§3, §9).
+- **Cleared on request:** SY.admin's `cognition_clear` has a hive's cognition drop every
+  communication and every episode it keeps, and the factory reset asks it of every hive but the
+  motherbee (§5.1).
 
 ---
 
@@ -490,13 +493,52 @@ nothing of cognition's.
   takes them again.
 - **Nothing deletes a communication:** not when it goes quiet, not when its agent is torn down.
   Its memories and feelings involve people (docs/cognition-hands-v1.md §11.2). The file grows with
-  each new communication.
+  each new communication. Only a clear deletes them, all at once (§5.1).
 - **Durability:** WAL, with `synchronous=NORMAL`. A lost hive loses its file, as it loses its WF
   instances and its agents' own state; the VM snapshots cover it.
 - **SY.storage's tables:** until 0.1.103 cognition wrote its items to 8 `cognition_*` tables of
   SY.storage through the stream (`storage.cognition.*`) and read them back over the mesh
   (`COGNITION_STATE_GET`). SY.storage drops those tables once at its start
   (`drop_cognition_tables`), with the inbox rows of their subjects.
+
+### 5.1 The clear: `COGNITION_CLEAR`
+
+SY.admin's `cognition_clear` (`POST /hives/{hive}/cognition/clear`,
+[SY.admin](../nodes/sy-admin.md#a-hives-cognition-the-clear)) has a hive's cognition drop
+everything it keeps (`take_clear`; FINDINGS A-160). The factory reset asks it of every hive that
+runs SY.cognition but the motherbee, whose file the reset removes with the node stopped.
+
+- **Who may send it:** only `SY.admin@motherbee`, as the router names the sender
+  (`routing.src_l2_name`; `COGNITION_CLEAR_AUTHORITY`, the edges' `EDGE_CONTROL_AUTHORITY`), and
+  never in a tap's copy (`meta.via_tap`), which keeps the name of a sender that did not address
+  this cognition (`authorize_clear`). The router does not gate it: it is none of the system
+  policy's protected actions. Any other sender is answered `{ok: false, error: "UNAUTHORIZED",
+  detail}`, and nothing is touched.
+- **What it drops** (`clear_everything`, `clear_held`), under the locks every writer takes:
+  - in its file, every communication and every episode, in one transaction
+    (`CognitionStore::clear`). The file is then rebuilt without the pages they freed (`VACUUM`)
+    and its WAL emptied, so none of their text stays in the file or beside it; that step failing
+    is logged, and the rows are gone all the same;
+  - in memory, every communication it holds, those a failed write left there included, and every
+    episode;
+  - the memory region, written empty: an agent's next message carries no package until its
+    communication has a new turn.
+- **What it keeps:** its config, its AI key, the stream positions (`stream_seen`, so a batch sent
+  again is still a repeat) and the totals of its counters. The live counts go to zero and the
+  last turn's fields empty; `clears.total` and `clears.last_at` count the clear.
+- **The worker** (`CognitionAppState::clears`): each turn carries the clears taken before its
+  intake. A turn taken before a clear is not analyzed, and one the worker was on when a clear came
+  brings nothing back, its communication nor its episode: the worker reads the clears under the
+  lock it writes under (`hold_for_worker`, `write_back_worker_turn`, `keep_episode`), which the
+  clear holds while it counts one more.
+- **It keeps running, empty:** a thread's next turn starts its communication again.
+- **The answer,** `COGNITION_CLEAR_RESPONSE`: `{ok: true, node_name, removed: {file:
+  {communications, episodes}, memory: {communications, episodes}}, region: "written_empty"}`, or
+  `"none"` for a cognition that opened no region. A file it cannot clear answers `STORE_ERROR`, and
+  nothing is dropped; a region it cannot write answers `REGION_ERROR` with `removed`, the file and
+  memory clear.
+- **Another hive's copies stay:** every hive's cognition keeps its own copy of each episode, so a
+  clear of one hive leaves the others'. The factory reset clears them all.
 
 ---
 
@@ -711,6 +753,8 @@ loaded at start (`loaded_at_start_total`), and the loads and writes with their f
 Under `episodes` (§4.1): those kept now (`live_total`), made here (`made_total`), proposed and
 refused by the gate (`gated_out_total`), taken from other hives (`received_total`) and refused
 from them (`refused_total`).
+
+Under `clears` (§5.1): the clears it took (`total`) and when the last one came (`last_at`).
 
 Under `shm`: the capacity, the communications kept and pruned, the payload bytes and the last
 sync status.

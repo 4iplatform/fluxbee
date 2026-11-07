@@ -70,6 +70,7 @@ Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 | `STREAM_BATCH` → `STREAM_ACK` | only a router stream of its own hive (`take_stream_batch`) | takes the `cognition.turns` records and skips repeats by stream and epoch; adds them to their communications' last turns, writes those to its file and rewrites the memory region; then queues them for the worker and acks, without waiting for it; a full turn queue (256, `COGNITION_TURN_QUEUE`) drops turns and counts them |
 | `STREAM_APPEND storage.usage` (sent) | to its router's stream | one usage record per LLM call, charged to the agent's tenant, or the writer's in a communication with no agent |
 | `COGNITION_EPISODE` (sent and taken) | a system broadcast to `SY.cognition@*`, taken only from a cognition (`take_episode`) | an episode it made, which every hive's cognition keeps once ([docs/reference/cognition.md](../reference/cognition.md) §4.1) |
+| `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` | only `SY.admin@motherbee`, as its router names it, and never a tap's copy (`take_clear`); SY.admin's `cognition_clear` | drops every communication and every episode it keeps, in memory and in its file, and writes the memory region empty; answers what it removed and keeps running ([docs/reference/cognition.md](../reference/cognition.md) §5.1) |
 | `CONFIG_GET`, `CONFIG_SET`, `PING`, `STATUS`, `NODE_STATUS_GET` | `CONFIG_*` only from `SY.admin@motherbee` (router system policy) | control and status |
 | `VAULT_SECRET_CHANGED` | broadcast | re-probes the AI key and updates its state; it does not exit |
 
@@ -82,8 +83,9 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 
 - `cognition.db`, its own SQLite file: one row per communication with its whole state (its open
   items, scope, memories, feelings, last turns and counters), written at every intake batch and
-  after every worker turn, and one per live episode. Only SY.cognition reads it; nothing deletes a communication
-  ([docs/reference/cognition.md](../reference/cognition.md) §5,
+  after every worker turn, and one per live episode. Only SY.cognition reads it; only a clear
+  deletes a communication, all of them at once
+  ([docs/reference/cognition.md](../reference/cognition.md) §5 and §5.1,
   [docs/cognition-hands-v1.md](../cognition-hands-v1.md) §11).
 - In memory: the communications of the memory region; any other comes back from the file at its
   next turn.
@@ -91,8 +93,10 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
   `src/shm/mod.rs`); the router reads it when it delivers a message to an agent. Each package
   carries its communication's last turns, so the region holds some 90 communications when every
   turn is 2,000 characters long. It does not survive a host reboot: the start fills it again from
-  the file. `fluxbee-factory-reset` removes its node directory, its file included, and the region
-  (`cognition_paths`).
+  the file.
+- `fluxbee-factory-reset` removes the motherbee's file and region with the node stopped
+  (`cognition_paths`), and has every other hive's SY.cognition drop its own through SY.admin's
+  `cognition_clear` (`clear_cognitions`, FINDINGS A-160).
 
 ## Failure behavior
 
@@ -109,8 +113,8 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
   key`, `loaded its most recent communications from its file`, warnings when the key is not
   resolvable or a communication cannot be read or written).
 - `STATUS`/`PING` report `state` (`ready_semantic_ai` or `degraded_no_ai_provider`,
-  `cognition_state_label`) and the turn counters. Through the admin:
-  `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
+  `cognition_state_label`) and the turn counters, and the clears it took (`clears`). Through the
+  admin: `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
 
 ## Links
 

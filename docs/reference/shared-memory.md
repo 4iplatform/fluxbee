@@ -434,7 +434,8 @@ afresh (§2.4), so readers find a region created again from their next read on.
 
 No service removes a region for good; a writer unlinks one only to create it again (§2.2).
 `scripts/fluxbee_cleanall.sh` deletes every `jsr-*` region, the router ones through their
-`identity.yaml`; `packaging/fluxbee-factory-reset` deletes the memory region.
+`identity.yaml`; `packaging/fluxbee-factory-reset` deletes the motherbee's memory region, and has
+every other hive's SY.cognition write its own empty (`cognition_clear`).
 
 ---
 

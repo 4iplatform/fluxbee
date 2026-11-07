@@ -4,9 +4,9 @@ SY.admin is the control-plane gateway of a Fluxbee mesh. The operator's actions,
 actions that nodes ask for, reach it two ways: an HTTP API on the motherbee's loopback, and the
 `ADMIN_COMMAND` message over the mesh. SY.admin does little work itself. For each action it finds
 the node that owns it (SY.orchestrator, SY.config.routes, SY.identity, SY.vault, SY.opa.rules,
-SY.wf-rules, SY.timer, SY.storage, SY.edge, IO.blob), forwards the request, and returns one
-envelope. It also runs the executor, which carries out executor plans one step at a time with an
-LLM.
+SY.wf-rules, SY.timer, SY.storage, SY.cognition, SY.edge, IO.blob), forwards the request, and
+returns one envelope. It also runs the executor, which carries out executor plans one step at a
+time with an LLM.
 
 Source: `src/bin/sy_admin.rs`. The Fluxbee Cloud allowlist is `CLOUD_EXPOSED_ACTIONS` in
 `crates/fluxbee_sdk/src/cloud.rs`.
@@ -139,7 +139,7 @@ caller and the action; a command with no stamped caller is refused too.
 | Caller | May ask for | Checked in |
 | --- | --- | --- |
 | any caller on an ingress or egress hive | nothing, whatever the rows below say | `caller_hive_role` |
-| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included | `authorize_llm_usage_scope` |
+| `SY.architect@motherbee` | every action `mesh_access` lists, `get_llm_usage` of all tenants included, but those closed to the mesh (`cognition_clear`) | `authorize_llm_usage_scope` |
 | `IO.cloud@motherbee` | the Cloud-exposed actions (`CLOUD_EXPOSED_ACTIONS`); payload rules apply (next section) | `enforce_cloud_relay_content`, `stamp_relay_facts` |
 | `SY.wf-rules@H` | the node actions `run_node`, `restart_node`, `kill_node`, `get_node_config`, `set_node_config`, `get_node_status`, only on `WF.*@H`, binding or launching `wf.<name>` on `wf.engine`; the package actions and `sync_hint` (below) | `authorize_wf_rules_node`, `authorize_wf_rules_package` |
 | `SY.orchestrator@H` | `teardown_node` for a node `*@H` ([Node teardown](#node-teardown)) | `authorize_orchestrator_teardown` |
@@ -149,7 +149,8 @@ caller and the action; a command with no stamped caller is refused too.
 - **The table lives next to the catalog.** `mesh_access`, right after `INTERNAL_ACTION_REGISTRY`,
   gives every action of the catalog and every mesh command off it its row. An action it does not
   list is closed to the whole mesh, Archi included, and the unit test
-  `every_action_has_a_mesh_decision` fails until it is listed.
+  `every_action_has_a_mesh_decision` fails until it is listed. One closed on purpose is listed as
+  `Nobody`.
 - **A hive's role comes from the hive registry**, `/var/lib/fluxbee/hives/<hive>/info.yaml`
   (`caller_hive_role`, over the SDK's strict reading `HiveRegistry::role`): `status: connected`,
   its join done, and `role` worker, ingress or egress.
@@ -158,6 +159,9 @@ caller and the action; a command with no stamped caller is refused too.
   warning for each one that gets none (`log_registry_caller_roles`).
 - **Only Archi and the HTTP API** ask for `executor_validate_plan`, `executor_execute_plan` and
   `publish_cloud_endpoint`. The executor then runs every step of the plan as the operator.
+- **Closed to the whole mesh,** Archi included: `cognition_clear` (`MeshAccess::Nobody`). The
+  operator asks for it on loopback, or Archi stages it in a plan the operator confirms and the
+  executor runs ([A hive's cognition](#a-hives-cognition-the-clear)).
 - **SY.wf-rules@H's packages**, with only the fields its deploys and deletes send
   (`go/sy-wf-rules/node/admin.go`):
   - `publish_runtime_package` `{source: {kind, files}, set_current}`: only an inline package
@@ -250,6 +254,7 @@ SY.admin stamps its own name, `SY.admin@motherbee`, as `src_l2_name` on what it 
 | `timer_*` | `SY.timer@<hive>` | `TIMER_*` → `TIMER_RESPONSE` (`handle_timer_rpc`) |
 | `list_streams` | every `RT.<router>.stream@<hive>` in the LSA | `STREAM_STATUS` (`handle_list_streams`) |
 | `get_llm_usage`, `GET /config/storage/metrics` | `SY.storage@motherbee` | `USAGE_QUERY`, `STORAGE_METRICS_GET` |
+| `cognition_clear` | `SY.cognition@<hive>` | `COGNITION_CLEAR` → `COGNITION_CLEAR_RESPONSE` (`handle_cognition_clear`) |
 | `node_control_config_get/set`, `send_node_message` | the node; a bare name is a node of the path's hive, and a name of another hive is refused (`node_name_on_hive`, FINDINGS A-127) | `CONFIG_GET`, `CONFIG_SET`; the message as given, with no answer awaited |
 | `externalize`, `unexternalize`, `list_externalized` | `SY.edge@<hive>` | `EDGE_OPEN_URL`, `EDGE_CLOSE_URL`, `EDGE_LIST_URLS` |
 | `publish_artifact` | the producer's hive's `SY.orchestrator` when the blob is not on the motherbee yet, then `IO.blob@motherbee`, then the public edge | `SYSTEM_SYNC_HINT`, `BLOB_CURATE`, `EDGE_PUBLISH_BLOB` |
@@ -268,8 +273,8 @@ catalog/help/timer/`hive_status`/`list_streams`/`web_status` 5 (`JSR_ADMIN_TIMEO
 `web_status`, its read of the orchestrator's view of io.web), everything else 30
 (`JSR_ADMIN_ORCH_TIMEOUT_SECS`). The `wf_rules_*` actions, the check included, wait 75 for
 SY.wf-rules (`JSR_ADMIN_WF_RULES_TIMEOUT_SECS`, `wf_rules_request_timeout`). The routes that ask a
-node itself (`node_control_config_get/set` and the instance actions) wait 5 less than their action,
-25, so they answer before a caller that waits 30.
+node itself (`node_control_config_get/set`, the instance actions and `cognition_clear`) wait 5 less
+than their action, 25, so they answer before a caller that waits 30.
 
 ### ORCHESTRATOR_BOOTING
 
@@ -417,7 +422,7 @@ to its hive's SY.wf-rules (`controlCallerAuthorized`, go/nodes/wf/wf-generic/nod
   `{ok: true, instance: {…, input, state_variables, recent_log}}`; `wf_cancel_instance` answers
   `{ok: true, instance_id, status: "cancelled"}`.
 - **A refusal**, `{ok: false, error: <code>, detail}`, keeps that payload and gives `error_code`
-  and `error_detail` (`wf_instance_answer`): `INSTANCE_NOT_FOUND` 404,
+  and `error_detail` (`node_verb_answer`): `INSTANCE_NOT_FOUND` 404,
   `INSTANCE_ALREADY_TERMINATED` and `node_not_configured` 409, `INVALID_REQUEST` 400,
   `STORE_ERROR` 502. A node that does not answer is `TIMEOUT` or `TRANSPORT_ERROR`.
 - **The cancel** changes a running conversation: it is the one mutating action of the three, with
@@ -432,6 +437,45 @@ to its hive's SY.wf-rules (`controlCallerAuthorized`, go/nodes/wf/wf-generic/nod
     "workflow_type": "invoice", "definition_hash": "…", "status": "running",
     "current_state": "waiting_team", "created_at_ms": 1775577000000,
     "updated_at_ms": 1775578000000, "terminated_at_ms": null } ] },
+  "error_code": null, "error_detail": null
+}
+```
+
+## A hive's cognition: the clear
+
+`POST /hives/{hive}/cognition/clear` (`cognition_clear`) has the hive's SY.cognition drop every
+communication and every episode it keeps, in memory, in its file and in its memory region, and
+answer what it removed (FINDINGS A-160; [cognition §5.1](../reference/cognition.md)). It cannot be
+undone: the hive's agents lose the memory of every conversation, and the hive every episode it
+kept, its own and those other hives sent it. Each hive keeps its own copy of an episode, so the
+other hives keep theirs.
+
+- **The request** (`handle_cognition_clear`): no body, or `{}`. A field is refused with
+  `400 INVALID_REQUEST` before anything is sent. SY.admin sends `COGNITION_CLEAR {}` to
+  `SY.cognition@<hive>` and waits 25 s for its `COGNITION_CLEAR_RESPONSE`.
+- **Who may ask:** the operator on loopback, or a step of an executor plan, which Archi stages
+  with its plan compiler and the operator confirms (`confirmation_required`). It is closed to the
+  whole mesh, Archi's own `ADMIN_COMMAND` included (`MeshAccess::Nobody`). SY.cognition takes the
+  message only from `SY.admin@motherbee`, as the router names it.
+- **The answer** is SY.cognition's payload as it is (`node_verb_answer`): `{ok: true, node_name,
+  removed: {file: {communications, episodes}, memory: {communications, episodes}}, region}`,
+  `region` being `written_empty`, or `none` for a cognition that opened no region. A refusal
+  gives `error_code` and `error_detail`: `UNAUTHORIZED` 403, `STORE_ERROR` 502 (its file could not
+  be cleared, and nothing was), `REGION_ERROR` 502 (its file and memory are clear, its region
+  could not be written). A hive without SY.cognition (an ingress, an egress) answers
+  `TRANSPORT_ERROR`, `NODE_NOT_FOUND` in the detail; a cognition that does not answer, `TIMEOUT`.
+- **After it** the cognition keeps running, empty: its `STATUS` shows its file and region empty,
+  and the clear in `clears.total` and `clears.last_at`.
+- **The factory reset** runs it on every hive that runs SY.cognition but the motherbee, whose file
+  it removes with the node stopped (`clear_cognitions` in `packaging/fluxbee-factory-reset`).
+
+```json
+{
+  "status": "ok", "action": "cognition_clear",
+  "payload": { "ok": true, "node_name": "SY.cognition@worker1",
+    "removed": { "file": { "communications": 12, "episodes": 3 },
+                 "memory": { "communications": 5, "episodes": 3 } },
+    "region": "written_empty" },
   "error_code": null, "error_detail": null
 }
 ```
@@ -866,7 +910,7 @@ the same entries (`caller_hive_role`).
 
 ## Action table
 
-Generated from `INTERNAL_ACTION_REGISTRY` (registry version 18, 111 actions, in registry order),
+Generated from `INTERNAL_ACTION_REGISTRY` (registry version 19, 112 actions, in registry order),
 `admin_action_path_patterns` and `admin_action_summary`. A few long descriptions are cut to their first
 sentence; `GET /admin/actions/{action}` has the full text, the fields and an example.
 
@@ -890,6 +934,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `list_nodes` | `GET /hives/{hive}/nodes` | List nodes for one hive only. Use inventory for system-wide node visibility. |
 | `list_streams` | `GET /hives/{hive}/streams` | Read the status of every router stream of one hive: backlog, deliveries and drops. |
 | `get_llm_usage` | `GET /hives/{hive}/usage` | Read the LLM usage records, one per model call, of one tenant or of every tenant: a period grouped by day, model, node or tenant or record by record, or the records stored since a cursor. |
+| `cognition_clear` | `POST /hives/{hive}/cognition/clear` | Make one hive's SY.cognition drop every communication and every episode it keeps (in memory, in its file and in its memory region) and answer what it removed. |
 | `get_storage` | `GET /config/storage` | Read storage configuration and status. |
 | `add_hive` | `POST /hives` | Create a hive and bootstrap it. |
 | `get_hive` | `GET /hives/{hive}` | Read one hive definition. |

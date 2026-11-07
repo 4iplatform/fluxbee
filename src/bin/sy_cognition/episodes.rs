@@ -294,6 +294,13 @@ impl EpisodeBook {
         self.by_id.len()
     }
 
+    /// Lets go every episode (`COGNITION_CLEAR`); returns how many it kept.
+    pub(crate) fn clear(&mut self) -> usize {
+        let kept = self.by_id.len();
+        self.by_id.clear();
+        kept
+    }
+
     /// The habit: how many live episodes of `lens` are about exactly these people.
     pub(crate) fn habit(&self, lens: &str, people: &[String], now_ms: i64) -> u32 {
         let wanted = lowercase_set(people);

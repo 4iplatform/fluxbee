@@ -416,8 +416,10 @@ that lists what it would remove; `--yes` executes after you type the `hive_id` (
    but the root;
 4. clears the user OPA policy on every hive;
 5. truncates every table of `fluxbee_storage` with SY.storage and SY.cognition stopped, removes
-   SY.cognition's cache and memory region and the nodes' conversation state, and clears
-   Archi's sessions.
+   the motherbee's SY.cognition file and memory region and the nodes' conversation state, and
+   clears Archi's sessions. Every other hive that runs SY.cognition drops its own through
+   SY.admin's `cognition_clear` (FINDINGS A-160), while the motherbee's is stopped; the dry run
+   lists those hives, and each answer is printed.
 
 It keeps the installation, `/etc/fluxbee`, the vault master key, TLS, the spokes (with their SSH
 and NAT tables, which their orchestrators keep applying), routes, VPNs, taps and the history.

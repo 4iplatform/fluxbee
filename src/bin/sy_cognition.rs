@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +63,13 @@ type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 const COGNITION_NODE_BASE_NAME: &str = "SY.cognition";
 const COGNITION_NODE_VERSION: &str = "2.0";
 const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
+/// The system message SY.admin sends to have this cognition drop everything it keeps
+/// (`cognition_clear`, FINDINGS A-160), and its answer.
+const MSG_COGNITION_CLEAR: &str = "COGNITION_CLEAR";
+const MSG_COGNITION_CLEAR_RESPONSE: &str = "COGNITION_CLEAR_RESPONSE";
+/// The one sender a clear is taken from, as its router names it: SY.admin on the motherbee, the
+/// node that commands the edges too.
+const COGNITION_CLEAR_AUTHORITY: &str = json_router::router::system_policy::EDGE_CONTROL_AUTHORITY;
 /// How long an agent node's ILK and tenant are trusted when the identity shared memory's sequence
 /// cannot be read; while it can, they are trusted until it changes.
 const COGNITION_AGENT_ILK_TTL: Duration = Duration::from_secs(60);
@@ -307,6 +315,9 @@ struct CognitionRuntimeState {
     episodes_gated_out_total: u64,
     episodes_received_total: u64,
     episodes_refused_total: u64,
+    /// The clears it took (`COGNITION_CLEAR`), and when the last one came.
+    clears_total: u64,
+    last_clear_at: Option<String>,
     shm_hot_threads_total: u64,
     shm_pruned_threads_total: u64,
     shm_payload_bytes: u64,
@@ -321,6 +332,29 @@ struct CognitionRuntimeState {
     narrative_summarizer_failures_total: u64,
     narrative_summarizer_invalid_outputs_total: u64,
     last_narrative_model: Option<String>,
+}
+
+impl CognitionRuntimeState {
+    /// After a clear: it holds nothing, and what its last turn left here names a communication the
+    /// clear dropped. The totals stay: they count what it did.
+    fn cleared(&mut self, at: String) {
+        self.last_trace_id = None;
+        self.last_thread_id = None;
+        self.last_src_ilk = None;
+        self.last_ich = None;
+        self.last_tags.clear();
+        self.last_reason_signals_canonical.clear();
+        self.last_reason_signals_extra.clear();
+        self.open_contexts_total = 0;
+        self.open_reasons_total = 0;
+        self.open_cooccurrences_total = 0;
+        self.active_threads_total = 0;
+        self.active_scopes_total = 0;
+        self.active_memories_total = 0;
+        self.active_feelings_total = 0;
+        self.clears_total = self.clears_total.saturating_add(1);
+        self.last_clear_at = Some(at);
+    }
 }
 
 struct CognitionAppState {
@@ -355,6 +389,11 @@ struct CognitionAppState {
     /// The episodes this cognition keeps, the public news of every hive (docs/cognition-hands-v1.md
     /// §12.4): the same its file keeps.
     episodes: std::sync::Mutex<episodes::EpisodeBook>,
+    /// How many clears it took (`COGNITION_CLEAR`). Each turn carries the count of its intake: a
+    /// turn taken before a clear is not analyzed, and one the worker was on when a clear came brings
+    /// nothing back, its communication nor its episode. A clear counts one more under every lock the
+    /// worker writes under (`clear_held`), and the worker reads it under the same lock.
+    clears: AtomicU64,
 }
 
 /// A communication (docs/router-stream-v1.md §6.2): the thread between its interlocutors, owned by
@@ -368,8 +407,8 @@ struct CommunicationKey {
 
 /// A copy of a turn its router made for this cognition: the message, who holds its communication
 /// (`holder_of`, none for an agent without an ILK in the identity memory), whether a WF relayed it
-/// between people, its record's seq, and whether the intake found its communication held it
-/// already (`turn_key`).
+/// between people, its record's seq, whether the intake found its communication held it already
+/// (`turn_key`), and the clears taken before its intake (`CognitionAppState::clears`).
 #[derive(Debug)]
 struct CognitionTurn {
     message: Message,
@@ -377,6 +416,7 @@ struct CognitionTurn {
     relay: bool,
     seq: u64,
     duplicate: bool,
+    clears: u64,
 }
 
 /// A communication as this cognition holds it and writes it to its file: online state, so an item
@@ -684,6 +724,7 @@ async fn main() -> Result<(), CognitionError> {
         usage: UsageRecorder::start(Arc::clone(&dispatcher)),
         stream_seen: Mutex::new(HashMap::new()),
         episodes: std::sync::Mutex::new(episodes::EpisodeBook::default()),
+        clears: AtomicU64::new(0),
     });
 
     if let Ok(owner_uuid) = Uuid::parse_str(sender.uuid()) {
@@ -767,6 +808,11 @@ async fn main() -> Result<(), CognitionError> {
                 }
                 if msg.meta.msg.as_deref() == Some(episodes::MSG_COGNITION_EPISODE) {
                     take_episode(&app_state, &msg).await;
+                    continue;
+                }
+                // Here, as the batches are: no intake runs while a clear does.
+                if msg.meta.msg.as_deref() == Some(MSG_COGNITION_CLEAR) {
+                    take_clear(&app_state, &msg).await;
                     continue;
                 }
                 let sender = dispatcher.sender_snapshot();
@@ -877,6 +923,8 @@ async fn take_stream_batch(
     let mut turns = Vec::new();
     let mut recent = Vec::new();
     let mut relays = Vec::new();
+    // A clear runs in the main loop too, so none comes while this batch is taken.
+    let clears = app_state.clears.load(Ordering::SeqCst);
     for record in batch.records {
         if record.seq <= seen {
             repeats += 1;
@@ -923,6 +971,7 @@ async fn take_stream_batch(
             relay,
             seq: record.seq,
             duplicate: false,
+            clears,
         });
     }
     // The next message its router delivers to the agent carries these turns, whatever the
@@ -1525,6 +1574,46 @@ fn write_back_turn(
     threads.insert(key.clone(), updated);
 }
 
+/// The worker's communication held, back from the file when it is not (`held_or_loaded`). False,
+/// and nothing loaded, when a clear came after `clears`, its turn's: the turn belongs to what the
+/// clear dropped. Read under the held state's lock, which a clear holds while it counts one more.
+async fn hold_for_worker(
+    app_state: &CognitionAppState,
+    key: &CommunicationKey,
+    clears: u64,
+    loads: &mut StoreLoads,
+) -> Result<bool, CognitionError> {
+    let mut threads = app_state.thread_states.lock().await;
+    if app_state.clears.load(Ordering::SeqCst) != clears {
+        return Ok(false);
+    }
+    held_or_loaded(&mut threads, &app_state.store, key, loads).map(|_| true)
+}
+
+/// The worker's turn back into what is held (`write_back_turn`), its file row and the region's
+/// rewrite with it, unless a clear came after `clears`, its turn's, while the model answered: then
+/// nothing comes back. Whether it came back, and the region's write.
+async fn write_back_worker_turn(
+    app_state: &CognitionAppState,
+    key: &CommunicationKey,
+    updated: ThreadCognitionState,
+    clears: u64,
+) -> (bool, Result<(), json_router::shm::ShmError>) {
+    let mut written_back = false;
+    let synced = sync_held_state(app_state, std::slice::from_ref(key), |threads| {
+        // Under the region's lock and the held state's, which a clear holds while it counts one
+        // more.
+        if app_state.clears.load(Ordering::SeqCst) != clears {
+            return Vec::new();
+        }
+        write_back_turn(threads, key, updated);
+        written_back = true;
+        vec![key.clone()]
+    })
+    .await;
+    (written_back, synced)
+}
+
 /// One turn of a communication (§6.2): the ILK of the agent that owns it, its state (from the file
 /// when it is not held), the tagger and the derivations, its file row and the agent's memory
 /// package.
@@ -1592,23 +1681,28 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     *app_state.worker_turn.lock().await = Some(key.clone());
     // Held, or back from the file, where the intake wrote its turn.
     let mut loads = StoreLoads::default();
-    let held = held_or_loaded(
-        &mut *app_state.thread_states.lock().await,
-        &app_state.store,
-        &key,
-        &mut loads,
-    )
-    .map(|_| ());
+    let held = hold_for_worker(&app_state, &key, turn.clears, &mut loads).await;
     loads.count(&mut *app_state.runtime_state.lock().await);
-    if let Err(err) = held {
-        tracing::warn!(
-            trace_id = %msg.routing.trace_id,
-            thread_id = %thread_id,
-            agent_ilk = %agent_ilk,
-            error = %err,
-            "sy.cognition could not read a communication from its file; turn skipped"
-        );
-        return;
+    match held {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                "sy.cognition skipped a turn taken before a clear"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                agent_ilk = %agent_ilk,
+                error = %err,
+                "sy.cognition could not read a communication from its file; turn skipped"
+            );
+            return;
+        }
     }
 
     // Whose feelings the turn moves, and who spoke it for the narrator (§10.3).
@@ -1777,13 +1871,9 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     .await;
     let leading = leading_contexts(&thread_state.contexts);
 
-    // Its file row goes with the region's rewrite, both from what is held then.
-    if let Err(err) = sync_held_state(&app_state, std::slice::from_ref(&key), |threads| {
-        write_back_turn(threads, &key, thread_state);
-        vec![key.clone()]
-    })
-    .await
-    {
+    let (written_back, synced) =
+        write_back_worker_turn(&app_state, &key, thread_state, turn.clears).await;
+    if let Err(err) = synced {
         tracing::warn!(
             error = %err,
             trace_id = %msg.routing.trace_id,
@@ -1791,8 +1881,24 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             "sy.cognition failed to sync jsr-memory"
         );
     }
+    if !written_back {
+        tracing::info!(
+            trace_id = %msg.routing.trace_id,
+            thread_id = %thread_id,
+            "sy.cognition dropped what a turn derived: a clear came while it was analyzed"
+        );
+        return;
+    }
     if let Some(proposal) = narrative.episode.as_ref() {
-        publish_episode(&app_state, proposal, &leading, people, &thread_id).await;
+        publish_episode(
+            &app_state,
+            proposal,
+            &leading,
+            people,
+            &thread_id,
+            turn.clears,
+        )
+        .await;
     }
 
     let (
@@ -2159,13 +2265,15 @@ fn people_of_conversation(thread_state: &ThreadCognitionState, agent_ilk: &str) 
 
 /// An episode the narrator proposed, through the gate (`gate_episode`): kept here, in memory and in
 /// the file, and sent to every hive's cognition (docs/cognition-hands-v1.md §12.4). It must be about
-/// a person: an ILK the identity knows as no one else's, or does not know yet.
+/// a person: an ILK the identity knows as no one else's, or does not know yet. `clears` are its
+/// turn's: an episode a clear came before goes nowhere (`keep_episode`).
 async fn publish_episode(
     app_state: &CognitionAppState,
     proposal: &episodes::EpisodeProposal,
     leading: &[String],
     people: Vec<String>,
     thread_id: &str,
+    clears: u64,
 ) {
     let about_a_person = people.iter().any(|ilk| {
         message_writer::ilk_facts(&app_state.hive_id, ilk)
@@ -2217,7 +2325,13 @@ async fn publish_episode(
             node: app_state.node_name.clone(),
         },
     );
-    keep_episode(app_state, episode.clone()).await;
+    if !keep_episode(app_state, episode.clone(), clears).await {
+        tracing::info!(
+            thread_id,
+            "sy.cognition dropped an episode: a clear came while its turn was analyzed"
+        );
+        return;
+    }
     let sender = app_state.dispatcher.sender_snapshot();
     let sent = match episode_broadcast(&sender, &episode) {
         Ok(message) => sender.send(message).await.map_err(|err| err.to_string()),
@@ -2263,16 +2377,25 @@ fn episode_broadcast(
 }
 
 /// Keeps an episode once, in memory and in the file, and writes the region so the packages carry
-/// it. False when it had it already.
-async fn keep_episode(app_state: &CognitionAppState, episode: episodes::Episode) -> bool {
-    if let Err(err) = app_state.store.save_episode(&episode) {
-        tracing::warn!(episode_id = %episode.episode_id, error = %err, "sy.cognition could not write an episode to its file");
-    }
+/// it. False when it had it already, or when a clear came after `clears`, the clears it was made
+/// under: what it was made from is what the clear dropped. Checked under the book's lock, which a
+/// clear holds while it empties the file and the book.
+async fn keep_episode(
+    app_state: &CognitionAppState,
+    episode: episodes::Episode,
+    clears: u64,
+) -> bool {
     let (kept, live) = {
         let mut book = app_state
             .episodes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if app_state.clears.load(Ordering::SeqCst) != clears {
+            return false;
+        }
+        if let Err(err) = app_state.store.save_episode(&episode) {
+            tracing::warn!(episode_id = %episode.episode_id, error = %err, "sy.cognition could not write an episode to its file");
+        }
         (book.insert(episode), book.len() as u64)
     };
     app_state.runtime_state.lock().await.episodes_live_total = live;
@@ -2303,7 +2426,9 @@ async fn take_episode(app_state: &CognitionAppState, msg: &Message) {
         return;
     };
     let episode_id = episode.episode_id.clone();
-    if keep_episode(app_state, episode).await {
+    // A clear runs in the main loop too, so none comes while this one is kept.
+    let clears = app_state.clears.load(Ordering::SeqCst);
+    if keep_episode(app_state, episode, clears).await {
         let mut state = app_state.runtime_state.lock().await;
         state.episodes_received_total = state.episodes_received_total.saturating_add(1);
         tracing::info!(episode_id = %episode_id, from, "sy.cognition took an episode from another hive");
@@ -2335,6 +2460,149 @@ async fn load_live_episodes(app_state: &CognitionAppState) {
     };
     app_state.runtime_state.lock().await.episodes_live_total = live;
     tracing::info!(live, "sy.cognition loaded its live episodes from its file");
+}
+
+/// `COGNITION_CLEAR` (FINDINGS A-160): SY.admin on the motherbee has this cognition drop everything
+/// it keeps (`clear_everything`), as the factory reset does to the motherbee's by removing its file
+/// with the node stopped. Any other sender is refused, and nothing is touched. Either way it
+/// answers.
+async fn take_clear(app_state: &CognitionAppState, msg: &Message) {
+    let answer = match authorize_clear(msg) {
+        Ok(()) => clear_everything(app_state).await,
+        Err(detail) => {
+            tracing::warn!(detail = %detail, "sy.cognition refused a clear");
+            json!({ "ok": false, "error": "UNAUTHORIZED", "detail": detail })
+        }
+    };
+    let sender = app_state.dispatcher.sender_snapshot();
+    let reply = build_system_reply(&sender, msg, MSG_COGNITION_CLEAR_RESPONSE, answer);
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, "sy.cognition could not answer a clear");
+    }
+}
+
+/// A clear is taken only from SY.admin on the motherbee, as its router names the sender, and never
+/// from a tap's copy, which keeps the name of a sender that did not address it here. The router
+/// does not gate it: it is none of the system policy's protected actions.
+fn authorize_clear(msg: &Message) -> Result<(), String> {
+    if msg.meta.via_tap {
+        return Err(format!(
+            "{MSG_COGNITION_CLEAR} is not taken from a tap's copy"
+        ));
+    }
+    match msg.routing.src_l2_name.as_deref().map(str::trim) {
+        Some(src) if src == COGNITION_CLEAR_AUTHORITY => Ok(()),
+        Some("") | None => Err(format!(
+            "{MSG_COGNITION_CLEAR} requires router-stamped source"
+        )),
+        Some(src) => Err(format!("{MSG_COGNITION_CLEAR} not authorized from {src}")),
+    }
+}
+
+/// What a clear removed: the communications and episodes its file kept, and those it held in
+/// memory, which the region was written from.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Cleared {
+    file_communications: u64,
+    file_episodes: u64,
+    held_communications: u64,
+    held_episodes: u64,
+}
+
+/// Drops everything this cognition keeps and answers what it removed: its file's communications
+/// and episodes, what it holds in memory, those a failed write left there included, and its memory
+/// region, written empty. It keeps running, empty. A file it cannot clear leaves everything as it
+/// was; a region it cannot write is said, the rest cleared.
+async fn clear_everything(app_state: &CognitionAppState) -> Value {
+    let has_region = app_state.memory_region.lock().await.is_some();
+    let mut cleared: Result<Cleared, CognitionError> = Ok(Cleared::default());
+    let synced = sync_held_state(app_state, &[], |threads| {
+        cleared = clear_held(app_state, threads);
+        Vec::new()
+    })
+    .await;
+    let cleared = match cleared {
+        Ok(cleared) => cleared,
+        Err(err) => {
+            tracing::warn!(error = %err, "sy.cognition could not clear its file; it keeps everything");
+            return json!({
+                "ok": false,
+                "error": "STORE_ERROR",
+                "detail": format!("its file could not be cleared, and nothing was: {err}"),
+            });
+        }
+    };
+    app_state
+        .runtime_state
+        .lock()
+        .await
+        .cleared(chrono::Utc::now().to_rfc3339());
+    tracing::info!(
+        file_communications = cleared.file_communications,
+        file_episodes = cleared.file_episodes,
+        held_communications = cleared.held_communications,
+        held_episodes = cleared.held_episodes,
+        "sy.cognition cleared everything it kept"
+    );
+    let removed = json!({
+        "file": {
+            "communications": cleared.file_communications,
+            "episodes": cleared.file_episodes,
+        },
+        "memory": {
+            "communications": cleared.held_communications,
+            "episodes": cleared.held_episodes,
+        },
+    });
+    match synced {
+        Ok(()) => json!({
+            "ok": true,
+            "node_name": app_state.node_name,
+            "removed": removed,
+            "region": if has_region { "written_empty" } else { "none" },
+        }),
+        Err(err) => {
+            tracing::warn!(error = %err, "sy.cognition cleared its file and memory, and could not write its memory region");
+            json!({
+                "ok": false,
+                "error": "REGION_ERROR",
+                "detail": format!("its file and memory are cleared, and its memory region could not be written: {err}"),
+                "node_name": app_state.node_name,
+                "removed": removed,
+            })
+        }
+    }
+}
+
+/// The clear itself, inside `sync_held_state`'s change: under the region's lock and the held
+/// state's, the order every writer takes them in, and under the book's, which an episode is kept
+/// under. Every write of the worker checks the clears under one of them, so a turn it is on finds
+/// this one done and brings nothing back. The file first: when it cannot be cleared, nothing is.
+fn clear_held(
+    app_state: &CognitionAppState,
+    threads: &mut HashMap<CommunicationKey, ThreadCognitionState>,
+) -> Result<Cleared, CognitionError> {
+    let mut book = app_state
+        .episodes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (file_communications, file_episodes) = app_state.store.clear()?;
+    app_state.clears.fetch_add(1, Ordering::SeqCst);
+    let held_episodes = book.clear() as u64;
+    drop(book);
+    let held_communications = threads.len() as u64;
+    threads.clear();
+    app_state
+        .unsaved
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    Ok(Cleared {
+        file_communications,
+        file_episodes,
+        held_communications,
+        held_episodes,
+    })
 }
 
 /// The agent a turn's communication belongs to: its ILK and the tenant that pays for the turn's
@@ -3144,6 +3412,10 @@ fn build_status_payload(
         "received_total": runtime_state.episodes_received_total,
         "refused_total": runtime_state.episodes_refused_total
     });
+    let clears = json!({
+        "total": runtime_state.clears_total,
+        "last_at": runtime_state.last_clear_at
+    });
     let shm = json!({
         "capacity_bytes": MEMORY_MAX_DATA_SIZE,
         "hot_threads_total": runtime_state.shm_hot_threads_total,
@@ -3169,6 +3441,7 @@ fn build_status_payload(
         "paths": paths,
         "store": store,
         "episodes": episodes,
+        "clears": clears,
         "shm": shm
     })
 }
@@ -3282,6 +3555,8 @@ fn build_cognition_config_get_payload(
         "episodes_gated_out_total": runtime_state.episodes_gated_out_total,
         "episodes_received_total": runtime_state.episodes_received_total,
         "episodes_refused_total": runtime_state.episodes_refused_total,
+        "clears_total": runtime_state.clears_total,
+        "last_clear_at": runtime_state.last_clear_at,
         "last_thread_id": runtime_state.last_thread_id,
         "last_tags": runtime_state.last_tags,
         "last_reason_signals_canonical": runtime_state.last_reason_signals_canonical,
@@ -6232,6 +6507,7 @@ mod tests {
             usage: UsageRecorder::disabled(),
             stream_seen: Mutex::new(HashMap::new()),
             episodes: std::sync::Mutex::new(episodes::EpisodeBook::default()),
+            clears: AtomicU64::new(0),
         });
         (app_state, router)
     }
@@ -6822,6 +7098,7 @@ mod tests {
             &strings(&["refunds"]),
             people.clone(),
             TEST_THREAD,
+            0,
         )
         .await;
         assert_eq!(
@@ -6847,6 +7124,7 @@ mod tests {
             &leading,
             people,
             TEST_THREAD,
+            0,
         )
         .await;
         let sent = next_outgoing(&mut router).await;
@@ -6928,6 +7206,305 @@ mod tests {
         let (again, _router) = test_app_state("cogtake", None, &dir.0);
         load_live_episodes(&again).await;
         assert_eq!(again.runtime_state.lock().await.episodes_live_total, 1);
+    }
+
+    // --- The clear (FINDINGS A-160) ---------------------------------------------------------------
+
+    /// A `COGNITION_CLEAR` as its router delivers it: from `from`, as the router names the sender,
+    /// and a tap's copy when `via_tap`.
+    fn clear_from(from: Option<&str>, via_tap: bool) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: from.map(str::to_string),
+                dst: Destination::Unicast("SY.cognition@worker1".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_COGNITION_CLEAR.to_string()),
+                via_tap,
+                ..Meta::default()
+            },
+            payload: json!({}),
+        }
+    }
+
+    /// A test cognition that holds one communication, `TEST_THREAD`'s, with the person's turn the
+    /// intake took (its seq 1), and one episode about the person: in memory, in its file and in the
+    /// region. The worker's queue holds the turn.
+    async fn cognition_with_a_conversation(
+        hive_id: &str,
+        region: MemoryRegionWriter,
+        dir: &Path,
+    ) -> (
+        Arc<CognitionAppState>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+        mpsc::Sender<CognitionTurn>,
+        mpsc::Receiver<CognitionTurn>,
+    ) {
+        let (app_state, mut router) = test_app_state(hive_id, Some(region), dir);
+        let (turn_tx, turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        let question = person_says("Where is my credit note?");
+        let batch = turns_batch(hive_id, &[(1, TEST_TS, &question)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        assert_eq!(
+            next_outgoing(&mut router).await.meta.msg.as_deref(),
+            Some(MSG_STREAM_ACK)
+        );
+        publish_episode(
+            &app_state,
+            &credit_note_episode(),
+            &strings(&["credit note", "billing"]),
+            strings(&["ilk:person", "ilk:juan"]),
+            TEST_THREAD,
+            0,
+        )
+        .await;
+        assert_eq!(
+            next_outgoing(&mut router).await.meta.msg.as_deref(),
+            Some(episodes::MSG_COGNITION_EPISODE)
+        );
+        assert_eq!(app_state.store.stats().expect("stats").0, 1);
+        assert_eq!(app_state.store.live_episodes(0).expect("episodes").len(), 1);
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!((package.turns.len(), package.news.len()), (1, 1));
+        (app_state, router, turn_tx, turn_rx)
+    }
+
+    /// The bytes of its file and of its WAL, where a write lands before a checkpoint.
+    fn file_bytes(app_state: &CognitionAppState) -> Vec<u8> {
+        let path = app_state.store.path().to_path_buf();
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        [path, PathBuf::from(wal)]
+            .iter()
+            .filter_map(|path| fs::read(path).ok())
+            .flatten()
+            .collect()
+    }
+
+    fn holds(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    /// A clear from SY.admin on the motherbee drops every communication and every episode: from
+    /// memory, from the file, which keeps none of their text, and from the region, written empty.
+    /// It answers what it removed, and the cognition keeps running, empty: the turn it had queued is
+    /// not analyzed, and the next one starts its communication again.
+    #[tokio::test]
+    async fn a_clear_from_the_motherbee_admin_drops_everything_and_keeps_running() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogclear");
+        let (app_state, mut router, turn_tx, mut turn_rx) =
+            cognition_with_a_conversation(&hive_id, region, &dir.0).await;
+        let before = file_bytes(&app_state);
+        assert!(holds(&before, "Where is my credit note?"));
+        assert!(holds(&before, "Argument over the credit note"));
+
+        take_clear(&app_state, &clear_from(Some("SY.admin@motherbee"), false)).await;
+        let answer = next_outgoing(&mut router).await;
+        assert_eq!(
+            answer.meta.msg.as_deref(),
+            Some(MSG_COGNITION_CLEAR_RESPONSE)
+        );
+        assert_eq!(
+            answer.payload,
+            json!({
+                "ok": true,
+                "node_name": format!("SY.cognition@{hive_id}"),
+                "removed": {
+                    "file": { "communications": 1, "episodes": 1 },
+                    "memory": { "communications": 1, "episodes": 1 },
+                },
+                "region": "written_empty",
+            })
+        );
+
+        assert!(app_state.thread_states.lock().await.is_empty());
+        assert_eq!(app_state.episodes.lock().expect("book").len(), 0);
+        assert_eq!(app_state.store.stats().expect("stats").0, 0);
+        assert!(app_state
+            .store
+            .live_episodes(0)
+            .expect("episodes")
+            .is_empty());
+        let after = file_bytes(&app_state);
+        assert!(!holds(&after, "Where is my credit note?"));
+        assert!(!holds(&after, "Argument over the credit note"));
+        let snapshot = app_state
+            .memory_region
+            .lock()
+            .await
+            .as_ref()
+            .expect("the region")
+            .read_snapshot()
+            .expect("a snapshot");
+        assert!(snapshot.threads.is_empty());
+        let state = app_state.runtime_state.lock().await.clone();
+        assert_eq!(
+            (
+                state.active_threads_total,
+                state.episodes_live_total,
+                state.shm_hot_threads_total,
+                state.clears_total
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(state.last_thread_id.is_none() && state.last_src_ilk.is_none());
+        assert!(state.last_clear_at.is_some());
+        let status = build_status_payload(
+            &app_state.node_name,
+            &test_control_state(),
+            &state,
+            &app_state.runtime_paths,
+            app_state.store.stats().ok(),
+        );
+        assert_eq!(status["clears"]["total"], json!(1));
+        assert_eq!(status["store"]["communications_total"], json!(0));
+
+        // The turn it had queued was taken before the clear.
+        let queued = turn_rx.try_recv().expect("the queued turn");
+        assert_eq!(queued.clears, 0);
+        let mut loads = StoreLoads::default();
+        assert!(
+            !hold_for_worker(&app_state, &key(TEST_THREAD), queued.clears, &mut loads)
+                .await
+                .expect("no file read")
+        );
+        assert!(app_state.thread_states.lock().await.is_empty());
+
+        // The next turn starts its communication again.
+        let again = person_says("Hello again");
+        let batch = turns_batch(&hive_id, &[(2, TEST_TS + 1_000, &again)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let package = region_package(&app_state).await.expect("the new package");
+        assert_eq!(package.turns.len(), 1);
+        assert!(package.news.is_empty());
+        assert_eq!(app_state.store.stats().expect("stats").0, 1);
+        let next = turn_rx.try_recv().expect("the next turn");
+        assert_eq!(next.clears, 1);
+        unlink();
+    }
+
+    /// A clear from anyone but SY.admin on the motherbee, as the router names the sender, is
+    /// refused and touches nothing; so is a tap's copy of the admin's own.
+    #[tokio::test]
+    async fn a_clear_from_anyone_else_is_refused_and_touches_nothing() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogclearno");
+        let (app_state, mut router, _turn_tx, _turn_rx) =
+            cognition_with_a_conversation(&hive_id, region, &dir.0).await;
+        for (from, via_tap) in [
+            (Some("SY.admin@worker1"), false),
+            (Some("SY.cognition@worker2"), false),
+            (Some("SY.orchestrator@motherbee"), false),
+            (Some("AI.sales@motherbee"), false),
+            (Some(""), false),
+            (None, false),
+            (Some("SY.admin@motherbee"), true),
+        ] {
+            take_clear(&app_state, &clear_from(from, via_tap)).await;
+            let answer = next_outgoing(&mut router).await;
+            assert_eq!(
+                answer.meta.msg.as_deref(),
+                Some(MSG_COGNITION_CLEAR_RESPONSE)
+            );
+            assert_eq!(answer.payload["ok"], json!(false), "{from:?}");
+            assert_eq!(answer.payload["error"], json!("UNAUTHORIZED"), "{from:?}");
+        }
+        assert_eq!(app_state.clears.load(Ordering::SeqCst), 0);
+        assert_eq!(app_state.store.stats().expect("stats").0, 1);
+        assert_eq!(app_state.store.live_episodes(0).expect("episodes").len(), 1);
+        assert_eq!(app_state.thread_states.lock().await.len(), 1);
+        assert!(region_package(&app_state).await.is_some());
+        assert_eq!(app_state.runtime_state.lock().await.clears_total, 0);
+        unlink();
+    }
+
+    /// The worker's turn a clear came in the middle of brings nothing back: not its communication,
+    /// which it had copied before, nor its episode. A turn of after the clear writes back.
+    #[tokio::test]
+    async fn a_turn_the_worker_was_on_when_a_clear_came_brings_nothing_back() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogclearmid");
+        let (app_state, mut router, _turn_tx, _turn_rx) =
+            cognition_with_a_conversation(&hive_id, region, &dir.0).await;
+        let mut loads = StoreLoads::default();
+        assert!(
+            hold_for_worker(&app_state, &key(TEST_THREAD), 0, &mut loads)
+                .await
+                .expect("held")
+        );
+        let copy = app_state
+            .thread_states
+            .lock()
+            .await
+            .get(&key(TEST_THREAD))
+            .cloned()
+            .expect("the worker's copy");
+
+        take_clear(&app_state, &clear_from(Some("SY.admin@motherbee"), false)).await;
+        next_outgoing(&mut router).await;
+
+        let (written_back, synced) =
+            write_back_worker_turn(&app_state, &key(TEST_THREAD), copy.clone(), 0).await;
+        assert!(!written_back);
+        synced.expect("the region written");
+        assert!(app_state.thread_states.lock().await.is_empty());
+        assert_eq!(app_state.store.stats().expect("stats").0, 0);
+        assert!(region_package(&app_state).await.is_none());
+
+        publish_episode(
+            &app_state,
+            &credit_note_episode(),
+            &strings(&["credit note", "billing"]),
+            strings(&["ilk:person", "ilk:juan"]),
+            TEST_THREAD,
+            0,
+        )
+        .await;
+        assert!(
+            router
+                .next_outgoing_within(Duration::from_millis(200))
+                .await
+                .is_none(),
+            "an episode of before the clear goes nowhere"
+        );
+        assert!(app_state
+            .store
+            .live_episodes(0)
+            .expect("episodes")
+            .is_empty());
+        assert_eq!(app_state.episodes.lock().expect("book").len(), 0);
+
+        let (written_back, _) =
+            write_back_worker_turn(&app_state, &key(TEST_THREAD), copy, 1).await;
+        assert!(written_back);
+        assert_eq!(app_state.store.stats().expect("stats").0, 1);
+        unlink();
+    }
+
+    /// The authority is the admin that commands the edges, by the name its router stamps.
+    #[test]
+    fn a_clear_is_the_motherbee_admins_alone() {
+        assert_eq!(COGNITION_CLEAR_AUTHORITY, "SY.admin@motherbee");
+        assert!(authorize_clear(&clear_from(Some("SY.admin@motherbee"), false)).is_ok());
+        assert!(authorize_clear(&clear_from(Some(" SY.admin@motherbee "), false)).is_ok());
+        for refused in [
+            clear_from(Some("SY.admin@worker1"), false),
+            clear_from(Some("SY.architect@motherbee"), false),
+            clear_from(None, false),
+            clear_from(Some("SY.admin@motherbee"), true),
+        ] {
+            assert!(authorize_clear(&refused).is_err());
+        }
     }
 
     /// A host reboot empties the memory region. The file keeps the communications, and the start

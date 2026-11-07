@@ -18,9 +18,11 @@ REMOVED (operator decisions, 2026-09-28):
     every tenant but the root -- PURGED: identity's delete only marks (reversible, keys reserved),
     so the reset marks and then purges; ilks/tenants some earlier delete left marked go too;
   - the message log: every table of the fluxbee_storage DB (turns, inbox, usage...)
-    + this hive's SY.cognition state (its file, cognition.db, and its SHM) + the conversation
-    state of the base AI nodes and of the frontdesk (thread-state/, immediate-memory/) + the
-    Architect chat sessions. A worker's SY.cognition file stays: this runs on the motherbee;
+    + SY.cognition's state on every hive that runs it: this hive's removed with the unit
+    stopped (its file, cognition.db, and its SHM), every other's through cognition_clear (its
+    file, its memory and its memory region, the node running) + the conversation state of the
+    base AI nodes and of the frontdesk (thread-state/, immediate-memory/) + the Architect chat
+    sessions;
   - every vault secret except infrastructure (INFRA_KEYS / INFRA_PREFIXES below) -- including
     AI provider keys: the hive ends up as freshly installed, AI degraded until they are reloaded;
   - the user OPA policy on every hive (opa_clear: current, staged, backup; routers unload it --
@@ -67,6 +69,7 @@ INFRA_KEYS = ("storage_postgres_url",)
 SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
 WF_NODE_PREFIX = "WF."
 WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (hive.yaml system_nodes)
+COGNITION_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.cognition (the same)
 CONVERSATION_DIRS = ("thread-state", "immediate-memory")
 
 
@@ -305,6 +308,38 @@ def cognition_paths(hive):
     return [p for p in paths if os.path.exists(p)]
 
 
+def cognition_hives(local_hive):
+    """The other hives that run SY.cognition. Each keeps its state in a file of its own (A-158),
+    which this box cannot reach: SY.admin's cognition_clear has the node drop it (FINDINGS A-160)."""
+    out = []
+    for h in hives_raw():
+        hive = h.get("hive_id") or h.get("name")
+        if hive and hive != local_hive and (h.get("role") or "") in COGNITION_HIVE_ROLES:
+            out.append(hive)
+    return sorted(out)
+
+
+def clear_cognitions(hives):
+    """cognition_clear on each hive: its SY.cognition drops every communication and every episode it
+    keeps, in memory, in its file and in its memory region, keeps running, and says what it
+    removed."""
+    failed = []
+    for hive in hives:
+        status, resp = api("POST", "/hives/%s/cognition/clear" % q(hive), {}, timeout=60)
+        good = ok(status, resp)
+        print("  %-5s cognition_clear on %s" % ("OK" if good else "FAIL", hive))
+        if good:
+            removed = payload(resp).get("removed") or {}
+            stored, held = removed.get("file") or {}, removed.get("memory") or {}
+            print("    its file: %s communications, %s episodes; its memory: %s communications, %s episodes"
+                  % (stored.get("communications"), stored.get("episodes"),
+                     held.get("communications"), held.get("episodes")))
+        else:
+            print("    %s %s" % (status, str(resp)[:200]))
+            failed.append((hive, status, str(resp)[:200]))
+    return failed
+
+
 ROOT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
 
@@ -427,6 +462,7 @@ def main():
     counts = storage_counts(tables) if can_db else {}
     conv = conversation_dirs()
     cog = cognition_paths(hive_id)
+    cog_hives = cognition_hives(hive_id)
     tenants = user_tenants(hive_id)
     opa_versions = opa_user_policy_versions()
 
@@ -457,7 +493,9 @@ def main():
             print("    %-36s %d" % (t, counts.get(t, 0)))
     else:
         print("[6] message log (%s): run as root to see the row counts" % STORAGE_DB)
-    print("    + SY.cognition state: %s" % (", ".join(cog) or "none"))
+    print("    + SY.cognition state on this hive (removed, the unit stopped): %s" % (", ".join(cog) or "none"))
+    print("    + SY.cognition on the other hives (cognition_clear: its file, its memory and its memory region): %s"
+          % (", ".join(cog_hives) or "none"))
     print("    + conversation state of the nodes that stay: %d dirs" % len(conv))
     for d in conv:
         print("      %s" % d)
@@ -537,10 +575,15 @@ def main():
                            {"force": False, "purge_instance": False}, timeout=120)
         if not ok(status, resp):
             print("  WARN could not stop %s (%s): %s" % (n, status, str(resp)[:160]))
+    cog_fail = []
     try:
         tables = storage_tables()
         if tables:
             psql("TRUNCATE %s RESTART IDENTITY CASCADE" % ", ".join('"%s"' % t for t in tables))
+        # The other hives' cognition is cleared while this hive's is stopped: an episode one of
+        # them made before its clear, sent to every hive's cognition, cannot reach the file this
+        # one starts again with.
+        cog_fail = clear_cognitions(cog_hives)
         for p in cognition_paths(hive_id) + conversation_dirs():
             rm_path(p)
     finally:
@@ -550,7 +593,7 @@ def main():
             if not ok(status, resp):
                 print("  WARN could not start %s (%s): %s" % (n, status, str(resp)[:160]))
     left = {t: c for t, c in storage_counts(storage_tables()).items() if c}
-    print("  %d tables truncated%s; cognition state and %d conversation dirs removed"
+    print("  %d tables truncated%s; this hive's cognition state and %d conversation dirs removed"
           % (len(tables), (" -- NOT EMPTY: %s" % left) if left else "", len(conv)))
     status, resp = api("DELETE", "/api/sessions", host=ARCHITECT)
     print("  Architect sessions: %s" % ("cleared" if 200 <= status < 300 else "FAIL %s %s" % (status, str(resp)[:160])))
@@ -564,7 +607,8 @@ def main():
     failed_units = sh(["systemctl", "--failed", "--no-legend", "--plain"], check=False).stdout.split()
     print("  hives: %s" % ", ".join("%s=%s" % h for h in hives))
     print("  failed units: %s" % (" ".join(u for u in failed_units if u.endswith(".service")) or "none"))
-    problems = len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(opa_fail) + len(left)
+    problems = (len(wf_fail) + len(node_fail) + len(ilk_fail) + len(vault_fail) + len(tenant_fail) + len(opa_fail)
+                + len(left) + len(cog_fail))
     summary = "%s factory-reset hive=%s workflows=%d nodes=%d ilks=%d secrets=%d tables=%d problems=%d (%.0fs)" % (
         time.strftime("%Y-%m-%dT%H:%M:%S%z"), hive_id, len(workflows), len(user_nodes), len(ilks_now), len(secrets_now),
         len(tables), problems, time.time() - t0)
