@@ -125,7 +125,8 @@ mechanism is not improvised.
 1. **Snapshot before every destructive or doubtful change.** Name: `pre-<action>-YYYYMMDD`.
    **One per VM, the backup** (the operator lowered it from 3 on 2026-10-29): the old one is deleted
    first. `lab/pve.py` enforces it (HANDBOOK §12).
-2. **One change at a time**, verified before the next one. No blind batches.
+2. **One change at a time**, verified before the next one. No blind batches. A release may carry
+   several code changes when they touch different binaries and each has its own gate (§9).
 3. **Every change goes into the day's logbook** (§5), including the one that goes wrong.
 4. **What is irreversible is asked first** (§4). Even if the token can do it. On the 8.x host it
    is the agent's call since 2026-10-29 (§2, "Who decides").
@@ -209,3 +210,32 @@ If something fails: the failure is recorded, it is diagnosed, and **the diagnosi
 - **Compiling is ALWAYS done on the build box** (fb-build), never on a hive or in prod.
 - **Growing does not require a new `.deb`**: the runtime/package is published and an `update` is run.
 - **`base-nodes.json` is the single source** of what goes into the `.deb` (`build-deb.sh` reads it).
+
+---
+
+## 9. How a code change travels (the operator, 2026-11-07)
+
+Measured on 0.1.105, 3 h 31 min from the operator's choice to the version's close: the full check
+on the Mac took 1 h 43 min, almost all of it between one test binary and the next, while GitHub ran
+the same check in 3 min. CI, build, publish and deploy together took about 30 min. Hence:
+
+- **One branch per change**, `coa/<item>` (e.g. `coa/a-163`), cut from `daily_onworking_coa`. It
+  carries the change's code and its design doc. FINDINGS, the logbook and DEPLOYMENTS are written on
+  `daily_onworking_coa` when the change is integrated: branches that all wrote them would collide.
+  Each person works on a `daily_onworking_*` of their own; `daily_onworking_noe` is never touched.
+- **GitHub runs the tests.** On the Mac only the package the change touches is compiled (`cargo
+  check` or clippy), and no test binary is launched. Each push runs CI on its branch: fmt, clippy
+  denying warnings and every test of both Rust workspaces; format, vet and tests of the Go modules.
+  `lab/ci.py COMMIT --branch coa/<item>` waits for it and prints the end of a failed step's log.
+  The review round runs meanwhile.
+- **Green, the branch is integrated:** rebased on `daily_onworking_coa`, fast-forwarded into it so
+  the history stays linear, and deleted.
+- **A release carries several changes** when they touch different binaries (SY.cognition, Archi,
+  SY.identity…). A change to code they share — the SDK in Rust or Go, the protocol, the router —
+  goes alone. One review round, one ledger entry and one logbook section per release; CI runs once
+  more on the integrated head before the build.
+- **Each change keeps its own gate**, and the gates run in parallel after the deploy. A change that
+  fails its gate is fixed in the next release. The snapshot rolls the whole release back: it is for
+  a serious break.
+- **GitHub's Rust cache is saved on `main` only**, and every branch reads it: the repo's caches are
+  capped at 10 GB, and each branch kept its own copy, about 2 GB.
