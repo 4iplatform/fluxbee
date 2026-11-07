@@ -132,14 +132,17 @@ type MemoryPackage struct {
 
 // MemoryTurn is one turn of a communication, as its memory package carries it: a message its agent
 // received (Direction "in") or sent ("out"). Via, on "in" only, is the node it came in through, and
-// Writer who wrote it; To, on "out" only, whom the agent answered; Choice, on "out" only, the option
-// the agent chose from a WF's menu.
+// Writer who wrote it; To, on "out", whom the agent answered; Choice, on "out" only, the option the
+// agent chose from a WF's menu. A relay, what a WF sent an IO node on the agent's thread, is an "in"
+// that names where it went: ToVia, the IO node, and To, the person when the message names them
+// (docs/cognition-hands-v1.md §12.9).
 type MemoryTurn struct {
 	Direction   string            `json:"direction"`
 	SrcIlk      *string           `json:"src_ilk,omitempty"`
 	Via         *string           `json:"via,omitempty"`
 	Writer      *MemoryTurnParty  `json:"writer,omitempty"`
 	To          *MemoryTurnParty  `json:"to,omitempty"`
+	ToVia       *string           `json:"to_via,omitempty"`
 	Text        string            `json:"text,omitempty"`
 	Attachments uint32            `json:"attachments,omitempty"`
 	Choice      *MemoryTurnChoice `json:"choice,omitempty"`

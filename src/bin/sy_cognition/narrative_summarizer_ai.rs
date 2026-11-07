@@ -130,6 +130,7 @@ fn build_system_prompt(include_feeling: bool) -> String {
             "Rules:\n",
             "- memory_summary: concise narrative synthesis of recurring thread pattern, 1-2 sentences.\n",
             "- speaker is who spoke this turn. Name people as the speaker names them; when the thread has several people, the memory_summary says who said or sought what.\n",
+            "- counterpart is whom this turn was written to: the agent, for a turn to it; the person it answered, for the agent's own answer; or, for a turn between people that the agent took no part in, the other person or the node they are reached through.\n",
             "- preserve continuity with previous summaries when provided.\n",
             "- use only the supplied evidence. Do not invent facts, names, or timeline details.\n",
             "- mention context and dominant reason naturally.\n",
@@ -327,6 +328,8 @@ mod tests {
             assert!(system.contains(word), "{word}");
         }
         assert!(system.contains("never what someone feels"));
+        assert!(system.contains("counterpart is whom this turn was written to"));
+        assert!(system.contains("the person it answered, for the agent's own answer"));
         let account = AiAccount::charge(
             fluxbee_ai_sdk::UsageRecorder::disabled(),
             "SY.cognition@worker1",

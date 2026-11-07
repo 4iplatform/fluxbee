@@ -17,7 +17,8 @@
   meanwhile; cognition analyzes people's turns with no agent; and episodes are public news that
   fade with time. Agreed in the chat, its design reviewed by the operator the same day, and
   released in 0.1.104. Its gate on 8.x found that a line a WF relays between two people names no
-  one it was said to (§12.8, A-161): the fix, the operator's choice, is for 0.1.105.
+  one it was said to (§12.8, A-161): the fix, the operator's choice, built on 2026-11-07 for
+  0.1.105 (§12.9).
 
 This is the single place for the topic.
 
@@ -859,8 +860,11 @@ At 10:17 sales' package carries:
 - **A-159** (deleting an ILK) now also reaches the episodes, which name people's ILKs on every
   hive.
 - **Known limits of the build** (its review round):
-  - A WF's message to an agent and its copy to a person split across two stream batches, which is
-    rare, go to two communications on a new thread: the agent's and the one with no agent.
+  - A WF's message to an agent and its copy to a person can come in two stream batches: the router
+    sends a batch as soon as it has a record, one at a time. On a new thread, with the relay
+    first, they go to two communications, the agent's and the one with no agent, each analyzed.
+    On a thread the agent served they are one turn (§12.9). Corrected by A-161's review round
+    (2026-11-07): this was written as rare.
   - During the upgrade to 0.1.104, an ai.generic still on 0.1.103 cannot read a package that its
     new router cut (`truncated`), and that message fails. The packages start empty at the
     upgrade (the state version 2), so a cut one is rare in that window.
@@ -940,3 +944,53 @@ back to the agent when A asks. The ledger's 0.1.104 has each number.
   - For 0.1.105, and this gate again on a new thread, once the wrong episode is gone.
 - **Found, A-162:** one tagger call got an answer with no text, and the SDK's error does not say
   its `stop_reason`. That turn went unanalyzed. The error will name it, in 0.1.105.
+
+### 12.9 Built (2026-11-07): a relay names where it went (A-161), and an answer with no text says why (A-162)
+
+- **SY.cognition** (src/bin/sy_cognition.rs):
+  - a relay keeps where it went (`recent_turn_of`): `to_via`, the IO node its router names as its
+    destination (`relay_destination`), and `to`, the person when the message names one, its
+    `dst_ilk`. A turn the agent got names neither, and the agent's own answer keeps only `to`;
+  - the tagger reads whom a relay was written to (`relay_addressee`): `person A (<ILK>) via
+    IO.a`, or the IO node alone, as `identity_hints.to`, with the rule that what the text says to
+    "you" is said to them, never to an assistant;
+  - the narrator's rule: the counterpart is whom the turn was written to: the agent, the person
+    the agent answered, or, in a turn between people that the agent took no part in, the other
+    person or the node they are reached through;
+  - a relay's counterpart, and so who an episode of it is about (`episode_people`): the person its
+    message names, else the last other person who wrote through the IO node it went to, else that
+    node, which names no one.
+- **The package** (crates/fluxbee_sdk/src/protocol.rs, go/fluxbee-go-sdk/protocol.go):
+  `MemoryTurn.to_via`, optional. A package from a cognition of 0.1.104 has none, and the agent
+  reads its turns as before: the package's version stays 5.
+- **ai.generic** (`render_memory_turn`, `relay_addressee`): a relay reads `<writer>, to <kind>
+  <name> (<ILK>) via <node>`, or `<writer>, to <node>`. With any relay among the turns, a line
+  ahead of them gives the rule: *a line between other people names whom it was said to (", to
+  ..."): it was not said to you, and its "you" is that person.*
+
+  In the gate's handover the agent would read:
+
+  ```text
+  - [2026-11-07 05:40] person A (ilk:…) via IO.gate0206a@worker1, to IO.gate0206b@worker1: "Otra vez vos? …"
+  - [2026-11-07 05:41] person ilk:… via IO.gate0206b@worker1, to person A (ilk:…) via IO.gate0206a@worker1: "Tenes razon, te falle …"
+  ```
+
+- **The AI SDK** (crates/fluxbee_ai_sdk/src/llm.rs): an answer with no text names why, Anthropic's
+  `stop_reason` (`anthropic response missing text content (stop_reason=refusal)`), and the
+  Responses payload's `status`, with `refused` when a message refused.
+- **The review round** (one, one reviewer): two mediums and four lows, all fixed but one noted:
+  - **Medium:** a message a WF forwards to an IO node and to the agent, whose relay came first in
+    an earlier batch, kept the relay's line, and the agent read as not said to it a message it
+    had answered. The agent's copy now makes the turn the agent's (`said_to_the_agent_too`), and
+    the worker's write-back keeps the intake's copy of a turn (`merge_recent_turns`, `same_turn`).
+  - **Medium:** the narrator did not read where a relay went when its message named no one: the
+    first relay of a handover had no counterpart, and with three people the thread's last other
+    person could be the wrong one. A relay's counterpart is now the person its message names, else
+    the last other person who wrote through the IO node it went to, else that node.
+  - **Lows:** the narrator's rule names the agent's own answer too; an OpenAI answer cut for
+    another reason says the reason; the tests cover the batch path, the two batches and a relay
+    that names no one.
+  - **Noted, not changed:** a WF's `forward` toward an IO node other than the person's keeps the
+    `dst_ilk` its message had, so a relay of an agent's answer names whom the agent answered,
+    wherever the copy went. Only a communication of another agent than the one that answered
+    would show it, and the docs say what a forward keeps.

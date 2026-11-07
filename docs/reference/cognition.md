@@ -98,10 +98,16 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   (`last_agent_on_thread`), or else the thread's communication with no agent.
   - *Served last* is the newest last turn, as its router took it (`last_turn_epoch_ms`), whatever
     when the worker analyzed it.
-  - The relays of a batch find theirs after the batch's other turns are held. A WF that sends one
-    message to an agent and to a person puts both copies in one batch, in either order, so the
-    relay joins that agent's communication even on a new thread. Two copies split across two
-    batches, which is rare, go to two communications.
+  - The relays of a batch find theirs after the batch's other turns are held. The router sends a
+    batch as soon as it has a record, one at a time (`run_sink`, src/router/stream.rs), so the two
+    copies of one message a WF sends to an agent and to a person can come in one batch or in two:
+    - in one batch, in either order, the relay joins that agent's communication, even on a new
+      thread;
+    - in two, on a thread the agent served, the relay joins its communication too, and the agent's
+      copy, whichever comes second, is the same turn;
+    - in two, on a new thread, the relay first goes to the thread's communication with no agent and
+      the agent's copy to the agent's: two communications, each analyzed (cognition-hands-v1
+      §12.6).
 - It takes each new `cognition.turns` record into its communication's last turns, writes each
   communication it touched to its file and rewrites the memory region once for the batch (the
   intake, §3.4).
@@ -110,7 +116,10 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
   agent sent, which the WF then relays to the person, comes twice with one key: the second is
   left out, and not analyzed (`duplicate_turns_skipped_total`). An answer of the agent that a WF
   relays in a later cycle, under another trace, is left out too: the agent wrote it, and its
-  communication holds an answer with its text (`echoes_own_answer`).
+  communication holds an answer with its text (`echoes_own_answer`). When the agent's own copy of
+  a message comes after its relay, the turn was said to the agent too: it no longer names where
+  else it went (`said_to_the_agent_too`), and the worker's write-back keeps it so
+  (`merge_recent_turns` keeps the held copy of a turn, `same_turn`).
 - Then it hands each record to a queue of 256 turns (`COGNITION_TURN_QUEUE`). A full queue drops
   the turn and counts it (`dropped_turns_queue_full_total`); the turn stays in its communication's
   last turns.
@@ -178,7 +187,9 @@ stays in the last turns.
 `run_semantic_tagger_ai` in `semantic_tagger_ai.rs`:
 
 - **Input:** the turn's text, `max_tags`, `max_reason_signals`, the eight canonical signals, and
-  as hints `src_ilk`, `dst_ilk` and `ich`.
+  as hints `src_ilk`, `dst_ilk`, `ich` and, for a relay, `to`: whom it was written to, the person
+  the message names with the IO node it went to, or the node alone (`relay_addressee`). Its rule:
+  what the text says to "you" is said to them, never to an assistant (cognition-hands-v1 §12.9).
 - **Output:** a JSON object with `tags`, `reason_signals_canonical`, `reason_signals_extra` and
   `affect_signals`. Labels are normalized and capped; canonical and affect signals outside their
   sets are dropped.
@@ -206,8 +217,13 @@ stays in the last turns.
   the turn shows, with their titles and the text so far of the heaviest of them. It never sees
   the message text. The memory names each person as the speaker names them
   (docs/cognition-hands-v1.md §10.3). For an episode, it also reads whom the turn is to
-  (`episode_people`), the communication's two leading contexts (`leading_contexts`) and how many
-  live episodes of each lens the turn's people already have (§4.1).
+  (`episode_people`: the agent; for its answer, whom it answered; for a relay, the person the
+  message names, else the last other person who wrote through the IO node it went to, else that
+  node, which names no one), the communication's two leading contexts
+  (`leading_contexts`) and how many live episodes of each lens the turn's people already have
+  (§4.1). Its rule: the counterpart is whom the turn was written to: the agent, the person the
+  agent answered, or, in a turn between people that the agent took no part in, the other person
+  or the node they are reached through (cognition-hands-v1 §12.9).
 - **Output:** `memory_summary`, and `feeling_summary` with `feeling_reason` exactly when the
   turn shows an affect: one text for the moment, which each feeling the turn shows takes. An empty
   memory summary, or a missing feeling text, is an invalid output. And `episode`, null or a
@@ -249,11 +265,17 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
     `meta.context.trace` (docs/message-trace-v1.md), the IO node a WF forwards it from; otherwise
     its sender's L2 name;
   - `writer`, on `in` only: who wrote it, its `meta.context.writer`, else its `src_ilk`; and `to`,
-    on `out` only: whom the agent answered, its `dst_ilk` ([cognition-hands-v1](../cognition-hands-v1.md)
+    on `out`: whom the agent answered, its `dst_ilk` ([cognition-hands-v1](../cognition-hands-v1.md)
     §6). Each is `{ilk, name, kind}`: the name the message gives, else the identity's display
     name, and the kind the identity's type gives (`person`, `agent`, `workflow` or `system`, none
     for an ILK it does not know), read in the identity memory of the cognition's hive and kept a
     minute (`message_writer::ilk_facts`);
+  - `to_via`, on a relay only: the IO node the WF sent it to, its router's destination
+    (`relay_destination`), with `to` the person its `dst_ilk` names, when it names one. A relay was
+    said to whoever is there, not to the agent (cognition-hands-v1 §12.9, A-161). A WF's
+    `send_message` names a person only toward the IO node of whoever started it, and a `forward`
+    there sets that person; a `forward` toward any other IO node keeps the `dst_ilk` its message
+    had, none for a person's message (A-139);
   - `text`: `extract_turn_text`, cut at 2,000 characters (`COGNITION_TURN_TEXT_MAX_CHARS`), the
     last one an ellipsis when cut. Empty for a turn with files alone: it is kept, so the agent's
     answer to it keeps its question;
@@ -570,6 +592,10 @@ before a WF's block when the message carries one (`render_memory_package_prompt_
     `workflow` or `system` as the identity says, and `via <node>` after a person's, the node they
     wrote through. So a person, a supervisor, another agent and a WF's own text read apart;
   - the agent's own turns read `you, to <whom>`, or `you` when the turn names nobody;
+  - a WF's relay between people adds whom it was said to: `<writer>, to <kind> <name> (<ILK>)
+    via <node>`, or `<writer>, to <node>` when it names no one. With any relay among the turns,
+    a line ahead of them gives the rule: a line between other people was not said to the agent,
+    and its "you" is that person (cognition-hands-v1 §12.9);
   - a turn kept before turns named a writer reads its sender's ILK and the node it came through.
 - Each turn's text is a JSON string, so no text can pass for a turn's line of its own; files are
   counted, and an answer that chose from a WF's menu reads `chose <option> <params>`.

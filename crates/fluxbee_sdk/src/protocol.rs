@@ -129,7 +129,8 @@ pub struct MemoryPackage {
     pub truncated: Option<MemoryPackageTruncated>,
 }
 
-/// One turn of a communication: a message its agent received (`in`) or sent (`out`).
+/// One turn of a communication: a message its agent received (`in`) or sent (`out`). A relay, what
+/// a WF sent an IO node on the agent's thread, is an `in` that names where it went (`to_via`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTurn {
     pub direction: MemoryTurnDirection,
@@ -144,9 +145,14 @@ pub struct MemoryTurn {
     /// (docs/cognition-hands-v1.md §6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer: Option<MemoryTurnParty>,
-    /// Only on `out`: whom the agent answered, the answer's `dst_ilk`.
+    /// On `out`: whom the agent answered, the answer's `dst_ilk`. On a relay: the person it went
+    /// to, when the message names them, its `dst_ilk` (docs/cognition-hands-v1.md §12.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<MemoryTurnParty>,
+    /// Only on a relay: the IO node the WF sent it to. It was said to whoever is there, not to the
+    /// agent (docs/cognition-hands-v1.md §12.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_via: Option<String>,
     /// Its text, cut at 2,000 characters. Empty when it carried only files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
@@ -975,6 +981,31 @@ mod tests {
         assert_eq!(truncated.dropped_memories, 2);
         assert_eq!(truncated.dropped_feelings, 0);
         assert_eq!(truncated.dropped_news, 0);
+    }
+
+    /// A relay names the IO node it went to, and a turn of the version before, with none, reads
+    /// as a turn said to the agent (docs/cognition-hands-v1.md §12.9).
+    #[test]
+    fn a_relay_names_where_it_went_and_an_older_turn_reads_without_it() {
+        let relay: MemoryTurn = serde_json::from_value(json!({
+            "direction": "in", "via": "IO.a@worker1", "to_via": "IO.b@worker1",
+            "text": "hola", "ts": "2026-11-07T05:40:47.120Z"
+        }))
+        .expect("parse");
+        assert_eq!(relay.to_via.as_deref(), Some("IO.b@worker1"));
+        assert_eq!(
+            serde_json::to_value(&relay).expect("encode")["to_via"],
+            "IO.b@worker1"
+        );
+        let older: MemoryTurn = serde_json::from_value(json!({
+            "direction": "in", "via": "IO.a@worker1", "text": "hola", "ts": "2026-11-07T05:40:47.120Z"
+        }))
+        .expect("parse");
+        assert_eq!(older.to_via, None);
+        assert!(serde_json::to_value(&older)
+            .expect("encode")
+            .get("to_via")
+            .is_none());
     }
 
     #[test]

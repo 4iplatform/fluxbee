@@ -1016,8 +1016,10 @@ fn intake_turn(
 /// A copy of a turn as its communication keeps it. The agent sent it (`out`) when its router names
 /// the agent node as the sender; otherwise the agent received it (`in`), through `turn_via`. A turn
 /// the agent got names its writer, and one it sent whom it answered (`turn_party`, with what `facts`
-/// says of each ILK). An answer that chose from a WF's menu keeps its choice (`menu_choice`). A
-/// turn with neither text, files nor a choice is left out: the package would show it empty.
+/// says of each ILK). A relay names where it went (`relay_destination`), and the person when the
+/// message names them: it was said to them, not to the agent. An answer that chose from a WF's menu
+/// keeps its choice (`menu_choice`). A turn with neither text, files nor a choice is left out: the
+/// package would show it empty.
 fn recent_turn_of(
     message: &Message,
     agent_node: &str,
@@ -1047,6 +1049,10 @@ fn recent_turn_of(
     if text.is_empty() && attachments == 0 && choice.is_none() {
         return None;
     }
+    let to_via = match direction {
+        MemoryTurnDirection::In => relay_destination(message),
+        MemoryTurnDirection::Out => None,
+    };
     let turn = MemoryTurn {
         direction,
         src_ilk: message
@@ -1064,10 +1070,11 @@ fn recent_turn_of(
             MemoryTurnDirection::In => turn_writer(message, &facts),
             MemoryTurnDirection::Out => None,
         },
-        to: match direction {
-            MemoryTurnDirection::In => None,
-            MemoryTurnDirection::Out => turn_party(message.meta.dst_ilk.as_deref(), None, &facts),
+        to: match (direction, &to_via) {
+            (MemoryTurnDirection::In, None) => None,
+            _ => turn_party(message.meta.dst_ilk.as_deref(), None, &facts),
         },
+        to_via,
         text,
         attachments,
         choice,
@@ -1380,8 +1387,12 @@ fn hold_recent_turns(
         };
         // One message relayed by a WF to a person and copied for an agent too is one turn, and so
         // is the agent's own answer a WF relays in a later cycle, under that cycle's trace
-        // (docs/cognition-hands-v1.md §12.4).
+        // (docs/cognition-hands-v1.md §12.4). When the agent's copy comes after the relay, the
+        // turn was said to the agent too (§12.9).
         if held.turn_keys.contains(&recent.turn_key) || echoes_own_answer(held, &recent) {
+            if recent.turn.to_via.is_none() {
+                said_to_the_agent_too(&mut held.turns, &recent.turn);
+            }
             duplicates.push(recent.seq);
             continue;
         }
@@ -1421,6 +1432,26 @@ fn echoes_own_answer(held: &ThreadCognitionState, recent: &RecentTurn) -> bool {
             .any(|turn| turn.direction == MemoryTurnDirection::Out && turn.text == recent.turn.text)
 }
 
+/// A relay the agent's own copy of comes after: it was said to the agent too, so it no longer
+/// names where else it went (docs/cognition-hands-v1.md §12.9). A WF that forwards one message to
+/// an IO node and to the agent has its router copy each, and the two can come in two batches,
+/// either first.
+fn said_to_the_agent_too(turns: &mut [MemoryTurn], copy: &MemoryTurn) {
+    if copy.direction != MemoryTurnDirection::In {
+        return;
+    }
+    if let Some(turn) = turns.iter_mut().rev().find(|turn| {
+        turn.direction == MemoryTurnDirection::In
+            && turn.to_via.is_some()
+            && turn.writer == copy.writer
+            && turn.via == copy.via
+            && turn.text == copy.text
+    }) {
+        turn.to = None;
+        turn.to_via = None;
+    }
+}
+
 /// Adds a turn to a communication's last turns, in the order they were taken, unless they hold it
 /// already (a batch sent again).
 fn push_recent_turn(turns: &mut Vec<MemoryTurn>, turn: MemoryTurn) {
@@ -1448,17 +1479,32 @@ fn bound_recent_turns(turns: &mut Vec<MemoryTurn>) {
 }
 
 /// One communication's last turns from two copies of them, the worker's and what is held: each turn
-/// of either once, in the order they were taken, bounded as at intake.
+/// of either once, in the order they were taken, bounded as at intake. A turn in both is the held
+/// one: only the intake changes turns, and it may have learned more of one since the worker's copy
+/// (`said_to_the_agent_too`).
 fn merge_recent_turns(worker: &[MemoryTurn], held: &[MemoryTurn]) -> Vec<MemoryTurn> {
-    let mut merged = worker.to_vec();
-    for turn in held {
-        if !merged.contains(turn) {
+    let mut merged = held.to_vec();
+    for turn in worker {
+        if !merged.iter().any(|kept| same_turn(kept, turn)) {
             merged.push(turn.clone());
         }
     }
     merged.sort_by_key(|turn| parse_rfc3339_epoch_ms(&turn.ts).unwrap_or_default());
     bound_recent_turns(&mut merged);
     merged
+}
+
+/// Whether two copies are one turn: taken at the same time, the same way, from the same writer and
+/// sender, with the same text and files. Where a relay went is left out: the intake may clear it.
+fn same_turn(a: &MemoryTurn, b: &MemoryTurn) -> bool {
+    a.ts == b.ts
+        && a.direction == b.direction
+        && a.src_ilk == b.src_ilk
+        && a.via == b.via
+        && a.writer == b.writer
+        && a.text == b.text
+        && a.attachments == b.attachments
+        && a.choice == b.choice
 }
 
 /// The worker's turn back into what is held: its derivations replace the held ones, and what the
@@ -1569,6 +1615,12 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     let facts = |ilk: &str| message_writer::ilk_facts(&app_state.hive_id, ilk);
     let owner = feeling_owner(&msg, &agent_node, facts);
     let speaker = narrator_speaker(&msg, &agent_node, facts);
+    // Whom a relay was written to, so the tagger reads it between people (§12.9).
+    let addressee = if turn.relay {
+        relay_addressee(&msg, facts)
+    } else {
+        None
+    };
     let text = extract_turn_text(&msg.payload).unwrap_or_default();
     let (thresholds, semantic_tagger_config) = {
         let control_state = app_state.control_state.lock().await;
@@ -1640,6 +1692,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
         src_ilk: src_ilk.as_deref(),
         dst_ilk: dst_ilk.as_deref(),
         ich: ich.as_deref(),
+        to: addressee.as_deref(),
         config: &semantic_tagger_config,
     })
     .await
@@ -1862,6 +1915,41 @@ fn is_workflow_node(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WF."))
 }
 
+/// The IO node a relay went to: the destination of what a WF sent an IO node, the only copy whose
+/// router names an IO node as its destination (`copied_for_cognition_at_entry`, src/router/mod.rs).
+/// None for any other turn: what an agent gets is sent to it (docs/cognition-hands-v1.md §12.9).
+fn relay_destination(message: &Message) -> Option<String> {
+    match &message.routing.dst {
+        Destination::Unicast(dst) if is_io_node(dst.trim()) => {
+            Some(turn_field(dst.trim(), COGNITION_TURN_NAME_MAX_CHARS))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a node is an IO node, by its name, as the router tells one (`is_io_node`,
+/// src/router/mod.rs).
+fn is_io_node(name: &str) -> bool {
+    name.split_once('@')
+        .map_or(name, |(role, _)| role)
+        .starts_with("IO.")
+}
+
+/// Whom a relay was written to, in words, for the tagger: the person the message names and the IO
+/// node it went to, or the node alone (docs/cognition-hands-v1.md §12.9). None for any other turn.
+fn relay_addressee(message: &Message, facts: impl Fn(&str) -> Option<IlkFacts>) -> Option<String> {
+    let io_node = relay_destination(message)?;
+    Some(
+        match turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
+            .as_ref()
+            .and_then(party_words)
+        {
+            Some(person) => format!("{person} via {io_node}"),
+            None => io_node,
+        },
+    )
+}
+
 /// Whose communication a copy of a turn joins (docs/cognition-hands-v1.md §12.4). Its router copies
 /// an agent's turns for that agent, and a WF's messages to IO nodes, a relay between people, for
 /// the thread. A relay joins the communication whose agent served the thread last on this hive (a
@@ -1964,8 +2052,9 @@ fn turn_key(message: &Message) -> String {
 
 /// Whom a turn is to, and the ILKs of the people an episode of it would be about: its writer and
 /// whom it is to (docs/cognition-hands-v1.md §12.4). The agent's answer is to its `dst_ilk`; a turn
-/// the agent got is to the agent; a turn a WF relayed is to the last other person of the
-/// communication's turns, none when there is none yet.
+/// the agent got is to the agent; a turn a WF relayed is to the person its message names, else to
+/// the last other person who wrote through the IO node it went to, else to that node, which names
+/// no one (§12.9).
 fn episode_people(
     message: &Message,
     agent_node: &str,
@@ -1980,20 +2069,35 @@ fn episode_people(
     } else {
         turn_writer(message, &facts).and_then(|writer| writer.ilk)
     };
+    let another_person = |party: &MemoryTurnParty| {
+        party.ilk.is_some()
+            && party.ilk != writer
+            && !matches!(party.kind.as_deref(), Some("agent" | "workflow" | "system"))
+    };
     let counterpart = if sent {
         turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
     } else if relay {
-        turns
-            .iter()
-            .rev()
-            .filter_map(|turn| match turn.direction {
-                MemoryTurnDirection::In => turn.writer.clone(),
-                MemoryTurnDirection::Out => turn.to.clone(),
+        let to_via = relay_destination(message);
+        turn_party(message.meta.dst_ilk.as_deref(), None, &facts)
+            .filter(another_person)
+            .or_else(|| {
+                turns
+                    .iter()
+                    .rev()
+                    .filter(|turn| {
+                        turn.direction == MemoryTurnDirection::In
+                            && to_via.is_some()
+                            && turn.via == to_via
+                    })
+                    .filter_map(|turn| turn.writer.clone())
+                    .find(another_person)
             })
-            .find(|party| {
-                party.ilk.is_some()
-                    && party.ilk != writer
-                    && !matches!(party.kind.as_deref(), Some("agent" | "workflow" | "system"))
+            .or_else(|| {
+                to_via.clone().map(|node| MemoryTurnParty {
+                    ilk: None,
+                    name: Some(node),
+                    kind: None,
+                })
             })
     } else if agent_ilk != NO_AGENT_ILK {
         Some(MemoryTurnParty {
@@ -5136,6 +5240,7 @@ mod tests {
             via: None,
             writer: None,
             to: None,
+            to_via: None,
             text: text.to_string(),
             attachments: 0,
             choice: None,
@@ -6259,6 +6364,7 @@ mod tests {
                         ..MemoryTurnParty::default()
                     }),
                     to: None,
+                    to_via: None,
                     text: "How much is the Pro plan?".to_string(),
                     attachments: 0,
                     choice: None,
@@ -6270,6 +6376,7 @@ mod tests {
                     via: None,
                     writer: None,
                     to: None,
+                    to_via: None,
                     text: "USD 49 a license. How many do you want?".to_string(),
                     attachments: 0,
                     choice: None,
@@ -6378,6 +6485,11 @@ mod tests {
             Some("ilk:juan")
         );
         assert_eq!(
+            package.turns[1].to_via.as_deref(),
+            Some("IO.slack.team@motherbee")
+        );
+        assert_eq!(package.turns[0].to_via, None, "the agent's own answer");
+        assert_eq!(
             app_state
                 .runtime_state
                 .lock()
@@ -6443,8 +6555,96 @@ mod tests {
                 texts(&package.turns),
                 ["Hi, my invoice 123 was charged twice."]
             );
+            assert_eq!(package.turns[0].to_via, None, "relay first: {relay_first}");
             unlink();
         }
+    }
+
+    /// The two copies of one message a WF forwards to an IO node and to the agent can come in two
+    /// batches, the relay first: once the agent's copy comes, the turn is the agent's and names no
+    /// other place, and the worker's copy taken before does not bring the relay back
+    /// (docs/cognition-hands-v1.md §12.9).
+    #[tokio::test]
+    async fn the_agents_copy_after_its_relay_makes_the_turn_the_agents() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogcc");
+        let (app_state, mut router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let (turn_tx, mut turn_rx) = mpsc::channel(COGNITION_TURN_QUEUE);
+        let key = CommunicationKey {
+            thread_id: TEST_THREAD.to_string(),
+            agent_ilk: TEST_AGENT.to_string(),
+        };
+
+        let answer = agent_says("Hello, how can I help?");
+        let batch = turns_batch(&hive_id, &[(1, TEST_TS, &answer)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let mut to_agent = person_says("My invoice 123 was charged twice.");
+        to_agent.routing.src_l2_name = Some(RELAY_WF.to_string());
+        let mut to_team = to_agent.clone();
+        to_team.routing.dst = Destination::Unicast("IO.slack.team@motherbee".to_string());
+        let batch = batch_of(&hive_id, RELAY_WF, &[(2, TEST_TS + 1_000, &to_team)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let worker_copy = app_state
+            .thread_states
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("held");
+        assert_eq!(
+            worker_copy.turns[1].to_via.as_deref(),
+            Some("IO.slack.team@motherbee")
+        );
+
+        let batch = turns_batch(&hive_id, &[(3, TEST_TS + 1_001, &to_agent)]);
+        take_stream_batch(&app_state, &turn_tx, &batch).await;
+        next_outgoing(&mut router).await;
+        let queued: Vec<CognitionTurn> = std::iter::from_fn(|| turn_rx.try_recv().ok()).collect();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|turn| (turn.relay, turn.duplicate))
+                .collect::<Vec<_>>(),
+            [(false, false), (true, false), (false, true)]
+        );
+        let package = region_package(&app_state)
+            .await
+            .expect("the agent's package");
+        assert_eq!(
+            texts(&package.turns),
+            [
+                "Hello, how can I help?",
+                "My invoice 123 was charged twice."
+            ]
+        );
+        assert_eq!(
+            (&package.turns[1].to, &package.turns[1].to_via),
+            (&None, &None)
+        );
+
+        write_back_turn(
+            &mut *app_state.thread_states.lock().await,
+            &key,
+            worker_copy,
+        );
+        let held = app_state
+            .thread_states
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("held");
+        assert_eq!(
+            texts(&held.turns),
+            [
+                "Hello, how can I help?",
+                "My invoice 123 was charged twice."
+            ]
+        );
+        assert_eq!(held.turns[1].to_via, None);
+        unlink();
     }
 
     /// The agent's own answer that a WF relays in a later cycle, under that cycle's trace, is the
@@ -6496,6 +6696,7 @@ mod tests {
                     kind: Some("person".to_string()),
                 }),
                 to: None,
+                to_via: None,
                 text: format!("turn {n}"),
                 attachments: 0,
                 choice: None,
@@ -6866,6 +7067,124 @@ mod tests {
             answer.to,
             party(Some("ilk:ana"), Some("Ana Pérez"), Some("person"))
         );
+    }
+
+    /// A relay names where it went, the IO node, and the person when the message names them: it was
+    /// said to them, not to the agent. A turn the agent got names neither, and the agent's answer to
+    /// an IO node only whom it answered. The tagger reads whom a relay was written to, and an
+    /// episode of a relay is between its writer and the person it names, before any other person
+    /// of the thread (docs/cognition-hands-v1.md §12.9, FINDINGS A-161).
+    #[test]
+    fn a_relay_names_where_it_went_and_whom_when_the_message_does() {
+        let known = |ilk: &str| {
+            (ilk == "ilk:ana").then(|| IlkFacts {
+                ilk_type: "human".to_string(),
+                name: Some("Ana Pérez".to_string()),
+            })
+        };
+        let turn_of = |message: &Message| {
+            recent_turn_of(message, TEST_AGENT_NODE, TEST_AGENT, 0, TEST_TS, known)
+                .expect("a turn")
+                .turn
+        };
+        let mut to_ana = relayed("ilk:juan", "Te pido disculpas");
+        to_ana.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
+        to_ana.meta.dst_ilk = Some("ilk:ana".to_string());
+        let turn = turn_of(&to_ana);
+        assert_eq!(turn.direction, MemoryTurnDirection::In);
+        assert_eq!(turn.to_via.as_deref(), Some("IO.web@worker1"));
+        assert_eq!(
+            turn.to,
+            Some(MemoryTurnParty {
+                ilk: Some("ilk:ana".to_string()),
+                name: Some("Ana Pérez".to_string()),
+                kind: Some("person".to_string()),
+            })
+        );
+        assert_eq!(
+            relay_addressee(&to_ana, known).as_deref(),
+            Some("person Ana Pérez (ilk:ana) via IO.web@worker1")
+        );
+
+        let to_team = relayed("ilk:ana", "Otra vez vos?");
+        let turn = turn_of(&to_team);
+        assert_eq!(turn.to_via.as_deref(), Some("IO.slack.team@motherbee"));
+        assert_eq!(turn.to, None);
+        assert_eq!(
+            relay_addressee(&to_team, known).as_deref(),
+            Some("IO.slack.team@motherbee")
+        );
+
+        let got = turn_of(&person_says("hola"));
+        assert_eq!((got.to, got.to_via), (None, None));
+        assert_eq!(relay_addressee(&person_says("hola"), known), None);
+        let mut answer = agent_says("Ya lo paso a facturación");
+        answer.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
+        answer.meta.dst_ilk = Some("ilk:ana".to_string());
+        let answer = turn_of(&answer);
+        assert_eq!(answer.to_via, None);
+        assert_eq!(answer.to.and_then(|to| to.ilk).as_deref(), Some("ilk:ana"));
+
+        let pedro = MemoryTurn {
+            direction: MemoryTurnDirection::In,
+            src_ilk: Some("ilk:pedro".to_string()),
+            via: Some("IO.slack.team@motherbee".to_string()),
+            writer: Some(MemoryTurnParty {
+                ilk: Some("ilk:pedro".to_string()),
+                name: None,
+                kind: None,
+            }),
+            to: None,
+            to_via: None,
+            text: "Lo veo yo".to_string(),
+            attachments: 0,
+            choice: None,
+            ts: turn_ts(TEST_TS),
+        };
+        let (counterpart, people) = episode_people(
+            &to_ana,
+            TEST_AGENT_NODE,
+            TEST_AGENT,
+            true,
+            std::slice::from_ref(&pedro),
+            known,
+        );
+        assert_eq!(
+            counterpart.and_then(|party| party.ilk).as_deref(),
+            Some("ilk:ana")
+        );
+        assert_eq!(people, ["ilk:juan", "ilk:ana"]);
+        let (counterpart, _) = episode_people(
+            &to_team,
+            TEST_AGENT_NODE,
+            TEST_AGENT,
+            true,
+            std::slice::from_ref(&pedro),
+            known,
+        );
+        assert_eq!(
+            counterpart.and_then(|party| party.ilk).as_deref(),
+            Some("ilk:pedro")
+        );
+        let mut to_web = relayed("ilk:juan", "Lo reviso hoy");
+        to_web.routing.dst = Destination::Unicast("IO.web@worker1".to_string());
+        let (counterpart, people) = episode_people(
+            &to_web,
+            TEST_AGENT_NODE,
+            TEST_AGENT,
+            true,
+            std::slice::from_ref(&pedro),
+            known,
+        );
+        assert_eq!(
+            counterpart,
+            Some(MemoryTurnParty {
+                ilk: None,
+                name: Some("IO.web@worker1".to_string()),
+                kind: None,
+            })
+        );
+        assert_eq!(people, ["ilk:juan"]);
     }
 
     /// Cognition analyzes a turn with a person at its other end (docs/cognition-hands-v1.md §6): one

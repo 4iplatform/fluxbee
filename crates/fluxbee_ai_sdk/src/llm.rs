@@ -442,8 +442,12 @@ impl LlmClient for OpenAiResponsesClient {
         }
         openai_check_truncation(&value)?;
 
-        let text = openai_response_text(&value)
-            .ok_or_else(|| AiSdkError::Protocol("responses payload missing text output".into()))?;
+        let text = openai_response_text(&value).ok_or_else(|| {
+            AiSdkError::Protocol(format!(
+                "responses payload missing text output ({})",
+                openai_no_text_reason(&value)
+            ))
+        })?;
 
         let text = match &request.output_schema {
             Some(output_schema) => validate_structured_output(&text, output_schema)?,
@@ -489,6 +493,32 @@ fn openai_response_text(value: &Value) -> Option<String> {
         .iter()
         .find_map(|part| part.get("text").and_then(Value::as_str))
         .map(ToString::to_string)
+}
+
+/// Why a Responses payload has no answer, for its error: its `status`, the reason an incomplete one
+/// gives, and whether a message refused, so a refusal, a filter's cut and an empty answer read apart
+/// (FINDINGS A-162).
+fn openai_no_text_reason(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let reason = value
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .map(|reason| format!(", reason={reason}"))
+        .unwrap_or_default();
+    let refused = value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"));
+    let refused = if refused { ", refused" } else { "" };
+    format!("status={status}{reason}{refused}")
 }
 
 fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
@@ -1505,9 +1535,14 @@ fn anthropic_response_text(value: &Value) -> Result<String> {
         .collect::<Vec<_>>()
         .join("");
     if text.is_empty() {
-        return Err(AiSdkError::Protocol(
-            "anthropic response missing text content".to_string(),
-        ));
+        // Why there is none, so a refusal and an empty answer read apart (FINDINGS A-162).
+        let stop_reason = value
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        return Err(AiSdkError::Protocol(format!(
+            "anthropic response missing text content (stop_reason={stop_reason})"
+        )));
     }
     Ok(text)
 }
@@ -1939,6 +1974,47 @@ mod tests {
         );
         // key=sk-... (preceded by '=') is a token boundary and IS redacted.
         assert_eq!(scrub_secret_like("key=sk-abc def"), "key=sk-<redacted> def");
+    }
+
+    /// An answer with no text says why: Anthropic's `stop_reason`, and the Responses payload's
+    /// `status` with a refusal named, so a refusal and an empty answer read apart (FINDINGS A-162).
+    #[test]
+    fn an_answer_with_no_text_says_why() {
+        let err = anthropic_response_text(&json!({
+            "content": [{"type": "thinking", "thinking": "..."}], "stop_reason": "refusal"
+        }))
+        .expect_err("no text");
+        assert_eq!(
+            err.to_string(),
+            "protocol error: anthropic response missing text content (stop_reason=refusal)"
+        );
+        assert!(anthropic_response_text(&json!({"content": []}))
+            .expect_err("no text")
+            .to_string()
+            .ends_with("(stop_reason=none)"));
+        assert_eq!(
+            anthropic_response_text(&json!({
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"
+            }))
+            .expect("text"),
+            "ok"
+        );
+        assert_eq!(
+            openai_no_text_reason(&json!({"status": "completed", "output": [
+                {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
+            ]})),
+            "status=completed, refused"
+        );
+        assert_eq!(
+            openai_no_text_reason(&json!({"status": "completed", "output": []})),
+            "status=completed"
+        );
+        assert_eq!(
+            openai_no_text_reason(&json!({
+                "status": "incomplete", "incomplete_details": {"reason": "content_filter"}
+            })),
+            "status=incomplete, reason=content_filter"
+        );
     }
 
     #[test]

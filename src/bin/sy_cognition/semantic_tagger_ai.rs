@@ -25,6 +25,9 @@ pub(super) struct SemanticTaggerAiInput<'a> {
     pub(super) src_ilk: Option<&'a str>,
     pub(super) dst_ilk: Option<&'a str>,
     pub(super) ich: Option<&'a str>,
+    /// Whom a relay was written to, in words: a line between people, not to the agent
+    /// (docs/cognition-hands-v1.md §12.9). None for any other turn.
+    pub(super) to: Option<&'a str>,
     pub(super) config: &'a CognitionSemanticTaggerConfig,
 }
 
@@ -122,6 +125,7 @@ fn build_system_prompt(config: &CognitionSemanticTaggerConfig) -> String {
             "  urgency = a deadline or time pressure the writer states.\n",
             "- Do not include markdown, comments, code fences, or extra keys.\n",
             "- Use only evidence present in the input.\n",
+            "- identity_hints.to, when present, is whom the text was written to, between people: what it says to \"you\" is said to them, never to an assistant or agent.\n",
             "- examples:\n",
             "  complaint about duplicate charge and urgent refund -> tags [billing, duplicate charge, refund dispute], canonical [resolve, challenge], affect [frustration, urgency].\n",
             "  asking whether access was restored and wanting confirmation -> tags [account access, restoration status], canonical [inform, confirm], affect [].\n",
@@ -148,6 +152,7 @@ fn build_user_prompt(input: &SemanticTaggerAiInput<'_>) -> String {
             "src_ilk": input.src_ilk,
             "dst_ilk": input.dst_ilk,
             "ich": input.ich,
+            "to": input.to,
         }
     });
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string())
@@ -376,6 +381,40 @@ mod tests {
     fn load_golden_corpus() -> GoldenCorpus {
         serde_json::from_str(include_str!("golden_corpus.json"))
             .expect("golden corpus should parse")
+    }
+
+    /// A relay tells the tagger whom it was written to, so a "you" in it is not read as the agent
+    /// (docs/cognition-hands-v1.md §12.9); any other turn names no one.
+    #[test]
+    fn a_relay_tells_the_tagger_whom_it_was_written_to() {
+        assert!(
+            build_system_prompt(&CognitionSemanticTaggerConfig::default())
+                .contains("identity_hints.to, when present, is whom the text was written to")
+        );
+        let account = AiAccount::charge(
+            fluxbee_ai_sdk::UsageRecorder::disabled(),
+            "SY.cognition@worker1",
+            None,
+            fluxbee_ai_sdk::TenantSource::Agent,
+        );
+        let config = CognitionSemanticTaggerConfig::default();
+        let input = |to| SemanticTaggerAiInput {
+            api_key: "",
+            account: &account,
+            text: "Voy a pedir que te saquen de mi cuenta.",
+            src_ilk: Some("ilk:ana"),
+            dst_ilk: None,
+            ich: None,
+            to,
+            config: &config,
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&build_user_prompt(&input(Some("IO.billing@worker1"))))
+                .expect("json");
+        assert_eq!(body["identity_hints"]["to"], "IO.billing@worker1");
+        let body: serde_json::Value =
+            serde_json::from_str(&build_user_prompt(&input(None))).expect("json");
+        assert!(body["identity_hints"]["to"].is_null());
     }
 
     #[test]

@@ -9892,6 +9892,7 @@ mod tests {
                 via: Some("IO.api@motherbee".to_string()),
                 writer: None,
                 to: None,
+                to_via: None,
                 text: format!("{n:02} {}", "x".repeat(1_997)),
                 attachments: 0,
                 choice: None,
