@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ live, checked on 8.x | snap `pre-family-0-1-110` (all 4 VMs) · `apt install fluxbee=0.1.109` + core-update of the spokes |
+| **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ live, checked on 8.x | snap `pre-router-0-1-111` (all 4 VMs) · `apt install fluxbee=0.1.110` + core-update of the spokes |
+| **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ replaced by 0.1.111 | snap `pre-family-0-1-110` (deleted 2026-11-08) · `apt install fluxbee=0.1.109` + core-update of the spokes |
 | **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ replaced by 0.1.110 | snap `pre-reset-0-1-109` (deleted 2026-11-07) · `apt install fluxbee=0.1.108` + core-update of the spokes |
 | **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ replaced by 0.1.109 | snap `pre-contract-0-1-108` (deleted 2026-11-07) · `apt install fluxbee=0.1.107` + core-update of the spokes |
 | **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ replaced by 0.1.108 | snap `pre-train2-0-1-107` (deleted 2026-11-07) · `apt install fluxbee=0.1.106` + core-update of the spokes |
@@ -119,6 +120,41 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.111 — One router per name, a WAN that fails closed, and the baked policy checked against its Rego
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.110 · **Commit:** `cc01f86f`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's fifth release ([METHOD](logbook/METHOD.md) §9), the router alone, from
+  the sweep of pending items (the operator: *"por los bugs, si quedan claros que son bugs
+  continuá por ahí"*).
+- **What changed:**
+  - **rt-gateway (A-177):** it refuses any argument and exits 2; it holds
+    `/var/run/fluxbee/<router>.lock` (an flock, until the process ends) before it opens its shared
+    memory, its stream and its sockets, so a second instance exits naming the holder's PID. Any
+    other failure to lock is warned and the router runs as before.
+  - **rt-gateway (A-178):** an absent, empty or unknown `wan.mtls` is `required`; only an explicit
+    `permissive` or `disabled` loosens it. The four hives already said `required`.
+  - **sy-opa-rules and the baked policy (A-179):** the compile reads the module as `policy.rego`,
+    so the same Rego always gives the same wasm, where it recorded a random temporary path; both
+    baked wasm compiled again with it; CI's `policy-wasm-guard` compares them with the Rego. A
+    compile error names `policy.rego` and its line.
+- **Checks before the release:** on the Mac, clippy and the router's tests, Go vet and the compile
+  tests, and the committed wasm reproduced from the current Rego with their recorded paths; GitHub's
+  CI green on every branch and on the integrated head; one review round for the three, every
+  finding fixed.
+- **Deploy:**
+  - build of `cc01f86f` in 18 min; publish in 15 s;
+  - snapshot `pre-router-0-1-111` taken on all 4 VMs, `pre-family-0-1-110` dropped;
+  - 0.1.111 on all 4 in 274 s (manifest `dbe10afef9abff99`), health clean.
+- **Checked on 8.x:**
+  - **A-177, on egress1:** the live router (PID 1564690) held its lock. `rt-gateway --version`
+    printed that it takes no arguments, exit 2; `rt-gateway` alone was refused naming the lock and
+    PID 1564690, exit 1. After both: the same PID, the two sockets with the same inodes.
+  - **A-178:** each router logged `wan mtls mode mode=required` at its start.
+  - **A-179:** a broken policy checked through SY.admin (`POST /opa/policy/check`) answered
+    `COMPILE_ERROR` naming `policy.rego:6`, no temporary directory; a valid one `ok`. The user
+    policy in sync on all 4, their routers `ok`.
 
 ## 0.1.110 — Archi's executor names what each route stores, three texts, and the egress's alert
 

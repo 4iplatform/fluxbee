@@ -92,7 +92,7 @@ no change required
       A-175 found: an egress's alerts never reach the motherbee.
    4. The docs and FINDINGS texts that drifted, from the sweep (docs only, already on daily).
    5. A-173 held back to a release of its own.
-5. **Fifth release, 0.1.111, the router alone:**
+5. **Fifth release, 0.1.111, the router alone** ✅ live and checked on 8.x (2026-11-08):
    1. A-177 [General/router]: a second rt-gateway started by hand refuses and exits, and leaves the
       live router's sockets, shared memory and stream alone.
    2. A-178 [General/router]: `wan.mtls` fails closed: absent or unknown is `required`.
@@ -1327,7 +1327,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The other SY nodes:** SY.vault, SY.opa.rules and SY.wf-rules hold a lock already; the rest
   are refused by their router while the live one is connected (A-44).
 
-### A-179 [General/CI] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
+### A-179 [General/CI] ✅ VALIDATED ON 8.x (0.1.111, 2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
 
 - **What happens:** `policy/system.wasm` and `policy/system_route.wasm` are compiled by hand from
   `policy/system.rego` (`sy-opa-rules compile-file`) and baked into the router. A Rego change
@@ -1352,8 +1352,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Its review round:** a renamed test would have matched no filter and passed, so the guard runs
   the whole package; it runs when `src/router/system_policy.rs` changes too, and checks that the
   router bakes exactly the files it compares, each for its entrypoint.
+- **Validated on 8.x (0.1.111):** the routers loaded the recompiled policy (they fail closed
+  without it). A broken policy checked through SY.admin answered `COMPILE_ERROR` naming
+  `policy.rego:6`, no temporary directory; the user policy stayed in sync on all 4.
 
-### A-178 [General/router] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — A missing or unknown `wan.mtls` runs the WAN in plaintext, silently
+### A-178 [General/router] ✅ VALIDATED ON 8.x (0.1.111, 2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — A missing or unknown `wan.mtls` runs the WAN in plaintext, silently
 
 - **What happens:** the router's config started from `disabled` and took only `disabled`,
   `permissive` and `required`. A hive.yaml without the key, or with a typo (`requird`, `true`),
@@ -1368,8 +1371,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **On 8.x nothing changes:** the four hives' hive.yaml say `required` (read 2026-11-08).
 - **Its review round:** nothing wrong; identity's `off` and `none` are unknown values here, so
   `required`, which the docs now say.
+- **Validated on 8.x (0.1.111):** each router logged `wan mtls mode mode=required` at its start.
 
-### A-177 [General/router] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second rt-gateway started by hand takes the live router's sockets
+### A-177 [General/router] ✅ VALIDATED ON 8.x (0.1.111, 2026-11-08; found 2026-11-07, the sweep of pending items; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second rt-gateway started by hand takes the live router's sockets
 
 - **What happens:** rt-gateway reads no argument. Started by hand, with `--version` or anything
   else, it runs as a second router with the live one's name, so with its UUID:
@@ -1391,6 +1395,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the lock was dropped when `main` returned, before the runtime's tasks: it lives until the
     process ends now;
   - the refusal named `dpkg-query`, which a spoke lacks.
+- **Validated on 8.x (0.1.111, egress1):** the live router held its lock. `rt-gateway --version`
+  exited 2, and `rt-gateway` alone exited 1 naming the lock and the live PID. Its PID and its two
+  sockets' inodes were the same after both.
+- **Still open of the class:** the orchestrator (A-180); rt-gateway's lock moves to the shared
+  `json_router::instance_lock` at the router's next release.
 
 ### A-176 [General] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
 
