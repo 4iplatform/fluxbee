@@ -7,8 +7,8 @@
 - A first draft carried the release's keys inside the update message, applied to each hive's
   `hive.yaml`. A DTAP panel reviewed it the same day: 70 findings, four blockers (§11).
 - The operator approved this second draft's shape the same day: *"Sí, vamos como describiste"*.
-- Next: the build, by stages (§10). Stage 1 (A-186, with A-189's vendored Syncthing) is built for
-  0.1.116; the rest is not built.
+- **Stage 1 is live and checked on 8.x** (0.1.116): A-186, with A-189's vendored Syncthing.
+- **Next:** stage 2, the release's settings into the code (§10).
 
 This is the single place for the topic.
 

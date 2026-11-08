@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-115` (all 4 VMs) · `apt install fluxbee=0.1.114` + core-update of the spokes |
+| **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ live, checked on 8.x | snap `pre-start-0-1-116` (all 4 VMs) · `apt install fluxbee=0.1.115` + core-update of the spokes |
+| **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ replaced by 0.1.116 | snap `pre-aisdk-0-1-115` (deleted 2026-11-08) · `apt install fluxbee=0.1.114` + core-update of the spokes |
 | **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ replaced by 0.1.115 | snap `pre-gosdk-0-1-114` (deleted 2026-11-08) · `apt install fluxbee=0.1.113` + core-update of the spokes |
 | **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ replaced by 0.1.114 | snap `pre-rustsdk-0-1-113` (deleted 2026-11-08) · `apt install fluxbee=0.1.112` + core-update of the spokes |
 | **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ replaced by 0.1.113; its gate found A-185 | snap `pre-take-0-1-112` (deleted 2026-11-08) · `apt install fluxbee=0.1.111` + core-update of the spokes |
@@ -124,6 +125,43 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.116 — A spoke's start never stops on dist
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.115 · **Commit:** `9616278d`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** stage 1 of [hive-config-update-v1](../docs/hive-config-update-v1.md) (§10). Two bugs
+  that are true today:
+  - **A-186:** a spoke that restarts while a release syncs never starts again.
+  - **A-189:** the same, through the vendored Syncthing.
+- **What changed** (`src/bin/sy_orchestrator.rs`):
+  - **The start checks dist after Syncthing starts.** A role binary that is missing, of another
+    size or hash, or not in the manifest is a warning and an entry of `core.awaiting_update` in
+    `/versions`, not an error.
+  - **A minute's recheck closes the report.** The core update's own check stays strict, and the
+    motherbee copies a binary into a role's tree only once it matches.
+  - **The vendored Syncthing.** The start, the watchdog and the sync probes keep the installed
+    Syncthing when the vendored one does not match, and report it as `vendor.awaiting_update`.
+    `update category=vendor` and an ingress join stay strict.
+  - **Docs:** sy-orchestrator, operations, architecture, and the HANDBOOK's new-node recipe.
+- **Checks before the release:**
+  - GitHub's CI green on its branch.
+  - The review round: no high or medium finding. Four stale doc lines were fixed. One latent case
+    became a release rule: Syncthing's unit stays valid for the previous vendored Syncthing.
+- **Deploy:**
+  - build of `9616278d` in 10 min; publish in 16 s;
+  - snapshot `pre-start-0-1-116` taken on all 4 VMs, `pre-aisdk-0-1-115` dropped;
+  - 0.1.116 on all 4 in 265 s, health clean.
+- **Checked on 8.x (egress1):**
+  - **A-186:** `dist/core/bin/sy-opa-rules` set aside, then the orchestrator restarted. It started
+    with no restarts. Syncthing and the router were untouched. `core.awaiting_update` listed the
+    binary as `missing`. With the binary back, the report closed in 27 s.
+  - **A-189:** the vendored Syncthing set aside, then the orchestrator restarted. It started and
+    kept the installed Syncthing, and `vendor.awaiting_update` listed it as `missing`.
+  - **A-189 after a reboot:** Syncthing stopped too, as after a reboot. The orchestrator's start
+    brought the installed Syncthing up in 3 s, where before it stayed down. With the binary back,
+    the report closed in 3 s.
+  - The aside folder was removed, and health was clean afterwards.
 
 ## 0.1.115 — A provider's failure reaches the person
 

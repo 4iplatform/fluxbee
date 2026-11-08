@@ -221,12 +221,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
   release's new SY node). In design: one version on every hive, through the update
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
-  operator approved the second draft's shape (2026-11-08); the build goes by stages, A-186 first.
-- A-186 🔴 A spoke that restarts while a release syncs never starts again: its start checks dist
-  before it starts Syncthing.
+  operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
+  stage 2 next: the release's settings into the code.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
-- A-189 🔴 A spoke caught mid-sync of a release that changes the vendored Syncthing never runs
-  Syncthing again (being fixed with A-186).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1304,7 +1301,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-189 [General/orchestrator] 🔴 OPEN (found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
+### A-189 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.116, 2026-11-08; found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
 
 - **What happens:**
   - The start and the watchdog bring Syncthing up through `ensure_blob_sync_runtime`. It calls
@@ -1328,6 +1325,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **A release rule, from its review:** Syncthing's unit (`syncthing_unit_contents`) must stay valid
   for the previous vendored Syncthing. On a hive whose vendor lags, the start writes the new unit
   and restarts the old binary under it.
+- **Validated on 8.x (0.1.116, egress1):**
+  - **Vendor set aside:** with the vendored Syncthing set aside, the orchestrator's restart kept
+    the installed Syncthing and reported `vendor.awaiting_update`.
+  - **As after a reboot:** with Syncthing stopped as well, the start brought it up in 3 s, where
+    before it stayed down.
+  - **Back:** with the binary back, the report closed in 3 s.
 
 ### A-188 [General/blob] 🟡 LATENT (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
 
@@ -1352,7 +1355,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix:** add `packaging/**` to both path lists.
 - **Fixed:** both lists have it. The fix's own branch ran rust-tests with no Rust change in it.
 
-### A-186 [General/orchestrator] 🔴 OPEN (found 2026-11-08 by hive-config-update-v1's DTAP panel, P-1 and A-8; read in the code) — A spoke that restarts while a release is still syncing never starts again
+### A-186 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.116, 2026-11-08; found 2026-11-08 by hive-config-update-v1's DTAP panel, P-1 and A-8; read in the code) — A spoke that restarts while a release is still syncing never starts again
 
 - **What happens:**
   - At its start, a spoke's orchestrator checks every binary of its role in `dist/core/bin`
@@ -1379,6 +1382,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The motherbee copies a binary into a role's tree only once it matches the manifest.
 - **Its review round** (with A-189's): no high or medium finding. Four stale lines in the docs were
   fixed.
+- **Validated on 8.x (0.1.116, egress1):** a role binary of dist was set aside and the orchestrator
+  restarted.
+  - It started with no restarts, and Syncthing and the router were untouched.
+  - `/versions` listed the binary as `missing`.
+  - With the binary back, the report closed in 27 s.
 
 ### A-185 [WF] 🟢 NO CHANGE, the operator's call (2026-11-08; found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
 
