@@ -5,13 +5,15 @@
 # baked wasm and assert the expected truth table (they fail if a wasm diverges from intent).
 #
 # Authoring (baked stage): a developer edits THIS file, recompiles it to BOTH wasm artifacts (one
-# per entrypoint), and commits all three files:
+# per entrypoint), and commits all three files. On any OS, in go/sy-opa-rules:
+#   UPDATE_SYSTEM_WASM=1 go test -run TestTheBakedSystemPolicyIsTheRegoCompiled .
+# or on Linux, with the built tool:
 #   sy-opa-rules compile-file policy/system.rego fluxbee/system/allow           policy/system.wasm
 #   sy-opa-rules compile-file policy/system.rego fluxbee/system/frontdesk_route policy/system_route.wasm
-# (The Go tool is Linux-only; elsewhere, run it in the golang:1.25 image with the repository
-# mounted. The OPA v0.68.0 compile path is pure Go and reproducible: only the random temp path of
-# the rego, embedded as a source annotation, changes between builds, and the data offsets in the
-# code with it when its length does.)
+# Both use the user path's compiler (compileRego, go/sy-opa-rules/compile.go), which reads the
+# module as `policy.rego`, so a build depends on this file and the compiler only. CI compiles this
+# file again and compares both wasm byte for byte (FINDINGS A-179): a comment moved here moves the
+# rules' lines, which the wasm records, so recompile after any edit.
 # The router BAKES each wasm via `include_bytes!` and evaluates it through a lazy singleton
 # resolver. There is NO SHM region / runtime writer for the system layer (the future "OPA-dual
 # Phase 4" would add one, changing only HOW the resolver is fed, not this policy). Non-user-editable

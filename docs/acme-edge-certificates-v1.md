@@ -78,8 +78,9 @@ Out of scope for v1:
   - `PROTECTED_SYSTEM_ACTIONS` and its tests (`src/router/system_policy.rs` 36-62; the count goes from
     27 to 30);
   - the router's edge gates (mod.rs 5910-5946);
-  - `edge_service_actions` in `system.rego`, and both wasm files, rebuilt on Linux (the Go
-    `compile-file` tool is Linux-only);
+  - `edge_service_actions` in `system.rego`, and both wasm files, rebuilt (`UPDATE_SYSTEM_WASM=1
+    go test -run TestTheBakedSystemPolicyIsTheRegoCompiled .` in `go/sy-opa-rules`; CI checks
+    them, FINDINGS A-179);
   - the edge's handler;
   - `docs/nodes/sy-edge.md`.
 - **SY.vault:**

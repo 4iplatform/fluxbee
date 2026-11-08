@@ -502,12 +502,17 @@ func TestAReplicaRefusesAValidWasmThatIsNotThePublishedOne(t *testing.T) {
 	policyDistDir = t.TempDir()
 	defer func() { policyDistDir = oldDist }()
 
-	other := publishOnPrimary(t, 4, "\nrefused_probe := true\n")
+	// Another target, so another wasm: the compile is deterministic, and a rule the entrypoint does
+	// not reach compiles to the same wasm (FINDINGS A-179).
+	other := publishOnPrimary(t, 4, "\ntarget = \"SY.refused@motherbee\" { input.refused_probe }\n")
 	otherWasm, err := os.ReadFile(filepath.Join(policyDistDir, other.WasmFile))
 	if err != nil {
 		t.Fatal(err)
 	}
 	published := publishOnPrimary(t, 5, "")
+	if other.Hash == published.Hash {
+		t.Fatalf("the two policies compiled to one wasm (%s)", published.Hash)
+	}
 	wasmPath := filepath.Join(policyDistDir, published.WasmFile)
 	good, err := os.ReadFile(wasmPath)
 	if err != nil {
@@ -552,8 +557,11 @@ func TestOnlyThePrimaryWritesAndThePublicationIsJustTheWasm(t *testing.T) {
 	policyDistDir = t.TempDir()
 	defer func() { policyDistDir = oldDist }()
 
-	publishOnPrimary(t, 3, "\nfirst := true\n")
+	first := publishOnPrimary(t, 3, "\ntarget = \"SY.first@motherbee\" { input.first }\n")
 	published := publishOnPrimary(t, 4, "")
+	if first.WasmFile == published.WasmFile {
+		t.Fatalf("the two policies compiled to one wasm (%s)", published.WasmFile)
+	}
 	entries, err := os.ReadDir(policyDistDir)
 	if err != nil {
 		t.Fatal(err)

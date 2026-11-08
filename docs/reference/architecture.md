@@ -520,8 +520,10 @@ else `DEFAULT_ARCHITECT_LISTEN`) with no authentication, and acts through SY.adm
 Two policy layers live in the router (`src/router/system_policy.rs`):
 
 - **System layer: authority.** `policy/system.rego`, compiled to `policy/system.wasm` and
-  `policy/system_route.wasm` and baked into the router with `include_bytes!`. No operator path can
-  change it. At local delivery, the router evaluates it for every protected system action
+  `policy/system_route.wasm` and baked into the router with `include_bytes!`. A developer compiles
+  them with the user path's compiler (`compileRego`, `go/sy-opa-rules/compile.go`), and CI compiles
+  the committed Rego again and compares both files (`.github/workflows/policy-wasm-guard.yml`,
+  FINDINGS A-179). No operator path can change it. At local delivery, the router evaluates it for every protected system action
   (`PROTECTED_SYSTEM_ACTIONS`) against the router-stamped sender name, and drops what it denies
   (`prepare_local_delivery`).
 - **User layer: selection.** The operator's Rego, compiled to WASM by SY.opa.rules on the motherbee,

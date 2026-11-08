@@ -302,8 +302,10 @@ wasm and baked into the router binary with `include_bytes!` (`src/router/system_
 | `fluxbee/system/frontdesk_route` | `policy/system_route.wasm` | `{src_ilk_present, registration_status}` | send this sender to the frontdesk (§5) |
 
 - **Not editable at run time.** No region and no endpoint reaches it. It changes only by editing the
-  Rego, compiling both wasms with `sy-opa-rules compile-file policy/system.rego <entrypoint>
-  <out.wasm>` (`go/sy-opa-rules/main.go`), committing the three files and shipping a new router.
+  Rego, compiling both wasms (`UPDATE_SYSTEM_WASM=1 go test -run
+  TestTheBakedSystemPolicyIsTheRegoCompiled .` in `go/sy-opa-rules`, or `sy-opa-rules
+  compile-file` on Linux), committing the three files and shipping a new router. CI compiles the
+  Rego again and compares both wasms byte for byte (FINDINGS A-179).
 - **Fail closed.** `Router::run` calls `ensure_system_policy_loaded()`, which evaluates a probe on
   both wasms; if either fails, the router does not start. There is no Rust fallback table. At run
   time a lock or evaluation error denies (`authorize_system`) or does not force the frontdesk

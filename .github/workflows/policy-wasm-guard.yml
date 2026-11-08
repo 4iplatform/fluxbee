@@ -1,0 +1,40 @@
+name: policy-wasm-guard
+
+# The router's baked system policy is compiled from the committed Rego (FINDINGS A-179): the test
+# compiles policy/system.rego with the user path's compiler and compares both wasm byte for byte.
+# Runs when the Rego, the baked wasm, the compiler or this guard change; go-tests.yml runs the same
+# test with the rest of sy-opa-rules' on a Go change.
+on:
+  pull_request:
+    paths:
+      - "policy/**"
+      - "go/sy-opa-rules/**"
+      - ".github/workflows/policy-wasm-guard.yml"
+  push:
+    branches: ["**"]
+    paths:
+      - "policy/**"
+      - "go/sy-opa-rules/**"
+      - ".github/workflows/policy-wasm-guard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go/sy-opa-rules
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go/sy-opa-rules/go.mod
+          cache-dependency-path: go/sy-opa-rules/go.sum
+
+      - name: The baked system policy is the committed Rego compiled
+        run: go test -count=1 -run 'TestCompilingTheSameRegoTwiceGivesTheSameWasm|TestTheBakedSystemPolicyIsTheRegoCompiled' .

@@ -39,7 +39,13 @@ published; a write sent to it is refused with `NOT_PRIMARY` (`handleOpaAction`).
 `main` in `go/sy-opa-rules/main.go`:
 
 1. With arguments `compile-file <rego> <entrypoint> <out.wasm>` it only compiles a file and
-   exits. This is how the baked system policy is built (header of `policy/system.rego`).
+   exits. This is one way to build the baked system policy (header of `policy/system.rego`); the
+   other is `UPDATE_SYSTEM_WASM=1 go test -run TestTheBakedSystemPolicyIsTheRegoCompiled .`, on
+   any OS. Both use `compileRego` (`compile.go`), which reads the module as `policy.rego`, so the
+   same Rego always compiles to the same wasm, and CI checks the baked files against the Rego
+   (FINDINGS A-179). So an operator's policy applied again unchanged keeps its hash: a replica
+   that runs it is in sync (`in_sync` and the sync answers compare hashes) and keeps the version
+   it installed it under.
 2. Reads `hive_id` from `/etc/fluxbee/hive.yaml`.
 3. Creates `/var/lib/fluxbee/opa/{current,staged,backup}` with mode 0700 (`ensureDirs`).
 4. Takes an exclusive `flock` on `/var/run/fluxbee/sy-opa-rules.lock`; a second instance exits.
