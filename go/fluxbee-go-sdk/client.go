@@ -128,17 +128,24 @@ func connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
 	tx := make(chan []byte, 256)
 	rx := make(chan receivedMessage, 256)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	announce, err := connectAndHandshake(ctx, cfg, baseName, fullName, nodeID.String())
+	// The connection of the first handshake is the one the manager serves: a node says HELLO once
+	// at start (FINDINGS A-183).
+	conn, err := connectRouter(cfg.RouterSocket, baseName)
 	if err != nil {
+		close(tx)
+		close(rx)
+		return nil, nil, err
+	}
+	announce, err := handshakeWithin(conn, fullName, nodeID.String(), cfg.Version, handshakeTimeout)
+	if err != nil {
+		_ = conn.Close()
 		close(tx)
 		close(rx)
 		return nil, nil, err
 	}
 
 	state.SetAnnounce(announce)
-	go connectionManager(cfg, baseName, fullName, nodeID.String(), tx, rx, state)
+	go connectionManager(cfg, baseName, fullName, nodeID.String(), conn, tx, rx, state)
 
 	sender := &NodeSender{
 		uuid:     nodeID.String(),
@@ -285,22 +292,28 @@ func (r *NodeReceiver) RouterName() string {
 	return r.state.RouterName()
 }
 
-func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx <-chan []byte, rx chan<- receivedMessage, state *connectionState) {
+// connectionManager serves first, the connection connect's handshake opened, and after it every
+// connection it opens again, each with its own handshake.
+func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, first net.Conn, tx <-chan []byte, rx chan<- receivedMessage, state *connectionState) {
+	conn := first
 	for {
-		conn, err := connectRouter(cfg.RouterSocket, baseName)
-		if err != nil {
-			state.SetConnected(false)
-			time.Sleep(500 * time.Millisecond)
-			continue
+		if conn == nil {
+			next, err := connectRouter(cfg.RouterSocket, baseName)
+			if err != nil {
+				state.SetConnected(false)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			announce, err := handshakeWithin(next, fullName, uuidValue, cfg.Version, handshakeTimeout)
+			if err != nil {
+				_ = next.Close()
+				state.SetConnected(false)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			state.SetAnnounce(announce)
+			conn = next
 		}
-		_, announce, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
-		if err != nil {
-			_ = conn.Close()
-			state.SetConnected(false)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		state.SetAnnounce(announce)
 
 		stop := make(chan struct{})
 		done := make(chan struct{}, 2)
@@ -358,31 +371,29 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 		close(stop)
 		_ = conn.Close()
 		<-done
+		conn = nil
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-func connectAndHandshake(ctx context.Context, cfg NodeConfig, baseName, fullName, uuidValue string) (*NodeAnnouncePayload, error) {
-	conn, err := connectRouter(cfg.RouterSocket, baseName)
+// handshakeTimeout bounds a node's handshake with its router (FINDINGS A-183). The router answers a
+// HELLO at once; one that took the connection and never answers would otherwise hold a reconnect
+// forever.
+const handshakeTimeout = 5 * time.Second
+
+// handshakeWithin is PerformHandshake under a deadline on conn, cleared once the router answered.
+func handshakeWithin(conn net.Conn, fullName, uuidValue, version string, limit time.Duration) (*NodeAnnouncePayload, error) {
+	if err := conn.SetDeadline(time.Now().Add(limit)); err != nil {
+		return nil, err
+	}
+	_, announce, err := PerformHandshake(conn, fullName, uuidValue, version)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	type result struct {
-		payload *NodeAnnouncePayload
-		err     error
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
 	}
-	done := make(chan result, 1)
-	go func() {
-		_, payload, err := PerformHandshake(conn, fullName, uuidValue, cfg.Version)
-		done <- result{payload: payload, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case out := <-done:
-		return out.payload, out.err
-	}
+	return announce, nil
 }
 
 func PerformHandshake(conn net.Conn, fullName, uuidValue, version string) (*Message, *NodeAnnouncePayload, error) {

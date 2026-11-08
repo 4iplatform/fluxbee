@@ -129,6 +129,67 @@ func TestPerformHandshakeReturnsAnnounceEnvelopeAndPayload(t *testing.T) {
 	}
 }
 
+// FINDINGS A-183: a router that takes the connection and never answers the HELLO fails the
+// handshake once its limit passes, where a reconnect waited forever.
+func TestARouterThatNeverAnnouncesFailsTheHandshakeInTime(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	go func() { _, _ = ReadFrame(serverConn) }() // takes the HELLO, answers nothing
+
+	started := time.Now()
+	_, err := handshakeWithin(clientConn, "WF.demo@motherbee", "node-1", "1.0", 200*time.Millisecond)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("handshake: got %v, want a deadline exceeded", err)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatalf("the handshake took %v", time.Since(started))
+	}
+}
+
+// FINDINGS A-183: a node says HELLO once at start: the connection of its first handshake is the
+// one it speaks on, where it used to close it and open a second one.
+func TestANodeSpeaksOnTheConnectionOfItsFirstHandshake(t *testing.T) {
+	// A short path: macOS limits a Unix socket path to 104 bytes.
+	dir, err := os.MkdirTemp("", "fbsdk")
+	if err != nil {
+		t.Fatalf("mkdir temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.WriteFile(filepath.Join(dir, "hive.yaml"), []byte("hive_id: motherbee\n"), 0o644); err != nil {
+		t.Fatalf("write hive.yaml: %v", err)
+	}
+	socketPath := filepath.Join(dir, "rt.sock")
+	frames := startFakeRouter(t, socketPath)
+
+	profile, err := NewOperationalRouteProfile().Build()
+	if err != nil {
+		t.Fatalf("build profile: %v", err)
+	}
+	dispatcher, err := ConnectWithRetry(NodeConfig{
+		Name:         "WF.demo",
+		RouterSocket: socketPath,
+		UUIDMode:     NodeUuidEphemeral,
+		ConfigDir:    dir,
+		Version:      "test",
+	}, 0, profile)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = dispatcher.Close() }()
+	sender := dispatcher.SenderSnapshot()
+	msg, err := BuildSystemUnicast(sender.UUID(), "SY.peer@motherbee", "trace-first", "FIRST", map[string]any{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := sender.Send(msg); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got := nextRouterFrame(t, frames); got.msg != "FIRST" || got.conn != 1 {
+		t.Fatalf("the router got %+v, want FIRST on its first connection", got)
+	}
+}
+
 func TestConnectionStateTracksRouterName(t *testing.T) {
 	var state connectionState
 	state.SetRouterName("RT.edge@motherbee")

@@ -984,8 +984,9 @@ async fn handle_node(
 }
 
 /// How long a HELLO waits for an earlier connection with its UUID to go before it is refused
-/// (A-44). A node that restarts or reconnects, and every Go node's second HELLO at startup, can
-/// arrive before the router has processed the close of the connection it replaces.
+/// (A-44). A node that restarts or reconnects can arrive before the router has processed the close
+/// of the connection it replaces (as a Go node's second HELLO at startup did, before FINDINGS
+/// A-183).
 const DUPLICATE_HELLO_GRACE: Duration = Duration::from_secs(1);
 const DUPLICATE_HELLO_POLL: Duration = Duration::from_millis(50);
 
