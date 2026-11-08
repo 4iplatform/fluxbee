@@ -1327,14 +1327,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The other SY nodes:** SY.vault, SY.opa.rules and SY.wf-rules hold a lock already; the rest
   are refused by their router while the live one is connected (A-44).
 
-### A-179 [General/CI] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
+### A-179 [General/CI] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
 
 - **What happens:** `policy/system.wasm` and `policy/system_route.wasm` are compiled by hand from
   `policy/system.rego` (`sy-opa-rules compile-file`) and baked into the router. A Rego change
   committed without its recompile leaves the router enforcing the old policy.
 - **Fix:** a CI check compiles the Rego with the same compiler and compares both files.
+- **What its first run found:** no two compiles were the same. `compileRego` wrote the Rego in a
+  fresh temporary directory and the wasm recorded that path (`/tmp/opa-compile1566172891/...`),
+  so nothing could compare bytes. The Rego's header said so.
+  - The committed wasm were the current Rego compiled: compiling it with each file's recorded path
+    gave both byte for byte, on the Mac, so the compile is the same on any OS.
+- **So the compile is deterministic now** (`go/sy-opa-rules/compile.go`, which builds on any OS):
+  the module is read as `policy.rego`, so a build depends on the Rego and the compiler only.
+  - Both baked wasm were compiled again; the router loads them as before (its 14 policy tests).
+  - A compile error names `policy.rego` and its line, never a temporary directory.
+  - `UPDATE_SYSTEM_WASM=1 go test -run TestTheBakedSystemPolicyIsTheRegoCompiled .` writes them,
+    on any OS; CI's `policy-wasm-guard` runs the package's tests.
+  - Two tests relied on two compiles differing, and one passed in vain: "another" policy differed
+    by a rule its entrypoint does not reach, which compiles to the same wasm. They compile
+    policies with another target now, and check the two differ.
+  - An operator's policy applied again unchanged keeps its hash: a replica that runs it is in sync
+    (`in_sync` compares hashes) and keeps the version it installed it under.
+- **Its review round:** a renamed test would have matched no filter and passed, so the guard runs
+  the whole package; it runs when `src/router/system_policy.rs` changes too, and checks that the
+  router bakes exactly the files it compares, each for its entrypoint.
 
-### A-178 [General/router] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; read in the code) — A missing or unknown `wan.mtls` runs the WAN in plaintext, silently
+### A-178 [General/router] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — A missing or unknown `wan.mtls` runs the WAN in plaintext, silently
 
 - **What happens:** the router's config started from `disabled` and took only `disabled`,
   `permissive` and `required`. A hive.yaml without the key, or with a typo (`requird`, `true`),
@@ -1346,8 +1365,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - an absent, empty or unknown value is `required`, an unknown one with a warning;
   - only an explicit `disabled` or `permissive` loosens it, `disabled` with a warning;
   - `config/hive.yaml` says `required`.
+- **On 8.x nothing changes:** the four hives' hive.yaml say `required` (read 2026-11-08).
+- **Its review round:** nothing wrong; identity's `off` and `none` are unknown values here, so
+  `required`, which the docs now say.
 
-### A-177 [General/router] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second rt-gateway started by hand takes the live router's sockets
+### A-177 [General/router] 🟡 BUILT for 0.1.111 (2026-11-08; found 2026-11-07, the sweep of pending items; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second rt-gateway started by hand takes the live router's sockets
 
 - **What happens:** rt-gateway reads no argument. Started by hand, with `--version` or anything
   else, it runs as a second router with the live one's name, so with its UUID:
@@ -1356,10 +1378,19 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The effect:** the nodes that connect from then on reach the second router. Once it is killed,
   the socket paths are dead: a node that restarts cannot come back (0.1.60: about 84 seconds).
 - **Fix:**
-  - rt-gateway refuses any argument and exits before it touches anything;
-  - it holds a lock per router (`<state>/<router>/instance.lock`, an flock the process releases
-    when it ends), taken before its shared memory, its stream and its sockets. A second instance
-    of the same router exits and names the lock.
+  - rt-gateway refuses any argument and exits 2 before it touches anything;
+  - it holds a lock per router, taken before its shared memory, its stream and its sockets, and
+    held until the process ends: `/var/run/fluxbee/<router>.lock`, an flock the kernel releases
+    however the process ends. A second instance of the same router exits and names the lock and
+    the holder's PID.
+- **Its review round (2026-11-08):**
+  - the first build put the lock under `/var/lib/fluxbee/state`: a full or read-only disk would
+    have kept the router down, where it used to start. The lock is on tmpfs now, as SY.vault's and
+    SY.opa.rules' are; only another holder refuses a start, and any other failure to lock is
+    warned and the router runs as before;
+  - the lock was dropped when `main` returned, before the runtime's tasks: it lives until the
+    process ends now;
+  - the refusal named `dpkg-query`, which a spoke lacks.
 
 ### A-176 [General] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
 
