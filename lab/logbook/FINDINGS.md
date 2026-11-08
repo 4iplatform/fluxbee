@@ -221,8 +221,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   2026-11-08; router-stream-v1 §8).
 - A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
   release's new SY node). In design: one version on every hive, through the update
-  ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). The DTAP panel found four
-  blockers; §12 proposes the second draft, for the operator.
+  ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
+  operator approved the second draft's shape (2026-11-08); the build goes by stages, A-186 first.
 - A-186 🔴 A spoke that restarts while a release syncs never starts again: its start checks dist
   before it starts Syncthing.
 - A-187 🔴 CI skips the Rust tests that read `packaging/` files when only those files change.
@@ -1466,6 +1466,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The worker that joined before the egress is apart, for later.
 - **Next:** the update path's current state, a staged plan and a DTAP panel, before anything is
   built.
+- **The DTAP panel (2026-11-08):** 70 findings, four blockers. §12 of the doc proposed the second
+  draft's shape.
+- **The operator's call on it (2026-11-08):** *"Sí, vamos como describiste"*.
+  - The release's keys go into the code, by role.
+  - The operator's settings go into one installation file, distributed like the policy and
+    applied through the update channel.
+  - hive.yaml becomes the hive's own.
+  - The installation's update becomes SY.admin's. Its automatic step only finishes an open update
+    for a hive that comes back, and never touches a hive the operator rolled back.
+- **The second draft** is in the doc. Its stages start with A-186.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
