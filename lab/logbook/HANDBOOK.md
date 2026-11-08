@@ -1035,26 +1035,36 @@ with tokens loaded it is a real loss.
   - Before, it went down and systemd relaunched it every 5 s, and the reason was only left in
     journald.
 
-### A new system node in a role, with hives already joined (0.1.41: SY.opa.rules on ingress/egress)
+### A new system node in a role, with hives already joined
 
-A spoke's `hive.yaml` is written only once, at the join, and it is not re-issued. The spoke starts the nodes of **its own** `system_nodes.<role>` and validates them
-against the core manifest that the motherbee sends it. That is why the order matters:
+Since 0.1.117 a role's SY nodes are the release's: the table in `src/release_settings.rs`
+([hive-config-update-v1](../../docs/hive-config-update-v1.md) §3), not `hive.yaml`, whose
+`system_nodes` is ignored. A list and its binaries arrive together, in the core update; nobody
+edits a file on a hive. (Before 0.1.117 it took four steps by hand on the motherbee and each spoke,
+as with SY.opa.rules on the ingress and the egress in 0.1.41.)
 
-1. **Motherbee, before the `apt install`:** add the node to `system_nodes.<role>.nodes` in
-   `/etc/fluxbee/hive.yaml` (the `.deb` does not overwrite your changes: its payload ships only
-   `hive.yaml.example`; the postinst creates `hive.yaml` only if it is missing, and only fixes an
-   `architect.listen` set to `0.0.0.0`, A-46). On restart, the orchestrator builds
-   `dist/core/<role>` with the new binary, and Syncthing carries it to the spoke.
-2. **Wait for the binary to reach the spoke:** `dist/core/bin/<binary>` present, with the sha256
-   that `dist/core/manifest.json` states. If the spoke's `hive.yaml` names the node before that,
-   its orchestrator still starts (since 0.1.116, A-186). `/versions` then lists the binary as
-   `missing` in `core.awaiting_update`, and a core update refuses until the binary arrives.
-3. **Spoke:** add the node to `system_nodes.<role>.nodes` in its `/etc/fluxbee/hive.yaml`.
-4. **`update category=core` to the spoke:** it installs the binary; the new orchestrator
-   regenerates the units (it creates the node's unit) and starts it.
+- **Adding a node to a role:** add it to the role's list in `src/release_settings.rs` (its tests
+  hold the start-order rules) and ship its binary in the package; then build and deploy (§12):
+  1. the motherbee's orchestrator builds `dist/core/<role>` with the new binary, and Syncthing
+     carries it to the spokes;
+  2. each spoke's core update installs the new orchestrator with the rest; the previous
+     orchestrator, which runs the update, does not know the node;
+  3. the new orchestrator's start writes the node's unit, installs its binary from dist (recorded
+     as created by the update, so a `core_rollback` removes it) and starts it. If the binary is
+     still on its way, `/versions` shows it in `core.awaiting_update` and in
+     `core.last_update.settled.pending`, and the dist recheck installs it once it arrives.
+- **Dropping a node from a role:** remove it from the role's list. The motherbee prunes its binary
+  from the role's tree. The previous orchestrator's update leaves it out (`left_out`) once
+  Syncthing has deleted it from the spoke's dist; before that, the update refuses as for any binary
+  still syncing, so try again. The new orchestrator's start stops, disables and removes it, and
+  keeps its unit and binary in the update's generation: `core_rollback` brings it back.
+- **The motherbee:** dpkg owns its core. A node dropped from the motherbee's list is not stopped
+  by the orchestrator: its package has to do it (no release has needed it yet).
+- **`ops deploy`** waits for each spoke's update to be settled by the new orchestrator, and
+  reports anything left out, pending or awaiting (since 0.1.117).
 
-A hive that joins later needs none of this: the join copies the motherbee's
-`system_nodes.<role>`. Neither does the `fluxbee-dist-policy` folder: it inherits the peers of
+A hive that joins later needs none of this: the join writes no list, and the spoke's orchestrator
+has it. Neither does the `fluxbee-dist-policy` folder: it inherits the peers of
 `fluxbee-dist-vendor` at the next start of the orchestrator on each side. **Only that one:** the
 orchestrator does it by its fixed name; a new folder for all roles needs the same code (or
 generalizing it).
@@ -1069,11 +1079,29 @@ Three paths:
    changed binaries. The motherbee has no generations (dpkg installs its core): for it, as for a
    hive whose orchestrator is what is broken, use the next two. If it restores `sy-orchestrator`,
    the response may be `FORWARD_UNKNOWN`: check `core.installed.source = core_rollback` in
-   `/versions`.
+   `/versions`. Since 0.1.117 it also stops and removes the nodes the update added, including the
+   ones the new orchestrator's start installed, and brings back the nodes the release dropped,
+   unit and binary; a dry run lists them in `would_remove` and `would_restore_units`.
 2. **Cold snapshot of the VMs** — see §1 on why cold. With one per VM (§12), it undoes only the
    last release.
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
+
+**Downgrading from 0.1.117 or later to an earlier version:** an orchestrator of 0.1.116 or earlier
+reads its role's SY nodes and the blob's and dist's topology from `hive.yaml`, and does not start
+without `system_nodes`. The hives joined before 0.1.117 keep those keys (ignored since, never
+removed), so they go back as before: keep them. A hive whose `hive.yaml` has none (joined by
+0.1.117 or later, or a motherbee installed from 0.1.117's `hive.yaml.example`) needs them put back
+first, as 0.1.116's join wrote them:
+
+- `system_nodes`, from `git show 9616278d:packaging/hive.yaml.example` (0.1.116);
+- the role's blob flags: a worker `blob.enabled: true`, `blob.sync.enabled: true`,
+  `blob.sync.tool: syncthing`; an ingress `blob.enabled: false`, `blob.sync.enabled: true`,
+  `blob.sync.public_enabled: true`, `blob.sync.tool: syncthing`; an egress `blob.enabled: false`,
+  `blob.sync.enabled: false`; the motherbee its own as in that example;
+- every role: `dist.sync.enabled: true`, `dist.sync.tool: syncthing`.
+
+Without `blob.sync.enabled`, a worker on 0.1.116 runs with its blob sync off.
 
 **Downgrading from 0.1.63 or later to an earlier version:** Syncthing keeps running as `fluxbee`
 (0.1.62 uses that user if it exists), but the 0.1.62 nodes write root-owned blobs that it cannot

@@ -110,8 +110,9 @@ no change required
    3. 0.1.115: A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count,
       and the person's one fixed English text ✅ live and checked on 8.x (2026-11-08).
 8. **Design first, one at a time, the largest:**
-   1. In design now, A-181: a hive's shared config travels in the update
-      ([hive-config-update-v1](../../docs/hive-config-update-v1.md)).
+   1. A-181, a hive's shared config travels in the update
+      ([hive-config-update-v1](../../docs/hive-config-update-v1.md)), by stages: stage 1 ✅
+      0.1.116; stage 2, the release's settings in the code, built for 0.1.117.
    2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -222,7 +223,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   release's new SY node). In design: one version on every hive, through the update
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
   operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
-  stage 2 next: the release's settings into the code.
+  stage 2, the release's settings in the code, built for 0.1.117.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1481,7 +1482,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 IN DESIGN, the operator's direction (2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 built for 0.1.117; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -1540,6 +1541,38 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The installation's update becomes SY.admin's. Its automatic step only finishes an open update
     for a hive that comes back, and never touches a hive the operator rolled back.
 - **The second draft** is in the doc. Its stages start with A-186.
+- **Stage 1** (A-186, A-189) ✅ 0.1.116.
+- **Stage 2 built for 0.1.117 (2026-11-08):** the release's settings live in the code, by role,
+  in `src/release_settings.rs`: each role's SY nodes with their order and waits, and the blob's and
+  dist's topology. The values are today's, held by golden tests against what the example and the
+  joins wrote. All four 8.x hives ran those lists and flags, read on each before the build.
+  - The orchestrator, SY.identity and SY.vault read the table, never hive.yaml.
+  - The joins and `hive.yaml.example` stop writing those keys. An old hive.yaml still loads, and
+    the orchestrator names the keys it ignores once at its start.
+  - A node a release drops: the previous orchestrator's update leaves it out, only when it
+    replaces sy-orchestrator. The new orchestrator's start (the "settle") stops, disables and
+    removes it, keeping unit and binary in the update's generation. A node a release adds: the
+    new orchestrator's start installs it from dist. `core_rollback` undoes both.
+- **Its review round** (one reviewer; no high):
+  - **Medium, fixed:** the old keys' warning said they may be removed. An orchestrator of 0.1.116
+    or earlier does not start without `system_nodes`, so a hive without them cannot go back below
+    0.1.117. Now the warning and the docs say to keep them, and the HANDBOOK says how to put them
+    back on a hive joined by 0.1.117 or later before a downgrade.
+  - **Medium, fixed:** a race where the previous orchestrator's dist recheck could settle the new
+    update's generation with its own, older list. Now the recheck settles only the update the
+    orchestrator's own start left open, with a test.
+  - **Low, fixed:** `ops deploy` judged a spoke by the hash its update installed. Now it also
+    waits for the new orchestrator's settle, and reports anything left out, pending or awaiting.
+  - **Low, fixed:** stale texts, and a dead check in the ingress join.
+  - **Low, documented:** while Syncthing has not yet deleted a dropped binary, the update refuses
+    it as any binary still syncing; it goes through when tried again.
+- **Left for when a release needs it:** a node dropped from the motherbee's own list (dpkg owns
+  its core, so its package has to stop it); a dropped node's system ILK stays registered
+  (SY.identity's seed only adds).
+- **Left for their own releases:**
+  - the Rust SDK's doc comments that still say "hive.yaml system_nodes"
+    (`crates/fluxbee_sdk/src/identity.rs`, `managed_node.rs`);
+  - the router's dead read of the blob flags, with `government.identity_frontdesk` into the code.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 

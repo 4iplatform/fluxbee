@@ -8,8 +8,8 @@
   `hive.yaml`. A DTAP panel reviewed it the same day: 70 findings, four blockers (§11).
 - The operator approved this second draft's shape the same day: *"Sí, vamos como describiste"*.
 - **Stage 1 is live and checked on 8.x** (0.1.116): A-186, with A-189's vendored Syncthing.
-- **Stage 2 is built** (branch `coa/hive-config-s2`, CI only): the release's settings in the code,
-  `src/release_settings.rs` (§3). Its gate on 8.x is next (§10).
+- **Stage 2 is built for 0.1.117:** the release's settings in the code, `src/release_settings.rs`
+  (§3), with its review round's fixes. Its gate on 8.x is next (§10).
 
 This is the single place for the topic.
 
