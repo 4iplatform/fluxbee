@@ -1,4 +1,5 @@
 pub mod config;
+pub mod instance_lock;
 pub mod mesh_hmac;
 mod opa;
 pub mod paths;

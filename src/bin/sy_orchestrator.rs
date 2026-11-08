@@ -905,6 +905,15 @@ async fn main() -> Result<(), OrchestratorError> {
         eprintln!("sy_orchestrator supports only Linux targets.");
         std::process::exit(1);
     }
+    // systemd starts the orchestrator with no argument. One started by hand with any, `--version`
+    // among them, refuses before it touches anything (FINDINGS A-180).
+    if std::env::args_os().len() > 1 {
+        eprintln!(
+            "sy-orchestrator takes no arguments: systemd starts it (sy-orchestrator.service). The \
+             installed version is in GET /versions on SY.admin."
+        );
+        std::process::exit(2);
+    }
 
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     fluxbee_sdk::logging::fmt()
@@ -915,6 +924,12 @@ async fn main() -> Result<(), OrchestratorError> {
     let state_dir = json_router::paths::state_dir();
     let run_dir = json_router::paths::run_dir();
     let socket_dir = json_router::paths::router_socket_dir();
+    // Before its PID and its boot, which act on the host whether or not it reaches the router: a
+    // second orchestrator exits here, naming the lock (FINDINGS A-180).
+    json_router::instance_lock::hold_for_process(
+        &run_dir.join("sy-orchestrator.lock"),
+        "sy-orchestrator",
+    )?;
 
     let hive = load_hive(&config_dir)?;
     let is_motherbee = is_mother_role(hive.role.as_deref());
@@ -14855,6 +14870,17 @@ fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a
         .filter(|v| !v.is_empty())
 }
 
+/// What a read of the drift alerts says of another hive's (FINDINGS A-175): this file holds what this
+/// orchestrator recorded, about itself and the hives it checks. A spoke's own checks stay in its
+/// journal and its own file until the system's log, so an empty list does not mean a spoke is clean.
+fn drift_alerts_scope_note(hive_id: &str) -> String {
+    format!(
+        "These are the drift alerts {hive_id}'s orchestrator recorded. Another hive's own checks \
+         (an egress's LAN and internet, a host firewall, the ingress's SSH table) stay in that \
+         hive's journal and its own drift-alerts file, which this read does not reach yet."
+    )
+}
+
 fn list_drift_alerts_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -14867,6 +14893,7 @@ fn list_drift_alerts_flow(
         Ok(entries) => serde_json::json!({
             "status": "ok",
             "view": "history",
+            "note": drift_alerts_scope_note(&state.hive_id),
             "entries": enrich_drift_alert_history_entries(
                 state,
                 entries,
@@ -14895,20 +14922,26 @@ fn get_drift_alerts_flow(
     let severity = drift_filter_str(payload, "severity");
     let kind = drift_filter_str(payload, "kind");
     match read_drift_alerts(limit, Some(&target_hive), category, severity, kind) {
-        Ok(entries) => serde_json::json!({
-            "status": "ok",
-            "view": "history",
-            "hive_id": target_hive,
-            "entries": enrich_drift_alert_history_entries(
-                state,
-                entries,
-                Some(&target_hive),
-                category,
-                severity,
-                kind,
-                limit,
-            ),
-        }),
+        Ok(entries) => {
+            let mut answer = serde_json::json!({
+                "status": "ok",
+                "view": "history",
+                "hive_id": target_hive,
+                "entries": enrich_drift_alert_history_entries(
+                    state,
+                    entries,
+                    Some(&target_hive),
+                    category,
+                    severity,
+                    kind,
+                    limit,
+                ),
+            });
+            if target_hive != state.hive_id {
+                answer["note"] = serde_json::json!(drift_alerts_scope_note(&state.hive_id));
+            }
+            answer
+        }
         Err(err) => serde_json::json!({
             "status": "error",
             "error_code": "DRIFT_ALERTS_READ_FAILED",
@@ -38616,6 +38649,52 @@ blob:
         assert!(command.contains("systemctl restart"));
         assert!(command.contains("systemd-run --unit"));
         assert!(command.contains("FLUXBEE_NODE_NAME='WF.invoice@motherbee'"));
+    }
+
+    /// FINDINGS A-180: `main` refuses any argument before it logs or reads anything, and takes its
+    /// instance lock before its PID and its boot, which act on the host whether or not it reaches
+    /// the router.
+    #[test]
+    fn main_refuses_arguments_first_and_locks_before_it_acts_on_the_host() {
+        let src = include_str!("sy_orchestrator.rs");
+        let main = &src[src
+            .find("async fn main() -> Result<(), OrchestratorError> {")
+            .expect("main")..];
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("main: {needle}"))
+        };
+        let args = at("std::env::args_os().len() > 1");
+        let lock = at("json_router::instance_lock::hold_for_process(");
+        assert!(args < at(".init();") && args < at("load_hive(&config_dir)?"));
+        assert!(main[args..lock].contains("std::process::exit(2)"));
+        for after in [
+            "ensure_dirs(",
+            "write_pid(&run_dir)?",
+            "bootstrap_local(&state, &socket_dir)",
+        ] {
+            assert!(lock < at(after), "the lock comes before {after}");
+        }
+        assert!(main[lock..at("ensure_dirs(")].contains("\"sy-orchestrator.lock\""));
+    }
+
+    /// FINDINGS A-175: a read of the drift alerts says what it holds. Another hive's own checks stay
+    /// on that hive, so an empty list is no clean hive; a read of this hive's own says nothing more.
+    #[test]
+    fn a_drift_alert_read_says_what_it_holds() {
+        let state = sample_orchestrator_state_for_tests();
+        let other = get_drift_alerts_flow(&state, &serde_json::json!({"target": "worker1"}));
+        assert_eq!(other["status"], "ok");
+        let note = other["note"].as_str().expect("a note for another hive");
+        assert!(
+            note.contains("journal") && note.contains("does not reach"),
+            "{note}"
+        );
+        let own = get_drift_alerts_flow(&state, &serde_json::json!({"target": state.hive_id}));
+        assert_eq!(own["status"], "ok");
+        assert!(own.get("note").is_none(), "{own}");
+        let all = list_drift_alerts_flow(&state, &serde_json::json!({}));
+        assert!(all["note"].as_str().is_some(), "{all}");
     }
 
     fn sample_orchestrator_state_for_tests() -> OrchestratorState {

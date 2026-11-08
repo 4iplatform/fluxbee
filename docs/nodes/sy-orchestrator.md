@@ -32,10 +32,15 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
 
 `main`, in order:
 
-1. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file, an invalid `system_nodes` section or
+1. Refuses any argument and exits 2: systemd starts it with none, and one started by hand
+   (`--version`, say) would otherwise run a second boot on the host (FINDINGS A-180). Then it
+   takes `/var/run/fluxbee/sy-orchestrator.lock` (`json_router::instance_lock`, an flock until the
+   process ends, the holder's PID inside): a second orchestrator exits there, naming the holder's
+   PID; any other failure to lock is warned and it runs as before.
+2. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file, an invalid `system_nodes` section or
    an invalid `ai` section ends the process with an error. Creates its directories
    (`ensure_dirs`) and writes the PID file.
-2. **`bootstrap_local`**, before joining the router:
+3. **`bootstrap_local`**, before joining the router:
    1. checks the sha256 of every core binary of its role against `dist/core/manifest.json`
       (`validate_core_manifest_for_bins`; fatal);
    2. on a spoke, rewrites the core unit files if their template changed (`regen_local_core_units`);
@@ -55,18 +60,18 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       failure only warns;
    8. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
       timeout only warns.
-3. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
-4. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
+4. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
+5. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
    handles its messages one at a time, in arrival order.
-5. Starts the managed-node reconcile loop (every 60 s) and, on the motherbee, the loop that takes
+6. Starts the managed-node reconcile loop (every 60 s) and, on the motherbee, the loop that takes
    Syncthing off public infrastructure once every spoke reports a reachable motherbee
    (`run_syncthing_options_switch_loop`).
-6. **`finish_bootstrap`**: on the motherbee, waits for `sy-storage` to be active (30 s) and for its
+7. **`finish_bootstrap`**: on the motherbee, waits for `sy-storage` to be active (30 s) and for its
    database to answer `STORAGE_METRICS_GET` over the mesh (30 s, `wait_for_storage_db_ready`);
    then, on every role, runs the managed-node reconcile once (`reconcile_persisted_custom_nodes`,
    the pass the 60 s loop repeats, [Managed nodes](#managed-nodes)) and hands the blob folders
    over.
-7. Sets `booted`, logs `hive ready`, and starts the watchdog (every 5 s).
+8. Sets `booted`, logs `hive ready`, and starts the watchdog (every 5 s).
 
 ### ORCHESTRATOR_BOOTING
 
