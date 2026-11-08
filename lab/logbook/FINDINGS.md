@@ -124,8 +124,8 @@ no change required
 9. **Found by 0.1.117's gate:** A-190 [General/join], a fresh worker could not join ✅ 0.1.118,
    checked on 8.x with a throwaway worker, timed.
 10. **Found by 0.1.118's timed gate:** A-194 [General/orchestrator], the Syncthing watchdog's
-    restart during a finalize, small, with the orchestrator's next release; A-193 and A-195, to
-    evaluate.
+    restart during a finalize ✅ 0.1.119, checked with a throwaway worker; A-193 and A-195, to
+    evaluate; A-196, latent.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -234,8 +234,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
-- A-194 🟡 The Syncthing watchdog restarts Syncthing during a join's finalize (low): built for
-  0.1.119.
 - A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
@@ -1340,7 +1338,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and whether any is a request whose sender then waits for a timeout. Health counted no stream
   loss in the window.
 
-### A-194 [General/orchestrator] 🟡 BUILT FOR 0.1.119, gate next (found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
+### A-194 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.119, 2026-11-08; found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
 
 - **Seen:** during `gate0218`'s finalize, the peer link stopped Syncthing to restart it, and 89 ms
   later the watchdog found it inactive ("syncthing unhealthy; restarting") and restarted it too.
@@ -1357,6 +1355,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   it in both of its places.
 - **Its review round:** no high or medium. Its lows were fixed: the second check before the
   restart, the motherbee's side, and the one check everywhere. It also found A-196.
+- **Validated on 8.x (0.1.119):** a throwaway worker, `gate0219`, joined end to end, timed.
+  Inside its finalize Syncthing restarted once, for the peer link, and the watchdog left it
+  alone; on 0.1.118 it had restarted it again 89 ms later.
 
 ### A-193 [General/deploy] 🔵 TO EVALUATE (found 2026-11-08, the first timed deploy and join, 0.1.118) — Where a deploy and a join spend their time
 

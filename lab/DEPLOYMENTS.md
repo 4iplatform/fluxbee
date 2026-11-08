@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ live, checked on 8.x | snap `pre-join-0-1-118` (all 4 VMs) · `apt install fluxbee=0.1.117` + core-update of the spokes |
+| **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ live, checked on 8.x | snap `pre-watch-0-1-119` (all 4 VMs) · `apt install fluxbee=0.1.118` + core-update of the spokes |
+| **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ replaced by 0.1.119 | snap `pre-join-0-1-118` (deleted 2026-11-08) · `apt install fluxbee=0.1.117` + core-update of the spokes |
 | **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ replaced by 0.1.118 | snap `pre-relkeys-0-1-117` (deleted 2026-11-08) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
 | **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ replaced by 0.1.117 | snap `pre-start-0-1-116` (deleted 2026-11-08) · `apt install fluxbee=0.1.115` + core-update of the spokes |
 | **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ replaced by 0.1.116 | snap `pre-aisdk-0-1-115` (deleted 2026-11-08) · `apt install fluxbee=0.1.114` + core-update of the spokes |
@@ -127,6 +128,31 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.119 — The Syncthing watchdog leaves a join alone
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.118 · **Commit:** `b7f20c52`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** FINDINGS A-194, found by 0.1.118's timed gate: during a join's finalize the watchdog
+  restarted a Syncthing that the finalize had just stopped to restart.
+- **What changed** (`src/bin/sy_orchestrator.rs`): one check, `a_join_owns_syncthing`, true on a
+  spoke while its finalize runs and on the motherbee while an `add_hive` or `remove_hive` does. The
+  watchdog takes it before it reads the desired config, and again right before it restarts
+  Syncthing; the peer reconcile takes it in both of its places.
+- **Checks before the release:** GitHub's CI green on its branch, twice. The review round found no
+  high or medium; its lows were fixed (the second check, the motherbee's side, one check
+  everywhere), and it found A-196 (a join's peer link written and never applied, latent).
+- **Deploy:** build of `b7f20c52`; publish in 18 s; snapshot `pre-watch-0-1-119` taken on all 4 VMs,
+  `pre-join-0-1-118` dropped; 0.1.119 on all 4 in 266 s (apt install on the motherbee 141 s, the
+  spokes installed 19 s, settled 9 s); each spoke settled; health clean.
+- **Checked on 8.x, a throwaway worker `gate0219` on VM 104,** joined end to end, timed:
+  - connected at 120 s, done at 133 s; the finalize took 8.3 s (core 5.1 s with nothing
+    restarted, vendor 1.4 s, peer link 1.6 s, dist probe 0.2 s);
+  - **A-194:** inside the finalize, Syncthing restarted once, for the peer link, and the watchdog
+    did not restart it; with `gate0218` on 0.1.118 it had restarted it a second time 89 ms later.
+    The motherbee's Syncthing restarted once too, to add the peer;
+  - its dist stayed whole, and every folder ended `idle` with no revert;
+  - removed, the motherbee left as before; VM 104 destroyed; health clean.
 
 ## 0.1.118 — A fresh worker joins again, and every step is timed
 
