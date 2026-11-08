@@ -225,6 +225,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-186 🔴 A spoke that restarts while a release syncs never starts again: its start checks dist
   before it starts Syncthing.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
+- A-189 🔴 A spoke caught mid-sync of a release that changes the vendored Syncthing never runs
+  Syncthing again (being fixed with A-186).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1301,6 +1303,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-189 [General/orchestrator] 🔴 OPEN (found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
+
+- **What happens:**
+  - The start and the watchdog bring Syncthing up through `ensure_blob_sync_runtime`. It calls
+    `ensure_syncthing_installed()?`, which needs `dist/vendor`'s Syncthing to match the vendor
+    manifest (`local_syncthing_vendor_hash`, `resolve_syncthing_vendor_source_path`,
+    `src/bin/sy_orchestrator.rs:6882`, `:6901`, `:9070`).
+  - While a release that changes Syncthing is half-synced, both return an error. The Syncthing
+    already installed is then never started.
+  - The start goes on: it only warns and relies on the watchdog. But the watchdog takes the same
+    path, and `dist/vendor` can only be completed by Syncthing itself.
+- **When:** a spoke reboots in the minutes in which such a release syncs. That is rarer than A-186,
+  since the vendored Syncthing changes seldom.
+- **Impact:**
+  - The spoke stays on the mesh (after A-186), but it never gets a dist update again.
+  - `update category=vendor` goes through the same function, so the only way out is SSH.
+- **Fix (being built with A-186, same binary):**
+  - At the start and in the watchdog, a vendor mismatch with a Syncthing already installed runs the
+    installed one and reports the mismatch.
+  - The vendor update stays strict.
 
 ### A-188 [General/blob] 🟡 LATENT (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
 
