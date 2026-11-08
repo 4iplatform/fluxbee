@@ -54,18 +54,23 @@ to start without it (`ConfigError::MissingHive` in `src/config/mod.rs`). Its key
 - A router only peers with the shared-memory regions of its own `hive_id`, found in the host's
   `/dev/shm` (`discover_peer_regions` in `src/router/mod.rs`), so a hive is one host.
 
-The file also holds `system_nodes` (§2.2), `wan` (§5.1), `admin` and `architect` (§7),
-`identity.sync` (§5.3), `blob` and `dist` (§5.4), `ai` (the hive's AI provider, `HiveAiConfig` in
+The file also holds `wan` (§5.1), `admin` and `architect` (§7), `identity.sync` (§5.3), the blob's
+and dist's paths and ports (§5.4), `ai` (the hive's AI provider, `HiveAiConfig` in
 `crates/fluxbee_ai_sdk`), `government.identity_frontdesk` (§7.3), `edge` (§6.1) and `egress` (NAT
-on the egress hive; on the motherbee, the default route `add_hive` gives new workers).
+on the egress hive; on the motherbee, the default route `add_hive` gives new workers). What a
+release defines for each role (its system nodes, §2.2, and the blob's and dist's topology, §5.4)
+is in the code, not in the file (`src/release_settings.rs`,
+[hive-config-update-v1](../hive-config-update-v1.md) §3); a file that still holds those keys
+loads, and they are ignored.
 
 ### 2.2 Roles
 
-`HiveRole` in `src/bin/sy_orchestrator.rs` has four roles. Each role's system nodes are the list
-`system_nodes.<role>.nodes` in `hive.yaml`, in start order; the shipped lists are in
-`packaging/hive.yaml.example`.
+`HiveRole` in `src/release_settings.rs` has four roles. Each role's system nodes are the release's
+list for it, in start order, in the same file (`HiveRole::settings`). The list ships in the
+orchestrator, with the binaries it names, so a release's change to it reaches every hive with the
+core update, and a core rollback takes it back.
 
-| Role | System nodes (shipped `hive.yaml`) | Created by | Purpose |
+| Role | System nodes (the release's list) | Created by | Purpose |
 | --- | --- | --- | --- |
 | `motherbee` | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault | the `.deb` and `fluxbee-firstboot` | control plane, secrets, PostgreSQL, the Cloud relay |
 | `worker` | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules | `add_hive` | room for AI, IO and WF nodes |
@@ -75,11 +80,11 @@ on the egress hive; on the motherbee, the default route `add_hive` gives new wor
 Every role also runs `rt-gateway` (the router) and `sy-orchestrator`. A spoke's binaries are
 exactly these two plus its role's SY services (`core_component_names_from_section`).
 
-`validate_system_nodes` checks each list at boot. It must start with `SY.config.routes`, the writer
-of the routing shared memory. The motherbee list must contain `SY.vault` after every vault consumer,
-because the vault's start-up broadcast (one `VAULT_SECRET_CHANGED` per stored secret) reaches only
-nodes already registered; no other role may run it. Only `SY.*` names are accepted
-(`HIVE_YAML_NON_SY_LIFECYCLE_NODES` in `crates/fluxbee_sdk/src/managed_node.rs` is empty).
+The table's tests hold each list to its rules (`check_system_nodes`). It must start with
+`SY.config.routes`, the writer of the routing shared memory. The motherbee list must contain
+`SY.vault` after every vault consumer, because the vault's start-up broadcast (one
+`VAULT_SECRET_CHANGED` per stored secret) reaches only nodes already registered; no other role may
+run it. Only `SY.*` names are accepted.
 
 Some binaries also check the role themselves. SY.admin and SY.storage exit unless the role is
 `motherbee`. SY.identity refuses any role but `motherbee` and `worker`. IO.cloud, IO.blob and IO.web
@@ -119,8 +124,9 @@ default is `worker`. A worker join:
 3. copies the role's core binaries (`sync_core_to_worker`) and the vendored Syncthing
    (`sync_vendor_to_worker`);
 4. writes `/etc/fluxbee/hive.yaml` (`wan.uplinks` pointing at the motherbee, `wan.mtls: required`,
-   `identity.sync.upstream`, `identity.sync.auth: required`), the TLS files, the identity HMAC key
-   and an empty `/etc/fluxbee/sy-config-routes.yaml`;
+   `identity.sync.upstream`, `identity.sync.auth: required`, the motherbee's paths and ports; not
+   the role's system nodes nor the blob's and dist's topology, which the spoke's orchestrator
+   holds), the TLS files, the identity HMAC key and an empty `/etc/fluxbee/sy-config-routes.yaml`;
 5. writes the systemd units, then enables and starts `rt-gateway` and `sy-orchestrator`;
 6. waits up to 60 s for the WAN link and up to 60 s for the new orchestrator to appear in the LSA,
    then finishes over the mesh with `ADD_HIVE_FINALIZE` (Syncthing pairing and the first dist sync);
@@ -155,8 +161,11 @@ The boot (`bootstrap_local`, then `finish_bootstrap`):
    `dist/core/bin` against the manifest: one that does not match is a warning and
    `core.awaiting_update` in `/versions`, never fatal, and the hive runs what `/usr/bin` holds
    (FINDINGS A-186).
-4. Start the `system_nodes.<role>.nodes` units in order, then wait up to 60 s for the `wait_for`
-   nodes to register with the router (`wait_for_lifecycle_nodes`).
+4. On a spoke, finish the core update that installed this orchestrator, with its own role's list
+   (`settle_core_update`): a node the release dropped is stopped and removed, unit and binary,
+   kept in the update's backup generation; a node it added is installed from dist. Then start the
+   role's system-node units in order, and wait up to 60 s for its `wait_for` nodes to register
+   with the router (`wait_for_lifecycle_nodes`).
 5. Attach to the router as `SY.orchestrator@<hive>`. Admin commands get `ORCHESTRATOR_BOOTING` until
    the boot ends.
 6. Motherbee only: wait for SY.storage's database (`STORAGE_METRICS_GET`). Then relaunch the managed
@@ -447,6 +456,9 @@ Each spoke pairs with the motherbee only. The folders (`reconcile_syncthing_peer
 | `fluxbee-blob-public` | `blob/public/` | motherbee send-only, ingress receive-only | ingress |
 
 So only the motherbee writes software, and an egress hive gets core, vendor and policy only.
+Which of these each role syncs (the blob store, `fluxbee-blob`, `fluxbee-blob-public`, dist, and
+the tool) is the release's, by role (`HiveRole::settings`, `src/release_settings.rs`); the paths,
+Syncthing's API port and its home are each hive's own, in `hive.yaml`.
 
 Host posture stage 3 (`SYNCTHING_OWNED_OPTIONS`): a spoke switches once its motherbee device has a
 static address that answers; the motherbee switches once every spoke has reported both

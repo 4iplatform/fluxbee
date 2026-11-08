@@ -46,8 +46,8 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   communication, it stays. The agent's first message carries none of it: the router attaches the
   package at delivery, and the take happens when that same message reaches cognition through the
   stream. What people said reaches the agent from its second message on.
-- **Where it runs:** on the motherbee and on every worker, next to the agents (`hive.yaml`
-  `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
+- **Where it runs:** on the motherbee and on every worker, next to the agents (the release's
+  lists for both roles, `src/release_settings.rs`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.
 - **Who reads it:** ai.generic, through the memory package the router attaches to messages it
   delivers to an agent (§7). Its state lives in its own file on its hive, which only it reads

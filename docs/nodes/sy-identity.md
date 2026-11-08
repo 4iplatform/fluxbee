@@ -34,15 +34,17 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
 - `role: motherbee` is the primary. Its `hive_id` must be `motherbee`.
 - `role: worker` is a replica. Its `hive_id` must not be `motherbee`.
 - Any other role ends the process with `sy.identity supports only role=motherbee|worker`. The
-  packaged unit's `ExecCondition` skips the start on other roles, and the ingress and egress
-  `system_nodes` lists do not include SY.identity. Those hives have no identity SHM.
+  packaged unit's `ExecCondition` skips the start on other roles, and the release's lists for the
+  ingress and the egress (`json_router::release_settings`) do not include SY.identity. Those
+  hives have no identity SHM.
 
 ## How it starts
 
 1. Exits on non-Linux targets; log level from `JSR_LOG_LEVEL` (default `info`).
-2. Reads `hive.yaml`: `hive_id`, `role`, `government.identity_frontdesk`, `identity.*`
+2. Reads `hive.yaml`: `hive_id`, `role`, `government.identity_frontdesk` and `identity.*`
    (`merge_alias_ttl_secs`, `max_ilks`, `max_tenants`, `max_vocabulary`, `max_ilk_aliases`,
-   `sync.port`, `sync.upstream`, `sync.auth`) and `system_nodes.<role>.nodes` (`HiveFile`).
+   `sync.port`, `sync.upstream`, `sync.auth`) (`HiveFile`). A `system_nodes` key still there is
+   ignored: the SY nodes come from the release (step 6).
 3. Connects to the router first, so it is registered before SY.vault sends its startup
    announcements (see [SY.vault](sy-vault.md)).
 4. **Primary only: the database.** `resolve_database_url` asks SY.vault for the resource
@@ -58,10 +60,15 @@ authentication: `src/mesh_hmac.rs`. Shared helpers and constants:
    (`fetch_full_sync_from_primary`). If that fails it logs `identity full sync bootstrap FAILED;
    replica is DEGRADED` and starts with what it has.
 6. Makes sure the root tenant `tnt:00000000-0000-0000-0000-000000000001` (name `fluxbee`)
-   exists and is active (`ensure_default_root_tenant`), and seeds one `system` ILK for every
-   `SY.*` entry of `system_nodes.<role>.nodes` (`ensure_system_ilks_from_hive`). These ILKs are
+   exists and is active (`ensure_default_root_tenant`), and seeds one `system` ILK for every SY
+   node the release runs on the hive (`ensure_system_ilks_from_hive`, `system_nodes_for_hive`):
+   the motherbee's list on the primary, the worker's on a replica, from
+   `json_router::release_settings` (docs/hive-config-update-v1.md §3). These ILKs are
    deterministic: `deterministic_system_ilk_id` hashes `fluxbee:identity:system-ilk:v1:` plus the
-   node name, so SY.vault and other nodes compute the same id without asking.
+   node name, so SY.vault and other nodes compute the same id without asking. Their
+   `identification.source` is `hive.system_nodes` (`SYSTEM_ILK_SOURCE`), the name they were first
+   written with; it marks them as seeded (`is_well_known_system_ilk`), wherever the list comes
+   from. A node a release drops keeps its ILK: the seeding only adds.
 7. Opens or creates the SHM region and rebuilds it from the store (next section). Limits in
    `hive.yaml` lowered below what the store holds stop the start here. If the region cannot be
    opened, it logs `identity shm unavailable` and goes on.
@@ -273,8 +280,8 @@ sends its deltas; any error rolls the store back (`run_lifecycle_op`).
   publish its ILKs (publishing an empty view would delete them on the primary).
 - **HMAC failure:** the primary logs `identity sync request failed`; the replica logs the failure
   and reconnects.
-- Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica, a non-`SY.*` entry
-  in `system_nodes`) end the process; systemd restarts it every 5 s.
+- Startup errors (wrong role, bad `hive.yaml`, missing HMAC key on a replica) end the process;
+  systemd restarts it every 5 s.
 
 ## Health
 

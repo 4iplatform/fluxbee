@@ -211,7 +211,7 @@ assigned by name pattern; outside the system nodes, only nodes in the same VPN r
       └─────────────────────────┘
 ```
 
-**System nodes** (`system_nodes` in [packaging/hive.yaml.example](packaging/hive.yaml.example);
+**System nodes** (each role's list is the release's, in [src/release_settings.rs](src/release_settings.rs);
 every hive also runs the router, `RT.gateway`):
 
 | Node | Runs on | What it does |

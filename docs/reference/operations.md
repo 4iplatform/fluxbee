@@ -18,11 +18,16 @@ The ground rules, from the code:
 
 ## Roles and their services
 
-`/etc/fluxbee/hive.yaml` names the hive (`hive_id`), its `role` and, per role, the system nodes
-to start in order (`system_nodes.<role>.nodes`) and the ones the boot waits for (`wait_for`).
-`validate_system_nodes` enforces that each list starts with `SY.config.routes`, that only the
-motherbee runs `SY.vault`, and that on the motherbee every vault consumer comes before
-`SY.vault` (see [SY.vault](../nodes/sy-vault.md)). The shipped lists (`packaging/hive.yaml.example`):
+`/etc/fluxbee/hive.yaml` names the hive (`hive_id`) and its `role`, and holds its own paths and
+ports. What each role runs is the release's, in the code (`src/release_settings.rs`,
+[hive-config-update-v1](../hive-config-update-v1.md) §3): the system nodes to start in order, the
+ones the boot waits for, and the blob's and dist's topology. They reach every hive with the core
+update, and a rollback takes them back with the binaries. A hive.yaml an earlier release wrote
+still loads; the keys it holds for these (`system_nodes`, `blob.enabled`,
+`blob.sync.enabled|public_enabled|tool`, `dist.sync.enabled|tool`) are ignored, and the
+orchestrator names them in one warning at its start. The table's tests hold each list to start with
+`SY.config.routes`, only the motherbee to run `SY.vault`, and every vault consumer to come before
+it (see [SY.vault](../nodes/sy-vault.md)):
 
 | Role | System nodes (start order) |
 | --- | --- |
@@ -156,9 +161,12 @@ What a worker join does (`add_hive_flow`):
    `/var/lib/fluxbee/dist/core/` (`sync_core_to_worker`) and the vendored Syncthing
    (`sync_vendor_to_worker`).
 4. Writes the spoke's `hive.yaml`: uplink to the motherbee's `wan.listen`, `wan.mtls: required`,
-   `identity.sync.upstream` with `auth: required`, the `ai`, blob and dist sections and the role's
-   `system_nodes`; pushes the TLS files to `/var/lib/fluxbee/tls/<hive>/`; on a worker, creates and
-   copies the identity sync key (`distribute_hive_identity_key_inner`).
+   `identity.sync.upstream` with `auth: required`, the `ai` section, the motherbee's blob and
+   dist paths, Syncthing's port and home and the blob GC (`render_worker_hive_yaml`). It writes
+   nothing the release defines (the role's SY nodes, the blob's and dist's topology): the spoke's
+   orchestrator, of the same release, has them. Pushes the TLS files to
+   `/var/lib/fluxbee/tls/<hive>/`; on a worker, creates and copies the identity sync key
+   (`distribute_hive_identity_key_inner`).
 5. Writes one systemd unit per core service (`core_service_unit_contents`), starts `rt-gateway`
    and `sy-orchestrator`, waits for the WAN link and for the spoke's orchestrator to appear.
 6. Sends `ADD_HIVE_FINALIZE` over the mesh, which pairs the two Syncthing instances
@@ -324,22 +332,32 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
 
 - The spoke checks that its synced `dist/core/manifest.json` has that hash; otherwise
   `sync_pending`.
-- `prepare_core_update` checks each core binary of the role in `dist/core/bin` against that
-  manifest and fails the update (`UPDATE_FAILED`) on the first that does not match, so it never
-  installs one; past that check it closes `core.awaiting_update` (FINDINGS A-186). It backs up
-  the binaries that differ to
+- `prepare_core_update` checks each core binary of the role that `dist/core/bin` holds against
+  that manifest and fails the update (`UPDATE_FAILED`) on the first that does not match, so it
+  never installs one; past that check it closes `core.awaiting_update` (FINDINGS A-186). A node
+  of its role's list that dist holds no binary of, one the new release dropped from the role, is
+  left out as installed (`left_out`), but only by an update that replaces `sy-orchestrator`;
+  another update refuses it. It backs up the binaries that differ to
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/`, swaps them into `/usr/bin` and re-renders
   the units (`regen_local_core_units`).
 - It answers first (`phase: restarting`), then restarts `rt-gateway` and the system services in
-  order, checking each; a failed check rolls the binaries back. A replaced `sy-orchestrator`
-  restarts itself through a transient `systemd-run` timer. The outcome is in
+  order but the left-out ones, checking each; a failed check rolls the binaries back. A replaced
+  `sy-orchestrator` restarts itself through a transient `systemd-run` timer. The outcome is in
   `core-update-last.json`; what is installed, in `core-installed.json`.
+- The update runs in the spoke's previous orchestrator, which knows only its own release's list.
+  The new orchestrator finishes it at its start, with its own list
+  ([hive-config-update-v1](../hive-config-update-v1.md) §3): it stops, disables and removes a
+  node the release dropped, unit and binary, kept in the update's generation; it installs a node
+  the release added once dist holds its binary. `core-update-last.json` gets `settled`; the
+  generation, `settled_at_ms`.
 - The spoke's managed nodes that follow `current`, and its package nodes whose base runtime
   moved, move to the new runtime versions within a minute of those versions reaching it, through
   the orchestrator's 60 s reconcile, whether or not the update restarted its orchestrator
   (FINDINGS A-109).
 - `POST /hives/{hive}/core/rollback {"generation":"latest"}` (or `{"to_manifest_hash"}`, with
-  `dry_run`) goes back to a backed-up generation.
+  `dry_run`) goes back to a backed-up generation: a node its update or its settle added is
+  stopped, then removed; a node its release dropped comes back, unit and binary, and the
+  previous orchestrator, restored with them, starts it.
 - `GET /hives/{hive}/versions` (and `GET /versions` for every connected hive) compares core,
   vendor and runtimes; for core the installed hash wins over the synced one. A hive whose start
   found core binaries in dist that do not match the manifest lists them in
@@ -432,7 +450,10 @@ the version into `_system.runtime_version` before it launches the node, so `stat
    manifest describes, the Syncthing already installed runs, reported as
    `vendor.awaiting_update` (FINDINGS A-189); `update category=vendor` and the motherbee's setup
    for an ingress join refuse such a vendor;
-4. starts `system_nodes.<role>.nodes` in order and waits up to 60 s for the `wait_for` list
+4. on a spoke, finishes the core update that installed it (`settle_core_update`): a node its
+   role's list no longer names is stopped, disabled and removed, unit and binary, both kept in
+   that update's generation; a node the list added is installed from dist. Then it starts the
+   role's SY nodes in order and waits up to 60 s for its `wait_for` list
    (`LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS`; a timeout only warns);
 5. on the motherbee, waits for `sy-storage` (30 s) and for its database to answer
    `STORAGE_METRICS_GET` (30 s); failing either ends the orchestrator, which systemd restarts;

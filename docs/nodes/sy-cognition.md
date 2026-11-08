@@ -24,8 +24,8 @@ Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls
 
 ## Where it runs and how it starts
 
-- `SY.cognition` is in the `system_nodes.motherbee` and `system_nodes.worker` lists (and their
-  `wait_for` lists) of `/etc/fluxbee/hive.yaml`. The binary has no role check; the router feeds
+- `SY.cognition` is in the release's lists for the motherbee and the worker (and their `wait_for`
+  lists, `src/release_settings.rs`). The binary has no role check; the router feeds
   it only on motherbee and worker hives (`role_runs_cognition` in `src/router/stream.rs`).
 - From `hive.yaml` it reads `hive_id` and the `ai` section (provider and model).
 - Its AI key comes from SY.vault on the motherbee (`VaultClient::for_primary`): the resource type

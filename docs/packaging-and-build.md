@@ -86,8 +86,9 @@ Requirements:
    default instance in the root tenant; only io.cloud and io.blob use it, because the orchestrator
    rejects in the root tenant everything that is not core (`TENANT_ROOT_NOT_ALLOWED`, A-43 and D10).
 3. For a new **singleton** (rare; only 1-per-hive infra): add it to `singletons`, create its
-   systemd unit, and add it to the allowlist `HIVE_YAML_NON_SY_LIFECYCLE_NODES` (empty today) in
-   `crates/fluxbee_sdk/src/managed_node.rs` + to `system_nodes` of `packaging/hive.yaml.example`.
+   systemd unit, and add it to its role's list in `src/release_settings.rs` (the release's, which
+   reaches every hive with the core update). That list holds `SY.*` nodes only
+   (`check_system_nodes`), so a node of another name needs that rule changed first.
 
 `build-deb.sh` compiles the crate and bakes/publishes it according to its class; `fluxbee-firstboot` spawns the
 ones that have `boot: true`. **There is no need to touch the build script.**

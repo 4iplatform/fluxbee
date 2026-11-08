@@ -37,8 +37,8 @@ fails with `missing_ai_api_key`.
   an error.
 - The packaged unit carries the same check as an `ExecCondition` (`unit_role_gate` in
   `packaging/build-deb.sh`), so a start pulled in on another role is skipped, not looped.
-- It is a vault consumer: `validate_system_nodes` in `src/bin/sy_orchestrator.rs` requires
-  `SY.admin` to come before `SY.vault` in `system_nodes.motherbee.nodes`.
+- It is a vault consumer: the release's list for the motherbee (`src/release_settings.rs`) starts
+  `SY.admin` before `SY.vault`, as its tests (`check_system_nodes`) require.
 
 ## How it starts
 

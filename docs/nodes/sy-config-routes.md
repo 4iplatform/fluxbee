@@ -19,9 +19,9 @@ Source: `src/bin/sy_config_routes.rs`. Region writer: `ConfigRegionWriter` in
 
 ## Where it runs and why it starts first
 
-Every role's `system_nodes.<role>.nodes` list in `/etc/fluxbee/hive.yaml` starts with
-`SY.config.routes`, and `validate_system_nodes` in `src/bin/sy_orchestrator.rs` refuses a list
-that does not ("writer of the routing SHM; required by every other SY service"). The orchestrator
+Every role's list of SY nodes, the release's (`src/release_settings.rs`), starts with
+`SY.config.routes`, and its tests (`check_system_nodes`) refuse a list that does not (the writer
+of the routing SHM, which every other SY node needs). The orchestrator
 starts `rt-gateway` first, then the list in order (`bootstrap_local`). The node is not gated by
 role in its unit or in the binary.
 

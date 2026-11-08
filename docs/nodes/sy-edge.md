@@ -21,7 +21,7 @@ Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are
 | --- | --- |
 | Binary | `/usr/bin/sy-edge` (`packaging/build-deb.sh`, `RUST_BINS` entry `sy-edge:sy_edge`) |
 | Node name | `SY.edge@<hive>` (`NODE_NAME`, default `SY.edge`, in `Config::load`) |
-| Role | ingress (`system_nodes.ingress` in `packaging/hive.yaml.example`) |
+| Role | ingress (the release's list for the role, `src/release_settings.rs`) |
 | systemd unit | `sy-edge.service`: `After=network.target rt-gateway.service`, `Wants=rt-gateway.service`, `Restart=always`, `RestartSec=5`, `TimeoutStopSec=15` |
 | Listens on | `edge.listen` from hive.yaml, ingress role only (`resolve_http_listen`); `add_hive` asks for it, e.g. `0.0.0.0:443` |
 | Dials | io.web, for the web hosts only: the host of `wan.uplinks[0].address` on port 9200 (`IO_WEB_PORT`), over the mesh's mutual TLS (see The proxy to io.web) |
@@ -29,11 +29,10 @@ Source: `src/bin/sy_edge.rs`; the certificate checks it shares with SY.admin are
 
 ## Where it runs
 
-- The ingress hive's node list comes from the motherbee's hive.yaml template
-  `system_nodes.ingress` (`SY.config.routes`, `SY.opa.rules`, `SY.edge` in
-  `packaging/hive.yaml.example`). `add_hive` with `role=ingress` reads that template
-  (`system_nodes_for_role(&local_hive, HiveRole::Ingress)` in `src/bin/sy_orchestrator.rs`) and
-  renders it into the ingress hive.yaml.
+- The ingress hive's node list is the release's for the role (`SY.config.routes`,
+  `SY.opa.rules`, `SY.edge`; `src/release_settings.rs`). `add_hive` with `role=ingress` installs
+  their units from it (`system_nodes_for_role(HiveRole::Ingress)` in
+  `src/bin/sy_orchestrator.rs`), and the ingress' own orchestrator, of the same release, runs them.
 - The binary itself does not refuse a role. It always connects to the router, but it binds the
   public listener only when `role` is `ingress`, or when `SY_EDGE_HTTP_LISTEN` is set
   (`resolve_http_listen`). On any other role it serves no door: a VAULT_SECRET_CHANGED for its

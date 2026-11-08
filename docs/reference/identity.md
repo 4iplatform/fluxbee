@@ -75,7 +75,7 @@ Two identification keys are unique, and the database enforces both
 
 | Type | Who creates it | How |
 | --- | --- | --- |
-| `system` | SY.identity itself, at boot | One per `SY.*` entry of `hive.yaml` `system_nodes.<role>.nodes` (`ensure_system_ilks_from_hive`). |
+| `system` | SY.identity itself, at boot | One per SY node the release runs on the hive (`ensure_system_ilks_from_hive`; the lists in `src/release_settings.rs`). |
 | `agent` | SY.orchestrator | Every node it launches: AI, IO, WF and managed RT nodes (`derive_ilk_type_for_node` always answers `agent`). |
 | `agent` | An IO node | `ILK_PROVISION` with `ilk_type: "agent"`, when the counterpart is an agent. |
 | `human` | An IO node, then SY.frontdesk.gov | `ILK_PROVISION` creates it (the default type); `ILK_REGISTER` completes it (§2.6). |
@@ -89,7 +89,8 @@ Rules:
   with SHA-256 and shapes the first 16 bytes as a UUID. SY nodes compute their own ILK this way
   at boot; they never wait for the SHM.
 - A system ILK is charged to the root tenant, is `complete`, and carries
-  `identification.source = "hive.system_nodes"` (`is_well_known_system_ilk`).
+  `identification.source = "hive.system_nodes"` (`is_well_known_system_ilk`), the name these
+  records were first written with, when the lists came from hive.yaml.
 - A system ILK cannot be registered over (`SYSTEM_ILK_PROTECTED` in `register_ilk`), marked or
   purged (`check_ilk_markable`).
 - In the SHM the type is a byte: 0 human, 1 agent, 2 system (`SHM_ILK_TYPE_*`). An unknown

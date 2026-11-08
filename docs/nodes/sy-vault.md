@@ -19,11 +19,11 @@ Source: `src/bin/sy_vault.rs` (the node) and `crates/fluxbee_sdk/src/vault.rs` (
 
 ## Where it runs
 
-- Only on the motherbee. `validate_system_nodes` in `src/bin/sy_orchestrator.rs` refuses a
-  hive.yaml whose non-motherbee role lists `SY.vault` ("vault is motherbee-only") and refuses a
-  motherbee list without it.
+- Only on the motherbee. The release's lists (`json_router::release_settings`) put `SY.vault` in
+  the motherbee's only, and their tests (`check_system_nodes`) refuse a list that puts it in
+  another role's or leaves it out of the motherbee's.
 - Spokes never receive the binary: `core_component_names_from_section` ships a spoke only
-  `rt-gateway`, the SY services of its role's `system_nodes` list and `sy-orchestrator`.
+  `rt-gateway`, the SY services of its role's list and `sy-orchestrator`.
 - Every client addresses the motherbee's vault. `VaultClient::for_primary` targets
   `SY.vault@<PRIMARY_HIVE_ID>`, and `PRIMARY_HIVE_ID` is `"motherbee"`
   (`crates/fluxbee_sdk/src/protocol.rs`).
@@ -43,8 +43,9 @@ Source: `src/bin/sy_vault.rs` (the node) and `crates/fluxbee_sdk/src/vault.rs` (
    - the administrative set: the deterministic ILKs of `SY.admin@<hive>` and
      `SY.architect@<hive>`;
    - the system set (`compute_well_known_system_ilks`): its own ILK, the administrative set, and
-     the deterministic ILK of every `SY.*` entry of `system_nodes.<role>.nodes` in
-     `/etc/fluxbee/hive.yaml`.
+     the deterministic ILK of every SY node the release runs on its role
+     (`json_router::release_settings`; the role from `/etc/fluxbee/hive.yaml`, the motherbee when
+     it names none). A `system_nodes` key still in hive.yaml is ignored.
 5. Takes an exclusive `flock` on `/var/run/fluxbee/sy-vault.lock` (`acquire_lock`). A second
    instance fails with `lock unavailable`.
 6. Loads `/etc/fluxbee/vault.master.key` (`load_or_create_master_key`). If the file does not
@@ -58,8 +59,8 @@ Source: `src/bin/sy_vault.rs` (the node) and `crates/fluxbee_sdk/src/vault.rs` (
 
 ### Why SY.vault starts last
 
-The motherbee's `system_nodes.motherbee.nodes` list in hive.yaml is the start order, and
-`validate_system_nodes` enforces two rules: the list starts with `SY.config.routes`, and every
+The release's list for the motherbee (`json_router::release_settings`) is the start order, and its
+tests (`check_system_nodes`) hold two rules: the list starts with `SY.config.routes`, and every
 vault consumer (`SY.admin`, `SY.architect`, `SY.storage`, `SY.identity`, `SY.cognition`,
 `SY.frontdesk.gov`) comes before `SY.vault`.
 
@@ -67,8 +68,8 @@ The reason is the startup announcement. `emit_bootstrap_secret_broadcasts` sends
 `VAULT_SECRET_CHANGED` (`op=put`) per stored secret, marked with `meta.action = "bootstrap"`
 (`VAULT_BOOTSTRAP_ACTION`), and the same notice to the edge that owns the secret, if one does
 (see [VAULT_SECRET_CHANGED](#vault_secret_changed)). A router broadcast reaches only the nodes
-registered at that moment (the comment in `validate_system_nodes`), so the consumers must already
-be on the router. A consumer that boots without its secret reacts to that announcement.
+registered at that moment, so the consumers must already be on the router. A consumer that boots
+without its secret reacts to that announcement.
 
 Details that follow from the code:
 
@@ -134,8 +135,8 @@ by the WAN router; on one host it is the name the process declared when it conne
 1. The caller owns the secret (`metadata.ilk` equals the caller's ILK).
 2. The caller is in `assigned_ilks`.
 3. The secret is general, the caller is not an edge, and:
-   - it is in the root tenant and the caller's ILK is in the system set computed from
-     hive.yaml, or the identity SHM types the caller as `system`. A `SY.*` node the SHM does not
+   - it is in the root tenant and the caller's ILK is in the system set computed at the start
+     (above), or the identity SHM types the caller as `system`. A `SY.*` node the SHM does not
      hold yet (for example a worker's SY node while the motherbee's identity restarts) gets
      `IDENTITY_UNAVAILABLE`, not a refusal;
    - or the caller's tenant (from the SHM) is the secret's tenant.
@@ -282,9 +283,9 @@ identity SHM, or deterministically for a `SY.*` name. It rejects the legacy `met
 
 ## Config
 
-SY.vault has no `CONFIG_SET`. Its inputs are `/etc/fluxbee/hive.yaml` (`hive_id`, `role`,
-`system_nodes`), the hive registry's directory names (`/var/lib/fluxbee/hives`, to name the
-edges) and `JSR_LOG_LEVEL`. Paths are constants: `DEFAULT_DB_PATH`,
+SY.vault has no `CONFIG_SET`. Its inputs are `/etc/fluxbee/hive.yaml` (`hive_id`, `role`), the
+release's list of SY nodes for that role (`json_router::release_settings`), the hive registry's
+directory names (`/var/lib/fluxbee/hives`, to name the edges) and `JSR_LOG_LEVEL`. Paths are constants: `DEFAULT_DB_PATH`,
 `DEFAULT_MASTER_KEY_PATH`, `DEFAULT_LOCK_PATH`.
 
 ## State on disk

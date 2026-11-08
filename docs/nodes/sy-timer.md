@@ -19,8 +19,8 @@ database). Client helpers and constants: `go/fluxbee-go-sdk/timer*.go`.
 
 ## Where it runs
 
-`SY.timer` is in the `system_nodes.motherbee` and `system_nodes.worker` lists of
-`/etc/fluxbee/hive.yaml`, and in both `wait_for` lists, so the orchestrator's boot waits for it
+`SY.timer` is in the release's lists for the motherbee and the worker (`src/release_settings.rs`),
+and in both `wait_for` lists, so the orchestrator's boot waits for it
 there. It is not in the ingress or egress lists. It needs a local identity SHM (next section),
 which only motherbee and workers have.
 

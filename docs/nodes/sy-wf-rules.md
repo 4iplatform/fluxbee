@@ -21,8 +21,8 @@ engine: `go/nodes/wf/wf-generic/`. Admin side: `handle_wf_rules_http`,
 
 ## Where it runs
 
-`SY.wf-rules` is in the `system_nodes.motherbee` and `system_nodes.worker` lists of
-`/etc/fluxbee/hive.yaml`, but in neither `wait_for` list. Each hive's SY.wf-rules manages the
+`SY.wf-rules` is in the release's lists for the motherbee and the worker
+(`src/release_settings.rs`), but in neither `wait_for` list. Each hive's SY.wf-rules manages the
 workflows and the WF nodes of that hive only. SY.admin exists only on the motherbee, so every
 request reaches a worker's SY.wf-rules from `SY.admin@motherbee`.
 

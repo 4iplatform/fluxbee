@@ -37,13 +37,15 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    takes `/var/run/fluxbee/sy-orchestrator.lock` (`json_router::instance_lock`, an flock until the
    process ends, the holder's PID inside): a second orchestrator exits there, naming the holder's
    PID; any other failure to lock is warned and it runs as before.
-2. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file, an invalid `system_nodes` section or
-   an invalid `ai` section ends the process with an error. Creates its directories
-   (`ensure_dirs`) and writes the PID file.
+2. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file or an invalid `ai` section ends the
+   process with an error. Its role's SY nodes and the blob's and dist's topology are the
+   release's, in the code ([System nodes per role](#system-nodes-per-role)): a hive.yaml that
+   still holds those keys loads, and one warning at the start names the ones it ignores
+   (`warn_superseded_hive_keys`). Creates its directories (`ensure_dirs`) and writes the PID file.
 3. **`bootstrap_local`**, before joining the router:
    1. reads `dist/core/manifest.json` (missing or invalid, it is fatal) and lists the core
       components of its role (`core_components_listed_for_role`): on the motherbee every
-      component of the manifest; on a spoke `rt-gateway`, its `system_nodes` and
+      component of the manifest; on a spoke `rt-gateway`, the role's SY nodes and
       `sy-orchestrator`, a component the manifest does not name included;
    2. on a spoke, rewrites the core unit files if their template changed (`regen_local_core_units`);
    3. on the motherbee, makes sure the SSH join key and the mesh CA and TLS exist
@@ -67,15 +69,19 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
       with what `/usr/bin` holds. The check comes after Syncthing, the only thing that brings
       what dist lacks: it used to be the start's first step, and fatal, so a spoke restarted
       while a release was syncing never started again;
-   8. starts each `system_nodes.<role>.nodes` service in list order (`start_core_service`), using
+   8. on a spoke, finishes the core update that installed it, if one did and it is not finished
+      (`settle_core_update`, [Updates](#updates)): a node its role's list dropped is stopped and
+      removed, a node the list added is installed;
+   9. starts each SY node of its role in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
       `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45); a
       failure only warns;
-   9. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
-      timeout only warns.
+   10. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
+       timeout only warns.
 
    `main` then checks again every minute each report that is open, the core's or the vendor's,
-   until its tree matches (`run_dist_recheck_loop`).
+   until its tree matches (`run_dist_recheck_loop`); when the core's closes, it finishes a core
+   update the start could not (a node whose binary was still on its way).
 4. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
 5. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
    handles its messages one at a time, in arrival order.
@@ -99,39 +105,46 @@ through to its caller (over HTTP it arrives as a 500).
 
 ## System nodes per role
 
-There are no defaults in the code: `system_nodes_for_role` requires a
-`system_nodes.<role>` section in hive.yaml with a `nodes` list (start order) and an optional
-`wait_for` list. The packaged template (`packaging/hive.yaml.example`):
+The release defines them, in the code: `json_router::release_settings` (`src/release_settings.rs`,
+docs/hive-config-update-v1.md §3), one entry per role with its SY nodes in start order, the ones
+the start waits for (`wait_for`), and the blob's and dist's topology. `system_nodes_for_role`
+reads it. A list and its binaries arrive together: the list is in the orchestrator, which ships in
+the same core as the binaries. A spoke's hive.yaml used to carry the lists, copied from the
+motherbee's at its join and never written again, so a release's change to them reached no hive
+that had joined before.
 
-| Role | `nodes`, in start order |
-| --- | --- |
-| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault |
-| worker | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules |
-| egress | SY.config.routes, SY.opa.rules |
-| ingress | SY.config.routes, SY.opa.rules, SY.edge |
+| Role | SY nodes, in start order | `wait_for` |
+| --- | --- | --- |
+| motherbee | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.architect, SY.storage, SY.cognition, SY.timer, SY.wf-rules, SY.frontdesk.gov, SY.vault | SY.config.routes, SY.identity, SY.opa.rules, SY.admin, SY.cognition, SY.timer, SY.vault |
+| worker | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer, SY.wf-rules | SY.config.routes, SY.identity, SY.opa.rules, SY.cognition, SY.timer |
+| egress | SY.config.routes, SY.opa.rules | SY.config.routes |
+| ingress | SY.config.routes, SY.opa.rules, SY.edge | SY.config.routes |
 
-`add_hive` copies the motherbee's section for the new hive's role into that hive's hive.yaml
-(`render_system_nodes_yaml`).
+The table's tests keep its rules (`check_system_nodes`), the ones the orchestrator checked in each
+hive.yaml at its start before:
 
-`validate_system_nodes` refuses a list that:
+- a list starts with `SY.config.routes` (the writer of the routing SHM);
+- on the motherbee, `SY.vault` comes last, after each of its consumers (`SY.admin`,
+  `SY.architect`, `SY.storage`, `SY.identity`, `SY.cognition`, `SY.frontdesk.gov`). SY.vault
+  announces its secrets when it starts, and a router broadcast reaches only nodes already
+  registered;
+- no other role runs `SY.vault`;
+- only `SY.*` names, no duplicates, and a `wait_for` entry is one of the nodes.
 
-- is empty, or does not start with `SY.config.routes` (the writer of the routing SHM);
-- on the motherbee, lacks `SY.vault`, or lists one of its consumers (`SY.admin`, `SY.architect`,
-  `SY.storage`, `SY.identity`, `SY.cognition`, `SY.frontdesk.gov`) after it. SY.vault announces
-  its secrets when it starts, and a router broadcast reaches only nodes already registered;
-- on any other role, contains `SY.vault`;
-- has a non-`SY.*` name (the allowlist of other names is empty), duplicates, or a `wait_for`
-  entry that is not in `nodes`.
+`add_hive` writes none of this into a spoke's hive.yaml: the spoke's orchestrator, of the same
+release, has it. Golden tests hold the table to the lists `packaging/hive.yaml.example` shipped
+and to the blob and dist flags the joins wrote ([Config](#config)). A release that drops a node
+from a role, or adds one, reaches the spokes with the core update ([Updates](#updates)).
 
-A node name maps to its unit by `name_to_service`: drop `SY.`, lowercase, dots to dashes, prefix
-`sy-` (`SY.frontdesk.gov` → `sy-frontdesk-gov`).
+A node name maps to its unit by `name_to_service` (`release_settings::service_name`): drop `SY.`,
+lowercase, dots to dashes, prefix `sy-` (`SY.frontdesk.gov` → `sy-frontdesk-gov`).
 
 `get_node_status` reads an SY node from that unit, and the router (`RT.gateway` and its stream)
 from `rt-gateway` (`local_node_unit`): the lifecycle comes from the unit and the router's LSA,
 so a stopped or crashed one reads STOPPED or FAILED. The router's own name is no node of its LSA:
 it counts as seen while the LSA entry for its hive is fresh (`node_seen_by_router`). `config` and
 `state` read `{"managed": false}`; the health is still what the node answers to
-`NODE_STATUS_GET`. A core node this hive's role does not run (not in its `system_nodes`; the
+`NODE_STATUS_GET`. A core node this hive's role does not run (not in its role's list; the
 orchestrator runs everywhere) answers `NODE_NOT_FOUND`. The files some SY nodes keep under
 `/var/lib/fluxbee/nodes/SY/` play no part, and a status read writes nothing for a core node: its
 `status_version` is null. The managed listing (`list_nodes` with `managed`) shows those nodes the
@@ -330,8 +343,9 @@ The worker join (`add_hive_flow`), in order:
    grant (`/etc/sudoers.d/fluxbee-orchestrator`).
 4. Copy the role's core binaries and manifest, and the vendored Syncthing
    (`sync_core_to_worker`, `sync_vendor_to_worker`); write the spoke's hive.yaml with the
-   motherbee as WAN uplink; push the TLS material (`push_hive_tls`) and, for a worker, the
-   identity sync key.
+   motherbee as WAN uplink, the motherbee's paths and ports, and no key the release defines
+   (`render_worker_hive_yaml`; the egress' and the ingress' likewise); push the TLS material
+   (`push_hive_tls`) and, for a worker, the identity sync key.
 5. Write and start the units, wait for the spoke's orchestrator on the mesh, send
    `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked.
 6. Mark the hive `connected`, then revoke the SSH access: remove the sudoers file and the
@@ -424,20 +438,47 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   (`ensure_blob_sync_runtime`), when sync is enabled. It is strict (`VendorPolicy::Strict`): a
   vendored binary that does not match `dist/vendor/manifest.json` fails the update, and nothing
   is installed or restarted (FINDINGS A-189). Past that check it closes `vendor.awaiting_update`.
-- **core** (`apply_core_update_replying_first`): checks each core binary of its role in
-  `dist/core/bin` against the manifest and fails the update on the first that does not match
-  (`compute_local_core_update_sets`, `validate_core_manifest_for_bins`), so an update never
-  installs one; past that check it closes `core.awaiting_update`. Then it backs up each binary
-  to replace under
+- **core** (`apply_core_update_replying_first`): checks each core binary of its role that
+  `dist/core/bin` holds against the manifest and fails the update on the first that does not
+  match (`core_update_sets`), so an update never installs one; past that check it closes
+  `core.awaiting_update`. A component of its role's list that dist holds no binary of is left
+  out, as installed (`left_out` in the answer, the generation and `core-installed.json`), only
+  when the update replaces sy-orchestrator, and never rt-gateway or sy-orchestrator: the release
+  dropped it from the role, and the orchestrator the update installs settles it (below). Any
+  other update refuses it, as before. Then it backs up each binary to replace under
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` with a `generation.json`,
   swaps the binaries, rewrites the units, and **answers first** (`phase: restarting`). Two
-  seconds later it restarts `rt-gateway` and the system nodes, each behind a 30 s health gate
-  (`restart_local_core_services_with_health_gate`), skipping itself. A failed gate restores the
-  old binaries (`status: rollback`). If its own binary changed it schedules its own restart
-  (`schedule_orchestrator_self_restart`, `systemd-run --on-active=2s`, accurate to 100 ms). It
-  keeps 3 generations (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
-  `/var/lib/fluxbee/orchestrator/core-update-last.json` and `core-installed.json`.
-- **core_rollback** restores a stamped generation (`core_rollback_local`).
+  seconds later it restarts `rt-gateway` and the system nodes but the left-out ones, each behind
+  a 30 s health gate (`restart_local_core_services_with_health_gate`), skipping itself. A failed
+  gate restores the old binaries (`status: rollback`), stopping a node the update created before
+  its binary goes. On success it records `core-installed.json` and then, if its own binary
+  changed, schedules its own restart (`schedule_orchestrator_self_restart`,
+  `systemd-run --on-active=2s`, accurate to 100 ms). It keeps 3 generations
+  (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
+  `/var/lib/fluxbee/orchestrator/core-update-last.json`.
+- **The settle** (docs/hive-config-update-v1.md §3): the update ran in the previous release's
+  orchestrator, which knows only its own list. The orchestrator it installed finishes it at its
+  start, before its nodes start (`settle_core_update`, `settle_core_generation`), on the
+  generation whose `applied_manifest_hash` is what `core-installed.json` says the update
+  installed:
+  - each `sy-*` unit this orchestrator wrote (its template, `core_service_unit_contents`) whose
+    node its list no longer names is stopped and disabled; its unit (under `units/`) and its
+    binary go into the generation (`dropped_units`, `components`), then off the host;
+  - each node of its list `/usr/bin` lacks, one the release added, is installed from dist once
+    its binary there matches the manifest, and recorded as created by the update
+    (`created_without_backup`);
+  - a node still pending (its binary not yet in dist, or left out while this list names it)
+    keeps the generation open: the dist recheck tries again when `core.awaiting_update` closes,
+    and the next start too. Once nothing is pending the generation records `settled_at_ms`.
+
+  The outcome is logged and added to `core-update-last.json` as `settled` (`/versions`:
+  `core.last_update.settled`). The motherbee has no generations (dpkg installs its core): nothing
+  is settled there.
+- **core_rollback** restores a stamped generation (`core_rollback_local`,
+  `restore_core_generation`): the nodes its update created are stopped, then removed, unit and
+  binary; each binary it replaced comes back, a dropped node's among them; the units of the nodes
+  its release dropped come back. The orchestrator it restores starts them, its list naming them.
+  `/versions` lists each generation's `created`, `dropped`, `left_out` and `settled_at_ms`.
 
 **`core.awaiting_update`** in `/versions` (FINDINGS A-186) is null while dist holds every core
 binary of the role as the manifest says. When the start's check finds one that does not, it is
@@ -446,10 +487,11 @@ binary of the role as the manifest says. When the start's check finds one that d
 `not_in_manifest`, `invalid_entry` or `unreadable`. The hive runs what `/usr/bin` holds
 meanwhile. It closes when a later check, every minute, or a core update's own check finds dist
 consistent. A release still syncing closes it once Syncthing delivers the rest, and the core
-update then installs it; a node the role lists that dist no longer has (`not_in_manifest`, or
-`missing` once the motherbee pruned it from the role's tree) stays open, and the core update
-refuses it, until the hive's `system_nodes` drops it. It lives in the orchestrator's memory: each
-start checks again.
+update then installs it. A node the running orchestrator's list names that dist no longer has
+(`not_in_manifest`, or `missing` once the motherbee pruned it from the role's tree) is one the
+next release dropped: the core update that replaces this orchestrator leaves it out, and the new
+orchestrator's list no longer names it. It lives in the orchestrator's memory: each start checks
+again.
 
 **`vendor.awaiting_update`** (FINDINGS A-189) is the same for the vendored Syncthing, in the
 vendor section of `/versions`, with one component, `syncthing`. It opens when the start, the
@@ -492,7 +534,7 @@ match. What happens then is each caller's (`VendorPolicy`, FINDINGS A-189):
 | `fluxbee-dist-policy` | the compiled user OPA policy | every spoke |
 | `fluxbee-dist-runtimes` | runtime packages | workers only |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets`: SY.architect's agent assets, which ai.generic reads from disk | workers only |
-| `fluxbee-blob` | `blob/active` | workers only, when blob sync is on (`peer_shares_active_blob`) |
+| `fluxbee-blob` | `blob/active` | workers only, when the motherbee's blob sync is on, as the release has it (`peer_shares_active_blob`) |
 | `fluxbee-blob-public` | `blob/public` | the ingress only (`peer_shares_public_blob`) |
 
 Dist folders and `fluxbee-blob-public` are `sendonly` on the motherbee and `receiveonly` on the
@@ -569,8 +611,8 @@ spoke until the system's log (FINDINGS A-175).
 
 ## Watchdog
 
-Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every service of its
-`system_nodes` list with `systemctl is-active`, and runs `systemctl start` on any that is not
+Every 5 s (`watchdog_tick`) the orchestrator checks `rt-gateway` and every SY service of its
+role's list with `systemctl is-active`, and runs `systemctl start` on any that is not
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
 the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
 egress and the ingress' SSH table, reports an active host firewall (`watchdog_host_rules`), and runs
@@ -647,13 +689,28 @@ orchestrator for the reads, rule (3); `SY.admin@motherbee` for
 
 ## Config
 
-`/etc/fluxbee/hive.yaml` (`HiveFile`): `hive_id`, `role`, `wan` (`gateway_name`, default
-`RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`enabled`, default
-true; `path`, default `/var/lib/fluxbee/blob`; `sync`, default off, tool `syncthing`, `api_port`
-8384, `data_dir`; `gc`), `dist` (`path`, default `/var/lib/fluxbee/dist`; sync on by default),
-`identity.sync.port` (default 9100), `government`, `system_nodes`, `egress` (with
-`reachability_url`, the internet probe's target, no default; and `ssh_from_wan`, default true),
-`ingress.ssh_allow_from` (the ingress' extra SSH sources), `ai`.
+`/etc/fluxbee/hive.yaml` (`HiveFile`), the hive's own: `hive_id`, `role`, `wan` (`gateway_name`,
+default `RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`path`, default
+`/var/lib/fluxbee/blob`; `sync.api_port`, default 8384; `sync.data_dir`, default
+`/var/lib/fluxbee/syncthing`; `gc`), `dist.path` (default `/var/lib/fluxbee/dist`),
+`identity.sync.port` (default 9100), `government`, `egress` (with `reachability_url`, the
+internet probe's target, no default; and `ssh_from_wan`, default true), `ingress.ssh_allow_from`
+(the ingress' extra SSH sources), `ai`.
+
+What the release defines for each role is in the code (`json_router::release_settings`,
+[System nodes per role](#system-nodes-per-role)): the role's SY nodes, and the blob's and dist's
+topology (`blob_runtime_from_hive`, `dist_runtime_from_hive`):
+
+| Role | blob store | `fluxbee-blob` sync | `fluxbee-blob-public` | dist sync | tool |
+| --- | --- | --- | --- | --- | --- |
+| motherbee | on | on | on (sends) | on | Syncthing |
+| worker | on | on | off | on | Syncthing |
+| egress | off | off | off | on | Syncthing |
+| ingress | off | on | on (receives) | on | Syncthing |
+
+These keys of an older hive.yaml (`system_nodes`, `blob.enabled`,
+`blob.sync.enabled|public_enabled|tool`, `dist.sync.enabled|tool`) are ignored; the start names the
+ones it finds in one warning (`warn_superseded_hive_keys`), and they can be removed from the file.
 
 Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
 `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`

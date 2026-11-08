@@ -8,7 +8,8 @@
   `hive.yaml`. A DTAP panel reviewed it the same day: 70 findings, four blockers (§11).
 - The operator approved this second draft's shape the same day: *"Sí, vamos como describiste"*.
 - **Stage 1 is live and checked on 8.x** (0.1.116): A-186, with A-189's vendored Syncthing.
-- **Next:** stage 2, the release's settings into the code (§10).
+- **Stage 2 is built** (branch `coa/hive-config-s2`, CI only): the release's settings in the code,
+  `src/release_settings.rs` (§3). Its gate on 8.x is next (§10).
 
 This is the single place for the topic.
 
@@ -78,6 +79,13 @@ Three cases bite today:
 - **A node a release drops** is stopped, disabled and removed by the core update, unit and
   binary. The backup generation keeps both, so a rollback brings it back. A rollback stops a node
   it removes before deleting its binary (D-4, P-16, A-9, T-8).
+  - **As built (stage 2):** a spoke's core update runs in the previous release's orchestrator,
+    which knows only its own list. It installs what dist holds of that list, and leaves out a
+    component dist no longer holds, only when the update replaces sy-orchestrator
+    (`core_update_sets`). The new orchestrator finishes the update at its start, before its nodes
+    start (`settle_core_generation`): it drops each core unit its list no longer names, and installs
+    each node of its list `/usr/bin` lacks, a node the release added, recorded as created by the
+    update. Both go into the update's generation, so the same rollback undoes them.
 - **The frontdesk's name stays as each role has it today:**
   - a worker names `SY.frontdesk.gov@motherbee`;
   - the ingress and the egress have none, so their router defaults to a frontdesk on their own

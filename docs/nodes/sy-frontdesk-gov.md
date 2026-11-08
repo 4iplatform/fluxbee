@@ -21,8 +21,8 @@ Source: `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (the whole node),
 
 ## Where it runs
 
-- It is listed only in `system_nodes.motherbee.nodes` (`packaging/hive.yaml.example`), before
-  `SY.vault` as `validate_system_nodes` requires of a vault consumer. The orchestrator starts it
+- It is listed only in the release's list for the motherbee (`src/release_settings.rs`), before
+  `SY.vault` as `check_system_nodes` requires of a vault consumer. The orchestrator starts it
   and its watchdog restarts it like any system node.
 - The unit has no role gate (`unit_role_gate` in `packaging/build-deb.sh` covers only sy-admin,
   sy-storage and sy-identity).

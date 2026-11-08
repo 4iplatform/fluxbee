@@ -27,8 +27,8 @@ the router uses routes, VPNs and taps is in [routing-and-policy.md](routing-and-
 | Identity | `/jsr-identity-<hive>` | hive with SY.identity | SY.identity | the router; nodes through the Rust and Go SDKs |
 | Memory | `/jsr-memory-<hive>` | hive with SY.cognition | SY.cognition | the hive's routers; SY.cognition |
 
-The shipped `config/hive.yaml` lists SY.identity and SY.cognition for the motherbee and worker
-roles only (`system_nodes`), so ingress and egress hives have no identity and no memory region.
+The release lists SY.identity and SY.cognition for the motherbee and worker roles only
+(`src/release_settings.rs`), so ingress and egress hives have no identity and no memory region.
 
 | Region | Magic | Version | Size |
 | --- | --- | --- | --- |

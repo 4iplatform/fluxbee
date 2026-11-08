@@ -25,8 +25,8 @@ side: `maybe_refresh_opa_from_shm`, `apply_opa_reload`, `resolve_target_with_ide
 
 ## Where it runs
 
-`SY.opa.rules` is in the `system_nodes` list of all four roles in `/etc/fluxbee/hive.yaml`; it
-is in the `wait_for` list of motherbee and worker only. It computes its own ILK
+`SY.opa.rules` is in the release's list of SY nodes of all four roles (`src/release_settings.rs`);
+it is in the `wait_for` list of motherbee and worker only. It computes its own ILK
 deterministically (`DeterministicSystemIlkID`), so it also starts on ingress and egress hives,
 which have no SY.identity.
 

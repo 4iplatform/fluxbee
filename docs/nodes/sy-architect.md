@@ -21,8 +21,8 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
 
 ## Where it runs
 
-- `SY.architect` is in `system_nodes.motherbee.nodes` and in no other role's list
-  (`packaging/hive.yaml.example`), before `SY.vault` as a vault consumer.
+- `SY.architect` is in the release's list for the motherbee and in no other role's
+  (`src/release_settings.rs`), before `SY.vault` as a vault consumer.
 - The binary does not check the role: `main` reads only `hive_id`, `architect.listen`, `ai` and
   `blob.path` from hive.yaml, and the unit has no `ExecCondition`.
 
