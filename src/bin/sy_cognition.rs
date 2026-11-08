@@ -1408,20 +1408,18 @@ impl StoreLoads {
     }
 }
 
-/// How many takes the held state remembers (`Takes`). A take matters while a turn the intake held
-/// in the communication it took waits for the worker, and the worker's queue holds
-/// `COGNITION_TURN_QUEUE` turns.
-const COGNITION_TAKES_KEPT: usize = 2 * COGNITION_TURN_QUEUE;
+/// How many takes the held state remembers (`Takes`), oldest out first. A take matters while a turn
+/// held in the communication it took waits for the worker, whose queue holds `COGNITION_TURN_QUEUE`;
+/// each take is a thread reaching its first agent, so this many outlast any such wait.
+const COGNITION_TAKES_KEPT: usize = 4096;
 
 /// A thread's communication with no agent that the first agent on the thread took
 /// (docs/cognition-hands-v1.md §12.6): the agent's new communication started from it, and it left
-/// memory and the file. The keys of the turns it held then say which of the worker's turns go to
-/// the taker.
+/// memory and the file. Every turn of it from then on is the taker's.
 #[derive(Debug, Clone)]
 struct Take {
     taken: CommunicationKey,
     taker: CommunicationKey,
-    turn_keys: Vec<String>,
 }
 
 /// The takes the held state made, recorded under its lock by whoever made them, the intake or the
@@ -1444,15 +1442,11 @@ impl Takes {
         }
     }
 
-    /// Where the worker's turn of `key` goes: the communication that took `key` while it held the
-    /// turn (its `turn_key`), else `key`. The worker follows it at each step, since a take can come
-    /// while the models answer.
-    fn follow(&self, key: &CommunicationKey, turn_key: &str) -> CommunicationKey {
-        self.recent
-            .iter()
-            .rev()
-            .find(|take| take.taken == *key && take.turn_keys.iter().any(|held| held == turn_key))
-            .map_or_else(|| key.clone(), |take| take.taker.clone())
+    /// Where a turn of `key` goes: the communication that took `key`, else `key`. The intake follows
+    /// it for each turn, and the worker at each step, since a take can come while the models
+    /// answer: a taken communication is never made again.
+    fn follow(&self, key: &CommunicationKey) -> CommunicationKey {
+        self.taker_of(key).unwrap_or(key).clone()
     }
 
     /// The communication that took `key` last, if one did.
@@ -1524,6 +1518,24 @@ fn take_conversation(
         thread_id: taker.thread_id.clone(),
         agent_ilk: NO_AGENT_ILK.to_string(),
     };
+    // Only the thread's first agent takes it: what people said beside another agent's conversation
+    // stays theirs, as each agent sees only its own (§12.6's first question).
+    let another_agent = threads.keys().any(|key| {
+        key.thread_id == taker.thread_id && key.agent_ilk != NO_AGENT_ILK && key != taker
+    }) || match store.has_agent_on_thread(&taker.thread_id, NO_AGENT_ILK) {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!(
+                thread_id = %taker.thread_id,
+                error = %err,
+                "sy.cognition could not read whether a thread had an agent; its people's turns stay with no agent"
+            );
+            true
+        }
+    };
+    if another_agent {
+        return None;
+    }
     let taken = match threads.remove(&no_agent) {
         Some(held) => held,
         None if takes.removal_pending(&no_agent) => return None,
@@ -1543,7 +1555,6 @@ fn take_conversation(
     takes.record(Take {
         taken: no_agent,
         taker: taker.clone(),
-        turn_keys: taken.turn_keys.clone(),
     });
     loads.taken += 1;
     tracing::info!(
@@ -1566,7 +1577,9 @@ fn hold_recent_turns(
     duplicates: &mut Vec<u64>,
 ) -> Vec<CommunicationKey> {
     let mut touched: Vec<CommunicationKey> = Vec::new();
-    for recent in recent {
+    for mut recent in recent {
+        // A turn of a communication an agent took is the taker's (§12.6).
+        recent.key = takes.follow(&recent.key);
         let taken_before = loads.taken;
         let held = match held_or_loaded(threads, store, takes, &recent.key, loads) {
             Ok(held) => held,
@@ -1732,9 +1745,9 @@ fn write_back_turn(
     threads.insert(key.clone(), updated);
 }
 
-/// The communication the worker's turn goes to, held: `key`, or the agent's that took it while it
-/// held the turn (`Takes::follow`, docs/cognition-hands-v1.md §12.6), back from the file when it is
-/// not held (`held_or_loaded`). `None`, and nothing loaded, when a clear came after `clears`, its
+/// The communication the worker's turn goes to, held: `key`, or the agent's that took it
+/// (`Takes::follow`, docs/cognition-hands-v1.md §12.6), back from the file when it is not held
+/// (`held_or_loaded`). `None`, and nothing loaded, when a clear came after `clears`, its
 /// turn's: the turn belongs to what the clear dropped. Read under the held state's lock, which a
 /// clear holds while it counts one more. One this makes new takes its thread's people as the
 /// intake's do, and is written at once with the taken row's deletion: a take never lives only in
@@ -1742,7 +1755,6 @@ fn write_back_turn(
 async fn hold_for_worker(
     app_state: &CognitionAppState,
     key: &CommunicationKey,
-    turn_key: &str,
     agent_node: &str,
     clears: u64,
     loads: &mut StoreLoads,
@@ -1756,7 +1768,7 @@ async fn hold_for_worker(
             .takes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .follow(key, turn_key);
+            .follow(key);
         if threads.contains_key(&target) {
             return Ok(Some(target));
         }
@@ -1770,7 +1782,7 @@ async fn hold_for_worker(
             .takes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let target = takes.follow(key, turn_key);
+        let target = takes.follow(key);
         let taken_before = loads.taken;
         match held_or_loaded(threads, &app_state.store, &mut takes, &target, loads) {
             Ok(state) => {
@@ -1798,35 +1810,59 @@ async fn hold_for_worker(
     held
 }
 
+/// What came of a worker's write-back (`write_back_worker_turn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteBack {
+    Written,
+    /// A clear came while the models answered: the turn belongs to what it dropped.
+    AfterClear,
+    /// The communication it goes to was let go from memory and its file row cannot be read: the
+    /// result is dropped, never written over the row.
+    Unreadable,
+}
+
 /// The worker's turn back into what is held (`write_back_turn`), its file row and the region's
 /// rewrite with it, unless a clear came after `clears`, its turn's, while the model answered: then
 /// nothing comes back. It goes to `key`, or to the agent's communication that took it while the
-/// models answered (`Takes::follow`). Whether it came back, and the region's write.
+/// models answered (`Takes::follow`), back from the file first when it is not held, so its turns
+/// are merged and never written over. What came of it, and the region's write.
 async fn write_back_worker_turn(
     app_state: &CognitionAppState,
     key: &CommunicationKey,
-    turn_key: &str,
     updated: ThreadCognitionState,
     clears: u64,
-) -> (bool, Result<(), json_router::shm::ShmError>) {
-    let mut written_back = false;
+) -> (WriteBack, Result<(), json_router::shm::ShmError>) {
+    let mut outcome = WriteBack::AfterClear;
+    let mut loads = StoreLoads::default();
     let synced = sync_held_state(app_state, std::slice::from_ref(key), |threads| {
         // Under the region's lock and the held state's, which a clear holds while it counts one
         // more, and so does every take.
         if app_state.clears.load(Ordering::SeqCst) != clears {
             return Vec::new();
         }
-        let target = app_state
+        let mut takes = app_state
             .takes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .follow(key, turn_key);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = takes.follow(key);
+        if let Err(err) = held_or_loaded(threads, &app_state.store, &mut takes, &target, &mut loads)
+        {
+            tracing::warn!(
+                thread_id = %target.thread_id,
+                agent_ilk = %target.agent_ilk,
+                error = %err,
+                "sy.cognition could not read the communication a turn's result goes to; the result is dropped"
+            );
+            outcome = WriteBack::Unreadable;
+            return Vec::new();
+        }
         write_back_turn(threads, &target, updated);
-        written_back = true;
+        outcome = WriteBack::Written;
         vec![target]
     })
     .await;
-    (written_back, synced)
+    loads.count(&mut *app_state.runtime_state.lock().await);
+    (outcome, synced)
 }
 
 /// One turn of a communication (§6.2): the ILK of the agent that owns it, its state (from the file
@@ -1895,17 +1931,8 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     // Every region write keeps this communication until the turn is done (`run_turn_worker`).
     *app_state.worker_turn.lock().await = Some(key.clone());
     // Held, or back from the file, where the intake wrote its turn.
-    let turn_key = turn_key(&msg);
     let mut loads = StoreLoads::default();
-    let held = hold_for_worker(
-        &app_state,
-        &key,
-        &turn_key,
-        &agent_node,
-        turn.clears,
-        &mut loads,
-    )
-    .await;
+    let held = hold_for_worker(&app_state, &key, &agent_node, turn.clears, &mut loads).await;
     loads.count(&mut *app_state.runtime_state.lock().await);
     let target = match held {
         Ok(Some(target)) => target,
@@ -2068,7 +2095,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             .takes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .follow(&key, &turn_key);
+            .follow(&key);
         threads.get(&target).cloned().map(|state| (target, state))
     };
     let Some((target, mut thread_state)) = copied else {
@@ -2124,7 +2151,7 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     let leading = leading_contexts(&thread_state.contexts);
 
     let (written_back, synced) =
-        write_back_worker_turn(&app_state, &key, &turn_key, thread_state, turn.clears).await;
+        write_back_worker_turn(&app_state, &key, thread_state, turn.clears).await;
     if let Err(err) = synced {
         tracing::warn!(
             error = %err,
@@ -2133,13 +2160,18 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
             "sy.cognition failed to sync jsr-memory"
         );
     }
-    if !written_back {
-        tracing::info!(
-            trace_id = %msg.routing.trace_id,
-            thread_id = %thread_id,
-            "sy.cognition dropped what a turn derived: a clear came while it was analyzed"
-        );
-        return;
+    match written_back {
+        WriteBack::Written => {}
+        WriteBack::AfterClear => {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                thread_id = %thread_id,
+                "sy.cognition dropped what a turn derived: a clear came while it was analyzed"
+            );
+            return;
+        }
+        // Warned where it was found.
+        WriteBack::Unreadable => return,
     }
     if let Some(proposal) = narrative.episode.as_ref() {
         publish_episode(
@@ -7338,8 +7370,7 @@ mod tests {
         let batch = batch_of(&hive_id, RELAY_WF, &[(1, TEST_TS, &ana)]);
         take_stream_batch(&app_state, &turn_tx, &batch).await;
         next_outgoing(&mut router).await;
-        let relay = turn_rx.try_recv().expect("the relay");
-        let relay_key = turn_key(&relay.message);
+        turn_rx.try_recv().expect("the relay");
 
         let to_agent = person_says("Is my credit note coming?");
         let batch = turns_batch(&hive_id, &[(2, TEST_TS + 1_000, &to_agent)]);
@@ -7347,7 +7378,7 @@ mod tests {
         next_outgoing(&mut router).await;
 
         let mut loads = StoreLoads::default();
-        let target = hold_for_worker(&app_state, &no_agent_key(), &relay_key, "", 0, &mut loads)
+        let target = hold_for_worker(&app_state, &no_agent_key(), "", 0, &mut loads)
             .await
             .expect("held");
         assert_eq!(target, Some(key(TEST_THREAD)));
@@ -7365,22 +7396,21 @@ mod tests {
             "the agent's turn now, paid by its tenant"
         );
 
-        // A turn of the communication with no agent that the take did not carry is its own.
-        let other = turn_key(&person_says("unrelated"));
+        // Every turn of the taken communication is the agent's, whatever the take carried.
         assert_eq!(
             app_state
                 .takes
                 .lock()
                 .expect("takes")
-                .follow(&no_agent_key(), &other),
-            no_agent_key()
+                .follow(&no_agent_key()),
+            key(TEST_THREAD)
         );
 
         let mut analyzed = app_state.thread_states.lock().await[&key(TEST_THREAD)].clone();
         analyzed.turn_count += 1;
         let (written_back, synced) =
-            write_back_worker_turn(&app_state, &no_agent_key(), &relay_key, analyzed, 0).await;
-        assert!(written_back);
+            write_back_worker_turn(&app_state, &no_agent_key(), analyzed, 0).await;
+        assert_eq!(written_back, WriteBack::Written);
         synced.expect("the region written");
         let threads = app_state.thread_states.lock().await;
         assert!(!threads.contains_key(&no_agent_key()), "never made again");
@@ -7409,13 +7439,12 @@ mod tests {
         let batch = batch_of(&hive_id, RELAY_WF, &[(1, TEST_TS, &ana)]);
         take_stream_batch(&app_state, &turn_tx, &batch).await;
         next_outgoing(&mut router).await;
-        let relay = turn_rx.try_recv().expect("the relay");
-        let relay_key = turn_key(&relay.message);
+        turn_rx.try_recv().expect("the relay");
 
         // The worker holds the relay's communication and copies it, as `handle_turn` does.
         *app_state.worker_turn.lock().await = Some(no_agent_key());
         let mut loads = StoreLoads::default();
-        let target = hold_for_worker(&app_state, &no_agent_key(), &relay_key, "", 0, &mut loads)
+        let target = hold_for_worker(&app_state, &no_agent_key(), "", 0, &mut loads)
             .await
             .expect("held");
         assert_eq!(target, Some(no_agent_key()));
@@ -7429,8 +7458,8 @@ mod tests {
 
         analyzed.turn_count += 1;
         let (written_back, synced) =
-            write_back_worker_turn(&app_state, &no_agent_key(), &relay_key, analyzed, 0).await;
-        assert!(written_back);
+            write_back_worker_turn(&app_state, &no_agent_key(), analyzed, 0).await;
+        assert_eq!(written_back, WriteBack::Written);
         synced.expect("the region written");
         {
             let threads = app_state.thread_states.lock().await;
@@ -7475,7 +7504,6 @@ mod tests {
         let target = hold_for_worker(
             &app_state,
             &key(TEST_THREAD),
-            "a turn the intake left out",
             TEST_AGENT_NODE,
             0,
             &mut loads,
@@ -7566,7 +7594,7 @@ mod tests {
         assert_eq!(texts(&held.turns), ["hello"]);
         assert_eq!(loads.taken, 1);
         assert!(takes.removal_pending(&no_agent_key()));
-        assert_eq!(takes.follow(&no_agent_key(), "k1"), key(TEST_THREAD));
+        assert_eq!(takes.follow(&no_agent_key()), key(TEST_THREAD));
         // Its row is not read again while it waits to be deleted.
         let mut fresh = HashMap::new();
         let again = held_or_loaded(&mut fresh, &store, &mut takes, &no_agent_key(), &mut loads)
@@ -7599,6 +7627,143 @@ mod tests {
         assert!(store.load(&no_agent_key()).expect("read").is_some());
     }
 
+    /// A turn of a communication the first agent took is the taker's, whatever the intake found its
+    /// holder to be (a relay whose agent the identity memory lost, say): the communication with no
+    /// agent is never made again.
+    #[test]
+    fn a_turn_of_a_taken_communication_is_the_takers() {
+        let store = test_store();
+        let mut threads = HashMap::new();
+        threads.insert(
+            key(TEST_THREAD),
+            ThreadCognitionState {
+                agent_node: TEST_AGENT_NODE.to_string(),
+                ..ThreadCognitionState::default()
+            },
+        );
+        let mut takes = Takes::default();
+        takes.record(Take {
+            taken: no_agent_key(),
+            taker: key(TEST_THREAD),
+        });
+        let mut relay = taken(&relayed("ilk:ana", "one more thing"), TEST_TS);
+        relay.key = no_agent_key();
+        relay.agent_node = String::new();
+        let touched = hold_recent_turns(
+            &mut threads,
+            &store,
+            &mut takes,
+            vec![relay],
+            &mut StoreLoads::default(),
+            &mut Vec::new(),
+        );
+        assert_eq!(touched, vec![key(TEST_THREAD)]);
+        assert!(!threads.contains_key(&no_agent_key()));
+        assert_eq!(texts(&threads[&key(TEST_THREAD)].turns), ["one more thing"]);
+        assert_eq!(threads[&key(TEST_THREAD)].agent_node, TEST_AGENT_NODE);
+    }
+
+    /// Only the first agent on a thread takes what people said there: beside another agent's
+    /// communication, held or in the file, they stay with no agent (§12.6's first question).
+    #[test]
+    fn only_the_first_agent_on_a_thread_takes_its_people() {
+        for in_the_file in [false, true] {
+            let store = test_store();
+            let mut threads = HashMap::new();
+            threads.insert(
+                no_agent_key(),
+                ThreadCognitionState {
+                    turns: vec![taken(&person_says("hello"), TEST_TS).turn],
+                    ..ThreadCognitionState::default()
+                },
+            );
+            let invoice = CommunicationKey {
+                thread_id: TEST_THREAD.to_string(),
+                agent_ilk: "ilk:invoice".to_string(),
+            };
+            if in_the_file {
+                store
+                    .save([(&invoice, &ThreadCognitionState::default())], &[])
+                    .expect("written");
+            } else {
+                threads.insert(invoice, ThreadCognitionState::default());
+            }
+            let mut takes = Takes::default();
+            let mut loads = StoreLoads::default();
+            let held = held_or_loaded(
+                &mut threads,
+                &store,
+                &mut takes,
+                &key(TEST_THREAD),
+                &mut loads,
+            )
+            .expect("held");
+            assert!(held.turns.is_empty(), "in the file: {in_the_file}");
+            assert_eq!(loads.taken, 0);
+            assert!(threads.contains_key(&no_agent_key()));
+            assert!(takes.recent.is_empty() && takes.removals.is_empty());
+        }
+    }
+
+    /// A row written again in the transaction that deletes it stays: the deletions go first.
+    #[test]
+    fn a_row_written_again_in_the_transaction_that_deletes_it_stays() {
+        let store = test_store();
+        store
+            .save([(&no_agent_key(), &ThreadCognitionState::default())], &[])
+            .expect("written");
+        let again = ThreadCognitionState {
+            turn_count: 3,
+            ..ThreadCognitionState::default()
+        };
+        store
+            .save([(&no_agent_key(), &again)], &[no_agent_key()])
+            .expect("written");
+        assert_eq!(
+            store
+                .load(&no_agent_key())
+                .expect("read")
+                .expect("kept")
+                .turn_count,
+            3
+        );
+    }
+
+    /// A write-back to a communication let go from memory loads it from the file first: its turns
+    /// are merged, never written over.
+    #[tokio::test]
+    async fn a_write_back_to_a_communication_let_go_from_memory_keeps_its_file_row() {
+        let dir = TestDir::new();
+        let (hive_id, region, unlink) = test_region("cogwbload");
+        let (app_state, _router) = test_app_state(&hive_id, Some(region), &dir.0);
+        let stored = ThreadCognitionState {
+            agent_node: TEST_AGENT_NODE.to_string(),
+            turns: vec![taken(&person_says("kept in the file"), TEST_TS).turn],
+            ..ThreadCognitionState::default()
+        };
+        app_state
+            .store
+            .save([(&key(TEST_THREAD), &stored)], &[])
+            .expect("written");
+        let analyzed = ThreadCognitionState {
+            turn_count: 1,
+            ..ThreadCognitionState::default()
+        };
+        let (written_back, synced) =
+            write_back_worker_turn(&app_state, &key(TEST_THREAD), analyzed, 0).await;
+        assert_eq!(written_back, WriteBack::Written);
+        synced.expect("the region written");
+        let back = app_state
+            .store
+            .load(&key(TEST_THREAD))
+            .expect("read")
+            .expect("its row");
+        assert_eq!(texts(&back.turns), ["kept in the file"]);
+        assert_eq!(back.turn_count, 1);
+        assert_eq!(back.agent_node, TEST_AGENT_NODE);
+        unlink();
+    }
+
     /// A clear drops the takes with everything else: no row is left to delete, nor a communication a
     /// turn could follow to.
     #[tokio::test]
@@ -7609,7 +7774,6 @@ mod tests {
         app_state.takes.lock().expect("takes").record(Take {
             taken: no_agent_key(),
             taker: key(TEST_THREAD),
-            turn_keys: vec!["k1".to_string()],
         });
         take_clear(&app_state, &clear_from(Some("SY.admin@motherbee"), false)).await;
         next_outgoing(&mut router).await;
@@ -8138,7 +8302,6 @@ mod tests {
         assert!(hold_for_worker(
             &app_state,
             &key(TEST_THREAD),
-            &turn_key(&queued.message),
             TEST_AGENT_NODE,
             queued.clears,
             &mut loads
@@ -8210,7 +8373,6 @@ mod tests {
             hold_for_worker(
                 &app_state,
                 &key(TEST_THREAD),
-                "",
                 TEST_AGENT_NODE,
                 0,
                 &mut loads
@@ -8231,8 +8393,8 @@ mod tests {
         next_outgoing(&mut router).await;
 
         let (written_back, synced) =
-            write_back_worker_turn(&app_state, &key(TEST_THREAD), "", copy.clone(), 0).await;
-        assert!(!written_back);
+            write_back_worker_turn(&app_state, &key(TEST_THREAD), copy.clone(), 0).await;
+        assert_eq!(written_back, WriteBack::AfterClear);
         synced.expect("the region written");
         assert!(app_state.thread_states.lock().await.is_empty());
         assert_eq!(app_state.store.stats().expect("stats").0, 0);
@@ -8262,8 +8424,8 @@ mod tests {
         assert_eq!(app_state.episodes.lock().expect("book").len(), 0);
 
         let (written_back, _) =
-            write_back_worker_turn(&app_state, &key(TEST_THREAD), "", copy, 1).await;
-        assert!(written_back);
+            write_back_worker_turn(&app_state, &key(TEST_THREAD), copy, 1).await;
+        assert_eq!(written_back, WriteBack::Written);
         assert_eq!(app_state.store.stats().expect("stats").0, 1);
         unlink();
     }

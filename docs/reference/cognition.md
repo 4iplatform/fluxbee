@@ -42,7 +42,8 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   agent, `(thread_id, none)` (§2). The first agent on that thread takes it whole: its new
   communication starts from what people said there, and the one with no agent leaves the file in
   the write of the agent's (`held_or_loaded`, `take_conversation`, since 0.1.112;
-  cognition-hands-v1 §12.6).
+  cognition-hands-v1 §12.6). Only the first agent takes it: on a thread with another agent's
+  communication, it stays.
 - **Where it runs:** on the motherbee and on every worker, next to the agents (`hive.yaml`
   `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.
@@ -113,9 +114,10 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
       copy, whichever comes second, is the same turn;
     - in two, on a new thread, the relay first goes to the thread's communication with no agent;
       the agent's copy then makes the agent's communication, which takes that one with the relay's
-      key, so the copy is the same turn (since 0.1.112). The take is recorded (`Takes`), and the
-      worker's turn of the communication taken follows it to the agent's, whether the take came
-      before the worker got to the turn or while its models answered (`Takes::follow`).
+      key, so the copy is the same turn (since 0.1.112). The take is recorded (`Takes`), and every
+      turn of the communication taken goes to the agent's, at intake and in the worker, whether
+      the take came before the worker got to the turn or while its models answered
+      (`Takes::follow`).
 - It takes each new `cognition.turns` record into its communication's last turns, writes each
   communication it touched to its file and rewrites the memory region once for the batch (the
   intake, §3.4).

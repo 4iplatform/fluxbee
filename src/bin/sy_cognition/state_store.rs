@@ -150,6 +150,14 @@ impl CognitionStore {
         let tx = conn.transaction()?;
         let mut written = 0u64;
         {
+            // The deletions first: a communication made again under a key whose row waited to be
+            // deleted is written, not deleted with it.
+            let mut delete = tx.prepare_cached(
+                "DELETE FROM communications WHERE thread_id = ?1 AND agent_ilk = ?2",
+            )?;
+            for key in removed {
+                delete.execute(params![key.thread_id, key.agent_ilk])?;
+            }
             let mut upsert = tx.prepare_cached(UPSERT_SQL)?;
             for (key, state) in rows {
                 upsert.execute(params![
@@ -160,12 +168,6 @@ impl CognitionStore {
                     serde_json::to_string(state)?,
                 ])?;
                 written += 1;
-            }
-            let mut delete = tx.prepare_cached(
-                "DELETE FROM communications WHERE thread_id = ?1 AND agent_ilk = ?2",
-            )?;
-            for key in removed {
-                delete.execute(params![key.thread_id, key.agent_ilk])?;
             }
         }
         tx.commit()?;
@@ -209,6 +211,24 @@ impl CognitionStore {
             }
         }
         Ok(out)
+    }
+
+    /// Whether the file has a communication of an agent on `thread_id`, any but the one with no
+    /// agent (`no_agent`), readable or not.
+    pub(crate) fn has_agent_on_thread(
+        &self,
+        thread_id: &str,
+        no_agent: &str,
+    ) -> Result<bool, CognitionError> {
+        let found: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM communications WHERE thread_id = ?1 AND agent_ilk <> ?2 LIMIT 1",
+                params![thread_id, no_agent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// The thread's communication whose agent served it last: the newest last turn

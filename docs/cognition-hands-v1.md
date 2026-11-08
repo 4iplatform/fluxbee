@@ -888,14 +888,18 @@ At 10:17 sales' package carries:
     question).
   - **Built for 0.1.112 (A-173):** an agent's new communication takes the thread's communication
     with no agent, moved and not copied (`held_or_loaded`, `take_conversation`).
-    - The take is recorded under the held state's lock: which, by whom, and the keys of the turns
-      it held (`Takes`).
+    - Only the thread's first agent takes it: beside another agent's communication, what people
+      said stays with no agent, as each agent sees only its own (the first question).
+    - The take is recorded under the held state's lock, which and by whom (`Takes`): from then on
+      every turn of the communication taken is the taker's, at intake and at the worker's hold,
+      copy and write-back (`Takes::follow`). A take that comes while the models answer sends the
+      result to the agent's communication, and the one with no agent is never made again.
     - The taken row leaves the file in the transaction that writes the agent's communication,
       never before it; a row that cannot be read takes nothing and blocks nothing.
-    - A turn the worker is on follows the recorded take at its hold, its copy and its write-back
-      (`Takes::follow`), so a take that comes while the models answer sends the result to the
-      agent's communication, and the one with no agent is never made again.
     - A take the worker makes, for a turn the intake left out, is written at once.
+    - **Who pays** such a relay: the payer is set when its analysis starts. A take that lands
+      before it has the agent's tenant pay, one that lands while the models answer leaves the
+      call with its writer.
   - **It answers the third question too:** a message and its copy in two batches on a new thread,
     the relay first, are now one turn: the agent's communication takes the relay with its key.
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
