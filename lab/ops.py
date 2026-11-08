@@ -23,7 +23,13 @@ Commands
                                    snapshot every VM (one per VM: the new one replaces the one
                                    named in --drop), apt install on the motherbee, wait for
                                    its admin, core-update every spoke, wait for all to report
-                                   VERSION, then health
+                                   VERSION, then health; each step carries its time, and a
+                                   summary of the phases ends it
+  timeline --since 'YYYY-MM-DD HH:MM:SS' [--until ...] [--vm NAME=VMID ...] [--all]
+                                   one timeline, in time order, of every hive's core units'
+                                   journals (UTC): the milestones only (starts, stops,
+                                   connections, updates, joins, settles, warnings), or every
+                                   line with --all; each hive's clock offset first
 
 The inventory defaults to the 8.x PROD deployment (HANDBOOK §12): motherbee=100, worker1=101,
 ingress1=102, egress1=103, build VM 110. Override with FLUXBEE_HIVES="motherbee=100,worker1=101"
@@ -382,10 +388,19 @@ def cmd_deploy(a):
     v = a.version
     started = time.time()
     since = utc_stamp(started)
-    print("== snapshots")
+    phases = []  # (the phase that just ended, seconds since the start)
+
+    def mark(text, ended=None):
+        """Print `text` with the seconds since the deploy started, and close the phase `ended`."""
+        elapsed = time.time() - started
+        print("[%6.1fs] %s" % (elapsed, text))
+        if ended:
+            phases.append((ended, elapsed))
+
+    mark("== snapshots")
     snapshot_all(a.snapshot, a.drop)
 
-    print("== apt install fluxbee=%s on %s" % (v, PRIMARY))
+    mark("== apt install fluxbee=%s on %s" % (v, PRIMARY), "snapshots")
     # The seed's NOTE lines say which base runtime keeps a hand-published current (FINDINGS A-122).
     code, out, _ = vm_bash(hives()[PRIMARY], (
         "apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive "
@@ -397,25 +412,27 @@ def cmd_deploy(a):
     if code or v not in out:
         sys.exit("install failed")
 
-    print("== waiting for the motherbee admin on %s" % v)
+    mark("== waiting for the motherbee admin on %s" % v, "apt install on the motherbee")
 
     def primary_ready():
         status, versions, digest, _ = core_of(PRIMARY)
         return digest if versions == [v] else None
 
     digest = wait_for("the motherbee core on %s" % v, primary_ready, 300)
-    print("  manifest %s" % digest[:16])
+    mark("  manifest %s" % digest[:16], "the motherbee's admin on the version")
 
     spokes = [h for h in hives() if h != PRIMARY]
+    spoke_times = {h: {} for h in spokes}
     # The motherbee's admin answers before its router has the spokes back: an update sent then
     # fails with TRANSPORT_ERROR (0.1.56). Wait until each spoke's orchestrator answers.
     for h in spokes:
         wait_for("%s answering" % h, lambda h=h: core_of(h)[0] == "ok" or None, 300)
-    print("== core update: %s" % ", ".join(spokes))
+    mark("== core update: %s" % ", ".join(spokes), "the spokes answering the motherbee")
     # Since U-8b the call answers once the spoke has the new binaries in place (phase
     # `restarting`); the restarts run after it. Fire them all at once, retry one that did not
     # get through, print each answer, and still judge each spoke by what it installed.
     replies = {}
+    update_sent = time.time()
 
     def update(h):
         for attempt in range(3):
@@ -423,6 +440,7 @@ def cmd_deploy(a):
                 time.sleep(10)
             replies[h] = admin("POST", "/hives/%s/update" % h,
                                {"category": "core", "manifest_version": 0, "manifest_hash": digest})
+            spoke_times[h]["answered"] = time.time() - update_sent
             r = replies[h]
             if (r.get("status") or (r.get("payload") or {}).get("status")) == "ok":
                 return
@@ -435,20 +453,24 @@ def cmd_deploy(a):
     for h in spokes:
         r = replies.get(h) or {}
         p = r.get("payload") or {}
-        print("  %s answered: status=%s%s%s" % (
-            h, r.get("status") or p.get("status") or r.get("raw", "")[:60],
+        print("  %s answered in %.1fs: status=%s%s%s" % (
+            h, spoke_times[h].get("answered", 0),
+            r.get("status") or p.get("status") or r.get("raw", "")[:60],
             " error_code=%s" % (r.get("error_code") or p.get("error_code")) if (r.get("error_code") or p.get("error_code")) else "",
             " phase=%s" % p.get("phase") if p.get("phase") else ""))
+    mark("  every update call answered", "the update calls")
     for h in spokes:
         def spoke_ready(h=h):
             status, versions, got, _ = core_of(h)
             return got if versions == [v] and got == digest else None
         wait_for("%s on %s" % (h, v), spoke_ready, 600)
-        print("  %s on %s" % (h, v))
+        spoke_times[h]["installed"] = time.time() - update_sent
+        mark("  %s on %s" % (h, v))
+    phases.append(("the spokes installed", time.time() - started))
 
     # Each spoke's update over: the new orchestrator settled it, nothing left out or awaiting. A
     # left-out or awaiting binary clears once Syncthing delivers, so it gets two minutes.
-    print("== core update settled")
+    mark("== core update settled")
     expect_settle = tuple(int(x) for x in v.split(".")[:3]) >= (0, 1, 117)
     settled_ok = True
     for h in spokes:
@@ -460,12 +482,127 @@ def cmd_deploy(a):
         if items is None:
             items = ["the new orchestrator did not settle the update"]
         settled_ok &= not items
-        print("  %s %s" % (h, "; ".join(items) if items else "settled"))
+        spoke_times[h]["settled"] = time.time() - update_sent
+        mark("  %s %s" % (h, "; ".join(items) if items else "settled"))
+    phases.append(("the spokes settled", time.time() - started))
 
-    print("== health since %s" % since)
+    mark("== health since %s" % since)
     ok = health(since) and settled_ok
+    phases.append(("health", time.time() - started))
+
+    # Where the deploy spent its time. A spoke's times count from the update calls, and are when
+    # this script saw each state, at most one poll late.
+    print("== phases")
+    previous = 0.0
+    for name, ended in phases:
+        print("  %-38s %6.1fs" % (name, ended - previous))
+        previous = ended
+    for h in spokes:
+        times = spoke_times[h]
+        print("  %-10s answered %5.1fs, installed %5.1fs, settled %5.1fs after the update call" % (
+            h, times.get("answered", 0), times.get("installed", 0), times.get("settled", 0)))
     print("deploy of %s done in %d s" % (v, time.time() - started))
     sys.exit(0 if ok else 1)
+
+
+# The units a timeline reads on each hive, and what counts as a milestone among their lines.
+TIMELINE_UNITS = [
+    "rt-gateway", "sy-orchestrator", "sy-admin", "sy-identity", "sy-vault", "sy-config-routes",
+    "sy-opa-rules", "sy-cognition", "sy-timer", "sy-wf-rules", "sy-edge", "sy-storage",
+    "sy-architect", "sy-frontdesk-gov", "fluxbee-syncthing",
+]
+TIMELINE_MILESTONES = (
+    r"\b(Started|Stopped|Stopping|Starting|Failed|Main process exited)\b|connected to router|"
+    r"hive ready|lifecycle node|service active|ADD_HIVE|add_hive|finalize|join|bootstrap|"
+    r"core update|SYSTEM_UPDATE|update category|settle|revert|receive-only|awaiting_update|"
+    r"dist check|peer|restart|WAN|uplink| WARN | ERROR "
+)
+
+# Runs on each VM: the units' journal lines in the window, as "epoch_us<TAB>unit<TAB>message", the
+# tracing timestamp and ANSI codes dropped, milestones only unless asked for every line.
+TIMELINE_SCRIPT = r"""
+import json, re, subprocess, sys
+since, until, every, units, pattern, width = sys.argv[1:7]
+args = ["journalctl", "--no-pager", "-o", "json", "--since", since]
+if until:
+    args += ["--until", until]
+for unit in units.split(","):
+    args += ["-u", unit]
+out = subprocess.run(args, capture_output=True, text=True).stdout
+milestone = re.compile(pattern)
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+stamp = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+")
+for line in out.splitlines():
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        continue
+    msg = rec.get("MESSAGE")
+    if isinstance(msg, list):
+        msg = bytes(msg).decode("utf-8", "replace")
+    msg = stamp.sub("", ansi.sub("", msg or "")).replace("\t", " ").replace("\n", " ")
+    if every != "1" and not milestone.search(msg):
+        continue
+    # systemd's own lines name the unit they are about in UNIT; a service's lines, in _SYSTEMD_UNIT.
+    unit = (rec.get("UNIT") or rec.get("_SYSTEMD_UNIT") or rec.get("SYSLOG_IDENTIFIER") or "?")
+    print("%s\t%s\t%s" % (rec.get("__REALTIME_TIMESTAMP", "0"), unit.replace(".service", ""), msg[: int(width)]))
+"""
+
+
+def clock_offset(vm):
+    """This VM's clock minus this machine's, in seconds, and the round trip it was read in."""
+    before = time.time()
+    _, out, _ = vm_bash(vm, "date +%s.%N", quiet=True)
+    after = time.time()
+    try:
+        return float(out.strip()) - (before + after) / 2, after - before
+    except ValueError:
+        return None, after - before
+
+
+def cmd_timeline(a):
+    targets = dict(hives())
+    for extra in a.vm or []:
+        name, vm = extra.split("=")
+        targets[name.strip()] = vm.strip()
+    b64 = base64.b64encode(TIMELINE_SCRIPT.encode()).decode("ascii")
+    rows, offsets, threads = [], {}, []
+
+    def one(hive, vm):
+        offsets[hive] = clock_offset(vm)
+        argv = [a.since, a.until or "", "1" if a.all else "0", ",".join(TIMELINE_UNITS),
+                TIMELINE_MILESTONES, str(a.width)]
+        quoted = " ".join("'%s'" % x.replace("'", "'\\''") for x in argv)
+        _, out, _ = vm_bash(vm, "echo %s | base64 -d | python3 - %s" % (b64, quoted), quiet=True)
+        for line in out.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[0].isdigit():
+                rows.append((int(parts[0]) / 1e6, hive, parts[1], parts[2]))
+
+    for hive, vm in targets.items():
+        t = threading.Thread(target=one, args=(hive, vm))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    print("clock offsets against this machine (a guest-agent call each, so +-half its round trip):")
+    for hive in targets:
+        offset, rtt = offsets.get(hive, (None, 0))
+        print("  %-10s %s (round trip %.2fs)" % (
+            hive, "%+.3fs" % offset if offset is not None else "unknown", rtt))
+    if a.align:
+        rows = [(ts - (offsets.get(hive, (None, 0))[0] or 0), hive, unit, msg)
+                for ts, hive, unit, msg in rows]
+    rows.sort()
+    if not rows:
+        print("no lines in the window")
+        return
+    first = rows[0][0]
+    previous = first
+    print("%9s %8s  %-10s %-18s %s" % ("t", "delta", "hive", "unit", "line (UTC %s)" % utc_stamp(first)))
+    for ts, hive, unit, msg in rows:
+        print("%8.3fs %7.3fs  %-10s %-18s %s" % (ts - first, ts - previous, hive, unit[:18], msg))
+        previous = ts
 
 
 def main():
@@ -488,6 +625,13 @@ def main():
     s.add_argument("--snapshot", required=True, help="name of the snapshot taken on every VM first")
     s.add_argument("--drop", help="the snapshot to delete where a VM already has its one")
     s.set_defaults(fn=cmd_deploy)
+    s = sub.add_parser("timeline"); s.add_argument("--since", required=True, help="UTC, 'YYYY-MM-DD HH:MM:SS'")
+    s.add_argument("--until", help="UTC, 'YYYY-MM-DD HH:MM:SS'")
+    s.add_argument("--vm", action="append", help="NAME=VMID, a VM outside the inventory (repeatable)")
+    s.add_argument("--all", action="store_true", help="every line, not only the milestones")
+    s.add_argument("--align", action="store_true", help="shift each hive's lines by its clock offset")
+    s.add_argument("--width", type=int, default=170, help="the longest line shown")
+    s.set_defaults(fn=cmd_timeline)
     a = p.parse_args()
     # Progress shows as it happens even when the output goes to a pipe or a file.
     sys.stdout.reconfigure(line_buffering=True)
