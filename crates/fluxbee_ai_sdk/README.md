@@ -91,11 +91,17 @@ pub fn create_function_calling_model(
   - **`AiSdkError::Refused`:** the model declined: Anthropic's `stop_reason: refusal`, an OpenAI
     refusal part, or OpenAI's content filter. A tool turn that refuses is this error too, never an
     empty turn its caller asks again without tools.
-  - **`is_provider_failure()`:** the provider gave no answer: `Provider`, `Http` (no connection, or
-    an answer that could not be read), `Timeout` or `Refused`. Neither the model's answer nor the
-    caller's request is at fault. An AI node answers a person with `PROVIDER_FAILURE_TEXT` then,
-    one fixed text in English, and logs the error (the operator's call of 2026-11-08); SY.cognition
-    counts it apart from an invalid output.
+  - **`AiSdkError::NoAnswer`:** a 2xx with nothing to send, no text or only blanks, and no
+    refusal; its `reason` says what the answer held (`stop_reason=…`, `status=…`). A tool turn's
+    blank text is `None`.
+  - **`AiSdkError::MissingKey`:** there is no key to ask the provider with; the caller makes it
+    when SY.vault gives none.
+  - **`is_provider_failure()`:** the provider gave no answer: `MissingKey`, `Provider`, `Http` (no
+    connection, or an answer that could not be read), `Timeout`, `NoAnswer` or `Refused`. Neither
+    the request nor its contract is at fault, and a cut answer (`Truncated`) is not one. An AI node
+    answers a person with `PROVIDER_FAILURE_TEXT` then, one fixed text in English, and logs the
+    error (the operator's call of 2026-11-08); SY.cognition counts it apart from an invalid
+    output.
 - **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (each
   provider's `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says
   `abandoned`. The bound is for stuck connections: a long reasoning answer or an Archi stage fits

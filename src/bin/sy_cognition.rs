@@ -152,7 +152,8 @@ struct NarrativeOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelFailure {
     /// The provider gave no answer: an error status after its retries, no connection, none in
-    /// time, or the model's refusal. Cognition does not judge it: it is no invalid output.
+    /// time, an answer with no text, or the model's refusal. Cognition does not judge it: it is
+    /// no invalid output.
     Provider,
     /// The model answered, and its answer is not the object asked for: no JSON, other JSON, or
     /// one cut at its token limit.
@@ -5654,6 +5655,10 @@ mod tests {
             provider: fluxbee_ai_sdk::AiProvider::OpenAi,
             limit: "max_output_tokens",
         };
+        let empty = || fluxbee_ai_sdk::AiSdkError::NoAnswer {
+            provider: fluxbee_ai_sdk::AiProvider::Anthropic,
+            reason: "stop_reason=end_turn".to_string(),
+        };
         for (make, kind) in [
             (
                 provider as fn() -> fluxbee_ai_sdk::AiSdkError,
@@ -5661,6 +5666,7 @@ mod tests {
             ),
             (refused, ModelFailure::Provider),
             (late, ModelFailure::Provider),
+            (empty, ModelFailure::Provider),
             (no_json, ModelFailure::InvalidOutput),
             (cut, ModelFailure::InvalidOutput),
         ] {

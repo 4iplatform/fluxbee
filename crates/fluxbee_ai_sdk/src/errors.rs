@@ -37,6 +37,20 @@ pub enum AiSdkError {
         provider: AiProvider,
         limit: &'static str,
     },
+    /// The provider answered with nothing to send: no text, or only blanks, and no refusal. The
+    /// reason says what its answer held instead (FINDINGS A-184).
+    #[error("{provider} answered with no text ({reason})")]
+    NoAnswer {
+        provider: AiProvider,
+        reason: String,
+    },
+    /// There is no key to ask the provider with: SY.vault has none for the node, or could not be
+    /// asked. The provider was never called (FINDINGS A-184).
+    #[error("missing AI api key for {provider}: {reason}")]
+    MissingKey {
+        provider: AiProvider,
+        reason: String,
+    },
     #[error("invalid response contract: {detail}")]
     InvalidResponseContract { detail: String },
     #[error("invalid structured output: {detail}")]
@@ -140,9 +154,11 @@ impl AiSdkError {
         matches!(self, AiSdkError::Truncated { .. })
     }
 
-    /// The provider gave no answer: an error status after its retries, no connection or an answer
-    /// that could not be read, none in time, or the model's refusal. Neither the model's answer
-    /// nor the caller's request is at fault (FINDINGS A-184).
+    /// The provider gave no answer: there is no key to ask it with, it answered an error status
+    /// after its retries, it could not be reached or its answer read, it gave none in time, it
+    /// answered with no text, or the model refused. Neither the request nor its contract is at
+    /// fault, and an answer cut at its token limit is not this (FINDINGS A-184). An AI node gives
+    /// a person `PROVIDER_FAILURE_TEXT` for it.
     pub fn is_provider_failure(&self) -> bool {
         matches!(
             self,
@@ -150,6 +166,8 @@ impl AiSdkError {
                 | AiSdkError::Http(_)
                 | AiSdkError::Timeout(_)
                 | AiSdkError::Refused { .. }
+                | AiSdkError::NoAnswer { .. }
+                | AiSdkError::MissingKey { .. }
         )
     }
 
@@ -177,6 +195,8 @@ impl AiSdkError {
             AiSdkError::Provider(_) => false,
             AiSdkError::Refused { .. } => false,
             AiSdkError::Truncated { .. } => false,
+            AiSdkError::NoAnswer { .. } => false,
+            AiSdkError::MissingKey { .. } => false,
             AiSdkError::InvalidResponseContract { .. } => false,
             AiSdkError::InvalidStructuredOutput { .. } => false,
             AiSdkError::InvalidMenu { .. } => false,

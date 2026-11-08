@@ -492,10 +492,10 @@ impl LlmClient for OpenAiResponsesClient {
                     reason,
                 });
             }
-            return Err(AiSdkError::Protocol(format!(
-                "responses payload missing text output ({})",
-                openai_no_text_reason(&value)
-            )));
+            return Err(AiSdkError::NoAnswer {
+                provider: AiProvider::OpenAi,
+                reason: openai_no_text_reason(&value),
+            });
         };
 
         let text = match &request.output_schema {
@@ -510,9 +510,15 @@ impl LlmClient for OpenAiResponsesClient {
 /// The answer of a Responses payload: `output_text` when the server sends it (the official SDKs
 /// compute it client-side), else the first text of the first `message` item of `output`. A model
 /// that reasons puts a `reasoning` item first, so the first item is not the answer: reading it
-/// left SY.cognition's tagger with "missing text output" on gpt-5.5 (A-69).
+/// left SY.cognition's tagger with "missing text output" on gpt-5.5 (A-69). A blank text is none:
+/// it is nothing to send (FINDINGS A-184).
 fn openai_response_text(value: &Value) -> Option<String> {
-    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+    let written = |text: &&str| !text.trim().is_empty();
+    if let Some(text) = value
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(written)
+    {
         return Some(text.to_string());
     }
     value
@@ -524,6 +530,7 @@ fn openai_response_text(value: &Value) -> Option<String> {
         .and_then(Value::as_array)?
         .iter()
         .find_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(written)
         .map(ToString::to_string)
 }
 
@@ -1635,15 +1642,17 @@ fn anthropic_response_text(value: &Value) -> Result<String> {
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("");
-    if text.is_empty() {
-        // Why there is none, so a refusal and an empty answer read apart (FINDINGS A-162).
+    if text.trim().is_empty() {
+        // Nothing to send, and why, so an empty answer reads apart from a refusal (FINDINGS
+        // A-162, A-184).
         let stop_reason = value
             .get("stop_reason")
             .and_then(Value::as_str)
             .unwrap_or("none");
-        return Err(AiSdkError::Protocol(format!(
-            "anthropic response missing text content (stop_reason={stop_reason})"
-        )));
+        return Err(AiSdkError::NoAnswer {
+            provider: AiProvider::Anthropic,
+            reason: format!("stop_reason={stop_reason}"),
+        });
     }
     Ok(text)
 }
@@ -1784,12 +1793,10 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
                 .fold(0, u64::saturating_add)
             })
             .unwrap_or(0) as u32;
+        // A blank text is none, as on OpenAI's turn: nothing to send (FINDINGS A-184).
+        let assistant_text = assistant_text.join("");
         Ok(FunctionModelTurnResponse {
-            assistant_text: if assistant_text.is_empty() {
-                None
-            } else {
-                Some(assistant_text.join(""))
-            },
+            assistant_text: (!assistant_text.trim().is_empty()).then_some(assistant_text),
             tool_calls,
             tokens_used,
         })
@@ -2137,7 +2144,7 @@ mod tests {
         .expect_err("no text");
         assert_eq!(
             err.to_string(),
-            "protocol error: anthropic response missing text content (stop_reason=refusal)"
+            "anthropic answered with no text (stop_reason=refusal)"
         );
         assert!(anthropic_response_text(&json!({"content": []}))
             .expect_err("no text")
@@ -3121,6 +3128,14 @@ mod tests {
             openai_response_text(&json!({"output_text": "plain"})).as_deref(),
             Some("plain")
         );
+        // A blank text is none (FINDINGS A-184).
+        assert_eq!(openai_response_text(&json!({"output_text": " \n "})), None);
+        assert_eq!(
+            openai_response_text(&json!({"output": [
+                {"type": "message", "content": [{"type": "output_text", "text": ""}]}
+            ]})),
+            None
+        );
     }
 
     #[test]
@@ -3756,5 +3771,80 @@ providers:
             ),
             "{err:?}"
         );
+    }
+
+    /// An answer with nothing to send, no text or only blanks and no refusal, is its own error on
+    /// both providers' plain path, and a tool turn's blank text is none (FINDINGS A-184): a person
+    /// gets the fixed text for it, as for a missing key, never an empty reply.
+    #[tokio::test]
+    async fn an_answer_with_nothing_to_send_is_its_own_error() {
+        for (answer, reason) in [
+            (
+                json!({"id": "resp_e", "status": "completed", "output": []}),
+                "status=completed",
+            ),
+            (
+                json!({"id": "resp_b", "status": "completed", "output_text": " \n"}),
+                "status=completed",
+            ),
+        ] {
+            let (base_url, _bodies, handle) = spawn_single_response_server(answer);
+            let err = OpenAiResponsesClient::new("test-key", test_account())
+                .with_base_url(base_url)
+                .generate(plain_request())
+                .await
+                .expect_err("nothing to send");
+            handle.join().expect("server thread");
+            let AiSdkError::NoAnswer {
+                provider: AiProvider::OpenAi,
+                reason: said,
+            } = &err
+            else {
+                panic!("no answer: {err:?}");
+            };
+            assert_eq!(said, reason);
+            assert!(err.is_provider_failure());
+        }
+
+        let blank = || {
+            json!({
+                "content": [{"type": "text", "text": "  "}],
+                "stop_reason": "end_turn"
+            })
+        };
+        let (base_url, _bodies, handle) = spawn_single_response_server(blank());
+        let err = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("nothing to send");
+        handle.join().expect("server thread");
+        assert_eq!(
+            err.to_string(),
+            "anthropic answered with no text (stop_reason=end_turn)"
+        );
+        assert!(err.is_provider_failure());
+
+        let (base_url, _bodies, handle) = spawn_single_response_server(blank());
+        let turn = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model("claude-sonnet-5-5", None, ModelSettings::default())
+            .run_turn(plain_turn())
+            .await
+            .expect("a turn");
+        handle.join().expect("server thread");
+        assert_eq!(turn.assistant_text, None);
+
+        // A missing key is the provider's side too; a cut answer is not.
+        assert!(AiSdkError::MissingKey {
+            provider: AiProvider::OpenAi,
+            reason: "SY.vault has no openai secret for this node".to_string(),
+        }
+        .is_provider_failure());
+        assert!(!AiSdkError::Truncated {
+            provider: AiProvider::OpenAi,
+            limit: "max_output_tokens",
+        }
+        .is_provider_failure());
     }
 }

@@ -148,11 +148,12 @@ EOF
   - any unknown field under `behavior` or `runtime`, `behavior.instructions` included.
 - **`runtime` has one part,** `runtime.cognitive_definition` (`poll_interval_secs`, `blob_root`),
   which applies at the next start.
-- **When the provider gives no answer** (an error status after the AI SDK's retries, no
-  connection, none in time, or a refusal), the person gets one fixed text in English, that the
-  agent's AI provider has a problem and to contact the administrator; the node's journal has the
-  error, `AI runtime request failed`. A sender with a response envelope gets the error payload
-  instead (FINDINGS A-184; [nodes/ai/ai-generic/README.md](../nodes/ai/ai-generic/README.md)).
+- **When the provider gives no answer** (no key for it in SY.vault, an error status after the AI
+  SDK's retries, no connection, none in time, an answer with no text, or a refusal), the person
+  gets one fixed text in English, that the agent's AI provider has a problem and to contact the
+  administrator; the node's journal has the error, `AI runtime request failed`. A sender with a
+  response envelope gets the error payload instead, `missing_ai_api_key` for a missing key
+  (FINDINGS A-184; [nodes/ai/ai-generic/README.md](../nodes/ai/ai-generic/README.md)).
 - **Timeouts, workers and queue are the AI runtime's, not config:**
   - each model call has 5 min, its provider's own retries included;
   - a message has 47 min: up to 8 model turns of a tool loop, one plain call after them, and 2 min

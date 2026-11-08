@@ -215,9 +215,9 @@ stays in the last turns.
   1024 output tokens (`SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS`); no temperature.
 - **A failed call is counted by what it was** (`model_failure`, FINDINGS A-184):
   - **the provider gave no answer:** an error status after the AI SDK's retries, no connection,
-    no answer in its `timeout_ms`, or the model's refusal. Cognition does not judge it:
-    `semantic_tagger_provider_errors_total`. A provider's error status, a 429 among them, used to
-    count as an invalid output, as if the model had answered badly;
+    no answer in its `timeout_ms`, an answer with no text, or the model's refusal. Cognition does
+    not judge it: `semantic_tagger_provider_errors_total`. A provider's error status, a 429 among
+    them, used to count as an invalid output, as if the model had answered badly;
   - **the model answered, and not with that JSON object** (no JSON, other JSON, or an answer cut
     at its token limit): `semantic_tagger_invalid_outputs_total`;
   - **anything else, no AI key included:** `semantic_tagger_failures_total`.

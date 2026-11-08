@@ -1030,16 +1030,6 @@ impl AiNode for GenericAiNode {
                     .await
                 {
                     Ok(output) => output,
-                    Err(err) if err.to_string().contains("missing AI api key") => {
-                        tracing::warn!(
-                            node_name = %self.node_name,
-                            trace_id = %msg.routing.trace_id,
-                            error = %err,
-                            "AI runtime missing api key; replying with runtime-not-ready payload"
-                        );
-                        let payload = missing_ai_api_key_payload(openai.provider);
-                        return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
-                    }
                     Err(err) => {
                         let attachment_summary =
                             attachment_summary_for_observability(resolved_user_input.as_ref());
@@ -1100,11 +1090,12 @@ impl GenericAiNode {
         let api_key = self
             .resolve_ai_api_key(openai.provider)
             .await
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                    "missing AI api key in SY.vault resource_type={}",
+            .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
+                provider: openai.provider,
+                reason: format!(
+                    "SY.vault has no key of resource_type {} for the frontdesk",
                     openai.provider
-                ))
+                ),
             })?;
         let account = self.usage_account(ctx);
         let client = create_llm_client(
@@ -3292,6 +3283,15 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "message": "The AI model declined to answer.",
             "retryable": false
         }),
+        fluxbee_ai_sdk::errors::AiSdkError::NoAnswer { .. } => json!({
+            "type": "error",
+            "code": "provider_no_answer",
+            "message": "The AI provider answered with no text.",
+            "retryable": false
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::MissingKey { provider, .. } => {
+            missing_ai_api_key_payload(*provider)
+        }
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(_) => json!({
             "type": "error",
             "code": "provider_error",
@@ -4327,9 +4327,12 @@ mod tests {
         assert!(!FRONTDESK_DEFAULT_SYSTEM_PROMPT.contains("delete"));
     }
 
+    /// As in ai.generic: without a key, the person gets the fixed text, never a fatal error; io.api
+    /// and io.cloud, whose messages carry a response envelope, get `missing_ai_api_key` (FINDINGS
+    /// A-184).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the env lock spans the whole test, awaits included
-    async fn ai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
+    async fn ai_chat_missing_api_key_answers_the_fixed_text_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
         let node = test_node();
@@ -4359,7 +4362,21 @@ mod tests {
             .await
             .expect("on_message should not fail fatally")
             .expect("response should be present");
+        assert_eq!(response.payload["type"], json!("text"));
+        assert_eq!(response.payload["content"], json!(PROVIDER_FAILURE_TEXT));
 
+        let msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "sim-thread-1",
+                "response_envelope": producer_contract()
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("on_message should not fail fatally")
+            .expect("response should be present");
         assert_eq!(
             response.payload.get("code").and_then(Value::as_str),
             Some("missing_ai_api_key")
@@ -4915,6 +4932,14 @@ mod tests {
                 reason: "refusal",
             },
             fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string()),
+            fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
+                provider: AiProvider::Anthropic,
+                reason: "stop_reason=end_turn".to_string(),
+            },
+            fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
+                provider: AiProvider::Anthropic,
+                reason: "SY.vault has no anthropic key for the frontdesk".to_string(),
+            },
         ] {
             let (payload, reply) = ai_chat_failure_reply(&err, false, false);
             assert_eq!(reply, "provider_failure_text", "{err}");
@@ -4924,12 +4949,17 @@ mod tests {
             assert_eq!(reply, "error_payload", "{err}");
             assert_eq!(payload["type"], json!("error"), "{err}");
         }
-        let (_, reply) = ai_chat_failure_reply(
-            &fluxbee_ai_sdk::errors::AiSdkError::Protocol("unexpected".to_string()),
+        // A cut answer keeps its error payload.
+        let (payload, reply) = ai_chat_failure_reply(
+            &fluxbee_ai_sdk::errors::AiSdkError::Truncated {
+                provider: AiProvider::OpenAi,
+                limit: "max_output_tokens",
+            },
             false,
             false,
         );
         assert_eq!(reply, "error_payload");
+        assert_eq!(payload["code"], json!("provider_output_truncated"));
     }
 
     #[test]

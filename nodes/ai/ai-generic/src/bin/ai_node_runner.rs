@@ -916,16 +916,6 @@ impl AiNode for GenericAiNode {
                     .await
                 {
                     Ok(answer) => answer,
-                    Err(err) if err.to_string().contains("missing AI api key") => {
-                        tracing::warn!(
-                            node_name = %self.node_name,
-                            trace_id = %msg.routing.trace_id,
-                            error = %err,
-                            "AI runtime missing api key; replying with runtime-not-ready payload"
-                        );
-                        let payload = missing_ai_api_key_payload(&err.to_string());
-                        return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
-                    }
                     Err(err) => {
                         let attachment_summary =
                             attachment_summary_for_observability(resolved_user_input.as_ref());
@@ -985,10 +975,7 @@ impl GenericAiNode {
         ctx: &BehaviorContext,
         contract: Option<&MessageContract>,
     ) -> fluxbee_ai_sdk::Result<AiChatAnswer> {
-        let credential = self
-            .resolve_ai_credential(engine.provider)
-            .await
-            .map_err(fluxbee_ai_sdk::errors::AiSdkError::Protocol)?;
+        let credential = self.resolve_ai_credential(engine.provider).await?;
         let account = self.usage_account(ctx);
         let client = create_llm_client(
             credential.provider,
@@ -1243,15 +1230,18 @@ impl GenericAiNode {
     /// The AI key comes from SY.vault by resource type, like every other AI consumer: the
     /// node's provider's (`effective_ai_engine`), and only in its tenant: one this node owns,
     /// one assigned to it, or its tenant's general one (docs/ilk-tenant-model-v1.md §2.2). The
-    /// root tenant's keys are the core's. Nodes do not name a Vault key.
+    /// root tenant's keys are the core's. Nodes do not name a Vault key. Without one the error is
+    /// `MissingKey`, whose person gets the fixed text (FINDINGS A-184).
     async fn resolve_ai_credential(
         &self,
         provider: AiProvider,
-    ) -> std::result::Result<ResolvedAiCredential, String> {
+    ) -> fluxbee_ai_sdk::Result<ResolvedAiCredential> {
+        let missing =
+            |reason: String| fluxbee_ai_sdk::errors::AiSdkError::MissingKey { provider, reason };
         let Some(vault) = self.vault.as_ref() else {
-            return Err(
-                "missing AI api key: no vault client (the node has no self ILK)".to_string(),
-            );
+            return Err(missing(
+                "no vault client (the node has no self ILK)".to_string(),
+            ));
         };
         let tenant = self
             .self_tenant_id
@@ -1263,14 +1253,14 @@ impl GenericAiNode {
         {
             Ok(Some(value)) => match extract_ai_api_key_from_value(&value) {
                 Some(api_key) => Ok(ResolvedAiCredential { provider, api_key }),
-                None => Err(format!(
-                    "missing AI api key: the {provider} secret in SY.vault has no api_key"
-                )),
+                None => Err(missing(format!(
+                    "the {provider} secret in SY.vault has no api_key"
+                ))),
             },
-            Ok(None) => Err(format!(
-                "missing AI api key: SY.vault has no {provider} secret for this node (owned, assigned, or tenant {tenant}'s general one)"
-            )),
-            Err(err) => Err(format!("missing AI api key: SY.vault lookup failed: {err}")),
+            Ok(None) => Err(missing(format!(
+                "SY.vault has no {provider} secret for this node (owned, assigned, or tenant {tenant}'s general one)"
+            ))),
+            Err(err) => Err(missing(format!("SY.vault lookup failed: {err}"))),
         }
     }
 
@@ -6484,6 +6474,15 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "message": "The AI model declined to answer.",
             "retryable": false
         }),
+        fluxbee_ai_sdk::errors::AiSdkError::NoAnswer { .. } => json!({
+            "type": "error",
+            "code": "provider_no_answer",
+            "message": "The AI provider answered with no text.",
+            "retryable": false
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::MissingKey { reason, .. } => {
+            missing_ai_api_key_payload(reason)
+        }
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(_) => json!({
             "type": "error",
             "code": "provider_error",
@@ -7427,6 +7426,14 @@ mod tests {
                 reason: "stop_reason=refusal",
             },
             fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string()),
+            fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
+                provider: AiProvider::OpenAi,
+                reason: "status=completed".to_string(),
+            },
+            fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
+                provider: AiProvider::Anthropic,
+                reason: "SY.vault has no anthropic secret for this node".to_string(),
+            },
         ];
         for err in &failures {
             for contract in [None, Some(sample_menu_contract())] {
@@ -7443,15 +7450,46 @@ mod tests {
             assert_eq!(reply, "error_payload", "{err}");
             assert_eq!(payload["type"], json!("error"), "{err}");
         }
-        let (payload, reply) = ai_chat_failure_reply(
-            &fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput {
-                detail: "not_json".to_string(),
-            },
-            None,
-            false,
-        );
-        assert_eq!(reply, "error_payload");
-        assert_eq!(payload["code"], json!("invalid_structured_output"));
+        // A cut answer and an answer off its contract keep their error payload.
+        for (err, code) in [
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput {
+                    detail: "not_json".to_string(),
+                },
+                "invalid_structured_output",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::Truncated {
+                    provider: AiProvider::Anthropic,
+                    limit: "max_tokens",
+                },
+                "provider_output_truncated",
+            ),
+        ] {
+            let (payload, reply) = ai_chat_failure_reply(&err, None, false);
+            assert_eq!(reply, "error_payload", "{err}");
+            assert_eq!(payload["code"], json!(code), "{err}");
+        }
+        // Under an envelope, a missing key and an answer with no text keep their own codes.
+        for (err, code) in [
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
+                    provider: AiProvider::OpenAi,
+                    reason: "no vault client".to_string(),
+                },
+                "missing_ai_api_key",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
+                    provider: AiProvider::OpenAi,
+                    reason: "status=completed".to_string(),
+                },
+                "provider_no_answer",
+            ),
+        ] {
+            let (payload, _) = ai_chat_failure_reply(&err, Some(&sales_contract()), false);
+            assert_eq!(payload["code"], json!(code), "{err}");
+        }
     }
 
     /// A model that refuses on a tool turn ends the run with its refusal, with no call without
@@ -8507,7 +8545,7 @@ mod tests {
             assert_eq!(payload["retryable"], json!(false));
         }
         let other = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-            "anthropic response missing text content (stop_reason=end_turn)".to_string(),
+            "function calling loop exceeded max_turns=8".to_string(),
         ));
         assert_eq!(other["code"], json!("provider_error"));
         let refused = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Refused {
@@ -8515,6 +8553,11 @@ mod tests {
             reason: "stop_reason=refusal",
         });
         assert_eq!(refused["code"], json!("provider_refused"));
+        let empty = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
+            provider: AiProvider::Anthropic,
+            reason: "stop_reason=end_turn".to_string(),
+        });
+        assert_eq!(empty["code"], json!("provider_no_answer"));
     }
 
     /// A model call that times out is retryable only while no tool has run: on a later turn of
@@ -8530,9 +8573,11 @@ mod tests {
         assert_eq!(after["retryable"], json!(false));
     }
 
+    /// Without a key, the person gets the fixed text, never a fatal error; a sender with a
+    /// response envelope gets `missing_ai_api_key` (FINDINGS A-184).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the env lock spans the whole test, awaits included
-    async fn ai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
+    async fn ai_chat_missing_api_key_answers_the_fixed_text_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
         let node = test_node();
@@ -8552,17 +8597,38 @@ mod tests {
             }));
         }
 
-        let mut msg = sample_user_request_with_context(
-            json!({ "thread_id": "sim-thread-1" }),
-            Some("ilk:11111111-1111-4111-8111-111111111111"),
-        );
-        msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
+        let message = |context: Value| {
+            let mut msg = sample_user_request_with_context(
+                context,
+                Some("ilk:11111111-1111-4111-8111-111111111111"),
+            );
+            msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
+            msg
+        };
         let response = node
-            .on_message(msg)
+            .on_message(message(json!({ "thread_id": "sim-thread-1" })))
             .await
             .expect("on_message should not fail fatally")
             .expect("response should be present");
+        assert_eq!(response.payload["type"], json!("text"));
+        assert_eq!(
+            response.payload["content"],
+            json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT)
+        );
 
+        let response = node
+            .on_message(message(json!({
+                "thread_id": "sim-thread-1",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["reply"],
+                    "properties": {"reply": {"type": "string"}},
+                    "text_field": "reply"
+                }
+            })))
+            .await
+            .expect("on_message should not fail fatally")
+            .expect("response should be present");
         assert_eq!(
             response.payload.get("code").and_then(Value::as_str),
             Some("missing_ai_api_key")
@@ -10723,7 +10789,7 @@ mod tests {
         let node = test_node();
         node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
         // Its own provider and model, and no SY.vault client: a message that passed the check
-        // would be answered `missing_ai_api_key`.
+        // would be answered the fixed text, for its missing key.
         *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), Some("gpt-5.5")));
 
         let mut invalid = sample_wf_menu_context();
@@ -10777,7 +10843,10 @@ mod tests {
             .await
             .expect("on_message")
             .expect("a reply");
-        assert_eq!(reply.payload["code"], "missing_ai_api_key");
+        assert_eq!(
+            reply.payload["content"],
+            json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT)
+        );
     }
 
     /// Under a WF's menu, the tool loop's reply is the answer's `reply`, with the files its tools

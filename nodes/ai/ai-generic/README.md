@@ -283,18 +283,20 @@ On every request the node reads the key of its provider from SY.vault:
   *"There is a problem with the AI provider this agent uses, so it could not answer. Please
   contact your administrator."* (`PROVIDER_FAILURE_TEXT`; the operator's call of 2026-11-08,
   FINDINGS A-184).
-  - **No answer means:** an error status after the AI SDK's retries, no connection, none in time,
-    or the model's refusal (`AiSdkError::is_provider_failure`).
+  - **No answer means:** no key for the node's provider in SY.vault, an error status after the AI
+    SDK's retries, no connection or an answer that cannot be read, none in time, an answer with no
+    text, or the model's refusal (`AiSdkError::is_provider_failure`).
   - **Why a text:** it reaches the person on any path a text answer takes, a WF's forward among
     them; the error payload reached no one.
   - **Where the error goes:** the node's journal, `AI runtime request failed`, with
     `provider_status`, `provider_param`, `provider_request_id` and the error.
   - **A sender with a response envelope** is a program that reads the object it asked for, so it
-    gets the error payload instead: `provider_invalid_request`, `provider_auth_error`,
-    `provider_timeout`, `provider_rate_limited`, `provider_unavailable`, `provider_error`,
-    `provider_attachment_invalid_request`, `provider_refused` or `provider_unreachable`.
+    gets the error payload instead: `missing_ai_api_key`, `provider_invalid_request`,
+    `provider_auth_error`, `provider_timeout`, `provider_rate_limited`, `provider_unavailable`,
+    `provider_error`, `provider_attachment_invalid_request`, `provider_no_answer`,
+    `provider_refused` or `provider_unreachable`.
   - **Any other failure** is its error payload, as below: an invalid contract or menu, an answer
-    off its contract, an answer cut at its token limit, a missing key.
+    off its contract, an answer cut at its token limit.
 - **Time:** the AI runtime's defaults, not config:
   - each model call has 5 min, its provider's own retries included (up to 3 attempts on a 408,
     409, 429 or 5xx, after the wait the provider names);
