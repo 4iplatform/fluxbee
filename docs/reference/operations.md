@@ -172,7 +172,10 @@ What a worker join does (`add_hive_flow`):
 5. Writes one systemd unit per core service (`core_service_unit_contents`), starts `rt-gateway`
    and `sy-orchestrator`, waits for the WAN link and for the spoke's orchestrator to appear.
 6. Sends `ADD_HIVE_FINALIZE` over the mesh, which pairs the two Syncthing instances
-   (`add_hive_finalize_via_socket`).
+   (`add_hive_finalize_via_socket`). The spoke checks what step 3 copied against the manifests,
+   restarting nothing when nothing is new; a vendor still on its way does not stop it, and is
+   reported in `vendor.awaiting_update` until it arrives. Its answer comes within the
+   motherbee's wait (45 s), with `timings_ms` for each step.
 7. Marks the hive `connected` and revokes its own SSH access: removes the motherbee key from
    `authorized_keys` and the temporary sudoers file (`revoke_bootstrap_ssh_access`).
 
@@ -291,7 +294,9 @@ The orchestrator declares one Syncthing folder per kind of content (`dist_sync_f
 
 The motherbee rebuilds `dist/core/<role>` at every start of its orchestrator
 (`materialize_role_core_trees`). A spoke's receive-only copy is never edited locally: the
-orchestrator reverts local changes through Syncthing's `/rest/db/revert`.
+orchestrator reverts local changes through Syncthing's `/rest/db/revert`, once the folder has its
+source. A new spoke's folders, filled by its join before the motherbee's peer is linked, have none
+yet, and are left as they are (FINDINGS A-190).
 
 **Announcing a package to workers.** There is no announce message: the motherbee's Syncthing
 announces a change after its own scan. To make a worker pull a package now, scan the folder **on

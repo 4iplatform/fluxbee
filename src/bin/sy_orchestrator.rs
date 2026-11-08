@@ -3708,6 +3708,8 @@ async fn handle_system_message(
             let _ = send_system_action_response(sender, msg, "INVENTORY_RESPONSE", result).await;
         }
         Some("ADD_HIVE_FINALIZE") => {
+            let started = Instant::now();
+            tracing::info!("ADD_HIVE_FINALIZE received");
             let result = match spoke_only_action_refusal("ADD_HIVE_FINALIZE", state.is_motherbee) {
                 Some(refusal) => {
                     tracing::warn!(
@@ -3718,7 +3720,11 @@ async fn handle_system_message(
                 }
                 None => add_hive_finalize_local_flow(state, &msg.payload).await,
             };
-            tracing::info!(result = %result, "ADD_HIVE_FINALIZE processed");
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                result = %result,
+                "ADD_HIVE_FINALIZE processed"
+            );
             let _ = send_system_action_response(sender, msg, "ADD_HIVE_FINALIZE_RESPONSE", result)
                 .await;
         }
@@ -5778,23 +5784,61 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
     // like a health-gate failure — roll the binaries back so binaries+units stay
     // consistent (regenerated unit files are benign to leave in place: a unit adding
     // TimeoutStopSec still runs the rolled-back binary fine).
-    if let Err(err) = regen_local_core_units(&manifest, state.role) {
-        let rollback_note = match rollback_local_core_binaries(
-            &host,
-            &updated,
-            &backup_dir,
-            &created_without_backup,
-        ) {
-            Ok(()) => "rollback applied".to_string(),
-            Err(rb_err) => format!("rollback failed: {rb_err}"),
-        };
+    let units_changed = match regen_local_core_units(&manifest, state.role) {
+        Ok(changed) => changed,
+        Err(err) => {
+            let rollback_note = match rollback_local_core_binaries(
+                &host,
+                &updated,
+                &backup_dir,
+                &created_without_backup,
+            ) {
+                Ok(()) => "rollback applied".to_string(),
+                Err(rb_err) => format!("rollback failed: {rb_err}"),
+            };
+            return Ok(CorePrepareOutcome::Done(SystemUpdateApplyResult {
+                status: "rollback".to_string(),
+                updated: Vec::new(),
+                unchanged,
+                left_out,
+                restarted: Vec::new(),
+                errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
+            }));
+        }
+    };
+
+    // FINDINGS A-190: with no binary and no unit new, nothing is restarted. A join's finalize runs
+    // a core update over what the bootstrap installed, and restarting the router there cut the
+    // finalize's own reply.
+    if updated.is_empty() && !units_changed {
+        tracing::info!(
+            unchanged = ?unchanged,
+            "core update: every binary and unit is already the manifest's; nothing to restart"
+        );
+        let now_ms = now_epoch_ms().to_string();
+        write_core_installed_record(
+            local_core_manifest_hash().ok().flatten(),
+            "update",
+            serde_json::json!({ "components": [], "left_out": left_out }),
+        );
+        write_core_update_last_record(&serde_json::json!({
+            "phase": "done",
+            "status": "ok",
+            "started_at_ms": now_ms,
+            "finished_at_ms": now_ms,
+            "updated": [],
+            "unchanged": unchanged,
+            "left_out": left_out,
+            "restarted": [],
+            "errors": [],
+        }));
         return Ok(CorePrepareOutcome::Done(SystemUpdateApplyResult {
-            status: "rollback".to_string(),
+            status: "ok".to_string(),
             updated: Vec::new(),
             unchanged,
             left_out,
             restarted: Vec::new(),
-            errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
+            errors: Vec::new(),
         }));
     }
 
@@ -10059,22 +10103,62 @@ fn syncthing_folder_status_from_payload(payload: &serde_json::Value) -> Syncthin
 /// The watchdog's check of one folder: whether it is healthy. A receive-only folder with local
 /// changes gets them reverted first (FINDINGS A-16): Syncthing neither sends nor undoes them, so a
 /// spoke's mirror that something touched would stay diverged from its source, in silence.
+///
+/// Only a folder with a source to revert to (FINDINGS A-190). A join's bootstrap fills a new
+/// spoke's dist folders before its peer is linked: with no source, a revert would delete them, and
+/// the join's finalize needs them.
 fn check_syncthing_folder(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let status = syncthing_folder_status(sync, folder_id)?;
     if status.receive_only_total_items > 0 {
-        tracing::warn!(
-            folder = folder_id,
-            local_items = status.receive_only_total_items,
-            "receive-only folder has local changes; reverting it to its source"
-        );
-        if let Err(err) = syncthing_revert_folder(sync, folder_id) {
-            tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
+        match syncthing_folder_has_source(sync, folder_id) {
+            Ok(true) => {
+                tracing::warn!(
+                    folder = folder_id,
+                    local_items = status.receive_only_total_items,
+                    "receive-only folder has local changes; reverting it to its source"
+                );
+                if let Err(err) = syncthing_revert_folder(sync, folder_id) {
+                    tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
+                }
+            }
+            Ok(false) => tracing::info!(
+                folder = folder_id,
+                local_items = status.receive_only_total_items,
+                "receive-only folder holds local items and has no source peer yet: left as they \
+                 are until its source is linked"
+            ),
+            Err(err) => tracing::warn!(
+                folder = folder_id,
+                error = %err,
+                "could not read the folder's members; its local items are left as they are"
+            ),
         }
     }
     Ok(status.is_healthy())
+}
+
+/// Whether a folder has a source to take from: a member other than this device. A folder Fluxbee
+/// creates starts with none, and gets its peer when the join links it.
+fn syncthing_folder_has_source(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+) -> Result<bool, OrchestratorError> {
+    let (config_xml, _) = read_syncthing_config(&sync.sync_data_dir.join("config.xml"), false)?;
+    let members = syncthing_folder_device_ids(&config_xml, folder_id)?;
+    if members.is_empty() {
+        return Ok(false);
+    }
+    let local = local_syncthing_device_id(sync)?;
+    Ok(folder_members_include_a_peer(&members, &local))
+}
+
+fn folder_members_include_a_peer(members: &[String], local_device_id: &str) -> bool {
+    members
+        .iter()
+        .any(|member| !member.trim().eq_ignore_ascii_case(local_device_id.trim()))
 }
 
 /// `POST /rest/db/revert`: a receive-only folder drops its local changes and takes the source's.
@@ -25384,6 +25468,7 @@ async fn add_hive_finalize_local_flow(
 ) -> serde_json::Value {
     // The Syncthing reconcile stays away from config.xml and the service until this returns.
     let _finalize_in_flight = SyncthingFinalizeInFlight::start();
+    let started = Instant::now();
     let desired_dist = current_dist_runtime_config(state);
     let desired_blob = current_blob_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -25442,6 +25527,7 @@ async fn add_hive_finalize_local_flow(
         runtime: None,
         runtime_version: None,
     };
+    let step = Instant::now();
     let core_result = match apply_system_update_local(state, &core_request).await {
         Ok(result) => result,
         Err(err) => {
@@ -25503,7 +25589,9 @@ async fn add_hive_finalize_local_flow(
     updated.extend(core_result.updated);
     unchanged.extend(core_result.unchanged);
     restarted.extend(core_result.restarted);
+    let core_ms = step.elapsed().as_millis() as u64;
 
+    let step = Instant::now();
     let vendor_request = SystemUpdateRequest {
         category: "vendor".to_string(),
         manifest_version: 0,
@@ -25514,19 +25602,41 @@ async fn add_hive_finalize_local_flow(
     let vendor_result = match apply_system_update_local(state, &vendor_request).await {
         Ok(result) => result,
         Err(err) => {
-            errors.push(err.to_string());
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SYNC_SETUP_FAILED",
-                "message": err.to_string(),
-                "hive_id": state.hive_id,
-                "require_dist_sync": require_dist_sync,
-                "dist_sync_enabled": desired_dist.sync_enabled,
-                "updated": updated,
-                "unchanged": unchanged,
-                "restarted": restarted,
-                "errors": errors,
-            });
+            if let Some(mismatch) = vendor_still_arriving(&SyncthingVendorPaths::local()) {
+                // FINDINGS A-190: the Syncthing the bootstrap installed runs, and the peer link
+                // below brings dist/vendor; until then `/versions` reports it, and the recheck
+                // closes it.
+                tracing::warn!(
+                    hive_id = %state.hive_id,
+                    error = %err,
+                    "vendor finalize pending (dist/vendor not delivered yet); continuing with the \
+                     installed Syncthing"
+                );
+                record_dist_check(state, DistTree::Vendor, vec![mismatch]);
+                unchanged.push("vendor-sync-pending".to_string());
+                SystemUpdateApplyResult {
+                    status: "ok".to_string(),
+                    updated: Vec::new(),
+                    unchanged: Vec::new(),
+                    left_out: Vec::new(),
+                    restarted: Vec::new(),
+                    errors: Vec::new(),
+                }
+            } else {
+                errors.push(err.to_string());
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SYNC_SETUP_FAILED",
+                    "message": err.to_string(),
+                    "hive_id": state.hive_id,
+                    "require_dist_sync": require_dist_sync,
+                    "dist_sync_enabled": desired_dist.sync_enabled,
+                    "updated": updated,
+                    "unchanged": unchanged,
+                    "restarted": restarted,
+                    "errors": errors,
+                });
+            }
         }
     };
     if vendor_result.status != "ok" {
@@ -25553,7 +25663,9 @@ async fn add_hive_finalize_local_flow(
     updated.extend(vendor_result.updated);
     unchanged.extend(vendor_result.unchanged);
     restarted.extend(vendor_result.restarted);
+    let vendor_ms = step.elapsed().as_millis() as u64;
 
+    let step = Instant::now();
     let mut syncthing_peer_linked = false;
     if let (Some(peer_device_id), Some(peer_address)) =
         (syncthing_peer_device_id.as_deref(), syncthing_peer_static)
@@ -25587,6 +25699,7 @@ async fn add_hive_finalize_local_flow(
         }
         syncthing_peer_linked = true;
     }
+    let peer_link_ms = step.elapsed().as_millis() as u64;
 
     let syncthing_device_id = if desired_sync.sync_enabled
         && (blob_sync_tool_is_syncthing(&desired_sync)
@@ -25616,6 +25729,13 @@ async fn add_hive_finalize_local_flow(
     } else {
         None
     };
+    // FINDINGS A-190: the motherbee waits `dist_sync_probe_timeout_secs` (45 s at least) for this
+    // whole finalize, so the probe gets what is left of it, less a margin for the reply.
+    let probe_budget_ms = finalize_probe_budget_ms(
+        dist_sync_probe_timeout_secs,
+        started.elapsed().as_millis() as u64,
+    );
+    let step = Instant::now();
     let (service_active, api_healthy, folder_status, folder_converged, sync_errors) =
         if let Some(folder_id) = probe_folder_id {
             match wait_for_syncthing_folder_convergence(
@@ -25623,7 +25743,7 @@ async fn add_hive_finalize_local_flow(
                 &desired_blob,
                 &desired_dist,
                 folder_id,
-                dist_sync_probe_timeout_secs.saturating_mul(1000),
+                probe_budget_ms,
                 true,
             )
             .await
@@ -25662,6 +25782,7 @@ async fn add_hive_finalize_local_flow(
         } else {
             (false, false, None, false, Vec::new())
         };
+    let dist_probe_ms = step.elapsed().as_millis() as u64;
     let folder_healthy = folder_status
         .as_ref()
         .is_some_and(SyncthingFolderStatus::is_healthy);
@@ -25715,7 +25836,34 @@ async fn add_hive_finalize_local_flow(
         "unchanged": unchanged,
         "restarted": restarted,
         "errors": errors,
+        // Where the finalize spent its time, for a join's timeline.
+        "timings_ms": {
+            "core": core_ms,
+            "vendor": vendor_ms,
+            "peer_link": peer_link_ms,
+            "dist_probe": dist_probe_ms,
+            "dist_probe_budget": probe_budget_ms,
+            "total": started.elapsed().as_millis() as u64,
+        },
     })
+}
+
+/// The margin a join's finalize keeps for its reply inside the motherbee's wait.
+const FINALIZE_REPLY_MARGIN_MS: u64 = 10_000;
+
+/// How long the motherbee waits for a spoke's whole finalize.
+fn finalize_socket_timeout_secs(dist_sync_probe_timeout_secs: u64) -> u64 {
+    dist_sync_probe_timeout_secs.max(45).clamp(30, 75)
+}
+
+/// What a finalize's dist probe may wait: the motherbee's wait for the whole finalize, less what
+/// the finalize spent already and the reply's margin; 5 s at least.
+fn finalize_probe_budget_ms(dist_sync_probe_timeout_secs: u64, spent_ms: u64) -> u64 {
+    let motherbee_wait_ms = finalize_socket_timeout_secs(dist_sync_probe_timeout_secs) * 1000;
+    let probe_ms = dist_sync_probe_timeout_secs.saturating_mul(1000);
+    probe_ms
+        .min(motherbee_wait_ms.saturating_sub(spent_ms + FINALIZE_REPLY_MARGIN_MS))
+        .max(5_000)
 }
 
 fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
@@ -25723,6 +25871,20 @@ fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
     lower.contains("core manifest missing")
         || lower.contains("missing core source binary")
         || lower.contains("core manifest missing required worker component")
+        // FINDINGS A-186's check (`check_dist_file`): "core binary 'X' missing at '<path>'".
+        || (lower.contains("core binary '") && lower.contains("' missing at '"))
+}
+
+/// A join's finalize on a spoke whose dist/vendor has not arrived yet (FINDINGS A-190): what it
+/// lacks, when the manifest or the binary is missing and the Syncthing the bootstrap installed is
+/// there to link the peer that brings it. None otherwise, and the vendor step's error stands.
+fn vendor_still_arriving(paths: &SyncthingVendorPaths) -> Option<DistMismatch> {
+    if !paths.installed.is_file() {
+        return None;
+    }
+    vendored_syncthing_at(paths)
+        .err()
+        .filter(|mismatch| mismatch.reason == DistMismatchReason::Missing)
 }
 
 fn is_socket_only_unreachable_error(error: &str) -> bool {
@@ -25761,7 +25923,7 @@ async fn add_hive_finalize_via_socket(
 ) -> Result<serde_json::Value, OrchestratorError> {
     // Socket-only path is an optimization. Keep it bounded so add_hive still has
     // enough budget to fall back to SSH bootstrap within admin timeout (180s).
-    let timeout_secs = dist_sync_probe_timeout_secs.max(45).clamp(30, 75);
+    let timeout_secs = finalize_socket_timeout_secs(dist_sync_probe_timeout_secs);
     let payload = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
@@ -38646,6 +38808,120 @@ blob:
         // No other caller: those six calls and the function's own head.
         let code = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests")];
         assert_eq!(code.matches("ensure_blob_sync_runtime(").count(), 7);
+    }
+
+    /// FINDINGS A-190: a join's finalize goes on while dist/vendor is still on its way, with the
+    /// Syncthing the bootstrap installed; anything else the vendor step refuses still fails it.
+    #[test]
+    fn a_finalize_goes_on_while_its_vendor_is_still_arriving_and_only_then() {
+        let root = a186_temp_root("a190-vendor");
+        let installed = Some(&b"syncthing-2"[..]);
+        let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
+        fs::remove_file(&paths.manifest).expect("the manifest not there yet");
+        assert_eq!(
+            vendor_still_arriving(&paths).map(|mismatch| mismatch.reason),
+            Some(DistMismatchReason::Missing)
+        );
+        let paths = a189_vendor(&root, b"syncthing-2", None, installed);
+        assert_eq!(
+            vendor_still_arriving(&paths).map(|mismatch| mismatch.reason),
+            Some(DistMismatchReason::Missing),
+            "the binary not there yet"
+        );
+        let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-x"), installed);
+        assert_eq!(
+            vendor_still_arriving(&paths),
+            None,
+            "another binary than its manifest says"
+        );
+        let paths = a189_vendor(&root, b"syncthing-2", None, None);
+        assert_eq!(
+            vendor_still_arriving(&paths),
+            None,
+            "no Syncthing installed to link the peer with"
+        );
+        let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
+        assert_eq!(vendor_still_arriving(&paths), None, "nothing missing");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-190: the finalize's core step takes A-186's words for a binary still on its way
+    /// as pending, as it took the older ones; a binary that is there and wrong still fails it.
+    #[test]
+    fn a_core_binary_still_on_its_way_leaves_a_finalize_pending() {
+        for pending in [
+            "core binary 'sy-timer' missing at '/var/lib/fluxbee/dist/core/bin/sy-timer'",
+            "core manifest missing at '/var/lib/fluxbee/dist/core/manifest.json' (reinstall the \
+             fluxbee package)",
+            "missing core source binary '/var/lib/fluxbee/dist/core/bin/rt-gateway'",
+        ] {
+            assert!(is_add_hive_core_sync_pending_error(pending), "{pending}");
+        }
+        for failed in [
+            "core manifest hash mismatch for 'sy-timer': expected=aa actual=bb",
+            "core binary 'sy-timer' at '/var/lib/fluxbee/dist/core/bin/sy-timer' unreadable: denied",
+        ] {
+            assert!(!is_add_hive_core_sync_pending_error(failed), "{failed}");
+        }
+    }
+
+    /// FINDINGS A-190: a finalize's dist probe fits inside the motherbee's wait for the whole
+    /// finalize, with room for the reply.
+    #[test]
+    fn a_finalize_fits_in_the_motherbees_wait_for_it() {
+        assert_eq!(finalize_socket_timeout_secs(45), 45);
+        assert_eq!(finalize_probe_budget_ms(45, 0), 35_000);
+        assert_eq!(finalize_probe_budget_ms(45, 12_000), 23_000);
+        assert_eq!(finalize_probe_budget_ms(45, 40_000), 5_000);
+        assert_eq!(finalize_probe_budget_ms(60, 0), 50_000);
+        assert_eq!(finalize_probe_budget_ms(600, 0), 65_000);
+        assert_eq!(finalize_probe_budget_ms(5, 0), 5_000);
+    }
+
+    /// FINDINGS A-190: a receive-only folder is reverted only when it has a source, a member other
+    /// than this device. A join leaves a new spoke's folders with no member until it links the peer.
+    #[test]
+    fn a_folder_without_a_peer_has_nothing_to_revert_to() {
+        let local = "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH";
+        let peer = "IIIIIII-JJJJJJJ-KKKKKKK-LLLLLLL-MMMMMMM-NNNNNNN-OOOOOOO-PPPPPPP";
+        assert!(!folder_members_include_a_peer(&[local.to_string()], local));
+        assert!(!folder_members_include_a_peer(
+            &[local.to_ascii_lowercase()],
+            local
+        ));
+        assert!(folder_members_include_a_peer(
+            &[local.to_string(), peer.to_string()],
+            local
+        ));
+        assert!(folder_members_include_a_peer(&[peer.to_string()], local));
+        let new_spoke = r#"<configuration>
+  <folder id="fluxbee-dist-vendor" path="/var/lib/fluxbee/dist/vendor" type="receiveonly"></folder>
+  <device id="AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH" name="gate"></device>
+</configuration>"#;
+        assert!(
+            syncthing_folder_device_ids(new_spoke, "fluxbee-dist-vendor")
+                .expect("parses")
+                .is_empty()
+        );
+    }
+
+    /// FINDINGS A-190: a core update with no binary and no unit new restarts nothing: it ends
+    /// after the units are rendered and before the restarts are prepared.
+    #[test]
+    fn a_core_update_with_nothing_new_restarts_nothing() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src.find("fn prepare_core_update(").expect("the prepare")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let regen = body
+            .find("regen_local_core_units(&manifest, state.role)")
+            .expect("the units");
+        let nothing_new = body
+            .find("if updated.is_empty() && !units_changed")
+            .expect("the no-op");
+        let ready = body
+            .find("CorePrepareOutcome::Ready(")
+            .expect("the restarts");
+        assert!(regen < nothing_new && nothing_new < ready);
     }
 
     /// SY.admin names the policy folder to have it scanned at once after a publish; a folder of

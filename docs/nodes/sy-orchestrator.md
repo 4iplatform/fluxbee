@@ -347,7 +347,13 @@ The worker join (`add_hive_flow`), in order:
    (`render_worker_hive_yaml`; the egress' and the ingress' likewise); push the TLS material
    (`push_hive_tls`) and, for a worker, the identity sync key.
 5. Write and start the units, wait for the spoke's orchestrator on the mesh, send
-   `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked.
+   `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked. On the
+   spoke the finalize (`add_hive_finalize_local_flow`) runs a core update over what step 4 copied,
+   which restarts nothing when nothing is new, then the vendor's: a vendor still on its way, with
+   the Syncthing step 4 installed running, is reported in `vendor.awaiting_update` and the
+   finalize goes on (FINDINGS A-190). It links the motherbee's Syncthing, and waits for its core
+   folder with what is left of the motherbee's wait (`finalize_probe_budget_ms`, a 10 s margin
+   for the reply). Its answer's `timings_ms` gives each step's time.
 6. Mark the hive `connected`, then revoke the SSH access: remove the sudoers file and the
    motherbee key from `authorized_keys` (`revoke_bootstrap_ssh_access`). A failed join revokes
    too (`best_effort_revoke_bootstrap`), except after a transient failure, where the key stays so
@@ -447,7 +453,9 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   dropped it from the role, and the orchestrator the update installs settles it (below). Any
   other update refuses it, as before. Then it backs up each binary to replace under
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` with a `generation.json`,
-  swaps the binaries, rewrites the units, and **answers first** (`phase: restarting`). Two
+  swaps the binaries, rewrites the units, and **answers first** (`phase: restarting`). With no
+  binary and no unit new it restarts nothing, records the update as done and answers `ok`
+  (FINDINGS A-190: a join's finalize runs one over what the join copied). Otherwise, two
   seconds later it restarts `rt-gateway` and the system nodes but the left-out ones, each behind
   a 30 s health gate (`restart_local_core_services_with_health_gate`), skipping itself. A failed
   gate restores the old binaries (`status: rollback`), stopping a node the update created before
