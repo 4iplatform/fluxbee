@@ -104,7 +104,7 @@ no change required
       interim, a hive's drift alerts say they hold only what the motherbee recorded
       (SY.orchestrator, and Archi's line on it).
 7. **Then each SDK alone, from the sweep:**
-   1. 0.1.113: A-182, the Rust SDK's handshake bounded (built, CI green).
+   1. 0.1.113: A-182, the Rust SDK's handshake bounded ✅ live and checked on 8.x (2026-11-08).
    2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline (built, CI green).
    3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count.
 8. **Design first, one at a time, the largest:**
@@ -1344,13 +1344,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   manager serves; `handshakeWithin` bounds every handshake by 5 s. A test with a fake router saw
   the node's first message on its second connection before the fix, and on its first after.
 
-### A-182 [General/Rust SDK] 🟡 BUILT, for 0.1.113 (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Rust node's handshake has no time limit
+### A-182 [General/Rust SDK] ✅ VALIDATED ON 8.x (0.1.113, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Rust node's handshake has no time limit
 
 - **What happens:** `perform_handshake` (`crates/fluxbee_sdk/src/node_client.rs`) sends the HELLO
   and waits for the ANNOUNCE without a limit. A router that takes the connection and never answers
   holds the node in its handshake forever, at the first connection and at any reconnect.
 - **Fix:** 10 s (`HANDSHAKE_TIMEOUT`), past which the handshake fails and the reconnect loop goes
   on.
+- **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
+  as before); a handshake took 11 ms.
 
 ### A-181 [General/blob] 🔵 TO EVALUATE, for the operator (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 

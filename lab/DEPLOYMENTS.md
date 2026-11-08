@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ live, checked on 8.x; its gate found A-185 | snap `pre-take-0-1-112` (all 4 VMs) · `apt install fluxbee=0.1.111` + core-update of the spokes |
+| **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ live, checked on 8.x | snap `pre-rustsdk-0-1-113` (all 4 VMs) · `apt install fluxbee=0.1.112` + core-update of the spokes |
+| **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ replaced by 0.1.113; its gate found A-185 | snap `pre-take-0-1-112` (deleted 2026-11-08) · `apt install fluxbee=0.1.111` + core-update of the spokes |
 | **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ replaced by 0.1.112 | snap `pre-router-0-1-111` (deleted 2026-11-08) · `apt install fluxbee=0.1.110` + core-update of the spokes |
 | **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ replaced by 0.1.111 | snap `pre-family-0-1-110` (deleted 2026-11-08) · `apt install fluxbee=0.1.109` + core-update of the spokes |
 | **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ replaced by 0.1.110 | snap `pre-reset-0-1-109` (deleted 2026-11-07) · `apt install fluxbee=0.1.108` + core-update of the spokes |
@@ -121,6 +122,25 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.113 — The Rust SDK's handshake bounded
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.112 · **Commit:** `f72ca82e`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** shared code goes alone ([METHOD](logbook/METHOD.md) §9): A-182, from the sweep of
+  pending items.
+- **What changed:** `perform_handshake` (`crates/fluxbee_sdk/src/node_client.rs`) waits at most
+  10 s for the router's ANNOUNCE, at the first connection and at every reconnect; past it the
+  handshake fails and is retried.
+- **Checks before the release:** clippy and the SDK's tests on the Mac; GitHub's CI green on its
+  branch and on the integrated head; the review round, for both SDKs: no defect.
+- **Deploy:**
+  - build of `f72ca82e` in 26 min (every Rust binary); publish in 14 s;
+  - snapshot `pre-rustsdk-0-1-113` taken on all 4 VMs, `pre-take-0-1-112` dropped;
+  - 0.1.113 on all 4 in 256 s, health clean.
+- **Checked on 8.x:** every node joined its router again: 4 hives alive and 36 nodes active by
+  type, as before the deploy. SY.cognition on worker1 sent its HELLO and was connected 11 ms
+  later; no handshake failed.
 
 ## 0.1.112 — The first agent on a thread takes what people said, and one orchestrator per host
 
