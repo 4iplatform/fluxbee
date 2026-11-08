@@ -80,7 +80,18 @@ no change required
       3. A message and its copy split in two batches on a new thread.
 
       Then A-137's case closes: gate0206 run once from zero, and taken down.
-4. **Design first, one at a time, the largest:**
+4. **Fourth release, 0.1.110** (each item on a binary of its own, built 2026-11-07, its review
+   rounds' findings fixed):
+   1. A-172 [Archi], with its family: Archi removes a runtime version and a hive, deletes, restores
+      and purges a tenant and lists its nodes, rolls a hive's core back, reads the global
+      versions, deployments and drift alerts; `set_node_config` names its binding fields; a CI
+      check and a test hold the executor's fields to what each route stores (SY.admin).
+   2. A-176, three texts (SY.timer, SY.wf-rules, SY.architect).
+   3. The egress's internet alert and A-174, a worker reads its IPv6 block back (SY.orchestrator);
+      A-175 found: an egress's alerts never reach the motherbee.
+   4. The docs and FINDINGS texts that drifted, from the sweep (docs only, already on daily).
+   5. A-173 held back to a release of its own.
+5. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -147,7 +158,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
-- A-173 🔵 What an agent may know of conversations it was not in: pending by the operator's call.
+- A-173 🟡 The first agent on a thread takes what people said before it: decided, its first build
+  held back by its review; rebuilt in a release of its own.
 
 ### io.web
 
@@ -157,8 +169,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### Archi
 
-- A-172 🟡 Archi cannot remove a runtime version (the executor sends `version`); for the next
-  release.
+- A-172 🟢 Archi cannot remove a runtime version, nor a hive, nor delete a tenant (the executor's
+  fields): built for 0.1.110.
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -188,6 +200,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
+- A-174 🟢 A worker reports its IPv6 blocked without reading it back: built for 0.1.110.
+- A-175 🟡 An egress's drift alerts never reach the motherbee: the operator's design.
+- A-176 🟢 Three texts that misled: built for 0.1.110.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1265,7 +1280,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-173 [WF] 🔵 TO DESIGN, pending by the operator's call (2026-11-07, cognition-hands-v1 §12.6) — What an agent may know of conversations it was not in
+### A-176 [General] 🟢 BUILT for 0.1.110 (found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
+
+- **SY.timer** answered a verb it does not know with `TIMER_INTERNAL`, as if it had broken; now
+  `TIMER_UNKNOWN_VERB`, and `TIMER_INTERNAL` means only an internal error.
+- **SY.wf-rules** answered an unknown operation "not implemented yet"; now "unknown operation".
+- **Archi's attachment error** named OpenAI whatever the provider; now it names the model.
+
+### A-175 [General/egress] 🟡 OPEN, for the operator's design (found 2026-11-07, the review of the egress alert; read in the code) — An egress's drift alerts never reach the motherbee
+
+- **What happens:** an egress's orchestrator writes its drift alerts (`lan_leg_missing`,
+  `ipv4_forwarding_off`, `ipv6_not_blocked`, and since 0.1.110 `internet_unreachable`) in the
+  egress's own `/var/lib/fluxbee/orchestrator/drift-alerts.jsonl`. SY.admin's `get_drift_alerts`
+  and `list_drift_alerts` read only the motherbee's file, a spoke runs no SY.admin, and that folder
+  is not synced. So `GET /hives/egress1/drift-alerts`, and Archi, answer none of them.
+- **A-1's "queryable as drift alerts" was never true** for an egress: only its journal says it.
+- **The call:** the spoke's orchestrator sends the fact to `SY.orchestrator@motherbee` (accepted
+  only from the router-stamped `SY.orchestrator@<that hive>`, the hive taken from the sender), or
+  SY.admin asks the spoke. A cross-hive message must fit the control path's rule (3).
+
+### A-174 [General/egress] 🟢 BUILT for 0.1.110 (an audit's F23, 2026-06-23, half fixed; found again 2026-11-07 by the docs sweep; read in the code) — A worker reports its IPv6 blocked without reading it back
+
+- `reconcile_worker_egress` set `ipv6_blocked = true` once it applied the sysctl, without reading
+  the kernel back, as the egress has done since July. A sysctl that did not take left IPv6 on, and
+  a rogue RA could route around the gateway, while the worker said it was blocked.
+- **Fixed:** it reads it back (`ipv6_disabled_now`), and warns when the block did not take.
+
+### A-173 [WF] 🟡 DECIDED 2026-11-07, its first build held back by its review (cognition-hands-v1 §12.6) — What an agent may know of conversations it was not in
 
 - **The question:** a conversation that starts among people and later reaches an agent. Should the
   agent start from what they said?
@@ -1278,8 +1319,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - nor what two agents of different roles said (§12.6's first question);
   - talks between agents are not passed on;
   - what crosses is *"los hechos negativos y positivos"*, the episodes, as news.
-- **Open:** whether the lines of Juan's part (people talking while the agent's case was with
-  them, §12.3, 1, live since 0.1.104) fall under the rule. Asked the same day.
+- **The operator's second call, the same day:** *"si hacemos que le llegue al agente y el agente
+  lo use o no desde el prompt, tendríamos la posibilidad de activarlo o desactivarlo, y dado que ya
+  está programado, sería coherente dejarlo todo igual, si es posible entonces lo que planteaste
+  antes.. hacelo también"*. So Juan's part stays, the first agent on a thread takes what people
+  said before it, and the agent's role decides whether to use those lines. An agent still never
+  sees another agent's turns.
+- **Built on its branch (`coa/a-173`), held back from 0.1.110:** the agent's new communication
+  takes the no-agent one at its creation. Its review found that the take races the worker: in the
+  usual timing of a message and its copy in two batches, the first message's analysis can be
+  dropped; a take the worker makes lives only in memory until its write-back; the delete and the
+  taker's write are not one transaction; a result redirected by turn keys can pick the wrong
+  agent.
+- **Next:** rebuilt with each take recorded under the held state's lock (no-agent key → taker),
+  which the worker's hold, its write-back and the re-resolution of a queued relay follow; the
+  worker's copy taken under the same lock; the delete in the taker's save transaction. A release
+  of its own (SY.cognition).
 
 ### A-172 [Archi] 🟡 OPEN, for the next release (found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 
@@ -1294,6 +1349,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (next release, SY.admin):** the parameter is `runtime_version` in the help and the path
   pattern; and a test that every executor field of an action is one its handler reads, for every
   route that renames a path segment.
+- **Its review found the family (built for 0.1.110):**
+  - `get_hive` and `remove_hive`: the help named `hive`, the route stores `hive_id`, so Archi's
+    removal of a hive answered "missing hive_id";
+  - `delete_tenant`, `restore_tenant`, `purge_tenant`, `list_tenant_nodes`: an empty executor
+    schema, so no step could name the tenant;
+  - `list_versions`, `list_deployments`, `list_drift_alerts` asked for a hive they had no field
+    for, and `core_rollback` named no hive;
+  - `set_node_config` did not name the binding fields its route lifts.
+  - My first CI check read too few arms and passed most of the family in silence; the check now
+    reads every arm of the help and every form a route stores a segment in, and a test holds that
+    an action needing a hive names one and that every path field is in its schema.
 - **On 8.x meanwhile:** the gate's version was removed through SY.admin's HTTP route.
 
 ### A-171 [General/upgrade] 🔵 TO EVALUATE, low (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock
