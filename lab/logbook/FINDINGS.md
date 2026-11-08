@@ -121,8 +121,11 @@ no change required
    5. A-159: deleting an ILK that other data names, the episodes now among them; a chapter of
       its own.
    6. A-96: how the SY nodes' tokens are measured per message.
-9. **Found by 0.1.117's gate, 🔴, this sprint:** A-190 [General/join]: a fresh worker's join fails
-   at its finalize, so no new worker can join 8.x. The direction of the fix is the operator's call.
+9. **Found by 0.1.117's gate:** A-190 [General/join], a fresh worker could not join ✅ 0.1.118,
+   checked on 8.x with a throwaway worker, timed.
+10. **Found by 0.1.118's timed gate:** A-194 [General/orchestrator], the Syncthing watchdog's
+    restart during a finalize, small, with the orchestrator's next release; A-193 and A-195, to
+    evaluate.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -229,6 +232,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   stage 2 ✅ 0.1.117, the release's settings in the code; stage 3 next, the installation file.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
+- A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
+  and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
+- A-194 🟡 The Syncthing watchdog restarts Syncthing during a join's finalize (low; small fix).
+- A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1306,6 +1313,48 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-195 [General/router] 🔵 TO EVALUATE (found 2026-11-08 by 0.1.118's gate, its timeline) — WAN frames are dropped at each link-up, before the peer's LSA names their sender
+
+- **Seen:** when `gate0218`'s WAN link came up, the motherbee's router and `gate0218`'s each
+  dropped a frame as `foreign_source` ("its sender is neither a node of the peer that sent it nor
+  one that peer relays as the hub"), with no `src_l2_name`.
+- **How often:** the motherbee's counter stood at 43 since its router last started, and its
+  journal has 57 such lines in 7 days. The line is rate-limited, so there were more drops than
+  lines.
+- **Why, read in the code:** the router binds a WAN frame's sender to the peer's LSA bucket
+  (EDGE-01, `wan_frame_source`). A frame that arrives before the LSA naming its sender is dropped.
+- **To find out:** which frames these are (the router stream's records? a node's first message?),
+  and whether any is a request whose sender then waits for a timeout. Health counted no stream
+  loss in the window.
+
+### A-194 [General/orchestrator] 🟡 OBSERVED, low (found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
+
+- **Seen:** during `gate0218`'s finalize, the peer link stopped Syncthing to restart it, and 89 ms
+  later the watchdog found it inactive ("syncthing unhealthy; restarting") and restarted it too.
+  It came back, and the join went on.
+- **Why:** `watchdog_blob_sync` does not look at `SYNCTHING_FINALIZES_IN_FLIGHT`, the guard that
+  keeps the peer reconcile away from a finalize. Its restart runs `ensure_blob_sync_runtime`,
+  which can also rewrite the folders in config.xml while the finalize links the peer.
+- **Fix:** the watchdog's Syncthing restart waits while a finalize is in flight on a spoke, as
+  the peer reconcile already does. Small; for the orchestrator's next release.
+
+### A-193 [General/deploy] 🔵 TO EVALUATE (found 2026-11-08, the first timed deploy and join, 0.1.118) — Where a deploy and a join spend their time
+
+- **The deploy (263 s):** snapshots 29 s; apt install on the motherbee 126 s; its admin on the
+  version 47 s; the spokes' updates 15 s, installed 24 s, settled 8 s; health 5 s.
+- **Inside the apt install:** about 40 s to fetch and unpack. Then the package's scripts kept
+  sy-orchestrator, sy-admin and sy-wf-rules down for 65 s (the unpack and the base runtimes'
+  seeding): Archi and the operator cannot act on the motherbee then. The orchestrator's start then
+  took 25 s to rebuild the three role trees, hashing the same binaries once per role
+  (`materialize_core_tree`), before 12 s of restarts.
+- **A join (127 s):** the bootstrap's copy over SSH about 67 s; the spoke's start about 15 s; its
+  finalize 8 s. At the end the motherbee restarts its own Syncthing to add the peer, which drops
+  every spoke's sync for a moment.
+- **To evaluate, by cost and benefit:**
+  - hash each binary once per role-tree rebuild;
+  - time the package's scripts, to see where the 65 s go;
+  - add a peer to the motherbee's Syncthing through its REST, without a restart.
+
 ### A-192 [General/vault] 🟢 LAB NOTE, no change (found 2026-11-08, 0.1.117's deploy on 8.x; read in its journals) — A running IO node's secret read is refused for a moment at a motherbee restart
 
 - **Seen:** at SY.vault's start, its `VAULT_SECRET_CHANGED` reaches `IO.slack.gate0192@motherbee`,
@@ -1330,7 +1379,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reuses them. Data hygiene, next to A-159 (deleting an ILK that other data names); a release
   that drops a node from a role leaves its ILK too (A-181, stage 2).
 
-### A-190 [General/join] 🔴 BUILT FOR 0.1.118, gate next (found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
+### A-190 [General/join] ✅ VALIDATED ON 8.x (0.1.118, 2026-11-08; found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
 
 - **Seen:** `gate0217`, a throwaway worker on a fresh clone of template 9000. Its `add_hive`
   failed twice with `FINALIZE_FAILED`:
@@ -1389,6 +1438,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Low, left:** a finalize whose core step does change something (a join resumed after the
     motherbee was upgraded) still restarts the router before its reply; the retry is then a
     no-op and goes through.
+- **Validated on 8.x (0.1.118):** a throwaway worker, `gate0218`, joined end to end, timed:
+  - `connected` at 113 s, the join done at 127 s, `dist_sync_ready: true`;
+  - the finalize took 8.1 s (core 5.1 s with nothing restarted, vendor 1.1 s, peer link 1.4 s,
+    dist probe 0.4 s), and its answer arrived;
+  - the watchdog held the bootstrap's local items until the source was there. Syncthing then took
+    the motherbee's versions over the identical files within a minute, so no revert ran, and dist
+    stayed whole;
+  - removed afterwards, the motherbee left as before.
 
 ### A-189 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.116, 2026-11-08; found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
 

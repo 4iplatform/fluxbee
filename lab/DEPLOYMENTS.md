@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ live, checked on 8.x | snap `pre-relkeys-0-1-117` (all 4 VMs) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
+| **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ live, checked on 8.x | snap `pre-join-0-1-118` (all 4 VMs) · `apt install fluxbee=0.1.117` + core-update of the spokes |
+| **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ replaced by 0.1.118 | snap `pre-relkeys-0-1-117` (deleted 2026-11-08) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
 | **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ replaced by 0.1.117 | snap `pre-start-0-1-116` (deleted 2026-11-08) · `apt install fluxbee=0.1.115` + core-update of the spokes |
 | **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ replaced by 0.1.116 | snap `pre-aisdk-0-1-115` (deleted 2026-11-08) · `apt install fluxbee=0.1.114` + core-update of the spokes |
 | **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ replaced by 0.1.115 | snap `pre-gosdk-0-1-114` (deleted 2026-11-08) · `apt install fluxbee=0.1.113` + core-update of the spokes |
@@ -126,6 +127,69 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.118 — A fresh worker joins again, and every step is timed
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.117 · **Commit:** `9ea2f812`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** FINDINGS A-190, found by 0.1.117's gate: a fresh worker's join failed at its finalize,
+  so no new worker could join 8.x. And the operator's call of the same day: every gate measures
+  where the time goes.
+- **What changed** (`src/bin/sy_orchestrator.rs`, `lab/ops.py`):
+  - **The receive-only revert waits for its source:** a member other than this device,
+    connected and sharing the folder (`remoteState: valid`), for 60 s in a row.
+  - **The join's finalize goes on while its vendor is still arriving,** with a Syncthing
+    installed and running, and reports it in `vendor.awaiting_update`. Its core step takes A-186's
+    words for a binary still on its way as pending. Its dist probe gets what is left of the
+    motherbee's wait. It answers each step's `timings_ms`.
+  - **A core update with no binary and no unit new restarts nothing,** and answers `ok` at once.
+  - **`ops timeline`** merges every hive's core journals into one timeline, with each hive's clock
+    offset. **`ops deploy`** prints each step's time and ends with the phases.
+- **Checks before the release:**
+  - GitHub's CI green on its branch, twice: as built, and with the review's fixes.
+  - The review round: one medium, fixed. The first build reverted once the peer was a member; the
+    finalize's own peer link restarts Syncthing, so the next tick, before the motherbee's index
+    arrived, would still have deleted dist. Now the source must be connected and sharing it for
+    60 s.
+- **Deploy:** build of `9ea2f812` in 9 min; publish in 14 s; snapshot `pre-join-0-1-118` taken on
+  all 4 VMs, `pre-relkeys-0-1-117` dropped; 0.1.118 on all 4 in 263 s; each spoke settled; health
+  clean.
+- **Where the deploy spent its time** (`ops deploy`'s phases):
+
+  | Phase | Time |
+  | --- | --- |
+  | snapshots | 29 s |
+  | apt install on the motherbee | 126 s |
+  | the motherbee's admin on the version | 47 s |
+  | the spokes answering | 8 s |
+  | the update calls (worker1 the slowest) | 15 s |
+  | the spokes installed | 24 s |
+  | the spokes settled | 8 s |
+  | health | 5 s |
+
+  Inside the apt install (`ops timeline`): about 40 s to fetch and unpack; then the package's
+  scripts kept sy-orchestrator, sy-admin and sy-wf-rules down for 65 s (the unpack and the base
+  runtimes' seeding). The orchestrator's start then took 25 s to rebuild the three role trees,
+  hashing the same binaries once per role, before 12 s of restarts.
+- **Checked on 8.x, a throwaway worker `gate0218` on VM 104** (a clone of template 9000,
+  10.10.10.60), joined key-first:
+  - **It joined:** `connected` at 113 s and the join done at 127 s, `dist_sync_ready: true`, the
+    peer linked.
+  - **The finalize took 8.1 s:** core 5.1 s (a check, nothing restarted), vendor 1.1 s, the peer
+    link 1.4 s, the dist probe 0.4 s. Its answer arrived.
+  - **The join's longest step** was the bootstrap's copy over SSH, about 67 s.
+  - **Its dist stayed whole:** the watchdog held the local items until the source was there
+    ("left as they are until its source…", then "with its source connected"). Syncthing then took
+    the motherbee's versions over the identical files within a minute, so no revert ran. Every
+    folder ended `idle` with nothing needed.
+  - **Its state:** nine units active with no restart; a hive.yaml without the release's keys;
+    `/versions` core `ok`, recorded as installed by the no-op update, and no `awaiting_update`.
+  - **Removed:** its Syncthing peer was unlinked, and the motherbee's devices and folder members
+    are as before. VM 104 was destroyed. Health was clean afterwards.
+- **Timing findings recorded:**
+  - A-193 🔵: where a deploy and a join spend their time.
+  - A-194 🟡: the Syncthing watchdog restarts Syncthing while a join's finalize is restarting it.
+  - A-195 🔵: WAN frames dropped at each link-up, before the peer's LSA names their sender.
 
 ## 0.1.117 — The release's settings live in the code
 
