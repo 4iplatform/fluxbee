@@ -8,8 +8,11 @@
   `hive.yaml`. A DTAP panel reviewed it the same day: 70 findings, four blockers (§11).
 - The operator approved this second draft's shape the same day: *"Sí, vamos como describiste"*.
 - **Stage 1 is live and checked on 8.x** (0.1.116): A-186, with A-189's vendored Syncthing.
-- **Stage 2 is built for 0.1.117:** the release's settings in the code, `src/release_settings.rs`
-  (§3), with its review round's fixes. Its gate on 8.x is next (§10).
+- **Stage 2 is live and checked on 8.x** (0.1.117): the release's settings in the code,
+  `src/release_settings.rs` (§3). Its gate's throwaway worker got a `hive.yaml` without the
+  release's keys and ran its role from the table. Its join failed at the finalize, for a reason
+  stage 2 does not touch (FINDINGS A-190).
+- **Next:** stage 3, the installation file (§10).
 
 This is the single place for the topic.
 
@@ -234,6 +237,9 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
    - Tests that a node a release drops is stopped and removed, and that a rollback brings it back.
    - Gate: a deploy changes nothing in `/versions` or `ops.py health`. A throwaway worker joins
      8.x (a VM, removed after) and gets a `hive.yaml` without the release's keys.
+   - ✅ 0.1.117 (2026-11-08): nothing changed on the four hives; the throwaway worker's
+     `hive.yaml`, nodes, system ILKs and folders came from the table. Its join failed at the
+     finalize (FINDINGS A-190, not this stage's).
 3. **The installation file and the operator's action** (the readers, SY.admin, the folder,
    `SYSTEM_UPDATE` category `config`, `/versions`).
    - Gate: a reversible change on 8.x, `ai.providers.openai.model` (not the default provider's)
@@ -246,7 +252,8 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
 5. **A-181's blob members, and A-188.**
    - A-72's tests for both blob folders, and a removal without flags.
    - Gate: a throwaway worker. Its device is taken out of `fluxbee-blob` through Syncthing's REST;
-     the reconcile must restore it, and `remove_hive` must leave both folders.
+     the reconcile must restore it, and `remove_hive` must leave both folders. It needs A-190
+     fixed first: a fresh worker cannot join today.
 
 ## 11. The DTAP panel (2026-11-08)
 

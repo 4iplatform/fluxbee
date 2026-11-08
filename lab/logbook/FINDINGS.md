@@ -112,7 +112,8 @@ no change required
 8. **Design first, one at a time, the largest:**
    1. A-181, a hive's shared config travels in the update
       ([hive-config-update-v1](../../docs/hive-config-update-v1.md)), by stages: stage 1 ✅
-      0.1.116; stage 2, the release's settings in the code, built for 0.1.117.
+      0.1.116; stage 2 ✅ 0.1.117, the release's settings in the code; stage 3 next, the
+      installation file.
    2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -120,6 +121,8 @@ no change required
    5. A-159: deleting an ILK that other data names, the episodes now among them; a chapter of
       its own.
    6. A-96: how the SY nodes' tokens are measured per message.
+9. **Found by 0.1.117's gate, 🔴, this sprint:** A-190 [General/join]: a fresh worker's join fails
+   at its finalize, so no new worker can join 8.x. The direction of the fix is the operator's call.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -223,8 +226,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   release's new SY node). In design: one version on every hive, through the update
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
   operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
-  stage 2, the release's settings in the code, built for 0.1.117.
+  stage 2 ✅ 0.1.117, the release's settings in the code; stage 3 next, the installation file.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
+- A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1302,6 +1306,63 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-192 [General/vault] 🟢 LAB NOTE, no change (found 2026-11-08, 0.1.117's deploy on 8.x; read in its journals) — A running IO node's secret read is refused for a moment at a motherbee restart
+
+- **Seen:** at SY.vault's start, its `VAULT_SECRET_CHANGED` reaches `IO.slack.gate0192@motherbee`,
+  which is still running. Its `VAULT_GET` comes before SY.identity holds its ILK in the SHM, and is
+  refused with `IDENTITY_UNAVAILABLE` ("which the identity SHM does not hold (yet)").
+- **The node treats it as transient** and keeps its credentials. 13 s later it restarts on the new
+  version and loads them.
+- **It shows at every motherbee restart,** since at least 2026-11-03, as a WARN on both sides.
+  Nothing to change: the code already treats it as transient.
+
+### A-191 [General/identity] 🟡 OBSERVED, low (found 2026-11-08 by 0.1.117's gate on 8.x; read there) — A removed hive's and a retired node's system ILKs stay registered
+
+- **Seen:**
+  - after `remove_hive` of `gate0217`, its six `SY.*@gate0217` system ILKs stayed on the
+    motherbee;
+  - `worker2`'s seven have stayed since its removal on 2026-10-06;
+  - `SY.policy`'s, on the motherbee, worker1 and worker2, have stayed since 0.1.79 retired that
+    node.
+- **Why:** SY.identity's seed only adds. Well-known system ILKs are never reconcile-removed, on
+  purpose, against forgery. `remove_hive` deletes the hive's identity key but not its ILKs.
+- **Impact:** none seen. They are deterministic, so a hive joined again under the same name
+  reuses them. Data hygiene, next to A-159 (deleting an ILK that other data names); a release
+  that drops a node from a role leaves its ILK too (A-181, stage 2).
+
+### A-190 [General/join] 🔴 CONFIRMED, OPEN (found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
+
+- **Seen:** `gate0217`, a throwaway worker on a fresh clone of template 9000. Its `add_hive`
+  failed twice with `FINALIZE_FAILED`:
+  - the first time, the motherbee timed out after 45 s, while the spoke's own result was
+    `SYNC_SETUP_FAILED`: "vendor manifest missing at '/var/lib/fluxbee/dist/vendor/manifest.json'";
+  - the resumed join, over the socket only, got the same `SYNC_SETUP_FAILED` back;
+  - every dist folder on the spoke was empty afterwards.
+- **Why:**
+  1. The join's bootstrap puts the role's dist files on the new spoke, and starts its
+     orchestrator.
+  2. The orchestrator's start declares the dist folders, receive-only, before any peer exists.
+     Syncthing reports every file there as a local change of a receive-only folder.
+  3. The first watchdog tick, half a second after the hive is ready, reverts such a folder
+     (`check_syncthing_folder`, A-16, 0.1.55). With no source known yet, the revert deletes the
+     files: dist/vendor's 4 at 19:53:02, dist/core's 10 at 19:53:11.
+  4. The motherbee's `ADD_HIVE_FINALIZE` runs a core update, then a vendor update
+     (`add_hive_finalize_local_flow`). The vendor update is strict and finds no manifest. The
+     peer link that would bring dist back comes after it, so a resume cannot get past it.
+  5. The finalize's core update restarts every core service, rt-gateway first, even with nothing
+     changed. The spoke's reply then goes out on a dead router connection and is lost. That is why
+     the first attempt read `FINALIZE_FAILED` after 45 s, not the spoke's own error.
+- **Not 0.1.117's doing:** stage 2 changed none of these functions (the finalize, the revert, the
+  peer link), only the hive.yaml the join writes. 0.1.116 has the same code. When it began is to
+  be found: worker2 joined on 0.1.57, after A-16's revert, through a resumed join.
+- **Impact:** no new worker can join 8.x today. The four hives already joined are not affected.
+- **Directions for the fix,** the operator's call before building:
+  - the revert leaves alone a folder whose source peer does not exist yet, or the bootstrap's
+    files do not count as local changes;
+  - the finalize's vendor step tolerates a vendor still syncing, as its core step does;
+  - the finalize does not restart the router under its own reply, or a no-op core update
+    restarts nothing.
+
 ### A-189 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.116, 2026-11-08; found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
 
 - **What happens:**
@@ -1482,7 +1543,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 built for 0.1.117; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -1542,7 +1603,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     for a hive that comes back, and never touches a hive the operator rolled back.
 - **The second draft** is in the doc. Its stages start with A-186.
 - **Stage 1** (A-186, A-189) ✅ 0.1.116.
-- **Stage 2 built for 0.1.117 (2026-11-08):** the release's settings live in the code, by role,
+- **Stage 2 ✅ VALIDATED ON 8.x (0.1.117, 2026-11-08):** the release's settings live in the code, by role,
   in `src/release_settings.rs`: each role's SY nodes with their order and waits, and the blob's and
   dist's topology. The values are today's, held by golden tests against what the example and the
   joins wrote. All four 8.x hives ran those lists and flags, read on each before the build.
@@ -1572,7 +1633,18 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Left for their own releases:**
   - the Rust SDK's doc comments that still say "hive.yaml system_nodes"
     (`crates/fluxbee_sdk/src/identity.rs`, `managed_node.rs`);
-  - the router's dead read of the blob flags, with `government.identity_frontdesk` into the code.
+  - the router's dead read of the blob flags, with `government.identity_frontdesk` into the code;
+  - SY.vault's log line, which still says its well-known SY ILKs are "computed from hive.yaml"
+    (`src/bin/sy_vault.rs:256`): with SY.vault's next change.
+- **Checked on 8.x (0.1.117):**
+  - nothing changed on the four hives (units, Syncthing folders and members, unit files, the
+    keys in each hive.yaml); each orchestrator named its old keys once; each spoke settled 0.1.116's
+    update with nothing dropped or added;
+  - a throwaway worker, `gate0217`: its hive.yaml held none of the release's keys, and it ran the
+    worker's six SY nodes, seeded their six system ILKs and declared the worker's Syncthing folders,
+    all from the table;
+  - its join failed at the finalize, for a reason stage 2 does not touch: A-190 🔴.
+- **Next:** stage 3, the installation file.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 

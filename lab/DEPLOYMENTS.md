@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ live, checked on 8.x | snap `pre-start-0-1-116` (all 4 VMs) · `apt install fluxbee=0.1.115` + core-update of the spokes |
+| **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ live, checked on 8.x | snap `pre-relkeys-0-1-117` (all 4 VMs) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
+| **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ replaced by 0.1.117 | snap `pre-start-0-1-116` (deleted 2026-11-08) · `apt install fluxbee=0.1.115` + core-update of the spokes |
 | **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ replaced by 0.1.116 | snap `pre-aisdk-0-1-115` (deleted 2026-11-08) · `apt install fluxbee=0.1.114` + core-update of the spokes |
 | **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ replaced by 0.1.115 | snap `pre-gosdk-0-1-114` (deleted 2026-11-08) · `apt install fluxbee=0.1.113` + core-update of the spokes |
 | **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ replaced by 0.1.114 | snap `pre-rustsdk-0-1-113` (deleted 2026-11-08) · `apt install fluxbee=0.1.112` + core-update of the spokes |
@@ -125,6 +126,67 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.117 — The release's settings live in the code
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.116 · **Commit:** `e1c5e5ab`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** stage 2 of [hive-config-update-v1](../docs/hive-config-update-v1.md) (§10), for A-181:
+  a spoke's hive.yaml is written once, at its join, so a release's change to a role's SY nodes or
+  to the blob's topology never reached a hive that had joined before it.
+- **What changed:**
+  - **`src/release_settings.rs`:** each role's SY nodes, their order and waits, and the blob's and
+    dist's topology, with today's values. Golden tests hold them to what `hive.yaml.example` and
+    the joins wrote.
+  - **The orchestrator, SY.identity and SY.vault** read the table, never hive.yaml.
+  - **The joins and `hive.yaml.example`** stop writing those keys. An old hive.yaml still loads;
+    the orchestrator names the keys it ignores once at its start, and says to keep them while the
+    hive may go back to 0.1.116 or earlier.
+  - **A node a release drops or adds:** the update runs in the previous orchestrator, which leaves
+    a dropped node out. The new orchestrator's start settles the update: it removes a dropped node
+    and installs an added one, both kept in the update's generation, so `core_rollback` undoes
+    them. `/versions` shows it as `core.last_update.settled`.
+  - **`lab/ops.py`:** `deploy` waits for each spoke's settle, and reports anything left out,
+    pending or awaiting.
+  - **Docs:** the design doc, sy-orchestrator, sy-identity, sy-vault, operations, architecture,
+    opa-distribution, the HANDBOOK's new-node recipe, rollback and downgrade.
+- **Checks before the release:**
+  - Read on 8.x: every hive's lists and flags were the table's, and every spoke's `sy-*` units its
+    role's.
+  - GitHub's CI green on its branch, twice: as built, and with the review's fixes.
+  - The review round: no high finding. Two mediums were fixed: the old keys must stay for a
+    rollback below 0.1.117, and the dist recheck settles only the update its own start left open.
+- **Deploy:**
+  - build of `e1c5e5ab` in 19 min; publish in 17 s;
+  - snapshot `pre-relkeys-0-1-117` taken on all 4 VMs, `pre-start-0-1-116` dropped;
+  - 0.1.117 on all 4 in 314 s; each spoke settled; health clean.
+- **Checked on 8.x:**
+  - **Nothing changed on the 4 hives,** compared with a snapshot taken before:
+    - units, Syncthing folders and their members, and the `sy-*` unit files were all the same;
+    - the release's keys were still in each hive.yaml;
+    - no `awaiting_update` anywhere.
+  - **The old keys:** each orchestrator named them once at its start, exactly the ones its own
+    hive.yaml holds.
+  - **The first settle:** each spoke settled 0.1.116's update generation with nothing dropped or
+    installed.
+  - **SY.vault:** computed the motherbee's 11 well-known SY ILKs. Its log line still says "from
+    hive.yaml"; that text is fixed in a later release.
+  - **A throwaway worker, `gate0217`, on VM 104** (a clone of template 9000, 10.10.10.60), joined
+    key-first with the motherbee's public key:
+    - its hive.yaml held none of the release's keys;
+    - it ran the worker's six SY nodes, from the table;
+    - its SY.identity seeded the six system ILKs of the release's list;
+    - its Syncthing folders were the worker's (`fluxbee-blob` and the dist folders, no public one).
+  - **Its join failed at the finalize, twice,** for a reason this release does not touch:
+    FINDINGS A-190 🔴. The receive-only revert, on its first watchdog tick, deleted what the join's
+    bootstrap had put in dist. The finalize's strict vendor step then found no manifest. Its first
+    reply was also lost: the finalize's own core step restarts the router.
+  - **Cleanup:** `gate0217` was removed. The motherbee kept no device, folder member or hive entry
+    for it. Its six system ILKs stay registered, as `worker2`'s do since 2026-10-06 (A-191). VM 104
+    was destroyed.
+- **Seen on the way:** A-192 🟢, a running IO node's `VAULT_GET` refused at a motherbee restart
+  (`IDENTITY_UNAVAILABLE`, transient). It happens since at least 2026-11-03, and the node keeps its
+  credentials.
 
 ## 0.1.116 — A spoke's start never stops on dist
 
