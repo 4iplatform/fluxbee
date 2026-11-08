@@ -36,6 +36,29 @@ It provides:
         model: "gpt-5.5"
   ```
 
+- **The installation file** ([hive-config-update-v1](../../docs/hive-config-update-v1.md) §4) will
+  hold the operator's `ai` for the whole installation, one version on every hive:
+  `/var/lib/fluxbee/dist/installation/installation.json` (`INSTALLATION_FILE_PATH`), written by
+  the motherbee's orchestrator and received through dist. `ai_settings(hive_yaml_ai)` returns its
+  `ai`, with its version and sha256, once the hive holds it, and the `ai` of the hive's own
+  hive.yaml until then (`AiSettingsSource::HiveYaml`). A file that is there and is not a valid one
+  (`InstallationFile::parse`: its schema, a version of 1 or more, an `ai` whose default provider
+  has its model) is an error, never a fallback to an older hive.yaml.
+
+  ```json
+  {
+    "schema_version": 1,
+    "version": 1,
+    "ai": {
+      "default_provider": "anthropic",
+      "providers": {
+        "openai": { "model": "gpt-5.5" },
+        "anthropic": { "model": "claude-sonnet-5-5" }
+      }
+    }
+  }
+  ```
+
 - **The key comes from SY.vault, never from config.** Look it up with
   `fluxbee_sdk::VaultClient::resolve_resource(provider.resource_type(), tenant, timeout)`.
   `AiProvider::resource_type()` gives `openai` or `anthropic`. The lookup returns the key the node

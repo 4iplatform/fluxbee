@@ -3,6 +3,7 @@ pub mod control_plane;
 pub mod errors;
 pub mod function_calling;
 pub mod immediate_memory;
+pub mod installation;
 pub mod llm;
 pub mod message;
 pub mod node_trait;
@@ -31,6 +32,10 @@ pub use function_calling::{
 pub use immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
+};
+pub use installation::{
+    ai_settings, ai_settings_at, read_installation_file, AiSettings, AiSettingsSource,
+    InstallationFile, InstalledSettings, INSTALLATION_FILE_PATH, INSTALLATION_SCHEMA_VERSION,
 };
 pub use llm::{
     build_output_schema_fallback_instruction, create_function_calling_model,
