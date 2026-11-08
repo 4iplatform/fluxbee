@@ -206,6 +206,14 @@ node). The root tenant's keys are the core's; a tenant's node never falls back t
 runs on a provider only when its tenant has that provider's key (`vault_list` shows the metadata).
 The SY nodes (Archi, cognition, the frontdesk) keep the hive's provider.
 
+When an agent's provider gives no answer (an error status after the AI SDK's retries, no
+connection, none in time, or the model's refusal), the person gets one fixed text: *"There is a
+problem with the AI provider this agent uses, so it could not answer. Please contact your
+administrator."* A person who reports it points to the agent's key or its provider: the node's
+log has the error, `AI runtime request failed`, with `provider_status` (401 or 403: the key; 429:
+its rate or quota; 5xx: the provider). A WF's step that asks under a response envelope gets the
+error payload instead.
+
 ### 4.1.1 Agent tools
 
 What an AI agent can do beyond answering is its **tools**: the functions its model calls while it

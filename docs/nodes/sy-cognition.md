@@ -102,6 +102,11 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 
 - Fail-open: without an AI key, or when the tagger fails, the worker skips a turn (no labels,
   memories or feelings). Its text is in the last turns all the same: the intake needs no model.
+- A failed model call is counted by what it was: the provider gave no answer (an error status
+  after the AI SDK's retries, no connection, none in time, a refusal), which cognition does not
+  judge (`*_provider_errors_total`); an answer that is not the object asked for
+  (`*_invalid_outputs_total`); anything else (`*_failures_total`). See
+  [cognition.md](../reference/cognition.md) §3.1 (FINDINGS A-184).
 - A communication whose file row cannot be read is skipped and counted
   (`store_load_failures_total`); a file that cannot be opened stops the node. A thread's
   communication with no agent that cannot be read is not taken by the thread's first agent, which

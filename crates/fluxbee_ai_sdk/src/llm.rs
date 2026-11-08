@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::errors::{AiSdkError, Result, TRUNCATED_ANSWER_MARKER};
+use crate::errors::{AiSdkError, ProviderError, Result};
 use crate::function_calling::{
     FunctionCallingModel, FunctionLoopItem, FunctionModelTurnRequest, FunctionModelTurnResponse,
     FunctionToolCall,
@@ -387,6 +387,70 @@ impl OpenAiResponsesClient {
             model_settings,
         }
     }
+
+    /// One request, asked again by the rules Anthropic's are (`provider_should_retry`), its
+    /// status and headers read before its body: a proxy's 502 with an HTML body keeps its status
+    /// (FINDINGS A-184). Each attempt is a call of its own for the usage records (§7.2): only the
+    /// one that answers 2xx is recorded, and a retry's wait is no call.
+    async fn send(&self, body: &Value, model: &str, kind: UsageKind) -> Result<Value> {
+        let auth = format!("Bearer {}", self.api_key);
+        for attempt in 0..PROVIDER_MAX_ATTEMPTS {
+            let mut call = self.account.begin(AiProvider::OpenAi, model, kind);
+            let response = match self
+                .http
+                .post(&self.base_url)
+                .header(AUTHORIZATION, &auth)
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) if attempt + 1 < PROVIDER_MAX_ATTEMPTS => {
+                    call.failed();
+                    tokio::time::sleep(provider_retry_delay(attempt, None)).await;
+                    tracing::warn!(attempt = attempt + 1, error = %err, "retrying OpenAI transport error");
+                    continue;
+                }
+                Err(err) => {
+                    call.failed();
+                    return Err(err.into());
+                }
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let request_id = header_text(&headers, "x-request-id");
+            if !status.is_success()
+                && attempt + 1 < PROVIDER_MAX_ATTEMPTS
+                && provider_should_retry(status.as_u16(), &headers)
+            {
+                call.failed();
+                let retry_after = provider_retry_after(&headers);
+                tokio::time::sleep(provider_retry_delay(attempt, retry_after)).await;
+                tracing::warn!(attempt = attempt + 1, status = %status, request_id = ?request_id, "retrying OpenAI response");
+                continue;
+            }
+            if status.is_success() {
+                return match response.json::<Value>().await {
+                    Ok(value) => {
+                        call.answered(Some(&value));
+                        Ok(value)
+                    }
+                    Err(err) => {
+                        call.answered(None);
+                        Err(err.into())
+                    }
+                };
+            }
+            // Not to be asked again, or the last attempt: a body that is no JSON leaves the status.
+            call.failed();
+            let value: Value = response.json().await.unwrap_or(Value::Null);
+            return Err(openai_status_error(status.as_u16(), &value, request_id).into());
+        }
+        Err(AiSdkError::Protocol(
+            "OpenAI retry loop exhausted unexpectedly".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -416,38 +480,23 @@ impl LlmClient for OpenAiResponsesClient {
             });
         }
 
-        let auth = format!("Bearer {}", self.api_key);
-        let mut call = self
-            .account
-            .begin(AiProvider::OpenAi, &request.model, UsageKind::Generate);
-        let response = match self
-            .http
-            .post(&self.base_url)
-            .header(AUTHORIZATION, auth)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                call.failed();
-                return Err(err.into());
-            }
-        };
-
-        let (status, value) = openai_read_answer(&mut call, response).await?;
-        if !status.is_success() {
-            return Err(openai_status_error(status.as_u16(), &value));
-        }
+        let value = self
+            .send(&body, &request.model, UsageKind::Generate)
+            .await?;
         openai_check_truncation(&value)?;
 
-        let text = openai_response_text(&value).ok_or_else(|| {
-            AiSdkError::Protocol(format!(
+        let Some(text) = openai_response_text(&value) else {
+            if let Some(reason) = openai_refusal(&value) {
+                return Err(AiSdkError::Refused {
+                    provider: AiProvider::OpenAi,
+                    reason,
+                });
+            }
+            return Err(AiSdkError::Protocol(format!(
                 "responses payload missing text output ({})",
                 openai_no_text_reason(&value)
-            ))
-        })?;
+            )));
+        };
 
         let text = match &request.output_schema {
             Some(output_schema) => validate_structured_output(&text, output_schema)?,
@@ -456,23 +505,6 @@ impl LlmClient for OpenAiResponsesClient {
 
         Ok(LlmResponse { content: text })
     }
-}
-
-/// An OpenAI answer's body. A 2xx is recorded as soon as its body is read (§7.2), `unreadable`
-/// when it cannot be; anything else is no call that costs, settled before its body is read.
-async fn openai_read_answer(
-    call: &mut crate::usage::CallGuard<'_>,
-    response: reqwest::Response,
-) -> Result<(reqwest::StatusCode, Value)> {
-    let status = response.status();
-    if !status.is_success() {
-        call.failed();
-    }
-    let body = response.json::<Value>().await;
-    if status.is_success() {
-        call.answered(body.as_ref().ok());
-    }
-    Ok((status, body?))
 }
 
 /// The answer of a Responses payload: `output_text` when the server sends it (the official SDKs
@@ -495,9 +527,8 @@ fn openai_response_text(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Why a Responses payload has no answer, for its error: its `status`, the reason an incomplete one
-/// gives, and whether a message refused, so a refusal, a filter's cut and an empty answer read apart
-/// (FINDINGS A-162).
+/// Why a Responses payload has no answer, for its error: its `status` and the reason an incomplete
+/// one gives, so an empty answer reads apart from a refusal, which is its own (FINDINGS A-162).
 fn openai_no_text_reason(value: &Value) -> String {
     let status = value
         .get("status")
@@ -509,6 +540,12 @@ fn openai_no_text_reason(value: &Value) -> String {
         .and_then(Value::as_str)
         .map(|reason| format!(", reason={reason}"))
         .unwrap_or_default();
+    format!("status={status}{reason}")
+}
+
+/// Why a Responses payload holds no text because the model declined: a message's refusal part, or
+/// the content filter that cut it (FINDINGS A-184). `None` for any other payload.
+fn openai_refusal(value: &Value) -> Option<&'static str> {
     let refused = value
         .get("output")
         .and_then(Value::as_array)
@@ -517,8 +554,15 @@ fn openai_no_text_reason(value: &Value) -> String {
         .filter_map(|item| item.get("content").and_then(Value::as_array))
         .flatten()
         .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"));
-    let refused = if refused { ", refused" } else { "" };
-    format!("status={status}{reason}{refused}")
+    if refused {
+        return Some("refusal");
+    }
+    let filtered = value.get("status").and_then(Value::as_str) == Some("incomplete")
+        && value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("content_filter");
+    filtered.then_some("content_filter")
 }
 
 fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
@@ -941,52 +985,32 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
 
         let mut asked_without_format = false;
         let value = loop {
-            let auth = format!("Bearer {}", self.client.api_key);
-            let mut call =
-                self.client
-                    .account
-                    .begin(AiProvider::OpenAi, &self.model, UsageKind::FunctionTurn);
-            let response = match self
+            match self
                 .client
-                .http
-                .post(&self.client.base_url)
-                .header(AUTHORIZATION, auth)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&body)
-                .send()
+                .send(&body, &self.model, UsageKind::FunctionTurn)
                 .await
             {
-                Ok(response) => response,
-                Err(err) => {
-                    call.failed();
-                    return Err(err.into());
+                Ok(value) => break value,
+                // A schema OpenAI cannot hold, a strict one with an optional property or one a
+                // model without `json_schema` refuses, comes back as a 400 that names
+                // `text.format`: the turn is asked again without it, and the schema reaches the
+                // model only as its caller's instruction, as on every tool turn before FINDINGS
+                // A-150 and as Anthropic's turn does with `output_config`.
+                Err(err)
+                    if !asked_without_format
+                        && body.get("text").is_some()
+                        && openai_text_format_refused(&err) =>
+                {
+                    asked_without_format = true;
+                    if let Some(fields) = body.as_object_mut() {
+                        fields.remove("text");
+                    }
+                    tracing::warn!(
+                        "openai model refused text.format on a tool turn; retrying without it"
+                    );
                 }
-            };
-            let (status, value) = openai_read_answer(&mut call, response).await?;
-            if status.is_success() {
-                break value;
+                Err(err) => return Err(err),
             }
-            // A schema OpenAI cannot hold, a strict one with an optional property or one a model
-            // without `json_schema` refuses, comes back as a 400 that names `text.format`: the
-            // turn is asked again without it, and the schema reaches the model only as its
-            // caller's instruction, as on every tool turn before FINDINGS A-150 and as Anthropic's
-            // turn does with `output_config`.
-            if !asked_without_format
-                && body.get("text").is_some()
-                && openai_text_format_refused(status.as_u16(), &value)
-            {
-                asked_without_format = true;
-                if let Some(fields) = body.as_object_mut() {
-                    fields.remove("text");
-                }
-                tracing::warn!(
-                    "openai model refused text.format on a tool turn; retrying without it"
-                );
-                continue;
-            }
-            // Same clean format as the Responses path (audit B6/M3): no raw body (key echo), and
-            // it carries type/param/message so the consumer can classify + scrub.
-            return Err(openai_status_error(status.as_u16(), &value));
         };
         // A turn cut at the token limit can end inside a tool call's arguments: it is an error,
         // as on the plain path and on Anthropic's turns, never a turn to act on.
@@ -1029,6 +1053,17 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                     }
                     continue;
                 }
+            }
+        }
+
+        // A turn with neither a call nor text because the model declined is its refusal, as on the
+        // plain path, never a turn its caller asks again without tools.
+        if tool_calls.is_empty() && assistant_text.is_none() {
+            if let Some(reason) = openai_refusal(&value) {
+                return Err(AiSdkError::Refused {
+                    provider: AiProvider::OpenAi,
+                    reason,
+                });
             }
         }
 
@@ -1133,7 +1168,9 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ceiling, and truncation is now detected loudly (anthropic_check_truncation) so a caller that
 // still needs more gets an explicit error instead of a corrupted/short completion.
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
-const ANTHROPIC_MAX_ATTEMPTS: usize = 3;
+/// How many times a call to either provider is tried, by the rules both advise
+/// (`provider_should_retry`, `provider_retry_delay`).
+const PROVIDER_MAX_ATTEMPTS: usize = 3;
 
 /// Private to the SDK: every call goes through the factories, with its `AiAccount` (§7.2).
 #[derive(Clone)]
@@ -1181,7 +1218,7 @@ impl AnthropicMessagesClient {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        for attempt in 0..ANTHROPIC_MAX_ATTEMPTS {
+        for attempt in 0..PROVIDER_MAX_ATTEMPTS {
             let mut call = self.account.begin(AiProvider::Anthropic, &model, kind);
             let response = match self
                 .http
@@ -1198,9 +1235,9 @@ impl AnthropicMessagesClient {
                 .await
             {
                 Ok(response) => response,
-                Err(err) if attempt + 1 < ANTHROPIC_MAX_ATTEMPTS => {
+                Err(err) if attempt + 1 < PROVIDER_MAX_ATTEMPTS => {
                     call.failed();
-                    tokio::time::sleep(anthropic_retry_delay(attempt, None)).await;
+                    tokio::time::sleep(provider_retry_delay(attempt, None)).await;
                     tracing::warn!(attempt = attempt + 1, error = %err, "retrying Anthropic transport error");
                     continue;
                 }
@@ -1211,23 +1248,19 @@ impl AnthropicMessagesClient {
             };
             let status = response.status();
             let headers = response.headers().clone();
-            let request_id = headers
-                .get("request-id")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_string();
+            let request_id = header_text(&headers, "request-id");
             // Decide retry from STATUS + headers BEFORE touching the body (audit M1): a
             // proxy/LB 5xx or 429 often carries an HTML or empty body, and parsing it first
             // (`response.json().await?`) aborted the whole retry loop on a decode error exactly
             // when a retry was warranted.
             if !status.is_success()
-                && attempt + 1 < ANTHROPIC_MAX_ATTEMPTS
-                && anthropic_should_retry(status.as_u16(), &headers)
+                && attempt + 1 < PROVIDER_MAX_ATTEMPTS
+                && provider_should_retry(status.as_u16(), &headers)
             {
                 call.failed();
-                let retry_after = anthropic_retry_after(&headers);
-                tokio::time::sleep(anthropic_retry_delay(attempt, retry_after)).await;
-                tracing::warn!(attempt = attempt + 1, status = %status, request_id = %request_id, "retrying Anthropic response");
+                let retry_after = provider_retry_after(&headers);
+                tokio::time::sleep(provider_retry_delay(attempt, retry_after)).await;
+                tracing::warn!(attempt = attempt + 1, status = %status, request_id = ?request_id, "retrying Anthropic response");
                 continue;
             }
             if status.is_success() {
@@ -1246,18 +1279,13 @@ impl AnthropicMessagesClient {
             // surfaces the status/request-id instead of a masking decode error.
             call.failed();
             let value: Value = response.json().await.unwrap_or(Value::Null);
-            let error_type = value
-                .pointer("/error/type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown_error");
-            let message = value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Anthropic request failed");
-            return Err(AiSdkError::Protocol(format!(
-                "anthropic error status={} type={} request_id={} message={}",
-                status, error_type, request_id, message
-            )));
+            return Err(provider_status_error(
+                AiProvider::Anthropic,
+                status.as_u16(),
+                &value,
+                request_id,
+            )
+            .into());
         }
         Err(AiSdkError::Protocol(
             "Anthropic retry loop exhausted unexpectedly".to_string(),
@@ -1265,7 +1293,9 @@ impl AnthropicMessagesClient {
     }
 }
 
-fn anthropic_should_retry(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
+/// Whether a provider's error status is worth asking again: its `x-should-retry` when it sends one,
+/// else 408, 409, 429 and any 5xx, as both providers' own SDKs do.
+fn provider_should_retry(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
     match headers
         .get("x-should-retry")
         .and_then(|value| value.to_str().ok())
@@ -1277,7 +1307,9 @@ fn anthropic_should_retry(status: u16, headers: &reqwest::header::HeaderMap) -> 
     matches!(status, 408 | 409 | 429) || status >= 500
 }
 
-fn anthropic_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+/// The wait a provider asks for before the next attempt (`retry-after-ms`, `retry-after`), at most
+/// 60 s.
+fn provider_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(ms) = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
@@ -1293,7 +1325,8 @@ fn anthropic_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
         .map(|seconds| Duration::from_secs_f64(seconds.min(60.0)))
 }
 
-fn anthropic_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Duration {
+/// The wait before the next attempt: the provider's, else 0.5 s doubling, with jitter.
+fn provider_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Duration {
     if let Some(delay) = server_delay {
         return delay;
     }
@@ -1306,34 +1339,41 @@ fn anthropic_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Dura
     Duration::from_millis(base_ms.saturating_mul(jitter_percent) / 100)
 }
 
-/// Build an OpenAI error WITHOUT embedding the raw response body (audit B6): OpenAI's own 401
-/// body echoes a partially-masked form of the api key ("Incorrect API key provided: sk-…"),
-/// which the old `body={value}` leaked into logs and the mesh error envelope. We keep the
-/// `openai error status=` prefix so the consumer classifier still recognizes it, but carry only
-/// the extracted error type/message.
-fn openai_status_error(status: u16, body: &Value) -> AiSdkError {
-    let error_type = body
-        .pointer("/error/type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown_error");
-    // `param` identifies the offending request field on a 400 (e.g. an attachment path); the
-    // consumer classifier reads it to raise provider_attachment_invalid_request, so carry it
-    // explicitly (before message=) now that the raw JSON body no longer travels.
-    let param = body
-        .pointer("/error/param")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let message = body
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .unwrap_or("OpenAI request failed");
-    // OpenAI's 401 message itself echoes a masked key ("Incorrect API key provided: sk-…"),
-    // so extracting the message is not enough (audit B6) — scrub any sk- token before it reaches
-    // logs / the mesh error envelope.
-    AiSdkError::Protocol(format!(
-        "openai error status={status} type={error_type} param={param} message={}",
-        scrub_secret_like(message)
-    ))
+/// A provider's header as text, when it sends one that is not empty.
+fn header_text(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// An error status of either provider, from its body's `error.type`, `error.param` and
+/// `error.message`, never the body itself (audit B6): OpenAI's 401 body echoes a masked form of
+/// the key ("Incorrect API key provided: sk-…"), so the message is scrubbed of it too.
+fn provider_status_error(
+    provider: AiProvider,
+    status: u16,
+    body: &Value,
+    request_id: Option<String>,
+) -> ProviderError {
+    let text = |pointer: &str| body.pointer(pointer).and_then(Value::as_str);
+    ProviderError {
+        provider,
+        status,
+        error_type: text("/error/type").unwrap_or("unknown_error").to_string(),
+        param: text("/error/param")
+            .filter(|param| !param.is_empty())
+            .map(ToString::to_string),
+        request_id,
+        message: scrub_secret_like(text("/error/message").unwrap_or("request failed")),
+    }
+}
+
+/// An OpenAI error status (`provider_status_error`).
+fn openai_status_error(status: u16, body: &Value, request_id: Option<String>) -> ProviderError {
+    provider_status_error(AiProvider::OpenAi, status, body, request_id)
 }
 
 /// Redact OpenAI-style key tokens (`sk-…`) that provider error messages can echo, so a key
@@ -1385,33 +1425,36 @@ fn openai_check_truncation(body: &Value) -> Result<()> {
 
 /// The error of an answer cut at its token limit, the same on both providers so a caller can tell
 /// it apart (`AiSdkError::is_truncated_answer`).
-fn truncated_answer_error(provider: AiProvider, limit: &str) -> AiSdkError {
-    AiSdkError::Protocol(format!(
-        "{provider} {TRUNCATED_ANSWER_MARKER} {limit} (raise model_settings.max_output_tokens)"
-    ))
+fn truncated_answer_error(provider: AiProvider, limit: &'static str) -> AiSdkError {
+    AiSdkError::Truncated { provider, limit }
+}
+
+/// An OpenAI 400 that refuses the `text.format` a tool turn sent: its `param` names it.
+fn openai_text_format_refused(err: &AiSdkError) -> bool {
+    matches!(
+        err,
+        AiSdkError::Provider(err)
+            if err.provider == AiProvider::OpenAi
+                && err.status == 400
+                && err
+                    .param
+                    .as_deref()
+                    .is_some_and(|param| param.starts_with("text.format"))
+    )
 }
 
 /// Heuristic: an Anthropic 400 that indicates the model does not support the `output_config`
 /// structured-outputs feature (audit M4), so `generate` can retry once with a prompt-instruction
 /// fallback instead of surfacing the raw 400, and a tool turn once without it. Conservative — only
-/// a 400 that names the feature.
-/// An OpenAI 400 that refuses the `text.format` a tool turn sent: its `param` names it.
-fn openai_text_format_refused(status: u16, body: &Value) -> bool {
-    status == 400
-        && body
-            .pointer("/error/param")
-            .and_then(Value::as_str)
-            .is_some_and(|param| param.starts_with("text.format"))
-}
-
+/// a 400 whose message names the feature.
 fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
-    let AiSdkError::Protocol(msg) = err else {
+    let AiSdkError::Provider(err) = err else {
         return false;
     };
-    if !msg.contains("anthropic error status=400") {
+    if err.provider != AiProvider::Anthropic || err.status != 400 {
         return false;
     }
-    let lower = msg.to_ascii_lowercase();
+    let lower = err.message.to_ascii_lowercase();
     lower.contains("output_config") || lower.contains("json_schema") || lower.contains("structured")
 }
 
@@ -1434,6 +1477,18 @@ fn anthropic_output_config(output_schema: &OutputSchemaSpec) -> Result<Value> {
 fn anthropic_check_truncation(value: &Value) -> Result<()> {
     if value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
         return Err(truncated_answer_error(AiProvider::Anthropic, "max_tokens"));
+    }
+    Ok(())
+}
+
+/// `stop_reason: refusal`: the model declined, and whatever text came before it is no answer to
+/// give, nor any tool call one to run (FINDINGS A-184).
+fn anthropic_check_refusal(value: &Value) -> Result<()> {
+    if value.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
+        return Err(AiSdkError::Refused {
+            provider: AiProvider::Anthropic,
+            reason: "stop_reason=refusal",
+        });
     }
     Ok(())
 }
@@ -1517,6 +1572,7 @@ impl LlmClient for AnthropicMessagesClient {
             Err(err) => return Err(err),
         };
         anthropic_check_truncation(&value)?;
+        anthropic_check_refusal(&value)?;
         let text = anthropic_response_text(&value)?;
         let text = match &request.output_schema {
             Some(output_schema) => validate_structured_output(&text, output_schema)?,
@@ -1676,6 +1732,7 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
             Err(err) => return Err(err),
         };
         anthropic_check_truncation(&value)?;
+        anthropic_check_refusal(&value)?;
         let mut assistant_text = Vec::new();
         let mut tool_calls = Vec::new();
         if let Some(content) = value.get("content").and_then(Value::as_array) {
@@ -2007,19 +2064,44 @@ mod tests {
 
     #[test]
     fn openai_status_error_omits_raw_body_and_key_echo() {
-        // B6: the error must carry only the extracted type/message, never the raw body (OpenAI's
-        // 401 body echoes a masked key), and must keep the "openai error status=" prefix the
-        // consumer classifier matches.
+        // B6: the error carries only what the body names, never the body itself (OpenAI's 401
+        // body echoes a masked key), and the message is scrubbed of the key.
         let body = json!({"error": {"type": "invalid_request_error", "message": "Incorrect API key provided: sk-abc...xyz"}});
-        let err = openai_status_error(401, &body);
-        let AiSdkError::Protocol(msg) = err else {
-            panic!("expected Protocol error");
-        };
-        assert!(msg.starts_with("openai error status=401"));
-        assert!(msg.contains("type=invalid_request_error"));
-        assert!(msg.contains("Incorrect API key"));
-        assert!(!msg.contains("sk-abc...xyz")); // the masked-key echo must NOT be present
-        assert!(!msg.contains("body="));
+        let err = openai_status_error(401, &body, Some("req_1".to_string()));
+        assert_eq!(err.kind(), crate::errors::ProviderErrorKind::Auth);
+        assert_eq!(err.error_type, "invalid_request_error");
+        assert_eq!(err.param, None);
+        assert!(!err.message.contains("sk-abc...xyz")); // the masked-key echo must NOT be present
+        let text = AiSdkError::from(err).to_string();
+        assert_eq!(
+            text,
+            "openai error status=401 type=invalid_request_error request_id=req_1 \
+             message=Incorrect API key provided: sk-<redacted>"
+        );
+        assert!(!text.contains("body="));
+    }
+
+    /// A status names its kind, whichever provider sent it; a body that names nothing, as a
+    /// proxy's page, still leaves the status.
+    #[test]
+    fn a_provider_error_status_names_its_kind() {
+        use crate::errors::ProviderErrorKind as Kind;
+        for (status, kind) in [
+            (400, Kind::InvalidRequest),
+            (404, Kind::InvalidRequest),
+            (422, Kind::InvalidRequest),
+            (401, Kind::Auth),
+            (403, Kind::Auth),
+            (408, Kind::Timeout),
+            (409, Kind::Other),
+            (429, Kind::RateLimited),
+            (500, Kind::Unavailable),
+            (529, Kind::Unavailable),
+        ] {
+            let err = provider_status_error(AiProvider::Anthropic, status, &Value::Null, None);
+            assert_eq!(err.kind(), kind, "{status}");
+            assert_eq!(err.error_type, "unknown_error");
+        }
     }
 
     #[test]
@@ -2069,12 +2151,6 @@ mod tests {
             "ok"
         );
         assert_eq!(
-            openai_no_text_reason(&json!({"status": "completed", "output": [
-                {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
-            ]})),
-            "status=completed, refused"
-        );
-        assert_eq!(
             openai_no_text_reason(&json!({"status": "completed", "output": []})),
             "status=completed"
         );
@@ -2083,6 +2159,23 @@ mod tests {
                 "status": "incomplete", "incomplete_details": {"reason": "content_filter"}
             })),
             "status=incomplete, reason=content_filter"
+        );
+        // A refusal, or the filter's cut, is its own error (FINDINGS A-184).
+        assert_eq!(
+            openai_refusal(&json!({"status": "completed", "output": [
+                {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
+            ]})),
+            Some("refusal")
+        );
+        assert_eq!(
+            openai_refusal(&json!({
+                "status": "incomplete", "incomplete_details": {"reason": "content_filter"}
+            })),
+            Some("content_filter")
+        );
+        assert_eq!(
+            openai_refusal(&json!({"status": "completed", "output": []})),
+            None
         );
     }
 
@@ -2107,20 +2200,40 @@ mod tests {
         ] {
             assert!(err.is_truncated_answer(), "{err}");
         }
-        assert!(!openai_status_error(400, &json!({})).is_truncated_answer());
+        assert!(
+            !AiSdkError::from(openai_status_error(400, &json!({}), None)).is_truncated_answer()
+        );
     }
 
     #[test]
     fn output_config_unsupported_only_on_capability_400() {
         // M4: the capability-fallback heuristic fires only on a 400 that names the feature.
-        assert!(anthropic_output_config_unsupported(&AiSdkError::Protocol(
-            "anthropic error status=400 type=invalid_request_error message=output_config not supported".into()
+        let anthropic = |status, message: &str| {
+            AiSdkError::from(provider_status_error(
+                AiProvider::Anthropic,
+                status,
+                &json!({"error": {"type": "invalid_request_error", "message": message}}),
+                None,
+            ))
+        };
+        assert!(anthropic_output_config_unsupported(&anthropic(
+            400,
+            "output_config not supported"
         )));
-        assert!(!anthropic_output_config_unsupported(&AiSdkError::Protocol(
-            "anthropic error status=429 type=rate_limit_error message=slow down".into()
+        assert!(!anthropic_output_config_unsupported(&anthropic(
+            429,
+            "slow down"
         )));
-        assert!(!anthropic_output_config_unsupported(&AiSdkError::Protocol(
-            "anthropic error status=400 type=invalid_request_error message=bad max_tokens".into()
+        assert!(!anthropic_output_config_unsupported(&anthropic(
+            400,
+            "bad max_tokens"
+        )));
+        assert!(!anthropic_output_config_unsupported(&AiSdkError::from(
+            openai_status_error(
+                400,
+                &json!({"error": {"message": "output_config not supported"}}),
+                None
+            )
         )));
     }
     use crate::function_calling::{FunctionToolDefinition, FunctionToolResult};
@@ -2178,12 +2291,36 @@ mod tests {
     fn spawn_responses_server(
         responses: Vec<(&'static str, Value)>,
     ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        spawn_raw_responses_server(
+            responses
+                .into_iter()
+                .map(|(status_line, body)| RawAnswer {
+                    status_line,
+                    headers: "Content-Type: application/json\r\n",
+                    body: serde_json::to_vec(&body).expect("serialize response"),
+                })
+                .collect(),
+        )
+    }
+
+    /// One answer of `spawn_raw_responses_server`: its status line, its header lines (each ending
+    /// in CRLF) and its body, which need not be JSON.
+    struct RawAnswer {
+        status_line: &'static str,
+        headers: &'static str,
+        body: Vec<u8>,
+    }
+
+    /// `spawn_responses_server` with each answer's headers and body as given.
+    fn spawn_raw_responses_server(
+        responses: Vec<RawAnswer>,
+    ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            for (status_line, response_body) in responses {
+            for answer in responses {
                 let (mut stream, _) = listener.accept().expect("accept connection");
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -2225,17 +2362,16 @@ mod tests {
                     serde_json::from_slice(body_bytes).expect("json request body");
                 tx.send(body_value).expect("send captured body");
 
-                let response_json = serde_json::to_vec(&response_body).expect("serialize response");
                 let response = format!(
-                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response_json.len()
+                    "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    answer.status_line,
+                    answer.headers,
+                    answer.body.len()
                 );
                 stream
                     .write_all(response.as_bytes())
                     .expect("write response head");
-                stream
-                    .write_all(&response_json)
-                    .expect("write response body");
+                stream.write_all(&answer.body).expect("write response body");
             }
         });
 
@@ -3023,13 +3159,32 @@ providers:
     }
 
     #[test]
-    fn anthropic_retry_policy_matches_official_status_contract() {
+    fn provider_retry_policy_matches_official_status_contract() {
         let headers = reqwest::header::HeaderMap::new();
-        assert!(anthropic_should_retry(408, &headers));
-        assert!(anthropic_should_retry(409, &headers));
-        assert!(anthropic_should_retry(429, &headers));
-        assert!(anthropic_should_retry(500, &headers));
-        assert!(!anthropic_should_retry(400, &headers));
+        assert!(provider_should_retry(408, &headers));
+        assert!(provider_should_retry(409, &headers));
+        assert!(provider_should_retry(429, &headers));
+        assert!(provider_should_retry(500, &headers));
+        assert!(provider_should_retry(529, &headers));
+        assert!(!provider_should_retry(400, &headers));
+        assert!(!provider_should_retry(401, &headers));
+        // The provider's own word wins either way.
+        let mut said = reqwest::header::HeaderMap::new();
+        said.insert("x-should-retry", HeaderValue::from_static("false"));
+        assert!(!provider_should_retry(429, &said));
+        said.insert("x-should-retry", HeaderValue::from_static("true"));
+        assert!(provider_should_retry(400, &said));
+        // Its wait, at most 60 s.
+        let mut wait = reqwest::header::HeaderMap::new();
+        wait.insert("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(provider_retry_after(&wait), Some(Duration::from_secs(2)));
+        wait.insert("retry-after-ms", HeaderValue::from_static("250"));
+        assert_eq!(
+            provider_retry_after(&wait),
+            Some(Duration::from_millis(250))
+        );
+        wait.insert("retry-after-ms", HeaderValue::from_static("600000"));
+        assert_eq!(provider_retry_after(&wait), Some(Duration::from_secs(60)));
     }
 
     #[tokio::test]
@@ -3273,18 +3428,19 @@ providers:
             .and_then(|body| body.remove("text"))
             .is_some());
         assert_eq!(asked_again, refused);
-        assert!(openai_text_format_refused(
+        let openai = |status, param: &str| {
+            AiSdkError::from(openai_status_error(
+                status,
+                &json!({"error": {"param": param}}),
+                None,
+            ))
+        };
+        assert!(openai_text_format_refused(&openai(
             400,
-            &json!({"error": {"param": "text.format.schema"}})
-        ));
-        assert!(!openai_text_format_refused(
-            400,
-            &json!({"error": {"param": "input"}})
-        ));
-        assert!(!openai_text_format_refused(
-            429,
-            &json!({"error": {"param": "text.format"}})
-        ));
+            "text.format.schema"
+        )));
+        assert!(!openai_text_format_refused(&openai(400, "input")));
+        assert!(!openai_text_format_refused(&openai(429, "text.format")));
     }
 
     /// A model without structured outputs refuses `output_config` with a 400 that names it: the
@@ -3331,5 +3487,274 @@ providers:
             .and_then(|body| body.remove("output_config"))
             .is_some());
         assert_eq!(asked_again, refused);
+    }
+
+    fn plain_request() -> LlmRequest {
+        LlmRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: None,
+            max_output_tokens: None,
+            model_settings: None,
+        }
+    }
+
+    fn plain_turn() -> FunctionModelTurnRequest {
+        FunctionModelTurnRequest {
+            items: vec![FunctionLoopItem::UserText {
+                content: "hola".to_string(),
+            }],
+            tools: vec![tool_definition("thread_state_get")],
+            output_schema: None,
+        }
+    }
+
+    fn json_answer(status_line: &'static str, headers: &'static str, body: Value) -> RawAnswer {
+        RawAnswer {
+            status_line,
+            headers,
+            body: serde_json::to_vec(&body).expect("serialize response"),
+        }
+    }
+
+    /// OpenAI's two paths ask again on a status worth it, as Anthropic's do, after the wait the
+    /// provider names (FINDINGS A-184); only the answer that succeeds is a usage record.
+    #[tokio::test]
+    async fn an_openai_call_is_asked_again_on_a_status_worth_it() {
+        let (recorder, mut records) = crate::usage::UsageRecorder::for_test();
+        let account = AiAccount::root(recorder, "AI.sales@motherbee");
+        let (base_url, bodies, handle) = spawn_raw_responses_server(vec![
+            json_answer(
+                "429 Too Many Requests",
+                "Content-Type: application/json\r\nretry-after-ms: 1\r\n",
+                json!({"error": {"type": "rate_limit_error", "message": "slow down"}}),
+            ),
+            json_answer(
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                json!({"id": "resp_1", "status": "completed", "output_text": "hola"}),
+            ),
+        ]);
+        let answer = OpenAiResponsesClient::new("test-key", account.clone())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect("the answer, asked again");
+        handle.join().expect("server thread");
+        assert_eq!(answer.content, "hola");
+        assert_eq!(bodies.try_iter().count(), 2);
+        assert!(records.try_recv().is_ok(), "the answer is a record");
+        assert!(records.try_recv().is_err(), "the 429 is none");
+
+        let (base_url, bodies, handle) = spawn_raw_responses_server(vec![
+            json_answer(
+                "503 Service Unavailable",
+                "Content-Type: application/json\r\nretry-after: 0\r\n",
+                json!({"error": {"type": "server_error", "message": "try again"}}),
+            ),
+            json_answer(
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                json!({"id": "resp_2", "status": "completed", "output_text": "listo"}),
+            ),
+        ]);
+        let turn = OpenAiResponsesClient::new("test-key", account)
+            .with_base_url(base_url)
+            .function_model("gpt-5.5", None, ModelSettings::default())
+            .run_turn(plain_turn())
+            .await
+            .expect("the turn, asked again");
+        handle.join().expect("server thread");
+        assert_eq!(turn.assistant_text.as_deref(), Some("listo"));
+        assert_eq!(bodies.try_iter().count(), 2);
+    }
+
+    /// The status decides before the body is read: a proxy's 502 with an HTML page is asked
+    /// again, and the last one's error keeps its status, where the body read first lost it in a
+    /// decoding error (FINDINGS A-184). A 400 is asked once, and its error names its field.
+    #[tokio::test]
+    async fn an_openai_error_keeps_its_status_whatever_its_body() {
+        let page = || RawAnswer {
+            status_line: "502 Bad Gateway",
+            headers: "Content-Type: text/html\r\nretry-after-ms: 1\r\nx-request-id: req_502\r\n",
+            body: b"<html><body>502 Bad Gateway</body></html>".to_vec(),
+        };
+        let (base_url, bodies, handle) = spawn_raw_responses_server(vec![page(), page(), page()]);
+        let err = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("three 502s");
+        handle.join().expect("server thread");
+        assert_eq!(bodies.try_iter().count(), PROVIDER_MAX_ATTEMPTS);
+        let AiSdkError::Provider(err) = err else {
+            panic!("a provider error: {err:?}");
+        };
+        assert_eq!(
+            (err.provider, err.status, err.kind()),
+            (
+                AiProvider::OpenAi,
+                502,
+                crate::errors::ProviderErrorKind::Unavailable
+            )
+        );
+        assert_eq!(err.error_type, "unknown_error");
+        assert_eq!(err.request_id.as_deref(), Some("req_502"));
+
+        let (base_url, bodies, handle) = spawn_raw_responses_server(vec![json_answer(
+            "400 Bad Request",
+            "Content-Type: application/json\r\n",
+            json!({"error": {
+                "type": "invalid_request_error",
+                "param": "input[0].content[1].file_data",
+                "message": "Invalid value"
+            }}),
+        )]);
+        let err = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model("gpt-5.5", None, ModelSettings::default())
+            .run_turn(plain_turn())
+            .await
+            .expect_err("a 400");
+        handle.join().expect("server thread");
+        assert_eq!(bodies.try_iter().count(), 1, "a 400 is asked once");
+        let AiSdkError::Provider(err) = err else {
+            panic!("a provider error: {err:?}");
+        };
+        assert_eq!(err.status, 400);
+        assert_eq!(err.param.as_deref(), Some("input[0].content[1].file_data"));
+    }
+
+    /// Anthropic's error status is typed the same way, with its `request-id`.
+    #[tokio::test]
+    async fn an_anthropic_error_status_is_typed_with_its_request_id() {
+        let (base_url, _bodies, handle) = spawn_raw_responses_server(vec![json_answer(
+            "401 Unauthorized",
+            "Content-Type: application/json\r\nrequest-id: req_401\r\n",
+            json!({"type": "error", "error": {
+                "type": "authentication_error", "message": "invalid x-api-key"
+            }}),
+        )]);
+        let err = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("a 401");
+        handle.join().expect("server thread");
+        let AiSdkError::Provider(err) = err else {
+            panic!("a provider error: {err:?}");
+        };
+        assert_eq!(
+            (err.provider, err.status, err.kind()),
+            (
+                AiProvider::Anthropic,
+                401,
+                crate::errors::ProviderErrorKind::Auth
+            )
+        );
+        assert_eq!(err.error_type, "authentication_error");
+        assert_eq!(err.request_id.as_deref(), Some("req_401"));
+        assert_eq!(
+            err.to_string(),
+            "anthropic error status=401 type=authentication_error request_id=req_401 \
+             message=invalid x-api-key"
+        );
+    }
+
+    /// A refusal is the model's answer, its own error on both providers and both paths, never an
+    /// empty turn its caller asks again without tools (FINDINGS A-184, 0.1.112's gate).
+    #[tokio::test]
+    async fn a_refusal_is_its_own_error_on_both_providers() {
+        let anthropic_refusal = || {
+            json!({
+                "content": [{"type": "text", "text": "I"}],
+                "stop_reason": "refusal"
+            })
+        };
+        let (base_url, _bodies, handle) = spawn_single_response_server(anthropic_refusal());
+        let err = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("a refusal");
+        handle.join().expect("server thread");
+        assert!(
+            matches!(
+                err,
+                AiSdkError::Refused {
+                    provider: AiProvider::Anthropic,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_provider_failure());
+
+        let (base_url, _bodies, handle) = spawn_single_response_server(anthropic_refusal());
+        let err = AnthropicMessagesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model("claude-sonnet-5-5", None, ModelSettings::default())
+            .run_turn(plain_turn())
+            .await
+            .expect_err("a refusal on a tool turn");
+        handle.join().expect("server thread");
+        assert!(matches!(err, AiSdkError::Refused { .. }), "{err:?}");
+
+        let openai_refusal = || {
+            json!({"id": "resp_r", "status": "completed", "output": [{
+                "type": "message", "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "I can't help with that."}]
+            }]})
+        };
+        let (base_url, _bodies, handle) = spawn_single_response_server(openai_refusal());
+        let err = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("a refusal");
+        handle.join().expect("server thread");
+        assert!(
+            matches!(
+                err,
+                AiSdkError::Refused {
+                    provider: AiProvider::OpenAi,
+                    reason: "refusal"
+                }
+            ),
+            "{err:?}"
+        );
+
+        let (base_url, _bodies, handle) = spawn_single_response_server(openai_refusal());
+        let err = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .function_model("gpt-5.5", None, ModelSettings::default())
+            .run_turn(plain_turn())
+            .await
+            .expect_err("a refusal on a tool turn");
+        handle.join().expect("server thread");
+        assert!(matches!(err, AiSdkError::Refused { .. }), "{err:?}");
+
+        let (base_url, _bodies, handle) = spawn_single_response_server(json!({
+            "id": "resp_f", "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"}, "output": []
+        }));
+        let err = OpenAiResponsesClient::new("test-key", test_account())
+            .with_base_url(base_url)
+            .generate(plain_request())
+            .await
+            .expect_err("the filter's cut");
+        handle.join().expect("server thread");
+        assert!(
+            matches!(
+                err,
+                AiSdkError::Refused {
+                    reason: "content_filter",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

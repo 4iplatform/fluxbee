@@ -19,7 +19,7 @@ pub use control_plane::{
     control_caller_authorized, control_request, is_infrastructure_message,
     note_infrastructure_message, ControlRequest, MSG_PING, MSG_STATUS,
 };
-pub use errors::{AiSdkError, Result};
+pub use errors::{AiSdkError, ProviderError, ProviderErrorKind, Result, PROVIDER_FAILURE_TEXT};
 pub use fluxbee_sdk::{TenantSource, UsageWork};
 pub use function_calling::{
     dispatch_tool_calls, AgentTool, FunctionCallingConfig, FunctionCallingModel,

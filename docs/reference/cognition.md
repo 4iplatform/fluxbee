@@ -213,9 +213,14 @@ stays in the last turns.
   never named them, so before 0.1.102 no feeling was ever made.
 - **Limits:** `semantic_tagger.timeout_ms` (default 8000, `COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS`);
   1024 output tokens (`SEMANTIC_TAGGER_MAX_OUTPUT_TOKENS`); no temperature.
-- An answer it cannot parse as that JSON object counts as an invalid output
-  (`semantic_tagger_invalid_outputs_total`); any other error, a timeout included, as a failure
-  (`semantic_tagger_failures_total`).
+- **A failed call is counted by what it was** (`model_failure`, FINDINGS A-184):
+  - **the provider gave no answer:** an error status after the AI SDK's retries, no connection,
+    no answer in its `timeout_ms`, or the model's refusal. Cognition does not judge it:
+    `semantic_tagger_provider_errors_total`. A provider's error status, a 429 among them, used to
+    count as an invalid output, as if the model had answered badly;
+  - **the model answered, and not with that JSON object** (no JSON, other JSON, or an answer cut
+    at its token limit): `semantic_tagger_invalid_outputs_total`;
+  - **anything else, no AI key included:** `semantic_tagger_failures_total`.
 
 ### 3.2 The narrative summarizer
 
@@ -252,7 +257,9 @@ The policy is published in `STATUS` and `CONFIG_GET` (`degraded_semantics_policy
 - no AI key, or a tagger failure: `skip_semantic_derivation_fail_open`. The turn is not
   processed;
 - a summarizer failure: `skip_narrative_update_fail_open`. The turn keeps its thread, context,
-  reason, co-occurrence, scope and feeling updates, without the memory or the feelings' text;
+  reason, co-occurrence, scope and feeling updates, without the memory or the feelings' text. It
+  is counted as the tagger's is (§3.1): `narrative_summarizer_provider_errors_total`,
+  `narrative_summarizer_invalid_outputs_total` or `narrative_summarizer_failures_total`;
 - there is no fallback without a model, and nothing in the message path waits for cognition;
 - none of these touch the last turns, which need no model (§3.4).
 
@@ -753,8 +760,8 @@ The records land in the `llm_usage` table (`docs/reference/storage.md`).
   intake added to their communications' last turns, §3.4), `turns_not_analyzed_total` (turns
   with no person at their other end, §3), `relay_turns_total` (the turns a WF relayed between
   people, §2) and `duplicate_turns_skipped_total` (one message copied twice, §2);
-- the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, failures and invalid
-  outputs;
+- the model calls: `semantic_tagger_*` and `narrative_summarizer_*` calls, provider errors,
+  invalid outputs and other failures (§3.1);
 - the live state: the communications held, their contexts, reasons and co-occurrences, active
   scopes, memories and feelings (`active_feelings_total`).
 

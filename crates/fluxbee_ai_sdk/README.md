@@ -73,10 +73,33 @@ pub fn create_function_calling_model(
   - Anthropic needs a token limit on every request, so the SDK sends 4,096 when
     `max_output_tokens` is unset; OpenAI uses the model's default;
   - an answer cut at the limit is an error on both providers, plain path and tool turns alike
-    (`AiSdkError::is_truncated_answer`); its usage record says `truncated`.
-- **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (Anthropic's
-  `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says `abandoned`.
-  The bound is for stuck connections: a long reasoning answer or an Archi stage fits in it.
+    (`AiSdkError::Truncated`, `is_truncated_answer`); its usage record says `truncated`.
+- **Each call is retried the same way on both providers** (`send` in `llm.rs`, FINDINGS A-184):
+  - up to 3 attempts, on a transport error and on 408, 409, 429 or any 5xx, or as the provider's
+    `x-should-retry` says;
+  - the wait is the provider's `retry-after-ms` or `retry-after` (at most 60 s), else 0.5 s
+    doubling, with jitter;
+  - the status and the headers decide before the body is read, so a proxy's 502 with an HTML
+    page keeps its status.
+- **The errors are typed** (`errors.rs`), and a caller matches the type, never the text:
+  - **`AiSdkError::Provider(ProviderError)`:** the provider answered an error status after the
+    retries: its `provider`, `status`, `kind()` (`InvalidRequest`, `Auth`, `Timeout`,
+    `RateLimited`, `Unavailable`, `Other`), the body's `error_type`, OpenAI's `param` (the request
+    field it refused), the `request_id` and the `message`. Never the body itself: OpenAI's 401
+    echoes the key, and the message is scrubbed of it. Its `Display` is one line for the log,
+    `anthropic error status=429 type=rate_limit_error request_id=… message=…`.
+  - **`AiSdkError::Refused`:** the model declined: Anthropic's `stop_reason: refusal`, an OpenAI
+    refusal part, or OpenAI's content filter. A tool turn that refuses is this error too, never an
+    empty turn its caller asks again without tools.
+  - **`is_provider_failure()`:** the provider gave no answer: `Provider`, `Http` (no connection, or
+    an answer that could not be read), `Timeout` or `Refused`. Neither the model's answer nor the
+    caller's request is at fault. An AI node answers a person with `PROVIDER_FAILURE_TEXT` then,
+    one fixed text in English, and logs the error (the operator's call of 2026-11-08); SY.cognition
+    counts it apart from an invalid output.
+- **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (each
+  provider's `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says
+  `abandoned`. The bound is for stuck connections: a long reasoning answer or an Archi stage fits
+  in it.
 - **Prompt caching on Anthropic:** a tool turn marks two cache breakpoints,
   `cache_control: {"type": "ephemeral"}`, on the last tool definition and on the `system` prompt
   given to the factory. The tools and that prompt are the same on every turn, so Anthropic reads
@@ -276,8 +299,8 @@ What is recorded:
   invalid answer still cost. Its `outcome` is `ok`, `truncated`, `refused` or `unreadable`.
 - **A call dropped while its request is outstanding** (a caller's timeout): `abandoned`, without
   tokens.
-- **Non-2xx answers and transport errors:** no record. Of Anthropic's retries, only the attempt that
-  answered is recorded.
+- **Non-2xx answers and transport errors:** no record. Of a call's retries, on either provider, only
+  the attempt that answered is recorded.
 - **The counts, normalized across providers:** `uncached_input`, `cache_read`, `cache_write`,
   `output` (reasoning included), `reasoning` (OpenAI only), plus the provider's raw usage object.
 

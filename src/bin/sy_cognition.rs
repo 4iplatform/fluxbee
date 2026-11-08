@@ -142,8 +142,36 @@ struct NarrativeOutcome {
     called: bool,
     failed: bool,
     invalid_output: bool,
+    /// The provider gave no answer (`ModelFailure::Provider`).
+    provider_error: bool,
     /// The episode the narrator proposed, for the gate (docs/cognition-hands-v1.md §12.4).
     episode: Option<episodes::EpisodeProposal>,
+}
+
+/// What a failed model call of cognition's was, for its counters (FINDINGS A-184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelFailure {
+    /// The provider gave no answer: an error status after its retries, no connection, none in
+    /// time, or the model's refusal. Cognition does not judge it: it is no invalid output.
+    Provider,
+    /// The model answered, and its answer is not the object asked for: no JSON, other JSON, or
+    /// one cut at its token limit.
+    InvalidOutput,
+    /// Anything else.
+    Other,
+}
+
+fn model_failure(err: &fluxbee_ai_sdk::AiSdkError) -> ModelFailure {
+    if err.is_provider_failure() {
+        return ModelFailure::Provider;
+    }
+    match err {
+        fluxbee_ai_sdk::AiSdkError::Json(_)
+        | fluxbee_ai_sdk::AiSdkError::Protocol(_)
+        | fluxbee_ai_sdk::AiSdkError::Truncated { .. }
+        | fluxbee_ai_sdk::AiSdkError::InvalidStructuredOutput { .. } => ModelFailure::InvalidOutput,
+        _ => ModelFailure::Other,
+    }
 }
 
 /// What the narrator needs to propose an episode (docs/cognition-hands-v1.md §12.4): whom the turn
@@ -328,11 +356,13 @@ struct CognitionRuntimeState {
     semantic_tagger_calls_total: u64,
     semantic_tagger_failures_total: u64,
     semantic_tagger_invalid_outputs_total: u64,
+    semantic_tagger_provider_errors_total: u64,
     last_semantic_model: Option<String>,
     last_semantic_impl: Option<String>,
     narrative_summarizer_calls_total: u64,
     narrative_summarizer_failures_total: u64,
     narrative_summarizer_invalid_outputs_total: u64,
+    narrative_summarizer_provider_errors_total: u64,
     last_narrative_model: Option<String>,
 }
 
@@ -2057,18 +2087,22 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     {
         Ok(output) => output,
         Err(err) => {
-            let is_invalid_output = matches!(
-                err,
-                fluxbee_ai_sdk::AiSdkError::Json(_) | fluxbee_ai_sdk::AiSdkError::Protocol(_)
-            );
             let mut state = app_state.runtime_state.lock().await;
-            if is_invalid_output {
-                state.semantic_tagger_invalid_outputs_total = state
-                    .semantic_tagger_invalid_outputs_total
-                    .saturating_add(1);
-            } else {
-                state.semantic_tagger_failures_total =
-                    state.semantic_tagger_failures_total.saturating_add(1);
+            match model_failure(&err) {
+                ModelFailure::Provider => {
+                    state.semantic_tagger_provider_errors_total = state
+                        .semantic_tagger_provider_errors_total
+                        .saturating_add(1);
+                }
+                ModelFailure::InvalidOutput => {
+                    state.semantic_tagger_invalid_outputs_total = state
+                        .semantic_tagger_invalid_outputs_total
+                        .saturating_add(1);
+                }
+                ModelFailure::Other => {
+                    state.semantic_tagger_failures_total =
+                        state.semantic_tagger_failures_total.saturating_add(1);
+                }
             }
             state.last_trace_id = Some(msg.routing.trace_id.clone());
             state.last_thread_id = Some(thread_id.clone());
@@ -2252,6 +2286,11 @@ async fn handle_turn(turn: CognitionTurn, app_state: Arc<CognitionAppState>) {
     if narrative.invalid_output {
         state.narrative_summarizer_invalid_outputs_total = state
             .narrative_summarizer_invalid_outputs_total
+            .saturating_add(1);
+    }
+    if narrative.provider_error {
+        state.narrative_summarizer_provider_errors_total = state
+            .narrative_summarizer_provider_errors_total
             .saturating_add(1);
     }
     state.active_threads_total = active_threads_total;
@@ -3711,11 +3750,13 @@ fn build_status_payload(
         "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
         "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
         "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "semantic_tagger_provider_errors_total": runtime_state.semantic_tagger_provider_errors_total,
         "last_semantic_model": runtime_state.last_semantic_model,
         "last_semantic_impl": runtime_state.last_semantic_impl,
         "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
         "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
         "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "narrative_summarizer_provider_errors_total": runtime_state.narrative_summarizer_provider_errors_total,
         "last_narrative_model": runtime_state.last_narrative_model
     });
     let paths = json!({
@@ -3906,11 +3947,13 @@ fn build_cognition_config_get_payload(
         "semantic_tagger_calls_total": runtime_state.semantic_tagger_calls_total,
         "semantic_tagger_failures_total": runtime_state.semantic_tagger_failures_total,
         "semantic_tagger_invalid_outputs_total": runtime_state.semantic_tagger_invalid_outputs_total,
+        "semantic_tagger_provider_errors_total": runtime_state.semantic_tagger_provider_errors_total,
         "last_semantic_model": runtime_state.last_semantic_model,
         "last_semantic_impl": runtime_state.last_semantic_impl,
         "narrative_summarizer_calls_total": runtime_state.narrative_summarizer_calls_total,
         "narrative_summarizer_failures_total": runtime_state.narrative_summarizer_failures_total,
         "narrative_summarizer_invalid_outputs_total": runtime_state.narrative_summarizer_invalid_outputs_total,
+        "narrative_summarizer_provider_errors_total": runtime_state.narrative_summarizer_provider_errors_total,
         "last_narrative_model": runtime_state.last_narrative_model
     });
     let contract = json!({
@@ -4920,15 +4963,13 @@ async fn update_memories_and_feelings_for_thread<S: NarrativeSummarizer>(
                 error = %err,
                 "sy.cognition narrative summarizer failed; skipping memory/feeling synthesis for turn"
             );
-            let invalid_output = matches!(
-                err,
-                fluxbee_ai_sdk::AiSdkError::Json(_) | fluxbee_ai_sdk::AiSdkError::Protocol(_)
-            );
+            let failure = model_failure(&err);
             return (
                 NarrativeOutcome {
                     called: true,
-                    failed: !invalid_output,
-                    invalid_output,
+                    failed: failure == ModelFailure::Other,
+                    invalid_output: failure == ModelFailure::InvalidOutput,
+                    provider_error: failure == ModelFailure::Provider,
                     episode: None,
                 },
                 None,
@@ -4950,6 +4991,7 @@ async fn update_memories_and_feelings_for_thread<S: NarrativeSummarizer>(
             called: true,
             failed: false,
             invalid_output: false,
+            provider_error: false,
             episode: narrative_result.episode,
         },
         narrative_result.feeling,
@@ -5567,6 +5609,103 @@ mod tests {
                     episode: None,
                 })
             }
+        }
+    }
+
+    /// A narrator whose provider fails the way `0` makes it.
+    struct FailingNarrative(fn() -> fluxbee_ai_sdk::AiSdkError);
+
+    impl NarrativeSummarizer for FailingNarrative {
+        fn summarize<'a>(
+            &'a self,
+            _input: NarrativeSummarizerAiInput<'a>,
+        ) -> impl Future<Output = Result<NarrativeSummaries, fluxbee_ai_sdk::AiSdkError>> + Send + 'a
+        {
+            let err = (self.0)();
+            async move { Err(err) }
+        }
+    }
+
+    /// A provider's error is no invalid output: cognition does not judge it, and counts it apart
+    /// (FINDINGS A-184). An answer that is not the object asked for is one.
+    #[tokio::test]
+    async fn a_provider_error_is_no_invalid_output() {
+        let provider = || {
+            fluxbee_ai_sdk::AiSdkError::Provider(fluxbee_ai_sdk::ProviderError {
+                provider: fluxbee_ai_sdk::AiProvider::OpenAi,
+                status: 429,
+                error_type: "rate_limit_error".to_string(),
+                param: None,
+                request_id: None,
+                message: "slow down".to_string(),
+            })
+        };
+        let refused = || fluxbee_ai_sdk::AiSdkError::Refused {
+            provider: fluxbee_ai_sdk::AiProvider::Anthropic,
+            reason: "stop_reason=refusal",
+        };
+        let late = || fluxbee_ai_sdk::AiSdkError::Timeout("semantic tagger".to_string());
+        let no_json = || {
+            fluxbee_ai_sdk::AiSdkError::Protocol(
+                "semantic tagger response missing JSON object".to_string(),
+            )
+        };
+        let cut = || fluxbee_ai_sdk::AiSdkError::Truncated {
+            provider: fluxbee_ai_sdk::AiProvider::OpenAi,
+            limit: "max_output_tokens",
+        };
+        for (make, kind) in [
+            (
+                provider as fn() -> fluxbee_ai_sdk::AiSdkError,
+                ModelFailure::Provider,
+            ),
+            (refused, ModelFailure::Provider),
+            (late, ModelFailure::Provider),
+            (no_json, ModelFailure::InvalidOutput),
+            (cut, ModelFailure::InvalidOutput),
+        ] {
+            let err = make();
+            assert_eq!(model_failure(&err), kind, "{err}");
+
+            let mut thread = ThreadCognitionState::default();
+            let tagger = SemanticTaggerOutput {
+                tags: strings(&["billing"]),
+                reason_signals_canonical: strings(&["resolve", "challenge"]),
+                reason_signals_extra: strings(&["frustration"]),
+                affect_signals: strings(&["frustration"]),
+            };
+            let juan = person("ilk:juan", "Juan");
+            let outcome = update_thread_state(
+                &key(TEST_THREAD),
+                Some("ilk:juan"),
+                Some(TEST_AGENT),
+                Some(&juan),
+                Some("Juan"),
+                &tagger,
+                &CognitionThresholds::default(),
+                "test-key",
+                &AiAccount::root(UsageRecorder::disabled(), "SY.cognition@motherbee"),
+                &CognitionSemanticTaggerConfig::default(),
+                "2026-01-01T00:01:00Z",
+                &mut thread,
+                &EpisodeAsk::default(),
+                &FailingNarrative(make),
+            )
+            .await;
+            assert!(outcome.called, "{err}");
+            assert_eq!(
+                (
+                    outcome.provider_error,
+                    outcome.invalid_output,
+                    outcome.failed
+                ),
+                (
+                    kind == ModelFailure::Provider,
+                    kind == ModelFailure::InvalidOutput,
+                    false
+                ),
+                "{err}"
+            );
         }
     }
 

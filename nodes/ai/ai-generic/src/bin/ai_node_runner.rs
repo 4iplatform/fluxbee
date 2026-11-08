@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fluxbee_ai_sdk::errors::{ProviderError, ProviderErrorKind};
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
-    build_output_schema_fallback_instruction, build_reply_message_runtime_src, control_request,
-    create_function_calling_model, create_llm_client, extract_text, is_infrastructure_message,
-    note_infrastructure_message, resolve_message_contract,
+    build_output_schema_fallback_instruction, build_reply_message_runtime_src, build_text_response,
+    control_request, create_function_calling_model, create_llm_client, extract_text,
+    is_infrastructure_message, note_infrastructure_message, resolve_message_contract,
     resolve_model_input_from_payload_with_options, set_reply_evaluation, AgentTool, AiAccount,
     AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, ContractAnswer,
     ControlRequest, FunctionCallingConfig, FunctionCallingModel, FunctionCallingRunner,
@@ -928,48 +929,25 @@ impl AiNode for GenericAiNode {
                     Err(err) => {
                         let attachment_summary =
                             attachment_summary_for_observability(resolved_user_input.as_ref());
-                        if let fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg_text) = &err {
-                            if let Some((status, detail)) = parse_openai_status_error(msg_text) {
-                                tracing::warn!(
-                                    node_name = %self.node_name,
-                                    trace_id = %msg.routing.trace_id,
-                                    model = %engine.model,
-                                    provider_status = status,
-                                    provider_param = ?extract_openai_error_param(msg_text),
-                                    provider_detail = %trim_chars(&detail, 280),
-                                    attachment_count = attachment_summary.count,
-                                    attachment_total_bytes = attachment_summary.total_bytes,
-                                    attachment_mimes = ?attachment_summary.mimes,
-                                    error = %err,
-                                    "AI runtime request failed with structured provider status; replying with provider error payload"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    node_name = %self.node_name,
-                                    trace_id = %msg.routing.trace_id,
-                                    model = %engine.model,
-                                    attachment_count = attachment_summary.count,
-                                    attachment_total_bytes = attachment_summary.total_bytes,
-                                    attachment_mimes = ?attachment_summary.mimes,
-                                    error = %err,
-                                    "AI runtime request failed; replying with provider error payload"
-                                );
-                            }
-                        } else {
-                            tracing::warn!(
-                                node_name = %self.node_name,
-                                trace_id = %msg.routing.trace_id,
-                                model = %engine.model,
-                                attachment_count = attachment_summary.count,
-                                attachment_total_bytes = attachment_summary.total_bytes,
-                                attachment_mimes = ?attachment_summary.mimes,
-                                error = %err,
-                                "AI runtime request failed; replying with provider error payload"
-                            );
-                        }
-                        let payload = ai_chat_failure_payload(
+                        let provider = provider_error_of(&err);
+                        let (payload, reply) = ai_chat_failure_reply(
                             &err,
+                            contract.as_ref(),
                             behavior_ctx.tool_ran.load(Ordering::Relaxed),
+                        );
+                        tracing::warn!(
+                            node_name = %self.node_name,
+                            trace_id = %msg.routing.trace_id,
+                            model = %engine.model,
+                            provider_status = ?provider.map(|provider| provider.status),
+                            provider_param = ?provider.and_then(|provider| provider.param.as_deref()),
+                            provider_request_id = ?provider.and_then(|provider| provider.request_id.as_deref()),
+                            attachment_count = attachment_summary.count,
+                            attachment_total_bytes = attachment_summary.total_bytes,
+                            attachment_mimes = ?attachment_summary.mimes,
+                            reply,
+                            error = %err,
+                            "AI runtime request failed"
                         );
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
@@ -6431,6 +6409,37 @@ fn ai_engine_error_payload(err: &AiEngineError) -> Value {
     }
 }
 
+/// The reply to a message whose AI run failed, and which one it is, for the log. When the provider
+/// gave no answer (`is_provider_failure`), the person gets `PROVIDER_FAILURE_TEXT` as the agent's
+/// text, so it reaches them on any path a text answer takes, a WF's forward among them, where the
+/// error payload reached no one (FINDINGS A-184). Only a response envelope's sender, a program
+/// that reads the object it asked for, gets the error payload instead. Any other failure is the
+/// error payload (`ai_chat_failure_payload`).
+fn ai_chat_failure_reply(
+    err: &fluxbee_ai_sdk::errors::AiSdkError,
+    contract: Option<&MessageContract>,
+    tool_ran: bool,
+) -> (Value, &'static str) {
+    if err.is_provider_failure() && !matches!(contract, Some(MessageContract::Envelope(_))) {
+        match build_text_response(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT) {
+            Ok(payload) => return (payload, "provider_failure_text"),
+            Err(build_err) => tracing::warn!(
+                error = %build_err,
+                "the provider-failure text could not be built; replying with the error payload"
+            ),
+        }
+    }
+    (ai_chat_failure_payload(err, tool_ran), "error_payload")
+}
+
+/// The provider's error status in `err`, if that is what it is.
+fn provider_error_of(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Option<&ProviderError> {
+    match err {
+        fluxbee_ai_sdk::errors::AiSdkError::Provider(provider) => Some(provider),
+        _ => None,
+    }
+}
+
 /// What the sender gets for a failed AI run. Once a tool has run, no failure is `retryable`
 /// (`provider_timeout` on a later turn included): sending the same message again would run that
 /// tool again.
@@ -6468,70 +6477,19 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "message": "The AI's answer hit its token limit and was cut. Raise behavior.model_settings.max_output_tokens.",
             "retryable": false
         }),
-        fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
-            if let Some((status, detail)) = parse_openai_status_error(msg) {
-                if (status == 400 || status == 404 || status == 422)
-                    && extract_openai_error_param(msg)
-                        .as_deref()
-                        .is_some_and(is_openai_attachment_param)
-                {
-                    return json!({
-                        "type": "error",
-                        "code": "provider_attachment_invalid_request",
-                        "message": "The AI provider rejected one or more attached files for the current model/provider.",
-                        "retryable": false,
-                        "provider_status": status,
-                        "provider_detail": trim_chars(&detail, 280)
-                    });
-                }
-                let (code, retryable, message) = match status {
-                    400 | 404 | 422 => (
-                        "provider_invalid_request",
-                        false,
-                        "The request is not valid for the AI provider.",
-                    ),
-                    401 | 403 => (
-                        "provider_auth_error",
-                        false,
-                        "AI provider authentication failed. Check configured credentials.",
-                    ),
-                    408 => (
-                        "provider_timeout",
-                        true,
-                        "The AI provider timed out while processing the request.",
-                    ),
-                    429 => (
-                        "provider_rate_limited",
-                        true,
-                        "The AI provider is rate limiting requests. Retry shortly.",
-                    ),
-                    500..=599 => (
-                        "provider_unavailable",
-                        true,
-                        "The AI provider is temporarily unavailable.",
-                    ),
-                    _ => (
-                        "provider_error",
-                        true,
-                        "The AI provider returned an error while processing the request.",
-                    ),
-                };
-                return json!({
-                    "type": "error",
-                    "code": code,
-                    "message": message,
-                    "retryable": retryable,
-                    "provider_status": status,
-                    "provider_detail": trim_chars(&detail, 280)
-                });
-            }
-            json!({
-                "type": "error",
-                "code": "provider_error",
-                "message": "The AI provider returned an unexpected error.",
-                "retryable": false
-            })
-        }
+        fluxbee_ai_sdk::errors::AiSdkError::Provider(provider) => provider_error_payload(provider),
+        fluxbee_ai_sdk::errors::AiSdkError::Refused { .. } => json!({
+            "type": "error",
+            "code": "provider_refused",
+            "message": "The AI model declined to answer.",
+            "retryable": false
+        }),
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(_) => json!({
+            "type": "error",
+            "code": "provider_error",
+            "message": "The AI provider returned an unexpected error.",
+            "retryable": false
+        }),
         // The model answered, but not with the object the message's contract asks for: its
         // response contract, or its WF's menu.
         fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput { detail } => json!({
@@ -6606,25 +6564,63 @@ fn ai_final_output_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Va
     }
 }
 
-/// Extract (status, detail) from a provider HTTP error. Matches BOTH the OpenAI and Anthropic
-/// adapter formats (audit M3): the SDK emits "<provider> error status={code} type={t} message={m}"
-/// (Anthropic also carries request_id=). The old parser matched only "openai error status=" + a
-/// now-removed " body=" tail, so every Anthropic error collapsed to a generic unclassified payload
-/// and (after the B6 body-scrub) OpenAI details were lost too.
-fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
-    let idx = message.find("error status=")?;
-    let after = &message[idx + "error status=".len()..];
-    let status = after.split([' ', ',']).next()?.trim().parse::<u16>().ok()?;
-    let detail = after
-        .split_once("message=")
-        .map(|(_, msg)| msg.trim().to_string())
-        .or_else(|| {
-            after
-                .split_once(" body=")
-                .map(|(_, body)| body.trim().to_string())
-        })
-        .unwrap_or_default();
-    Some((status, detail))
+/// The error payload of a provider's error status, by its kind (FINDINGS A-184: the SDK's typed
+/// error, where this read the error's text). An attachment the provider refused, by the field its
+/// 400 names, is its own.
+fn provider_error_payload(err: &ProviderError) -> Value {
+    let detail = trim_chars(&err.message, 280);
+    if err.kind() == ProviderErrorKind::InvalidRequest
+        && err.param.as_deref().is_some_and(is_openai_attachment_param)
+    {
+        return json!({
+            "type": "error",
+            "code": "provider_attachment_invalid_request",
+            "message": "The AI provider rejected one or more attached files for the current model/provider.",
+            "retryable": false,
+            "provider_status": err.status,
+            "provider_detail": detail
+        });
+    }
+    let (code, retryable, message) = match err.kind() {
+        ProviderErrorKind::InvalidRequest => (
+            "provider_invalid_request",
+            false,
+            "The request is not valid for the AI provider.",
+        ),
+        ProviderErrorKind::Auth => (
+            "provider_auth_error",
+            false,
+            "AI provider authentication failed. Check configured credentials.",
+        ),
+        ProviderErrorKind::Timeout => (
+            "provider_timeout",
+            true,
+            "The AI provider timed out while processing the request.",
+        ),
+        ProviderErrorKind::RateLimited => (
+            "provider_rate_limited",
+            true,
+            "The AI provider is rate limiting requests. Retry shortly.",
+        ),
+        ProviderErrorKind::Unavailable => (
+            "provider_unavailable",
+            true,
+            "The AI provider is temporarily unavailable.",
+        ),
+        ProviderErrorKind::Other => (
+            "provider_error",
+            true,
+            "The AI provider returned an error while processing the request.",
+        ),
+    };
+    json!({
+        "type": "error",
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "provider_status": err.status,
+        "provider_detail": detail
+    })
 }
 
 #[derive(Debug, Default)]
@@ -6656,19 +6652,6 @@ fn attachment_summary_for_observability(
         total_bytes,
         mimes,
     }
-}
-
-/// Extract the OpenAI error `param` (the offending request field) from a provider error string
-/// "openai error status=N type=T param=P message=M". The raw JSON body no longer travels (audit
-/// B6), so param is now a named token bounded by " message="; empty/absent yields None.
-fn extract_openai_error_param(error_str: &str) -> Option<String> {
-    let after = error_str.split_once("param=")?.1;
-    let param = after
-        .split_once(" message=")
-        .map(|(param, _)| param)
-        .unwrap_or(after)
-        .trim();
-    (!param.is_empty()).then(|| param.to_string())
 }
 
 fn is_openai_attachment_param(param: &str) -> bool {
@@ -7371,37 +7354,149 @@ mod tests {
         .is_ok());
     }
 
-    #[test]
-    fn parse_provider_status_error_handles_both_providers() {
-        // M3: status extracted from BOTH adapter formats; detail is the message (no raw body).
-        let (s, d) = parse_openai_status_error(
-            "openai error status=401 type=invalid_request_error message=Incorrect API key",
-        )
-        .expect("openai parsed");
-        assert_eq!(s, 401);
-        assert_eq!(d, "Incorrect API key");
-        let (s, d) = parse_openai_status_error(
-            "anthropic error status=429 type=rate_limit_error request_id=req_1 message=slow down",
-        )
-        .expect("anthropic parsed");
-        assert_eq!(s, 429);
-        assert_eq!(d, "slow down");
-        assert!(parse_openai_status_error("some unrelated error").is_none());
+    fn provider_error(provider: AiProvider, status: u16, param: Option<&str>) -> ProviderError {
+        ProviderError {
+            provider,
+            status,
+            error_type: "invalid_request_error".to_string(),
+            param: param.map(str::to_string),
+            request_id: None,
+            message: "Invalid value".to_string(),
+        }
     }
 
+    /// A provider's error status gets the payload of its kind, on either provider, from the SDK's
+    /// typed error (FINDINGS A-184); an attachment the provider refused is its own.
     #[test]
-    fn extract_openai_error_param_reads_named_token_and_classifies_attachment() {
-        // M3: attachment classification must survive the body->param=/message= format change.
-        let err = "openai error status=400 type=invalid_request_error param=input[0].content[1].file_data message=Invalid value";
-        let param = extract_openai_error_param(err).expect("param extracted");
-        assert_eq!(param, "input[0].content[1].file_data");
-        assert!(is_openai_attachment_param(&param));
-        // Empty param -> None; no param field -> None.
-        assert!(
-            extract_openai_error_param("openai error status=401 type=x param= message=nope")
-                .is_none()
+    fn a_provider_error_status_gets_the_payload_of_its_kind() {
+        for provider in [AiProvider::OpenAi, AiProvider::Anthropic] {
+            for (status, code, retryable) in [
+                (400, "provider_invalid_request", false),
+                (401, "provider_auth_error", false),
+                (408, "provider_timeout", true),
+                (409, "provider_error", true),
+                (429, "provider_rate_limited", true),
+                (502, "provider_unavailable", true),
+            ] {
+                let payload = provider_error_payload(&provider_error(provider, status, None));
+                assert_eq!(payload["code"], json!(code), "{provider} {status}");
+                assert_eq!(
+                    payload["retryable"],
+                    json!(retryable),
+                    "{provider} {status}"
+                );
+                assert_eq!(payload["provider_status"], json!(status));
+                assert_eq!(payload["provider_detail"], json!("Invalid value"));
+            }
+        }
+        let attachment = provider_error(
+            AiProvider::OpenAi,
+            400,
+            Some("input[0].content[1].file_data"),
         );
-        assert!(extract_openai_error_param("anthropic error status=429 message=slow").is_none());
+        assert_eq!(
+            provider_error_payload(&attachment)["code"],
+            json!("provider_attachment_invalid_request")
+        );
+        let not_an_attachment = provider_error(AiProvider::OpenAi, 400, Some("model"));
+        assert_eq!(
+            provider_error_payload(&not_an_attachment)["code"],
+            json!("provider_invalid_request")
+        );
+    }
+
+    /// When the provider gives no answer, the person gets the fixed text as the agent's text, a
+    /// payload a WF forwards as it does any answer (`event.payload.type == 'text'`), with no
+    /// contract or under a WF's menu; a response envelope's sender gets the error payload. A
+    /// failure that is not the provider's stays the error payload (FINDINGS A-184).
+    #[test]
+    fn a_provider_failure_reaches_the_person_as_the_fixed_text() {
+        let failures = [
+            fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
+                AiProvider::Anthropic,
+                429,
+                None,
+            )),
+            fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
+                AiProvider::OpenAi,
+                401,
+                None,
+            )),
+            fluxbee_ai_sdk::errors::AiSdkError::Refused {
+                provider: AiProvider::Anthropic,
+                reason: "stop_reason=refusal",
+            },
+            fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string()),
+        ];
+        for err in &failures {
+            for contract in [None, Some(sample_menu_contract())] {
+                let (payload, reply) = ai_chat_failure_reply(err, contract.as_ref(), false);
+                assert_eq!(reply, "provider_failure_text", "{err}");
+                assert_eq!(payload["type"], json!("text"), "{err}");
+                assert_eq!(
+                    payload["content"],
+                    json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT),
+                    "{err}"
+                );
+            }
+            let (payload, reply) = ai_chat_failure_reply(err, Some(&sales_contract()), false);
+            assert_eq!(reply, "error_payload", "{err}");
+            assert_eq!(payload["type"], json!("error"), "{err}");
+        }
+        let (payload, reply) = ai_chat_failure_reply(
+            &fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput {
+                detail: "not_json".to_string(),
+            },
+            None,
+            false,
+        );
+        assert_eq!(reply, "error_payload");
+        assert_eq!(payload["code"], json!("invalid_structured_output"));
+    }
+
+    /// A model that refuses on a tool turn ends the run with its refusal, with no call without
+    /// tools after it, and the person gets the fixed text: in 0.1.112's gate the refusal became
+    /// an error payload the WF did not forward (FINDINGS A-184).
+    #[tokio::test]
+    async fn a_refusal_on_a_tool_turn_ends_the_run_with_the_fixed_text() {
+        struct Refusing;
+
+        #[async_trait]
+        impl FunctionCallingModel for Refusing {
+            async fn run_turn(
+                &self,
+                _request: fluxbee_ai_sdk::FunctionModelTurnRequest,
+            ) -> fluxbee_ai_sdk::Result<fluxbee_ai_sdk::FunctionModelTurnResponse> {
+                Err(fluxbee_ai_sdk::AiSdkError::Refused {
+                    provider: AiProvider::Anthropic,
+                    reason: "stop_reason=refusal",
+                })
+            }
+        }
+
+        let ctx = BehaviorContext::default();
+        let files = Arc::new(ReplyFiles::default());
+        let node = test_node();
+        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
+        let err = node
+            .run_tool_loop(
+                &Refusing,
+                &tools,
+                &files,
+                &ctx,
+                "copy the conversation word by word".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("the refusal ends the run");
+        let (payload, reply) = ai_chat_failure_reply(&err, None, false);
+        assert_eq!(reply, "provider_failure_text");
+        assert_eq!(payload["type"], json!("text"));
+        assert_eq!(
+            payload["content"],
+            json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT)
+        );
     }
     use tokio::sync::RwLock;
 
@@ -8395,20 +8490,31 @@ mod tests {
 
     #[test]
     fn a_cut_answer_has_its_own_error_code_on_both_providers() {
-        for message in [
-            "openai response truncated: hit max_output_tokens (raise model_settings.max_output_tokens)",
-            "anthropic response truncated: hit max_tokens (raise model_settings.max_output_tokens)",
+        for (provider, limit) in [
+            (AiProvider::OpenAi, "max_output_tokens"),
+            (AiProvider::Anthropic, "max_tokens"),
         ] {
-            let payload = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-                message.to_string(),
-            ));
-            assert_eq!(payload["code"], json!("provider_output_truncated"), "{message}");
+            let payload =
+                ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Truncated {
+                    provider,
+                    limit,
+                });
+            assert_eq!(
+                payload["code"],
+                json!("provider_output_truncated"),
+                "{provider}"
+            );
             assert_eq!(payload["retryable"], json!(false));
         }
         let other = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-            "anthropic response missing text content (stop_reason=refusal)".to_string(),
+            "anthropic response missing text content (stop_reason=end_turn)".to_string(),
         ));
         assert_eq!(other["code"], json!("provider_error"));
+        let refused = ai_runtime_error_payload(&fluxbee_ai_sdk::errors::AiSdkError::Refused {
+            provider: AiProvider::Anthropic,
+            reason: "stop_reason=refusal",
+        });
+        assert_eq!(refused["code"], json!("provider_refused"));
     }
 
     /// A model call that times out is retryable only while no tool has run: on a later turn of
