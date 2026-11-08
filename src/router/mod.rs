@@ -4854,6 +4854,57 @@ fn listen_local_socket(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// The lock that makes this process the only one running `cfg`'s router, held until it ends.
+/// `main` takes it before `Router::new`: a second instance of the same router has the same name
+/// and so the same UUID, and without it would open the live router's shared memory and stream and
+/// replace its sockets (`listen_local_socket` removes them), as `rt-gateway --version` did in
+/// 0.1.60 (FINDINGS A-177).
+pub fn hold_instance_lock(cfg: &RouterConfig) -> Result<fs::File, RouterError> {
+    let path = cfg
+        .state_dir
+        .join(&cfg.router_l2_name)
+        .join("instance.lock");
+    hold_instance_lock_at(&path, &cfg.router_l2_name)
+}
+
+/// An flock on `path`, which the kernel releases when the process ends, however it ends: a router
+/// that crashed leaves nothing to clean. The file is never removed, since a removal would let a
+/// third process lock a new file beside one still held. It holds the holder's PID, for whoever
+/// looks.
+fn hold_instance_lock_at(path: &Path, router: &str) -> Result<fs::File, RouterError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    ensure_parent_dir(path)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    // SAFETY: the descriptor is open and owned by `file` for the whole call.
+    if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) } != 0 {
+        let err = io::Error::last_os_error();
+        let holder = fs::read_to_string(path).unwrap_or_default();
+        return Err(RouterError::Startup(
+            if err.kind() == io::ErrorKind::WouldBlock {
+                format!(
+                    "another rt-gateway runs {router} (PID {}, it holds {}); this one exits and \
+                     leaves its sockets, shared memory and stream alone",
+                    holder.trim(),
+                    path.display()
+                )
+            } else {
+                format!("could not lock {}: {err}", path.display())
+            },
+        ));
+    }
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(file)
+}
+
 /// Whether a connection accepted on one of this router's sockets comes from the router's own user,
 /// `own_uid`, by the peer's credentials (`SO_PEERCRED`). That is root in production: every unit,
 /// managed node and Go node connects as root. Another user, or a peer whose credentials cannot be
@@ -10909,6 +10960,66 @@ mod tests {
                 "{accept}: the check must come before {serve}"
             );
         }
+    }
+
+    /// FINDINGS A-177: one process holds a router's lock. A second instance of the same router is
+    /// refused while the first lives, and named the holder's PID; once the first ends, the lock is
+    /// free again. The file stays where it is.
+    #[test]
+    fn a_second_instance_of_a_router_is_refused_while_the_first_holds_its_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "fblock-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let path = dir.join("RT.gateway@motherbee").join("instance.lock");
+
+        let first = hold_instance_lock_at(&path, "RT.gateway@motherbee").expect("the first");
+        let mode = fs::metadata(&path).expect("lock file").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let pid = std::process::id().to_string();
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), pid);
+
+        let Err(RouterError::Startup(refused)) =
+            hold_instance_lock_at(&path, "RT.gateway@motherbee")
+        else {
+            panic!("a second instance must be refused");
+        };
+        assert!(
+            refused.contains("another rt-gateway runs RT.gateway@motherbee"),
+            "{refused}"
+        );
+        assert!(refused.contains(&format!("PID {pid}")), "{refused}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            pid,
+            "the refused one writes nothing"
+        );
+
+        drop(first);
+        let again = hold_instance_lock_at(&path, "RT.gateway@motherbee");
+        assert!(again.is_ok(), "the lock is free once its holder ends");
+        drop(again);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pins `main`'s order (FINDINGS A-177): it refuses any argument before it logs or reads the
+    /// config, and takes the lock before `Router::new`, which opens the shared memory and the
+    /// stream, and so before `run` binds the sockets.
+    #[test]
+    fn main_refuses_arguments_first_and_locks_before_the_router_opens_anything() {
+        let main = include_str!("../main.rs");
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("main: {needle}"))
+        };
+        let args = at("std::env::args_os().len() > 1");
+        let config = at("RouterConfig::load_from_env()");
+        let lock = at("hold_instance_lock(&cfg)?");
+        let router = at("Router::new(cfg)");
+        assert!(args < at(".init();") && args < config);
+        assert!(config < lock && lock < router);
+        assert!(main[args..config].contains("std::process::exit(2)"));
     }
 
     async fn deliver_from_peer(peer_is_gateway: bool) -> Option<Message> {

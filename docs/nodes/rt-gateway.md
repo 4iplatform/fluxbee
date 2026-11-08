@@ -35,8 +35,15 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
   with `@<hive_id>` added (`src/config/mod.rs`). A router is the gateway when its base name
   equals `gateway_name`'s, so the packaged router is the gateway. Only the gateway loads TLS,
   runs the WAN and writes the LSA region.
+- It takes no argument: started with any (`--version` among them) it prints so and exits 2
+  before it touches anything (FINDINGS A-177). The installed version is in `GET /versions`.
 - At first start it creates `/var/lib/fluxbee/state/<router name>/identity.yaml` with its UUID
   and SHM name; later starts reuse them, and with them the SHM region the previous process left.
+- **One process per router** (`hold_instance_lock`): before it opens its SHM region, its stream
+  and its sockets, it takes an flock on `/var/lib/fluxbee/state/<router name>/instance.lock`
+  (0600, the holder's PID inside). The kernel releases it when the process ends, however it
+  ends. A second instance of the same router has the same UUID, so it would take over the live
+  one's region, stream and sockets: it exits instead, naming the lock and the holder's PID.
   The router takes that region over before it accepts a node: it empties the node table and writes
   its PID, start time, name and gateway flag (`RouterRegionWriter::open_or_create`). Nodes appear
   in it again as they reconnect, so a node that does not come back is gone for the readers too
@@ -209,8 +216,8 @@ counted as zero.
 ## Failure behavior
 
 - The process exits, and systemd restarts it, when `hive.yaml` or `identity.yaml` is missing or
-  invalid, when the baked system policy cannot load, when its own SHM region or a socket cannot
-  be created. The orchestrator's 5 s watchdog also restarts it when the unit is not active.
+  invalid, when another process holds its instance lock, when the baked system policy cannot
+  load, when its own SHM region or a socket cannot be created. The orchestrator's 5 s watchdog also restarts it when the unit is not active.
 - Missing shared regions (config, LSA, OPA, identity, memory) do not stop it: it reopens them
   when they appear or when their heartbeat is older than 30 s. Without the config region a hive
   routes with no static routes, no taps and everything in VPN 0. The identity region is opened

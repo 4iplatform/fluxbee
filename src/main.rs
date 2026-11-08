@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 use json_router::config::RouterConfig;
 #[cfg(target_os = "linux")]
-use json_router::router::Router;
+use json_router::router::{hold_instance_lock, Router};
 #[cfg(target_os = "linux")]
 use tokio::signal::unix::{signal, SignalKind};
 #[cfg(target_os = "linux")]
@@ -16,12 +16,24 @@ fn main() {
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // systemd starts rt-gateway with no argument. One started by hand with any, `--version` among
+    // them, refuses before it touches anything (FINDINGS A-177).
+    if std::env::args_os().len() > 1 {
+        eprintln!(
+            "rt-gateway takes no arguments: systemd starts it (rt-gateway.service). The installed \
+             version is in GET /versions on SY.admin, or dpkg-query -W fluxbee."
+        );
+        std::process::exit(2);
+    }
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     fluxbee_sdk::logging::fmt()
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
     let cfg = RouterConfig::load_from_env()?;
+    // Before the router opens its shared memory, its stream and its sockets: a second instance of
+    // this router exits here, naming the lock (FINDINGS A-177).
+    let _instance = hold_instance_lock(&cfg)?;
     let router = Router::new(cfg);
     let mut router_task = tokio::spawn(async move { router.run().await });
 
