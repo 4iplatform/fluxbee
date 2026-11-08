@@ -359,9 +359,9 @@ is retried after 5 s doubling up to 60 s (`wan_connect_loop`, `UplinkRetry`). Th
 
 | Mode | Behavior |
 | --- | --- |
-| `disabled` | Plaintext. The default when the key is absent. |
+| `disabled` | Plaintext, only when written so; logged as a warning at start. |
 | `permissive` | Accepts TLS (detected by the first byte, `0x16`) and plaintext; each plaintext peer is logged as unauthenticated. Without TLS material the router runs plaintext. |
-| `required` | TLS only. Without TLS material every WAN connection fails; there is no fallback. The shipped example and every `add_hive` write `required`. |
+| `required` | TLS only. Without TLS material every WAN connection fails; there is no fallback. The shipped example and every `add_hive` write `required`, and an absent, empty or unknown value means it (an unknown one logged; FINDINGS A-178). |
 
 The motherbee's orchestrator keeps a dedicated mesh CA in `/var/lib/fluxbee/tls/ca/`
 (`ensure_mesh_ca`) and signs one leaf per hive, with CN and SAN set to the `hive_id`

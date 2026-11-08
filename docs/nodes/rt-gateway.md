@@ -75,7 +75,9 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 
 ## WAN between hives
 
-- `wan.mtls`: `disabled` (also when missing or unknown), `permissive` or `required`. With
+- `wan.mtls`: `required`, `permissive` or `disabled`. An absent, empty or unknown value is
+  `required`, an unknown one logged; `disabled` is logged as a warning (`wan_mtls_mode_from`,
+  FINDINGS A-178, the rule of `identity.sync.auth`). With
   `required` the server demands a client certificate signed by the mesh CA, the peer's hive is
   taken from its certificate, and a `HELLO` that claims another hive is dropped
   (`crates/fluxbee_sdk/src/mesh/tls.rs`). With `required` and no TLS material on disk the router

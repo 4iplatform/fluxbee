@@ -141,7 +141,7 @@ impl RouterConfig {
         let heartbeat_stale_ms = DEFAULT_HEARTBEAT_STALE_MS;
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
-        let mut wan_mtls_mode = "disabled".to_string();
+        let mut wan_mtls_mode = wan_mtls_mode_from(None).to_string();
         let mut hive_role = DEFAULT_HIVE_ROLE.to_string();
         let mut blob_enabled = DEFAULT_BLOB_ENABLED;
         let mut blob_path = PathBuf::from(DEFAULT_BLOB_PATH);
@@ -183,12 +183,7 @@ impl RouterConfig {
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
             }
-            if let Some(mode) = wan.mtls {
-                let mode = mode.trim().to_ascii_lowercase();
-                if matches!(mode.as_str(), "disabled" | "permissive" | "required") {
-                    wan_mtls_mode = mode;
-                }
-            }
+            wan_mtls_mode = wan_mtls_mode_from(wan.mtls.as_deref()).to_string();
         }
         if let Some(blob) = hive.blob {
             if let Some(enabled) = blob.enabled {
@@ -286,6 +281,34 @@ impl RouterConfig {
     }
 }
 
+/// `wan.mtls`, fail-closed as `identity.sync.auth` is since the identity audit's F-01 (FINDINGS
+/// A-178): an absent, empty or unknown value is `required`, an unknown one with a warning; only an
+/// explicit `permissive` or `disabled` loosens it, `disabled` with a warning. A typo used to run
+/// the WAN in plaintext, where a peer's hive is not authenticated.
+fn wan_mtls_mode_from(raw: Option<&str>) -> &'static str {
+    let Some(raw) = raw else {
+        return "required";
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "required" | "" => "required",
+        "permissive" => "permissive",
+        "disabled" => {
+            tracing::warn!(
+                "wan.mtls=disabled: the WAN runs in plaintext, and a peer's hive is not \
+                 authenticated. Only on a strictly isolated network."
+            );
+            "disabled"
+        }
+        other => {
+            tracing::warn!(
+                "wan.mtls='{other}' is unrecognized; treating it as required (fail-closed). Use \
+                 required, permissive or (insecure) disabled."
+            );
+            "required"
+        }
+    }
+}
+
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
@@ -357,4 +380,33 @@ fn build_identity_yaml(
         .collect(),
     ))?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // FINDINGS A-178: as `auth_mode_required` in SY.identity (F-01).
+    #[test]
+    fn wan_mtls_is_fail_closed() {
+        // Absent, empty, whitespace or a typo: required.
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("require"),
+            Some("requird"),
+            Some("true"),
+            Some("enabled"),
+            Some("off"),
+        ] {
+            assert_eq!(wan_mtls_mode_from(raw), "required", "{raw:?}");
+        }
+        assert_eq!(wan_mtls_mode_from(Some("  Required ")), "required");
+        // Only the explicit values loosen it.
+        assert_eq!(wan_mtls_mode_from(Some("permissive")), "permissive");
+        assert_eq!(wan_mtls_mode_from(Some("PERMISSIVE")), "permissive");
+        assert_eq!(wan_mtls_mode_from(Some("disabled")), "disabled");
+        assert_eq!(wan_mtls_mode_from(Some(" Disabled ")), "disabled");
+    }
 }

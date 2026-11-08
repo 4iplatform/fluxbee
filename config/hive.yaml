@@ -17,6 +17,7 @@ ai:
 wan:
   listen: "0.0.0.0:9000"
   gateway_name: "RT.gateway"
+  mtls: required
   uplinks:
     - address: "192.168.8.220:9000"
 

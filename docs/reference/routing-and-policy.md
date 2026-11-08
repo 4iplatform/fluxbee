@@ -83,8 +83,8 @@ wrote it, never as the sender wrote it.
   - A peer fills only its own LSA bucket: `apply_lsa_payload` rejects an LSA whose `hive` is not the
     hive of the peer's WAN HELLO (`hive_mismatch`). With mTLS (`wan.mtls: required`, or
     `permissive` with a TLS peer) that HELLO hive must equal the hive in the peer's certificate
-    (`handle_wan_connection`). The loader's default for `wan.mtls` is `disabled`; then the bucket
-    rests on the HELLO alone.
+    (`handle_wan_connection`). The loader's default for `wan.mtls` is `required` (FINDINGS A-178);
+    with an explicit `disabled` the bucket rests on the HELLO alone.
   - A peer advertises only its own nodes: from hive P's LSA the router installs only the nodes
     named `<role>@P`, split at the first `@`. Any other name is dropped, counted under
     `foreign_node` and logged as `lsa nodes dropped` (`apply_lsa_payload`, `node_is_on_hive`); the
