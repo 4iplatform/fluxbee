@@ -119,7 +119,8 @@ On every request the node reads the key of its provider from SY.vault:
   `/etc/fluxbee/hive.yaml`, or OpenAI without an `ai:` section;
 - **the lookup** is by `resource_type` `openai` or `anthropic`, only in its tenant: a key the node
   owns, else one assigned to it, else the tenant's general key (no owner, no assigned node);
-- **a failed lookup** answers the message with a `missing_ai_api_key` error.
+- **a failed lookup** gets the person the fixed text of a provider that gives no answer, and a
+  sender with a response envelope a `missing_ai_api_key` error (see [Messages](#messages)).
 
 ## The agent definition
 

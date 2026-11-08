@@ -58,7 +58,9 @@ SY.vault and the identity writes live on the motherbee, so their calls below alw
   never by a tenant's AI node (`docs/ilk-tenant-model-v1.md` §2.2).
 - **SY.vault hands out a tenant's key only while the tenant is active.**
 - **The node names no key.** A config with `behavior.vault_key` is refused.
-- **Without a usable key**, the node answers each message with a `missing_ai_api_key` error.
+- **Without a usable key**, the node answers each person with the fixed text of a provider that
+  gives no answer, and a sender with a response envelope with a `missing_ai_api_key` error; its
+  journal says `missing AI api key for <provider>`.
 
 ---
 
