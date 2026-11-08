@@ -871,8 +871,18 @@ At 10:17 sales' package carries:
     stays with invoice, and sales gets only Juan's hand-back note. That fits the rule: Juan worked
     invoice's part.
   - Archi's handbook states it among the WF chapter's rules across atoms.
-- **A conversation that starts among people and later reaches an agent:** does the agent's
-  communication start from the one with no agent?
+- **A conversation that starts among people and later reaches an agent, pending (the operator,
+  2026-11-07):** the first agent to take the thread does not start from the communication with no
+  agent, and it stays so for now. *"si hablamos de que los agentes son personas, esta capacidad
+  sería como un superpoder.. saber lo que hablaron dos personas que no estaban en contacto.. no
+  digo que no lo hagamos, digo que es terreno desconocido, puede generar enojo dependiendo de lo
+  que hablaron en privado.. anotá este tema como un pendiente"*.
+  - **The rule for now:** an agent is not told what two people said to each other, nor what two
+    agents of different roles said, and talks between agents are not passed on. What crosses is
+    *"los hechos negativos y positivos"*: the episodes, the news.
+  - Whether the lines of Juan's part (§12.3, 1, built in 0.1.104) fall under the rule was asked
+    the same day.
+  - A design topic of its own: FINDINGS A-173.
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
   lenses. The gate says why it turns a proposal down (A-163, since 0.1.106): SY.cognition's log
   names, at info, the condition missed and the gate's numbers.

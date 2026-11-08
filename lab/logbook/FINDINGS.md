@@ -73,7 +73,10 @@ no change required
          operator's call (2026-11-07): it stays so, so roles do not mix; what matters crosses
          only through the WF, or the person tells it. Nothing to build; Archi's handbook states
          the rule.
-      2. A conversation among people that later reaches an agent.
+      2. A conversation among people that later reaches an agent. The operator's call
+         (2026-11-07): not now, pending as A-173. For now an agent is told nothing of what
+         people said to each other, nor of other agents' talks; only the facts cross, as news.
+         Whether Juan's part falls under it was asked.
       3. A message and its copy split in two batches on a new thread.
 
       Then A-137's case closes: gate0206 run once from zero, and taken down.
@@ -144,6 +147,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
+- A-173 🔵 What an agent may know of conversations it was not in: pending by the operator's call.
 
 ### io.web
 
@@ -1258,6 +1262,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-173 [WF] 🔵 TO DESIGN, pending by the operator's call (2026-11-07, cognition-hands-v1 §12.6) — What an agent may know of conversations it was not in
+
+- **The question:** a conversation that starts among people and later reaches an agent. Should the
+  agent start from what they said?
+- **The operator's call (2026-11-07): not now.** *"si hablamos de que los agentes son personas,
+  esta capacidad sería como un superpoder.. saber lo que hablaron dos personas que no estaban en
+  contacto.. no digo que no lo hagamos, digo que es terreno desconocido, puede generar enojo
+  dependiendo de lo que hablaron en privado.. anotá este tema como un pendiente"*.
+- **The rule for now:**
+  - an agent is not told what two people said to each other;
+  - nor what two agents of different roles said (§12.6's first question);
+  - talks between agents are not passed on;
+  - what crosses is *"los hechos negativos y positivos"*, the episodes, as news.
+- **Open:** whether the lines of Juan's part (people talking while the agent's case was with
+  them, §12.3, 1, live since 0.1.104) fall under the rule. Asked the same day.
 
 ### A-172 [Archi] 🟡 OPEN, for the next release (found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 
