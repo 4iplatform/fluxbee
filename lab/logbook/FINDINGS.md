@@ -102,10 +102,11 @@ no change required
    1. 🧠 A-173 [WF]: rebuilt, each take recorded under the held state's lock (SY.cognition).
    2. A-180 [General/orchestrator]: a second sy-orchestrator refuses and exits; and A-175's
       interim, a hive's drift alerts say they hold only what the motherbee recorded
-      (SY.orchestrator).
-7. **Then each SDK alone, from the sweep:** Rust's handshake timeout, Go's HELLO sent twice with
-   no deadline, the AI SDK's provider errors (untyped, OpenAI never retries a 429 or a 5xx,
-   SY.cognition counts one as an invalid output).
+      (SY.orchestrator, and Archi's line on it).
+7. **Then each SDK alone, from the sweep:**
+   1. 0.1.113: A-182, the Rust SDK's handshake bounded (built, CI green).
+   2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline (built, CI green).
+   3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count.
 8. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
@@ -1294,6 +1295,42 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-184 [General/AI SDK] 🔴 OPEN (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A provider's HTTP error is untyped, OpenAI never retries a 429 or a 5xx, and SY.cognition counts one as an invalid output
+
+- **OpenAI never retries:** both of its paths, the plain answer and the tool turn
+  (`crates/fluxbee_ai_sdk/src/llm.rs`), return the first 429 or 5xx as an error. Anthropic's path
+  retries them (`anthropic_should_retry`, `anthropic_retry_delay`, honoring `retry-after`).
+- **It reads the body before the status:** `openai_read_answer` decodes the body as JSON first, so
+  a proxy's 502 with an HTML body fails as a decoding error and its status is lost. Anthropic's
+  path was fixed for this by its audit's M1.
+- **The error is untyped:** `openai_status_error` returns `AiSdkError::Protocol("openai error
+  status=… type=… param=… message=…")`, and its consumers parse that text: ai.generic's and the
+  frontdesk's runners raise `provider_attachment_invalid_request` from it.
+- **SY.cognition counts it as an invalid output:** `handle_turn` counts `Json` and `Protocol`
+  errors in `semantic_tagger_invalid_outputs_total`, so a provider's 429 reads as a model that
+  answered badly.
+- **Fix (the AI SDK, alone):** a typed provider error with its status, OpenAI's retries as
+  Anthropic's, the status read first, and the consumers matching the type instead of the text.
+
+### A-183 [General/Go SDK] 🟡 BUILT, for 0.1.114 (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
+
+- **Twice at start:** `connect` handshook on a first connection under a 5 s limit, closed it, and
+  its `connectionManager` opened a second one with a second HELLO. The router saw the node
+  register, leave and register again.
+- **No deadline after:** the manager's handshake at every reconnect had none, so a router that took
+  the connection and never answered held the node forever.
+- **Fix (`go/fluxbee-go-sdk/client.go`):** the connection of the first handshake is the one the
+  manager serves; `handshakeWithin` bounds every handshake by 5 s. A test with a fake router saw
+  the node's first message on its second connection before the fix, and on its first after.
+
+### A-182 [General/Rust SDK] 🟡 BUILT, for 0.1.113 (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Rust node's handshake has no time limit
+
+- **What happens:** `perform_handshake` (`crates/fluxbee_sdk/src/node_client.rs`) sends the HELLO
+  and waits for the ANNOUNCE without a limit. A router that takes the connection and never answers
+  holds the node in its handshake forever, at the first connection and at any reconnect.
+- **Fix:** 10 s (`HANDSHAKE_TIMEOUT`), past which the handshake fails and the reconnect loop goes
+  on.
+
 ### A-181 [General/blob] 🔵 TO EVALUATE, for the operator (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
@@ -1313,7 +1350,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the setting's way to the spokes is a design question: how a motherbee setting reaches the
     hives that joined before it.
 
-### A-180 [General/orchestrator] 🔴 OPEN (found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
+### A-180 [General/orchestrator] 🟡 BUILT for 0.1.112 (2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
 - **Seen in 0.1.60's verification:** `sy-orchestrator --version` ran for about 11 minutes as a
   second orchestrator. The router refused it, since its UUID was connected, and it overwrote the
@@ -1326,6 +1363,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   with the orchestrator.
 - **The other SY nodes:** SY.vault, SY.opa.rules and SY.wf-rules hold a lock already; the rest
   are refused by their router while the live one is connected (A-44).
+- **Built:** the guard and `/var/run/fluxbee/sy-orchestrator.lock`, through a shared
+  `json_router::instance_lock`. With A-175's interim: a drift alert read for another hive, and the
+  global one, say in a `note` that a hive's own checks stay on that hive; Archi says so too.
+- **Its review round:** no legitimate start refused (every restart goes through systemd on the
+  unit, which starts the new process only after the old one ended); the docs said the motherbee's
+  rows were about every hive, they are about itself but for a spoke's post-sync mismatch; the
+  note's examples read as a full list; Archi was not told to pass the note on; a process holding
+  two locks would have dropped the second. All fixed.
 
 ### A-179 [General/CI] ✅ VALIDATED ON 8.x (0.1.111, 2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
 
@@ -1465,10 +1510,16 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   dropped; a take the worker makes lives only in memory until its write-back; the delete and the
   taker's write are not one transaction; a result redirected by turn keys can pick the wrong
   agent.
-- **Next:** rebuilt with each take recorded under the held state's lock (no-agent key → taker),
-  which the worker's hold, its write-back and the re-resolution of a queued relay follow; the
-  worker's copy taken under the same lock; the delete in the taker's save transaction. In the
-  sixth release (SY.cognition), beside the orchestrator's A-180.
+- **Rebuilt (2026-11-08, `coa/a-173-take`), for 0.1.112 beside the orchestrator's A-180:** each
+  take is recorded under the held state's lock; the taken row leaves the file in the transaction
+  that writes the agent's; the worker follows the take at its hold, its copy and its write-back; a
+  take the worker makes is written at once; a row that cannot be read takes nothing.
+- **Its review round** found the seven old defects fixed but one in part: the take carried only the
+  last 40 turn keys, so on a busy thread an older queued turn made the communication with no agent
+  again. Every turn of a taken communication is its taker's now, at intake too. Also: only the
+  thread's first agent takes it (beside another agent's conversation, people's turns stay theirs);
+  a write-back to a communication let go from memory loads it first; a row written again in the
+  transaction that deletes it stays; the docs say who pays a relay taken while it is analyzed.
 
 ### A-172 [Archi] ✅ VALIDATED ON 8.x (0.1.110, 2026-11-07; found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 
