@@ -168,8 +168,8 @@ func (c *seedConversation) fire(instanceID, key string) {
 
 // The seeds' sales.chat on the engine: each of the person's messages reaches sales with the menu
 // answer, the first one included; sales' answers reach the person in whatever order they come, two at
-// a time included; an empty reply is never forwarded; an error gets the person an apology; the
-// conversation closes on its quiet time.
+// a time included; an empty reply is never forwarded; an error gets the person an apology, and a
+// provider failure the text its error carries; the conversation closes on its quiet time.
 func TestTheSeedExampleIsTheBasicLoop(t *testing.T) {
 	c := newSeedConversation(t)
 
@@ -212,6 +212,14 @@ func TestTheSeedExampleIsTheBasicLoop(t *testing.T) {
 	broken, _ := c.asked()
 	c.dispatch(agentAnswer(t, seedSales, broken, `{"type":"error","code":"invalid_structured_output","message":"not_json"}`, nil))
 	c.person(3, "Sorry, something went wrong on our side. Could you write that again?")
+	c.inState("talking")
+
+	// A provider failure: the error carries the operator's text for the person, which the same
+	// catch sends in place of the WF's own (FINDINGS A-184).
+	c.say("¿Sigue en pie?")
+	failed, _ := c.asked()
+	c.dispatch(agentAnswer(t, seedSales, failed, `{"type":"error","code":"provider_rate_limited","message":"The AI provider is rate limiting requests. Retry shortly.","retryable":true,"reply":"There is a problem with the AI provider this agent uses, so it could not answer. Please contact your administrator."}`, nil))
+	c.person(4, "There is a problem with the AI provider this agent uses, so it could not answer. Please contact your administrator.")
 	c.inState("talking")
 
 	// 5. The conversation closes after its quiet time.

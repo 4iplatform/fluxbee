@@ -174,7 +174,10 @@
                   },
                   "payload": {
                     "type": "text",
-                    "content": "Sorry, something went wrong on our side. Could you write that again?"
+                    "content": {
+                      "$ref": "event.payload.reply",
+                      "default": "Sorry, something went wrong on our side. Could you write that again?"
+                    }
                   }
                 }
               ]

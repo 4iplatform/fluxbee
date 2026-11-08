@@ -3210,7 +3210,8 @@ fn missing_ai_api_key_payload(provider: AiProvider) -> Value {
 /// The reply to a message whose AI run failed, and which one it is, for the log, as in ai.generic:
 /// when the provider gave no answer (`is_provider_failure`), the person gets
 /// `PROVIDER_FAILURE_TEXT` as the frontdesk's text (FINDINGS A-184), and a response envelope's
-/// sender, io.api or io.cloud, the error payload it reads. Any other failure is the error payload
+/// sender, io.api or io.cloud, the error payload it reads, whose `reply` is that text. The
+/// frontdesk takes no WF menu. Any other failure is the error payload
 /// (`ai_chat_failure_payload`).
 fn ai_chat_failure_reply(
     err: &fluxbee_ai_sdk::errors::AiSdkError,
@@ -3249,7 +3250,7 @@ fn ai_chat_failure_payload(err: &fluxbee_ai_sdk::errors::AiSdkError, tool_ran: b
 }
 
 fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
-    match err {
+    let mut payload = match err {
         fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
             if http_err.is_timeout() || http_err.is_connect() =>
         {
@@ -3304,7 +3305,13 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "message": format!("AI runtime failure: {}", trim_chars(&other.to_string(), 220)),
             "retryable": other.is_recoverable()
         }),
+    };
+    // A provider failure's payload also carries the text for the person, wherever it goes: a WF
+    // catches an agent's error and can send it, `event.payload.reply` (FINDINGS A-184).
+    if err.is_provider_failure() {
+        payload["reply"] = json!(PROVIDER_FAILURE_TEXT);
     }
+    payload
 }
 
 fn build_frontdesk_result_reply(
@@ -4385,6 +4392,7 @@ mod tests {
             response.payload.get("retryable").and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(response.payload["reply"], json!(PROVIDER_FAILURE_TEXT));
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
     }
 
@@ -4922,7 +4930,7 @@ mod tests {
 
     /// As in ai.generic: when the provider gives no answer, a person gets the fixed text as the
     /// frontdesk's text, and a response envelope's sender (io.api, io.cloud) the error payload it
-    /// reads (FINDINGS A-184).
+    /// reads, whose `reply` is the fixed text (FINDINGS A-184).
     #[test]
     fn a_provider_failure_reaches_the_person_as_the_fixed_text() {
         for err in [
@@ -4948,8 +4956,9 @@ mod tests {
             let (payload, reply) = ai_chat_failure_reply(&err, true, false);
             assert_eq!(reply, "error_payload", "{err}");
             assert_eq!(payload["type"], json!("error"), "{err}");
+            assert_eq!(payload["reply"], json!(PROVIDER_FAILURE_TEXT), "{err}");
         }
-        // A cut answer keeps its error payload.
+        // A cut answer keeps its error payload, with no reply.
         let (payload, reply) = ai_chat_failure_reply(
             &fluxbee_ai_sdk::errors::AiSdkError::Truncated {
                 provider: AiProvider::OpenAi,
@@ -4960,6 +4969,7 @@ mod tests {
         );
         assert_eq!(reply, "error_payload");
         assert_eq!(payload["code"], json!("provider_output_truncated"));
+        assert_eq!(payload.get("reply"), None);
     }
 
     #[test]

@@ -78,7 +78,8 @@ pub fn create_function_calling_model(
   - up to 3 attempts, on a transport error and on 408, 409, 429 or any 5xx, or as the provider's
     `x-should-retry` says;
   - the wait is the provider's `retry-after-ms` or `retry-after` (at most 60 s), else 0.5 s
-    doubling, with jitter;
+    doubling, with jitter. Each retry is logged before its wait, with the status and the request
+    id, so a caller whose own deadline is shorter (cognition's 8 s) still leaves the line;
   - the status and the headers decide before the body is read, so a proxy's 502 with an HTML
     page keeps its status.
 - **The errors are typed** (`errors.rs`), and a caller matches the type, never the text:
@@ -89,8 +90,9 @@ pub fn create_function_calling_model(
     echoes the key, and the message is scrubbed of it. Its `Display` is one line for the log,
     `anthropic error status=429 type=rate_limit_error request_id=… message=…`.
   - **`AiSdkError::Refused`:** the model declined: Anthropic's `stop_reason: refusal`, an OpenAI
-    refusal part, or OpenAI's content filter. A tool turn that refuses is this error too, never an
-    empty turn its caller asks again without tools.
+    refusal part with no text, or OpenAI's content filter (`status: incomplete`, reason
+    `content_filter`), whatever text came before the cut. A tool turn that refuses is this error
+    too, never an empty turn its caller asks again without tools, nor a call to run.
   - **`AiSdkError::NoAnswer`:** a 2xx with nothing to send, no text or only blanks, and no
     refusal; its `reason` says what the answer held (`stop_reason=…`, `status=…`). A tool turn's
     blank text is `None`.
@@ -100,8 +102,9 @@ pub fn create_function_calling_model(
     connection, or an answer that could not be read), `Timeout`, `NoAnswer` or `Refused`. Neither
     the request nor its contract is at fault, and a cut answer (`Truncated`) is not one. An AI node
     answers a person with `PROVIDER_FAILURE_TEXT` then, one fixed text in English, and logs the
-    error (the operator's call of 2026-11-08); SY.cognition counts it apart from an invalid
-    output.
+    error (the operator's call of 2026-11-08): as its text with no contract, and in the error
+    payload's `reply` under a WF's menu or a response envelope. SY.cognition counts it apart from
+    an invalid output.
 - **Every call has `MODEL_CALL_TIMEOUT` (5 min),** the provider's own retries included (each
   provider's `send`). Past it the call fails with `AiSdkError::Timeout` and its usage record says
   `abandoned`. The bound is for stuck connections: a long reasoning answer or an Archi stage fits

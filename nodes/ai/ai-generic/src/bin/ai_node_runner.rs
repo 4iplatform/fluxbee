@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fluxbee_ai_sdk::errors::{ProviderError, ProviderErrorKind};
+use fluxbee_ai_sdk::errors::{ProviderError, ProviderErrorKind, PROVIDER_FAILURE_TEXT};
 use fluxbee_ai_sdk::{
     build_ai_behavior_response, build_model_user_content_parts,
     build_output_schema_fallback_instruction, build_reply_message_runtime_src, build_text_response,
@@ -6399,19 +6399,20 @@ fn ai_engine_error_payload(err: &AiEngineError) -> Value {
     }
 }
 
-/// The reply to a message whose AI run failed, and which one it is, for the log. When the provider
-/// gave no answer (`is_provider_failure`), the person gets `PROVIDER_FAILURE_TEXT` as the agent's
-/// text, so it reaches them on any path a text answer takes, a WF's forward among them, where the
-/// error payload reached no one (FINDINGS A-184). Only a response envelope's sender, a program
-/// that reads the object it asked for, gets the error payload instead. Any other failure is the
-/// error payload (`ai_chat_failure_payload`).
+/// The reply to a message whose AI run failed, and which one it is, for the log (FINDINGS A-184).
+/// When the provider gave no answer (`is_provider_failure`), a message with no contract gets
+/// `PROVIDER_FAILURE_TEXT` as the agent's text, so it reaches the person on any path a text answer
+/// takes. Under a WF's menu or a response envelope the sender is a program that reads its error:
+/// a WF catches an agent's error on `event.payload.type == 'error'`, and forwards an answer only on
+/// its evaluation's reply, which the text has not. So it gets the error payload, whose `reply` is
+/// that text. Any other failure is the error payload (`ai_chat_failure_payload`).
 fn ai_chat_failure_reply(
     err: &fluxbee_ai_sdk::errors::AiSdkError,
     contract: Option<&MessageContract>,
     tool_ran: bool,
 ) -> (Value, &'static str) {
-    if err.is_provider_failure() && !matches!(contract, Some(MessageContract::Envelope(_))) {
-        match build_text_response(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT) {
+    if err.is_provider_failure() && contract.is_none() {
+        match build_text_response(PROVIDER_FAILURE_TEXT) {
             Ok(payload) => return (payload, "provider_failure_text"),
             Err(build_err) => tracing::warn!(
                 error = %build_err,
@@ -6442,7 +6443,7 @@ fn ai_chat_failure_payload(err: &fluxbee_ai_sdk::errors::AiSdkError, tool_ran: b
 }
 
 fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
-    match err {
+    let mut payload = match err {
         fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
             if http_err.is_timeout() || http_err.is_connect() =>
         {
@@ -6526,7 +6527,13 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
             "message": format!("AI runtime failure: {}", trim_chars(&other.to_string(), 220)),
             "retryable": other.is_recoverable()
         }),
+    };
+    // A provider failure's payload also carries the text for the person, wherever it goes: a WF
+    // catches an agent's error and can send it, `event.payload.reply` (FINDINGS A-184).
+    if err.is_provider_failure() {
+        payload["reply"] = json!(PROVIDER_FAILURE_TEXT);
     }
+    payload
 }
 
 fn ai_final_output_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
@@ -7404,53 +7411,73 @@ mod tests {
         );
     }
 
-    /// When the provider gives no answer, the person gets the fixed text as the agent's text, a
-    /// payload a WF forwards as it does any answer (`event.payload.type == 'text'`), with no
-    /// contract or under a WF's menu; a response envelope's sender gets the error payload. A
-    /// failure that is not the provider's stays the error payload (FINDINGS A-184).
+    /// When the provider gives no answer (FINDINGS A-184):
+    /// - a message with no contract gets the fixed text as the agent's text;
+    /// - under a WF's menu, the WF gets the error payload with its code, whose `reply` is the fixed
+    ///   text: a WF catches an agent's error on `event.payload.type == 'error'` and forwards an
+    ///   answer only on its evaluation's reply, which a bare text has not;
+    /// - a response envelope's sender gets the error payload with that `reply` too.
+    ///
+    /// A failure that is not the provider's is the error payload, with no `reply`.
     #[test]
     fn a_provider_failure_reaches_the_person_as_the_fixed_text() {
         let failures = [
-            fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
-                AiProvider::Anthropic,
-                429,
-                None,
-            )),
-            fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
-                AiProvider::OpenAi,
-                401,
-                None,
-            )),
-            fluxbee_ai_sdk::errors::AiSdkError::Refused {
-                provider: AiProvider::Anthropic,
-                reason: "stop_reason=refusal",
-            },
-            fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string()),
-            fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
-                provider: AiProvider::OpenAi,
-                reason: "status=completed".to_string(),
-            },
-            fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
-                provider: AiProvider::Anthropic,
-                reason: "SY.vault has no anthropic secret for this node".to_string(),
-            },
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
+                    AiProvider::Anthropic,
+                    429,
+                    None,
+                )),
+                "provider_rate_limited",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::Provider(provider_error(
+                    AiProvider::OpenAi,
+                    401,
+                    None,
+                )),
+                "provider_auth_error",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::Refused {
+                    provider: AiProvider::Anthropic,
+                    reason: "stop_reason=refusal",
+                },
+                "provider_refused",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::Timeout("model call".to_string()),
+                "provider_timeout",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
+                    provider: AiProvider::OpenAi,
+                    reason: "status=completed".to_string(),
+                },
+                "provider_no_answer",
+            ),
+            (
+                fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
+                    provider: AiProvider::Anthropic,
+                    reason: "SY.vault has no anthropic secret for this node".to_string(),
+                },
+                "missing_ai_api_key",
+            ),
         ];
-        for err in &failures {
-            for contract in [None, Some(sample_menu_contract())] {
-                let (payload, reply) = ai_chat_failure_reply(err, contract.as_ref(), false);
-                assert_eq!(reply, "provider_failure_text", "{err}");
-                assert_eq!(payload["type"], json!("text"), "{err}");
-                assert_eq!(
-                    payload["content"],
-                    json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT),
-                    "{err}"
-                );
+        for (err, code) in &failures {
+            let (payload, reply) = ai_chat_failure_reply(err, None, false);
+            assert_eq!(reply, "provider_failure_text", "{err}");
+            assert_eq!(payload["type"], json!("text"), "{err}");
+            assert_eq!(payload["content"], json!(PROVIDER_FAILURE_TEXT), "{err}");
+            for contract in [sample_menu_contract(), sales_contract()] {
+                let (payload, reply) = ai_chat_failure_reply(err, Some(&contract), false);
+                assert_eq!(reply, "error_payload", "{err}");
+                assert_eq!(payload["type"], json!("error"), "{err}");
+                assert_eq!(payload["code"], json!(code), "{err}");
+                assert_eq!(payload["reply"], json!(PROVIDER_FAILURE_TEXT), "{err}");
             }
-            let (payload, reply) = ai_chat_failure_reply(err, Some(&sales_contract()), false);
-            assert_eq!(reply, "error_payload", "{err}");
-            assert_eq!(payload["type"], json!("error"), "{err}");
         }
-        // A cut answer and an answer off its contract keep their error payload.
+        // A cut answer and an answer off its contract keep their error payload, with no reply.
         for (err, code) in [
             (
                 fluxbee_ai_sdk::errors::AiSdkError::InvalidStructuredOutput {
@@ -7466,75 +7493,172 @@ mod tests {
                 "provider_output_truncated",
             ),
         ] {
-            let (payload, reply) = ai_chat_failure_reply(&err, None, false);
-            assert_eq!(reply, "error_payload", "{err}");
-            assert_eq!(payload["code"], json!(code), "{err}");
-        }
-        // Under an envelope, a missing key and an answer with no text keep their own codes.
-        for (err, code) in [
-            (
-                fluxbee_ai_sdk::errors::AiSdkError::MissingKey {
-                    provider: AiProvider::OpenAi,
-                    reason: "no vault client".to_string(),
-                },
-                "missing_ai_api_key",
-            ),
-            (
-                fluxbee_ai_sdk::errors::AiSdkError::NoAnswer {
-                    provider: AiProvider::OpenAi,
-                    reason: "status=completed".to_string(),
-                },
-                "provider_no_answer",
-            ),
-        ] {
-            let (payload, _) = ai_chat_failure_reply(&err, Some(&sales_contract()), false);
-            assert_eq!(payload["code"], json!(code), "{err}");
+            for contract in [None, Some(sample_menu_contract())] {
+                let (payload, reply) = ai_chat_failure_reply(&err, contract.as_ref(), false);
+                assert_eq!(reply, "error_payload", "{err}");
+                assert_eq!(payload["code"], json!(code), "{err}");
+                assert_eq!(payload.get("reply"), None, "{err}");
+            }
         }
     }
 
-    /// A model that refuses on a tool turn ends the run with its refusal, with no call without
-    /// tools after it, and the person gets the fixed text: in 0.1.112's gate the refusal became
-    /// an error payload the WF did not forward (FINDINGS A-184).
+    /// A provider at a local address that answers every request with Anthropic's refusal, and
+    /// hands over each request's body. It takes requests for 10 s.
+    fn refusing_provider() -> (String, std::sync::mpsc::Receiver<Value>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let (bodies, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < until {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length])
+                            .ok();
+                    }
+                };
+                if let Some(body) = body {
+                    let _ = bodies.send(body);
+                }
+                let answer = br#"{"content":[],"stop_reason":"refusal","usage":{"input_tokens":3,"output_tokens":0}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    answer.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(answer);
+            }
+        });
+        (url, received)
+    }
+
+    /// SY.vault's answer to `request`.
+    fn vault_reply(request: &Message, msg: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "uuid-of-sy-vault".to_string(),
+                src_l2_name: Some("SY.vault@motherbee".to_string()),
+                dst: Destination::Unicast(request.routing.src.clone()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: fluxbee_sdk::protocol::SYSTEM_KIND.to_string(),
+                msg: Some(msg.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    /// A model that refuses on a tool turn ends the message's run with its refusal: `on_message`
+    /// asks the provider once, with the tools, and no call without them follows; the person gets
+    /// the fixed text. In 0.1.112's gate the refusal led to a second, billed call, and to an error
+    /// payload the WF did not forward (FINDINGS A-184).
     #[tokio::test]
     async fn a_refusal_on_a_tool_turn_ends_the_run_with_the_fixed_text() {
-        struct Refusing;
-
-        #[async_trait]
-        impl FunctionCallingModel for Refusing {
-            async fn run_turn(
-                &self,
-                _request: fluxbee_ai_sdk::FunctionModelTurnRequest,
-            ) -> fluxbee_ai_sdk::Result<fluxbee_ai_sdk::FunctionModelTurnResponse> {
-                Err(fluxbee_ai_sdk::AiSdkError::Refused {
-                    provider: AiProvider::Anthropic,
-                    reason: "stop_reason=refusal",
-                })
-            }
-        }
-
-        let ctx = BehaviorContext::default();
-        let files = Arc::new(ReplyFiles::default());
-        let node = test_node();
-        let tools = node.build_tool_registry(&ctx, &files).expect("registry");
-        let err = node
-            .run_tool_loop(
-                &Refusing,
-                &tools,
-                &files,
-                &ctx,
-                "copy the conversation word by word".to_string(),
-                None,
-                None,
-            )
-            .await
-            .expect_err("the refusal ends the run");
-        let (payload, reply) = ai_chat_failure_reply(&err, None, false);
-        assert_eq!(reply, "provider_failure_text");
-        assert_eq!(payload["type"], json!("text"));
-        assert_eq!(
-            payload["content"],
-            json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT)
+        const TENANT: &str = "tnt:33333333-3333-4333-8333-333333333333";
+        let (base_url, asked) = refusing_provider();
+        let (dispatcher, mut vault) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "AI.generic@motherbee",
+            build_ai_generic_rpc_profile().expect("profile"),
         );
+        let mut node = test_node();
+        node.self_tenant_id = Some(TENANT.to_string());
+        node.vault = vault_client_for(
+            dispatcher,
+            "AI.generic@motherbee",
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
+        *node.behavior.write().await = Some(NodeBehavior::AiChat(AiChatRuntime {
+            model: Some("claude-sonnet-5-5".to_string()),
+            model_settings: ModelSettings::default(),
+            provider: Some(AiProvider::Anthropic),
+            base_url: Some(base_url),
+            multimodal: false,
+        }));
+        let node = Arc::new(node);
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "sim-thread-1" }),
+            Some("ilk:22222222-2222-4222-8222-222222222222"),
+        );
+        msg.meta.thread_id = Some("thread:sim-thread-1".to_string());
+        let answered = tokio::spawn({
+            let node = node.clone();
+            async move { node.on_message(msg).await }
+        });
+
+        // SY.vault hands over the node's key.
+        let list = vault
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("a vault list");
+        assert_eq!(list.meta.msg.as_deref(), Some("VAULT_LIST"));
+        vault
+            .inject(vault_reply(
+                &list,
+                "VAULT_LIST_RESPONSE",
+                json!({"status": "ok", "count": 1, "secrets": [{
+                    "key": "anthropic/sales",
+                    "metadata": {"tenant_id": TENANT, "resource_type": "anthropic"},
+                    "version": 1,
+                    "access_count": 0
+                }]}),
+            ))
+            .await
+            .expect("the list");
+        let get = vault
+            .next_outgoing_within(Duration::from_secs(5))
+            .await
+            .expect("a vault get");
+        assert_eq!(get.meta.msg.as_deref(), Some("VAULT_GET"));
+        vault
+            .inject(vault_reply(
+                &get,
+                "VAULT_GET_RESPONSE",
+                json!({"status": "ok", "key": "anthropic/sales", "value": {"api_key": "test-key"}}),
+            ))
+            .await
+            .expect("the key");
+
+        let reply = answered
+            .await
+            .expect("the task")
+            .expect("on_message")
+            .expect("a reply");
+        assert_eq!(reply.payload["type"], json!("text"));
+        assert_eq!(reply.payload["content"], json!(PROVIDER_FAILURE_TEXT));
+        let calls = asked.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one call, with the tools, and none without them after it"
+        );
+        assert!(calls[0].get("tools").is_some(), "{}", calls[0]);
     }
     use tokio::sync::RwLock;
 
@@ -8574,7 +8698,8 @@ mod tests {
     }
 
     /// Without a key, the person gets the fixed text, never a fatal error; a sender with a
-    /// response envelope gets `missing_ai_api_key` (FINDINGS A-184).
+    /// response envelope gets `missing_ai_api_key`, with the fixed text as its `reply` (FINDINGS
+    /// A-184).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the env lock spans the whole test, awaits included
     async fn ai_chat_missing_api_key_answers_the_fixed_text_instead_of_fatal() {
@@ -8637,6 +8762,7 @@ mod tests {
             response.payload.get("retryable").and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(response.payload["reply"], json!(PROVIDER_FAILURE_TEXT));
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
     }
 
@@ -10789,7 +10915,7 @@ mod tests {
         let node = test_node();
         node.control_plane.write().await.current_state = NodeLifecycleState::Configured;
         // Its own provider and model, and no SY.vault client: a message that passed the check
-        // would be answered the fixed text, for its missing key.
+        // would be answered `missing_ai_api_key`, with the fixed text as its reply.
         *node.behavior.write().await = Some(ai_chat(Some(AiProvider::OpenAi), Some("gpt-5.5")));
 
         let mut invalid = sample_wf_menu_context();
@@ -10837,16 +10963,15 @@ mod tests {
         assert_eq!(reply.payload["code"], "ai_runtime_error");
         assert_eq!(reply.payload["retryable"], json!(false));
 
-        // A valid menu goes on, to the key.
+        // A valid menu goes on, to the key: the WF gets the error payload, whose reply is the
+        // fixed text, for its catch.
         let reply = node
             .on_message(wf_user_message(sample_wf_menu_context()))
             .await
             .expect("on_message")
             .expect("a reply");
-        assert_eq!(
-            reply.payload["content"],
-            json!(fluxbee_ai_sdk::PROVIDER_FAILURE_TEXT)
-        );
+        assert_eq!(reply.payload["code"], "missing_ai_api_key");
+        assert_eq!(reply.payload["reply"], json!(PROVIDER_FAILURE_TEXT));
     }
 
     /// Under a WF's menu, the tool loop's reply is the answer's `reply`, with the files its tools

@@ -886,7 +886,10 @@ knew a supervisor's decision on the person's next question.
     does.
 - **What reaches it:**
   - `none`;
-  - an agent's error: an answer off the menu, a timeout, a provider failure;
+  - an agent's error: an answer off the menu, a timeout, a provider failure. A provider failure's
+    error carries `reply`, the operator's text for the person (FINDINGS A-184, 2026-11-08): the
+    catch sends it with `{"$ref": "event.payload.reply", "default": ...}`, its own text for any
+    other error;
   - any event no transition took.
 
   Its guards tell them apart as any guard does: `event.context.evaluation.option == 'none'`,

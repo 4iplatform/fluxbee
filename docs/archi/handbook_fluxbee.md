@@ -212,8 +212,10 @@ gets one fixed text: *"There is a problem with the AI provider this agent uses, 
 answer. Please contact your administrator."* A person who reports it points to the agent's key or
 its provider: the node's log has the error, `AI runtime request failed`. `missing AI api key` is
 a tenant with no key for the agent's provider (`vault_list`); otherwise `provider_status` says
-which (401 or 403: the key; 429: its rate or quota; 5xx: the provider). A WF's step that asks
-under a response envelope gets the error payload instead.
+which (401 or 403: the key; 429: its rate or quota; 5xx: the provider). A WF that asks the
+agent with a menu gets the error payload instead, with its code, and the same text in `reply`: its
+catch sends it to the person (§4.2.4, atom 6). A program that asks under a response envelope gets
+the same payload.
 
 ### 4.1.1 Agent tools
 
@@ -491,8 +493,10 @@ The known options:
   a price below the list price.
 - **Errors:** an answer off the menu comes back as a payload of type `error`, code
   `invalid_structured_output`, with no retry. Off the menu means an unknown option, a missing or
-  mistyped param, or no JSON. A timeout and a provider failure are errors too. An error's `msg` is
-  `<msg>.error` only when the request had a `msg`.
+  mistyped param, or no JSON. A timeout and a provider failure are errors too. A provider failure's
+  error also carries `reply`, the operator's text for the person (§4.1): the catch sends it with
+  `{"$ref": "event.payload.reply", "default": "<the WF's own text>"}` (atom 6). An error's `msg`
+  is `<msg>.error` only when the request had a `msg`.
 - **Delivering:**
   - to give the person the agent's reply, forward the agent's answer to the IO node. A reply may be
     empty: guard that forward with `event.context.evaluation.reply != ''`;
@@ -837,13 +841,15 @@ date or a reminder. Guard the time's shape before setting the timer. The minimum
 ```
 
 **Atom 6, the catch.** For every definition with more than one state. It takes an agent's `none`,
-its errors, and the answers that arrive after their wait.
+its errors, and the answers that arrive after their wait. An error of the agent also tells the
+person: when its provider gave no answer, the error carries the operator's text for the person in
+`reply` (§4.1), and a `$ref` with a `default` sends the WF's own text for any other error.
 
 ```json
 {
   "wf_schema_version": "1",
   "workflow_type": "atom.catch",
-  "description": "The basic loop with a wait for sales' answer and a catch: an agent's none and any error are noted in last_error, and sales' answer that comes after its wait still reaches the person.",
+  "description": "The basic loop with a wait for sales' answer and a catch: an agent's none and any error are noted in last_error, an error of sales' also tells the person, and sales' answer that comes after its wait still reaches the person.",
   "start_from": ["IO.api.shop@worker1"],
   "input_schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string"}}},
   "initial_state": "thinking",
@@ -876,6 +882,7 @@ its errors, and the answers that arrive after their wait.
   ],
   "catch": [
     {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.option == 'none'", "actions": [{"type": "set_variable", "name": "last_error", "value": "'sales answered none'"}]},
+    {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.payload.type == 'error'", "actions": [{"type": "set_variable", "name": "last_error", "value": "'error: ' + event.payload.code"}, {"type": "send_message", "target": "IO.api.shop@worker1", "meta": {"msg": "SALES_ERROR", "context": {"io": {"$ref": "event.context.io", "default": {}}}}, "payload": {"type": "text", "content": {"$ref": "event.payload.reply", "default": "Sorry, something went wrong on our side. Could you write that again?"}}}]},
     {"event_match": {}, "guard": "event.payload.type == 'error'", "actions": [{"type": "set_variable", "name": "last_error", "value": "'error: ' + event.payload.code"}]},
     {"event_match": {"src": "AI.sales@worker1"}, "guard": "event.context.evaluation.reply != ''", "actions": [{"type": "forward", "target": "IO.api.shop@worker1"}]}
   ]

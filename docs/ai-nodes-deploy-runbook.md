@@ -59,8 +59,8 @@ SY.vault and the identity writes live on the motherbee, so their calls below alw
 - **SY.vault hands out a tenant's key only while the tenant is active.**
 - **The node names no key.** A config with `behavior.vault_key` is refused.
 - **Without a usable key**, the node answers each person with the fixed text of a provider that
-  gives no answer, and a sender with a response envelope with a `missing_ai_api_key` error; its
-  journal says `missing AI api key for <provider>`.
+  gives no answer, and a WF's menu or a response envelope with a `missing_ai_api_key` error whose
+  `reply` is that text; its journal says `missing AI api key for <provider>`.
 
 ---
 
@@ -153,9 +153,10 @@ EOF
 - **When the provider gives no answer** (no key for it in SY.vault, an error status after the AI
   SDK's retries, no connection, none in time, an answer with no text, or a refusal), the person
   gets one fixed text in English, that the agent's AI provider has a problem and to contact the
-  administrator; the node's journal has the error, `AI runtime request failed`. A sender with a
-  response envelope gets the error payload instead, `missing_ai_api_key` for a missing key
-  (FINDINGS A-184; [nodes/ai/ai-generic/README.md](../nodes/ai/ai-generic/README.md)).
+  administrator; the node's journal has the error, `AI runtime request failed`. A WF's menu or a
+  response envelope gets the error payload instead, `missing_ai_api_key` for a missing key, with
+  that text in `reply` for the WF's catch to send (FINDINGS A-184;
+  [nodes/ai/ai-generic/README.md](../nodes/ai/ai-generic/README.md)).
 - **Timeouts, workers and queue are the AI runtime's, not config:**
   - each model call has 5 min, its provider's own retries included;
   - a message has 47 min: up to 8 model turns of a tool loop, one plain call after them, and 2 min

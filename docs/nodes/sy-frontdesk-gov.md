@@ -128,8 +128,8 @@ subject it sends, its email included ([control-path hardening](../control-path-h
   the person gets the fixed text in English that ai.generic gives, `PROVIDER_FAILURE_TEXT`, and
   the journal the error (`AI runtime request failed`; FINDINGS A-184).
   - io.api and io.cloud send a response envelope, so they get the error payload they read
-    instead: its codes are ai.generic's (`missing_ai_api_key`, `provider_rate_limited`,
-    `provider_auth_error`, …).
+    instead, with the same text in `reply`: its codes are ai.generic's (`missing_ai_api_key`,
+    `provider_rate_limited`, `provider_auth_error`, …). The frontdesk takes no WF menu.
 - The reply to the person is the model's text. The result code comes from the thread state the
   model wrote (`build_frontdesk_result_for_conversation`): `completed` → `ALREADY_COMPLETE`,
   `completed_error` → `REGISTER_FAILED`, otherwise `MISSING_REQUIRED_FIELDS` or

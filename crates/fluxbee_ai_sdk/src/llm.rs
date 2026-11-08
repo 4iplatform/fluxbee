@@ -408,8 +408,11 @@ impl OpenAiResponsesClient {
                 Ok(response) => response,
                 Err(err) if attempt + 1 < PROVIDER_MAX_ATTEMPTS => {
                     call.failed();
-                    tokio::time::sleep(provider_retry_delay(attempt, None)).await;
-                    tracing::warn!(attempt = attempt + 1, error = %err, "retrying OpenAI transport error");
+                    let delay = provider_retry_delay(attempt, None);
+                    // Logged before the wait: a caller with a shorter deadline (cognition's 8 s)
+                    // may drop the call during it.
+                    tracing::warn!(attempt = attempt + 1, delay_ms = delay.as_millis() as u64, error = %err, "retrying OpenAI transport error");
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 Err(err) => {
@@ -425,9 +428,9 @@ impl OpenAiResponsesClient {
                 && provider_should_retry(status.as_u16(), &headers)
             {
                 call.failed();
-                let retry_after = provider_retry_after(&headers);
-                tokio::time::sleep(provider_retry_delay(attempt, retry_after)).await;
-                tracing::warn!(attempt = attempt + 1, status = %status, request_id = ?request_id, "retrying OpenAI response");
+                let delay = provider_retry_delay(attempt, provider_retry_after(&headers));
+                tracing::warn!(attempt = attempt + 1, delay_ms = delay.as_millis() as u64, status = %status, request_id = ?request_id, "retrying OpenAI response");
+                tokio::time::sleep(delay).await;
                 continue;
             }
             if status.is_success() {
@@ -484,12 +487,13 @@ impl LlmClient for OpenAiResponsesClient {
             .send(&body, &request.model, UsageKind::Generate)
             .await?;
         openai_check_truncation(&value)?;
+        openai_check_filter(&value)?;
 
         let Some(text) = openai_response_text(&value) else {
-            if let Some(reason) = openai_refusal(&value) {
+            if openai_refused(&value) {
                 return Err(AiSdkError::Refused {
                     provider: AiProvider::OpenAi,
-                    reason,
+                    reason: "refusal",
                 });
             }
             return Err(AiSdkError::NoAnswer {
@@ -550,26 +554,34 @@ fn openai_no_text_reason(value: &Value) -> String {
     format!("status={status}{reason}")
 }
 
-/// Why a Responses payload holds no text because the model declined: a message's refusal part, or
-/// the content filter that cut it (FINDINGS A-184). `None` for any other payload.
-fn openai_refusal(value: &Value) -> Option<&'static str> {
-    let refused = value
+/// Whether a Responses payload holds a message's refusal part: the model declined (FINDINGS A-184).
+fn openai_refused(value: &Value) -> bool {
+    value
         .get("output")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|item| item.get("content").and_then(Value::as_array))
         .flatten()
-        .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"));
-    if refused {
-        return Some("refusal");
-    }
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+}
+
+/// OpenAI's content filter cut the answer (`status: incomplete`, reason `content_filter`): the text
+/// before the cut is no answer to give, nor any call one to run. It is a refusal on both paths,
+/// whatever the answer holds, as Anthropic's `stop_reason: refusal` is (FINDINGS A-184).
+fn openai_check_filter(value: &Value) -> Result<()> {
     let filtered = value.get("status").and_then(Value::as_str) == Some("incomplete")
         && value
             .pointer("/incomplete_details/reason")
             .and_then(Value::as_str)
             == Some("content_filter");
-    filtered.then_some("content_filter")
+    if filtered {
+        return Err(AiSdkError::Refused {
+            provider: AiProvider::OpenAi,
+            reason: "content_filter",
+        });
+    }
+    Ok(())
 }
 
 fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
@@ -1020,8 +1032,10 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             }
         };
         // A turn cut at the token limit can end inside a tool call's arguments: it is an error,
-        // as on the plain path and on Anthropic's turns, never a turn to act on.
+        // as on the plain path and on Anthropic's turns, never a turn to act on. So is one the
+        // content filter cut.
         openai_check_truncation(&value)?;
+        openai_check_filter(&value)?;
 
         let response_id = value
             .get("id")
@@ -1065,13 +1079,11 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
 
         // A turn with neither a call nor text because the model declined is its refusal, as on the
         // plain path, never a turn its caller asks again without tools.
-        if tool_calls.is_empty() && assistant_text.is_none() {
-            if let Some(reason) = openai_refusal(&value) {
-                return Err(AiSdkError::Refused {
-                    provider: AiProvider::OpenAi,
-                    reason,
-                });
-            }
+        if tool_calls.is_empty() && assistant_text.is_none() && openai_refused(&value) {
+            return Err(AiSdkError::Refused {
+                provider: AiProvider::OpenAi,
+                reason: "refusal",
+            });
         }
 
         let tokens_used = value
@@ -1244,8 +1256,11 @@ impl AnthropicMessagesClient {
                 Ok(response) => response,
                 Err(err) if attempt + 1 < PROVIDER_MAX_ATTEMPTS => {
                     call.failed();
-                    tokio::time::sleep(provider_retry_delay(attempt, None)).await;
-                    tracing::warn!(attempt = attempt + 1, error = %err, "retrying Anthropic transport error");
+                    let delay = provider_retry_delay(attempt, None);
+                    // Logged before the wait: a caller with a shorter deadline (cognition's 8 s)
+                    // may drop the call during it.
+                    tracing::warn!(attempt = attempt + 1, delay_ms = delay.as_millis() as u64, error = %err, "retrying Anthropic transport error");
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 Err(err) => {
@@ -1265,9 +1280,9 @@ impl AnthropicMessagesClient {
                 && provider_should_retry(status.as_u16(), &headers)
             {
                 call.failed();
-                let retry_after = provider_retry_after(&headers);
-                tokio::time::sleep(provider_retry_delay(attempt, retry_after)).await;
-                tracing::warn!(attempt = attempt + 1, status = %status, request_id = ?request_id, "retrying Anthropic response");
+                let delay = provider_retry_delay(attempt, provider_retry_after(&headers));
+                tracing::warn!(attempt = attempt + 1, delay_ms = delay.as_millis() as u64, status = %status, request_id = ?request_id, "retrying Anthropic response");
+                tokio::time::sleep(delay).await;
                 continue;
             }
             if status.is_success() {
@@ -2168,22 +2183,25 @@ mod tests {
             "status=incomplete, reason=content_filter"
         );
         // A refusal, or the filter's cut, is its own error (FINDINGS A-184).
-        assert_eq!(
-            openai_refusal(&json!({"status": "completed", "output": [
-                {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
-            ]})),
-            Some("refusal")
-        );
-        assert_eq!(
-            openai_refusal(&json!({
+        assert!(openai_refused(&json!({"status": "completed", "output": [
+            {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help with that."}]}
+        ]})));
+        assert!(!openai_refused(
+            &json!({"status": "completed", "output": []})
+        ));
+        assert!(matches!(
+            openai_check_filter(&json!({
                 "status": "incomplete", "incomplete_details": {"reason": "content_filter"}
             })),
-            Some("content_filter")
-        );
-        assert_eq!(
-            openai_refusal(&json!({"status": "completed", "output": []})),
-            None
-        );
+            Err(AiSdkError::Refused {
+                reason: "content_filter",
+                ..
+            })
+        ));
+        assert!(openai_check_filter(&json!({
+            "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}
+        }))
+        .is_ok());
     }
 
     #[test]
@@ -3751,15 +3769,49 @@ providers:
         handle.join().expect("server thread");
         assert!(matches!(err, AiSdkError::Refused { .. }), "{err:?}");
 
-        let (base_url, _bodies, handle) = spawn_single_response_server(json!({
-            "id": "resp_f", "status": "incomplete",
-            "incomplete_details": {"reason": "content_filter"}, "output": []
-        }));
+        // The content filter's cut is a refusal on both paths, whatever text or call came before
+        // it: that text is never sent, nor that call run.
+        let filtered = |output: Value| {
+            json!({
+                "id": "resp_f", "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"}, "output": output
+            })
+        };
+        for output in [
+            json!([]),
+            json!([{"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Here is how to"}]}]),
+        ] {
+            let (base_url, _bodies, handle) = spawn_single_response_server(filtered(output));
+            let err = OpenAiResponsesClient::new("test-key", test_account())
+                .with_base_url(base_url)
+                .generate(plain_request())
+                .await
+                .expect_err("the filter's cut");
+            handle.join().expect("server thread");
+            assert!(
+                matches!(
+                    err,
+                    AiSdkError::Refused {
+                        reason: "content_filter",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+        let (base_url, _bodies, handle) = spawn_single_response_server(filtered(json!([
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Let me look"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "thread_state_get",
+             "arguments": "{}"}
+        ])));
         let err = OpenAiResponsesClient::new("test-key", test_account())
             .with_base_url(base_url)
-            .generate(plain_request())
+            .function_model("gpt-5.5", None, ModelSettings::default())
+            .run_turn(plain_turn())
             .await
-            .expect_err("the filter's cut");
+            .expect_err("the filter's cut on a tool turn");
         handle.join().expect("server thread");
         assert!(
             matches!(

@@ -119,8 +119,9 @@ On every request the node reads the key of its provider from SY.vault:
   `/etc/fluxbee/hive.yaml`, or OpenAI without an `ai:` section;
 - **the lookup** is by `resource_type` `openai` or `anthropic`, only in its tenant: a key the node
   owns, else one assigned to it, else the tenant's general key (no owner, no assigned node);
-- **a failed lookup** gets the person the fixed text of a provider that gives no answer, and a
-  sender with a response envelope a `missing_ai_api_key` error (see [Messages](#messages)).
+- **a failed lookup** is a provider that gives no answer: the person gets the fixed text, and a
+  WF's menu or a response envelope a `missing_ai_api_key` error whose `reply` is that text (see
+  [Messages](#messages)).
 
 ## The agent definition
 
@@ -280,24 +281,27 @@ On every request the node reads the key of its provider from SY.vault:
 - **Tools:** see [Tools](#tools).
 - **Every model call** is recorded and charged to the node's tenant
   ([crates/fluxbee_ai_sdk/README.md](../../../crates/fluxbee_ai_sdk/README.md#usage-records-who-pays-for-each-call)).
-- **When the provider gives no answer,** the person gets one fixed text as the agent's answer:
-  *"There is a problem with the AI provider this agent uses, so it could not answer. Please
-  contact your administrator."* (`PROVIDER_FAILURE_TEXT`; the operator's call of 2026-11-08,
-  FINDINGS A-184).
+- **When the provider gives no answer,** the person gets one fixed text: *"There is a problem with
+  the AI provider this agent uses, so it could not answer. Please contact your administrator."*
+  (`PROVIDER_FAILURE_TEXT`; the operator's call of 2026-11-08, FINDINGS A-184).
   - **No answer means:** no key for the node's provider in SY.vault, an error status after the AI
     SDK's retries, no connection or an answer that cannot be read, none in time, an answer with no
     text, or the model's refusal (`AiSdkError::is_provider_failure`).
-  - **Why a text:** it reaches the person on any path a text answer takes, a WF's forward among
-    them; the error payload reached no one.
+  - **How it goes out, by the message's contract:**
+    - **no contract:** the agent's text, which reaches the person on any path a text answer takes;
+    - **a WF's menu:** the error payload, with its code and the text in `reply`. A WF forwards an
+      agent's answer only on its evaluation's `reply`, which a bare text has not, and catches an
+      agent's error on `event.payload.type == 'error'`: its catch sends `event.payload.reply` to
+      the person (Archi's handbook §4.2.4, atom 6);
+    - **a response envelope:** the error payload with `reply` too, for the program that asked.
+  - **Its codes:** `missing_ai_api_key`, `provider_invalid_request`, `provider_auth_error`,
+    `provider_timeout`, `provider_rate_limited`, `provider_unavailable`, `provider_error`,
+    `provider_attachment_invalid_request`, `provider_no_answer`, `provider_refused` or
+    `provider_unreachable`.
   - **Where the error goes:** the node's journal, `AI runtime request failed`, with
     `provider_status`, `provider_param`, `provider_request_id` and the error.
-  - **A sender with a response envelope** is a program that reads the object it asked for, so it
-    gets the error payload instead: `missing_ai_api_key`, `provider_invalid_request`,
-    `provider_auth_error`, `provider_timeout`, `provider_rate_limited`, `provider_unavailable`,
-    `provider_error`, `provider_attachment_invalid_request`, `provider_no_answer`,
-    `provider_refused` or `provider_unreachable`.
-  - **Any other failure** is its error payload, as below: an invalid contract or menu, an answer
-    off its contract, an answer cut at its token limit.
+  - **Any other failure** is its error payload, as below, with no `reply`: an invalid contract or
+    menu, an answer off its contract, an answer cut at its token limit.
 - **Time:** the AI runtime's defaults, not config:
   - each model call has 5 min, its provider's own retries included (up to 3 attempts on a 408,
     409, 429 or 5xx, after the wait the provider names);
