@@ -12752,7 +12752,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_runtimes" => vec!["GET /hives/{hive}/runtimes"],
         "get_runtime" => vec!["GET /hives/{hive}/runtimes/{runtime}"],
         "remove_runtime_version" => {
-            vec!["DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}"]
+            vec!["DELETE /hives/{hive}/runtimes/{runtime}/versions/{runtime_version}"]
         }
         "reset_base_runtime" => vec!["POST /hives/{hive}/runtimes/{runtime}/reset"],
         "list_routes" => vec!["GET /hives/{hive}/routes"],
@@ -12983,7 +12983,8 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         "remove_runtime_version" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.generic."),
-            admin_action_path_param("version", "string", "Runtime version to delete."),
+            // The name the handler reads: the executor sends a step's args under these names (A-172).
+            admin_action_path_param("runtime_version", "string", "Runtime version to delete."),
         ],
         "reset_base_runtime" => vec![
             admin_action_path_param("hive", "string", "The motherbee, where the runtimes manifest lives."),
@@ -28549,6 +28550,31 @@ mod tests {
         assert!(
             doc.contains("Required with ssh_password and no ssh_key"),
             "{doc}"
+        );
+    }
+
+    /// Archi removes a runtime version through the executor, which sends a step's args under the
+    /// names the help gives (FINDINGS A-172: it sent `version`, the handler reads
+    /// `runtime_version`, and the step failed with INVALID_REQUEST on 8.x).
+    #[test]
+    fn the_executor_names_a_runtime_version_as_its_handler_reads_it() {
+        let spec =
+            resolve_internal_action_spec("remove_runtime_version").expect("remove_runtime_version");
+        let doc = build_admin_action_doc(spec);
+        let schema = &doc["executor_contract"]["function_schema"];
+        assert_eq!(
+            schema["required"],
+            json!(["hive", "runtime", "runtime_version"])
+        );
+        assert_eq!(
+            doc["path_patterns"],
+            json!(["DELETE /hives/{hive}/runtimes/{runtime}/versions/{runtime_version}"])
+        );
+        assert_eq!(
+            admin_methods_allowed_for_path(
+                "/hives/motherbee/runtimes/ai.generic/versions/0.1.109-gate1"
+            ),
+            vec!["DELETE"]
         );
     }
 

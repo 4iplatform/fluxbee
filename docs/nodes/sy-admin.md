@@ -932,7 +932,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
 | `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive; `tool_catalog` is the tool catalog its version ships (ai.generic's base tools), or null. |
-| `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}` | Delete one published runtime version from motherbee dist/manifest. |
+| `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{runtime_version}` | Delete one published runtime version from motherbee dist/manifest. |
 | `reset_base_runtime` | `POST /hives/{hive}/runtimes/{runtime}/reset` | Return a base runtime to the version the installed package brought, its `package_version`: `current` becomes that version, and every node that follows `current` moves onto it. Motherbee-only, closed to the mesh, confirmed by the operator (FINDINGS A-122). |
 | `list_routes` | `GET /hives/{hive}/routes` | List route rules for a hive. |
 | `list_vpns` | `GET /hives/{hive}/vpns` | List VPN patterns for a hive. |

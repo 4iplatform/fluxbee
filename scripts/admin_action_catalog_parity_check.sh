@@ -154,6 +154,30 @@ if extra_in_registry:
         + ", ".join(extra_in_registry)
     )
 
+# FINDINGS A-172: the executor sends a step's args under the names the help gives an action's path
+# parameters, while the HTTP route stores each path segment in the payload under its own key. A
+# key the help does not name reaches the handler from HTTP and never from Archi's plans.
+help_block = section_between("fn admin_action_path_params(", "\nfn ")
+path_params = {}
+for arm in re.finditer(r'((?:"[a-z_]+"\s*\|\s*)*"[a-z_]+")\s*=>\s*vec!\[(.*?)\n\s*\],?\n', help_block, flags=re.S):
+    names = re.findall(r'admin_action_path_param\(\s*"([^"]+)"', arm.group(2))
+    for action in re.findall(r'"([a-z_]+)"', arm.group(1)):
+        path_params[action] = set(names)
+arm_starts = [m.start() for m in re.finditer(r'\(\s*"(?:GET|POST|PUT|PATCH|DELETE)"\s*,\s*\[', hive_block)]
+renamed = []
+for i, start in enumerate(arm_starts):
+    arm = hive_block[start:arm_starts[i + 1] if i + 1 < len(arm_starts) else len(hive_block)]
+    actions = re.findall(r'handle_admin_(?:command|query)(?:_with_payload)?\(\s*ctx,\s*client,\s*"([^"]+)"', arm, flags=re.S)
+    keys = re.findall(r'"(\w+)":\s*decode_percent\(', arm)
+    for action in actions:
+        if action not in path_params:
+            continue
+        for key in keys:
+            if key not in path_params[action]:
+                renamed.append(f"{action}: the route stores '{key}', the help names {sorted(path_params[action])}")
+if renamed:
+    fail("a path segment the executor cannot send (A-172): " + "; ".join(renamed))
+
 print("status=ok")
 print(f"source={src_path}")
 print(f"http_actions={len(http_actions)}")
