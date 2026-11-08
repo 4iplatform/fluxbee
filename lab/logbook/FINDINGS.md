@@ -234,7 +234,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
-- A-194 🟡 The Syncthing watchdog restarts Syncthing during a join's finalize (low; small fix).
+- A-194 🟡 The Syncthing watchdog restarts Syncthing during a join's finalize (low): built for
+  0.1.119.
+- A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1313,6 +1315,17 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-196 [General/join] 🟡 LATENT, low (found 2026-11-08 by A-194's review round; read in the code) — A join's peer link can be written to Syncthing's config and never applied
+
+- **Why:** `ensure_syncthing_peer_link_runtime` writes the peer into config.xml, then restarts
+  Syncthing, and skips the restart when nothing changed.
+- **The case:** the restart fails, or the orchestrator dies between the write and the restart. A
+  resumed finalize then finds nothing changed and does not restart, so the running Syncthing keeps
+  the config without the peer until something else restarts it.
+- **The peer reconcile** keeps a `syncthing-restart-pending` marker for exactly this; the join's
+  link has none.
+- **Fix:** the same marker for the join's link. Not seen on 8.x.
+
 ### A-195 [General/router] 🔵 TO EVALUATE (found 2026-11-08 by 0.1.118's gate, its timeline) — WAN frames are dropped at each link-up, before the peer's LSA names their sender
 
 - **Seen:** when `gate0218`'s WAN link came up, the motherbee's router and `gate0218`'s each
@@ -1327,7 +1340,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   and whether any is a request whose sender then waits for a timeout. Health counted no stream
   loss in the window.
 
-### A-194 [General/orchestrator] 🟡 OBSERVED, low (found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
+### A-194 [General/orchestrator] 🟡 BUILT FOR 0.1.119, gate next (found 2026-11-08 by 0.1.118's gate, its timeline; read in the code) — The Syncthing watchdog restarts Syncthing while a join's finalize is restarting it
 
 - **Seen:** during `gate0218`'s finalize, the peer link stopped Syncthing to restart it, and 89 ms
   later the watchdog found it inactive ("syncthing unhealthy; restarting") and restarted it too.
@@ -1337,6 +1350,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   which can also rewrite the folders in config.xml while the finalize links the peer.
 - **Fix:** the watchdog's Syncthing restart waits while a finalize is in flight on a spoke, as
   the peer reconcile already does. Small; for the orchestrator's next release.
+- **The operator's call (2026-11-08):** *"Sí, seguí como planteás"*: A-194 first, then stage 3.
+- **Built for 0.1.119:** one check, `a_join_owns_syncthing`, true on a spoke while its finalize runs
+  and on the motherbee while an `add_hive` or `remove_hive` does. The watchdog takes it before it
+  reads the desired config, and again right before it restarts Syncthing; the peer reconcile takes
+  it in both of its places.
+- **Its review round:** no high or medium. Its lows were fixed: the second check before the
+  restart, the motherbee's side, and the one check everywhere. It also found A-196.
 
 ### A-193 [General/deploy] 🔵 TO EVALUATE (found 2026-11-08, the first timed deploy and join, 0.1.118) — Where a deploy and a join spend their time
 
