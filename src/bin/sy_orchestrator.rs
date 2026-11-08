@@ -8964,7 +8964,14 @@ fn reconcile_worker_egress(
     if ipv6_policy.trim() == "blocked" {
         write_file_if_changed(EGRESS_SYSCTL_PATH, worker_ipv6_sysctl_content())?;
         apply_sysctl_system()?;
-        verification.ipv6_blocked = true;
+        // Read back from the kernel, as the egress does: a sysctl file that did not take leaves
+        // IPv6 on, and a rogue RA could route around the gateway (an audit's F23).
+        verification.ipv6_blocked = ipv6_disabled_now();
+        if !verification.ipv6_blocked {
+            tracing::warn!(
+                "EGRESS_IPV6_UNMANAGED: the worker's IPv6 block was applied and the kernel still has IPv6 on"
+            );
+        }
     } else {
         tracing::warn!(
             policy = ipv6_policy,
