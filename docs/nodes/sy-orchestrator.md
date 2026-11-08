@@ -491,12 +491,14 @@ What the code does today:
   `lan_iface` present, `edge_ip` (always in its hive.yaml, never guessed) on `lan_iface`. Any of
   them missing fails the boot with what is missing; after boot the watchdog logs each on every
   drift tick and records an `egress` drift alert (`lan_leg_missing`, `ipv4_forwarding_off`,
-  `ipv6_not_blocked`). A worker gets its default route via the egress `gateway_ip`. The motherbee
+  `ipv6_not_blocked`) in its own drift-alert file, which the motherbee does not read yet
+  (FINDINGS A-175). A worker gets its default route via the egress `gateway_ip`. The motherbee
   is only checked (`EGRESS_MOTHERBEE_BYPASS`).
 - **Internet probe** (`check_internet_reachable`): an HTTPS GET (curl, 5 s) of the hive's own
   `egress.reachability_url`, on the egress at boot and every drift tick, and at boot on a worker
   that routes through it and on the motherbee when they declare `gateway_ip`. A failure is a
-  warning in the journal. Without the URL the probe does not run and logs
+  warning in the journal; on the egress, since 0.1.110, also an `internet_unreachable` drift alert
+  in its own file (FINDINGS A-175). Without the URL the probe does not run and logs
   `internet_reachable=not_configured`, as it does after warning about a URL that is not a valid
   `https://` one: the code names no target of its own. A host without `curl` does not probe
   either and logs `not_probed` (`run_internet_probe`), never a `false` it did not measure.

@@ -189,7 +189,9 @@ session.
 
 **Internet probe.** The egress, a worker that routes through it and the motherbee check the
 internet with an HTTPS GET of their own `egress.reachability_url` (the egress at boot and every
-drift tick, the others at boot); a failure is a warning in that hive's journal. There is no
+drift tick, the others at boot); a failure is a warning in that hive's journal, and on the egress
+also an `internet_unreachable` drift alert in its own file, which the motherbee does not read yet
+(FINDINGS A-175). There is no
 default: without the URL the probe does not run and logs `internet_reachable=not_configured`. An
 egress join takes `egress.reachability_url` from the request, else the motherbee's, and refuses
 anything but an `https://` URL; a worker join copies the motherbee's with `gateway_ip`. A hive

@@ -3110,7 +3110,8 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                     Ok(v) => {
                         // FINDINGS A-1: an egress can stop serving its LAN after boot (an
                         // interface renamed or removed, a sysctl reverted). Reported on every
-                        // drift tick, and queryable as drift alerts.
+                        // drift tick, and kept as drift alerts in this hive's own file, which the
+                        // motherbee does not read yet (FINDINGS A-175).
                         for (kind, problem) in v.serving_problems() {
                             tracing::warn!(
                                 kind = kind,
@@ -3133,8 +3134,9 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                         // it on every drift tick (not just once at bootstrap) so an
                         // operator tailing the journal sees a persistent signal. Without
                         // egress.reachability_url there is no probe and nothing to say.
-                        // A drift alert too, so the operator sees it where the LAN problems show
-                        // (the sweep of 2026-11-07: it was a journal line only).
+                        // A drift alert too, next to the LAN problems' (the sweep of 2026-11-07:
+                        // it was a journal line only); like theirs, it stays in this hive's file
+                        // until a spoke's alerts reach the motherbee (FINDINGS A-175).
                         if let Some((kind, problem)) = egress_internet_problem(
                             v.internet_reachable,
                             eg.reachability_url.as_deref(),
