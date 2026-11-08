@@ -103,7 +103,9 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 - Fail-open: without an AI key, or when the tagger fails, the worker skips a turn (no labels,
   memories or feelings). Its text is in the last turns all the same: the intake needs no model.
 - A communication whose file row cannot be read is skipped and counted
-  (`store_load_failures_total`); a file that cannot be opened stops the node.
+  (`store_load_failures_total`); a file that cannot be opened stops the node. A thread's
+  communication with no agent that cannot be read is not taken by the thread's first agent, which
+  starts without it (cognition-hands-v1 §12.6).
 - The orchestrator's boot waits up to 60 s for it to appear on the router and only warns if it
   does not.
 

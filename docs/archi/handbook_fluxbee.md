@@ -885,7 +885,11 @@ its errors, and the answers that arrive after their wait.
   instance.
 - **A handover between agents carries nothing by itself.** The agent that takes a conversation
   sees its own turns with the person, and what people said to each other while it held the
-  conversation; never another agent's turns, so no agent takes over another's role. When it must
+  conversation or before any agent did; never another agent's turns, so no agent takes over
+  another's role.
+- **What people said to each other reaches the agent; its role decides whether to use it.** Each
+  such line names its writer and whom it was to. When the agent must not use it (what two people
+  said in private, say), write that in its role. When it must
   know something to go on (a state, a result, an order's number), the workflow passes it on in the
   message it sends, as Case 4's `handback` carries its `note`. Otherwise the person tells it, or it
   asks.

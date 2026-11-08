@@ -138,10 +138,13 @@ impl CognitionStore {
         }
     }
 
-    /// Writes each communication's state whole, all in one transaction. Returns how many.
+    /// Writes each communication's state whole and deletes the rows of `removed`, all in one
+    /// transaction: a communication an agent took leaves the file with its taker's write, never
+    /// before it (docs/cognition-hands-v1.md §12.6). Returns how many it wrote.
     pub(crate) fn save<'a>(
         &self,
         rows: impl IntoIterator<Item = (&'a CommunicationKey, &'a ThreadCognitionState)>,
+        removed: &[CommunicationKey],
     ) -> Result<u64, CognitionError> {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
@@ -157,6 +160,12 @@ impl CognitionStore {
                     serde_json::to_string(state)?,
                 ])?;
                 written += 1;
+            }
+            let mut delete = tx.prepare_cached(
+                "DELETE FROM communications WHERE thread_id = ?1 AND agent_ilk = ?2",
+            )?;
+            for key in removed {
+                delete.execute(params![key.thread_id, key.agent_ilk])?;
             }
         }
         tx.commit()?;
@@ -231,6 +240,22 @@ impl CognitionStore {
             }
         }
         Ok(last)
+    }
+
+    /// A row as another build would have left it, for the tests: its state version and its state
+    /// as they are.
+    #[cfg(test)]
+    pub(crate) fn put_row(
+        &self,
+        key: &CommunicationKey,
+        state_version: i64,
+        state: &str,
+    ) -> Result<(), CognitionError> {
+        self.connection().execute(
+            UPSERT_SQL,
+            params![key.thread_id, key.agent_ilk, 0i64, state_version, state],
+        )?;
+        Ok(())
     }
 
     /// Keeps an episode, once: false when the file had it already.

@@ -39,7 +39,10 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   agent that serves it. Two agents in one thread are two communications. The memory is never
   keyed by hive or by node; the node is only how the router finds the agent. What people say to
   each other through a WF on a thread no agent served on this hive is the communication with no
-  agent, `(thread_id, none)` (§2).
+  agent, `(thread_id, none)` (§2). The first agent on that thread takes it whole: its new
+  communication starts from what people said there, and the one with no agent leaves the file in
+  the write of the agent's (`held_or_loaded`, `take_conversation`, since 0.1.112;
+  cognition-hands-v1 §12.6).
 - **Where it runs:** on the motherbee and on every worker, next to the agents (`hive.yaml`
   `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.
@@ -108,9 +111,11 @@ communications to its own stream, under the subject `cognition.turns` (`src/rout
       thread;
     - in two, on a thread the agent served, the relay joins its communication too, and the agent's
       copy, whichever comes second, is the same turn;
-    - in two, on a new thread, the relay first goes to the thread's communication with no agent and
-      the agent's copy to the agent's: two communications, each analyzed (cognition-hands-v1
-      §12.6).
+    - in two, on a new thread, the relay first goes to the thread's communication with no agent;
+      the agent's copy then makes the agent's communication, which takes that one with the relay's
+      key, so the copy is the same turn (since 0.1.112). The take is recorded (`Takes`), and the
+      worker's turn of the communication taken follows it to the agent's, whether the take came
+      before the worker got to the turn or while its models answered (`Takes::follow`).
 - It takes each new `cognition.turns` record into its communication's last turns, writes each
   communication it touched to its file and rewrites the memory region once for the batch (the
   intake, §3.4).
@@ -301,7 +306,9 @@ turn goes to the worker's queue (`intake_turn`, `recent_turn_of`, `take_recent_t
 - **A communication not held** (new, after a restart, or let go from a full region, §7): the
   intake loads it from the file, or starts it new, and adds the turn (`held_or_loaded`). When the
   file cannot be read, the turn is kept out (`store_load_failures_total`): a new one would write
-  over what the file keeps.
+  over what the file keeps. An agent's new one takes the thread's communication with no agent
+  (`take_conversation`, counted in `conversations_taken_total`); when that one's row cannot be
+  read, it takes nothing and starts new.
 - **Who writes what:** the intake owns the last turns and the last turn's ILKs and channel; the
   worker owns the rest. Both change the held state and write it out in `sync_held_state`: each
   communication changed is written whole to the file, then the region is rewritten, under the

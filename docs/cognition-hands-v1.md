@@ -871,18 +871,33 @@ At 10:17 sales' package carries:
     stays with invoice, and sales gets only Juan's hand-back note. That fits the rule: Juan worked
     invoice's part.
   - Archi's handbook states it among the WF chapter's rules across atoms.
-- **A conversation that starts among people and later reaches an agent, pending (the operator,
-  2026-11-07):** the first agent to take the thread does not start from the communication with no
-  agent, and it stays so for now. *"si hablamos de que los agentes son personas, esta capacidad
-  sería como un superpoder.. saber lo que hablaron dos personas que no estaban en contacto.. no
-  digo que no lo hagamos, digo que es terreno desconocido, puede generar enojo dependiendo de lo
-  que hablaron en privado.. anotá este tema como un pendiente"*.
-  - **The rule for now:** an agent is not told what two people said to each other, nor what two
-    agents of different roles said, and talks between agents are not passed on. What crosses is
-    *"los hechos negativos y positivos"*: the episodes, the news.
-  - Whether the lines of Juan's part (§12.3, 1, built in 0.1.104) fall under the rule was asked
-    the same day.
-  - A design topic of its own: FINDINGS A-173.
+- **A conversation that starts among people and later reaches an agent, decided (the operator,
+  2026-11-07, after a first "not now"):** the first agent to take the thread starts from the
+  communication with no agent. First the operator held it back: *"si hablamos de que los agentes
+  son personas, esta capacidad sería como un superpoder.. saber lo que hablaron dos personas que no
+  estaban en contacto.. no digo que no lo hagamos, digo que es terreno desconocido, puede generar
+  enojo dependiendo de lo que hablaron en privado.. anotá este tema como un pendiente"*.
+  - Asked whether that rule also took Juan's part back (§12.3, 1, live since 0.1.104), the
+    operator decided the other way: *"si hacemos que le llegue al agente y el agente lo use o no
+    desde el prompt, tendríamos la posibilidad de activarlo o desactivarlo, y dado que ya está
+    programado, sería coherente dejarlo todo igual, si es posible entonces lo que planteaste
+    antes.. hacelo también"*.
+  - **So:** what people said to each other reaches the agent, Juan's part as before and now what
+    they said before any agent; each line names its writer and whom it was to, and the agent's
+    role decides whether to use it. An agent still never sees another agent's turns (the first
+    question).
+  - **Built for 0.1.112 (A-173):** an agent's new communication takes the thread's communication
+    with no agent, moved and not copied (`held_or_loaded`, `take_conversation`).
+    - The take is recorded under the held state's lock: which, by whom, and the keys of the turns
+      it held (`Takes`).
+    - The taken row leaves the file in the transaction that writes the agent's communication,
+      never before it; a row that cannot be read takes nothing and blocks nothing.
+    - A turn the worker is on follows the recorded take at its hold, its copy and its write-back
+      (`Takes::follow`), so a take that comes while the models answer sends the result to the
+      agent's communication, and the one with no agent is never made again.
+    - A take the worker makes, for a turn the intake left out, is written at once.
+  - **It answers the third question too:** a message and its copy in two batches on a new thread,
+    the relay first, are now one turn: the agent's communication takes the relay with its key.
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the
   lenses. The gate says why it turns a proposal down (A-163, since 0.1.106): SY.cognition's log
   names, at info, the condition missed and the gate's numbers.
@@ -897,9 +912,9 @@ At 10:17 sales' package carries:
 - **Known limits of the build** (its review round):
   - A WF's message to an agent and its copy to a person can come in two stream batches: the router
     sends a batch as soon as it has a record, one at a time. On a new thread, with the relay
-    first, they go to two communications, the agent's and the one with no agent, each analyzed.
+    first, they went to two communications, the agent's and the one with no agent, each analyzed.
     On a thread the agent served they are one turn (§12.9). Corrected by A-161's review round
-    (2026-11-07): this was written as rare.
+    (2026-11-07): this was written as rare. Since 0.1.112 they are one turn too (A-173).
   - During the upgrade to 0.1.104, an ai.generic still on 0.1.103 cannot read a package that its
     new router cut (`truncated`), and that message fails. The packages start empty at the
     upgrade (the state version 2), so a cut one is rare in that window.
