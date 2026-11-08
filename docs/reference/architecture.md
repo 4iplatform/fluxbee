@@ -141,14 +141,18 @@ every boot.
 
 The boot (`bootstrap_local`, then `finish_bootstrap`):
 
-1. Check its role's core binaries against the hashes in `dist/core/manifest.json`
-   (`validate_core_manifest_for_bins`); a spoke also re-renders its core units.
+1. Read `dist/core/manifest.json` (a missing or invalid one is fatal); a spoke also re-renders its
+   core units.
 2. Motherbee only: create the SSH join key and the mesh CA when missing, write its own TLS leaf
    (`ensure_motherbee_ssh_key`, `ensure_motherbee_mesh_tls`), and lay out one core tree per spoke
-   role under `dist/core/<role>/` (`materialize_role_core_trees`).
+   role under `dist/core/<role>/` (`materialize_role_core_trees`, which copies a binary only once
+   it matches the manifest).
 3. Start `rt-gateway` and wait for a fresh heartbeat in its shared memory (`wait_for_router_ready`).
    Report an active ufw or firewalld, apply the ingress' SSH table (`reconcile_ingress_ssh`, §9),
-   apply the egress setup (`reconcile_egress`) and start Syncthing.
+   apply the egress setup (`reconcile_egress`) and start Syncthing. Then check its role's core
+   binaries in `dist/core/bin` against the manifest: one that does not match is a warning and
+   `core.awaiting_update` in `/versions`, never fatal, and the hive runs what `/usr/bin` holds
+   (FINDINGS A-186).
 4. Start the `system_nodes.<role>.nodes` units in order, then wait up to 60 s for the `wait_for`
    nodes to register with the router (`wait_for_lifecycle_nodes`).
 5. Attach to the router as `SY.orchestrator@<hive>`. Admin commands get `ORCHESTRATOR_BOOTING` until

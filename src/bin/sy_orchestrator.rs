@@ -724,6 +724,10 @@ struct OrchestratorState {
     /// pass waits for it, and the 60 s loop skips a tick while the boot's pass holds it, so two
     /// passes never run at once.
     reconcile_pass: Mutex<()>,
+    /// FINDINGS A-186: the core binaries of this role that the start's dist check, or a later one,
+    /// found not matching the manifest; None while dist holds them as it says. `/versions` shows it
+    /// as `core.awaiting_update`.
+    awaiting_update: std::sync::Mutex<Option<AwaitingUpdate>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -1005,6 +1009,7 @@ async fn main() -> Result<(), OrchestratorError> {
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         relaunch_waits: std::sync::Mutex::new(HashMap::new()),
         reconcile_pass: Mutex::new(()),
+        awaiting_update: std::sync::Mutex::new(None),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -1037,6 +1042,11 @@ async fn main() -> Result<(), OrchestratorError> {
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
+    // FINDINGS A-186: a start whose dist check found binaries that do not match checks again every
+    // minute, until a check or a core update finds dist consistent.
+    if awaiting_update_open(&state) {
+        tokio::spawn(run_core_dist_recheck_loop(Arc::clone(&state)));
+    }
 
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
@@ -1660,8 +1670,10 @@ async fn bootstrap_local(
     socket_dir: &Path,
 ) -> Result<(), OrchestratorError> {
     let core_manifest = load_core_manifest()?;
-    let core_bins = core_bin_paths_for_role(&core_manifest, state.role)?;
-    validate_core_manifest_for_bins(&core_bins)?;
+    // The core components this role runs, whether or not dist holds each: the start runs what
+    // `/usr/bin` holds, and checks dist only once Syncthing, which brings what dist lacks, runs
+    // (FINDINGS A-186).
+    let role_components = core_components_listed_for_role(&core_manifest, state.role)?;
 
     // Spoke self-heal: a category=core update swaps this role's binaries, but the systemd unit
     // files were written once at add_hive. Re-render them from THIS binary's templates on every
@@ -1720,9 +1732,10 @@ async fn bootstrap_local(
     );
     // Core components a hive.yaml leaves out of system_nodes get their new binary too; they are
     // restarted after the listed ones, and only if they run a replaced binary.
-    let unlisted_core: Vec<String> = core_component_names_for_role(&core_manifest, state.role)?
-        .into_iter()
-        .filter(|name| name != "sy-orchestrator" && !core_services.contains(name))
+    let unlisted_core: Vec<String> = role_components
+        .iter()
+        .filter(|name| *name != "sy-orchestrator" && !core_services.contains(*name))
+        .cloned()
         .collect();
     core_services.extend(unlisted_core.iter().cloned());
     let replaced = services_running_replaced_binary(&core_services);
@@ -1772,6 +1785,11 @@ async fn bootstrap_local(
     } else {
         disable_blob_sync_runtime_local()?;
     }
+
+    // FINDINGS A-186: dist is checked once Syncthing runs, and a binary that does not match the
+    // manifest stops nothing: it is reported, the start goes on with what `/usr/bin` holds, and
+    // the core update, whose own check stays strict, installs it once dist matches.
+    check_core_dist_at_start(state, &core_manifest, &role_components);
 
     for node_name in &state.system_nodes.nodes {
         let service = name_to_service(node_name);
@@ -5048,7 +5066,11 @@ enum CorePrepareOutcome {
 /// swap the binaries in, re-render this role's units. Restarting is `restart_core_after_update`.
 fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, OrchestratorError> {
     let manifest = load_core_manifest()?;
+    // Strict: a binary dist does not hold as the manifest says fails the update here, before
+    // anything is backed up or swapped. Past it, dist matches, so the start's report closes
+    // (FINDINGS A-186).
     let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
+    close_awaiting_update(state);
     let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
     // Created LAZILY, on the first binary we actually back up. It used to be created
     // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
@@ -5975,7 +5997,10 @@ fn regen_local_core_units(
     if role == HiveRole::Motherbee {
         return Ok(false);
     }
-    let names = core_component_names_for_role(manifest, role)?;
+    // Every component the role lists, whether or not dist holds it (FINDINGS A-186): a unit runs
+    // what `/usr/bin` holds, so a binary dist lacks keeps its unit, and a core update has already
+    // refused a component its manifest does not name before it gets here.
+    let names = core_components_listed_for_role(manifest, role)?;
     let mut changed = false;
     for name in &names {
         let unit = core_service_unit_contents(name, &service_to_exec(name));
@@ -13389,6 +13414,9 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             .collect()
     };
 
+    // FINDINGS A-186: null while dist holds this role's core binaries as the manifest says; else
+    // which do not match and why, while the hive runs what /usr/bin holds.
+    let awaiting_update = awaiting_update_json(awaiting_update_slot(state).as_ref());
     let core = match load_core_manifest() {
         Ok(manifest) => {
             let manifest_hash = local_core_manifest_hash().ok().flatten();
@@ -13405,11 +13433,13 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
                 // The last core update: `phase` restarting|done, `status` ok|rollback, errors.
                 "last_update": read_core_update_last_record(),
                 "rollback_generations": rollback_generations,
+                "awaiting_update": awaiting_update,
             })
         }
         Err(err) => serde_json::json!({
             "status": "error",
             "message": err.to_string(),
+            "awaiting_update": awaiting_update,
         }),
     };
 
@@ -23185,69 +23215,378 @@ fn load_core_manifest() -> Result<CoreManifest, OrchestratorError> {
     Ok(manifest)
 }
 
+/// The strict check, a core update's and a join's: an error for the first binary of `bin_paths`
+/// that the core manifest does not describe. Never the start's (FINDINGS A-186).
 fn validate_core_manifest_for_bins(bin_paths: &[String]) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
+    validate_core_bins_against_manifest(&manifest, bin_paths)
+}
 
+/// `validate_core_manifest_for_bins` against a manifest already read. Each binary is named by
+/// its file name. Its verdicts are `core_dist_binary_mismatch`'s, so this check and the start's
+/// report never disagree on a binary.
+fn validate_core_bins_against_manifest(
+    manifest: &CoreManifest,
+    bin_paths: &[String],
+) -> Result<(), OrchestratorError> {
     for bin_path in bin_paths {
         let path = Path::new(bin_path);
-        let component_name = path
+        let component = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("invalid core binary path '{}'", path.display()))?
-            .to_string();
-
-        let expected = manifest.components.get(&component_name).ok_or_else(|| {
-            format!(
-                "core manifest missing component '{component_name}' for '{}'",
-                path.display()
-            )
-        })?;
-        if expected.service.trim().is_empty()
-            || expected.version.trim().is_empty()
-            || expected.build_id.trim().is_empty()
-        {
-            return Err(format!(
-                "core manifest component '{}' missing service/version/build_id",
-                component_name
-            )
-            .into());
-        }
-        if expected.service.trim() != component_name {
-            return Err(format!(
-                "core manifest component '{}' has service='{}' (expected '{}')",
-                component_name, expected.service, component_name
-            )
-            .into());
-        }
-
-        let actual_hash = sha256_file(path)?;
-        if actual_hash.is_empty() {
-            return Err(format!("failed to compute sha256 for '{}'", path.display()).into());
-        }
-        if !actual_hash.eq_ignore_ascii_case(expected.sha256.trim()) {
-            return Err(format!(
-                "core manifest hash mismatch for '{}': expected={} actual={}",
-                component_name, expected.sha256, actual_hash
-            )
-            .into());
-        }
-
-        if let Some(expected_size) = expected.size {
-            let actual_size = fs::metadata(path)?.len();
-            if actual_size != expected_size {
-                return Err(format!(
-                    "core manifest size mismatch for '{}': expected={} actual={}",
-                    component_name, expected_size, actual_size
-                )
-                .into());
-            }
+            .ok_or_else(|| format!("invalid core binary path '{}'", path.display()))?;
+        if let Some(mismatch) = core_dist_binary_mismatch(manifest, component, path) {
+            return Err(mismatch.detail.into());
         }
     }
-
     Ok(())
 }
 
+/// Why a core binary in dist is not the one its manifest describes (FINDINGS A-186).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CoreDistReason {
+    /// The manifest names no such component: the role lists a binary this build does not have.
+    NotInManifest,
+    /// Its manifest entry lacks a service, a version or a build id, or names another service.
+    InvalidEntry,
+    /// No file at its path: not delivered yet, or pruned from the role's tree.
+    Missing,
+    /// Not a regular file, or a file that could not be read.
+    Unreadable,
+    /// Its size is not the manifest's.
+    SizeMismatch,
+    /// Its sha256 is not the manifest's.
+    HashMismatch,
+}
+
+impl CoreDistReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            CoreDistReason::NotInManifest => "not_in_manifest",
+            CoreDistReason::InvalidEntry => "invalid_entry",
+            CoreDistReason::Missing => "missing",
+            CoreDistReason::Unreadable => "unreadable",
+            CoreDistReason::SizeMismatch => "size_mismatch",
+            CoreDistReason::HashMismatch => "hash_mismatch",
+        }
+    }
+}
+
+/// One core binary in dist that is not the one its manifest describes, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CoreDistMismatch {
+    component: String,
+    reason: CoreDistReason,
+    detail: String,
+}
+
+/// None when the binary of `component` at `path` is the one `manifest` describes; else why not.
+/// The strict check and the start's report both read it.
+fn core_dist_binary_mismatch(
+    manifest: &CoreManifest,
+    component: &str,
+    path: &Path,
+) -> Option<CoreDistMismatch> {
+    let mismatch = |reason: CoreDistReason, detail: String| {
+        Some(CoreDistMismatch {
+            component: component.to_string(),
+            reason,
+            detail,
+        })
+    };
+    let Some(expected) = manifest.components.get(component) else {
+        return mismatch(
+            CoreDistReason::NotInManifest,
+            format!(
+                "core manifest missing component '{component}' for '{}'",
+                path.display()
+            ),
+        );
+    };
+    if expected.service.trim().is_empty()
+        || expected.version.trim().is_empty()
+        || expected.build_id.trim().is_empty()
+    {
+        return mismatch(
+            CoreDistReason::InvalidEntry,
+            format!("core manifest component '{component}' missing service/version/build_id"),
+        );
+    }
+    if expected.service.trim() != component {
+        return mismatch(
+            CoreDistReason::InvalidEntry,
+            format!(
+                "core manifest component '{component}' has service='{}' (expected '{component}')",
+                expected.service
+            ),
+        );
+    }
+    // What the path is, before anything opens it: an open of a FIFO would wait forever.
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return mismatch(
+                CoreDistReason::Missing,
+                format!("core binary '{component}' missing at '{}'", path.display()),
+            );
+        }
+        Err(err) => {
+            return mismatch(
+                CoreDistReason::Unreadable,
+                format!(
+                    "core binary '{component}' at '{}' unreadable: {err}",
+                    path.display()
+                ),
+            );
+        }
+    };
+    if !meta.is_file() {
+        return mismatch(
+            CoreDistReason::Unreadable,
+            format!(
+                "core binary '{component}' at '{}' is not a regular file",
+                path.display()
+            ),
+        );
+    }
+    // The size before the hash: it reads nothing.
+    if let Some(expected_size) = expected.size {
+        if meta.len() != expected_size {
+            return mismatch(
+                CoreDistReason::SizeMismatch,
+                format!(
+                    "core manifest size mismatch for '{component}': expected={expected_size} actual={}",
+                    meta.len()
+                ),
+            );
+        }
+    }
+    match sha256_file(path) {
+        Ok(actual) if actual.eq_ignore_ascii_case(expected.sha256.trim()) => None,
+        Ok(actual) => mismatch(
+            CoreDistReason::HashMismatch,
+            format!(
+                "core manifest hash mismatch for '{component}': expected={} actual={actual}",
+                expected.sha256
+            ),
+        ),
+        Err(err) => mismatch(
+            CoreDistReason::Unreadable,
+            format!(
+                "core binary '{component}' at '{}' unreadable: {err}",
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// The start's dist check, and every later one (FINDINGS A-186): each of `components` in
+/// `bin_dir` against `manifest`. It returns a report, never an error: what does not match, in
+/// the role's order, and nothing when dist holds them all as the manifest says.
+fn core_dist_mismatches(
+    manifest: &CoreManifest,
+    components: &[String],
+    bin_dir: &Path,
+) -> Vec<CoreDistMismatch> {
+    components
+        .iter()
+        .filter_map(|name| core_dist_binary_mismatch(manifest, name, &bin_dir.join(name)))
+        .collect()
+}
+
+/// How often dist is checked again while `core.awaiting_update` is open (FINDINGS A-186).
+const CORE_DIST_RECHECK_SECS: u64 = 60;
+
+const AWAITING_UPDATE_MESSAGE: &str = "Core binaries of this hive's role in dist/core/bin do not \
+     match dist/core/manifest.json: a release still syncing, or a binary the role lists that dist \
+     no longer has. The hive runs what /usr/bin holds, and a core update installs dist's binaries \
+     only once they match the manifest.";
+
+/// FINDINGS A-186: the core binaries of this hive's role that a dist check found not matching
+/// `dist/core/manifest.json`, since the first check that found any, as of the last one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AwaitingUpdate {
+    since_ms: u64,
+    checked_at_ms: u64,
+    mismatches: Vec<CoreDistMismatch>,
+}
+
+/// The report after a check that found `mismatches` at `now_ms`: none when it found none; else
+/// this check's, open since `previous` opened.
+fn awaiting_update_after(
+    previous: Option<&AwaitingUpdate>,
+    mismatches: Vec<CoreDistMismatch>,
+    now_ms: u64,
+) -> Option<AwaitingUpdate> {
+    if mismatches.is_empty() {
+        return None;
+    }
+    Some(AwaitingUpdate {
+        since_ms: previous.map_or(now_ms, |open| open.since_ms),
+        checked_at_ms: now_ms,
+        mismatches,
+    })
+}
+
+/// `core.awaiting_update` in `/versions`: null while dist matches.
+fn awaiting_update_json(awaiting: Option<&AwaitingUpdate>) -> serde_json::Value {
+    let Some(awaiting) = awaiting else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "reason": "dist_mismatch",
+        "message": AWAITING_UPDATE_MESSAGE,
+        "since_ms": awaiting.since_ms,
+        "checked_at_ms": awaiting.checked_at_ms,
+        "components": awaiting.mismatches,
+    })
+}
+
+fn awaiting_update_slot(
+    state: &OrchestratorState,
+) -> std::sync::MutexGuard<'_, Option<AwaitingUpdate>> {
+    state
+        .awaiting_update
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn awaiting_update_open(state: &OrchestratorState) -> bool {
+    awaiting_update_slot(state).is_some()
+}
+
+fn warn_awaiting_update(open: &AwaitingUpdate) {
+    for mismatch in &open.mismatches {
+        tracing::warn!(
+            component = %mismatch.component,
+            reason = mismatch.reason.as_str(),
+            detail = %mismatch.detail,
+            "core binary in dist/core/bin does not match dist/core/manifest.json"
+        );
+    }
+    let components: Vec<&str> = open
+        .mismatches
+        .iter()
+        .map(|mismatch| mismatch.component.as_str())
+        .collect();
+    tracing::warn!(
+        components = ?components,
+        "awaiting update: the hive runs what /usr/bin holds, /versions shows these as \
+         core.awaiting_update, and dist is checked again every minute (FINDINGS A-186)"
+    );
+}
+
+/// The start's dist check (FINDINGS A-186), once Syncthing runs: it opens `core.awaiting_update`
+/// with a warning when a binary of the role does not match, and stops nothing.
+fn check_core_dist_at_start(
+    state: &OrchestratorState,
+    manifest: &CoreManifest,
+    components: &[String],
+) {
+    let mismatches =
+        core_dist_mismatches(manifest, components, Path::new(DIST_CORE_BIN_SOURCE_DIR));
+    let mut awaiting = awaiting_update_slot(state);
+    *awaiting = awaiting_update_after(None, mismatches, now_epoch_ms());
+    if let Some(open) = awaiting.as_ref() {
+        warn_awaiting_update(open);
+    }
+}
+
+/// A later check's outcome: the open report takes its components, or closes when it found none.
+/// A report a core update closed in the meantime stays closed. Whether it is still open.
+fn refresh_awaiting_update(state: &OrchestratorState, mismatches: Vec<CoreDistMismatch>) -> bool {
+    let mut awaiting = awaiting_update_slot(state);
+    let Some(previous) = awaiting.take() else {
+        return false;
+    };
+    let next = awaiting_update_after(Some(&previous), mismatches, now_epoch_ms());
+    let reasons = |report: &AwaitingUpdate| -> Vec<(String, CoreDistReason)> {
+        report
+            .mismatches
+            .iter()
+            .map(|mismatch| (mismatch.component.clone(), mismatch.reason))
+            .collect()
+    };
+    match next.as_ref() {
+        None => tracing::info!(
+            "dist/core/bin matches dist/core/manifest.json; core.awaiting_update closed (FINDINGS A-186)"
+        ),
+        Some(open) if reasons(open) != reasons(&previous) => warn_awaiting_update(open),
+        Some(_) => {}
+    }
+    *awaiting = next;
+    awaiting.is_some()
+}
+
+/// A core update's strict check passed, so dist holds this role's binaries as the manifest says:
+/// closes `core.awaiting_update`.
+fn close_awaiting_update(state: &OrchestratorState) {
+    if awaiting_update_slot(state).take().is_some() {
+        tracing::info!(
+            "a core update found dist/core/bin matching its manifest; core.awaiting_update closed (FINDINGS A-186)"
+        );
+    }
+}
+
+/// FINDINGS A-186: while `core.awaiting_update` is open, dist is checked again every minute, as
+/// Syncthing hands it what it lacked, until a check, or a core update's own, finds it
+/// consistent.
+async fn run_core_dist_recheck_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(CORE_DIST_RECHECK_SECS));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // The start has just checked.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        if !awaiting_update_open(&state) {
+            return;
+        }
+        let role = state.role;
+        let checked = tokio::task::spawn_blocking(
+            move || -> Result<Vec<CoreDistMismatch>, OrchestratorError> {
+                let manifest = load_core_manifest()?;
+                let components = core_components_listed_for_role(&manifest, role)?;
+                Ok(core_dist_mismatches(
+                    &manifest,
+                    &components,
+                    Path::new(DIST_CORE_BIN_SOURCE_DIR),
+                ))
+            },
+        )
+        .await;
+        match checked {
+            Ok(Ok(mismatches)) => {
+                if !refresh_awaiting_update(&state, mismatches) {
+                    return;
+                }
+            }
+            Ok(Err(err)) => tracing::warn!(
+                error = %err,
+                "dist check could not run; core.awaiting_update stays as it was"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "dist check task failed; core.awaiting_update stays as it was"
+            ),
+        }
+    }
+}
+
+/// The core components this hive's role runs, each named in the core manifest: a component the
+/// manifest does not name is an error. What a core update, a join and the role trees use.
 fn core_component_names_for_role(
+    manifest: &CoreManifest,
+    role: HiveRole,
+) -> Result<Vec<String>, OrchestratorError> {
+    require_core_components_in_manifest(core_components_listed_for_role(manifest, role)?, manifest)
+}
+
+/// The core components this hive's role runs: every component of the manifest on the motherbee;
+/// on a spoke rt-gateway, its `system_nodes` and sy-orchestrator, from its hive.yaml. A component
+/// the manifest does not name is listed, not refused: the start runs what `/usr/bin` holds and
+/// reports it, and a core update refuses it (FINDINGS A-186, the DTAP panel's A-8).
+fn core_components_listed_for_role(
     manifest: &CoreManifest,
     role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
@@ -23257,16 +23596,12 @@ fn core_component_names_for_role(
 
     let hive = load_hive(&json_router::paths::config_dir())?;
     let section = system_nodes_for_role(&hive, role)?;
-    core_component_names_from_section(&section, manifest)
+    Ok(core_component_names_in_section(&section))
 }
 
-/// rt-gateway + the section's SY nodes (as services) + sy-orchestrator,
-/// de-duplicated, preserving order. Validates every resulting component exists
-/// in the core manifest.
-fn core_component_names_from_section(
-    section: &RoleSystemNodes,
-    manifest: &CoreManifest,
-) -> Result<Vec<String>, OrchestratorError> {
+/// rt-gateway + the section's SY nodes (as services) + sy-orchestrator, de-duplicated,
+/// preserving order.
+fn core_component_names_in_section(section: &RoleSystemNodes) -> Vec<String> {
     let mut out = vec!["rt-gateway".to_string()];
     for node_name in &section.nodes {
         let service = name_to_service(node_name);
@@ -23277,22 +23612,28 @@ fn core_component_names_from_section(
     if !out.iter().any(|name| name == "sy-orchestrator") {
         out.push("sy-orchestrator".to_string());
     }
-    for name in &out {
-        if !manifest.components.contains_key(name) {
-            return Err(format!("core manifest missing required component '{name}'").into());
-        }
-    }
-    Ok(out)
+    out
 }
 
-fn core_bin_paths_for_role(
+/// `core_component_names_in_section`, each component named in the core manifest.
+fn core_component_names_from_section(
+    section: &RoleSystemNodes,
     manifest: &CoreManifest,
-    role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
-    Ok(core_component_names_for_role(manifest, role)?
-        .into_iter()
-        .map(|name| local_core_bin_source_path(&name).display().to_string())
-        .collect())
+    require_core_components_in_manifest(core_component_names_in_section(section), manifest)
+}
+
+fn require_core_components_in_manifest(
+    names: Vec<String>,
+    manifest: &CoreManifest,
+) -> Result<Vec<String>, OrchestratorError> {
+    if let Some(name) = names
+        .iter()
+        .find(|name| !manifest.components.contains_key(*name))
+    {
+        return Err(format!("core manifest missing required component '{name}'").into());
+    }
+    Ok(names)
 }
 
 /// Motherbee-side per-role core distribution root: `dist/core/<role>/`.
@@ -23314,8 +23655,8 @@ const ROLE_CORE_DIST_ROLES: [HiveRole; 3] = [HiveRole::Worker, HiveRole::Ingress
 /// NOT used for the manifest that ships — see `materialize_role_core_trees` for why that one
 /// stays whole. This exists to validate, on motherbee and before anything is copied, that every
 /// component a role claims actually exists in the build: a role asking for a binary the package
-/// does not contain must fail here, loudly, rather than produce a short tree that turns into a
-/// spoke crash-loop later.
+/// does not contain must fail here, loudly, rather than produce a short tree that every spoke of
+/// the role reports, and whose core update it refuses, later (FINDINGS A-186).
 fn scope_core_manifest_to_components(
     manifest: &CoreManifest,
     components: &[String],
@@ -23347,12 +23688,11 @@ fn scope_core_manifest_to_components(
 /// work exists to remove. The manifest is metadata (component names, versions, hashes), not
 /// executables, so shipping it whole does not put anything on a DMZ box that it could run.
 ///
-/// The spoke stays safe with a whole manifest because `validate_core_manifest_for_bins` only
-/// validates the paths it is GIVEN — its own role's set — and extra manifest entries are
-/// inert. What it does NOT tolerate is a binary it expects being absent: that check runs at
-/// BOOT (`bootstrap_local` → `core_bin_paths_for_role` → `validate_core_manifest_for_bins`,
-/// sha256ing each file) and `main` propagates it with `?`, so a short tree is not an update
-/// failure but an orchestrator crash-loop with no channel left to repair it. Both sides derive
+/// The spoke stays safe with a whole manifest because its checks read only its own role's set,
+/// and extra manifest entries are inert. A binary of that set its tree lacks, or one that does
+/// not match, is reported by the spoke's start and refused by its core update, never installed:
+/// the start goes on with what `/usr/bin` holds (FINDINGS A-186). It used to stop the start for
+/// good, before Syncthing, the only channel that could repair it, had started. Both sides derive
 /// the role's set from the same `system_nodes.<role>` — motherbee's template, which it wrote
 /// into the spoke's hive.yaml at add_hive — so they agree unless that template is edited after
 /// the join: a spoke's hive.yaml is written once, at the join, and never re-emitted (the HANDBOOK
@@ -23366,6 +23706,8 @@ fn scope_core_manifest_to_components(
 /// scoped manifest is rewritten only on a real diff — so syncthing sees no spurious churn.
 fn materialize_role_core_trees(manifest: &CoreManifest) -> Result<Vec<String>, OrchestratorError> {
     let hive = load_hive(&json_router::paths::config_dir())?;
+    let manifest_path = local_core_manifest_path()
+        .ok_or_else(|| format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'"))?;
     let mut changed_roles = Vec::new();
 
     for role in ROLE_CORE_DIST_ROLES {
@@ -23380,75 +23722,16 @@ fn materialize_role_core_trees(manifest: &CoreManifest) -> Result<Vec<String>, O
         };
         let components = core_component_names_from_section(&section, manifest)?;
         // Validate up-front that the build actually contains everything this role claims.
-        // Failing here is cheap and visible; failing on the spoke is a crash-loop.
+        // Failing here is cheap and visible; on the spoke it is a binary its update refuses.
         scope_core_manifest_to_components(manifest, &components)?;
 
-        let root = role_core_dist_dir(role);
-        let bin_dir = root.join("bin");
-        fs::create_dir_all(&bin_dir)?;
-
-        let mut role_changed = false;
-        for name in &components {
-            let src = local_core_bin_source_path(name);
-            let dst = bin_dir.join(name);
-            if !src.exists() {
-                return Err(format!(
-                    "core binary '{}' missing from '{}' — the installed package is incomplete",
-                    name,
-                    src.display()
-                )
-                .into());
-            }
-            // Compare against the manifest's sha rather than re-hashing the source twice: the
-            // manifest is authoritative and `validate_core_manifest_for_bins` will hold us to it.
-            let expected = &manifest
-                .components
-                .get(name)
-                .expect("component presence was validated above")
-                .sha256;
-            let dst_matches = dst.exists()
-                && sha256_file(&dst)
-                    .map(|h| h.eq_ignore_ascii_case(expected.trim()))
-                    .unwrap_or(false);
-            if dst_matches {
-                continue;
-            }
-            copy_exec_file(&src, &dst)?;
-            role_changed = true;
-        }
-
-        // Prune components this role no longer runs. Without this, a role that drops a service
-        // keeps shipping its binary forever, and the spoke would hold an executable it does not
-        // run — exactly what this whole subtree exists to prevent.
-        if let Ok(entries) = fs::read_dir(&bin_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !components.iter().any(|c| c == &name) {
-                    fs::remove_file(entry.path())?;
-                    role_changed = true;
-                }
-            }
-        }
-
-        // The WHOLE manifest, byte-for-byte what motherbee serves itself, so the staleness gate
-        // sees identical hashes on both ends. Copied rather than re-serialized for exactly that
-        // reason: a re-render could differ by key order or whitespace and silently wedge the gate.
-        let manifest_path = root.join("manifest.json");
-        let rendered = fs::read_to_string(
-            local_core_manifest_path()
-                .ok_or_else(|| format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'"))?,
+        let role_changed = materialize_core_tree(
+            manifest,
+            &components,
+            Path::new(DIST_CORE_BIN_SOURCE_DIR),
+            &manifest_path,
+            &role_core_dist_dir(role),
         )?;
-        let manifest_changed = match fs::read_to_string(&manifest_path) {
-            Ok(existing) => existing != rendered,
-            Err(_) => true,
-        };
-        if manifest_changed {
-            // Atomic: syncthing must never observe a half-written manifest, because a spoke
-            // that reads one fails `validate_core_manifest_for_bins` at boot.
-            write_file_atomic(&manifest_path, rendered.as_bytes())?;
-            role_changed = true;
-        }
-
         if role_changed {
             tracing::info!(
                 role = %role.as_str(),
@@ -23460,6 +23743,83 @@ fn materialize_role_core_trees(manifest: &CoreManifest) -> Result<Vec<String>, O
     }
 
     Ok(changed_roles)
+}
+
+/// One role's core tree under `root`: `bin/` holds `components` copied from `source_bin` and
+/// nothing else, and `manifest.json` is the manifest file at `manifest_path`, whole. Whether
+/// anything changed.
+///
+/// Every binary it is about to copy is checked against `manifest` first, all of them before the
+/// first write: the motherbee's start no longer stops on a dist that does not match (FINDINGS
+/// A-186), so this check keeps a binary the manifest does not describe out of every spoke's dist,
+/// and a tree whose sources do not all match stays as it was, consistent with the manifest it
+/// already holds.
+fn materialize_core_tree(
+    manifest: &CoreManifest,
+    components: &[String],
+    source_bin: &Path,
+    manifest_path: &Path,
+    root: &Path,
+) -> Result<bool, OrchestratorError> {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+
+    let mut copies = Vec::new();
+    for name in components {
+        let src = source_bin.join(name);
+        let dst = bin_dir.join(name);
+        // A copy already holding the manifest's bytes stays, whatever the source holds.
+        let dst_matches = manifest.components.get(name).is_some_and(|entry| {
+            sha256_file(&dst).is_ok_and(|hash| hash.eq_ignore_ascii_case(entry.sha256.trim()))
+        });
+        if dst_matches {
+            continue;
+        }
+        if let Some(mismatch) = core_dist_binary_mismatch(manifest, name, &src) {
+            return Err(format!(
+                "{} — the installed package is incomplete; the {} tree is left as it was",
+                mismatch.detail,
+                root.display()
+            )
+            .into());
+        }
+        copies.push((src, dst));
+    }
+    let mut role_changed = !copies.is_empty();
+    for (src, dst) in &copies {
+        copy_exec_file(src, dst)?;
+    }
+
+    // Prune components this role no longer runs. Without this, a role that drops a service
+    // keeps shipping its binary forever, and the spoke would hold an executable it does not
+    // run — exactly what this whole subtree exists to prevent.
+    if let Ok(entries) = fs::read_dir(&bin_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !components.iter().any(|c| c == &name) {
+                fs::remove_file(entry.path())?;
+                role_changed = true;
+            }
+        }
+    }
+
+    // The WHOLE manifest, byte-for-byte what motherbee serves itself, so the staleness gate sees
+    // identical hashes on both ends. Copied rather than re-serialized for exactly that reason: a
+    // re-render could differ by key order or whitespace and silently wedge the gate.
+    let rendered = fs::read_to_string(manifest_path)?;
+    let tree_manifest = root.join("manifest.json");
+    let manifest_changed = match fs::read_to_string(&tree_manifest) {
+        Ok(existing) => existing != rendered,
+        Err(_) => true,
+    };
+    if manifest_changed {
+        // Atomic: syncthing must never observe a half-written manifest, because a spoke whose
+        // manifest does not parse stops at its start (`load_core_manifest`).
+        write_file_atomic(&tree_manifest, rendered.as_bytes())?;
+        role_changed = true;
+    }
+
+    Ok(role_changed)
 }
 
 /// Copy an executable as 0755, via a temp file + rename so a reader (syncthing, or a spoke
@@ -36355,14 +36715,306 @@ blob:
     }
 
     /// A role asking for a component the build does not contain must fail loudly at
-    /// materialization time, on motherbee — not silently ship an incomplete tree that turns
-    /// into a spoke crash-loop later.
+    /// materialization time, on motherbee — not silently ship an incomplete tree that every
+    /// spoke of the role reports and whose core update it refuses.
     #[test]
     fn scoping_a_missing_component_fails_loudly() {
         let full = sample_core_manifest();
         let err = scope_core_manifest_to_components(&full, &["sy-nonexistent".to_string()])
             .expect_err("must reject a component absent from the manifest");
         assert!(err.to_string().contains("sy-nonexistent"));
+    }
+
+    /// A core manifest that describes each of `entries` by its bytes.
+    fn core_manifest_of(entries: &[(&str, &[u8])]) -> CoreManifest {
+        let mut components = std::collections::BTreeMap::new();
+        for (name, bytes) in entries {
+            components.insert(
+                name.to_string(),
+                CoreManifestComponent {
+                    service: name.to_string(),
+                    version: "0.1.114".to_string(),
+                    build_id: "build-a186".to_string(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    size: Some(bytes.len() as u64),
+                },
+            );
+        }
+        CoreManifest {
+            schema_version: 1,
+            components,
+        }
+    }
+
+    fn a186_temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fb-a186-{tag}-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    /// FINDINGS A-186: the start's dist check returns a report, never an error. A binary still
+    /// to arrive, one of another build (same size, other bytes, or another size) and one the role
+    /// lists that the manifest no longer names are each reported, with why, in the role's order;
+    /// the binary that matches is not.
+    #[test]
+    fn the_start_dist_check_reports_a_missing_binary_and_a_hash_mismatch_instead_of_failing() {
+        let root = a186_temp_root("check");
+        let manifest = core_manifest_of(&[
+            ("rt-gateway", b"router-new"),
+            ("sy-cognition", b"cognition-new"),
+            ("sy-timer", b"timer-new"),
+            ("sy-identity", b"identity-new"),
+        ]);
+        fs::write(root.join("rt-gateway"), b"router-new").expect("rt-gateway");
+        // Same size as the manifest's, other bytes: only its hash tells.
+        fs::write(root.join("sy-timer"), b"timer-old").expect("sy-timer");
+        fs::write(root.join("sy-identity"), b"identity-older").expect("sy-identity");
+        fs::write(root.join("sy-gone"), b"gone").expect("sy-gone");
+        let components: Vec<String> = [
+            "rt-gateway",
+            "sy-cognition",
+            "sy-timer",
+            "sy-identity",
+            "sy-gone",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+        let report = core_dist_mismatches(&manifest, &components, &root);
+        let found: Vec<(&str, CoreDistReason)> = report
+            .iter()
+            .map(|mismatch| (mismatch.component.as_str(), mismatch.reason))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("sy-cognition", CoreDistReason::Missing),
+                ("sy-timer", CoreDistReason::HashMismatch),
+                ("sy-identity", CoreDistReason::SizeMismatch),
+                ("sy-gone", CoreDistReason::NotInManifest),
+            ]
+        );
+        assert!(report[0].detail.contains("missing"), "{}", report[0].detail);
+        assert!(
+            report[1].detail.contains("hash mismatch") && report[1].detail.contains("expected="),
+            "{}",
+            report[1].detail
+        );
+
+        // Dist matching its manifest is an empty report.
+        assert!(core_dist_mismatches(&manifest, &components[..1], &root).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-186, the update's side: the core update's check reads the same verdicts as the
+    /// start's report and stays strict. Each binary the report lists is an error to it, so an
+    /// update never installs one; a binary that matches passes.
+    #[test]
+    fn the_update_check_refuses_each_binary_the_start_only_reports() {
+        let root = a186_temp_root("strict");
+        let manifest = core_manifest_of(&[
+            ("rt-gateway", b"router-new"),
+            ("sy-cognition", b"cognition-new"),
+            ("sy-timer", b"timer-new"),
+        ]);
+        fs::write(root.join("rt-gateway"), b"router-new").expect("rt-gateway");
+        fs::write(root.join("sy-timer"), b"timer-old").expect("sy-timer");
+        let path = |name: &str| root.join(name).display().to_string();
+
+        validate_core_bins_against_manifest(&manifest, &[path("rt-gateway")])
+            .expect("a binary that matches passes");
+        for (name, says) in [("sy-cognition", "missing"), ("sy-timer", "hash mismatch")] {
+            let err =
+                validate_core_bins_against_manifest(&manifest, &[path("rt-gateway"), path(name)])
+                    .expect_err("the update refuses what the start reports");
+            assert!(err.to_string().contains(name), "{err}");
+            assert!(err.to_string().contains(says), "{err}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-186 (the DTAP panel's A-8): a role that lists a node its manifest no longer
+    /// names is listed whole for the start, which runs what /usr/bin holds and reports it; the
+    /// list a core update or a role tree reads still refuses it.
+    #[test]
+    fn a_role_listing_a_node_its_manifest_dropped_is_reported_not_refused_at_start() {
+        let section = RoleSystemNodes {
+            nodes: vec!["SY.config.routes".to_string(), "SY.gone".to_string()],
+            wait_for: Vec::new(),
+        };
+        assert_eq!(
+            core_component_names_in_section(&section),
+            vec![
+                "rt-gateway",
+                "sy-config-routes",
+                "sy-gone",
+                "sy-orchestrator"
+            ]
+        );
+        let err = core_component_names_from_section(&section, &sample_core_manifest())
+            .expect_err("the update's list refuses it");
+        assert!(err.to_string().contains("sy-gone"), "{err}");
+    }
+
+    /// FINDINGS A-186: a check that finds a mismatch opens `core.awaiting_update` in /versions, a
+    /// later one keeps its start and takes its own components, and one that finds none, or a core
+    /// update, closes it. A report a core update closed is not opened again by a check that ran
+    /// before it.
+    #[test]
+    fn awaiting_update_opens_on_a_mismatch_and_closes_once_dist_matches() {
+        let mismatch = |component: &str, reason: CoreDistReason| CoreDistMismatch {
+            component: component.to_string(),
+            reason,
+            detail: format!("{component}: {}", reason.as_str()),
+        };
+        let open = awaiting_update_after(
+            None,
+            vec![mismatch("sy-timer", CoreDistReason::Missing)],
+            100,
+        )
+        .expect("a mismatch opens it");
+        assert_eq!((open.since_ms, open.checked_at_ms), (100, 100));
+        let later = awaiting_update_after(
+            Some(&open),
+            vec![mismatch("sy-timer", CoreDistReason::SizeMismatch)],
+            160,
+        )
+        .expect("still open");
+        assert_eq!((later.since_ms, later.checked_at_ms), (100, 160));
+        assert_eq!(later.mismatches[0].reason, CoreDistReason::SizeMismatch);
+        assert!(awaiting_update_after(Some(&later), Vec::new(), 220).is_none());
+        // The journal names each reason as /versions does.
+        for reason in [
+            CoreDistReason::NotInManifest,
+            CoreDistReason::InvalidEntry,
+            CoreDistReason::Missing,
+            CoreDistReason::Unreadable,
+            CoreDistReason::SizeMismatch,
+            CoreDistReason::HashMismatch,
+        ] {
+            assert_eq!(serde_json::json!(reason), reason.as_str());
+        }
+
+        let state = sample_orchestrator_state_for_tests();
+        assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
+        *awaiting_update_slot(&state) = Some(later);
+        let shown = local_versions_snapshot(&state)["core"]["awaiting_update"].clone();
+        assert_eq!(shown["reason"], "dist_mismatch");
+        assert_eq!(shown["since_ms"], 100);
+        assert_eq!(shown["components"][0]["component"], "sy-timer");
+        assert_eq!(shown["components"][0]["reason"], "size_mismatch");
+        assert!(shown["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("/usr/bin")));
+
+        assert!(refresh_awaiting_update(
+            &state,
+            vec![mismatch("sy-timer", CoreDistReason::HashMismatch)]
+        ));
+        assert!(!refresh_awaiting_update(&state, Vec::new()));
+        assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
+
+        *awaiting_update_slot(&state) = Some(open);
+        close_awaiting_update(&state);
+        assert!(!awaiting_update_open(&state));
+        assert!(!refresh_awaiting_update(
+            &state,
+            vec![mismatch("sy-timer", CoreDistReason::Missing)]
+        ));
+        assert!(!awaiting_update_open(&state));
+    }
+
+    /// FINDINGS A-186: the start checks dist only once Syncthing, which brings what dist lacks,
+    /// has started, and runs no strict check of its own: a mismatch is the core update's to
+    /// refuse. `main` checks again while the report is open, before it joins its router.
+    #[test]
+    fn the_start_checks_dist_after_syncthing_starts_and_never_stops_on_it() {
+        let src = include_str!("sy_orchestrator.rs");
+        let boot = &src[src.find("async fn bootstrap_local(").expect("boot")..];
+        let boot = &boot[..boot.find("\n}\n").expect("its end")];
+        let check = boot
+            .find("check_core_dist_at_start(state, &core_manifest, &role_components);")
+            .expect("the start's dist check");
+        for syncthing in [
+            "ensure_blob_sync_runtime(",
+            "disable_blob_sync_runtime_local()",
+        ] {
+            let started = boot.rfind(syncthing).expect(syncthing);
+            assert!(started < check, "{syncthing} comes before the dist check");
+        }
+        for strict in [
+            "validate_core_manifest_for_bins(",
+            "validate_core_bins_against_manifest(",
+            "core_component_names_for_role(",
+        ] {
+            assert!(!boot.contains(strict), "the start runs no {strict}");
+        }
+
+        let main = &src[src
+            .find("async fn main() -> Result<(), OrchestratorError> {")
+            .expect("main")..];
+        let after_start = &main[main
+            .find("bootstrap_local(&state, &socket_dir).await?;")
+            .expect("the start")..];
+        let before_router = &after_start[..after_start
+            .find("RouterDispatcher::connect_with_retry(")
+            .expect("the router")];
+        assert!(before_router.contains("run_core_dist_recheck_loop("));
+    }
+
+    /// FINDINGS A-186 on the motherbee: its start no longer stops on a dist that does not match,
+    /// so each role tree checks what it copies. A tree whose sources do not all match takes none
+    /// of them and keeps its manifest; once they match it takes them and the whole manifest,
+    /// prunes what the role no longer runs, and a second pass changes nothing.
+    #[test]
+    fn a_role_tree_takes_no_binary_its_manifest_does_not_describe() {
+        let root = a186_temp_root("tree");
+        let source = root.join("src");
+        let tree = root.join("worker");
+        fs::create_dir_all(&source).expect("source");
+        let manifest = core_manifest_of(&[
+            ("rt-gateway", b"router-new"),
+            ("sy-orchestrator", b"orchestrator-new"),
+        ]);
+        let manifest_path = root.join("manifest.json");
+        fs::write(&manifest_path, "{\"schema_version\":1}\n").expect("manifest");
+        fs::write(source.join("rt-gateway"), b"router-new").expect("rt-gateway");
+        fs::write(source.join("sy-orchestrator"), b"orchestrator-bad").expect("bad");
+        let components = vec!["rt-gateway".to_string(), "sy-orchestrator".to_string()];
+
+        let err = materialize_core_tree(&manifest, &components, &source, &manifest_path, &tree)
+            .expect_err("a source the manifest does not describe is refused");
+        assert!(err.to_string().contains("sy-orchestrator"), "{err}");
+        assert!(
+            !tree.join("bin").join("rt-gateway").exists(),
+            "nothing copied"
+        );
+        assert!(
+            !tree.join("manifest.json").exists(),
+            "the manifest untouched"
+        );
+
+        fs::write(source.join("sy-orchestrator"), b"orchestrator-new").expect("good");
+        fs::write(tree.join("bin").join("sy-dropped"), b"old").expect("dropped");
+        assert!(
+            materialize_core_tree(&manifest, &components, &source, &manifest_path, &tree)
+                .expect("matching sources")
+        );
+        assert_eq!(
+            fs::read(tree.join("bin").join("sy-orchestrator")).expect("copied"),
+            b"orchestrator-new"
+        );
+        assert!(!tree.join("bin").join("sy-dropped").exists(), "pruned");
+        assert_eq!(
+            fs::read_to_string(tree.join("manifest.json")).expect("manifest copied"),
+            "{\"schema_version\":1}\n"
+        );
+        assert!(
+            !materialize_core_tree(&manifest, &components, &source, &manifest_path, &tree)
+                .expect("again")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// SY.admin names the policy folder to have it scanned at once after a publish; a folder of
@@ -38730,6 +39382,7 @@ blob:
             node_lifecycle_locks: StdMutex::new(HashMap::new()),
             relaunch_waits: StdMutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
+            awaiting_update: StdMutex::new(None),
             rpc: OnceLock::new(),
         }
     }

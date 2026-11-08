@@ -324,7 +324,10 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
 
 - The spoke checks that its synced `dist/core/manifest.json` has that hash; otherwise
   `sync_pending`.
-- `prepare_core_update` backs up the binaries that differ to
+- `prepare_core_update` checks each core binary of the role in `dist/core/bin` against that
+  manifest and fails the update (`UPDATE_FAILED`) on the first that does not match, so it never
+  installs one; past that check it closes `core.awaiting_update` (FINDINGS A-186). It backs up
+  the binaries that differ to
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/`, swaps them into `/usr/bin` and re-renders
   the units (`regen_local_core_units`).
 - It answers first (`phase: restarting`), then restarts `rt-gateway` and the system services in
@@ -338,7 +341,11 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
 - `POST /hives/{hive}/core/rollback {"generation":"latest"}` (or `{"to_manifest_hash"}`, with
   `dry_run`) goes back to a backed-up generation.
 - `GET /hives/{hive}/versions` (and `GET /versions` for every connected hive) compares core,
-  vendor and runtimes; for core the installed hash wins over the synced one.
+  vendor and runtimes; for core the installed hash wins over the synced one. A hive whose start
+  found core binaries in dist that do not match the manifest lists them in
+  `core.awaiting_update`, with why each, and runs what `/usr/bin` holds until a check or a core
+  update finds dist consistent
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#updates)).
 
 The lab routine `lab/ops.py deploy <version>` does all of this in order: snapshots every VM,
 installs the version on the motherbee, waits for its core to report it, waits until each spoke's
@@ -411,12 +418,17 @@ the version into `_system.runtime_version` before it launches the node, so `stat
 
 `bootstrap_local` then `finish_bootstrap` in `src/bin/sy_orchestrator.rs`:
 
-1. validates the core manifest and binaries; spokes re-render their units; the motherbee checks
-   its SSH key and mesh TLS, rebuilds the per-role core trees and deletes the identity keys of
-   hives the registry does not have;
+1. reads the core manifest (fatal when missing or invalid); spokes re-render their units; the
+   motherbee checks its SSH key and mesh TLS, rebuilds the per-role core trees (each binary
+   checked against the manifest before it is copied) and deletes the identity keys of hives the
+   registry does not have;
 2. starts `rt-gateway` and waits up to 30 s for it (`wait_for_router_ready`);
 3. the host firewall report, the ingress' SSH table (never fatal), egress NAT (fatal on an egress
-   hive, as is a missing LAN leg, forwarding off or IPv6 not disabled), Syncthing;
+   hive, as is a missing LAN leg, forwarding off or IPv6 not disabled), Syncthing; then the dist
+   check: each core binary of the role in `dist/core/bin` against the manifest. One that does not
+   match is a warning and `core.awaiting_update` in `/versions`, never fatal: the hive starts on
+   what `/usr/bin` holds, and dist is checked again every minute until it matches (FINDINGS
+   A-186);
 4. starts `system_nodes.<role>.nodes` in order and waits up to 60 s for the `wait_for` list
    (`LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS`; a timeout only warns);
 5. on the motherbee, waits for `sy-storage` (30 s) and for its database to answer
@@ -590,7 +602,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}` | one hive's join record (`status`, `join`) |
 | `GET /inventory`, `/inventory/summary`, `/inventory/{hive}` | the live view from the router's LSA; answers while the orchestrator boots |
 | `GET /hives/{hive}/nodes`, `.../nodes/{name}/status` | nodes and one node's lifecycle and health |
-| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive |
+| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes. A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |

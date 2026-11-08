@@ -41,25 +41,38 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    an invalid `ai` section ends the process with an error. Creates its directories
    (`ensure_dirs`) and writes the PID file.
 3. **`bootstrap_local`**, before joining the router:
-   1. checks the sha256 of every core binary of its role against `dist/core/manifest.json`
-      (`validate_core_manifest_for_bins`; fatal);
+   1. reads `dist/core/manifest.json` (missing or invalid, it is fatal) and lists the core
+      components of its role (`core_components_listed_for_role`): on the motherbee every
+      component of the manifest; on a spoke `rt-gateway`, its `system_nodes` and
+      `sy-orchestrator`, a component the manifest does not name included;
    2. on a spoke, rewrites the core unit files if their template changed (`regen_local_core_units`);
    3. on the motherbee, makes sure the SSH join key and the mesh CA and TLS exist
       (`ensure_motherbee_ssh_key`, `ensure_motherbee_mesh_tls`), refreshes the per-role core
-      trees spokes sync from (`materialize_role_core_trees`), clears interrupted joins, and
-      deletes the identity keys of hives the registry does not have
+      trees spokes sync from (`materialize_role_core_trees`: it checks each binary against the
+      manifest before it copies any, and leaves a role's tree as it was when one does not match),
+      clears interrupted joins, and deletes the identity keys of hives the registry does not have
       (`sweep_orphan_identity_keys`);
    4. starts `rt-gateway` and waits up to 30 s for it and its SHM (`wait_for_router_ready`; fatal);
    5. reports an active ufw or firewalld (`report_active_host_firewalls`), applies the ingress'
       SSH table on the ingress role (`reconcile_ingress_ssh`, never fatal), and reconciles egress
       (fatal only on the egress role);
    6. starts Syncthing if blob or dist sync is enabled (a failure only warns);
-   7. starts each `system_nodes.<role>.nodes` service in list order (`start_core_service`), using
+   7. checks each core binary of its role in `dist/core/bin` against the manifest, its size and
+      sha256 (`check_core_dist_at_start`, FINDINGS A-186). One that is missing, of another size
+      or hash, or not in the manifest stops nothing: each is a warning in the journal and an
+      entry of `core.awaiting_update` in `/versions` ([Updates](#updates)), and the start goes on
+      with what `/usr/bin` holds. The check comes after Syncthing, the only thing that brings
+      what dist lacks: it used to be the start's first step, and fatal, so a spoke restarted
+      while a release was syncing never started again;
+   8. starts each `system_nodes.<role>.nodes` service in list order (`start_core_service`), using
       `restart` instead of `start` for a service whose binary a package upgrade replaced (its
       `/proc/<pid>/exe` link ends in "(deleted)", `exe_link_is_replaced`, FINDINGS A-45); a
       failure only warns;
-   8. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
+   9. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
       timeout only warns.
+
+   With `core.awaiting_update` open, `main` then checks dist again every minute
+   (`run_core_dist_recheck_loop`) until it matches.
 4. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
 5. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
    handles its messages one at a time, in arrival order.
@@ -406,7 +419,11 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   applies retention.
 - **vendor**: brings the running Syncthing in line with the vendored one
   (`ensure_blob_sync_runtime`), when sync is enabled.
-- **core** (`apply_core_update_replying_first`): backs up each binary to replace under
+- **core** (`apply_core_update_replying_first`): checks each core binary of its role in
+  `dist/core/bin` against the manifest and fails the update on the first that does not match
+  (`compute_local_core_update_sets`, `validate_core_manifest_for_bins`), so an update never
+  installs one; past that check it closes `core.awaiting_update`. Then it backs up each binary
+  to replace under
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` with a `generation.json`,
   swaps the binaries, rewrites the units, and **answers first** (`phase: restarting`). Two
   seconds later it restarts `rt-gateway` and the system nodes, each behind a 30 s health gate
@@ -416,6 +433,18 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   keeps 3 generations (`CORE_BACKUP_GENERATIONS_KEPT`) and records the outcome in
   `/var/lib/fluxbee/orchestrator/core-update-last.json` and `core-installed.json`.
 - **core_rollback** restores a stamped generation (`core_rollback_local`).
+
+**`core.awaiting_update`** in `/versions` (FINDINGS A-186) is null while dist holds every core
+binary of the role as the manifest says. When the start's check finds one that does not, it is
+`{reason: "dist_mismatch", message, since_ms, checked_at_ms, components}`, each component
+`{component, reason, detail}`, `reason` one of `missing`, `size_mismatch`, `hash_mismatch`,
+`not_in_manifest`, `invalid_entry` or `unreadable`. The hive runs what `/usr/bin` holds
+meanwhile. It closes when a later check, every minute, or a core update's own check finds dist
+consistent. A release still syncing closes it once Syncthing delivers the rest, and the core
+update then installs it; a node the role lists that dist no longer has (`not_in_manifest`, or
+`missing` once the motherbee pruned it from the role's tree) stays open, and the core update
+refuses it, until the hive's `system_nodes` drops it. It lives in the orchestrator's memory: each
+start checks again.
 
 `SYSTEM_SYNC_HINT` (SY.admin's `sync_hint`) asks Syncthing to rescan a folder (`blob` or `dist`)
 and waits until it is idle: default 30 s, at most 300 s.
@@ -621,6 +650,10 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 
 - **No router.** `wait_for_router_ready` gives up after 30 s and `main` exits with an error;
   systemd restarts it 5 s later.
+- **Dist does not hold a core binary of the role as the manifest says.** No error: a warning per
+  binary, `core.awaiting_update` in `/versions`, and the hive runs what `/usr/bin` holds until a
+  core update can install it (FINDINGS A-186). A missing or invalid `dist/core/manifest.json` is
+  still fatal.
 - **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
   within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
   `ORCHESTRATOR_BOOTING`.
@@ -636,7 +669,7 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - `curl -s http://127.0.0.1:8080/hive/status` on the motherbee: `hive_id`, `pid`, `uptime_ms`
   of the motherbee's orchestrator.
 - `GET /hives`, `GET /hives/{hive}` (join status), `GET /versions` (core, runtime and vendor per
-  hive, with the last core update), `GET /drift-alerts` on SY.admin.
+  hive, with the last core update and `core.awaiting_update`), `GET /drift-alerts` on SY.admin.
 
 ## Links
 
@@ -650,4 +683,4 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - [Host posture spec](../host-posture-and-exposure-spec-v1.md): the posture stages.
 - [Software distribution spec](../history/software-distribution-spec.md) and
   [runtime lifecycle spec](../history/runtime-lifecycle-spec.md): dist and runtimes.
-- `lab/logbook/FINDINGS.md`: A-39, A-45, A-46, A-54; D32 in the join comments.
+- `lab/logbook/FINDINGS.md`: A-39, A-45, A-46, A-54, A-186; D32 in the join comments.
