@@ -11843,18 +11843,26 @@ impl Drop for SyncthingFinalizeInFlight {
     }
 }
 
-/// Whether a join's finalize owns this spoke's Syncthing right now: the peer reconcile and the
-/// watchdog leave config.xml and the service to it (FINDINGS A-194).
-fn syncthing_finalize_owns_syncthing(is_motherbee: bool) -> bool {
-    finalize_owns_syncthing(
-        is_motherbee,
+/// Whether a join owns this hive's Syncthing right now, so the peer reconcile and the watchdog
+/// leave config.xml and the service to it (FINDINGS A-194): on the motherbee, an `add_hive` or a
+/// `remove_hive` in flight, which links or unlinks the peer and restarts Syncthing; on a spoke, the
+/// join's finalize, which links the motherbee, restarts Syncthing and probes its folders.
+fn a_join_owns_syncthing(state: &OrchestratorState) -> bool {
+    join_owns_syncthing(
+        state.is_motherbee,
+        state.is_motherbee && state.any_hive_topology_busy(),
         SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst),
     )
 }
 
-/// A finalize runs only on a spoke, never on the motherbee (`spoke_only_action_refusal`).
-fn finalize_owns_syncthing(is_motherbee: bool, finalizes_in_flight: u64) -> bool {
-    !is_motherbee && finalizes_in_flight > 0
+/// A finalize runs only on a spoke (`spoke_only_action_refusal`), a join's topology work only on
+/// the motherbee.
+fn join_owns_syncthing(is_motherbee: bool, topology_busy: bool, finalizes_in_flight: u64) -> bool {
+    if is_motherbee {
+        topology_busy
+    } else {
+        finalizes_in_flight > 0
+    }
 }
 
 /// Present while config.xml may hold a reconcile change that Syncthing has not been restarted
@@ -11897,12 +11905,9 @@ async fn reconcile_syncthing_peer_addresses(
     if !config_path.exists() {
         return Ok(Some(Vec::new()));
     }
-    // A join restarts Syncthing itself; asking it for its id then would only report a failure.
-    if state.is_motherbee && state.any_hive_topology_busy() {
-        return Ok(None);
-    }
-    // On a spoke, a finalize links the motherbee and probes Syncthing: leave both alone.
-    if syncthing_finalize_owns_syncthing(state.is_motherbee) {
+    // A join restarts Syncthing itself, and on a spoke its finalize links the motherbee and probes
+    // Syncthing: leave both alone (asking it for its id then would only report a failure).
+    if a_join_owns_syncthing(state) {
         return Ok(None);
     }
     let marker = syncthing_restart_pending_marker();
@@ -11925,7 +11930,7 @@ async fn reconcile_syncthing_peer_addresses(
     // A join waiting for its spoke to connect must not see the motherbee drop every link, and a
     // finalize that started on this spoke since the check above must not see its Syncthing
     // restart under its probe: the restart waits, the marker stays.
-    if state.any_hive_topology_busy() || SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+    if a_join_owns_syncthing(state) {
         return Ok(notes);
     }
     tracing::info!(
@@ -13377,12 +13382,13 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    // FINDINGS A-194: a join's finalize on this spoke restarts Syncthing to link the motherbee and
-    // probes its folders. The watchdog leaves Syncthing to it until it returns, as the peer
-    // reconcile does: it restarted one caught mid-restart, and its reconcile could rewrite the
-    // folders while the peer is linked. A config change is still seen, at the next tick.
-    if syncthing_finalize_owns_syncthing(state.is_motherbee) {
-        tracing::debug!("a join's finalize owns Syncthing; the watchdog leaves it alone");
+    // FINDINGS A-194: a join restarts Syncthing to link its peer (the motherbee's in `add_hive`, the
+    // spoke's in its finalize, which then probes the folders). The watchdog leaves Syncthing to it
+    // until it is done, as the peer reconcile does: it restarted one caught mid-restart, and its
+    // reconcile could rewrite the folders while the peer is linked. A config change is still seen,
+    // at the next tick.
+    if a_join_owns_syncthing(state) {
+        tracing::debug!("a join owns Syncthing; the watchdog leaves it alone");
         return Ok(());
     }
     let desired_blob = current_blob_runtime_config(state);
@@ -13504,6 +13510,10 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         report_blob_folder_errors(&state.hive_id, &desired_sync, &desired_blob);
     }
     if service_active && api_healthy && folders_healthy {
+        return Ok(());
+    }
+    // A join that started during this tick's checks owns Syncthing by now (FINDINGS A-194).
+    if a_join_owns_syncthing(state) {
         return Ok(());
     }
 
@@ -37207,14 +37217,19 @@ mod tests {
         assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
     }
 
-    /// FINDINGS A-194: while a join's finalize runs on a spoke, its Syncthing is the finalize's;
-    /// the motherbee runs no finalize.
+    /// FINDINGS A-194: while a join runs, its Syncthing is the join's: a spoke's while its finalize
+    /// runs, the motherbee's while its `add_hive` or `remove_hive` does.
     #[test]
-    fn a_finalize_in_flight_owns_the_spokes_syncthing() {
-        assert!(finalize_owns_syncthing(false, 1));
-        assert!(finalize_owns_syncthing(false, 2));
-        assert!(!finalize_owns_syncthing(false, 0));
-        assert!(!finalize_owns_syncthing(true, 1));
+    fn a_join_in_flight_owns_the_hives_syncthing() {
+        assert!(join_owns_syncthing(false, false, 1));
+        assert!(join_owns_syncthing(false, false, 2));
+        assert!(!join_owns_syncthing(false, false, 0));
+        assert!(join_owns_syncthing(true, true, 0));
+        assert!(!join_owns_syncthing(true, false, 0));
+        assert!(
+            !join_owns_syncthing(true, false, 1),
+            "no finalize runs on the motherbee"
+        );
     }
 
     /// FINDINGS A-194: the Syncthing watchdog leaves Syncthing alone while a finalize owns it, before
@@ -37228,7 +37243,7 @@ mod tests {
             .expect("the watchdog")..];
         let body = &body[..body.find("\n}\n").expect("its end")];
         let guard = body
-            .find("syncthing_finalize_owns_syncthing(state.is_motherbee)")
+            .find("a_join_owns_syncthing(state)")
             .expect("the guard");
         for later in [
             "blob_sync_last_desired",
@@ -37237,11 +37252,19 @@ mod tests {
         ] {
             assert!(guard < body.find(later).expect(later), "{later}");
         }
+        // Asked again right before the unhealthy restart: a join may have started during the checks.
+        let restart = body
+            .find("\"syncthing unhealthy; restarting\"")
+            .expect("the restart");
+        let again = body[..restart]
+            .rfind("a_join_owns_syncthing(state)")
+            .expect("the second guard");
+        assert!(guard < again && body[again..restart].contains("return Ok(());"));
         let reconcile = &src[src
             .find("async fn reconcile_syncthing_peer_addresses(")
             .expect("the peer reconcile")..];
         let reconcile = &reconcile[..reconcile.find("\n}\n").expect("its end")];
-        assert!(reconcile.contains("syncthing_finalize_owns_syncthing(state.is_motherbee)"));
+        assert_eq!(reconcile.matches("a_join_owns_syncthing(state)").count(), 2);
     }
 
     /// Readers report a state that does not decode; its writer moves it aside and derives the
