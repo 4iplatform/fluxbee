@@ -159,6 +159,9 @@ versión. Si cambia versión cambia todo, como un pedazo de software de update."
 - **A hive that joins** gets the current version at its join.
 - **The version is a number** the motherbee raises with each change. `/versions` shows it beside the
   release, and the hash of each role's part checks its content.
+- **A rollback takes both back.** The core update's backup generation keeps the `hive.yaml` it
+  replaced beside the binaries, and `SYSTEM_CORE_ROLLBACK` restores the two together. Today the
+  generation holds only `/usr/bin`'s binaries (`prepare_core_update`).
 
 ## 8. A-181 in this design
 
@@ -185,3 +188,70 @@ versión. Si cambia versión cambia todo, como un pedazo de software de update."
 3. **The blob's switch:** it goes, and the release decides it by role (§8).
 4. **The worker that joined before the egress** (`egress.gateway_ip`): apart, to be talked over
    later (*"luego la hablamos"*).
+
+## 10. The update path today (read 2026-11-08)
+
+- **The deploy** (`lab/ops.py deploy`):
+  1. It installs the .deb on the motherbee.
+  2. For each spoke, it sends `POST /hives/{hive}/update` with category `core` and the new core
+     manifest's hash.
+  3. It waits until each spoke reports the version in `/versions`.
+- **SY.admin** turns that call into `SYSTEM_UPDATE` `{category, manifest_version,
+  manifest_hash, runtime?}` to `SY.orchestrator@<hive>` (`src/bin/sy_admin.rs:18763`).
+- **The spoke's orchestrator** (`handle_system_update_message`, `src/bin/sy_orchestrator.rs:5417`):
+  - **The check:** it compares the expected manifest with the one Syncthing delivered, and
+    answers `sync_pending` while they differ.
+  - **The core:** `apply_core_update_replying_first` (`:5273`) runs `prepare_core_update`
+    (`:5049`): a backup generation with its stamp, then the swap into `/usr/bin`. It answers
+    `restarting` and restarts in the background (`restart_local_core_services_with_health_gate`,
+    `:4337`). The outcome lands in `/versions` → `core.last_update`.
+  - **The components** it installs come from its own file's `system_nodes`
+    (`core_component_names_for_role`, `:23250`).
+  - **The motherbee's lists** decide each role's `dist/core/<role>` tree
+    (`materialize_role_core_trees`, `:23366`).
+- **`/versions`** (`local_versions_snapshot`, `:13359`): the core's manifest hash, its components,
+  what is installed, the last update and the rollback generations. It shows nothing of the config.
+- **The join** writes a spoke's whole `hive.yaml` over SSH, from three templates:
+  - the worker's: `:25968`, written at `:25992`;
+  - the egress's: `:26785`;
+  - the ingress's: `:27542`.
+
+  Then `ADD_HIVE_FINALIZE` runs on the spoke (`:24236`).
+- **After the join,** only `set_storage` writes the file, and only `storage.path`. It round-trips
+  the YAML through serde, so the comments go.
+- **The motherbee's file at an install:** `deb-postinst` copies the example only when there is no
+  `hive.yaml`.
+- **Who reads the shared keys, and when:**
+  - blob and dist: the reconcile, at every pass (`current_blob_runtime_config`, `:6306`;
+    `current_dist_runtime_config`, `:6320`);
+  - the watchdog's list: read at the orchestrator's start (`:971`);
+  - `ai`: SY.cognition, at its start;
+  - `government.identity_frontdesk`: the router, at its start.
+
+## 11. The plan, by stages
+
+Each stage is a release with its gate on 8.x, and the next starts only after it. To be refined by
+the DTAP panel.
+
+1. **The shared config, rendered and shown; nothing applied yet.**
+   - One function renders a role's shared part, general and its role's, from the motherbee's file,
+     with the installation's version and the part's hash.
+   - The join writes it, with the same content as today.
+   - `/versions` shows each hive's config version and hash; a hive that never got one says so.
+   - Gate: `/versions` on 8.x, where no hive has a version yet.
+2. **The core update carries it, and the hive applies it.**
+   - `SYSTEM_UPDATE` with category `core` gains the hive's shared config.
+   - The orchestrator applies it before the core (§5) and keeps the replaced file in the backup
+     generation, and the rollback restores both.
+   - The deploy waits for every hive on the version.
+   - Gate: a deploy brings every hive on 8.x to version 1, its content today's, with no change in
+     behavior. A unit test covers a worker whose file lacks a key.
+3. **The motherbee's file at a release, and the operator's change.**
+   - At the install, the release's keys come from `hive.yaml.example`; the previous file is kept,
+     and the report lists what changed.
+   - An SY.admin action for the operator's keys raises the version and updates every hive.
+     Archi's handbook says how to use it.
+4. **A hive that comes back** on another version gets the current one from the motherbee, reported
+   (§7).
+5. **A-181's blob:** the switch goes, by role. The motherbee's blob folders follow the dist folders'
+   members (§8).
