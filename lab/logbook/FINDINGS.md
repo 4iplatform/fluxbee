@@ -54,10 +54,19 @@ no change required
    3. A-150 [WF]: first, whether the provider can enforce a response contract inside the tool
       loop (ai.generic; alone if the fix reaches the shared AI SDK). Both providers can; the fix
       reaches the shared AI SDK, so it went alone: ✅ 0.1.108, checked on 8.x (2026-11-07).
-3. **Third release, 0.1.109:**
-   1. A-122 [General/upgrade]: an action, reachable by Archi, that returns a base runtime to its
-      package's version (SY.admin and the package's seed).
-   2. 🧠 What stays open of A-137 ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §12.6),
+3. **Third release, 0.1.109** (SY.admin, the orchestrator and the package's seed: one branch,
+   since every item touches SY.admin), built 2026-11-07, its review rounds' findings fixed:
+   1. A-122 [General/upgrade]: `reset_base_runtime`, reachable by Archi behind the operator's
+      CONFIRM, returns a base runtime to its package's version, which the seed records as
+      `package_version` and `list_runtimes` shows.
+   2. A-165 [General/add_hive]: a join that may log in over a password chooses `harden_ssh`, or
+      is refused (the operator left the call to me, 2026-11-07).
+   3. A-164 [General/vault]: the vault help's types come from the SDK's list, with the three the
+      product's nodes use and their values.
+   4. A-166 [General/add_hive]: ✅ verified in the code, nothing to change.
+   5. From the sweep of pending items (lab/logbook/2026-11-07.md): A-169, an identity read that
+      names a spoke was refused, and A-170's three small ones.
+   6. 🧠 What stays open of A-137 ([cognition-hands-v1](../../docs/cognition-hands-v1.md) §12.6),
       talked first, one at a time:
       1. An agent taking a conversation back from another sees none of its turns. ✅ The
          operator's call (2026-11-07): it stays so, so roles do not mix; what matters crosses
@@ -167,15 +176,20 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### General
 
-- A-122 🟡 A base runtime published by hand keeps `current` through every upgrade.
+- A-122 🟢 A base runtime published by hand keeps `current` through every upgrade. Built for
+  0.1.109.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
-- A-164 🔵 The vault's resource types leave out four the product uses (PENDING-BUGS PB-3).
-- A-165 🟡 After a join over the password channel, password logins stay on (PENDING-BUGS PB-6).
-- A-166 🔵 To verify: whether every join pushes the vendor before its folder syncs (PENDING-BUGS
-  U-6).
+- A-164 🟢 The vault's resource types leave out the ones the product uses. Built for 0.1.109.
+- A-165 🟢 After a join over the password channel, password logins stay on. Built for 0.1.109.
+- A-169 🟢 An identity read through SY.admin that names a spoke is refused. Built for 0.1.109.
+- A-170 🟢 Three small ones from the sweep (the OPA counter, a help's values, a spoke's role in its
+  own list). Built for 0.1.109.
+- A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
+- The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
+  that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
   already closed, U-12 needed no change, and the other three came here.
 
@@ -1249,6 +1263,42 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-171 [General/upgrade] 🔵 TO EVALUATE, low (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock
+
+- **What happens:** SY.admin's writers of the runtimes manifest (`publish_runtime_package`,
+  `remove_runtime_version`, `reset_base_runtime`) share one in-process lock
+  (`runtime_manifest_lock`). `scripts/publish-runtime.sh` (the seed and every hand publish) and
+  the `fluxbee-publish` CLI take none.
+- **What it can do:** a hand publish and an admin write that read the manifest at the same moment
+  lose one of the two writes, without notice.
+- **Fix, when it matters:** one `flock` on a file next to the manifest, taken by every writer.
+  Not new with A-122; low, since hand publishes are rare and the operator's.
+
+### A-170 [General] 🟢 BUILT for 0.1.109 (found 2026-11-07, the sweep of pending items; read in the code) — Three small ones in SY.admin and the orchestrator
+
+- **The OPA version counter** (`next_opa_version`, src/bin/sy_admin.rs) was read, incremented and
+  written in three steps, unlocked and not atomically, while every mesh command runs in its own
+  task (A-68): two OPA writes at once could take the same version. Now it is one step under a
+  lock, synced and renamed into place.
+- **`publish_artifact`'s help** said its lifetimes by hand; now it says the constants.
+- **A hive in its own list** (`list_hives`, src/bin/sy_orchestrator.rs) was "worker" on an egress
+  or an ingress (an audit's F19); now it carries the role it runs as.
+
+### A-169 [General/identity] 🟢 BUILT for 0.1.109 (found 2026-11-07, the sweep of pending items; seen on 8.x the same day) — An identity read through SY.admin that names a spoke is refused
+
+- **Seen on 8.x (0.1.108):** `GET /hives/worker1/identity/ilks` and `GET
+  /hives/worker1/identity/tenants` answered `UNAUTHORIZED_REGISTRAR`, "source not authorized for
+  action".
+- **Why:** A-143 (0.1.96) sent identity writes to the primary and left reads on the path's hive.
+  A spoke's replica takes `ILK_GET`, `ILK_LIST`, `TNT_GET` and `TNT_LIST` only from SY.admin of its
+  own hive (F-07), and SY.admin runs only on the motherbee. So Archi could read no spoke's
+  identities.
+- **Fix (built):** SY.admin sends every identity action, reads included, to the primary,
+  whatever hive the path names (`identity_command_hive`). Every replica holds the primary's
+  identities, so the answer is the same. The replica's own check is the sync diag's counts
+  (scripts/identity_replica_sync_e2e.sh, whose steps 2 and 4 read the replica through SY.admin
+  and so never passed).
+
 ### A-168 [WF] 🔵 TO DESIGN (found 2026-11-07, A-150's evaluation; read in the code) — A WF's menu has no schema, so no provider holds an agent's answer to it
 
 - **What happens:** since Case 3 a WF asks an agent with a menu (wf-orchestration-v1 §5.3.1), and
@@ -1284,7 +1334,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   only where the AI agent is meant, in the memory: *"the agent had already told [A] that billing
   promised to send the credit note today"*.
 
-### A-166 [General/add_hive] 🔵 TO VERIFY (PENDING-BUGS U-6, found 2026-07-30; read in the code 2026-11-07) — Whether every join pushes the vendor before its folder syncs
+### A-166 [General/add_hive] ✅ VERIFIED IN THE CODE (2026-11-07; PENDING-BUGS U-6, found 2026-07-30) — Whether every join pushes the vendor before its folder syncs
 
 - **What happened:** the first `add_hive role=ingress` of 2026-07-30 failed with
   `SYNC_SETUP_FAILED`: the vendor pushed over SSH and Syncthing wrote the same file at once
@@ -1293,9 +1343,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   Syncthing setup (`sync_vendor_to_worker`, then `ensure_blob_sync_runtime`, in
   `add_ingress_hive_flow`, src/bin/sy_orchestrator.rs): the order U-6 proposed. The worker and
   egress flows push it too, fatal; their order against the new hive's folders was not read through.
-- **To do:** read those two flows through, or watch the next joins, then close.
+- **Read through (2026-11-07):** all three flows push the vendor, awaited and fatal, before they
+  start the new hive's units and before the motherbee links its Syncthing peer: the worker's
+  (`add_hive_flow`), the egress's and the ingress's, each in src/bin/sy_orchestrator.rs. Nothing
+  else can write those files then. Closed, with no change.
 
-### A-165 [General/add_hive] 🟡 OPEN (PENDING-BUGS PB-6, found in August; read in the code 2026-11-07) — After a join over the password channel, password logins stay on
+### A-165 [General/add_hive] 🟢 BUILT for 0.1.109 (PENDING-BUGS PB-6, found in August; read in the code 2026-11-07) — After a join over the password channel, password logins stay on
 
 - **What happens:** `add_hive`'s `ssh_password` channel leaves `PasswordAuthentication yes` on the
   new box unless the request sets `harden_ssh: true`, which defaults to `false`
@@ -1304,9 +1357,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Since August:** closing it through `ssh_access=key_only_persist` left with that mode in 0.1.61
   (D32). Turning `harden_ssh` on by default would leave a box with no way in
   ([PENDING-BUGS](PENDING-BUGS.md) PB-6).
-- **The operator's call:** whether the channel closes by itself, and how, with no lockout.
+- **The operator's call:** whether the channel closes by itself, and how, with no lockout. The
+  operator left it to me (2026-11-07, *"OK avanzar con 165, 164 si te parece a vos"*).
+- **Built (0.1.109):** no default, so nobody is locked out by surprise. A join that may log in
+  over a password (`ssh_password` and no `ssh_key`; next to a key the password only feeds `sudo`)
+  must carry `harden_ssh`, or SY.orchestrator refuses it with `INVALID_REQUEST` before anything
+  touches the box (`require_password_logins_choice`):
+  - `true` turns password logins off at the join's end, and afterwards only the hypervisor's
+    console or a key of the operator's own gets in;
+  - `false` leaves them on, and the answer warns when the join logged in over the password.
+  - Archi's handbook says to ask the operator, never to choose; the help's examples take the key
+    channel, so none makes the choice.
+  - **Its review round:** a socket-only re-run (the worker's orchestrator already up after an
+    attempt that failed late) touches no SSH and applies no `harden_ssh`; its answer now says so
+    when the request carries a password. A retry whose body drops the password is not asked.
 
-### A-164 [General/vault] 🔵 TO EVALUATE (PENDING-BUGS PB-3, found in August; read in the code 2026-11-07) — The vault's resource types leave out four the product uses
+### A-164 [General/vault] 🟢 BUILT for 0.1.109 (PENDING-BUGS PB-3, found in August; read in the code 2026-11-07) — The vault's resource types leave out the ones the product uses
 
 - **What happens:** `ResourceType` (crates/fluxbee_sdk/src/vault.rs) names neither `tls`, `ssh`,
   `whatsapp` nor `linkedhelper_adapter`, which the product writes and reads, and
@@ -1316,6 +1382,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, one of:** name the four and use `known_wire_values()`, with a warning when the admin falls
   into `Custom`; or make `vault_put`'s help treat a normalized custom type as a path of its own,
   with each type's value shape.
+- **Built (0.1.109), the second, with the SDK untouched (shared code goes alone):** the help's
+  types come from `known_wire_values()`, which now has a caller, plus the product's own: `tls` (the
+  edge's certificate, `{cert, key}`), `whatsapp` (io.wapp) and `linkedhelper_adapter`
+  (io.linkedhelper), each with its value and how its node finds it. `ssh` left the product with
+  D32. The risk it closes: Archi writing a secret under a type its node does not read.
 
 ### A-163 [WF] ✅ VALIDATED ON 8.x (0.1.106, 2026-11-07; found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
 
@@ -2863,7 +2934,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     nothing;
   - `AI.*` and `SY.*` in `start_from` got `COMPILE_ERROR`.
 
-### A-122 [General/upgrade] 🟡 OPEN (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
+### A-122 [General/upgrade] 🟢 BUILT for 0.1.109 (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 
 - **What happens:**
   - The 0.1.88 gate published `ai.generic 0.1.88-gate1` with publish-ia-runtime.sh, which made it
@@ -2894,6 +2965,19 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - an admin action, reachable by Archi, that sets a runtime's `current`, or returns a base
     runtime to its package's version;
   - and the deploy reporting a kept hot-published `current` in its result.
+- **Built (0.1.109):**
+  - **The seed records the package's version** as each base runtime's `package_version`
+    (`publish-runtime.sh --package`), and `list_runtimes` and `get_runtime` show it next to
+    `current`: a `current` that differs is a hand publish.
+  - **`reset_base_runtime`** (SY.admin, motherbee-only, closed to the mesh, behind the
+    operator's CONFIRM through Archi) makes `package_version` current again, once the version
+    can run as the orchestrator judges it. The orchestrators move the nodes on their next pass.
+  - **The way back is kept:** `remove_runtime_version` never removes a base runtime's
+    `package_version` (`RUNTIME_PACKAGE_VERSION`), and `publish-runtime.sh` refuses a hand publish
+    under it.
+  - **Visible at the deploy:** the seed's NOTE names the action, and the lab's deploy shows it.
+  - **Its review round:** a base with packages on it keeps its leftover version
+    (`RUNTIME_HAS_DEPENDENTS`), now said in the docs; A-171 found on the way.
 
 ### A-121 ✅ RESOLVED (0.1.89; by tests, not exercised on 8.x) — A node whose purge failed on SY.timer comes back within 60 s
 
