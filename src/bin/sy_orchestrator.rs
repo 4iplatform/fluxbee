@@ -42,6 +42,7 @@ use fluxbee_sdk::{
     MSG_STORAGE_METRICS_RESPONSE,
 };
 use json_router::{
+    release_settings::{self, HiveRole},
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared, RuntimeManifest,
         RuntimeManifestEntry,
@@ -155,10 +156,7 @@ const NODE_HELP_RUNTIMES: &[&str] = &["ai.generic"];
 const NODE_HELP_FORWARD_TIMEOUT_SECS: u64 = 7;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
-const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
-const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
-const DEFAULT_BLOB_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_BLOB_SYNC_API_PORT: u16 = 8384;
 const DEFAULT_BLOB_SYNC_DATA_DIR: &str = "/var/lib/fluxbee/syncthing";
 const DEFAULT_BLOB_GC_ENABLED: bool = false;
@@ -167,12 +165,13 @@ const DEFAULT_BLOB_GC_APPLY: bool = false;
 const DEFAULT_BLOB_GC_STAGING_TTL_HOURS: u64 = BLOB_STAGING_TTL_HOURS;
 const DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS: u64 = BLOB_ACTIVE_RETAIN_DAYS;
 const DEFAULT_DIST_PATH: &str = DIST_ROOT_DIR;
-const DEFAULT_DIST_SYNC_ENABLED: bool = true;
-const DEFAULT_DIST_SYNC_TOOL: &str = "syncthing";
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_NODE_ILK_MAP_FILE: &str = "identity-node-ilk-map.json";
 const NODE_FILES_ROOT: &str = "/var/lib/fluxbee/nodes";
 
+/// `/etc/fluxbee/hive.yaml`: the hive's own settings. What the release defines for each role (its
+/// SY nodes, the blob's and dist's topology) is in `json_router::release_settings`; a file that
+/// still holds those keys parses as before, and they are ignored (`warn_superseded_hive_keys`).
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
@@ -183,7 +182,6 @@ struct HiveFile {
     dist: Option<DistSection>,
     identity: Option<IdentitySection>,
     government: Option<GovernmentSection>,
-    system_nodes: Option<SystemNodesSection>,
     egress: Option<EgressSection>,
     ingress: Option<HiveIngressSection>,
     ai: Option<HiveAiConfig>,
@@ -197,14 +195,6 @@ struct HiveFile {
 struct HiveIngressSection {
     #[serde(default)]
     ssh_allow_from: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemNodesSection {
-    motherbee: Option<RoleSystemNodes>,
-    worker: Option<RoleSystemNodes>,
-    egress: Option<RoleSystemNodes>,
-    ingress: Option<RoleSystemNodes>,
 }
 
 /// Egress NAT parameters. On a `role: egress` hive this carries the LAN/WAN
@@ -381,44 +371,11 @@ fn ingress_endpoints_seed_is_empty(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolved hive role. `SY.orchestrator` supports motherbee | worker | egress | ingress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HiveRole {
-    Motherbee,
-    Worker,
-    Egress,
-    Ingress,
-}
-
-impl HiveRole {
-    fn from_role(role: Option<&str>) -> Option<HiveRole> {
-        if is_mother_role(role) {
-            Some(HiveRole::Motherbee)
-        } else if is_worker_role(role) {
-            Some(HiveRole::Worker)
-        } else if is_egress_role(role) {
-            Some(HiveRole::Egress)
-        } else if is_ingress_role(role) {
-            Some(HiveRole::Ingress)
-        } else {
-            None
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            HiveRole::Motherbee => "motherbee",
-            HiveRole::Worker => "worker",
-            HiveRole::Egress => "egress",
-            HiveRole::Ingress => "ingress",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+/// A role's SY nodes as the orchestrator holds them: the release's list for its role
+/// (`system_nodes_for_role`), in start order, and the ones its start waits for.
+#[derive(Debug, Clone)]
 struct RoleSystemNodes {
     nodes: Vec<String>,
-    #[serde(default)]
     wait_for: Vec<String>,
 }
 
@@ -461,19 +418,18 @@ struct GovernmentSection {
     identity_frontdesk: Option<String>,
 }
 
+/// The blob's local settings. Its topology (enabled, sync, the public channel, the tool) is the
+/// release's, by role.
 #[derive(Debug, Deserialize)]
 struct BlobSection {
-    enabled: Option<bool>,
     path: Option<String>,
     sync: Option<BlobSyncSection>,
     gc: Option<BlobGcSection>,
 }
 
+/// Syncthing's local settings: its API port and its home.
 #[derive(Debug, Deserialize)]
 struct BlobSyncSection {
-    enabled: Option<bool>,
-    public_enabled: Option<bool>,
-    tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
 }
@@ -487,16 +443,10 @@ struct BlobGcSection {
     active_retain_days: Option<u64>,
 }
 
+/// Dist's local setting: its path. Its sync is the release's, by role.
 #[derive(Debug, Deserialize)]
 struct DistSection {
     path: Option<String>,
-    sync: Option<DistSyncSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DistSyncSection {
-    enabled: Option<bool>,
-    tool: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -972,10 +922,12 @@ async fn main() -> Result<(), OrchestratorError> {
         .unwrap_or_else(|| "RT.gateway".to_string());
     let wan_listen = hive.wan.as_ref().and_then(|wan| wan.listen.clone());
     let identity_sync_port = identity_sync_port_from_hive(&hive);
-    let blob_runtime = blob_runtime_from_hive(&hive);
-    let dist_runtime = dist_runtime_from_hive(&hive);
+    let blob_runtime = blob_runtime_from_hive(&hive, role);
+    let dist_runtime = dist_runtime_from_hive(&hive, role);
     let storage_path = storage_path_from_hive(&hive);
-    let system_nodes = system_nodes_for_role(&hive, role)?;
+    // The release's settings for this role, from the code (docs/hive-config-update-v1.md §3).
+    let system_nodes = system_nodes_for_role(role);
+    warn_superseded_hive_keys(&config_dir);
     let ai = hive
         .ai
         .as_ref()
@@ -1675,7 +1627,7 @@ async fn bootstrap_local(
     // The core components this role runs, whether or not dist holds each: the start runs what
     // `/usr/bin` holds, and checks dist only once Syncthing, which brings what dist lacks, runs
     // (FINDINGS A-186).
-    let role_components = core_components_listed_for_role(&core_manifest, state.role)?;
+    let role_components = core_components_listed_for_role(&core_manifest, state.role);
 
     // Spoke self-heal: a category=core update swaps this role's binaries, but the systemd unit
     // files were written once at add_hive. Re-render them from THIS binary's templates on every
@@ -1732,8 +1684,9 @@ async fn bootstrap_local(
             .iter()
             .map(|name| name_to_service(name)),
     );
-    // Core components a hive.yaml leaves out of system_nodes get their new binary too; they are
-    // restarted after the listed ones, and only if they run a replaced binary.
+    // Core components the role's list leaves out (on the motherbee, whose components are the whole
+    // manifest) get their new binary too; they are restarted after the listed ones, and only if
+    // they run a replaced binary.
     let unlisted_core: Vec<String> = role_components
         .iter()
         .filter(|name| *name != "sy-orchestrator" && !core_services.contains(*name))
@@ -1795,6 +1748,13 @@ async fn bootstrap_local(
     // manifest stops nothing: it is reported, the start goes on with what `/usr/bin` holds, and
     // the core update, whose own check stays strict, installs it once dist matches.
     check_core_dist_at_start(state, &core_manifest, &role_components);
+    // docs/hive-config-update-v1.md §3: a core update that installed this orchestrator ends here,
+    // with this release's list, before the role's nodes start: a node it dropped stops and goes,
+    // one it added is installed.
+    {
+        let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
+        settle_core_update(state.role, &core_manifest, &role_components);
+    }
 
     for node_name in &state.system_nodes.nodes {
         let service = name_to_service(node_name);
@@ -4364,14 +4324,17 @@ async fn handle_system_sync_hint_for_folder(
     )
 }
 
-async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
+/// Restarts rt-gateway and the SY services of this release's list for `role`, in start order, each
+/// health-gated, but those of `left_out`: a core update left their binaries as they were
+/// (`core_update_sets`).
+async fn restart_local_core_services_with_health_gate(
+    role: HiveRole,
+    left_out: &[String],
+) -> Result<Vec<String>, OrchestratorError> {
     let mut restarted = Vec::new();
-    let hive = load_hive(&json_router::paths::config_dir())?;
-    let role = HiveRole::from_role(hive.role.as_deref())
-        .ok_or_else(|| "invalid hive.yaml: unsupported role".to_string())?;
     let mut services = vec!["rt-gateway".to_string()];
     services.extend(
-        system_nodes_for_role(&hive, role)?
+        system_nodes_for_role(role)
             .nodes
             .iter()
             .map(|name| name_to_service(name)),
@@ -4379,6 +4342,9 @@ async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, O
     for service in services {
         if service == "sy-orchestrator" {
             // Avoid self-restart while processing the request; operator can restart orchestrator separately.
+            continue;
+        }
+        if left_out.contains(&service) {
             continue;
         }
         if !systemd_unit_exists(&service) {
@@ -4405,6 +4371,10 @@ struct SystemUpdateApplyResult {
     status: String,
     updated: Vec<String>,
     unchanged: Vec<String>,
+    /// A core update's components it left as installed, which dist no longer holds: the release
+    /// dropped them from this role, and the orchestrator it installs settles them
+    /// (`core_update_sets`).
+    left_out: Vec<String>,
     restarted: Vec<String>,
     errors: Vec<String>,
 }
@@ -4423,6 +4393,7 @@ fn vendor_update_result(outcome: SyncthingRuntimeOutcome) -> SystemUpdateApplyRe
         status: "ok".to_string(),
         updated,
         unchanged,
+        left_out: Vec::new(),
         restarted: if outcome.restarted {
             vec![SYNCTHING_SERVICE_NAME.to_string()]
         } else {
@@ -4439,23 +4410,187 @@ fn set_exec_0755(path: &Path) -> Result<(), OrchestratorError> {
     Ok(())
 }
 
-fn compute_local_core_update_sets(
-    manifest: &CoreManifest,
-    role: HiveRole,
-) -> Result<(Vec<String>, Vec<String>), OrchestratorError> {
-    let component_names = core_component_names_for_role(manifest, role)?;
-    let local_paths = component_names
-        .iter()
-        .map(|name| local_core_bin_source_path(name).display().to_string())
-        .collect::<Vec<_>>();
-    validate_core_manifest_for_bins(&local_paths)?;
+/// What a core update and its rollback act on: the installed core binaries (`/usr/bin`), the core
+/// units this orchestrator writes on a spoke (`/etc/systemd/system`, `core_service_unit_contents`),
+/// and systemd. `CoreHost::live()` is this host; the tests point both directories at temporary
+/// roots and record systemd's calls instead of making them.
+struct CoreHost {
+    bin_dir: PathBuf,
+    unit_dir: PathBuf,
+    systemctl: Box<dyn Fn(&[&str]) -> Result<(), OrchestratorError> + Send + Sync>,
+}
 
-    let mut updated = Vec::new();
-    let mut unchanged = Vec::new();
-    for name in component_names {
-        let source_path = local_core_bin_source_path(&name);
+impl CoreHost {
+    fn live() -> Self {
+        CoreHost {
+            bin_dir: PathBuf::from("/usr/bin"),
+            unit_dir: PathBuf::from("/etc/systemd/system"),
+            systemctl: Box::new(|args: &[&str]| {
+                let mut cmd = Command::new("systemctl");
+                cmd.args(args);
+                run_cmd(cmd, &format!("systemctl {}", args.join(" ")))
+            }),
+        }
+    }
+
+    fn systemctl(&self, args: &[&str]) -> Result<(), OrchestratorError> {
+        (self.systemctl)(args)
+    }
+
+    fn bin_path(&self, name: &str) -> PathBuf {
+        self.bin_dir.join(name)
+    }
+
+    fn unit_path(&self, name: &str) -> PathBuf {
+        self.unit_dir.join(format!("{name}.service"))
+    }
+
+    /// Whether `name`'s unit here is one this orchestrator wrote for a core component: its
+    /// template names the component and runs `/usr/bin/<name>` (`core_service_unit_contents`).
+    fn has_core_unit(&self, name: &str) -> bool {
+        let description = format!("Description=Fluxbee {name}");
+        let exec = format!("ExecStart={}", service_to_exec(name));
+        fs::read_to_string(self.unit_path(name)).is_ok_and(|unit| {
+            unit.lines().any(|line| line.trim() == description)
+                && unit.lines().any(|line| line.trim() == exec)
+        })
+    }
+
+    /// The SY core units this orchestrator wrote here, by name. rt-gateway and sy-orchestrator
+    /// are in every role's set, so no release drops them.
+    fn sy_core_units(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.unit_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|file| file.strip_suffix(".service"))
+                    .map(str::to_string)
+            })
+            .filter(|name| {
+                name.starts_with("sy-") && name != "sy-orchestrator" && self.has_core_unit(name)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Stops a core node and disables it. A unit systemd does not run counts as stopped; a node
+    /// still running after a failed stop is an error, and nothing of it may be removed.
+    fn stop_core_node(&self, name: &str) -> Result<(), OrchestratorError> {
+        if let Err(err) = self.systemctl(&["stop", name]) {
+            if self.systemctl(&["is-active", "--quiet", name]).is_ok() {
+                return Err(format!("stop {name}: {err}").into());
+            }
+        }
+        if let Err(err) = self.systemctl(&["disable", name]) {
+            tracing::warn!(service = name, error = %err, "could not disable a core node it stopped");
+        }
+        Ok(())
+    }
+
+    /// Takes stopped core nodes off this host: each unit this orchestrator wrote, then systemd's
+    /// view of them, then each binary. A node started again between its stop and the removal of
+    /// its unit (by a watchdog that still lists it) is stopped once more before its binary goes.
+    /// The errors, by node.
+    fn remove_core_nodes(&self, names: &[String]) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut units_removed = false;
+        for name in names {
+            if self.has_core_unit(name) {
+                match fs::remove_file(self.unit_path(name)) {
+                    Ok(()) => units_removed = true,
+                    Err(err) => errors.push(format!("remove the unit of {name}: {err}")),
+                }
+            }
+        }
+        if units_removed {
+            if let Err(err) = self.systemctl(&["daemon-reload"]) {
+                errors.push(format!("daemon-reload: {err}"));
+            }
+        }
+        for name in names {
+            if self.systemctl(&["is-active", "--quiet", name]).is_ok() {
+                if let Err(err) = self.systemctl(&["stop", name]) {
+                    errors.push(format!("{name} runs again and does not stop: {err}"));
+                    continue;
+                }
+            }
+            match fs::remove_file(self.bin_path(name)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => errors.push(format!("remove the binary of {name}: {err}")),
+            }
+        }
+        errors
+    }
+
+    /// Copies `source` into `name`'s place in `/usr/bin` through a temp sibling and a rename, so a
+    /// running process keeps its binary and no reader sees a partial one.
+    fn install_binary(&self, name: &str, source: &Path) -> Result<(), OrchestratorError> {
+        let target = self.bin_path(name);
+        let stage = self.bin_dir.join(format!(".{name}.fluxbee.tmp"));
+        let result = (|| -> Result<(), OrchestratorError> {
+            fs::copy(source, &stage)?;
+            set_exec_0755(&stage)?;
+            fs::rename(&stage, &target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&stage);
+        }
+        result
+    }
+}
+
+/// A core update's components, from dist and the installed binaries.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CoreUpdateSets {
+    /// Dist holds the manifest's binary, and the installed one differs or is none.
+    updated: Vec<String>,
+    /// Dist holds the manifest's binary, and it is the installed one.
+    unchanged: Vec<String>,
+    /// Dist holds no binary of it: left as installed.
+    left_out: Vec<String>,
+}
+
+/// The sets of a core update over `components`, this orchestrator's role (FINDINGS A-186: every
+/// binary dist holds must match the manifest, strictly).
+///
+/// A component dist holds no binary of is left out, as installed. A release drops a node from a
+/// role in the code (docs/hive-config-update-v1.md §3), and the motherbee prunes its binary from
+/// the role's tree; the orchestrator that runs the update is the previous release's, whose list
+/// still names it. Only a release that replaces the orchestrator changes the role's list, so only
+/// an update that replaces sy-orchestrator may leave a component out, and never rt-gateway or
+/// sy-orchestrator: the new orchestrator settles the rest at its start
+/// (`settle_core_generation`). Any other update refuses a binary dist lacks, as before.
+fn core_update_sets(
+    manifest: &CoreManifest,
+    components: &[String],
+    dist_bin: &Path,
+    bin_dir: &Path,
+) -> Result<CoreUpdateSets, OrchestratorError> {
+    let mut sets = CoreUpdateSets::default();
+    let mut missing: Vec<DistMismatch> = Vec::new();
+    for name in components {
+        let source_path = dist_bin.join(name);
+        if let Some(mismatch) = core_dist_binary_mismatch(manifest, name, &source_path) {
+            let absent = matches!(
+                fs::symlink_metadata(&source_path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound
+            );
+            if !absent {
+                return Err(mismatch.detail.into());
+            }
+            sets.left_out.push(name.clone());
+            missing.push(mismatch);
+            continue;
+        }
         let source_hash = sha256_file(&source_path)?;
-        let target_path = Path::new("/usr/bin").join(&name);
+        let target_path = bin_dir.join(name);
         let target_hash = if target_path.exists() {
             Some(sha256_file(&target_path)?)
         } else {
@@ -4465,12 +4600,32 @@ fn compute_local_core_update_sets(
             .as_deref()
             .is_some_and(|hash| hash.eq_ignore_ascii_case(source_hash.trim()))
         {
-            unchanged.push(name);
+            sets.unchanged.push(name.clone());
         } else {
-            updated.push(name);
+            sets.updated.push(name.clone());
         }
     }
-    Ok((updated, unchanged))
+    let replaces_orchestrator = sets.updated.iter().any(|name| name == "sy-orchestrator");
+    if let Some(first) = missing.first() {
+        let essential = missing.iter().find(|mismatch| {
+            matches!(
+                mismatch.component.as_str(),
+                "rt-gateway" | "sy-orchestrator"
+            )
+        });
+        if let Some(essential) = essential {
+            return Err(essential.detail.clone().into());
+        }
+        if !replaces_orchestrator {
+            return Err(format!(
+                "{} — dist no longer holds a binary this role lists, and only a release that \
+                 replaces sy-orchestrator may drop one from the role",
+                first.detail
+            )
+            .into());
+        }
+    }
+    Ok(sets)
 }
 
 /// How many `update-<ms>/` generations of previous core binaries to keep.
@@ -4522,10 +4677,27 @@ struct CoreBackupGeneration {
     /// The manifest hash the update installed over them.
     applied_manifest_hash: Option<String>,
     components: Vec<CoreBackupComponent>,
-    /// Components the update CREATED (no previous binary): a rollback removes these rather than
-    /// restoring them.
+    /// Components the update CREATED (no previous binary): a rollback stops each and removes it,
+    /// unit and binary, rather than restoring it. The start of the orchestrator the update
+    /// installed adds the role's new nodes it installs (`settle_core_generation`).
     created_without_backup: Vec<String>,
+    /// Components the update left as installed: dist held no binary of them
+    /// (`core_update_sets`).
+    #[serde(default)]
+    left_out: Vec<String>,
+    /// The units of the nodes the release dropped from this hive's role, kept under `units/`: the
+    /// start of the orchestrator the update installed stopped, disabled and removed each, and its
+    /// binary is among `components`. A rollback puts both back (docs/hive-config-update-v1.md §3).
+    #[serde(default)]
+    dropped_units: Vec<CoreBackupComponent>,
+    /// When the start of the orchestrator the update installed finished it, with its own role's
+    /// list; None until then.
+    #[serde(default)]
+    settled_at_ms: Option<u64>,
 }
+
+/// Where a generation keeps the units of the nodes its release dropped.
+const CORE_GENERATION_UNITS_DIR: &str = "units";
 
 fn read_core_installed_record() -> Option<serde_json::Value> {
     let raw = fs::read_to_string(core_installed_record_path()).ok()?;
@@ -4706,6 +4878,28 @@ fn select_core_backup_generation(
             ));
         }
     }
+    // The units of the nodes its release dropped, the same way.
+    for unit in &generation.dropped_units {
+        let path = dropped_unit_backup_path(&dir, &unit.name);
+        let checked = fs::metadata(&path)
+            .map_err(OrchestratorError::from)
+            .and_then(|meta| Ok((meta.len(), sha256_file(&path)?)))
+            .map_err(|err| {
+                (
+                    "BACKUP_CORRUPT",
+                    format!("the unit of dropped node '{}' is missing: {err}", unit.name),
+                )
+            })?;
+        if checked.0 != unit.size || normalize_hash(&checked.1) != normalize_hash(&unit.sha256) {
+            return Err((
+                "BACKUP_CORRUPT",
+                format!(
+                    "the unit of dropped node '{}' failed its size or sha256 check",
+                    unit.name
+                ),
+            ));
+        }
+    }
 
     // Return the directory we actually hashed. Recomputing it downstream from the stamp's
     // `generation` FIELD would let a renamed or hand-copied directory verify one tree and
@@ -4768,14 +4962,18 @@ fn prune_core_backup_generations_in(root: &Path, keep: usize) {
     }
 }
 
+/// Undoes a core update in flight on `host`: each of `updated` back from `backup_dir`, and each of
+/// `created_without_backup` stopped, then its binary removed. Its unit stays: the orchestrator that
+/// runs this still lists the node.
 fn rollback_local_core_binaries(
+    host: &CoreHost,
     updated: &[String],
     backup_dir: &Path,
     created_without_backup: &HashSet<String>,
 ) -> Result<(), OrchestratorError> {
     let mut rollback_errors = Vec::new();
     for name in updated {
-        let target_path = Path::new("/usr/bin").join(name);
+        let target_path = host.bin_path(name);
         let backup_path = backup_dir.join(name);
         if backup_path.exists() {
             // STAGE + RENAME, never `fs::copy` onto the target. Writing directly into a binary
@@ -4783,20 +4981,20 @@ fn rollback_local_core_binaries(
             // undo an update whose services were just restarted, so the target is running by
             // definition. A rename swaps the directory entry instead of the file, which the
             // update path (and `core_rollback_local`) already do for exactly this reason.
-            let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.rollback"));
-            if let Err(err) = (|| -> Result<(), OrchestratorError> {
-                fs::copy(&backup_path, &stage_path)?;
-                set_exec_0755(&stage_path)?;
-                fs::rename(&stage_path, &target_path)?;
-                Ok(())
-            })() {
-                let _ = fs::remove_file(&stage_path);
+            if let Err(err) = host.install_binary(name, &backup_path) {
                 rollback_errors.push(format!("restore {} failed: {}", target_path.display(), err));
-                continue;
             }
             continue;
         }
         if created_without_backup.contains(name) {
+            // The update's restarts may have started it: stopped before its binary goes.
+            if let Err(err) = host.stop_core_node(name) {
+                rollback_errors.push(format!(
+                    "{} left in place during rollback: {err}",
+                    target_path.display()
+                ));
+                continue;
+            }
             if target_path.exists() && fs::remove_file(&target_path).is_err() {
                 rollback_errors.push(format!(
                     "remove {} failed during rollback",
@@ -4824,6 +5022,94 @@ fn rollback_local_core_binaries(
     } else {
         Err(format!("rollback errors: {}", rollback_errors.join("; ")).into())
     }
+}
+
+/// Where a generation keeps the unit of a node its release dropped.
+fn dropped_unit_backup_path(generation_dir: &Path, name: &str) -> PathBuf {
+    generation_dir
+        .join(CORE_GENERATION_UNITS_DIR)
+        .join(format!("{name}.service"))
+}
+
+fn write_core_backup_generation(
+    dir: &Path,
+    generation: &CoreBackupGeneration,
+) -> Result<(), OrchestratorError> {
+    let stamp = serde_json::to_vec_pretty(generation)?;
+    write_file_atomic(&dir.join(CORE_GENERATION_MANIFEST_NAME), &stamp)
+}
+
+/// What a rollback to a generation did on a host.
+#[derive(Debug, Default)]
+struct CoreRestoreOutcome {
+    /// Binaries back from the generation.
+    restored: Vec<String>,
+    /// Binaries that could not be put back: still the update's.
+    restore_failed: Vec<String>,
+    /// The nodes the update created, stopped and removed.
+    removed: Vec<String>,
+    /// The units of the nodes its release dropped, back.
+    units_restored: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Puts a generation back on `host` (U-5; docs/hive-config-update-v1.md §3), once
+/// `select_core_backup_generation` verified all of it:
+/// 1. each node its update created is stopped, then removed, unit and binary; one that does not
+///    stop keeps both;
+/// 2. each binary it replaced comes back, a node its release dropped among them;
+/// 3. the unit of each node its release dropped comes back.
+///
+/// A node it brings back starts with the orchestrator it restores, whose list names it.
+fn restore_core_generation(
+    host: &CoreHost,
+    backup_dir: &Path,
+    generation: &CoreBackupGeneration,
+) -> CoreRestoreOutcome {
+    let mut outcome = CoreRestoreOutcome::default();
+    let mut stopped = Vec::new();
+    for name in &generation.created_without_backup {
+        match host.stop_core_node(name) {
+            Ok(()) => stopped.push(name.clone()),
+            Err(err) => outcome
+                .errors
+                .push(format!("{name} not removed, it did not stop: {err}")),
+        }
+    }
+    outcome.errors.extend(host.remove_core_nodes(&stopped));
+    outcome.removed = stopped;
+    // Byte-identical staging to the update path: tmp sibling + rename, which is what makes the
+    // swap atomic against a running unit. Tracked per component: a partial failure leaves the
+    // binaries mixed, and the operator needs to know WHICH side each one landed on.
+    for component in &generation.components {
+        match host.install_binary(&component.name, &backup_dir.join(&component.name)) {
+            Ok(()) => outcome.restored.push(component.name.clone()),
+            Err(err) => {
+                outcome.restore_failed.push(component.name.clone());
+                outcome
+                    .errors
+                    .push(format!("restore {} failed: {err}", component.name));
+            }
+        }
+    }
+    for unit in &generation.dropped_units {
+        let source = dropped_unit_backup_path(backup_dir, &unit.name);
+        match fs::read(&source)
+            .map_err(OrchestratorError::from)
+            .and_then(|bytes| write_file_atomic(&host.unit_path(&unit.name), &bytes))
+        {
+            Ok(()) => outcome.units_restored.push(unit.name.clone()),
+            Err(err) => outcome
+                .errors
+                .push(format!("restore the unit of {} failed: {err}", unit.name)),
+        }
+    }
+    if !outcome.units_restored.is_empty() {
+        if let Err(err) = host.systemctl(&["daemon-reload"]) {
+            outcome.errors.push(format!("daemon-reload: {err}"));
+        }
+    }
+    outcome
 }
 
 /// Undo the last core update on THIS hive.
@@ -4885,6 +5171,11 @@ async fn core_rollback_local(
         .iter()
         .map(|c| c.name.clone())
         .collect();
+    let dropped: Vec<String> = generation
+        .dropped_units
+        .iter()
+        .map(|unit| unit.name.clone())
+        .collect();
 
     if dry_run {
         return serde_json::json!({
@@ -4896,43 +5187,14 @@ async fn core_rollback_local(
             "applied_manifest_hash": generation.applied_manifest_hash,
             "would_restore": restored,
             "would_remove": generation.created_without_backup,
+            "would_restore_units": dropped,
         });
     }
 
-    // Byte-identical staging to the update path: tmp sibling + rename, which is what makes the
-    // swap atomic against a running unit.
-    let mut errors = Vec::new();
-    // Tracked per component: a partial failure leaves /usr/bin mixed, and the operator needs to
-    // know WHICH side each binary landed on.
-    let mut restored_ok: Vec<String> = Vec::new();
-    let mut restore_failed: Vec<String> = Vec::new();
-    for component in &generation.components {
-        let target = Path::new("/usr/bin").join(&component.name);
-        let stage = Path::new("/usr/bin").join(format!(".{}.fluxbee.tmp", component.name));
-        match (|| -> Result<(), OrchestratorError> {
-            fs::copy(backup_dir.join(&component.name), &stage)?;
-            set_exec_0755(&stage)?;
-            fs::rename(&stage, &target)?;
-            Ok(())
-        })() {
-            Ok(()) => restored_ok.push(component.name.clone()),
-            Err(e) => {
-                // Leave no staging file behind to be mistaken for a binary.
-                let _ = fs::remove_file(&stage);
-                restore_failed.push(component.name.clone());
-                errors.push(format!("restore {} failed: {e}", component.name));
-            }
-        }
-    }
-    // Components the update CREATED have nothing to restore to: remove them.
-    for name in &generation.created_without_backup {
-        let target = Path::new("/usr/bin").join(name);
-        if target.exists() {
-            if let Err(e) = fs::remove_file(&target) {
-                errors.push(format!("remove {name} failed: {e}"));
-            }
-        }
-    }
+    let outcome = restore_core_generation(&CoreHost::live(), &backup_dir, &generation);
+    let mut errors = outcome.errors.clone();
+    let restored_ok = outcome.restored.clone();
+    let restore_failed = outcome.restore_failed.clone();
 
     if !errors.is_empty() {
         append_single_deployment_history(
@@ -4956,6 +5218,8 @@ async fn core_rollback_local(
                 "inconsistent": true,
                 "restored": restored_ok,
                 "still_on_new_build": restore_failed,
+                "removed": outcome.removed,
+                "units_restored": outcome.units_restored,
             }),
         );
         return serde_json::json!({
@@ -4974,6 +5238,8 @@ async fn core_rollback_local(
             "inconsistent": true,
             "restored": restored_ok,
             "still_on_new_build": restore_failed,
+            "removed": outcome.removed,
+            "units_restored": outcome.units_restored,
         });
     }
 
@@ -4985,6 +5251,8 @@ async fn core_rollback_local(
             "generation": generation.generation,
             "rolled_back_from": generation.applied_manifest_hash,
             "components": restored,
+            "removed": outcome.removed,
+            "units_restored": outcome.units_restored,
         }),
     );
 
@@ -5003,7 +5271,7 @@ async fn core_rollback_local(
     let mut restarted: Vec<String> = Vec::new();
     let mut self_restart = false;
     if restart {
-        match restart_local_core_services_with_health_gate().await {
+        match restart_local_core_services_with_health_gate(state.role, &[]).await {
             Ok(units) => restarted = units,
             Err(e) => errors.push(format!("restart after rollback failed: {e}")),
         }
@@ -5049,7 +5317,10 @@ async fn core_rollback_local(
         "replaced_manifest_hash": generation.replaced_manifest_hash,
         "applied_manifest_hash": generation.applied_manifest_hash,
         "restored": restored,
-        "removed": generation.created_without_backup,
+        "removed": outcome.removed,
+        // The nodes its release dropped: their units and binaries are back, and the
+        // orchestrator it restores starts them.
+        "units_restored": outcome.units_restored,
         "restarted": restarted,
         "orchestrator_self_restart_scheduled": self_restart,
         // Deliberately not called "verified": the gate proves each unit reached active/running,
@@ -5059,10 +5330,283 @@ async fn core_rollback_local(
     })
 }
 
+/// What the start of the orchestrator a core update installed did to finish that update
+/// (`settle_core_generation`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+struct CoreSettleOutcome {
+    generation: String,
+    /// Core nodes this release's list for the role no longer names: stopped, disabled and
+    /// removed, their units and binaries kept in the generation.
+    dropped: Vec<String>,
+    /// Nodes of the list `/usr/bin` did not hold: installed from dist, recorded as created.
+    installed: Vec<String>,
+    /// Nodes of the list still waiting: their binary not yet in dist as the manifest says, or
+    /// left out of the update while this list names them. A core update installs them.
+    pending: Vec<String>,
+    errors: Vec<String>,
+    /// Whether the generation is settled now.
+    settled: bool,
+}
+
+/// The newest stamped generation whose update installed `manifest_hash`, with its directory.
+fn generation_that_installed(
+    root: &Path,
+    manifest_hash: &str,
+) -> Option<(PathBuf, CoreBackupGeneration)> {
+    let wanted = normalize_hash(manifest_hash);
+    let mut found: Vec<(PathBuf, CoreBackupGeneration)> = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("update-"))
+        })
+        .filter_map(|path| read_core_backup_generation(&path).map(|g| (path, g)))
+        .filter(|(_, g)| {
+            g.applied_manifest_hash
+                .as_deref()
+                .map(normalize_hash)
+                .is_some_and(|hash| hash == wanted)
+        })
+        .collect();
+    found.sort_by(|a, b| a.1.generation.cmp(&b.1.generation));
+    found.pop()
+}
+
+/// Copies a dropped node's binary and unit into its generation, and records them there.
+fn keep_dropped_node(
+    host: &CoreHost,
+    dir: &Path,
+    generation: &mut CoreBackupGeneration,
+    name: &str,
+) -> Result<(), OrchestratorError> {
+    let binary = host.bin_path(name);
+    // A binary the generation holds already is the one a rollback must restore: kept as it is.
+    if binary.exists() && !generation.components.iter().any(|c| c.name == name) {
+        let backup = dir.join(name);
+        fs::copy(&binary, &backup)?;
+        generation.components.push(CoreBackupComponent {
+            name: name.to_string(),
+            sha256: sha256_file(&backup)?,
+            size: fs::metadata(&backup)?.len(),
+        });
+    }
+    let unit = dropped_unit_backup_path(dir, name);
+    if let Some(parent) = unit.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(host.unit_path(name), &unit)?;
+    generation.dropped_units.retain(|kept| kept.name != name);
+    generation.dropped_units.push(CoreBackupComponent {
+        name: name.to_string(),
+        sha256: sha256_file(&unit)?,
+        size: fs::metadata(&unit)?.len(),
+    });
+    Ok(())
+}
+
+/// The core update this orchestrator came in with, finished with this release's list for its
+/// role, `components` (docs/hive-config-update-v1.md §3). The update ran in the previous release's
+/// orchestrator, which knows only its own list: it installed what dist held of it, and left out
+/// what dist no longer held (`core_update_sets`). At the start of the orchestrator it installed:
+/// - each SY core unit this orchestrator wrote whose node the list no longer names, one the release
+///   dropped, is stopped and disabled; its unit and binary go into the update's generation, and
+///   then off the host;
+/// - each node of the list `/usr/bin` lacks, one the release added, is installed from dist once
+///   its binary there is the manifest's, and recorded as created by the update.
+///
+/// So a core rollback of that generation stops the added nodes and removes them, and brings the
+/// dropped ones back, unit and binary, with the orchestrator that runs them.
+///
+/// It acts on the newest generation whose update installed `installed_hash`, until that one is
+/// settled. A node still pending keeps it open: the start and the dist recheck try again. None
+/// when there is nothing to settle.
+fn settle_core_generation(
+    host: &CoreHost,
+    generations_root: &Path,
+    installed_hash: &str,
+    manifest: &CoreManifest,
+    dist_bin: &Path,
+    components: &[String],
+    now_ms: u64,
+) -> Result<Option<CoreSettleOutcome>, OrchestratorError> {
+    let Some((dir, mut generation)) = generation_that_installed(generations_root, installed_hash)
+    else {
+        return Ok(None);
+    };
+    if generation.settled_at_ms.is_some() {
+        return Ok(None);
+    }
+    let mut outcome = CoreSettleOutcome {
+        generation: generation.generation.clone(),
+        ..CoreSettleOutcome::default()
+    };
+
+    // The nodes the release dropped: stopped, kept in the generation, then removed.
+    let mut stopped = Vec::new();
+    for name in host
+        .sy_core_units()
+        .into_iter()
+        .filter(|name| !components.contains(name))
+    {
+        match host.stop_core_node(&name) {
+            Ok(()) => stopped.push(name),
+            Err(err) => outcome.errors.push(format!("{name} not dropped: {err}")),
+        }
+    }
+    let mut kept = Vec::new();
+    for name in stopped {
+        match keep_dropped_node(host, &dir, &mut generation, &name) {
+            Ok(()) => kept.push(name),
+            Err(err) => outcome
+                .errors
+                .push(format!("{name} not dropped, its backup failed: {err}")),
+        }
+    }
+
+    // The nodes the release added, whose binary dist holds as the manifest says.
+    let mut to_install = Vec::new();
+    for name in components {
+        if host.bin_path(name).exists() {
+            continue;
+        }
+        if core_dist_binary_mismatch(manifest, name, &dist_bin.join(name)).is_some() {
+            outcome.pending.push(name.clone());
+            continue;
+        }
+        if !generation.created_without_backup.contains(name) {
+            generation.created_without_backup.push(name.clone());
+        }
+        to_install.push(name.clone());
+    }
+
+    // The generation describes what it keeps and creates before anything is removed or
+    // installed: a start cut short leaves a rollback that still undoes it.
+    if !kept.is_empty() || !to_install.is_empty() {
+        write_core_backup_generation(&dir, &generation)?;
+    }
+    if !kept.is_empty() {
+        outcome.errors.extend(host.remove_core_nodes(&kept));
+        outcome.dropped = kept;
+    }
+    for name in to_install {
+        match host.install_binary(&name, &dist_bin.join(&name)) {
+            Ok(()) => outcome.installed.push(name),
+            Err(err) => outcome.errors.push(format!("install {name}: {err}")),
+        }
+    }
+
+    // Left out of the update while this list names them: still the previous release's binary.
+    for name in &generation.left_out {
+        if components.contains(name) && !outcome.pending.contains(name) {
+            outcome.pending.push(name.clone());
+        }
+    }
+    outcome.settled = outcome.pending.is_empty() && outcome.errors.is_empty();
+    if outcome.settled {
+        generation.settled_at_ms = Some(now_ms);
+        write_core_backup_generation(&dir, &generation)?;
+    }
+    Ok(Some(outcome))
+}
+
+/// `settle_core_generation` on this spoke, for the core update recorded as having installed what
+/// `/usr/bin` holds; its outcome is logged and added to the last update's record (`/versions`:
+/// `core.last_update.settled`). The motherbee's core is the package's: nothing to settle there.
+fn settle_core_update(role: HiveRole, manifest: &CoreManifest, components: &[String]) {
+    if role == HiveRole::Motherbee {
+        return;
+    }
+    let Some(record) = read_core_installed_record() else {
+        return;
+    };
+    if record.get("source").and_then(|value| value.as_str()) != Some("update") {
+        return;
+    }
+    let Some(installed_hash) = record.get("manifest_hash").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let outcome = match settle_core_generation(
+        &CoreHost::live(),
+        &core_backup_root_dir(),
+        installed_hash,
+        manifest,
+        Path::new(DIST_CORE_BIN_SOURCE_DIR),
+        components,
+        now_epoch_ms(),
+    ) {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not settle the core update with this release's list");
+            return;
+        }
+    };
+    if outcome.settled {
+        tracing::info!(
+            generation = %outcome.generation,
+            dropped = ?outcome.dropped,
+            installed = ?outcome.installed,
+            "core update settled with this release's list for the role (docs/hive-config-update-v1.md §3)"
+        );
+    } else {
+        tracing::warn!(
+            generation = %outcome.generation,
+            dropped = ?outcome.dropped,
+            installed = ?outcome.installed,
+            pending = ?outcome.pending,
+            errors = ?outcome.errors,
+            "core update not settled yet: a core update installs what is pending, and the start \
+             and the dist recheck try again"
+        );
+    }
+    let mut last = read_core_update_last_record().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(fields) = last.as_object_mut() {
+        let mut settled = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
+        if let Some(settled) = settled.as_object_mut() {
+            settled.insert(
+                "at_ms".to_string(),
+                serde_json::json!(now_epoch_ms().to_string()),
+            );
+        }
+        fields.insert("settled".to_string(), settled);
+    }
+    write_core_update_last_record(&last);
+}
+
+/// The dist recheck's settle: once the role's binaries in dist match the manifest, a node the
+/// start could not install while its binary was on its way gets it, and the watchdog starts it.
+async fn settle_core_update_after_recheck(state: &Arc<OrchestratorState>) {
+    if state.role == HiveRole::Motherbee {
+        return;
+    }
+    let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
+    let role = state.role;
+    let settled = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let manifest = load_core_manifest().map_err(|err| err.to_string())?;
+        let components = core_components_listed_for_role(&manifest, role);
+        settle_core_update(role, &manifest, &components);
+        Ok(())
+    })
+    .await;
+    match settled {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(error = %err, "core update settle could not run"),
+        Err(err) => tracing::warn!(error = %err, "core update settle task failed"),
+    }
+}
+
 /// A core update with its new binaries and units in place, waiting for its restarts.
 struct PreparedCoreUpdate {
+    role: HiveRole,
     updated: Vec<String>,
     unchanged: Vec<String>,
+    left_out: Vec<String>,
     backup_dir: PathBuf,
     created_without_backup: HashSet<String>,
 }
@@ -5078,10 +5622,30 @@ enum CorePrepareOutcome {
 /// swap the binaries in, re-render this role's units. Restarting is `restart_core_after_update`.
 fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, OrchestratorError> {
     let manifest = load_core_manifest()?;
-    // Strict: a binary dist does not hold as the manifest says fails the update here, before
-    // anything is backed up or swapped. Past it, dist matches, so the start's report closes
-    // (FINDINGS A-186).
-    let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
+    let host = CoreHost::live();
+    // Strict: a binary dist holds that is not the manifest's fails the update here, before
+    // anything is backed up or swapped (FINDINGS A-186). One dist no longer holds is left out
+    // only by an update that replaces this orchestrator: the release dropped it from the role,
+    // and the orchestrator it installs settles it (`core_update_sets`). Past it, the start's
+    // report closes; the new orchestrator's start checks dist again with its own list.
+    let components = core_components_listed_for_role(&manifest, state.role);
+    let CoreUpdateSets {
+        updated,
+        unchanged,
+        left_out,
+    } = core_update_sets(
+        &manifest,
+        &components,
+        Path::new(DIST_CORE_BIN_SOURCE_DIR),
+        &host.bin_dir,
+    )?;
+    if !left_out.is_empty() {
+        tracing::warn!(
+            left_out = ?left_out,
+            "core update: dist holds no binary of these, which this orchestrator's list names; \
+             they stay as installed, and the orchestrator this update installs settles them"
+        );
+    }
     record_dist_check(state, DistTree::Core, Vec::new());
     let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
     // Created LAZILY, on the first binary we actually back up. It used to be created
@@ -5096,7 +5660,7 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
     // stamp is written before the first swap so a crash mid-update still leaves a
     // rollback target that describes itself.
     for name in &updated {
-        let target_path = Path::new("/usr/bin").join(name);
+        let target_path = host.bin_path(name);
         if target_path.exists() {
             if !backup_dir_created {
                 fs::create_dir_all(&backup_dir)?;
@@ -5127,7 +5691,7 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
                 .to_string(),
             created_at_ms: now_epoch_ms(),
             hive_id: state.hive_id.clone(),
-            role: format!("{:?}", state.role).to_lowercase(),
+            role: state.role.as_str().to_string(),
             replaced_manifest_hash: read_core_installed_record().and_then(|r| {
                 r.get("manifest_hash")
                     .and_then(|v| v.as_str().map(String::from))
@@ -5135,23 +5699,18 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
             applied_manifest_hash: local_core_manifest_hash().ok().flatten(),
             components: backup_components,
             created_without_backup: created_without_backup.iter().cloned().collect(),
+            left_out: left_out.clone(),
+            dropped_units: Vec::new(),
+            settled_at_ms: None,
         };
-        let stamp = serde_json::to_vec_pretty(&generation)?;
-        write_file_atomic(&backup_dir.join(CORE_GENERATION_MANIFEST_NAME), &stamp)?;
+        write_core_backup_generation(&backup_dir, &generation)?;
     }
 
     // PHASE C — the swap.
     for name in &updated {
-        let source_path = local_core_bin_source_path(name);
-        let target_path = Path::new("/usr/bin").join(name);
-        let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.tmp"));
-        if let Err(err) = (|| -> Result<(), OrchestratorError> {
-            fs::copy(&source_path, &stage_path)?;
-            set_exec_0755(&stage_path)?;
-            fs::rename(&stage_path, &target_path)?;
-            Ok(())
-        })() {
+        if let Err(err) = host.install_binary(name, &local_core_bin_source_path(name)) {
             let rollback_note = match rollback_local_core_binaries(
+                &host,
                 &installed,
                 &backup_dir,
                 &created_without_backup,
@@ -5175,23 +5734,30 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
     // consistent (regenerated unit files are benign to leave in place: a unit adding
     // TimeoutStopSec still runs the rolled-back binary fine).
     if let Err(err) = regen_local_core_units(&manifest, state.role) {
-        let rollback_note =
-            match rollback_local_core_binaries(&updated, &backup_dir, &created_without_backup) {
-                Ok(()) => "rollback applied".to_string(),
-                Err(rb_err) => format!("rollback failed: {rb_err}"),
-            };
+        let rollback_note = match rollback_local_core_binaries(
+            &host,
+            &updated,
+            &backup_dir,
+            &created_without_backup,
+        ) {
+            Ok(()) => "rollback applied".to_string(),
+            Err(rb_err) => format!("rollback failed: {rb_err}"),
+        };
         return Ok(CorePrepareOutcome::Done(SystemUpdateApplyResult {
             status: "rollback".to_string(),
             updated: Vec::new(),
             unchanged,
+            left_out,
             restarted: Vec::new(),
             errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
         }));
     }
 
     Ok(CorePrepareOutcome::Ready(PreparedCoreUpdate {
+        role: state.role,
         updated,
         unchanged,
+        left_out,
         backup_dir,
         created_without_backup,
     }))
@@ -5201,8 +5767,10 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
 /// the binaries back if the gate fails, and record the outcome in `core-update-last.json`.
 async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdateApplyResult {
     let PreparedCoreUpdate {
+        role,
         updated,
         unchanged,
+        left_out,
         backup_dir,
         created_without_backup,
     } = prepared;
@@ -5212,10 +5780,18 @@ async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdate
         "started_at_ms": started_at_ms,
         "updated": updated,
         "unchanged": unchanged,
+        "left_out": left_out,
     }));
     let attempted = updated.clone();
-    let result = match restart_local_core_services_with_health_gate().await {
+    let result = match restart_local_core_services_with_health_gate(role, &left_out).await {
         Ok(restarted) => {
+            // Recorded before the orchestrator's own restart is scheduled: the orchestrator it
+            // starts finishes the update from this record (`settle_core_update`).
+            write_core_installed_record(
+                local_core_manifest_hash().ok().flatten(),
+                "update",
+                serde_json::json!({ "components": updated, "left_out": left_out }),
+            );
             // sy-orchestrator excludes itself from the in-process restart above, so if
             // its own binary was swapped, schedule a detached self-restart to pick it up
             // (and its regenerated unit) hands-off.
@@ -5224,26 +5800,24 @@ async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdate
             }
             // Only on the success path: a rollback still needs its generation on disk.
             prune_core_backup_generations(CORE_BACKUP_GENERATIONS_KEPT);
-            write_core_installed_record(
-                local_core_manifest_hash().ok().flatten(),
-                "update",
-                serde_json::json!({ "components": updated }),
-            );
             SystemUpdateApplyResult {
                 status: "ok".to_string(),
                 updated,
                 unchanged,
+                left_out,
                 restarted,
                 errors: Vec::new(),
             }
         }
         Err(err) => {
             let rollback_note = match rollback_local_core_binaries(
+                &CoreHost::live(),
                 &updated,
                 &backup_dir,
                 &created_without_backup,
             ) {
-                Ok(()) => match restart_local_core_services_with_health_gate().await {
+                Ok(()) => match restart_local_core_services_with_health_gate(role, &left_out).await
+                {
                     Ok(_) => "rollback applied and services recovered".to_string(),
                     Err(rb_restart_err) => {
                         format!("rollback applied but service recovery failed: {rb_restart_err}")
@@ -5255,6 +5829,7 @@ async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdate
                 status: "rollback".to_string(),
                 updated: Vec::new(),
                 unchanged,
+                left_out,
                 restarted: Vec::new(),
                 errors: vec![format!("core health gate failed: {err}; {rollback_note}")],
             }
@@ -5266,6 +5841,7 @@ async fn restart_core_after_update(prepared: PreparedCoreUpdate) -> SystemUpdate
         "started_at_ms": started_at_ms,
         "finished_at_ms": now_epoch_ms().to_string(),
         "updated": attempted,
+        "left_out": result.left_out,
         "restarted": result.restarted,
         "errors": result.errors,
     }));
@@ -5327,6 +5903,7 @@ async fn apply_core_update_replying_first(
             status: "ok".to_string(),
             updated: prepared.updated.clone(),
             unchanged: prepared.unchanged.clone(),
+            left_out: prepared.left_out.clone(),
             restarted: Vec::new(),
             errors: Vec::new(),
         };
@@ -5386,6 +5963,7 @@ async fn apply_system_update_local(
                     status: "sync_pending".to_string(),
                     updated: Vec::new(),
                     unchanged: vec!["runtime-manifest".to_string()],
+                    left_out: Vec::new(),
                     restarted: Vec::new(),
                     errors: artifact_errors,
                 });
@@ -5410,6 +5988,7 @@ async fn apply_system_update_local(
                 status: "ok".to_string(),
                 updated: Vec::new(),
                 unchanged: vec!["runtime-manifest".to_string()],
+                left_out: Vec::new(),
                 restarted: Vec::new(),
                 errors: Vec::new(),
             })
@@ -5441,6 +6020,7 @@ async fn apply_system_update_local(
                     status: "ok".to_string(),
                     updated: Vec::new(),
                     unchanged: vec!["vendor-sync-disabled".to_string()],
+                    left_out: Vec::new(),
                     restarted: Vec::new(),
                     errors: Vec::new(),
                 })
@@ -5611,6 +6191,9 @@ async fn handle_system_update_message(
                 .unwrap_or(serde_json::Value::Null),
             "updated": result.updated,
             "unchanged": result.unchanged,
+            // A core update's components dist no longer holds, left as installed: the release
+            // dropped them from the role, and the orchestrator it installs settles them.
+            "left_out": result.left_out,
             "restarted": result.restarted,
             "errors": result.errors,
         }),
@@ -5701,15 +6284,12 @@ async fn wait_for_service_active(
     }
 }
 
-fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
-    let mut enabled = DEFAULT_BLOB_ENABLED;
+/// The blob's runtime config on a hive of `role`: its topology is the release's for the role
+/// (`release_settings`), its path, Syncthing's API port and home, and its GC are the hive's own,
+/// from hive.yaml.
+fn blob_runtime_from_hive(hive: &HiveFile, role: HiveRole) -> BlobRuntimeConfig {
+    let topology = role.settings().blob;
     let mut path = PathBuf::from(DEFAULT_BLOB_PATH);
-    let mut sync_enabled = DEFAULT_BLOB_SYNC_ENABLED;
-    let mut public_sync_enabled = matches!(
-        HiveRole::from_role(hive.role.as_deref()),
-        Some(HiveRole::Motherbee | HiveRole::Ingress)
-    );
-    let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
     let mut gc_enabled = DEFAULT_BLOB_GC_ENABLED;
@@ -5719,9 +6299,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut gc_active_retain_days = DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS;
 
     if let Some(blob) = hive.blob.as_ref() {
-        if let Some(value) = blob.enabled {
-            enabled = value;
-        }
         if let Some(value) = blob.path.as_ref() {
             let value = value.trim();
             if !value.is_empty() {
@@ -5729,18 +6306,6 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
             }
         }
         if let Some(sync) = blob.sync.as_ref() {
-            if let Some(value) = sync.enabled {
-                sync_enabled = value;
-            }
-            if let Some(value) = sync.public_enabled {
-                public_sync_enabled = value;
-            }
-            if let Some(value) = sync.tool.as_ref() {
-                let value = value.trim().to_ascii_lowercase();
-                if !value.is_empty() {
-                    sync_tool = value;
-                }
-            }
             if let Some(value) = sync.api_port {
                 sync_api_port = value;
             }
@@ -5771,11 +6336,11 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     }
 
     BlobRuntimeConfig {
-        enabled,
+        enabled: topology.enabled,
         path,
-        sync_enabled,
-        public_sync_enabled,
-        sync_tool,
+        sync_enabled: topology.sync_enabled,
+        public_sync_enabled: topology.public_sync_enabled,
+        sync_tool: topology.sync_tool.to_string(),
         sync_api_port,
         sync_data_dir,
         gc_enabled,
@@ -5786,35 +6351,21 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     }
 }
 
-fn dist_runtime_from_hive(hive: &HiveFile) -> DistRuntimeConfig {
-    let mut path = PathBuf::from(DEFAULT_DIST_PATH);
-    let mut sync_enabled = DEFAULT_DIST_SYNC_ENABLED;
-    let mut sync_tool = DEFAULT_DIST_SYNC_TOOL.to_string();
-
-    if let Some(dist) = hive.dist.as_ref() {
-        if let Some(value) = dist.path.as_ref() {
-            let value = value.trim();
-            if !value.is_empty() {
-                path = PathBuf::from(value);
-            }
-        }
-        if let Some(sync) = dist.sync.as_ref() {
-            if let Some(value) = sync.enabled {
-                sync_enabled = value;
-            }
-            if let Some(value) = sync.tool.as_ref() {
-                let value = value.trim().to_ascii_lowercase();
-                if !value.is_empty() {
-                    sync_tool = value;
-                }
-            }
-        }
-    }
-
+/// Dist's runtime config on a hive of `role`: its sync is the release's for the role
+/// (`release_settings`), its path the hive's own, from hive.yaml.
+fn dist_runtime_from_hive(hive: &HiveFile, role: HiveRole) -> DistRuntimeConfig {
+    let topology = role.settings().dist;
+    let path = hive
+        .dist
+        .as_ref()
+        .and_then(|dist| dist.path.as_deref())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_DIST_PATH), PathBuf::from);
     DistRuntimeConfig {
         path,
-        sync_enabled,
-        sync_tool,
+        sync_enabled: topology.sync_enabled,
+        sync_tool: topology.sync_tool.to_string(),
     }
 }
 
@@ -5823,159 +6374,42 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn system_nodes_for_role(
-    hive: &HiveFile,
-    role: HiveRole,
-) -> Result<RoleSystemNodes, OrchestratorError> {
-    let section = hive
-        .system_nodes
-        .as_ref()
-        .ok_or_else(|| "invalid hive.yaml: system_nodes section is required".to_string())?;
-    let role_section = match role {
-        HiveRole::Motherbee => section.motherbee.as_ref(),
-        HiveRole::Worker => section.worker.as_ref(),
-        HiveRole::Egress => section.egress.as_ref(),
-        HiveRole::Ingress => section.ingress.as_ref(),
-    }
-    .ok_or_else(|| {
-        format!(
-            "invalid hive.yaml: system_nodes.{} section is required",
-            role.as_str()
-        )
-    })?;
-    validate_system_nodes(role_section, role)?;
-    Ok(role_section.clone())
+/// The keys a hive.yaml holds of what the release defines now (`release_settings`), named once at
+/// the start: they are ignored, and the file still loads (docs/hive-config-update-v1.md §3).
+fn superseded_hive_keys(config_dir: &Path) -> Vec<&'static str> {
+    fs::read_to_string(config_dir.join("hive.yaml"))
+        .ok()
+        .and_then(|data| serde_yaml::from_str::<serde_yaml::Value>(&data).ok())
+        .map(|hive| release_settings::superseded_hive_yaml_keys(&hive))
+        .unwrap_or_default()
 }
 
-fn validate_system_nodes(
-    section: &RoleSystemNodes,
-    role: HiveRole,
-) -> Result<(), OrchestratorError> {
-    let is_motherbee = role == HiveRole::Motherbee;
-    let nodes = &section.nodes;
-    if nodes.is_empty() {
-        return Err("invalid hive.yaml: configured system node list is empty".into());
+fn warn_superseded_hive_keys(config_dir: &Path) {
+    let keys = superseded_hive_keys(config_dir);
+    if !keys.is_empty() {
+        tracing::warn!(
+            keys = ?keys,
+            "hive.yaml holds settings the release defines now (the role's SY nodes, the blob's \
+             and dist's topology); they are ignored, and may be removed from the file \
+             (docs/hive-config-update-v1.md §3)"
+        );
     }
-    // Model D' boot order (counter-intuitive but required by the
-    // VAULT_SECRET_CHANGED broadcast semantics):
-    //
-    //   - SY.config.routes FIRST: writes the routing SHM. Every other
-    //     SY node needs the router to be functional before it can
-    //     register.
-    //   - SY.vault LAST among the SY system nodes that participate in
-    //     vault. Reason: broadcasts in src/router/mod.rs Destination::
-    //     Broadcast only reach nodes registered at the moment of
-    //     emission. Vault emits `VAULT_SECRET_CHANGED { op=put }` for
-    //     every existing secret right after it connects, to rescue
-    //     consumers that already arrived in `secret_source = Missing`.
-    //     For those broadcasts to land, every consumer must already
-    //     be registered. Vault-last achieves that.
-    //
-    // We enforce both invariants.
-    if nodes[0].trim() != "SY.config.routes" {
-        return Err(format!(
-            "invalid hive.yaml: system_nodes.{}.nodes must start with SY.config.routes (writer of the routing SHM; required by every other SY service)",
-            role.as_str()
-        )
-        .into());
-    }
-    if is_motherbee {
-        let vault_idx = nodes.iter().position(|n| n.trim() == "SY.vault");
-        if let Some(vault_idx) = vault_idx {
-            const VAULT_CONSUMERS: &[&str] = &[
-                "SY.admin",
-                "SY.architect",
-                "SY.storage",
-                "SY.identity",
-                "SY.cognition",
-                "SY.frontdesk.gov",
-            ];
-            for consumer in VAULT_CONSUMERS {
-                if let Some(consumer_idx) = nodes.iter().position(|n| n.trim() == *consumer) {
-                    if consumer_idx > vault_idx {
-                        return Err(format!(
-                            "invalid hive.yaml: system_nodes.motherbee.nodes lists '{}' after SY.vault — vault consumers must appear BEFORE SY.vault so the bootstrap VAULT_SECRET_CHANGED broadcasts that vault emits at startup land in their receive loop (router broadcasts only reach already-registered nodes; Model D' VA-J'-13c)",
-                            consumer
-                        )
-                        .into());
-                    }
-                }
-            }
-        } else {
-            return Err(
-                "invalid hive.yaml: system_nodes.motherbee.nodes must include SY.vault on motherbee (Model D' canonical secret backend)"
-                    .into(),
-            );
-        }
-    }
-    let mut seen_nodes = HashSet::new();
-    let mut seen_services = HashSet::new();
-    for raw_name in nodes {
-        let name = raw_name.trim();
-        let is_sy_node = name.starts_with("SY.");
-        let is_packaged_non_system_node =
-            is_motherbee && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name);
-        if !is_sy_node && !is_packaged_non_system_node {
-            return Err(format!(
-                "invalid hive.yaml: lifecycle node '{}' must use SY.* naming or be an allowlisted motherbee packaged node",
-                raw_name
-            )
-            .into());
-        }
-        let service = name_to_service(name);
-        let valid_service_prefix = if is_sy_node {
-            service.starts_with("sy-")
-        } else {
-            service.starts_with("io-")
-        };
-        if !valid_token(&service) || !valid_service_prefix {
-            return Err(format!(
-                "invalid hive.yaml: system node '{}' yields invalid service '{}'",
-                name, service
-            )
-            .into());
-        }
-        if !is_motherbee && service == "sy-vault" {
-            return Err(format!(
-                "invalid hive.yaml: role={} must not run sy-vault (vault is motherbee-only)",
-                role.as_str()
-            )
-            .into());
-        }
-        if !seen_nodes.insert(name.to_string()) {
-            return Err(format!("invalid hive.yaml: duplicate system node '{name}'").into());
-        }
-        if !seen_services.insert(service.clone()) {
-            return Err(format!("invalid hive.yaml: duplicate system service '{service}'").into());
-        }
-    }
-    let node_set: HashSet<&str> = nodes.iter().map(String::as_str).map(str::trim).collect();
-    let mut seen_wait = HashSet::new();
-    for raw_wait in &section.wait_for {
-        let wait_name = raw_wait.trim();
-        if !node_set.contains(wait_name) {
-            return Err(format!(
-                "invalid hive.yaml: wait_for entry '{}' is not in nodes list",
-                wait_name
-            )
-            .into());
-        }
-        if !seen_wait.insert(wait_name.to_string()) {
-            return Err(
-                format!("invalid hive.yaml: duplicate wait_for entry '{wait_name}'").into(),
-            );
-        }
-    }
-    Ok(())
 }
 
-/// Map an allowlisted declarative node to its packaged systemd service. Only SY.* system
-/// authorities reach here now — IO.blob/IO.cloud are managed runtimes (no packaged unit), not
-/// lifecycle nodes, so they never pass through validate_system_nodes -> name_to_service.
+/// The SY nodes this release runs on `role`, in start order, and the ones the start waits for.
+fn system_nodes_for_role(role: HiveRole) -> RoleSystemNodes {
+    let nodes = role.settings().system_nodes;
+    RoleSystemNodes {
+        nodes: nodes.nodes.iter().map(|name| name.to_string()).collect(),
+        wait_for: nodes.wait_for.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// The packaged systemd service of an SY node (`release_settings::service_name`). Only SY.*
+/// system authorities are lifecycle nodes: the managed IO/AI/WF runtimes run as transient
+/// `fluxbee-node-*` units.
 fn name_to_service(node_name: &str) -> String {
-    let trimmed = node_name.trim();
-    let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
-    format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
+    release_settings::service_name(node_name)
 }
 
 fn service_to_exec(service: &str) -> String {
@@ -6014,7 +6448,7 @@ fn regen_local_core_units(
     // Every component the role lists, whether or not dist holds it (FINDINGS A-186): a unit runs
     // what `/usr/bin` holds, so a binary dist lacks keeps its unit, and a core update has already
     // refused a component its manifest does not name before it gets here.
-    let names = core_components_listed_for_role(manifest, role)?;
+    let names = core_components_listed_for_role(manifest, role);
     let mut changed = false;
     for name in &names {
         let unit = core_service_unit_contents(name, &service_to_exec(name));
@@ -6061,18 +6495,74 @@ fn schedule_orchestrator_self_restart() {
     }
 }
 
-fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String {
-    let mut out = format!("system_nodes:\n  {}:\n    nodes:\n", role.as_str());
-    for name in &section.nodes {
-        out.push_str(&format!("      - {}\n", name.trim()));
-    }
-    if !section.wait_for.is_empty() {
-        out.push_str("    wait_for:\n");
-        for name in &section.wait_for {
-            out.push_str(&format!("      - {}\n", name.trim()));
-        }
-    }
-    out
+/// A worker's hive.yaml, as its join writes it: its identity and control path, the motherbee's
+/// paths, ports, blob GC and `ai`, and its egress route. What the release defines for the role (its
+/// SY nodes, the blob's and dist's topology) is not written: the worker's orchestrator holds it
+/// (docs/hive-config-update-v1.md §3). Every interpolated scalar was checked by the caller
+/// (`validate_yaml_scalar`).
+fn render_worker_hive_yaml(
+    hive_id: &str,
+    ai_yaml: &str,
+    uplink: &str,
+    storage_path: &str,
+    identity_frontdesk: &str,
+    identity_sync_upstream: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    egress_yaml: &str,
+) -> String {
+    format!(
+        "hive_id: {hive_id}\nrole: worker\n{ai_yaml}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ngovernment:\n  identity_frontdesk: \"{identity_frontdesk}\"\nidentity:\n  sync:\n    upstream: \"{identity_sync_upstream}\"\n    auth: required\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\n  gc:\n    enabled: {gc_enabled}\n    interval_secs: {gc_interval_secs}\n    apply: {gc_apply}\n    staging_ttl_hours: {gc_staging_ttl_hours}\n    active_retain_days: {gc_active_retain_days}\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
+        blob_path = blob.path.display(),
+        api_port = blob.sync_api_port,
+        data_dir = blob.sync_data_dir.display(),
+        gc_enabled = blob.gc_enabled,
+        gc_interval_secs = blob.gc_interval_secs,
+        gc_apply = blob.gc_apply,
+        gc_staging_ttl_hours = blob.gc_staging_ttl_hours,
+        gc_active_retain_days = blob.gc_active_retain_days,
+        dist_path = dist.path.display(),
+    )
+}
+
+/// An egress' hive.yaml, as its join writes it: its identity and control path, the motherbee's
+/// storage and dist paths, and its `egress:` section. The egress' SY nodes and dist's sync are the
+/// release's (docs/hive-config-update-v1.md §3). Every interpolated scalar was checked by the
+/// caller.
+fn render_egress_hive_yaml(
+    hive_id: &str,
+    uplink: &str,
+    storage_path: &str,
+    dist: &DistRuntimeConfig,
+    egress_yaml: &str,
+) -> String {
+    format!(
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\ndist:\n  path: \"{dist_path}\"\n{egress_yaml}",
+        dist_path = dist.path.display(),
+    )
+}
+
+/// An ingress' hive.yaml, as its join writes it: its identity and control path, the motherbee's
+/// paths and Syncthing's port and home, its `edge:` section and its SSH table. The ingress' SY
+/// nodes and the blob's and dist's topology are the release's (docs/hive-config-update-v1.md §3).
+/// Every interpolated scalar was checked by the caller.
+fn render_ingress_hive_yaml(
+    hive_id: &str,
+    uplink: &str,
+    storage_path: &str,
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+    edge_listen: &str,
+    edge_tls_yaml: &str,
+    ingress_ssh_yaml: &str,
+) -> String {
+    format!(
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage_path}\"\nblob:\n  path: \"{blob_path}\"\n  sync:\n    api_port: {api_port}\n    data_dir: \"{data_dir}\"\ndist:\n  path: \"{dist_path}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls_yaml}{ingress_ssh_yaml}",
+        blob_path = blob.path.display(),
+        api_port = blob.sync_api_port,
+        data_dir = blob.sync_data_dir.display(),
+        dist_path = dist.path.display(),
+    )
 }
 
 fn render_worker_egress_yaml(egress: Option<&EgressSection>) -> Result<String, OrchestratorError> {
@@ -6344,7 +6834,7 @@ fn effective_syncthing_runtime_config(
 
 fn current_blob_runtime_config(state: &OrchestratorState) -> BlobRuntimeConfig {
     match load_hive(&state.config_dir) {
-        Ok(hive) => blob_runtime_from_hive(&hive),
+        Ok(hive) => blob_runtime_from_hive(&hive, state.role),
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -6358,7 +6848,7 @@ fn current_blob_runtime_config(state: &OrchestratorState) -> BlobRuntimeConfig {
 
 fn current_dist_runtime_config(state: &OrchestratorState) -> DistRuntimeConfig {
     match load_hive(&state.config_dir) {
-        Ok(hive) => dist_runtime_from_hive(&hive),
+        Ok(hive) => dist_runtime_from_hive(&hive, state.role),
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -13540,6 +14030,12 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
                     "replaced_manifest_hash": g.replaced_manifest_hash,
                     "applied_manifest_hash": g.applied_manifest_hash,
                     "components": g.components.len(),
+                    // What a rollback to it removes, and the nodes its release dropped, which
+                    // it brings back (docs/hive-config-update-v1.md §3).
+                    "created": g.created_without_backup,
+                    "dropped": g.dropped_units.iter().map(|unit| unit.name.clone()).collect::<Vec<_>>(),
+                    "left_out": g.left_out,
+                    "settled_at_ms": g.settled_at_ms,
                 })
             })
             .collect()
@@ -23774,7 +24270,7 @@ fn local_dist_mismatches(
     match tree {
         DistTree::Core => {
             let manifest = load_core_manifest()?;
-            let components = core_components_listed_for_role(&manifest, role)?;
+            let components = core_components_listed_for_role(&manifest, role);
             Ok(core_dist_mismatches(
                 &manifest,
                 &components,
@@ -23809,7 +24305,12 @@ async fn run_dist_recheck_loop(state: Arc<OrchestratorState>) {
                 tokio::task::spawn_blocking(move || local_dist_mismatches(tree, role)).await;
             match checked {
                 Ok(Ok(mismatches)) => {
-                    refresh_awaiting_update(&state, tree, mismatches);
+                    let open = refresh_awaiting_update(&state, tree, mismatches);
+                    // A node the start could not install while its binary was on its way gets
+                    // it now that dist holds the role's binaries (`settle_core_update`).
+                    if tree == DistTree::Core && !open {
+                        settle_core_update_after_recheck(&state).await;
+                    }
                 }
                 Ok(Err(err)) => tracing::warn!(
                     tree = tree.name(),
@@ -23826,30 +24327,24 @@ async fn run_dist_recheck_loop(state: Arc<OrchestratorState>) {
     }
 }
 
-/// The core components this hive's role runs, each named in the core manifest: a component the
-/// manifest does not name is an error. What a core update, a join and the role trees use.
+/// The core components a hive of `role` runs, each named in the core manifest: a component the
+/// manifest does not name is an error. What a join's push and the role trees use.
 fn core_component_names_for_role(
     manifest: &CoreManifest,
     role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
-    require_core_components_in_manifest(core_components_listed_for_role(manifest, role)?, manifest)
+    require_core_components_in_manifest(core_components_listed_for_role(manifest, role), manifest)
 }
 
-/// The core components this hive's role runs: every component of the manifest on the motherbee;
-/// on a spoke rt-gateway, its `system_nodes` and sy-orchestrator, from its hive.yaml. A component
-/// the manifest does not name is listed, not refused: the start runs what `/usr/bin` holds and
-/// reports it, and a core update refuses it (FINDINGS A-186, the DTAP panel's A-8).
-fn core_components_listed_for_role(
-    manifest: &CoreManifest,
-    role: HiveRole,
-) -> Result<Vec<String>, OrchestratorError> {
+/// The core components a hive of `role` runs: every component of the manifest on the motherbee;
+/// on a spoke rt-gateway, the role's SY nodes and sy-orchestrator, as this release lists them
+/// (`release_settings`). A component the manifest does not name is listed, not refused: the start
+/// runs what `/usr/bin` holds and reports it (FINDINGS A-186, the DTAP panel's A-8).
+fn core_components_listed_for_role(manifest: &CoreManifest, role: HiveRole) -> Vec<String> {
     if role == HiveRole::Motherbee {
-        return Ok(manifest.components.keys().cloned().collect());
+        return manifest.components.keys().cloned().collect();
     }
-
-    let hive = load_hive(&json_router::paths::config_dir())?;
-    let section = system_nodes_for_role(&hive, role)?;
-    Ok(core_component_names_in_section(&section))
+    core_component_names_in_section(&system_nodes_for_role(role))
 }
 
 /// rt-gateway + the section's SY nodes (as services) + sy-orchestrator, de-duplicated,
@@ -23945,11 +24440,13 @@ fn scope_core_manifest_to_components(
 /// and extra manifest entries are inert. A binary of that set its tree lacks, or one that does
 /// not match, is reported by the spoke's start and refused by its core update, never installed:
 /// the start goes on with what `/usr/bin` holds (FINDINGS A-186). It used to stop the start for
-/// good, before Syncthing, the only channel that could repair it, had started. Both sides derive
-/// the role's set from the same `system_nodes.<role>` — motherbee's template, which it wrote
-/// into the spoke's hive.yaml at add_hive — so they agree unless that template is edited after
-/// the join: a spoke's hive.yaml is written once, at the join, and never re-emitted (the HANDBOOK
-/// recipe for a new system node in a role covers that order).
+/// good, before Syncthing, the only channel that could repair it, had started.
+///
+/// The role's set is this release's (`release_settings`): the motherbee's orchestrator and the
+/// spoke's new one, which arrives in this tree, list the same. The spoke's running orchestrator is
+/// the previous release's while it updates: a component its list names and this tree no longer
+/// holds, one the release dropped from the role, it leaves out of the update when the update
+/// replaces it, and the new orchestrator settles it (`core_update_sets`, `settle_core_generation`).
 ///
 /// Copies, never hardlinks: `build-deb.sh` writes with `install -m0755`, which unlinks and
 /// recreates, so a hardlink would silently keep pointing at the previous inode while the manifest
@@ -23958,22 +24455,12 @@ fn scope_core_manifest_to_components(
 /// Idempotent: a component is re-copied only when its bytes differ from the source, and the
 /// scoped manifest is rewritten only on a real diff — so syncthing sees no spurious churn.
 fn materialize_role_core_trees(manifest: &CoreManifest) -> Result<Vec<String>, OrchestratorError> {
-    let hive = load_hive(&json_router::paths::config_dir())?;
     let manifest_path = local_core_manifest_path()
         .ok_or_else(|| format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'"))?;
     let mut changed_roles = Vec::new();
 
     for role in ROLE_CORE_DIST_ROLES {
-        // A role with no `system_nodes.<role>` section in motherbee's hive.yaml is simply not
-        // deployable here; skip it rather than failing motherbee's boot over a role nobody uses.
-        let section = match system_nodes_for_role(&hive, role) {
-            Ok(section) => section,
-            Err(err) => {
-                tracing::debug!(role = %role.as_str(), error = %err, "no system_nodes section; skipping role core tree");
-                continue;
-            }
-        };
-        let components = core_component_names_from_section(&section, manifest)?;
+        let components = core_component_names_from_section(&system_nodes_for_role(role), manifest)?;
         // Validate up-front that the build actually contains everything this role claims.
         // Failing here is cheap and visible; on the spoke it is a binary its update refuses.
         scope_core_manifest_to_components(manifest, &components)?;
@@ -24926,6 +25413,7 @@ async fn add_hive_finalize_local_flow(
                     status: "ok".to_string(),
                     updated: Vec::new(),
                     unchanged: Vec::new(),
+                    left_out: Vec::new(),
                     restarted: Vec::new(),
                     errors: Vec::new(),
                 }
@@ -26372,16 +26860,9 @@ async fn add_hive_flow(
             });
         }
     };
-    let worker_system_nodes = match system_nodes_for_role(&local_hive, HiveRole::Worker) {
-        Ok(value) => value,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "CONFIG_FAILED",
-                "message": format!("invalid worker system_nodes config: {err}"),
-            });
-        }
-    };
+    // The worker's SY nodes are this release's (`release_settings`): the join installs their
+    // units, and the worker's own orchestrator, of the same release, runs them.
+    let worker_system_nodes = system_nodes_for_role(HiveRole::Worker);
     for node_name in &worker_system_nodes.nodes {
         let service = name_to_service(node_name);
         if !core_manifest.components.contains_key(&service) {
@@ -26559,10 +27040,8 @@ async fn add_hive_flow(
         (identity_frontdesk_node_name.as_str(), "identity_frontdesk"),
         (identity_sync_upstream.as_str(), "identity.sync.upstream"),
         (blob_path_str.as_str(), "blob.path"),
-        (desired_blob.sync_tool.as_str(), "blob.sync.tool"),
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
         (dist_path_str.as_str(), "dist.path"),
-        (desired_dist.sync_tool.as_str(), "dist.sync.tool"),
         (state.ai.model.as_str(), "ai.providers.<default>.model"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
@@ -26577,30 +27056,16 @@ async fn add_hive_flow(
         "ai:\n  default_provider: {}\n  providers:\n    {}:\n      model: \"{}\"\n",
         state.ai.provider, state.ai.provider, state.ai.model
     );
-    let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+    let hive_yaml = render_worker_hive_yaml(
         hive_id,
-        ai_yaml,
-        worker_uplink,
-        storage_path,
-        identity_frontdesk_node_name,
-        identity_sync_upstream,
-        desired_blob.enabled,
-        desired_blob.path.display(),
-        desired_blob.sync_enabled,
-        desired_blob.sync_tool,
-        desired_blob.sync_api_port,
-        desired_blob.sync_data_dir.display(),
-        desired_blob.gc_enabled,
-        desired_blob.gc_interval_secs,
-        desired_blob.gc_apply,
-        desired_blob.gc_staging_ttl_hours,
-        desired_blob.gc_active_retain_days,
-        desired_dist.path.display(),
-        desired_dist.sync_enabled,
-        desired_dist.sync_tool,
-        worker_egress_yaml,
-        render_system_nodes_yaml(HiveRole::Worker, &worker_system_nodes)
+        &ai_yaml,
+        &worker_uplink,
+        &storage_path,
+        &identity_frontdesk_node_name,
+        &identity_sync_upstream,
+        &desired_blob,
+        &desired_dist,
+        &worker_egress_yaml,
     );
     if let Err(err) = write_remote_file(
         address,
@@ -27266,30 +27731,12 @@ async fn add_egress_hive_flow(
         return err_payload("EGRESS_LAN_LEG_INVALID", problem);
     }
 
-    // Resolve the egress profile template from motherbee's own hive.yaml
-    // (system_nodes.egress), symmetric with the worker template.
+    // The egress' SY nodes are this release's (`release_settings`), as the worker's.
     let core_manifest = match load_core_manifest() {
         Ok(m) => m,
         Err(err) => return err_payload("MANIFEST_INVALID", err.to_string()),
     };
-    let local_hive = match load_hive(&state.config_dir) {
-        Ok(h) => h,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("failed to read local hive.yaml: {err}"),
-            )
-        }
-    };
-    let egress_system_nodes = match system_nodes_for_role(&local_hive, HiveRole::Egress) {
-        Ok(s) => s,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("invalid egress system_nodes template on motherbee: {err}"),
-            )
-        }
-    };
+    let egress_system_nodes = system_nodes_for_role(HiveRole::Egress);
     for node_name in &egress_system_nodes.nodes {
         let service = name_to_service(node_name);
         if !core_manifest.components.contains_key(&service) {
@@ -27378,7 +27825,6 @@ async fn add_egress_hive_flow(
         (worker_uplink.as_str(), "wan uplink address"),
         (storage_path.as_str(), "storage.path"),
         (dist_path_str.as_str(), "dist.path"),
-        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return err_payload("CONFIG_FAILED", err.to_string());
@@ -27391,19 +27837,12 @@ async fn add_egress_hive_flow(
             Ok(yaml) => yaml,
             Err(err) => return err_payload("CONFIG_FAILED", err.to_string()),
         };
-    // U-2: this was hardcoded `enabled: false`, which left the egress with no core channel and
-    // an `update category=core` that sat at 202 sync_pending forever without ever saying the
-    // folder did not exist. It now follows motherbee's dist config like the worker's writer.
-    let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\n{egress_yaml}{system_nodes}",
-        hive_id = hive_id,
-        uplink = worker_uplink,
-        storage = storage_path,
-        dist_path = state.dist.path.display(),
-        dist_sync_enabled = state.dist.sync_enabled,
-        dist_sync_tool = state.dist.sync_tool,
-        egress_yaml = egress_yaml,
-        system_nodes = render_system_nodes_yaml(HiveRole::Egress, &egress_system_nodes),
+    let hive_yaml = render_egress_hive_yaml(
+        hive_id,
+        &worker_uplink,
+        &storage_path,
+        &state.dist,
+        &egress_yaml,
     );
     if let Err(err) = write_remote_file(
         address,
@@ -28023,29 +28462,12 @@ async fn add_ingress_hive_flow(
         );
     }
 
-    // Resolve the ingress profile template from motherbee's own hive.yaml.
+    // The ingress' SY nodes are this release's (`release_settings`), as the worker's.
     let core_manifest = match load_core_manifest() {
         Ok(m) => m,
         Err(err) => return err_payload("MANIFEST_INVALID", err.to_string()),
     };
-    let local_hive = match load_hive(&state.config_dir) {
-        Ok(h) => h,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("failed to read local hive.yaml: {err}"),
-            )
-        }
-    };
-    let ingress_system_nodes = match system_nodes_for_role(&local_hive, HiveRole::Ingress) {
-        Ok(s) => s,
-        Err(err) => {
-            return err_payload(
-                "CONFIG_FAILED",
-                format!("invalid ingress system_nodes template on motherbee: {err}"),
-            )
-        }
-    };
+    let ingress_system_nodes = system_nodes_for_role(HiveRole::Ingress);
     for node_name in &ingress_system_nodes.nodes {
         let service = name_to_service(node_name);
         if !core_manifest.components.contains_key(&service) {
@@ -28123,7 +28545,6 @@ async fn add_ingress_hive_flow(
     let dist_path_str = state.dist.path.to_string_lossy().to_string();
     let blob_path_str = state.blob.path.to_string_lossy().to_string();
     let blob_sync_data_dir_str = state.blob.sync_data_dir.to_string_lossy().to_string();
-    let blob_sync_tool = state.blob.sync_tool.trim().to_string();
     let edge_listen = ingress.listen.clone().unwrap_or_default();
     // Render the TLS block only when a vault key was supplied. Absent it, the edge
     // sets tls_requested=false and binds plaintext — so an HTTPS ingress REQUIRES
@@ -28143,30 +28564,21 @@ async fn add_ingress_hive_flow(
         (dist_path_str.as_str(), "dist.path"),
         (blob_path_str.as_str(), "blob.path"),
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
-        (blob_sync_tool.as_str(), "blob.sync.tool"),
-        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
         (edge_listen.as_str(), "edge.listen"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return err_payload("CONFIG_FAILED", err.to_string());
         }
     }
-    let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{ingress_ssh}{system_nodes}",
-        hive_id = hive_id,
-        uplink = worker_uplink,
-        storage = storage_path,
-        dist_path = state.dist.path.display(),
-        dist_sync_enabled = state.dist.sync_enabled,
-        dist_sync_tool = state.dist.sync_tool,
-        blob_path = state.blob.path.display(),
-        blob_sync_tool = blob_sync_tool,
-        blob_sync_api_port = state.blob.sync_api_port,
-        blob_sync_data_dir = state.blob.sync_data_dir.display(),
-        edge_listen = edge_listen,
-        edge_tls = edge_tls_yaml,
-        ingress_ssh = render_ingress_ssh_allow_from_yaml(&ingress.ssh_allow_from),
-        system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
+    let hive_yaml = render_ingress_hive_yaml(
+        hive_id,
+        &worker_uplink,
+        &storage_path,
+        &state.blob,
+        &state.dist,
+        &edge_listen,
+        &edge_tls_yaml,
+        &render_ingress_ssh_allow_from_yaml(&ingress.ssh_allow_from),
     );
     if let Err(err) = write_remote_file(
         address,
@@ -30565,6 +30977,9 @@ mod tests {
             applied_manifest_hash: Some("newhash".to_string()),
             components: recorded,
             created_without_backup: Vec::new(),
+            left_out: Vec::new(),
+            dropped_units: Vec::new(),
+            settled_at_ms: None,
         };
         fs::write(
             dir.join(CORE_GENERATION_MANIFEST_NAME),
@@ -30572,6 +30987,116 @@ mod tests {
         )
         .expect("write stamp");
         dir
+    }
+
+    /// A host of temporary roots for a core update: `bin/` stands for `/usr/bin`, `units/` for
+    /// `/etc/systemd/system`. systemd's calls are recorded, each with whether the node's binary
+    /// was still there when it was made, and `is-active` answers for the nodes `active` names.
+    struct TestCoreHost {
+        root: PathBuf,
+        host: CoreHost,
+        calls: Arc<StdMutex<Vec<String>>>,
+        active: Arc<StdMutex<HashSet<String>>>,
+    }
+
+    impl TestCoreHost {
+        fn new(tag: &str) -> Self {
+            // Short: the temp dir on macOS is long already.
+            let root = std::env::temp_dir().join(format!(
+                "fbch-{tag}-{}",
+                &Uuid::new_v4().simple().to_string()[..8]
+            ));
+            let bin_dir = root.join("bin");
+            let unit_dir = root.join("units");
+            fs::create_dir_all(&bin_dir).expect("bin dir");
+            fs::create_dir_all(&unit_dir).expect("unit dir");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let active = Arc::new(StdMutex::new(HashSet::new()));
+            let host = CoreHost {
+                bin_dir: bin_dir.clone(),
+                unit_dir,
+                systemctl: {
+                    let calls = Arc::clone(&calls);
+                    let active = Arc::clone(&active);
+                    Box::new(move |args: &[&str]| {
+                        let node = args.last().copied().unwrap_or_default();
+                        let binary = if bin_dir.join(node).exists() {
+                            "binary"
+                        } else {
+                            "no binary"
+                        };
+                        calls
+                            .lock()
+                            .expect("calls")
+                            .push(format!("{} ({binary})", args.join(" ")));
+                        let mut active = active.lock().expect("active");
+                        match args.first().copied() {
+                            Some("stop") => {
+                                active.remove(node);
+                                Ok(())
+                            }
+                            Some("is-active") if active.contains(node) => Ok(()),
+                            Some("is-active") => Err("inactive".into()),
+                            _ => Ok(()),
+                        }
+                    })
+                },
+            };
+            TestCoreHost {
+                root,
+                host,
+                calls,
+                active,
+            }
+        }
+
+        /// A core node installed as a join leaves it: its binary, its unit, running.
+        fn install(&self, name: &str, body: &str) {
+            fs::write(self.host.bin_path(name), body).expect("binary");
+            fs::write(
+                self.host.unit_path(name),
+                core_service_unit_contents(name, &service_to_exec(name)),
+            )
+            .expect("unit");
+            self.active.lock().expect("active").insert(name.to_string());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+
+        fn running(&self, name: &str) -> bool {
+            self.active.lock().expect("active").contains(name)
+        }
+    }
+
+    impl Drop for TestCoreHost {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A core manifest for `bodies`, each component's entry what its body hashes to.
+    fn manifest_for(bodies: &[(&str, &str)]) -> CoreManifest {
+        let mut components = BTreeMap::new();
+        for (name, body) in bodies {
+            let mut hasher = Sha256::new();
+            hasher.update(body.as_bytes());
+            components.insert(
+                (*name).to_string(),
+                CoreManifestComponent {
+                    service: (*name).to_string(),
+                    version: "0.1.117".to_string(),
+                    build_id: "test".to_string(),
+                    sha256: format!("{:x}", hasher.finalize()),
+                    size: Some(body.len() as u64),
+                },
+            );
+        }
+        CoreManifest {
+            schema_version: 1,
+            components,
+        }
     }
 
     /// U-5: every way a rollback can be wrong must be LOUD. The forbidden design — "restore the
@@ -30696,24 +31221,39 @@ mod tests {
     /// Unreachable from the in-flight callers, but `core_rollback` makes it reachable.
     #[test]
     fn a_rollback_that_restores_nothing_must_not_report_success() {
-        let backup_dir = std::env::temp_dir().join(format!("fluxbee-rb-empty-{}", Uuid::new_v4()));
+        let test = TestCoreHost::new("rbempty");
+        let backup_dir = test.root.join("update-1700000000001");
         fs::create_dir_all(&backup_dir).expect("dir");
 
-        let err =
-            rollback_local_core_binaries(&["sy-admin".to_string()], &backup_dir, &HashSet::new())
-                .expect_err("must refuse to claim a rollback it did not perform");
+        let err = rollback_local_core_binaries(
+            &test.host,
+            &["sy-admin".to_string()],
+            &backup_dir,
+            &HashSet::new(),
+        )
+        .expect_err("must refuse to claim a rollback it did not perform");
         let text = err.to_string();
         assert!(text.contains("sy-admin"), "must name the component: {text}");
         assert!(text.contains("restored nothing"), "must say why: {text}");
 
-        // A component the update CREATED has nothing to restore to; removing it is correct.
+        // A component the update CREATED has nothing to restore to; removing it is correct, once
+        // it is stopped: the update's restarts may have started it.
+        test.install("sy-admin", "new");
         let mut created = HashSet::new();
         created.insert("sy-admin".to_string());
-        assert!(
-            rollback_local_core_binaries(&["sy-admin".to_string()], &backup_dir, &created).is_ok()
+        assert!(rollback_local_core_binaries(
+            &test.host,
+            &["sy-admin".to_string()],
+            &backup_dir,
+            &created
+        )
+        .is_ok());
+        assert!(!test.host.bin_path("sy-admin").exists());
+        assert!(!test.running("sy-admin"));
+        assert_eq!(
+            test.calls().first().map(String::as_str),
+            Some("stop sy-admin (binary)")
         );
-
-        let _ = fs::remove_dir_all(&backup_dir);
     }
 
     /// X1: after a rollback the hive is deliberately off-manifest. Comparing DIST hashes would
@@ -32581,8 +33121,17 @@ mod tests {
             .expect("the first install");
         assert!(uplink < check && check < install);
         assert!(body.contains("ssh_allow_set(&uplink_addresses, &ingress.ssh_allow_from)"));
-        assert!(body.contains("    - address: \\\"{uplink}\\\""));
-        assert!(body.contains("uplink = worker_uplink,"));
+        // The uplink it checked is the one its hive.yaml names (`render_ingress_hive_yaml` writes
+        // it as `wan.uplinks[0]`, see the_joins_write_a_hive_yaml_without_the_release_s_keys).
+        let render = &body[body
+            .find("render_ingress_hive_yaml(")
+            .expect("the hive.yaml it writes")..];
+        let args = &render[..render.find(");").expect("its arguments")];
+        assert_eq!(
+            args.split(',').nth(1).map(str::trim),
+            Some("&worker_uplink"),
+            "{args}"
+        );
         assert_eq!(body.matches("resolve_worker_uplink_address(").count(), 1);
     }
 
@@ -33268,92 +33817,670 @@ mod tests {
         }
     }
 
+    /// The components each reader installs, runs and watches on a spoke, as they were read from
+    /// `system_nodes.<role>` of hive.yaml (rt-gateway, the role's SY services, sy-orchestrator):
+    /// the start, the core update, a join's push and the motherbee's role trees all take them from
+    /// the release's list now, and get the same.
     #[test]
-    fn egress_role_rejects_sy_vault() {
-        let section = RoleSystemNodes {
-            nodes: vec!["SY.config.routes".to_string(), "SY.vault".to_string()],
-            wait_for: vec![],
-        };
-        assert!(validate_system_nodes(&section, HiveRole::Egress).is_err());
+    fn every_reader_gets_the_lists_hive_yaml_gave_it() {
+        let expected: [(HiveRole, &[&str], &[&str]); 3] = [
+            (
+                HiveRole::Worker,
+                &[
+                    "rt-gateway",
+                    "sy-config-routes",
+                    "sy-identity",
+                    "sy-opa-rules",
+                    "sy-cognition",
+                    "sy-timer",
+                    "sy-wf-rules",
+                    "sy-orchestrator",
+                ],
+                &[
+                    "SY.config.routes",
+                    "SY.identity",
+                    "SY.opa.rules",
+                    "SY.cognition",
+                    "SY.timer",
+                ],
+            ),
+            (
+                HiveRole::Egress,
+                &[
+                    "rt-gateway",
+                    "sy-config-routes",
+                    "sy-opa-rules",
+                    "sy-orchestrator",
+                ],
+                &["SY.config.routes"],
+            ),
+            (
+                HiveRole::Ingress,
+                &[
+                    "rt-gateway",
+                    "sy-config-routes",
+                    "sy-opa-rules",
+                    "sy-edge",
+                    "sy-orchestrator",
+                ],
+                &["SY.config.routes"],
+            ),
+        ];
+        let bodies: Vec<(&str, &str)> = [
+            "rt-gateway",
+            "sy-orchestrator",
+            "sy-config-routes",
+            "sy-identity",
+            "sy-opa-rules",
+            "sy-admin",
+            "sy-architect",
+            "sy-storage",
+            "sy-cognition",
+            "sy-timer",
+            "sy-wf-rules",
+            "sy-frontdesk-gov",
+            "sy-vault",
+            "sy-edge",
+        ]
+        .into_iter()
+        .map(|name| (name, name))
+        .collect();
+        let manifest = manifest_for(&bodies);
+        for (role, components, wait_for) in expected {
+            assert_eq!(
+                core_components_listed_for_role(&manifest, role),
+                components,
+                "{}: what its start and its core update run",
+                role.as_str()
+            );
+            assert_eq!(
+                core_component_names_for_role(&manifest, role).expect("in the manifest"),
+                components,
+                "{}: what a join pushes and the role's tree holds",
+                role.as_str()
+            );
+            assert_eq!(
+                system_nodes_for_role(role).wait_for,
+                wait_for,
+                "{}: what its start waits for",
+                role.as_str()
+            );
+        }
+        // The motherbee runs every component of its package's manifest, as before.
+        assert_eq!(
+            core_components_listed_for_role(&manifest, HiveRole::Motherbee).len(),
+            bodies.len()
+        );
+        assert_eq!(
+            system_nodes_for_role(HiveRole::Motherbee)
+                .nodes
+                .last()
+                .map(String::as_str),
+            Some("SY.vault")
+        );
     }
 
+    /// An existing hive.yaml keeps its release keys until someone removes them: it still loads,
+    /// the keys are named, and they change nothing. Here a worker's file says the opposite of the
+    /// release on every one of them.
     #[test]
-    fn egress_role_accepts_config_routes_only() {
-        let section = RoleSystemNodes {
-            nodes: vec!["SY.config.routes".to_string()],
-            wait_for: vec![],
-        };
-        assert!(validate_system_nodes(&section, HiveRole::Egress).is_ok());
+    fn an_old_hive_yaml_still_loads_and_its_release_keys_are_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "fbhy-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir_all(&dir).expect("config dir");
+        fs::write(
+            dir.join("hive.yaml"),
+            "hive_id: worker9\nrole: worker\n\
+             blob:\n  enabled: false\n  path: \"/srv/blob\"\n  sync:\n    enabled: false\n    public_enabled: true\n    tool: \"rsync\"\n    api_port: 9384\n    data_dir: \"/srv/st\"\n  gc:\n    enabled: true\n    interval_secs: 120\n\
+             dist:\n  path: \"/srv/dist\"\n  sync:\n    enabled: false\n    tool: \"rsync\"\n\
+             system_nodes:\n  worker:\n    nodes:\n      - SY.config.routes\n      - SY.vault\n",
+        )
+        .expect("hive.yaml");
+        let hive = load_hive(&dir).expect("an old hive.yaml still loads");
+        let blob = blob_runtime_from_hive(&hive, HiveRole::Worker);
+        assert_eq!(
+            (
+                blob.enabled,
+                blob.sync_enabled,
+                blob.public_sync_enabled,
+                blob.sync_tool.as_str()
+            ),
+            (true, true, false, "syncthing"),
+            "the release's topology for a worker, not the file's"
+        );
+        assert_eq!(blob.path, PathBuf::from("/srv/blob"));
+        assert_eq!(blob.sync_api_port, 9384);
+        assert_eq!(blob.sync_data_dir, PathBuf::from("/srv/st"));
+        assert!(blob.gc_enabled);
+        assert_eq!(blob.gc_interval_secs, 120);
+        let dist = dist_runtime_from_hive(&hive, HiveRole::Worker);
+        assert_eq!(
+            (dist.path, dist.sync_enabled, dist.sync_tool.as_str()),
+            (PathBuf::from("/srv/dist"), true, "syncthing")
+        );
+        assert_eq!(
+            superseded_hive_keys(&dir),
+            vec![
+                "system_nodes",
+                "blob.enabled",
+                "blob.sync.enabled",
+                "blob.sync.public_enabled",
+                "blob.sync.tool",
+                "dist.sync.enabled",
+                "dist.sync.tool",
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The packaged hive.yaml: every role's system_nodes validates, and every role runs
-    /// SY.opa.rules — the one global user policy is enforced by the router of every hive.
+    /// The blob and dist each spoke's reconcile reads from hive.yaml as its join wrote it, by role:
+    /// the values the joins wrote (from the motherbee's `packaging/hive.yaml.example`), read now
+    /// from the release, the paths and ports still from the file.
     #[test]
-    fn packaged_hive_yaml_runs_opa_rules_on_every_role() {
-        let hive: HiveFile =
-            serde_yaml::from_str(include_str!("../../packaging/hive.yaml.example"))
-                .expect("packaged hive.yaml parses");
-        for role in [
-            HiveRole::Motherbee,
-            HiveRole::Worker,
-            HiveRole::Ingress,
-            HiveRole::Egress,
-        ] {
-            let section = system_nodes_for_role(&hive, role)
-                .unwrap_or_else(|err| panic!("{}: {err}", role.as_str()));
-            assert!(
-                section.nodes.iter().any(|node| node == "SY.opa.rules"),
-                "{} must run SY.opa.rules",
+    fn the_reconcile_reads_the_blob_and_dist_the_joins_wrote() {
+        let old_files = [
+            (
+                HiveRole::Worker,
+                "hive_id: w1\nrole: worker\nblob:\n  enabled: true\n  path: \"/var/lib/fluxbee/blob\"\n  sync:\n    enabled: true\n    tool: \"syncthing\"\n    api_port: 8384\n    data_dir: \"/var/lib/fluxbee/syncthing\"\ndist:\n  path: \"/var/lib/fluxbee/dist\"\n  sync:\n    enabled: true\n    tool: \"syncthing\"\n",
+                (true, true, false),
+            ),
+            (
+                HiveRole::Egress,
+                "hive_id: e1\nrole: egress\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"/var/lib/fluxbee/dist\"\n  sync:\n    enabled: true\n    tool: \"syncthing\"\n",
+                (false, false, false),
+            ),
+            (
+                HiveRole::Ingress,
+                "hive_id: i1\nrole: ingress\nblob:\n  enabled: false\n  path: \"/var/lib/fluxbee/blob\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"syncthing\"\n    api_port: 8384\n    data_dir: \"/var/lib/fluxbee/syncthing\"\ndist:\n  path: \"/var/lib/fluxbee/dist\"\n  sync:\n    enabled: true\n    tool: \"syncthing\"\n",
+                (false, true, true),
+            ),
+        ];
+        for (role, file, (enabled, sync_enabled, public_sync_enabled)) in old_files {
+            let hive: HiveFile = serde_yaml::from_str(file).expect("a join's hive.yaml");
+            let blob = blob_runtime_from_hive(&hive, role);
+            assert_eq!(
+                (
+                    blob.enabled,
+                    blob.sync_enabled,
+                    blob.public_sync_enabled,
+                    blob.sync_tool.as_str(),
+                    blob.path.as_path(),
+                    blob.sync_api_port,
+                    blob.sync_data_dir.as_path(),
+                ),
+                (
+                    enabled,
+                    sync_enabled,
+                    public_sync_enabled,
+                    "syncthing",
+                    Path::new("/var/lib/fluxbee/blob"),
+                    8384,
+                    Path::new("/var/lib/fluxbee/syncthing"),
+                ),
+                "{}",
+                role.as_str()
+            );
+            let dist = dist_runtime_from_hive(&hive, role);
+            assert_eq!(
+                (
+                    dist.path.as_path(),
+                    dist.sync_enabled,
+                    dist.sync_tool.as_str()
+                ),
+                (Path::new("/var/lib/fluxbee/dist"), true, "syncthing"),
+                "{}",
                 role.as_str()
             );
         }
     }
 
+    /// What a join writes holds the hive's own and none of the release's keys, and reads back as
+    /// the hive it describes.
     #[test]
-    fn ingress_role_accepts_sy_edge() {
-        let section = RoleSystemNodes {
-            nodes: vec!["SY.config.routes".to_string(), "SY.edge".to_string()],
-            wait_for: vec!["SY.config.routes".to_string()],
-        };
-        assert!(validate_system_nodes(&section, HiveRole::Ingress).is_ok());
+    fn the_joins_write_a_hive_yaml_without_the_release_s_keys() {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let worker = render_worker_hive_yaml(
+            "worker9",
+            "ai:\n  default_provider: openai\n  providers:\n    openai:\n      model: \"gpt-5.5\"\n",
+            "10.0.0.1:9000",
+            "/var/lib/fluxbee",
+            "SY.frontdesk.gov@motherbee",
+            "10.0.0.1:9100",
+            &blob,
+            &dist,
+            "egress:\n  gateway_ip: \"10.0.0.40\"\n  ipv6: \"blocked\"\n",
+        );
+        let egress = render_egress_hive_yaml(
+            "egress9",
+            "10.0.0.1:9000",
+            "/var/lib/fluxbee",
+            &dist,
+            "egress:\n  enabled: true\n",
+        );
+        let ingress = render_ingress_hive_yaml(
+            "ingress9",
+            "10.0.0.1:9000",
+            "/var/lib/fluxbee",
+            &blob,
+            &dist,
+            "0.0.0.0:443",
+            "  tls_vault_key: \"edge_tls\"\n  vault_hive: \"motherbee\"\n",
+            "",
+        );
+        for (role, written) in [
+            (HiveRole::Worker, &worker),
+            (HiveRole::Egress, &egress),
+            (HiveRole::Ingress, &ingress),
+        ] {
+            let value: serde_yaml::Value =
+                serde_yaml::from_str(written).unwrap_or_else(|err| panic!("{written}: {err}"));
+            assert_eq!(
+                release_settings::superseded_hive_yaml_keys(&value),
+                Vec::<&str>::new(),
+                "{}",
+                role.as_str()
+            );
+            let hive: HiveFile = serde_yaml::from_str(written).expect("the orchestrator reads it");
+            assert_eq!(HiveRole::from_role(hive.role.as_deref()), Some(role));
+            assert_eq!(
+                hive.wan
+                    .as_ref()
+                    .and_then(|wan| wan.uplinks.as_ref())
+                    .and_then(|uplinks| uplinks.first())
+                    .map(|uplink| uplink.address.as_str()),
+                Some("10.0.0.1:9000"),
+                "{}: its uplink is the motherbee's",
+                role.as_str()
+            );
+            assert_eq!(dist_runtime_from_hive(&hive, role).path, dist.path);
+            if role != HiveRole::Egress {
+                let read = blob_runtime_from_hive(&hive, role);
+                assert_eq!(
+                    (read.path, read.sync_api_port, read.sync_data_dir),
+                    (
+                        blob.path.clone(),
+                        blob.sync_api_port,
+                        blob.sync_data_dir.clone()
+                    ),
+                    "{}",
+                    role.as_str()
+                );
+            }
+        }
+        let hive: HiveFile = serde_yaml::from_str(&worker).expect("worker");
+        assert_eq!(
+            hive.egress.and_then(|egress| egress.gateway_ip).as_deref(),
+            Some("10.0.0.40")
+        );
+        assert!(ingress.contains("blob_public_root:"));
+        assert!(ingress.contains("tls_vault_key: \"edge_tls\""));
     }
 
+    /// The core update in the previous release's orchestrator: a component its list names that
+    /// dist no longer holds is left as installed only when the update replaces sy-orchestrator,
+    /// whose new list may have dropped it; never rt-gateway or sy-orchestrator; and a binary dist
+    /// holds stays checked strictly.
     #[test]
-    fn motherbee_role_rejects_io_blob_as_lifecycle_node() {
-        // IO.blob is a MANAGED runtime now (the orchestrator spawns it via run_node), NOT a
-        // hive.yaml lifecycle node — validate_system_nodes must reject it even on the motherbee.
-        let section = RoleSystemNodes {
-            nodes: vec![
-                "SY.config.routes".to_string(),
-                "SY.admin".to_string(),
-                "IO.blob".to_string(),
-                "SY.vault".to_string(),
-            ],
-            wait_for: vec![],
-        };
-        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_err());
+    fn an_update_leaves_out_what_dist_no_longer_holds_only_when_it_replaces_the_orchestrator() {
+        let test = TestCoreHost::new("sets");
+        let dist = test.root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        let components: Vec<String> = [
+            "rt-gateway",
+            "sy-config-routes",
+            "sy-timer",
+            "sy-orchestrator",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        for name in &components {
+            test.install(name, "old");
+        }
+        let new = [
+            ("rt-gateway", "new"),
+            ("sy-config-routes", "new"),
+            ("sy-orchestrator", "new"),
+        ];
+        for (name, body) in new {
+            fs::write(dist.join(name), body).expect("dist binary");
+        }
+        // The release dropped SY.timer from the role: dist holds no sy-timer, and the manifest
+        // may name it still (another role runs it) or not.
+        for manifest in [
+            manifest_for(&new),
+            manifest_for(&[new[0], new[1], new[2], ("sy-timer", "new")]),
+        ] {
+            let sets = core_update_sets(&manifest, &components, &dist, &test.host.bin_dir)
+                .expect("a release that replaces the orchestrator may drop a node");
+            assert_eq!(sets.left_out, vec!["sy-timer".to_string()]);
+            assert_eq!(
+                sets.updated,
+                vec!["rt-gateway", "sy-config-routes", "sy-orchestrator"]
+            );
+        }
+        // The same tree with the orchestrator already the new one: no release changes the list,
+        // so a binary dist lacks is refused, as before.
+        fs::write(test.host.bin_path("sy-orchestrator"), "new").expect("same orchestrator");
+        let err = core_update_sets(&manifest_for(&new), &components, &dist, &test.host.bin_dir)
+            .expect_err("no list change without a new orchestrator");
+        assert!(err.to_string().contains("sy-timer"), "{err}");
+        // Never the router or the orchestrator itself.
+        fs::write(test.host.bin_path("sy-orchestrator"), "old").expect("old orchestrator");
+        fs::remove_file(dist.join("rt-gateway")).expect("no router in dist");
+        let err = core_update_sets(&manifest_for(&new), &components, &dist, &test.host.bin_dir)
+            .expect_err("rt-gateway is never left out");
+        assert!(err.to_string().contains("rt-gateway"), "{err}");
+        // A binary dist holds that is not the manifest's is refused, whatever else.
+        fs::write(dist.join("rt-gateway"), "tampered").expect("tampered");
+        let err = core_update_sets(&manifest_for(&new), &components, &dist, &test.host.bin_dir)
+            .expect_err("strict on what dist holds");
+        assert!(err.to_string().contains("rt-gateway"), "{err}");
     }
 
-    #[test]
-    fn io_runtimes_are_never_hive_yaml_lifecycle_nodes() {
-        // Neither IO.blob nor IO.cloud may appear in hive.yaml system_nodes on ANY role: they are
-        // managed runtimes, not lifecycle authorities.
-        let blob_mb = RoleSystemNodes {
-            nodes: vec!["SY.config.routes".to_string(), "IO.blob".to_string()],
-            wait_for: vec![],
-        };
-        assert!(validate_system_nodes(&blob_mb, HiveRole::Motherbee).is_err());
-        assert!(validate_system_nodes(&blob_mb, HiveRole::Worker).is_err());
+    /// A generation as the previous release's orchestrator stamps it when its update replaces the
+    /// binaries in `replaced`, and its old copies.
+    fn stamp_update(
+        test: &TestCoreHost,
+        replaced: &[&str],
+        left_out: &[&str],
+        applied: &str,
+    ) -> PathBuf {
+        let generations = test.root.join("generations");
+        let dir = stamp_generation(
+            &generations,
+            "update-1700000000009",
+            Some("previous"),
+            &replaced
+                .iter()
+                .map(|name| (*name, "old"))
+                .collect::<Vec<_>>(),
+        );
+        let mut generation = read_core_backup_generation(&dir).expect("stamp");
+        generation.applied_manifest_hash = Some(applied.to_string());
+        generation.left_out = left_out.iter().map(|name| name.to_string()).collect();
+        write_core_backup_generation(&dir, &generation).expect("restamp");
+        dir
+    }
 
-        let cloud_mb = RoleSystemNodes {
-            nodes: vec![
-                "SY.config.routes".to_string(),
-                "IO.cloud".to_string(),
-                "SY.vault".to_string(),
-            ],
-            wait_for: vec![],
+    /// A node a release drops from the role (docs/hive-config-update-v1.md §3): the previous
+    /// orchestrator's update leaves it out, the new one's start stops it, disables it and removes
+    /// unit and binary, both kept in the update's generation; a core rollback of that generation
+    /// brings them back.
+    #[test]
+    fn a_node_a_release_drops_is_stopped_and_removed_and_a_rollback_brings_it_back() {
+        let test = TestCoreHost::new("drop");
+        let dist = test.root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        for name in [
+            "rt-gateway",
+            "sy-orchestrator",
+            "sy-config-routes",
+            "sy-timer",
+        ] {
+            test.install(name, "old");
+        }
+        // The update installed the new binaries of the release, which drops sy-timer.
+        let release = [
+            ("rt-gateway", "new"),
+            ("sy-orchestrator", "new"),
+            ("sy-config-routes", "new"),
+        ];
+        let manifest = manifest_for(&release);
+        for (name, body) in release {
+            fs::write(dist.join(name), body).expect("dist binary");
+            fs::write(test.host.bin_path(name), body).expect("installed");
+        }
+        let dir = stamp_update(
+            &test,
+            &["rt-gateway", "sy-orchestrator", "sy-config-routes"],
+            &["sy-timer"],
+            "sha256:NEWHASH",
+        );
+        let unit_before = fs::read(test.host.unit_path("sy-timer")).expect("unit");
+        let list: Vec<String> = ["rt-gateway", "sy-config-routes", "sy-orchestrator"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+
+        let outcome = settle_core_generation(
+            &test.host,
+            &test.root.join("generations"),
+            "newhash",
+            &manifest,
+            &dist,
+            &list,
+            1_700_000_000_100,
+        )
+        .expect("settle")
+        .expect("the update's generation");
+        assert_eq!(outcome.dropped, vec!["sy-timer".to_string()]);
+        assert!(outcome.settled, "{outcome:?}");
+        assert!(!test.running("sy-timer"));
+        assert!(!test.host.bin_path("sy-timer").exists());
+        assert!(!test.host.unit_path("sy-timer").exists());
+        let calls = test.calls();
+        let stop = calls
+            .iter()
+            .position(|call| call == "stop sy-timer (binary)")
+            .expect("stopped while its binary was there");
+        let disable = calls
+            .iter()
+            .position(|call| call == "disable sy-timer (binary)")
+            .expect("disabled");
+        assert!(stop < disable, "{calls:?}");
+        assert!(calls.iter().any(|call| call.starts_with("daemon-reload")));
+        let generation = read_core_backup_generation(&dir).expect("stamp");
+        assert_eq!(generation.settled_at_ms, Some(1_700_000_000_100));
+        assert!(generation.components.iter().any(|c| c.name == "sy-timer"));
+        assert_eq!(generation.dropped_units.len(), 1);
+
+        // Settled: the next start leaves it alone.
+        assert_eq!(
+            settle_core_generation(
+                &test.host,
+                &test.root.join("generations"),
+                "newhash",
+                &manifest,
+                &dist,
+                &list,
+                1_700_000_000_200,
+            )
+            .expect("settle"),
+            None
+        );
+
+        // The rollback: verified whole, then the dropped node's binary and unit come back with
+        // the rest of the previous release.
+        let (selected, generation) = select_core_backup_generation(
+            &test.root.join("generations"),
+            &CoreRollbackSelector::Latest,
+        )
+        .expect("a generation that verifies");
+        let restored = restore_core_generation(&test.host, &selected, &generation);
+        assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+        assert_eq!(restored.units_restored, vec!["sy-timer".to_string()]);
+        assert_eq!(
+            fs::read_to_string(test.host.bin_path("sy-timer")).expect("binary back"),
+            "old"
+        );
+        assert_eq!(
+            fs::read(test.host.unit_path("sy-timer")).expect("unit back"),
+            unit_before
+        );
+        for name in ["rt-gateway", "sy-orchestrator", "sy-config-routes"] {
+            assert_eq!(
+                fs::read_to_string(test.host.bin_path(name)).expect("binary"),
+                "old",
+                "{name}"
+            );
+        }
+        assert!(test
+            .calls()
+            .last()
+            .is_some_and(|call| call.starts_with("daemon-reload")));
+
+        // A tampered unit fails the rollback's check before anything is touched.
+        fs::write(dropped_unit_backup_path(&dir, "sy-timer"), "tampered").expect("tamper");
+        let (code, detail) = select_core_backup_generation(
+            &test.root.join("generations"),
+            &CoreRollbackSelector::Latest,
+        )
+        .expect_err("a corrupt unit");
+        assert_eq!(code, "BACKUP_CORRUPT");
+        assert!(detail.contains("sy-timer"), "{detail}");
+    }
+
+    /// A node a release adds to the role: the previous orchestrator's update does not know it, the
+    /// new one's start installs it from dist once its binary there is the manifest's, recorded as
+    /// created; a rollback stops it before it removes its unit and binary.
+    #[test]
+    fn a_node_a_release_adds_is_installed_at_the_start_and_a_rollback_stops_it_first() {
+        let test = TestCoreHost::new("add");
+        let dist = test.root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        for name in ["rt-gateway", "sy-orchestrator", "sy-config-routes"] {
+            test.install(name, "new");
+        }
+        let release = [
+            ("rt-gateway", "new"),
+            ("sy-orchestrator", "new"),
+            ("sy-config-routes", "new"),
+            ("sy-timer", "new"),
+        ];
+        let manifest = manifest_for(&release);
+        for (name, body) in &release[..3] {
+            fs::write(dist.join(name), body).expect("dist binary");
+        }
+        let dir = stamp_update(&test, &["rt-gateway", "sy-orchestrator"], &[], "newhash");
+        let list: Vec<String> = [
+            "rt-gateway",
+            "sy-config-routes",
+            "sy-timer",
+            "sy-orchestrator",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        let settle = |now: u64| {
+            settle_core_generation(
+                &test.host,
+                &test.root.join("generations"),
+                "newhash",
+                &manifest,
+                &dist,
+                &list,
+                now,
+            )
+            .expect("settle")
         };
-        assert!(validate_system_nodes(&cloud_mb, HiveRole::Motherbee).is_err());
+
+        // Its binary is still on its way: pending, the generation stays open.
+        let outcome = settle(1).expect("open");
+        assert_eq!(outcome.pending, vec!["sy-timer".to_string()]);
+        assert!(!outcome.settled);
+        assert!(!test.host.bin_path("sy-timer").exists());
+
+        // Dist holds it now: installed, and recorded as created by the update.
+        fs::write(dist.join("sy-timer"), "new").expect("arrived");
+        let outcome = settle(2).expect("open");
+        assert_eq!(outcome.installed, vec!["sy-timer".to_string()]);
+        assert!(outcome.settled, "{outcome:?}");
+        assert_eq!(
+            fs::read_to_string(test.host.bin_path("sy-timer")).expect("installed"),
+            "new"
+        );
+        let generation = read_core_backup_generation(&dir).expect("stamp");
+        assert_eq!(
+            generation.created_without_backup,
+            vec!["sy-timer".to_string()]
+        );
+
+        // Its start wrote its unit, and it runs. The rollback stops it while its binary is still
+        // there, then removes unit and binary.
+        fs::write(
+            test.host.unit_path("sy-timer"),
+            core_service_unit_contents("sy-timer", &service_to_exec("sy-timer")),
+        )
+        .expect("unit");
+        test.active
+            .lock()
+            .expect("active")
+            .insert("sy-timer".to_string());
+        let (selected, generation) = select_core_backup_generation(
+            &test.root.join("generations"),
+            &CoreRollbackSelector::Latest,
+        )
+        .expect("verifies");
+        let restored = restore_core_generation(&test.host, &selected, &generation);
+        assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+        assert_eq!(restored.removed, vec!["sy-timer".to_string()]);
+        assert!(!test.running("sy-timer"));
+        assert!(!test.host.bin_path("sy-timer").exists());
+        assert!(!test.host.unit_path("sy-timer").exists());
+        assert_eq!(
+            test.calls().first().map(String::as_str),
+            Some("stop sy-timer (binary)"),
+            "stopped before its binary went"
+        );
+        assert_eq!(
+            fs::read_to_string(test.host.bin_path("sy-orchestrator")).expect("restored"),
+            "old"
+        );
+    }
+
+    /// A node the previous orchestrator's update left out while the new list still names it (its
+    /// binary set aside in dist, say) keeps the generation open, and is not touched.
+    #[test]
+    fn a_node_left_out_that_the_new_list_names_keeps_the_update_open() {
+        let test = TestCoreHost::new("open");
+        let dist = test.root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        for name in ["rt-gateway", "sy-orchestrator", "sy-timer"] {
+            test.install(name, "new");
+        }
+        let manifest = manifest_for(&[
+            ("rt-gateway", "new"),
+            ("sy-orchestrator", "new"),
+            ("sy-timer", "new"),
+        ]);
+        stamp_update(&test, &["sy-orchestrator"], &["sy-timer"], "newhash");
+        let list: Vec<String> = ["rt-gateway", "sy-timer", "sy-orchestrator"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let outcome = settle_core_generation(
+            &test.host,
+            &test.root.join("generations"),
+            "newhash",
+            &manifest,
+            &dist,
+            &list,
+            1,
+        )
+        .expect("settle")
+        .expect("open");
+        assert_eq!(outcome.pending, vec!["sy-timer".to_string()]);
+        assert!(outcome.dropped.is_empty() && outcome.installed.is_empty());
+        assert!(!outcome.settled);
+        assert!(test.running("sy-timer") && test.host.bin_path("sy-timer").exists());
+        // Another release's generation, or none, is nothing to settle.
+        assert_eq!(
+            settle_core_generation(
+                &test.host,
+                &test.root.join("generations"),
+                "otherhash",
+                &manifest,
+                &dist,
+                &list,
+                2,
+            )
+            .expect("settle"),
+            None
+        );
     }
 
     #[test]
@@ -36562,7 +37689,7 @@ LISTEN 0 4096 0.0.0.0:notaport 0.0.0.0:* users:(("sy-architect",pid=1,fd=7))
     #[test]
     fn blob_runtime_from_hive_defaults_include_gc() {
         let hive: HiveFile = serde_yaml::from_str("hive_id: sandbox\n").expect("parse hive");
-        let blob = blob_runtime_from_hive(&hive);
+        let blob = blob_runtime_from_hive(&hive, HiveRole::Worker);
         assert_eq!(blob.gc_enabled, DEFAULT_BLOB_GC_ENABLED);
         assert_eq!(blob.gc_interval_secs, DEFAULT_BLOB_GC_INTERVAL_SECS);
         assert_eq!(blob.gc_apply, DEFAULT_BLOB_GC_APPLY);
@@ -36586,7 +37713,7 @@ blob:
     active_retain_days: 45
 "#;
         let hive: HiveFile = serde_yaml::from_str(hive_yaml).expect("parse hive");
-        let blob = blob_runtime_from_hive(&hive);
+        let blob = blob_runtime_from_hive(&hive, HiveRole::Motherbee);
         assert!(blob.gc_enabled);
         assert_eq!(blob.gc_interval_secs, 1800);
         assert!(blob.gc_apply);

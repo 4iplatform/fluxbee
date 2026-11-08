@@ -68,7 +68,7 @@ INFRA_PREFIXES = ("edge_channel_secret:", "edge_tls", "acme_account")
 INFRA_KEYS = ("storage_postgres_url",)
 SYSTEM_NODE_PREFIXES = ("SY.", "RT.")
 WF_NODE_PREFIX = "WF."
-WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (hive.yaml system_nodes)
+WF_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.wf-rules (src/release_settings.rs)
 COGNITION_HIVE_ROLES = ("motherbee", "worker")  # the roles that run SY.cognition (the same)
 CONVERSATION_DIRS = ("thread-state", "immediate-memory")
 

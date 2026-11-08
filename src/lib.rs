@@ -3,6 +3,7 @@ pub mod instance_lock;
 pub mod mesh_hmac;
 mod opa;
 pub mod paths;
+pub mod release_settings;
 pub mod router;
 pub mod runtime_manifest;
 pub mod runtime_package;

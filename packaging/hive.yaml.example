@@ -87,92 +87,24 @@ identity:
 government:
   identity_frontdesk: "SY.frontdesk.gov@motherbee"
 
-# Blob runtime config.
+# What the release defines for each role lives in the code, not here
+# (src/release_settings.rs, docs/hive-config-update-v1.md §3): the SY nodes each role runs, in
+# their start order and with the ones the start waits for, and the blob's and dist's topology
+# (enabled, sync, the public channel, the sync tool). They reach every hive with the binaries that
+# read them. This file holds the hive's own: its paths and ports. A hive.yaml that still holds
+# those keys (system_nodes, blob.enabled, blob.sync.enabled|public_enabled|tool,
+# dist.sync.enabled|tool) still loads: the orchestrator names them at its start and ignores them.
+
+# The blob store's path, and Syncthing's API port and home.
 blob:
-  enabled: true
   path: "/var/lib/fluxbee/blob"
   sync:
-    enabled: true
-    # Dedicated one-way public artifact channel: motherbee sends, ingress receives.
-    public_enabled: true
-    tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
 
-# Runtime artifact distribution config.
+# The runtime artifact distribution's path.
 dist:
   path: "/var/lib/fluxbee/dist"
-  sync:
-    enabled: true
-    tool: "syncthing"
-
-# Declarative packaged platform topology per hive role. `nodes` is the start order;
-# `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. Only SY.* system authorities are listed here; the managed IO/AI
-# runtimes (io.api, io.blob, io.cloud, io.slack, ai.generic, ...) are NOT lifecycle
-# nodes — the orchestrator spawns them via run_node (fluxbee-firstboot boot_runtimes)
-# after the hive is ready. Identity seeds deterministic ILKs only for the SY.* entries.
-# Workers do not run SY.vault.
-system_nodes:
-  motherbee:
-    # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
-    #   1. SY.config.routes FIRST (writer of /jsr-config-<hive> SHM).
-    #   2. All vault consumers SECOND (they register with the router before
-    #      vault emits its bootstrap broadcast; each tolerates VAULT_UNAVAILABLE).
-    #   3. SY.vault LAST — broadcasts only reach already-registered nodes.
-    nodes:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.admin
-      - SY.architect
-      - SY.storage
-      - SY.cognition
-      - SY.timer
-      - SY.wf-rules
-      - SY.frontdesk.gov
-      - SY.vault
-    wait_for:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.admin
-      - SY.cognition
-      - SY.timer
-      - SY.vault
-  worker:
-    nodes:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.cognition
-      - SY.timer
-      - SY.wf-rules
-    wait_for:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.cognition
-      - SY.timer
-  # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
-  # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no
-  # SY.identity (its ILK is deterministic), and it is not a readiness gate here.
-  egress:
-    nodes:
-      - SY.config.routes
-      - SY.opa.rules
-    wait_for:
-      - SY.config.routes
-  # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
-  # role==ingress) and reverse-proxies /e/<ich> into the mesh. No SY.identity here
-  # (identity frontier) — the edge forwards by pre-resolved owner name (Option Z).
-  ingress:
-    nodes:
-      - SY.config.routes
-      - SY.opa.rules
-      - SY.edge
-    wait_for:
-      - SY.config.routes
 
 # --- edge: the public ingress door (only used when role: ingress) ---
 # Uncommented on an ingress hive. SY.edge serves the public HTTPS door with the
@@ -214,7 +146,7 @@ system_nodes:
 #     - "192.168.8.0/24"     # an operator network
 #     - "fd00:10::5"         # one address
 
-# --- egress (root-level section; NOT the `system_nodes.egress` list above) ------------
+# --- egress (root-level section; NOT the egress role's SY nodes, which the release defines) --
 # The managed internet chokepoint. `gateway_ip` means, BY CONTRACT, "where the WORKERS
 # egress": add_hive injects that default route into workers provisioned AFTER it is set.
 #

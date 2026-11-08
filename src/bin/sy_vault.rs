@@ -24,6 +24,7 @@ use fluxbee_sdk::{
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
     MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
+use json_router::release_settings::HiveRole;
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -373,12 +374,11 @@ impl HandlerOutcome {
     }
 }
 
-/// Compute the set of well-known SY system ILKs from `hive.yaml`. Includes
-/// `self_ilk` (vault), `well_known_admin_ilks` (admin + architect), and
-/// every SY.* entry in `system_nodes.<role>.nodes` mapped via
-/// `deterministic_system_ilk_id`. Reads `hive.yaml` directly from disk;
-/// does NOT depend on identity SHM being populated. This is what closes
-/// the boot chicken-and-egg in Model D'.
+/// Compute the set of well-known SY system ILKs. Includes `self_ilk` (vault),
+/// `well_known_admin_ilks` (admin + architect), and every SY node the release runs on this hive's
+/// role (`release_settings`; the role from `hive.yaml`, the motherbee when it names none) mapped
+/// via `deterministic_system_ilk_id`. Does NOT depend on identity SHM being populated. This is what
+/// closes the boot chicken-and-egg in Model D'.
 fn compute_well_known_system_ilks(
     config_dir: &Path,
     hive_id: &str,
@@ -406,32 +406,18 @@ fn compute_well_known_system_ilks(
     let role = value
         .get("role")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| "motherbee".to_string());
-    if let Some(nodes) = value
-        .get("system_nodes")
-        .and_then(|sn| sn.get(role.as_str()))
-        .and_then(|r| r.get("nodes"))
-        .and_then(|n| n.as_sequence())
-    {
-        for entry in nodes {
-            if let Some(name) = entry.as_str() {
-                let name = name.trim();
-                if !name.starts_with("SY.") {
-                    tracing::debug!(
-                        node = name,
-                        "skipping non-SY lifecycle node in well-known system ILK set"
-                    );
-                    continue;
-                }
-                let l2 = if name.contains('@') {
-                    name.to_string()
-                } else {
-                    format!("{}@{}", name, hive_id)
-                };
-                set.insert(fluxbee_sdk::deterministic_system_ilk_id(&l2));
-            }
-        }
+        .unwrap_or("motherbee");
+    let Some(role) = HiveRole::from_role(Some(role)) else {
+        tracing::warn!(
+            role,
+            "hive.yaml names no known role; SY system ILK set will be admin+architect+self only"
+        );
+        return set;
+    };
+    for name in role.settings().system_nodes.nodes {
+        set.insert(fluxbee_sdk::deterministic_system_ilk_id(&format!(
+            "{name}@{hive_id}"
+        )));
     }
     set
 }
@@ -2247,8 +2233,10 @@ mod tests {
             .expect("well-known system caller reads root pool");
     }
 
+    /// The well-known SY ILKs are the release's SY nodes for the hive's role, the motherbee's list
+    /// hive.yaml's `system_nodes` gave; a `system_nodes` still in the file is ignored.
     #[test]
-    fn well_known_system_ilks_exclude_packaged_io_lifecycle_nodes() {
+    fn well_known_system_ilks_come_from_the_release_s_list() {
         let config_dir = std::env::temp_dir().join(format!(
             "fluxbee-vault-system-ilks-{}",
             Uuid::new_v4().simple()
@@ -2266,13 +2254,24 @@ mod tests {
         let system_ilks =
             compute_well_known_system_ilks(&config_dir, "motherbee", &self_ilk, &admin_set);
 
-        assert!(system_ilks.contains(&self_ilk));
-        assert!(system_ilks.contains(&admin_ilk));
-        assert!(
-            system_ilks.contains(&fluxbee_sdk::deterministic_system_ilk_id(
-                "SY.identity@motherbee"
-            ))
-        );
+        let expected: HashSet<String> = [
+            "SY.config.routes",
+            "SY.identity",
+            "SY.opa.rules",
+            "SY.admin",
+            "SY.architect",
+            "SY.storage",
+            "SY.cognition",
+            "SY.timer",
+            "SY.wf-rules",
+            "SY.frontdesk.gov",
+            "SY.vault",
+        ]
+        .iter()
+        .map(|node| fluxbee_sdk::deterministic_system_ilk_id(&format!("{node}@motherbee")))
+        .collect();
+        assert_eq!(system_ilks, expected);
+        assert!(system_ilks.contains(&self_ilk) && system_ilks.contains(&admin_ilk));
         assert!(
             !system_ilks.contains(&fluxbee_sdk::deterministic_system_ilk_id(
                 "IO.blob@motherbee"

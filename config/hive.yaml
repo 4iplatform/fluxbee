@@ -51,105 +51,17 @@ identity:
 government:
   identity_frontdesk: "SY.frontdesk.gov@motherbee"
 
-# Blob runtime config.
+# What the release defines for each role lives in the code, not here
+# (src/release_settings.rs, docs/hive-config-update-v1.md §3): the SY nodes each role runs and the
+# blob's and dist's topology. This file holds the hive's own paths and ports.
+
+# The blob store's path, and Syncthing's API port and home.
 blob:
-  enabled: true
   path: "/var/lib/fluxbee/blob"
   sync:
-    enabled: true
-    public_enabled: true
-    tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
 
-# Runtime artifact distribution config.
+# The runtime artifact distribution's path.
 dist:
   path: "/var/lib/fluxbee/dist"
-  sync:
-    enabled: true
-    tool: "syncthing"
-
-# Declarative packaged platform topology per hive role. `nodes` is the start order;
-# `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. Only SY.* system authorities are listed: the managed IO/AI runtimes
-# (io.blob, io.cloud, ...) are spawned by the orchestrator via run_node, and
-# validate_system_nodes rejects any other entry. Workers do not run SY.vault.
-system_nodes:
-  motherbee:
-    # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
-    #
-    # 1. SY.config.routes FIRST — writer of /jsr-config-<hive> SHM that
-    #    the router consults for cross-hive route lookups. Other SY nodes
-    #    don't depend on its SHM being populated to register, but having
-    #    it first guarantees routes exist before any cross-hive traffic.
-    # 2. All vault consumers SECOND (identity, admin, architect, storage,
-    #    cognition, opa.rules, timer, wf-rules, frontdesk-gov)
-    #    so they REGISTER WITH THE ROUTER before vault emits its
-    #    bootstrap broadcast. Each consumer tolerates VAULT_UNAVAILABLE
-    #    at its initial lookup — it logs degraded and waits for the
-    #    rescue broadcast. Every SY computes its own deterministic
-    #    system ILK locally (no SHM/seed dependency on identity).
-    # 3. SY.vault LAST — opens vault.db, registers, and emits one
-    #    VAULT_SECRET_CHANGED { op=put } per existing secret. Because
-    #    every consumer is already in the router's registry at this
-    #    point, the broadcasts land and the consumers react
-    #    (exit/refresh) to converge to configured.
-    #
-    # Why vault last (counter-intuitive): broadcasts only reach nodes
-    # registered at the moment of emission (router/mod.rs:1066 —
-    # `for (uuid, handle) in nodes_guard.iter()`). If vault emits
-    # first, no consumer is registered yet and the broadcast is lost,
-    # leaving the cluster stuck. Vault-last guarantees delivery.
-    nodes:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.admin
-      - SY.architect
-      - SY.storage
-      - SY.cognition
-      - SY.timer
-      - SY.wf-rules
-      - SY.frontdesk.gov
-      - SY.vault
-    wait_for:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.admin
-      - SY.cognition
-      - SY.timer
-      - SY.vault
-  worker:
-    nodes:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.cognition
-      - SY.timer
-      - SY.wf-rules
-    wait_for:
-      - SY.config.routes
-      - SY.identity
-      - SY.opa.rules
-      - SY.cognition
-      - SY.timer
-  # SY.opa.rules runs on EVERY role: the router of each hive enforces the one global user
-  # policy, compiled on the motherbee and synced to all hives (dist/policy). It needs no
-  # SY.identity (its ILK is deterministic), and it is not a readiness gate here.
-  egress:
-    nodes:
-      - SY.config.routes
-      - SY.opa.rules
-    wait_for:
-      - SY.config.routes
-  # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
-  # role==ingress) and reverse-proxies /e/<ich> into the mesh. No SY.identity here
-  # (identity frontier) — the edge forwards by pre-resolved owner name (Option Z).
-  ingress:
-    nodes:
-      - SY.config.routes
-      - SY.opa.rules
-      - SY.edge
-    wait_for:
-      - SY.config.routes

@@ -26,6 +26,7 @@ use fluxbee_sdk::{
     NodeConfig, NodeSender, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
     VaultCallerOwned, VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
+use json_router::release_settings::{self, HiveRole};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
     IdentityRegionReader, IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry,
@@ -203,6 +204,8 @@ struct IdentityConfigStateFile {
     updated_at: String,
 }
 
+/// `/etc/fluxbee/hive.yaml`, what SY.identity reads of it. The SY nodes it seeds system ILKs for are
+/// the release's (`release_settings`); a `system_nodes` key there is ignored.
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
@@ -212,21 +215,6 @@ struct HiveFile {
     government: Option<GovernmentSection>,
     #[serde(default)]
     identity: Option<IdentitySection>,
-    #[serde(default)]
-    system_nodes: Option<SystemNodesSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemNodesSection {
-    #[serde(default)]
-    motherbee: Option<RoleSystemNodes>,
-    #[serde(default)]
-    worker: Option<RoleSystemNodes>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RoleSystemNodes {
-    nodes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -989,9 +977,11 @@ impl IdentityStore {
         None
     }
 
-    fn ensure_system_ilks_from_hive(&mut self, hive: &HiveFile) -> Result<Vec<IlkRecord>, String> {
+    /// Seeds the deterministic system ILK of each SY node this release runs on the hive
+    /// (`system_nodes_for_hive`), the root tenant first. The records it changed.
+    fn ensure_system_ilks_from_hive(&mut self, hive: &HiveFile) -> Vec<IlkRecord> {
         self.ensure_default_root_tenant();
-        let nodes = system_nodes_for_hive(hive)?;
+        let nodes = system_nodes_for_hive(hive);
         let mut changed = Vec::new();
         for base_name in nodes {
             let node_name = ensure_l2_name(&base_name, &hive.hive_id);
@@ -1006,7 +996,7 @@ impl IdentityStore {
                     "system_node": base_name,
                     "service": name_to_service(&base_name),
                     "hive_id": hive.hive_id.as_str(),
-                    "source": "hive.system_nodes"
+                    "source": SYSTEM_ILK_SOURCE
                 }),
                 definition: json!({}),
                 channels: Vec::new(),
@@ -1029,7 +1019,7 @@ impl IdentityStore {
                 changed.push(next);
             }
         }
-        Ok(changed)
+        changed
     }
 
     /// ILK_PROVISION: find the ILK that holds (channel, address, scope), or mint a temporary one
@@ -4519,31 +4509,24 @@ async fn main() -> Result<(), IdentityError> {
             tracing::warn!("identity replica mode without identity.sync.upstream; starting with local in-memory state");
         }
     }
-    match runtime.store.ensure_system_ilks_from_hive(&hive) {
-        Ok(changed_ilks) => {
-            if !changed_ilks.is_empty() {
-                tracing::info!(
-                    count = changed_ilks.len(),
-                    "seeded deterministic system ILKs from hive.yaml"
-                );
-            }
-            if is_primary {
-                if let Some(database_config) = runtime.db_config.clone() {
-                    for ilk in &changed_ilks {
-                        if let Err(err) = persist_ilk_state_in_db(&database_config, ilk, None).await
-                        {
-                            tracing::warn!(
-                                ilk_id = %ilk.ilk_id,
-                                error = %err,
-                                "failed to persist deterministic system ILK"
-                            );
-                        }
-                    }
+    let changed_ilks = runtime.store.ensure_system_ilks_from_hive(&hive);
+    if !changed_ilks.is_empty() {
+        tracing::info!(
+            count = changed_ilks.len(),
+            "seeded deterministic system ILKs for the release's SY nodes of this hive"
+        );
+    }
+    if is_primary {
+        if let Some(database_config) = runtime.db_config.clone() {
+            for ilk in &changed_ilks {
+                if let Err(err) = persist_ilk_state_in_db(&database_config, ilk, None).await {
+                    tracing::warn!(
+                        ilk_id = %ilk.ilk_id,
+                        error = %err,
+                        "failed to persist deterministic system ILK"
+                    );
                 }
             }
-        }
-        Err(err) => {
-            return Err(format!("failed to seed system ILKs from hive.yaml: {err}").into());
         }
     }
     // Opened only now that the store is complete (a replica's full sync included), so the limits
@@ -4775,9 +4758,7 @@ async fn main() -> Result<(), IdentityError> {
                             let metrics = store.metrics();
                             runtime.store = *store;
                             replica_has_baseline = true;
-                            if let Err(err) = runtime.store.ensure_system_ilks_from_hive(&hive) {
-                                tracing::warn!(error = %err, "failed to re-seed system ILKs after identity resync");
-                            }
+                            runtime.store.ensure_system_ilks_from_hive(&hive);
                             tracing::info!(metrics = %metrics, "identity full sync applied (delta stream subscribed)");
                         }
                         ReplicaSyncEvent::Delta(envelope) => runtime.store.apply_delta(envelope.delta),
@@ -6805,8 +6786,14 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
     Ok(serde_yaml::from_str(&raw)?)
 }
 
+/// The `identification.source` of the system ILKs `ensure_system_ilks_from_hive` seeds. The name is
+/// the one those records were first written with, when the list came from hive.yaml's
+/// `system_nodes`; it names the seeded ILKs, and the list now comes from the release
+/// (`release_settings`).
+const SYSTEM_ILK_SOURCE: &str = "hive.system_nodes";
+
 /// An ILK is well-known and seeded by `ensure_system_ilks_from_hive` when
-/// `identification.source == "hive.system_nodes"`. These ILKs are the
+/// `identification.source == SYSTEM_ILK_SOURCE`. These ILKs are the
 /// deterministic SY identities and must not be removable through admin paths:
 /// their deletion would silently break vault authorization and node bootstrap
 /// the next time the SY node restarts.
@@ -6814,57 +6801,29 @@ fn is_well_known_system_ilk(ilk: &IlkRecord) -> bool {
     ilk.identification
         .get("source")
         .and_then(Value::as_str)
-        .map(|value| value == "hive.system_nodes")
+        .map(|value| value == SYSTEM_ILK_SOURCE)
         .unwrap_or(false)
 }
 
-fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
-    let section = hive
-        .system_nodes
-        .as_ref()
-        .ok_or_else(|| "system_nodes section is required".to_string())?;
-    let is_primary = is_mother_role(hive.role.as_deref());
-    let role_section = if is_primary {
-        section.motherbee.as_ref()
+/// The SY nodes this hive's system ILKs are seeded for: the release's list for the motherbee on
+/// the primary, and the worker's on a replica (SY.identity runs on those two roles only).
+fn system_nodes_for_hive(hive: &HiveFile) -> Vec<String> {
+    let role = if is_mother_role(hive.role.as_deref()) {
+        HiveRole::Motherbee
     } else {
-        section.worker.as_ref()
-    }
-    .ok_or_else(|| {
-        format!(
-            "system_nodes.{} section is required",
-            if is_primary { "motherbee" } else { "worker" }
-        )
-    })?;
-    let nodes = &role_section.nodes;
-    if nodes.is_empty() {
-        return Err("system node list is empty".to_string());
-    }
-    let mut seen_nodes = HashSet::new();
-    let mut out = Vec::with_capacity(nodes.len());
-    for raw_name in nodes {
-        let name = raw_name.trim();
-        if !seen_nodes.insert(name.to_string()) {
-            return Err(format!("duplicate system node '{name}'"));
-        }
-        if !name.starts_with("SY.") {
-            if is_primary && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name) {
-                continue;
-            }
-            return Err(format!(
-                "lifecycle node '{name}' must use SY.* naming or be an allowlisted motherbee packaged node"
-            ));
-        }
-        out.push(name.to_string());
-    }
-    Ok(out)
+        HiveRole::Worker
+    };
+    role.settings()
+        .system_nodes
+        .nodes
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
 }
 
-/// Derive the systemd-style service name for a SY base name. Matches the orchestrator's
-/// helper of the same name — keep both in sync if either changes.
+/// The systemd service of an SY node (`release_settings::service_name`, the orchestrator's too).
 fn name_to_service(node_name: &str) -> String {
-    let trimmed = node_name.trim();
-    let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
-    format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
+    release_settings::service_name(node_name)
 }
 
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {
@@ -9279,12 +9238,6 @@ mod tests {
                 identity_frontdesk: identity_frontdesk.map(str::to_string),
             }),
             identity: None,
-            system_nodes: Some(SystemNodesSection {
-                motherbee: Some(RoleSystemNodes {
-                    nodes: vec!["SY.identity".to_string(), "SY.architect".to_string()],
-                }),
-                worker: None,
-            }),
         }
     }
 
@@ -9855,10 +9808,11 @@ mod tests {
         let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
         let mut store = IdentityStore::default();
 
-        let changed = store
-            .ensure_system_ilks_from_hive(&hive)
-            .expect("seed system ilks");
-        assert_eq!(changed.len(), 2);
+        let changed = store.ensure_system_ilks_from_hive(&hive);
+        assert_eq!(
+            changed.len(),
+            HiveRole::Motherbee.settings().system_nodes.nodes.len()
+        );
 
         let identity_node = "SY.identity@motherbee";
         let identity_ilk_id = deterministic_system_ilk_id(identity_node);
@@ -9877,38 +9831,69 @@ mod tests {
             Some(identity_node)
         );
 
-        let changed_again = store
-            .ensure_system_ilks_from_hive(&hive)
-            .expect("seed system ilks idempotently");
+        let changed_again = store.ensure_system_ilks_from_hive(&hive);
         assert!(changed_again.is_empty());
     }
 
+    /// The system ILKs come from the release's list for the hive (the motherbee's on the primary,
+    /// the worker's on a replica), the same lists hive.yaml's `system_nodes` gave; a `system_nodes`
+    /// still in the file is ignored, whatever it says.
     #[test]
-    fn io_blob_is_no_longer_an_allowlisted_hive_yaml_lifecycle_node() {
-        // IO.blob was promoted from a packaged systemd unit to a managed runtime, so it is no longer
-        // allowed in hive.yaml system_nodes — Identity rejects the hive config, same as io.cloud.
-        let mut hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
-        hive.system_nodes
-            .as_mut()
-            .and_then(|section| section.motherbee.as_mut())
-            .expect("motherbee system nodes")
-            .nodes
-            .push("IO.blob".to_string());
-
-        assert!(system_nodes_for_hive(&hive).is_err());
-    }
-
-    #[test]
-    fn identity_rejects_unallowlisted_io_lifecycle_node() {
-        let mut hive = test_hive(None);
-        hive.system_nodes
-            .as_mut()
-            .and_then(|section| section.motherbee.as_mut())
-            .expect("motherbee system nodes")
-            .nodes
-            .push("IO.cloud".to_string());
-
-        assert!(system_nodes_for_hive(&hive).is_err());
+    fn system_ilks_come_from_the_release_s_lists_not_hive_yaml() {
+        let old_lists = [
+            (
+                "motherbee",
+                "motherbee",
+                &[
+                    "SY.config.routes",
+                    "SY.identity",
+                    "SY.opa.rules",
+                    "SY.admin",
+                    "SY.architect",
+                    "SY.storage",
+                    "SY.cognition",
+                    "SY.timer",
+                    "SY.wf-rules",
+                    "SY.frontdesk.gov",
+                    "SY.vault",
+                ][..],
+            ),
+            (
+                "worker9",
+                "worker",
+                &[
+                    "SY.config.routes",
+                    "SY.identity",
+                    "SY.opa.rules",
+                    "SY.cognition",
+                    "SY.timer",
+                    "SY.wf-rules",
+                ][..],
+            ),
+        ];
+        for (hive_id, role, expected) in old_lists {
+            let hive: HiveFile = serde_yaml::from_str(&format!(
+                "hive_id: {hive_id}\nrole: {role}\nsystem_nodes:\n  {role}:\n    nodes:\n      - SY.identity\n      - IO.blob\n"
+            ))
+            .expect("a hive.yaml with the old key");
+            assert_eq!(system_nodes_for_hive(&hive), expected, "{role}");
+            let mut store = IdentityStore::default();
+            let seeded: HashSet<String> = store
+                .ensure_system_ilks_from_hive(&hive)
+                .into_iter()
+                .map(|ilk| ilk.ilk_id)
+                .collect();
+            let wanted: HashSet<String> = expected
+                .iter()
+                .map(|node| deterministic_system_ilk_id(&format!("{node}@{hive_id}")))
+                .collect();
+            assert_eq!(seeded, wanted, "{role}");
+            assert!(!seeded.contains(&deterministic_system_ilk_id(&format!("IO.blob@{hive_id}"))));
+            assert!(store
+                .ilks
+                .values()
+                .all(|ilk| ilk.ilk_type != "system" || is_well_known_system_ilk(ilk)));
+        }
     }
 
     #[test]
