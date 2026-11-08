@@ -48,10 +48,26 @@ func TestTheBakedSystemPolicyIsTheRegoCompiled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the Rego: %v", err)
 	}
-	for _, baked := range []struct{ entrypoint, path string }{
+	pairs := []struct{ entrypoint, path string }{
 		{"fluxbee/system/allow", "../../policy/system.wasm"},
 		{"fluxbee/system/frontdesk_route", "../../policy/system_route.wasm"},
-	} {
+	}
+	// The router bakes these files, each loaded for its entrypoint, and no other.
+	router, err := os.ReadFile("../../src/router/system_policy.rs")
+	if err != nil {
+		t.Fatalf("read the router's system policy: %v", err)
+	}
+	if baked := strings.Count(string(router), `include_bytes!("../../policy/`); baked != len(pairs) {
+		t.Errorf("src/router/system_policy.rs bakes %d policy files, this test checks %d", baked, len(pairs))
+	}
+	for _, pair := range pairs {
+		file := strings.TrimPrefix(pair.path, "../../policy/")
+		if !strings.Contains(string(router), `include_bytes!("../../policy/`+file+`")`) ||
+			!strings.Contains(string(router), `"`+pair.entrypoint+`".to_string()`) {
+			t.Errorf("src/router/system_policy.rs no longer bakes %s for %s", file, pair.entrypoint)
+		}
+	}
+	for _, baked := range pairs {
 		wasm, hash, _, err := compileRego(string(rego), baked.entrypoint)
 		if err != nil {
 			t.Fatalf("compile %s: %v", baked.entrypoint, err)
