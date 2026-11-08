@@ -111,13 +111,15 @@ no change required
       operator's calls made (2026-11-08): cognition does not judge them, and the person gets one
       fixed message in English.
 8. **Design first, one at a time, the largest:**
-   1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
-   2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
+   1. In design now, A-181: a hive's shared config travels in the update
+      ([hive-config-update-v1](../../docs/hive-config-update-v1.md)).
+   2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
+   3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
-   3. io.web's stage 2, on the operator's definition of its security.
-   4. A-159: deleting an ILK that other data names, the episodes now among them; a chapter of
+   4. io.web's stage 2, on the operator's definition of its security.
+   5. A-159: deleting an ILK that other data names, the episodes now among them; a chapter of
       its own.
-   5. A-96: how the SY nodes' tokens are measured per message.
+   6. A-96: how the SY nodes' tokens are measured per message.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -217,8 +219,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
 - A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
   2026-11-08; router-stream-v1 §8).
-- A-181 🔵 A blob folder turned on after the joins: how a motherbee setting reaches the hives
-  that joined before it (the operator's).
+- A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
+  release's new SY node). In design: the update carries it
+  ([hive-config-update-v1](../../docs/hive-config-update-v1.md); its open points are the
+  operator's).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1366,7 +1370,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 TO EVALUATE, for the operator (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] 🔵 IN DESIGN, the operator's direction (2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -1391,6 +1395,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `fluxbee-blob-public` with ingress1, and egress1 has neither. A fresh install copies
   `hive.yaml.example`, whose sync is on, so A-181 bites only an installation that turns the sync
   on after its joins.
+- **The same gap bites in two more places (read 2026-11-08):**
+  - SY.cognition on a worker reads its AI model from its own file, written at its join. worker1's
+    was edited by hand at 0.1.72.
+  - A spoke installs and runs the SY nodes of its own `system_nodes`
+    (`core_component_names_for_role`). A release's new SY node for workers would reach none of them
+    until each file is edited by hand. The motherbee's own file needs it too: the .deb never touches
+    an existing `hive.yaml`.
+- **The operator's direction (2026-11-08):** a change to the hive's config is an update, so it goes
+  through the update channel (*"Todo lo define una versión de software … quedaría todo dentro del
+  canal de update"*). It carries what is general to every hive, and what goes by the hive's role
+  (*"… el JSON que diga el cambio según el perfil del hive"*).
+- **The design's first draft:** [hive-config-update-v1](../../docs/hive-config-update-v1.md).
+  - The core update carries the hive's shared config: the state, with its hash.
+  - Each orchestrator applies it to its own file.
+  - The control path never travels.
+  - Its open points (§8) are the operator's call.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
