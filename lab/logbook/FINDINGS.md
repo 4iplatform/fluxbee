@@ -497,7 +497,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - **Fix (0.1.49):** the snapshot and the plan compiler's `query_hive` query ask
   `SY.admin@motherbee`, with the hive as the target (the admin is, and will be, only on the
   motherbee; operator, 2026-10-01). A source-code test prevents naming a per-hive admin again.
-- **Still open:**
+- **Open after 0.1.49, both closed in 0.1.81 (the WF half above):**
   - The plan compiler does not receive the definition of the declared workflows
     (`wf_deployments`) either: the same gap A-23 had with the rego.
   - On ingress and egress, `list_runtimes` answers `RUNTIME_MANIFEST_MISSING` and there is no
@@ -996,6 +996,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     with no effect.
     - It is a trap: if someone turns ufw on, SSH on every host and the ingress's 443 get blocked.
     - The core rules are never closed.
+    - **Gone since 0.1.83** (docs/control-path-hardening-v1.md §6): no `ufw allow` remains in the
+      orchestrator, which only reads `ufw status` to raise `host_firewall_active`.
   - **They listen on external interfaces:** the ingress's SSH and Syncthing, also on `eth1`
     (public), and the egress's on the office network.
   - **The admin also accepts any address** (`admin.listen` / `JSR_ADMIN_LISTEN`), and it has no
@@ -4053,7 +4055,8 @@ router reviews.
 - **SY.orchestrator:**
   - `remove_hive` revokes neither the spoke's identity key nor its TLS certificate;
   - `syncthing_firewall_rules` still opens 22000/udp and 21027/udp, though Syncthing uses TCP only
-    since host-posture stage 3.
+    since host-posture stage 3. (0.1.81 kept 22000/tcp alone, on the motherbee; since 0.1.83 no
+    `ufw allow` remains in the orchestrator, only a read of `ufw status`.)
 - **AI nodes:**
   - `behavior.instructions` does nothing for a managed agent: its ILK definition, or the
     "unconfigured" prompt, replaces it (the scaffold no longer writes it);
@@ -4464,12 +4467,16 @@ router reviews.
   - the SDK reports a provider HTTP error as a protocol error, and that mixes two cognition
     counters. It goes with the AI SDK review;
   - `config-get` on SY.admin answers with its origin rejection (`CONFIG_GET_RESPONSE`) to a query
-    from the admin itself. Not investigated.
+    from the admin itself. Not investigated. **Fixed in 0.1.81 (A-76):** the gate admits
+    `SY.admin@motherbee` itself, as the system policy delivers it (`admin_origin_authorized`, with a
+    test).
   - **SY.cognition on a worker does not reach the database:** each hive has its embedded NATS, and
     SY.storage runs only on the motherbee. What a worker1 node publishes (its turns, what its
     cognition writes) stays in worker1's NATS, and its rebuild fails ("error connecting to
     server"). It predates this; it matters for stage 5 (where a worker node's consumption gets
-    recorded).
+    recorded). **Obsolete since A-70:** every hive's router stream reaches SY.storage (0.1.76),
+    NATS is gone (0.1.78), and since 0.1.103 SY.cognition keeps its state in its own file on its
+    hive.
 
 ### A-68 ✅ VALIDATED ON 8.x (0.1.70 to 0.1.72, 2026-10-16) — WF nodes were outside the standard: SY.wf-rules handled them directly with the orchestrator, and the Go node had its own control plane
 
@@ -4616,6 +4623,9 @@ router reviews.
     catalog:
     - `orch_system_diag` and the `scripts/orchestrator_*_e2e.sh` that use it;
     - `blob_sync_diag`, whose SYSTEM_SYNC_HINT was already denied.
+
+    **Gone:** `orch_system_diag` and the scripts that drove it in 0.1.80 (the cleanup of
+    2026-10-17, `41decbd`), `blob_sync_diag` in 0.1.81.
 
 ### A-67 ✅ VALIDATED ON 8.x (0.1.68 and 0.1.69, 2026-10-15) — Cloud could not see or manage its nodes, nor suspend a tenant, and a stopped node came back by itself
 
@@ -4969,8 +4979,9 @@ router reviews.
   - a restart of sy-identity, which resolved the ambiguous email live.
 
   Detail in `lab/DEPLOYMENTS.md`.
-- **Pending for the next stages:** reassigning nodes (with the vault's permissions, stage 2), and
-  the tenant's state as a gate and the rest of D8 (stage 3).
+- **Pending for the next stages, settled:** reassigning nodes was dropped, since a node is born and
+  dies in its tenant (D6; stage 2, 0.1.66, A-64); the tenant's state as a gate and the rest of D8
+  came with stage 3 (0.1.67, A-66).
 
 ### A-62 ✅ VALIDATED ON 8.x (0.1.83, 2026-10-22) — Any node on the mesh can ask the admin for any action
 
@@ -5051,7 +5062,8 @@ router reviews.
 - **Validated on 8.x (0.1.64, 2026-10-13):** 53 checks through the real public door with Cloud's
   bearer, plus the ones on the operator's side (the node purge deleted its secret in its tenant,
   the HTTP `DELETE` with and without a tenant, Archi over the mesh), all PASS (ledger 0.1.64).
-  Minor pending item: the admin's HTTP maps `TENANT_NOT_FOUND` to 500.
+  Minor pending item, settled in 0.1.66: the admin's HTTP mapped `TENANT_NOT_FOUND` to 500; it
+  answers 404 (`error_code_to_http_status`, src/bin/sy_admin.rs, with a test).
 
 ### A-60 [General/security] 🟡 PARKED (to evaluate, 2026-10-07; no design yet) — The managed nodes run as root
 
