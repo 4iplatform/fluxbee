@@ -629,7 +629,9 @@ role's list with `systemctl is-active`, and runs `systemctl start` on any that i
 active. A stopped core unit comes back within seconds. The same tick logs managed nodes that left
 the router, verifies runtimes, runs blob GC when enabled, checks Syncthing and its peers, re-applies
 egress and the ingress' SSH table, reports an active host firewall (`watchdog_host_rules`), and runs
-the loopback check.
+the loopback check. While a join's finalize runs on a spoke, its Syncthing is the finalize's: the
+Syncthing check and the peer reconcile leave it alone until the finalize returns
+(`syncthing_finalize_owns_syncthing`, FINDINGS A-194).
 
 To keep a core unit stopped, for a test or a repair, mask it for this boot and stop it:
 `systemctl mask --runtime <unit>` (the lab notes in `lab/DEPLOYMENTS.md` and

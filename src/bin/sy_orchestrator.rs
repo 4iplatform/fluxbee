@@ -11843,6 +11843,20 @@ impl Drop for SyncthingFinalizeInFlight {
     }
 }
 
+/// Whether a join's finalize owns this spoke's Syncthing right now: the peer reconcile and the
+/// watchdog leave config.xml and the service to it (FINDINGS A-194).
+fn syncthing_finalize_owns_syncthing(is_motherbee: bool) -> bool {
+    finalize_owns_syncthing(
+        is_motherbee,
+        SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst),
+    )
+}
+
+/// A finalize runs only on a spoke, never on the motherbee (`spoke_only_action_refusal`).
+fn finalize_owns_syncthing(is_motherbee: bool, finalizes_in_flight: u64) -> bool {
+    !is_motherbee && finalizes_in_flight > 0
+}
+
 /// Present while config.xml may hold a reconcile change that Syncthing has not been restarted
 /// with, so a later round restarts even though it finds nothing to change. A file, so it survives
 /// an orchestrator restart; written before the change is renamed into place, so a crash between
@@ -11888,7 +11902,7 @@ async fn reconcile_syncthing_peer_addresses(
         return Ok(None);
     }
     // On a spoke, a finalize links the motherbee and probes Syncthing: leave both alone.
-    if !state.is_motherbee && SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst) > 0 {
+    if syncthing_finalize_owns_syncthing(state.is_motherbee) {
         return Ok(None);
     }
     let marker = syncthing_restart_pending_marker();
@@ -13363,6 +13377,14 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+    // FINDINGS A-194: a join's finalize on this spoke restarts Syncthing to link the motherbee and
+    // probes its folders. The watchdog leaves Syncthing to it until it returns, as the peer
+    // reconcile does: it restarted one caught mid-restart, and its reconcile could rewrite the
+    // folders while the peer is linked. A config change is still seen, at the next tick.
+    if syncthing_finalize_owns_syncthing(state.is_motherbee) {
+        tracing::debug!("a join's finalize owns Syncthing; the watchdog leaves it alone");
+        return Ok(());
+    }
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -37183,6 +37205,43 @@ mod tests {
         });
         assert!(panicked.is_err());
         assert_eq!(SYNCTHING_FINALIZES_IN_FLIGHT.load(Ordering::SeqCst), before);
+    }
+
+    /// FINDINGS A-194: while a join's finalize runs on a spoke, its Syncthing is the finalize's;
+    /// the motherbee runs no finalize.
+    #[test]
+    fn a_finalize_in_flight_owns_the_spokes_syncthing() {
+        assert!(finalize_owns_syncthing(false, 1));
+        assert!(finalize_owns_syncthing(false, 2));
+        assert!(!finalize_owns_syncthing(false, 0));
+        assert!(!finalize_owns_syncthing(true, 1));
+    }
+
+    /// FINDINGS A-194: the Syncthing watchdog leaves Syncthing alone while a finalize owns it, before
+    /// it reads the desired config (a change is seen at the next tick, not lost) and before any
+    /// check, revert or restart; the peer reconcile asks the same.
+    #[test]
+    fn the_syncthing_watchdog_leaves_a_finalize_alone() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = &src[src
+            .find("async fn watchdog_blob_sync(")
+            .expect("the watchdog")..];
+        let body = &body[..body.find("\n}\n").expect("its end")];
+        let guard = body
+            .find("syncthing_finalize_owns_syncthing(state.is_motherbee)")
+            .expect("the guard");
+        for later in [
+            "blob_sync_last_desired",
+            "check_syncthing_folder(",
+            "ensure_blob_sync_runtime(",
+        ] {
+            assert!(guard < body.find(later).expect(later), "{later}");
+        }
+        let reconcile = &src[src
+            .find("async fn reconcile_syncthing_peer_addresses(")
+            .expect("the peer reconcile")..];
+        let reconcile = &reconcile[..reconcile.find("\n}\n").expect("its end")];
+        assert!(reconcile.contains("syncthing_finalize_owns_syncthing(state.is_motherbee)"));
     }
 
     /// Readers report a state that does not decode; its writer moves it aside and derives the
