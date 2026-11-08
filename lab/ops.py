@@ -165,6 +165,28 @@ def update_open_items(hive, expect_settle):
     return items
 
 
+def spoke_update_times(hive, since):
+    """A spoke's last core update by its own records, in seconds after `since` (epoch): its
+    restarts' start and end (`core-update-last.json`), its install (`core-installed.json`) and the
+    new orchestrator's settle. Each on the spoke's clock."""
+    reply = admin("GET", "/hives/%s/versions" % hive)
+    core = ((reply.get("payload") or {}).get("hive") or {}).get("core") or {}
+    last = core.get("last_update") or {}
+    stamps = [
+        ("restarts began", last.get("started_at_ms")),
+        ("ended", last.get("finished_at_ms")),
+        ("installed", (core.get("installed") or {}).get("installed_at_ms")),
+        ("settled", (last.get("settled") or {}).get("at_ms")),
+    ]
+    parts = []
+    for name, ms in stamps:
+        try:
+            parts.append("%s %+.1fs" % (name, int(ms) / 1000 - since))
+        except (TypeError, ValueError):
+            parts.append("%s -" % name)
+    return ", ".join(parts)
+
+
 def cmd_versions(_a):
     for hive in hives():
         status, versions, digest, source = core_of(hive)
@@ -501,6 +523,10 @@ def cmd_deploy(a):
         times = spoke_times[h]
         print("  %-10s answered %5.1fs, installed %5.1fs, settled %5.1fs after the update call" % (
             h, times.get("answered", 0), times.get("installed", 0), times.get("settled", 0)))
+    # The spokes' own records, on their clocks: when the script saw a state can lag it, as the
+    # motherbee's /versions forward is slow while a spoke's orchestrator restarts (0.1.120).
+    for h in spokes:
+        print("  %-10s by its own records: %s" % (h, spoke_update_times(h, update_sent)))
     print("deploy of %s done in %d s" % (v, time.time() - started))
     sys.exit(0 if ok else 1)
 
