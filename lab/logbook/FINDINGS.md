@@ -105,7 +105,8 @@ no change required
       (SY.orchestrator, and Archi's line on it).
 7. **Then each SDK alone, from the sweep:**
    1. 0.1.113: A-182, the Rust SDK's handshake bounded ✅ live and checked on 8.x (2026-11-08).
-   2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline (built, CI green).
+   2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline ✅ live and checked on 8.x
+      (2026-11-08).
    3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count.
 8. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
@@ -1333,7 +1334,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   retries as Anthropic's, the status read first, and the consumers matching the type instead of the
   text.
 
-### A-183 [General/Go SDK] 🟡 BUILT, for 0.1.114 (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
+### A-183 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.114, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
 
 - **Twice at start:** `connect` handshook on a first connection under a 5 s limit, closed it, and
   its `connectionManager` opened a second one with a second HELLO. The router saw the node
@@ -1343,6 +1344,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (`go/fluxbee-go-sdk/client.go`):** the connection of the first handshake is the one the
   manager serves; `handshakeWithin` bounds every handshake by 5 s. A test with a fake router saw
   the node's first message on its second connection before the fix, and on its first after.
+- **Validated on 8.x (0.1.114):** the motherbee's Go nodes registered twice since their start on
+  0.1.113, once on 0.1.114.
 
 ### A-182 [General/Rust SDK] ✅ VALIDATED ON 8.x (0.1.113, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Rust node's handshake has no time limit
 

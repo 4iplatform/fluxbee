@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ live, checked on 8.x | snap `pre-rustsdk-0-1-113` (all 4 VMs) · `apt install fluxbee=0.1.112` + core-update of the spokes |
+| **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-114` (all 4 VMs) · `apt install fluxbee=0.1.113` + core-update of the spokes |
+| **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ replaced by 0.1.114 | snap `pre-rustsdk-0-1-113` (deleted 2026-11-08) · `apt install fluxbee=0.1.112` + core-update of the spokes |
 | **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ replaced by 0.1.113; its gate found A-185 | snap `pre-take-0-1-112` (deleted 2026-11-08) · `apt install fluxbee=0.1.111` + core-update of the spokes |
 | **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ replaced by 0.1.112 | snap `pre-router-0-1-111` (deleted 2026-11-08) · `apt install fluxbee=0.1.110` + core-update of the spokes |
 | **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ replaced by 0.1.111 | snap `pre-family-0-1-110` (deleted 2026-11-08) · `apt install fluxbee=0.1.109` + core-update of the spokes |
@@ -122,6 +123,27 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.114 — The Go SDK says HELLO once
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.113 · **Commit:** `f8425df5`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** shared code goes alone ([METHOD](logbook/METHOD.md) §9): A-183, from the sweep of
+  pending items.
+- **What changed:** `go/fluxbee-go-sdk/client.go`: the connection of a node's first handshake is
+  the one its manager serves, where it was closed and a second one opened; `handshakeWithin` bounds
+  every handshake by 5 s, at every reconnect too. A router comment that spoke of the second HELLO.
+- **Checks before the release:** Go vet and the SDK's tests on the Mac, one of them seen failing
+  on the old client; GitHub's CI green on its branch and on the integrated head; the review round
+  (shared with 0.1.113): no defect.
+- **Deploy:**
+  - build of `f8425df5` in 27 min; publish in 15 s;
+  - snapshot `pre-gosdk-0-1-114` taken on all 4 VMs, `pre-rustsdk-0-1-113` dropped;
+  - 0.1.114 on all 4 in 260 s, health clean.
+- **Checked on 8.x:** on 0.1.113 each Go node of the motherbee had registered twice since its own
+  start, after the router's; on 0.1.114 once (SY.opa.rules, SY.timer, SY.wf-rules; SY.opa.rules on
+  worker1 too). WF.gate0206@worker1, on wf.engine 0.1.114, registered once with each router
+  process: with the old one a moment before it stopped, and with the new one.
 
 ## 0.1.113 — The Rust SDK's handshake bounded
 
