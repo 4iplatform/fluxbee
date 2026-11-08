@@ -6,8 +6,10 @@
   FINDINGS A-181 (a blob folder turned on after the joins).
 - The operator answered the first draft's open points the same day (§9), and added the rule of §7:
   every hive's config is at one version.
-- Next: the update path's current state with its code, a staged plan, and a DTAP panel before
-  anything is built.
+- The update path's current state (§10) and a staged plan (§11) were written, and a DTAP panel
+  reviewed them the same day.
+- **The panel found four blockers** in §1–§11. §12 has them, and a proposal for the second draft
+  that the operator decides.
 - Nothing is built.
 
 This is the single place for the topic.
@@ -255,3 +257,92 @@ the DTAP panel.
    (§7).
 5. **A-181's blob:** the switch goes, by role. The motherbee's blob folders follow the dist folders'
    members (§8).
+
+## 12. The DTAP panel (2026-11-08), and the second draft's proposal
+
+**The panel:** four reviewers, one per lens, each re-checking its findings in the code. They raised
+70 findings, many the same seen from different lenses:
+
+| Lens | Blockers | Major | Minor |
+| --- | --- | --- | --- |
+| D, development | 2 | 10 | 4 |
+| T, test | 1 | 17 | 3 |
+| A, acceptance | 2 | 9 | 5 |
+| P, production | 3 | 10 | 4 |
+
+**The blockers, the same four from every lens:**
+
+1. **The receiving orchestrator is the previous release's** (D-1, P-3, A-2, T-1, T-13). The update
+   that carries a release's config is handled by the orchestrator that update replaces.
+   - It ignores fields it does not know, so stage 2's own deploy cannot reach version 1.
+   - A release that adds a key is refused by every spoke, for good.
+2. **The file can name binaries the hive lacks** (D-2, P-1, A-1, T-4). Syncthing may deliver the
+   manifest before a binary, and the orchestrator's start stops on a missing binary before it
+   starts Syncthing. The spoke is then off the mesh, and nothing can repair it but SSH. That boot
+   check is also a hazard today: A-186.
+3. **An update's automatic rollbacks restore the binaries and not the file** (P-2, A-1, T-7), so a
+   failed release leaves the new config on the old core.
+4. **An operator's change rides the core path** (D-3, P-4, P-5, A-3, T-3).
+   - The core path restarts the whole core even when it swaps nothing.
+   - It installs what dist holds, not what the hive runs, so a model change re-installs a release
+     the operator rolled back from.
+
+**Also found, and true today:**
+
+- **A-186:** a spoke that restarts while a release syncs never starts again.
+- **A-187:** CI skips the Rust tests that read `packaging/` files when only those files change.
+- **A-188:** a worker's blob GC deletes the motherbee's published sources through the shared
+  folder (T-16).
+
+**The proposal: take the release's keys out of the file.** *"Todo lo define una versión de
+software"* read literally: what the release defines lives in the release, not in a file that must
+be kept in step with it.
+
+1. **The release's keys go into the code, by role:**
+   - `system_nodes` with its order and waits;
+   - the blob's and dist's topology and tool;
+   - the frontdesk's name, with each role's values of today.
+
+   They come with the binaries that use them, so the four blockers no longer apply:
+   - no orchestrator ever judges another release's keys;
+   - a list and its binaries arrive together;
+   - a rollback or a downgrade takes them back with the binaries;
+   - nothing is merged into a file at the install.
+2. **The operator's settings live in one installation file,** owned by the motherbee and
+   distributed to every hive like the policy and the runtimes. Today that is `ai`.
+   - The operator changes it through SY.admin (Archi).
+   - It is applied with the update channel's own pattern: content by Syncthing, then
+     `SYSTEM_UPDATE` with category `config` and the file's hash. The hive answers `sync_pending`
+     until the file arrives, then restarts only what reads a changed setting.
+   - One file means one version by construction, and a hive that was down gets it when it is back.
+3. **`hive.yaml` becomes the hive's own:** its identity, the control path, its local paths and
+   ports. The join writes it, and only that hive's actions change it.
+4. **The start never stops on a dist mismatch** (A-186). The orchestrator starts on what is
+   installed, starts Syncthing, and reports that it waits for its update.
+5. **A node a release drops is stopped and removed** by the core update, and kept in the backup
+   generation for a rollback (D-4, P-16, A-9, T-8).
+6. **The installation's update is SY.admin's** (A-10).
+   - One action updates every hive, core and config. It keeps its state, names the hives not on
+     the version, and resumes.
+   - `ops.py` and Archi call it.
+   - The automatic step of §7 becomes finishing that open update for a hive that comes back. Never
+     a hive the operator rolled back (A-4, P-12, T-17).
+7. **`/versions`** shows each hive's config version and hash beside its core, compared with the
+   motherbee's.
+8. **`blob.gc` stays the motherbee's own** (A-188). **A-181's blob folders** follow the dist
+   folders' members (§8).
+
+**Stages, re-cut:**
+
+1. A-186's start.
+2. The release's keys into the code, with today's values. Golden tests against today's templates
+   and a throwaway worker join.
+3. The installation file, `ai` moved to it, the config update and the operator's action.
+4. The installation's update in SY.admin.
+5. A-181's blob.
+
+The other findings (validation of `ai` with every reader's rules, the readers per role, one locked
+writer of `hive.yaml`, the tests over temporary roots, the gates) go into the second draft's
+sections.
+
+**For the operator:** the proposal's points 1 to 3 (the shape), and point 6's automatic step.

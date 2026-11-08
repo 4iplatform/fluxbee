@@ -220,9 +220,13 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
   2026-11-08; router-stream-v1 §8).
 - A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
-  release's new SY node). In design: the update carries it, at one version on every hive
-  ([hive-config-update-v1](../../docs/hive-config-update-v1.md); the operator's calls made, a
-  DTAP panel next).
+  release's new SY node). In design: one version on every hive, through the update
+  ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). The DTAP panel found four
+  blockers; §12 proposes the second draft, for the operator.
+- A-186 🔴 A spoke that restarts while a release syncs never starts again: its start checks dist
+  before it starts Syncthing.
+- A-187 🔴 CI skips the Rust tests that read `packaging/` files when only those files change.
+- A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1299,6 +1303,49 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   the binary would generate one as root); otherwise, the running Syncthing's `myID`. Never
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
+
+### A-188 [General/blob] 🟡 LATENT (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
+
+- **What happens:**
+  - The blob GC pins the sources of live publications from io.blob's ledger. The ledger lives on
+    the motherbee, where io.blob runs.
+  - On a worker the ledger is absent, so the GC runs with no pins: it only warns
+    (`run_blob_gc_housekeeping`, `src/bin/sy_orchestrator.rs:16575`).
+  - `fluxbee-blob` is send-receive, so a worker's deletions reach the motherbee, and a published
+    page loses its source.
+- **Today:** worker1's `blob.gc.enabled` is false. Only a hand edit turns it on, since only the
+  join writes it.
+- **Fix (proposed):** the GC runs only where it can pin, the motherbee. hive-config-update-v1 keeps
+  `blob.gc` the motherbee's own (§12).
+
+### A-187 [General/CI] 🔴 OPEN (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-14; read in the workflow) — A change to packaging files alone runs none of the Rust tests that read them
+
+- **What happens:** `rust-tests.yml`'s path filters leave out `packaging/**`. Yet Rust tests read
+  three packaging files: `packaging/hive.yaml.example`, `deb-postinst` and `deb-preinst`
+  (`include_str!` at `src/bin/sy_orchestrator.rs:32679`, `:35316` and `:35323`). A branch that
+  edits only those files gets no Rust test.
+- **Fix:** add `packaging/**` to both path lists.
+
+### A-186 [General/orchestrator] 🔴 OPEN (found 2026-11-08 by hive-config-update-v1's DTAP panel, P-1 and A-8; read in the code) — A spoke that restarts while a release is still syncing never starts again
+
+- **What happens:**
+  - At its start, a spoke's orchestrator checks every binary of its role in `dist/core/bin`
+    against the dist core manifest: hash and size (`bootstrap_local` →
+    `validate_core_manifest_for_bins`, `src/bin/sy_orchestrator.rs:1662`).
+  - `main` exits on a mismatch (`:1039`).
+  - Syncthing, the only thing that brings the missing bytes, is started further down in that same
+    start. The join enables only rt-gateway and sy-orchestrator (`:26085`).
+- **When:**
+  - A spoke reboots after Syncthing delivered a release's manifest but before all its binaries.
+  - Or a release drops a node from a role while a spoke's file still lists it: the motherbee
+    prunes that binary from the role's tree, and the spoke's start fails on it.
+- **Impact:**
+  - The orchestrator fails every 5 s, Syncthing never starts, and no update can reach the hive.
+    Only SSH by hand repairs it.
+  - It is rare: it needs a reboot during the minutes a release syncs. When it happens, the hive is
+    lost.
+- **Fix (proposed):** the start never stops on a dist mismatch. It starts on what is installed in
+  `/usr/bin`, starts Syncthing, and reports that it is waiting for its update.
 
 ### A-185 [WF] 🟢 NO CHANGE, the operator's call (2026-11-08; found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
 
