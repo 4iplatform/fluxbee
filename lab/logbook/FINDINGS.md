@@ -220,9 +220,9 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 - A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
   2026-11-08; router-stream-v1 §8).
 - A-181 🔵 A hive's shared config reaches it only at its join (the blob folder, the AI model, a
-  release's new SY node). In design: the update carries it
-  ([hive-config-update-v1](../../docs/hive-config-update-v1.md); its open points are the
-  operator's).
+  release's new SY node). In design: the update carries it, at one version on every hive
+  ([hive-config-update-v1](../../docs/hive-config-update-v1.md); the operator's calls made, a
+  DTAP panel next).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1410,7 +1410,15 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - The core update carries the hive's shared config: the state, with its hash.
   - Each orchestrator applies it to its own file.
   - The control path never travels.
-  - Its open points (§8) are the operator's call.
+- **The operator's calls on the draft (2026-11-08):**
+  - The motherbee's file takes the release's keys at the install: yes, with one rule. Every hive's
+    config is at one version (*"no puede pasar que los archivos de config entre hives sean de
+    distinta versión"*).
+  - The keys stay as listed.
+  - The blob's switch goes.
+  - The worker that joined before the egress is apart, for later.
+- **Next:** the update path's current state, a staged plan and a DTAP panel, before anything is
+  built.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 

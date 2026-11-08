@@ -4,8 +4,10 @@
 
 - The direction was agreed with the operator on 2026-11-08, in a design chat that started from
   FINDINGS A-181 (a blob folder turned on after the joins).
-- This is the design's first draft. Its open points are in §8, for the operator's call before it
-  is built.
+- The operator answered the first draft's open points the same day (§9), and added the rule of §7:
+  every hive's config is at one version.
+- Next: the update path's current state with its code, a staged plan, and a DTAP panel before
+  anything is built.
 - Nothing is built.
 
 This is the single place for the topic.
@@ -139,7 +141,26 @@ What worker1 would get today (the values on 8.x, read 2026-11-08):
   motherbee's. Archi reads it too.
 - Sending it again is the same update.
 
-## 7. A-181 in this design
+## 7. One version for every hive
+
+The operator: *"Lo que sí no puede pasar es que los archivos de config entre hives sean de distinta
+versión. Si cambia versión cambia todo, como un pedazo de software de update."*
+
+- **One version for the installation.** The shared config has one version, and every hive's file
+  carries it beside the shared part. Each release and each operator's change makes a new version,
+  and the update takes it whole (§4) to every hive.
+- **No hive gets a config of its own.** A change is made for the installation, and its update goes
+  to every hive.
+- **An update is done when every hive is on its version.** Until then, its result names the hives
+  still on another one, and `/versions` shows them out of date, as it does with a core.
+- **A hive that was down when the version changed** gets it from the motherbee when it is back,
+  once, and the motherbee reports it in its log and in `/versions`. This is the design's one
+  automatic step, and it is what makes the rule hold. It is proposed; the operator confirms it.
+- **A hive that joins** gets the current version at its join.
+- **The version is a number** the motherbee raises with each change. `/versions` shows it beside the
+  release, and the hash of each role's part checks its content.
+
+## 8. A-181 in this design
 
 - **The blob's topology goes by role, and the release decides it:** a worker shares `blob/active`,
   the ingress receives `blob/public`, and the egress gets neither. The operator has no switch for
@@ -151,16 +172,16 @@ What worker1 would get today (the values on 8.x, read 2026-11-08):
   - A worker that joined before the folder existed gets it at the next reconcile.
 - **With both,** an installation whose spokes joined with the sync off gets it at its next update.
 
-## 8. Open, for the operator
+## 9. The operator's calls (2026-11-08)
 
-1. **The motherbee's own file at a release:** the release's keys (§2) are taken from the release's
-   `hive.yaml.example` at the install, replacing the motherbee's, and the operator's keys stay.
-   The previous file is kept, and the deploy's report lists what changed. Today the .deb never
-   touches an existing `hive.yaml`.
-2. **The list of keys in §2,** to confirm: `government.identity_frontdesk` and `blob.gc.*` above
-   all.
-3. **The blob's switch:** it goes, and the release decides it by role (§7). This reads *"todo lo
-   define una versión de software"* that way.
-4. **Related, but apart:** the worker that joined before the egress never gets
-   `egress.gateway_ip` (the sweep of 2026-11-07). That key is the hive's default route, which §2
-   keeps out of the update. It stays a call of its own.
+1. **The motherbee's own file at a release:** yes, under the rule of §7.
+   - At the install, the release's keys (§2) are taken from the release's `hive.yaml.example` and
+     replace the motherbee's.
+   - The operator's keys stay.
+   - The previous file is kept, and the deploy's report lists what changed.
+   - Until now, the .deb never touched an existing `hive.yaml`.
+2. **The keys of §2:** as listed. `government.identity_frontdesk` goes with the release, and
+   `blob.gc.*` with the operator.
+3. **The blob's switch:** it goes, and the release decides it by role (§8).
+4. **The worker that joined before the egress** (`egress.gateway_ip`): apart, to be talked over
+   later (*"luego la hablamos"*).
