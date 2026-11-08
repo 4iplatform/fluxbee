@@ -4854,55 +4854,82 @@ fn listen_local_socket(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// The lock that makes this process the only one running `cfg`'s router, held until it ends.
-/// `main` takes it before `Router::new`: a second instance of the same router has the same name
-/// and so the same UUID, and without it would open the live router's shared memory and stream and
-/// replace its sockets (`listen_local_socket` removes them), as `rt-gateway --version` did in
-/// 0.1.60 (FINDINGS A-177).
-pub fn hold_instance_lock(cfg: &RouterConfig) -> Result<fs::File, RouterError> {
-    let path = cfg
-        .state_dir
-        .join(&cfg.router_l2_name)
-        .join("instance.lock");
-    hold_instance_lock_at(&path, &cfg.router_l2_name)
+/// This process's hold on its router (`hold_instance_lock`), open until the process ends.
+static INSTANCE_LOCK: std::sync::OnceLock<fs::File> = std::sync::OnceLock::new();
+
+/// Makes this process the only one running `cfg`'s router, until it ends. `main` calls it before
+/// `Router::new`: a second instance of the same router has the same name and so the same UUID, and
+/// without it would open the live router's shared memory and stream and replace its sockets
+/// (`listen_local_socket` removes them), as `rt-gateway --version` did in 0.1.60 (FINDINGS A-177).
+/// The lock is `/var/run/fluxbee/<router name>.lock`, on tmpfs as SY.vault's and SY.opa.rules'
+/// are: a full or read-only disk never keeps the router down.
+pub fn hold_instance_lock(cfg: &RouterConfig) -> Result<(), RouterError> {
+    let path = crate::paths::run_dir().join(format!("{}.lock", cfg.router_l2_name));
+    if let Some(file) = hold_instance_lock_at(&path, &cfg.router_l2_name)? {
+        let _ = INSTANCE_LOCK.set(file);
+    }
+    Ok(())
 }
 
 /// An flock on `path`, which the kernel releases when the process ends, however it ends: a router
-/// that crashed leaves nothing to clean. The file is never removed, since a removal would let a
-/// third process lock a new file beside one still held. It holds the holder's PID, for whoever
-/// looks.
-fn hold_instance_lock_at(path: &Path, router: &str) -> Result<fs::File, RouterError> {
+/// that crashed leaves nothing to clean. `Err` only when another process holds it. A lock that
+/// cannot be opened or taken for any other reason is warned and the router runs without it, since
+/// that is no sign of another router. The file is never removed, as a removal would let a third
+/// process lock a new file beside one still held; it holds the holder's PID, for whoever looks.
+fn hold_instance_lock_at(path: &Path, router: &str) -> Result<Option<fs::File>, RouterError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    ensure_parent_dir(path)?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
+    let opened = ensure_parent_dir(path).and_then(|()| {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+    });
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(err) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %err,
+                "rt-gateway could not open its instance lock; it runs without one"
+            );
+            return Ok(None);
+        }
+    };
     // SAFETY: the descriptor is open and owned by `file` for the whole call.
     if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) } != 0 {
         let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::WouldBlock {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %err,
+                "rt-gateway could not take its instance lock; it runs without one"
+            );
+            return Ok(None);
+        }
         let holder = fs::read_to_string(path).unwrap_or_default();
-        return Err(RouterError::Startup(
-            if err.kind() == io::ErrorKind::WouldBlock {
-                format!(
-                    "another rt-gateway runs {router} (PID {}, it holds {}); this one exits and \
-                     leaves its sockets, shared memory and stream alone",
-                    holder.trim(),
-                    path.display()
-                )
-            } else {
-                format!("could not lock {}: {err}", path.display())
-            },
-        ));
+        return Err(RouterError::Startup(format!(
+            "another rt-gateway runs {router} (PID {}, it holds {}); this one exits and leaves its \
+             sockets, shared memory and stream alone",
+            holder.trim(),
+            path.display()
+        )));
     }
-    file.set_len(0)?;
-    writeln!(file, "{}", std::process::id())?;
-    Ok(file)
+    if let Err(err) = file
+        .set_len(0)
+        .and_then(|()| writeln!(file, "{}", std::process::id()))
+    {
+        tracing::warn!(
+            lock = %path.display(),
+            error = %err,
+            "rt-gateway holds its instance lock and could not write its PID in it"
+        );
+    }
+    Ok(Some(file))
 }
 
 /// Whether a connection accepted on one of this router's sockets comes from the router's own user,
@@ -10971,9 +10998,11 @@ mod tests {
             "fblock-{}",
             &Uuid::new_v4().simple().to_string()[..8]
         ));
-        let path = dir.join("RT.gateway@motherbee").join("instance.lock");
+        let path = dir.join("RT.gateway@motherbee.lock");
 
-        let first = hold_instance_lock_at(&path, "RT.gateway@motherbee").expect("the first");
+        let first = hold_instance_lock_at(&path, "RT.gateway@motherbee")
+            .expect("the first")
+            .expect("its lock");
         let mode = fs::metadata(&path).expect("lock file").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let pid = std::process::id().to_string();
@@ -10996,10 +11025,27 @@ mod tests {
         );
 
         drop(first);
-        let again = hold_instance_lock_at(&path, "RT.gateway@motherbee");
-        assert!(again.is_ok(), "the lock is free once its holder ends");
+        let again = hold_instance_lock_at(&path, "RT.gateway@motherbee").expect("free again");
+        assert!(again.is_some(), "the lock is free once its holder ends");
         drop(again);
         assert!(path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A lock that cannot be opened is no sign of another router: it runs without one, as it ran
+    /// before the lock existed (a full or read-only disk, say).
+    #[test]
+    fn a_lock_that_cannot_be_opened_never_keeps_the_router_down() {
+        let dir = std::env::temp_dir().join(format!(
+            "fblock-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        let not_a_dir = dir.join("a-file");
+        fs::write(&not_a_dir, b"").expect("a file where the lock's folder would be");
+        let held =
+            hold_instance_lock_at(&not_a_dir.join("RT.gateway@motherbee.lock"), "RT.gateway");
+        assert!(matches!(held, Ok(None)), "{held:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

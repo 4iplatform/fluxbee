@@ -40,10 +40,11 @@ memory), and the SDK's `crates/fluxbee_sdk/src/mesh/` (WAN mTLS and the hive reg
 - At first start it creates `/var/lib/fluxbee/state/<router name>/identity.yaml` with its UUID
   and SHM name; later starts reuse them, and with them the SHM region the previous process left.
 - **One process per router** (`hold_instance_lock`): before it opens its SHM region, its stream
-  and its sockets, it takes an flock on `/var/lib/fluxbee/state/<router name>/instance.lock`
-  (0600, the holder's PID inside). The kernel releases it when the process ends, however it
-  ends. A second instance of the same router has the same UUID, so it would take over the live
-  one's region, stream and sockets: it exits instead, naming the lock and the holder's PID.
+  and its sockets, it takes an flock on `/var/run/fluxbee/<router name>.lock` (tmpfs, 0600, the
+  holder's PID inside), held until the process ends; the kernel releases it however it ends. A
+  second instance of the same router has the same UUID, so it would take over the live one's
+  region, stream and sockets: it exits instead, naming the lock and the holder's PID. A lock that
+  cannot be opened or taken for another reason is warned, and the router runs without it.
   The router takes that region over before it accepts a node: it empties the node table and writes
   its PID, start time, name and gateway flag (`RouterRegionWriter::open_or_create`). Nodes appear
   in it again as they reconnect, so a node that does not come back is gone for the readers too

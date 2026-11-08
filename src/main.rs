@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args_os().len() > 1 {
         eprintln!(
             "rt-gateway takes no arguments: systemd starts it (rt-gateway.service). The installed \
-             version is in GET /versions on SY.admin, or dpkg-query -W fluxbee."
+             version is in GET /versions on SY.admin."
         );
         std::process::exit(2);
     }
@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = RouterConfig::load_from_env()?;
     // Before the router opens its shared memory, its stream and its sockets: a second instance of
-    // this router exits here, naming the lock (FINDINGS A-177).
-    let _instance = hold_instance_lock(&cfg)?;
+    // this router exits here, naming the lock, held until the process ends (FINDINGS A-177).
+    hold_instance_lock(&cfg)?;
     let router = Router::new(cfg);
     let mut router_task = tokio::spawn(async move { router.run().await });
 
