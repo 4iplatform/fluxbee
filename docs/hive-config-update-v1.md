@@ -7,7 +7,8 @@
 - A first draft carried the release's keys inside the update message, applied to each hive's
   `hive.yaml`. A DTAP panel reviewed it the same day: 70 findings, four blockers (§11).
 - The operator approved this second draft's shape the same day: *"Sí, vamos como describiste"*.
-- Next: the build, by stages (§10), A-186 first. Nothing is built.
+- Next: the build, by stages (§10). Stage 1 (A-186, with A-189's vendored Syncthing) is built for
+  0.1.116; the rest is not built.
 
 This is the single place for the topic.
 
@@ -284,8 +285,9 @@ They raised 70 findings, many of them the same seen from several lenses:
   the YAML through serde, so the comments go.
 - **The motherbee's file at an install:** `deb-postinst` copies the example only when there is no
   `hive.yaml`.
-- **The start** (`bootstrap_local`, `:1658`) checks its role's binaries in `dist/core/bin` before it
-  starts Syncthing, and `main` exits on a mismatch (A-186).
+- **The start** (`bootstrap_local`, `:1658`) checked its role's binaries in `dist/core/bin` before
+  it started Syncthing, and `main` exited on a mismatch (A-186). Since 0.1.116 it checks after
+  Syncthing starts, and only reports: `core.awaiting_update`.
 - **Who reads the shared keys, and when:**
   - blob and dist: the reconcile, at every pass (`current_blob_runtime_config`, `:6306`;
     `current_dist_runtime_config`, `:6320`);

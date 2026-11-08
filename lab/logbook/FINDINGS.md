@@ -1320,10 +1320,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Impact:**
   - The spoke stays on the mesh (after A-186), but it never gets a dist update again.
   - `update category=vendor` goes through the same function, so the only way out is SSH.
-- **Fix (being built with A-186, same binary):**
-  - At the start and in the watchdog, a vendor mismatch with a Syncthing already installed runs the
-    installed one and reports the mismatch.
-  - The vendor update stays strict.
+- **Built, for 0.1.116, with A-186:**
+  - The start, the watchdog and the sync probes keep the installed Syncthing and report
+    `vendor.awaiting_update`.
+  - With none installed, they fail as before, but never the orchestrator.
+  - `update category=vendor` and an ingress join stay strict.
+- **A release rule, from its review:** Syncthing's unit (`syncthing_unit_contents`) must stay valid
+  for the previous vendored Syncthing. On a hive whose vendor lags, the start writes the new unit
+  and restarts the old binary under it.
 
 ### A-188 [General/blob] 🟡 LATENT (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-16; read in the code) — A worker's blob GC, if turned on, deletes the motherbee's published sources through the shared folder
 
@@ -1368,6 +1372,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     lost.
 - **Fix (proposed):** the start never stops on a dist mismatch. It starts on what is installed in
   `/usr/bin`, starts Syncthing, and reports that it is waiting for its update.
+- **Built, for 0.1.116:**
+  - The check runs after Syncthing starts, and it only reports: `core.awaiting_update` in
+    `/versions`, with why each binary failed. It is checked again every 60 s.
+  - The core update's own check stays strict.
+  - The motherbee copies a binary into a role's tree only once it matches the manifest.
+- **Its review round** (with A-189's): no high or medium finding. Four stale lines in the docs were
+  fixed.
 
 ### A-185 [WF] 🟢 NO CHANGE, the operator's call (2026-11-08; found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
 

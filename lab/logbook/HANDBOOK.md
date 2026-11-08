@@ -1047,8 +1047,8 @@ against the core manifest that the motherbee sends it. That is why the order mat
    `dist/core/<role>` with the new binary, and Syncthing carries it to the spoke.
 2. **Wait for the binary to reach the spoke:** `dist/core/bin/<binary>` present, with the sha256
    that `dist/core/manifest.json` states. If the spoke's `hive.yaml` names the node before that,
-   the spoke's orchestrator does not start: it validates every binary of its role against the
-   manifest, and that one is missing.
+   its orchestrator still starts (since 0.1.116, A-186). `/versions` then lists the binary as
+   `missing` in `core.awaiting_update`, and a core update refuses until the binary arrives.
 3. **Spoke:** add the node to `system_nodes.<role>.nodes` in its `/etc/fluxbee/hive.yaml`.
 4. **`update category=core` to the spoke:** it installs the binary; the new orchestrator
    regenerates the units (it creates the node's unit) and starts it.

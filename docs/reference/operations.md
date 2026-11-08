@@ -343,8 +343,8 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
 - `GET /hives/{hive}/versions` (and `GET /versions` for every connected hive) compares core,
   vendor and runtimes; for core the installed hash wins over the synced one. A hive whose start
   found core binaries in dist that do not match the manifest lists them in
-  `core.awaiting_update`, with why each, and runs what `/usr/bin` holds until a check or a core
-  update finds dist consistent
+  `core.awaiting_update`, with why each. It runs what `/usr/bin` holds until a core update
+  installs the binaries. The check every minute only closes the report once dist is consistent
   ([SY.orchestrator](../nodes/sy-orchestrator.md#updates)).
 
 The lab routine `lab/ops.py deploy <version>` does all of this in order: snapshots every VM,
