@@ -900,6 +900,10 @@ At 10:17 sales' package carries:
     - **Who pays** such a relay: the payer is set when its analysis starts. A take that lands
       before it has the agent's tenant pay, one that lands while the models answer leaves the
       call with its writer.
+    - **The agent's first message carries none of it** (0.1.112's gate): the router attaches the
+      package at delivery, before cognition takes on that same message. The lines reach the
+      agent from its second message on. The operator kept it so (2026-11-08): *"185 déjalo
+      así"*.
   - **It answers the third question too:** a message and its copy in two batches on a new thread,
     the relay first, are now one turn: the agent's communication takes the relay with its key.
 - **The numbers,** to tune with use: the half-life, the bar, the 5 a package carries, and the

@@ -43,7 +43,9 @@ A function or constant named without a path lives in `sy_cognition.rs`. Its file
   communication starts from what people said there, and the one with no agent leaves the file in
   the write of the agent's (`held_or_loaded`, `take_conversation`, since 0.1.112;
   cognition-hands-v1 §12.6). Only the first agent takes it: on a thread with another agent's
-  communication, it stays.
+  communication, it stays. The agent's first message carries none of it: the router attaches the
+  package at delivery, and the take happens when that same message reaches cognition through the
+  stream. What people said reaches the agent from its second message on.
 - **Where it runs:** on the motherbee and on every worker, next to the agents (`hive.yaml`
   `system_nodes.motherbee` and `system_nodes.worker`). Each one handles only the agents of its
   own hive. The ingress and the egress run none.

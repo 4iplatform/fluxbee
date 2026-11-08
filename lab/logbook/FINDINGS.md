@@ -107,7 +107,9 @@ no change required
    1. 0.1.113: A-182, the Rust SDK's handshake bounded ✅ live and checked on 8.x (2026-11-08).
    2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline ✅ live and checked on 8.x
       (2026-11-08).
-   3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count.
+   3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count; the
+      operator's calls made (2026-11-08): cognition does not judge them, and the person gets one
+      fixed message in English.
 8. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
@@ -175,8 +177,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
-- A-185 🟡 The first agent on a thread gets what people said only from its second message on: the
-  operator's call (A-173 ✅ 0.1.112 found it).
 
 ### io.web
 
@@ -1296,7 +1296,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-185 [WF] 🟡 OPEN, for the operator (found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
+### A-185 [WF] 🟢 NO CHANGE, the operator's call (2026-11-08; found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
 
 - **Seen on 8.x (gate0206, thread `gate0206-take`):** A wrote to B through the WF, B answered, then
   A wrote to the agent. The agent's first message carried no memory package
@@ -1311,6 +1311,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - One way: the region keeps a thread's communication with no agent too, and the router hands its
     package to an agent that has none on the thread. That is the router (alone) and the region.
   - The other: as it is, from the agent's second message on.
+- **The operator's call (2026-11-08):** as it is, *"185 déjalo así"*. The docs say so
+  (reference/cognition.md §1, cognition-hands-v1 §12.6).
 
 ### A-184 [General/AI SDK] 🔴 OPEN (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A provider's HTTP error is untyped, OpenAI never retries a 429 or a 5xx, and SY.cognition counts one as an invalid output
 
@@ -1333,6 +1335,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (the AI SDK, alone):** a typed provider error with its status, a refusal of its own, OpenAI's
   retries as Anthropic's, the status read first, and the consumers matching the type instead of the
   text.
+- **The operator's calls (2026-11-08):**
+  - SY.cognition does not judge a provider's error: it is no invalid output (*"errores del
+    proveedor cognition no debéis evaluarlo, sí"*).
+  - The person gets one fixed message in English: the AI provider of the agent's key has a
+    problem, and they should contact the administrator. *"Sería un mensaje fijo y no mucho
+    más."* It goes out for every provider error that leaves the person with no answer, the
+    refusal included. The other fixed replies, in Spanish, stay on the sweep's list.
 
 ### A-183 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.114, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
 
@@ -1375,6 +1384,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     with its audience;
   - the setting's way to the spokes is a design question: how a motherbee setting reaches the
     hives that joined before it.
+- **Turned off later, it stops nothing either:** the reconcile only adds folders, and a hive's
+  removal takes it out of the blob folder only while the flag is on
+  (`reconcile_syncthing_peer_removal_xml`).
+- **On 8.x (read 2026-11-08):** the motherbee shares `fluxbee-blob` with worker1 and
+  `fluxbee-blob-public` with ingress1, and egress1 has neither. A fresh install copies
+  `hive.yaml.example`, whose sync is on, so A-181 bites only an installation that turns the sync
+  on after its joins.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
