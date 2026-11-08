@@ -296,7 +296,7 @@ func (s *Service) handleMessage(msg fluxbeesdk.Message) error {
 	case fluxbeesdk.MsgTimerHelp:
 		return s.respondTimerHelp(msg)
 	default:
-		return s.sendTimerError(msg, stringValue(msg.Meta.Msg), "TIMER_UNKNOWN_VERB", fmt.Sprintf("SY.timer does not know the verb %s", stringValue(msg.Meta.Msg)))
+		return s.sendTimerError(msg, stringValue(msg.Meta.Msg), "TIMER_UNKNOWN_VERB", fmt.Sprintf("SY.timer does not know the verb %q", stringValue(msg.Meta.Msg)))
 	}
 }
 
@@ -458,7 +458,7 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 			{Code: "TIMER_NOT_OWNER", Description: "Requester does not own the timer it reads, cancels or reschedules."},
 			{Code: "TIMER_ALREADY_FIRED", Description: "Timer already fired and can no longer be modified."},
 			{Code: "TIMER_RECURRING_NOT_RESCHEDULABLE", Description: "Recurring timers cannot be rescheduled in v1."},
-			{Code: "TIMER_UNKNOWN_VERB", Description: "The verb is none SY.timer knows."},
+			{Code: "TIMER_UNKNOWN_VERB", Description: "SY.timer does not know the verb."},
 			{Code: "TIMER_INTERNAL", Description: "An internal error occurred, such as an answer that does not fit in one frame."},
 		},
 	)
