@@ -4203,7 +4203,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "20";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "21";
 
 /// The action catalog. Every action in it also names who on the mesh may ask for it, in
 /// `mesh_access` right below: one without an entry is closed to the mesh.
@@ -4259,7 +4259,7 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_versions",
         route: InternalActionRoute::Query("list_versions"),
-        requires_target: true,
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -4640,7 +4640,7 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_deployments",
         route: InternalActionRoute::Command("list_deployments"),
-        requires_target: true,
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -4652,7 +4652,7 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_drift_alerts",
         route: InternalActionRoute::Command("list_drift_alerts"),
-        requires_target: true,
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -12696,7 +12696,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "unpublish_artifact" => vec!["POST /artifacts/unpublish"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
-        "get_hive" => vec!["GET /hives/{hive}"],
+        "get_hive" => vec!["GET /hives/{hive_id}"],
         "list_nodes" => vec!["GET /hives/{hive}/nodes"],
         "list_streams" => vec!["GET /hives/{hive}/streams"],
         "get_llm_usage" => vec!["GET /hives/{hive}/usage"],
@@ -12786,7 +12786,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "set_node_config" => vec!["PUT /hives/{hive}/nodes/{node_name}/config"],
         "set_storage" => vec!["PUT /config/storage"],
         "add_hive" => vec!["POST /hives"],
-        "remove_hive" => vec!["DELETE /hives/{hive}"],
+        "remove_hive" => vec!["DELETE /hives/{hive_id}"],
         "add_route" => vec!["POST /hives/{hive}/routes"],
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
@@ -12894,10 +12894,25 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "Admin action name, for example add_hive.",
         )],
         "publish_runtime_package" => Vec::new(),
+        // The name the route stores and the orchestrator reads (A-172's family).
         "get_hive" | "remove_hive" => vec![admin_action_path_param(
-            "hive",
+            "hive_id",
             "string",
             "Hive id, for example worker-220.",
+        )],
+        // The hive and the tenant, as the routes store them; the hive is the step's target.
+        "delete_tenant" | "restore_tenant" | "purge_tenant" | "list_tenant_nodes" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "tenant_id",
+                "string",
+                "The tenant, in the prefixed UUID format tnt:<uuid>.",
+            ),
+        ],
+        "core_rollback" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "The hive whose core goes back to a backup generation.",
         )],
         "get_llm_usage" => vec![admin_action_path_param(
             "hive",
@@ -13602,6 +13617,25 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "replace",
                 "bool",
                 "Replace full config instead of patch/merge.",
+            ),
+            // The node's runtime binding, at the top level: inside `config` it would be an inert
+            // key (U-10).
+            admin_action_body_field("runtime", "string", "Rebind the node to this runtime."),
+            admin_action_body_field(
+                "runtime_version",
+                "string",
+                "Rebind the node to this runtime version (\"current\" follows the runtime's current).",
+            ),
+            admin_action_body_field(
+                "requested_runtime_version",
+                "string",
+                "The version the node asks for at its next launch.",
+            ),
+            admin_action_body_field("runtime_base", "string", "A package's base runtime."),
+            admin_action_body_field(
+                "package_path",
+                "string",
+                "The package's directory under dist/runtimes.",
             ),
         ],
         "node_control_config_get" | "node_control_config_set" => vec![
@@ -28502,7 +28536,6 @@ mod tests {
             );
         }
         assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"reset_base_runtime"));
-        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "20");
     }
 
     /// The note on a secret's type lists the SDK's types and the ones the product's own nodes
@@ -28576,6 +28609,53 @@ mod tests {
             ),
             vec!["DELETE"]
         );
+    }
+
+    /// The executor runs a step with the fields its schema names (FINDINGS A-172): an action that
+    /// needs a hive names one, and every field its path names is in its schema, so a plan Archi
+    /// stages from the help reaches the handler as an HTTP request would.
+    #[test]
+    fn every_action_the_executor_runs_names_what_its_path_names() {
+        // Apart on purpose: get_admin_action_help takes its action as `action_name` (its schema's
+        // override); list_recent_commands' hive only filters, and the executor reads every hive's;
+        // publish_cloud_endpoint's token waits for Archi's chapter (FINDINGS A-124).
+        let apart = [
+            "get_admin_action_help",
+            "list_recent_commands",
+            "publish_cloud_endpoint",
+        ];
+        let mut wrong = Vec::new();
+        for spec in INTERNAL_ACTION_REGISTRY {
+            if !admin_action_executor_available(spec.action) || apart.contains(&spec.action) {
+                continue;
+            }
+            let doc = build_admin_action_doc(spec);
+            let schema = &doc["executor_contract"]["function_schema"]["properties"];
+            let names: Vec<&str> = schema
+                .as_object()
+                .map(|fields| fields.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if spec.requires_target && !names.contains(&"hive") {
+                wrong.push(format!(
+                    "{}: needs a hive its schema does not name",
+                    spec.action
+                ));
+            }
+            for pattern in doc["path_patterns"].as_array().into_iter().flatten() {
+                let pattern = pattern.as_str().unwrap_or_default();
+                for field in pattern
+                    .split('{')
+                    .skip(1)
+                    .filter_map(|part| part.split('}').next())
+                {
+                    if !names.contains(&field) {
+                        wrong.push(format!("{}: its path names {{{field}}}", spec.action));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_eq!(INTERNAL_ACTION_REGISTRY_VERSION, "21");
     }
 
     /// The manifest of a motherbee where `ai.generic` runs a hand publish, `0.1.88-gate1`, over

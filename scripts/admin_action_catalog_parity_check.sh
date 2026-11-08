@@ -154,30 +154,95 @@ if extra_in_registry:
         + ", ".join(extra_in_registry)
     )
 
-# FINDINGS A-172: the executor sends a step's args under the names the help gives an action's path
-# parameters, while the HTTP route stores each path segment in the payload under its own key. A
-# key the help does not name reaches the handler from HTTP and never from Archi's plans.
-help_block = section_between("fn admin_action_path_params(", "\nfn ")
-path_params = {}
-for arm in re.finditer(r'((?:"[a-z_]+"\s*\|\s*)*"[a-z_]+")\s*=>\s*vec!\[(.*?)\n\s*\],?\n', help_block, flags=re.S):
-    names = re.findall(r'admin_action_path_param\(\s*"([^"]+)"', arm.group(2))
-    for action in re.findall(r'"([a-z_]+)"', arm.group(1)):
-        path_params[action] = set(names)
-arm_starts = [m.start() for m in re.finditer(r'\(\s*"(?:GET|POST|PUT|PATCH|DELETE)"\s*,\s*\[', hive_block)]
-renamed = []
-for i, start in enumerate(arm_starts):
-    arm = hive_block[start:arm_starts[i + 1] if i + 1 < len(arm_starts) else len(hive_block)]
-    actions = re.findall(r'handle_admin_(?:command|query)(?:_with_payload)?\(\s*ctx,\s*client,\s*"([^"]+)"', arm, flags=re.S)
-    keys = re.findall(r'"(\w+)":\s*decode_percent\(', arm)
-    for action in actions:
-        if action not in path_params:
-            continue
-        for key in keys:
-            if key not in path_params[action]:
-                renamed.append(f"{action}: the route stores '{key}', the help names {sorted(path_params[action])}")
-if renamed:
-    fail("a path segment the executor cannot send (A-172): " + "; ".join(renamed))
+# FINDINGS A-172: the executor sends a step's args under the names the help gives an action's
+# path parameters and body fields, while each HTTP route stores its path segments in the payload
+# under keys of its own. A key the help does not name reaches the handler from HTTP and never
+# from Archi's plans.
+def section(start, end):
+    i = text.find(start)
+    if i < 0:
+        fail(f"missing marker: {start!r}")
+    j = text.find(end, i + len(start))
+    return text[i:j if j > 0 else len(text)]
 
+
+def closing(src, open_at):
+    """The index just past the bracket that closes the one at `open_at`, skipping string literals."""
+    depth, i, n = 0, open_at, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            i += 1
+            while i < n and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+        elif src[i:i + 2] == 'r#':
+            end = src.find('"#', i + 3)
+            i = end + 1 if end > 0 else n
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def names_by_action(fn_start):
+    """Each action's field names in one help function: its `"a" | "b" => vec![...]` arms."""
+    body = section(fn_start, "\nfn ")
+    out = {}
+    for head in re.finditer(r'((?:"[a-z_]+"\s*\|\s*)*"[a-z_]+")\s*=>\s*vec!\[', body):
+        arm = body[head.end() - 1:closing(body, head.end() - 1)]
+        names = set(re.findall(r'admin_action_(?:path_param|body_field)\(\s*"([^"]+)"', arm))
+        for action in re.findall(r'"([a-z_]+)"', head.group(1)):
+            out.setdefault(action, set()).update(names)
+    return out
+
+
+schema = {}
+for fn in ("fn admin_action_path_params(", "fn admin_action_body_required_fields(",
+           "fn admin_action_body_optional_fields("):
+    for action, names in names_by_action(fn).items():
+        schema.setdefault(action, set()).update(names)
+# The intended translations: the executor's `hive` becomes inventory's `filter_hive`
+# (`internal_inventory_payload`), and get_admin_action_help takes its action as `action_name`.
+translated = {("inventory", "filter_hive"), ("get_admin_action_help", "action_name")}
+
+call_re = re.compile(
+    r'(?:handle_admin_(?:command|query)(?:_with_payload)?|handle_timer_rpc|'
+    r'dispatch_internal_admin_command|handle_identity_query)\(\s*ctx,\s*client,\s*"([^"]+)"', re.S)
+# A route's arm: `("METHOD", [segments]) =>`, or `"METHOD" =>` where a block matches the method alone
+# (`/hives/{hive}` itself).
+head_re = re.compile(
+    r'^\s*(?:\(\s*"[A-Z]+"\s*,\s*\[([^\]]*)\]\s*\)|"[A-Z]+")\s*(?:if [^=]*)?=>', re.M)
+mismatches = []
+for start, end in (("async fn handle_hive_paths(", "\nasync fn handle_modules_paths("),
+                   ("async fn handle_http(", "\nasync fn handle_inventory_http(")):
+    block = section(start, end)
+    heads = list(head_re.finditer(block))
+    for i, head in enumerate(heads):
+        arm = block[head.start():heads[i + 1].start() if i + 1 < len(heads) else len(block)]
+        segments = [tok.strip() for tok in (head.group(1) or "").split(",")]
+        segments = [tok for tok in segments if re.fullmatch(r"[a-z_][a-z0-9_]*", tok)]
+        if "handle_hive_paths" in start:
+            segments.append("hive")
+        stored = set()
+        for var in segments:
+            for form in (r'"(\w+)"\s*:\s*(?:decode_percent\(\s*)?&?\*?' + var + r'\b',
+                         r'\["(\w+)"\]\s*=\s*[^;]*\b' + var + r'\b',
+                         r'insert\(\s*"(\w+)"\.to_string\(\)\s*,[^;]*?\b' + var + r'\b'):
+                stored.update(re.findall(form, arm, flags=re.S))
+        for action in set(call_re.findall(arm)):
+            if action not in schema:
+                if stored:
+                    mismatches.append(f"{action}: the route stores {sorted(stored)}, the help names no field")
+                continue
+            for key in sorted(stored):
+                if key not in schema[action] and (action, key) not in translated:
+                    mismatches.append(f"{action}: the route stores '{key}', the help names {sorted(schema[action])}")
+if mismatches:
+    fail("a path segment the executor cannot send (A-172): " + "; ".join(sorted(set(mismatches))))
 print("status=ok")
 print(f"source={src_path}")
 print(f"http_actions={len(http_actions)}")

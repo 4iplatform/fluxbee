@@ -942,8 +942,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `cognition_clear` | `POST /hives/{hive}/cognition/clear` | Make one hive's SY.cognition drop every communication and every episode it keeps (in memory, in its file and in its memory region) and answer what it removed. |
 | `get_storage` | `GET /config/storage` | Read storage configuration and status. |
 | `add_hive` | `POST /hives` | Create a hive and bootstrap it. |
-| `get_hive` | `GET /hives/{hive}` | Read one hive definition. |
-| `remove_hive` | `DELETE /hives/{hive}` | Remove a hive. |
+| `get_hive` | `GET /hives/{hive_id}` | Read one hive definition. |
+| `remove_hive` | `DELETE /hives/{hive_id}` | Remove a hive. |
 | `add_route` | `POST /hives/{hive}/routes` | Add a route rule to a hive. |
 | `delete_route` | `DELETE /hives/{hive}/routes/{prefix}` | Delete a route rule from a hive. |
 | `add_vpn` | `POST /hives/{hive}/vpns` | Add a VPN pattern to a hive. |
