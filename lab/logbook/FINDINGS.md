@@ -1330,7 +1330,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   reuses them. Data hygiene, next to A-159 (deleting an ILK that other data names); a release
   that drops a node from a role leaves its ILK too (A-181, stage 2).
 
-### A-190 [General/join] 🔴 CONFIRMED, OPEN (found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
+### A-190 [General/join] 🔴 BUILT FOR 0.1.118, gate next (found 2026-11-08 by 0.1.117's gate on 8.x; read in the code and the spoke's journal) — A fresh worker's join fails at its finalize
 
 - **Seen:** `gate0217`, a throwaway worker on a fresh clone of template 9000. Its `add_hive`
   failed twice with `FINALIZE_FAILED`:
@@ -1362,6 +1362,33 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the finalize's vendor step tolerates a vendor still syncing, as its core step does;
   - the finalize does not restart the router under its own reply, or a no-op core update
     restarts nothing.
+- **The operator's call (2026-11-08):** *"Coincido, avanzá con eso"*, and from now on every gate
+  measures where the time goes.
+- **Built for 0.1.118** (`src/bin/sy_orchestrator.rs`):
+  - **The revert** waits for its source: a member other than this device, connected, sharing
+    the folder (`/rest/db/completion`'s `remoteState: valid`), for 60 s in a row. Until then the
+    local items stay, logged once.
+  - **The finalize's vendor step** goes on when it failed on a vendor manifest or binary still
+    missing, with a Syncthing installed and running. It is reported in `vendor.awaiting_update`,
+    and the recheck closes it.
+  - **The finalize's core step** takes A-186's "core binary 'X' missing at" as pending too.
+  - **A core update with no binary and no unit new restarts nothing,** and answers `ok` at once.
+  - **The finalize's dist probe** gets what is left of the motherbee's wait, less 10 s for the
+    reply.
+  - **Times:** the finalize logs when it arrives and how long it took, and answers each step's
+    `timings_ms`. `ops timeline` merges every hive's journals into one timeline, and
+    `ops deploy` prints each phase's time.
+- **Its review round:**
+  - **Medium, fixed:** the first build reverted once the peer was a member, not once its index
+    was in. The finalize's own peer link restarts Syncthing, so the next tick, before the
+    motherbee's index arrived, would still have deleted dist for about a minute. The 60 s with
+    the source connected and sharing is the fix.
+  - **Low, fixed:** the vendor tolerance looks at the step's error and needs Syncthing running,
+    not only installed; the held folders are logged once; the timeline takes WARN and ERROR,
+    reads its window as UTC, and streams the journal with a cap; stale texts.
+  - **Low, left:** a finalize whose core step does change something (a join resumed after the
+    motherbee was upgraded) still restarts the router before its reply; the retry is then a
+    no-op and goes through.
 
 ### A-189 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.116, 2026-11-08; found 2026-11-08 building A-186; read in the code) — A spoke caught mid-sync of a release that changes the vendored Syncthing never runs Syncthing again
 
