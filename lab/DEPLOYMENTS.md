@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ live, checked on 8.x | snap `pre-contract-0-1-108` (all 4 VMs) · `apt install fluxbee=0.1.107` + core-update of the spokes |
+| **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ live, checked on 8.x | snap `pre-reset-0-1-109` (all 4 VMs) · `apt install fluxbee=0.1.108` + core-update of the spokes |
+| **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ replaced by 0.1.109 | snap `pre-contract-0-1-108` (deleted 2026-11-07) · `apt install fluxbee=0.1.107` + core-update of the spokes |
 | **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ replaced by 0.1.108 | snap `pre-train2-0-1-107` (deleted 2026-11-07) · `apt install fluxbee=0.1.106` + core-update of the spokes |
 | **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ replaced by 0.1.107 | snap `pre-train1-0-1-106` (deleted 2026-11-07) · `apt install fluxbee=0.1.105` + core-update of the spokes |
 | **0.1.105** | 2026-11-07 | `f4d1c0f4` | motherbee + spokes (core): a line a WF relays between two people names where it went and, when its message names them, whom (A-161, [cognition-hands-v1](../docs/cognition-hands-v1.md) §12.9): the agent reads it as not said to it, and cognition's tagger and narrator read the same; an answer with no text says its `stop_reason` (A-162) | ✅ replaced by 0.1.106 | snap `pre-relayto-0-1-105` (deleted 2026-11-07) · `apt install fluxbee=0.1.104` + core-update of the spokes |
@@ -117,6 +118,54 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.109 — A base runtime goes back to its package's version, a password join chooses, and four small ones
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.108 · **Commit:** `3f292500`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's third release ([METHOD](logbook/METHOD.md) §9), every item on SY.admin, so
+  one branch: A-122, A-165 and A-164 (the operator: *"OK avanzar con 165, 164 si te parece a
+  vos"*), and from the sweep of pending items A-169 and A-170.
+- **What changed:**
+  - **A-122:** the seed records each base runtime's `package_version`, and `list_runtimes` and
+    `get_runtime` show it. `reset_base_runtime` (motherbee-only, closed to the mesh, confirmed by
+    the operator through Archi) makes it current again. `remove_runtime_version` never removes it,
+    `publish-runtime.sh` refuses a hand publish under it, and the lab's deploy shows the seed's
+    NOTE.
+  - **A-165:** a join that may log in over a password (`ssh_password` and no `ssh_key`) must carry
+    `harden_ssh`, or it is refused before anything touches the box; a socket-only re-run says it
+    applied none.
+  - **A-164:** the vault help's types come from the SDK's list, with `tls`, `whatsapp` and
+    `linkedhelper_adapter`, each with its value and how its node finds it.
+  - **A-169:** an identity read that names a spoke goes to the primary, as writes do.
+  - **A-170:** the OPA version counter is one locked, synced step; `publish_artifact`'s help says
+    the constants; a hive lists itself with its own role.
+- **Checks before the release:** on the Mac, clippy of SY.admin and the orchestrator and the seed's
+  e2e script (36 of 36); GitHub's CI green on every push but the first (a test caught the reset
+  rewriting a whole entry); two review rounds, one reviewer each, every finding fixed (A-171
+  recorded).
+- **Deploy:**
+  - build of `3f292500` in 12 min; publish in 15 s;
+  - snapshot `pre-reset-0-1-109` taken on all 4 VMs, `pre-contract-0-1-108` dropped;
+  - 0.1.109 on all 4 in 264 s (manifest `80ccc9303d128108`), health clean; the deploy printed
+    every base runtime's NOTE, each moved to 0.1.109 by the package.
+- **Checked on 8.x:**
+  - **A-122** (`a122_gate.py`): every base runtime showed `package_version` 0.1.109. A hand
+    publish of `ai.generic 0.1.109-gate1` showed as one, and AI.pruebas moved onto it in 81 s.
+    Removing 0.1.109 answered `RUNTIME_PACKAGE_VERSION`, and a hand publish under 0.1.109 was
+    refused. Asked to bring ai.generic back, Archi read the runtime, staged one
+    `reset_base_runtime` step and ran nothing until CONFIRM; the command log shows it `ok` from the
+    executor, and AI.pruebas was back on 0.1.109 in 47 s.
+  - **A-172 found:** Archi's removal of the gate's version failed with `INVALID_REQUEST`: the
+    executor sends `version`, the action reads `runtime_version`. The version was removed through
+    SY.admin's HTTP route instead; Syncthing took it off worker1.
+  - **A-165** (`r0109_gate.py join`): a password join with no `harden_ssh` was refused with
+    `INVALID_REQUEST` and its reason, and no hive was created.
+  - **A-164:** vault_put's executor notes name the SDK's types and the product's three with their
+    values; "escape hatch" is gone.
+  - **A-169:** `GET /hives/worker1/identity/ilks` and `/tenants` answer `ok` (0.1.108 answered
+    `UNAUTHORIZED_REGISTRAR`).
+  - **A-170:** by its tests.
 
 ## 0.1.108 — The provider holds a response contract inside the tool loop too (A-150)
 

@@ -24,10 +24,10 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 |---|---|---|---|
 | [PB-1](#pb-1) | ✅ **closed and VALIDATED live** (0.1.82) | SY.edge does not reload the TLS cert when it rotates in the vault | no |
 | [PB-2](#pb-2) | ✅ **closed and VALIDATED live** | Completeness of the TLS chain · `chain_len=4` served, `verify=0` from the internet | — |
-| [PB-3](#pb-3) | ↪ in FINDINGS as A-164 (2026-11-07) | The `ResourceType` enum drifted · **no functional impact** | no |
+| [PB-3](#pb-3) | ✅ **CLOSED** (0.1.109, FINDINGS A-164) | The `ResourceType` enum drifted · **no functional impact** | no |
 | [PB-4](#pb-4) | ✅ **CLOSED** | The cold start **looked** like a failure: the edge blamed the vault for no reason | — |
 | [PB-5](#pb-5) | ✅ **CLOSED** (0.1.81, FINDINGS A-1) | The egress reports `nat_applied: true` without verifying its LAN leg | no |
-| [PB-6](#pb-6) | ↪ in FINDINGS as A-165 (2026-11-07) | `ssh_password` does not close by itself · **⛔ inverting the default leaves boxes without access** | no |
+| [PB-6](#pb-6) | ✅ **CLOSED** (0.1.109, FINDINGS A-165: a password join chooses `harden_ssh`) | `ssh_password` does not close by itself · **⛔ inverting the default leaves boxes without access** | no |
 | [PB-6b](#pb-6b) | ✅ **CLOSED** | `harden_ssh_applied` was an echo of the request: it reported `false` with password auth already off | — |
 | [PB-7](#pb-7) | ✅ **CLOSED** | `add_hive` (>6 min) overflows the admin's window (180 s) **and blocks the channel** | no |
 | [PB-8](#pb-8) | ✅ **closed and VALIDATED live** | Egress for motherbee · **only reports**, does not touch the route (`EGRESS_MOTHERBEE_BYPASS`) | — |
@@ -44,7 +44,7 @@ Entry rule: only what **requires touching the product** goes here. Infrastructur
 | [U-4b](#u-4b) | ✅ **closed and VALIDATED live** | The drift-alerts were never written · now there is a writer, and the synthesis was deleted | — |
 | [U-5](#u-5) | ✅ **closed and VALIDATED live** | `core_rollback` with sealed generations, a health gate and a cross-hive forward | — |
 | [U-5b](#u-5b) | ✅ **CLOSED** | Core backups piled up without GC **and were created empty on every no-op** | — |
-| [U-6](#u-6) | ↪ in FINDINGS as A-166 (2026-11-07) | The race was **the orchestrator against itself**: a non-atomic 35 MB write | — |
+| [U-6](#u-6) | ✅ **CLOSED** (2026-11-07, FINDINGS A-166: verified in the code) | The race was **the orchestrator against itself**: a non-atomic 35 MB write | — |
 | [U-7](#u-7) | ✅ **closed** | The watchdog restarted syncthing every ~7 s because of a nonexistent folder | — |
 | [U-8a](#u-8a) | ✅ **closed and VALIDATED live** (`9f86c12`, with PB-7) | The admin API had no contract for long operations | — |
 | [U-8b](#u-8b) | ✅ **closed** (0.1.55) | `update category=core` returned TIMEOUT: now it replies before restarting | — |

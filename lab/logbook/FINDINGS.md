@@ -55,7 +55,8 @@ no change required
       loop (ai.generic; alone if the fix reaches the shared AI SDK). Both providers can; the fix
       reaches the shared AI SDK, so it went alone: ✅ 0.1.108, checked on 8.x (2026-11-07).
 3. **Third release, 0.1.109** (SY.admin, the orchestrator and the package's seed: one branch,
-   since every item touches SY.admin), built 2026-11-07, its review rounds' findings fixed:
+   since every item touches SY.admin) ✅ live and checked on 8.x (2026-11-07); its gate found
+   A-172:
    1. A-122 [General/upgrade]: `reset_base_runtime`, reachable by Archi behind the operator's
       CONFIRM, returns a base runtime to its package's version, which the seed records as
       `package_version` and `list_runtimes` shows.
@@ -152,6 +153,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### Archi
 
+- A-172 🟡 Archi cannot remove a runtime version (the executor sends `version`); for the next
+  release.
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -176,17 +179,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### General
 
-- A-122 🟢 A base runtime published by hand keeps `current` through every upgrade. Built for
-  0.1.109.
 - A-96 🔵 How the SY nodes' tokens are measured per message.
 - A-159 🔵 An ILK is deleted for good while data elsewhere refers to it: a chapter of its own, for
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
-- A-164 🟢 The vault's resource types leave out the ones the product uses. Built for 0.1.109.
-- A-165 🟢 After a join over the password channel, password logins stay on. Built for 0.1.109.
-- A-169 🟢 An identity read through SY.admin that names a spoke is refused. Built for 0.1.109.
-- A-170 🟢 Three small ones from the sweep (the OPA counter, a help's values, a spoke's role in its
-  own list). Built for 0.1.109.
 - A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1263,6 +1259,21 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-172 [Archi] 🟡 OPEN, for the next release (found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
+
+- **Seen on 8.x (0.1.109):** asked to remove `ai.generic 0.1.109-gate1`, Archi staged one
+  `remove_runtime_version` step with `version: 0.1.109-gate1`, and on CONFIRM it failed: the
+  command log shows `INVALID_REQUEST`, origin `executor`, params `{runtime, version}`.
+- **Why:** the action's help names its path parameter `version`
+  (`DELETE /hives/{hive}/runtimes/{runtime}/versions/{version}`), so the executor's function
+  schema asks for `version`. The HTTP route maps that segment to `runtime_version`, which the
+  handler reads (`handle_remove_runtime_version`, src/bin/sy_admin.rs); the executor passes the
+  step's args as they are. So Archi has never removed a runtime version.
+- **Fix (next release, SY.admin):** the parameter is `runtime_version` in the help and the path
+  pattern; and a test that every executor field of an action is one its handler reads, for every
+  route that renames a path segment.
+- **On 8.x meanwhile:** the gate's version was removed through SY.admin's HTTP route.
+
 ### A-171 [General/upgrade] 🔵 TO EVALUATE, low (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock
 
 - **What happens:** SY.admin's writers of the runtimes manifest (`publish_runtime_package`,
@@ -1274,7 +1285,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix, when it matters:** one `flock` on a file next to the manifest, taken by every writer.
   Not new with A-122; low, since hand publishes are rare and the operator's.
 
-### A-170 [General] 🟢 BUILT for 0.1.109 (found 2026-11-07, the sweep of pending items; read in the code) — Three small ones in SY.admin and the orchestrator
+### A-170 [General] ✅ RESOLVED (0.1.109, 2026-11-07, by its tests; found 2026-11-07, the sweep of pending items; read in the code) — Three small ones in SY.admin and the orchestrator
 
 - **The OPA version counter** (`next_opa_version`, src/bin/sy_admin.rs) was read, incremented and
   written in three steps, unlocked and not atomically, while every mesh command runs in its own
@@ -1284,7 +1295,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **A hive in its own list** (`list_hives`, src/bin/sy_orchestrator.rs) was "worker" on an egress
   or an ingress (an audit's F19); now it carries the role it runs as.
 
-### A-169 [General/identity] 🟢 BUILT for 0.1.109 (found 2026-11-07, the sweep of pending items; seen on 8.x the same day) — An identity read through SY.admin that names a spoke is refused
+### A-169 [General/identity] ✅ VALIDATED ON 8.x (0.1.109, 2026-11-07; found 2026-11-07, the sweep of pending items; seen on 8.x the same day) — An identity read through SY.admin that names a spoke is refused
 
 - **Seen on 8.x (0.1.108):** `GET /hives/worker1/identity/ilks` and `GET
   /hives/worker1/identity/tenants` answered `UNAUTHORIZED_REGISTRAR`, "source not authorized for
@@ -1298,6 +1309,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   identities, so the answer is the same. The replica's own check is the sync diag's counts
   (scripts/identity_replica_sync_e2e.sh, whose steps 2 and 4 read the replica through SY.admin
   and so never passed).
+- **Validated on 8.x (0.1.109):** `GET /hives/worker1/identity/ilks` and `/tenants` answer `ok`.
 
 ### A-168 [WF] 🔵 TO DESIGN (found 2026-11-07, A-150's evaluation; read in the code) — A WF's menu has no schema, so no provider holds an agent's answer to it
 
@@ -1348,7 +1360,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   (`add_hive_flow`), the egress's and the ingress's, each in src/bin/sy_orchestrator.rs. Nothing
   else can write those files then. Closed, with no change.
 
-### A-165 [General/add_hive] 🟢 BUILT for 0.1.109 (PENDING-BUGS PB-6, found in August; read in the code 2026-11-07) — After a join over the password channel, password logins stay on
+### A-165 [General/add_hive] ✅ VALIDATED ON 8.x (0.1.109, 2026-11-07; the refusal; PENDING-BUGS PB-6, found in August; read in the code 2026-11-07) — After a join over the password channel, password logins stay on
 
 - **What happens:** `add_hive`'s `ssh_password` channel leaves `PasswordAuthentication yes` on the
   new box unless the request sets `harden_ssh: true`, which defaults to `false`
@@ -1371,8 +1383,11 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - **Its review round:** a socket-only re-run (the worker's orchestrator already up after an
     attempt that failed late) touches no SSH and applies no `harden_ssh`; its answer now says so
     when the request carries a password. A retry whose body drops the password is not asked.
+- **Validated on 8.x (0.1.109):** a password join with no `harden_ssh` was refused with
+  `INVALID_REQUEST` and its reason, and no hive was created. No join ran: hardening itself did not
+  change.
 
-### A-164 [General/vault] 🟢 BUILT for 0.1.109 (PENDING-BUGS PB-3, found in August; read in the code 2026-11-07) — The vault's resource types leave out the ones the product uses
+### A-164 [General/vault] ✅ VALIDATED ON 8.x (0.1.109, 2026-11-07; PENDING-BUGS PB-3, found in August; read in the code 2026-11-07) — The vault's resource types leave out the ones the product uses
 
 - **What happens:** `ResourceType` (crates/fluxbee_sdk/src/vault.rs) names neither `tls`, `ssh`,
   `whatsapp` nor `linkedhelper_adapter`, which the product writes and reads, and
@@ -1387,6 +1402,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   edge's certificate, `{cert, key}`), `whatsapp` (io.wapp) and `linkedhelper_adapter`
   (io.linkedhelper), each with its value and how its node finds it. `ssh` left the product with
   D32. The risk it closes: Archi writing a secret under a type its node does not read.
+- **Validated on 8.x (0.1.109):** vault_put's executor notes name the SDK's types and the three,
+  with their values.
 
 ### A-163 [WF] ✅ VALIDATED ON 8.x (0.1.106, 2026-11-07; found 2026-11-07, 0.1.105's gate on 8.x; read in the code) — The episode gate turns a proposal down without saying why
 
@@ -2934,7 +2951,7 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
     nothing;
   - `AI.*` and `SY.*` in `start_from` got `COMPILE_ERROR`.
 
-### A-122 [General/upgrade] 🟢 BUILT for 0.1.109 (found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
+### A-122 [General/upgrade] ✅ VALIDATED ON 8.x (0.1.109, 2026-11-07; found 2026-10-28, 0.1.89 release) — A base runtime published by hand keeps `current` through every upgrade, and only a manual delete hands it back
 
 - **What happens:**
   - The 0.1.88 gate published `ai.generic 0.1.88-gate1` with publish-ia-runtime.sh, which made it
@@ -2978,6 +2995,11 @@ validated live in WF Cases 3 and 4. Against the standard it lacks:
   - **Visible at the deploy:** the seed's NOTE names the action, and the lab's deploy shows it.
   - **Its review round:** a base with packages on it keeps its leftover version
     (`RUNTIME_HAS_DEPENDENTS`), now said in the docs; A-171 found on the way.
+- **Validated on 8.x (0.1.109):** a hand publish of `ai.generic 0.1.109-gate1` showed as one next
+  to `package_version` 0.1.109, and AI.pruebas moved onto it in 81 s. Removing 0.1.109 answered
+  `RUNTIME_PACKAGE_VERSION`; a hand publish under 0.1.109 was refused. Archi staged one
+  `reset_base_runtime` step, ran it on CONFIRM, and AI.pruebas was back in 47 s. Removing the
+  gate's version through Archi found A-172.
 
 ### A-121 ✅ RESOLVED (0.1.89; by tests, not exercised on 8.x) — A node whose purge failed on SY.timer comes back within 60 s
 
