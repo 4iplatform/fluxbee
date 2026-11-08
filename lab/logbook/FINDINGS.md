@@ -1749,7 +1749,20 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     worker's six SY nodes, seeded their six system ILKs and declared the worker's Syncthing folders,
     all from the table;
   - its join failed at the finalize, for a reason stage 2 does not touch: A-190 🔴.
-- **Next:** stage 3, the installation file.
+- **Stage 3, in three releases** (2026-11-08; the AI SDK goes alone, METHOD §9):
+  - **3a, built for 0.1.120, the AI SDK alone:** the installation file's type and reader
+    (`fluxbee_ai_sdk::installation`). It is valid as every reader needs it, with every provider
+    named having its model. Its state (absent, valid, or invalid with its hash) is there for
+    `/versions`. `ai_settings` reads hive.yaml's `ai` only while the file is absent. No reader
+    uses it yet.
+  - **3a's review round:** no high. Two mediums on the contract 3b relies on: an invalid file
+    must not stop the starts that report it (SY.admin, the orchestrator), and the hive.yaml
+    fallback must be said and must end. Its lows were fixed in the SDK, since a later SDK change
+    would need a release of its own: `validate` in `render` too, the file's state with its hash, a
+    lazy fallback, the path from the hive's dist.
+  - **3b:** the motherbee writes the file as version 1 and distributes it, the readers switch to
+    it, and `/versions` shows it. Nothing changes in behavior.
+  - **3c:** the operator's action and the `config` update.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
