@@ -3133,10 +3133,25 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                         // it on every drift tick (not just once at bootstrap) so an
                         // operator tailing the journal sees a persistent signal. Without
                         // egress.reachability_url there is no probe and nothing to say.
-                        if v.internet_reachable == Some(false) {
+                        // A drift alert too, so the operator sees it where the LAN problems show
+                        // (the sweep of 2026-11-07: it was a journal line only).
+                        if let Some((kind, problem)) = egress_internet_problem(
+                            v.internet_reachable,
+                            eg.reachability_url.as_deref(),
+                        ) {
                             tracing::warn!(
                                 reachability_url = eg.reachability_url.as_deref().unwrap_or_default(),
                                 "egress NAT healthy but internet unreachable — DEGRADED; check WAN uplink"
+                            );
+                            append_drift_alert(
+                                "egress",
+                                kind,
+                                "error",
+                                &state.hive_id,
+                                problem,
+                                None,
+                                None,
+                                None,
                             );
                         }
                     }
@@ -8627,6 +8642,23 @@ fn egress_serving_problems(
         ));
     }
     problems
+}
+
+/// An egress whose NAT is applied but whose WAN reaches no internet, as (drift alert kind, what is
+/// wrong). Only a probe that ran says so: without `egress.reachability_url` there is none.
+fn egress_internet_problem(
+    internet_reachable: Option<bool>,
+    reachability_url: Option<&str>,
+) -> Option<(&'static str, String)> {
+    (internet_reachable == Some(false)).then(|| {
+        (
+            "internet_unreachable",
+            format!(
+                "the NAT is applied, and {} does not answer through the WAN uplink: the LAN reaches no internet",
+                reachability_url.unwrap_or("the reachability probe")
+            ),
+        )
+    })
 }
 
 impl EgressVerification {
@@ -33168,6 +33200,18 @@ mod tests {
             "{reply}"
         );
         assert!(!state.any_hive_topology_busy());
+    }
+
+    /// An egress whose WAN reaches no internet raises a drift alert, as its LAN problems do; a
+    /// probe that did not run or that answered says nothing.
+    #[test]
+    fn an_egress_without_internet_is_a_drift_alert() {
+        let (kind, problem) =
+            egress_internet_problem(Some(false), Some("https://example.org/ping")).expect("alert");
+        assert_eq!(kind, "internet_unreachable");
+        assert!(problem.contains("https://example.org/ping"), "{problem}");
+        assert!(egress_internet_problem(Some(true), Some("https://example.org/ping")).is_none());
+        assert!(egress_internet_problem(None, None).is_none());
     }
 
     /// A hive lists itself with the role it runs as (an audit's F19: an egress and an ingress read
