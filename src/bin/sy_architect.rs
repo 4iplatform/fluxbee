@@ -29167,13 +29167,13 @@ mod tests {
         const PINS: [(&str, u64, &str); 4] = [
             (
                 cookbook_paths::DESIGN,
-                6,
-                "cd38be12a3c4d57cc60e86fd19d69dc0b8217a1e0656111142af2b4bba71665b",
+                7,
+                "a1d81298622b34a802715fc9c0833d7147fe881f238dd6ea240b4007155fae1d",
             ),
             (
                 cookbook_paths::ARTIFACT,
-                6,
-                "70f4452fad5341516c9270b77ca2704b0324a363f88948ef3e627cb6f3c2d887",
+                7,
+                "25709bed42f90d460de35b1ed1b4ad47077f7a31e57ecbafc548ee0952e5adaa",
             ),
             (
                 cookbook_paths::PLAN_COMPILE,

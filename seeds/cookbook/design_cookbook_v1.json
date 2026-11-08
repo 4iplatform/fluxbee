@@ -43,7 +43,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 6
+    "seed_version": 7
   },
   {
     "layer": "design",
@@ -100,7 +100,7 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 6
+    "seed_version": 7
   },
   {
     "layer": "design",
@@ -297,6 +297,6 @@
     "failure_class": null,
     "recorded_from_run": null,
     "seed_kind": "manual",
-    "seed_version": 6
+    "seed_version": 7
   }
 ]
