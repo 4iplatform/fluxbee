@@ -6,16 +6,22 @@
 > - states `UNCONFIGURED/CONFIGURED/FAILED_CONFIG`,
 > - Control Plane `CONFIG_SET/GET`, `CONFIG_RESPONSE`, `STATUS/PING`.
 
+⚠️ **Status (2026-11-07):** these examples predate the IO family's `vault_ref` pattern (July
+2026). Today an IO node's tokens live in SY.vault and its config names their key
+(`slack.auth: {type: "vault_ref", resource_type: "slack", key: "<vault key>"}`); io.slack refuses
+any other `auth.type` and reads no token from YAML, env or `CONFIG_SET`. Its config is the node's
+`config.json`, not a YAML file. The secret-bearing YAML and JSON below (§1 to §5) show the old
+MVP; today's config is in [io-slack-deploy-runbook](io-slack-deploy-runbook.md) and
+[io-nodes-spec](io-nodes-spec.md) §5.
+
 ---
 
 ## 0) Quick conventions
 
 - **Replace**: `apply_mode="replace"` and `payload.config` contains a full config.
-- **Secrets**: TODAY they may travel inline (MVP). They are **not** persisted in clear text in `${STATE_DIR}`.
-- **Credential precedence** (Slack):
-  1) in-memory override from `CONFIG_SET` (if any),
-  2) local config (YAML/env).
-  After a restart, the in-memory override is lost.
+- **Secrets**: they live in SY.vault, and the config names their key (`vault_ref`, since July 2026). They never travel inline, and are **not** persisted in clear text in `${STATE_DIR}`.
+- **Credentials** (Slack): read from SY.vault at start, on a `VAULT_SECRET_CHANGED` for the key and
+  every 60 s. A `CONFIG_SET` is written to `config.json`, so it survives a restart.
 
 ---
 
@@ -56,32 +62,30 @@ adapter:
       # Socket mode: normally we care about app_mention
       allowed_event_types: ["app_mention"]
 
-# --- Secrets (TODAY vs FUTURE) ---
+# --- Secrets (the old MVP vs today) ---
 #
-# TODAY (real path without depending on a secret manager):
-# - storing tokens inline in YAML is allowed (they stay on disk).
+# OLD MVP, not accepted today: tokens inline in YAML, as in (A).
 #
-# FUTURE (recommended):
-# - use refs (env/file/vault/kms) and a secret manager.
+# TODAY (since July 2026): the tokens live in SY.vault and the config names their key, as in (B).
 #
-# IMPORTANT: do not use both variants at the same time.
-#
-# (A) TODAY: inline secret in YAML (MVP)
+# (A) OLD MVP: inline secret in YAML
 secrets:
   slack:
     app_token: "xapp-REDACTED-IN-YAML"
     bot_token: "xoxb-REDACTED-IN-YAML"
 
-# (B) FUTURE: references to secrets (do NOT use together with (A))
-# secrets:
-#   slack:
-#     app_token_ref: "env:SLACK_APP_TOKEN"
-#     bot_token_ref: "env:SLACK_BOT_TOKEN"
+# (B) TODAY: a vault reference (slack.auth in the node's config.json)
+# slack:
+#   auth:
+#     type: "vault_ref"
+#     resource_type: "slack"
+#     key: "slack:io-slack-support"
 ```
 
 ### Comments
 - In Socket Mode, `url_verification/challenge` does **not apply** (that is the Events API over HTTP).
-- If you omit `secrets.slack.*` in YAML, the node can still start, but it will stay `FAILED_CONFIG (missing_secret)` until it receives a `CONFIG_SET` with inline credentials.
+- Today a node whose vault secret is missing still starts, and runs degraded until the secret
+  arrives ([io-slack](io-slack.md) §12); it is not `FAILED_CONFIG`.
 
 ---
 

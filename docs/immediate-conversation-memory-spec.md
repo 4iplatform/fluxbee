@@ -1,10 +1,10 @@
 ﻿# Fluxbee AI SDK - Immediate Conversation Memory Spec
 
-Estado: onworking  
-Alcance: `crates/fluxbee_ai_sdk`  
-Consumidores iniciales:
+Status: onworking  
+Scope: `crates/fluxbee_ai_sdk`  
+First consumers:
 - `SY.architect`
-- futuros nodos `AI.*`
+- future `AI.*` nodes
 
 ai.generic, the `AI.*` runtime, no longer uses it: an agent's memory is cognition's (§18).
 

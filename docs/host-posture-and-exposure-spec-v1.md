@@ -461,7 +461,12 @@ docs, together. One track at a time.
 | O7 | More than one ingress per installation. | **No:** one ingress, one egress and one edge per installation, each installation under its own public name so many can live on the internet. Manual failover (the A record). |
 | O8 | Tenant label in tenant paths, and per-tenant hosts. | **Neither.** Public URLs already follow one pattern: opaque ids (`/e/<ich>`, `/public/<key>`), the tenant inside the request or the record, never in the URL. IO.web's artifacts follow it; `/t/<label>/` (§4.4) is withdrawn. Archi is one per installation, not per tenant. |
 
----|---|---|
+The options as revision 10 put them, before the decision of 2026-10-13. **Superseded** by the
+table above; since then [io-web-v2](io-web-v2.md) §5 replaced O5 and O6, and O6 is built as
+SY.admin's ACME client (0.1.82, [acme-edge-certificates-v1](acme-edge-certificates-v1.md)).
+
+| ID | Question | Options (revision 10, superseded) |
+|---|---|---|
 | O5 | The trust anchor for Archi through Cloud. Today a compromised ingress can mint and use an Archi session by itself. | **(a) Recommended: end to end.** Cloud signs the mint with a key pinned on the motherbee; the code goes back encrypted to Cloud; the edge passes `archi.<id>` through by SNI to IO.web, which holds the only certificate for it. (b) Accept the risk in A-46. |
 | O6 | Certificate source with manual DNS. | **(a) Recommended for now:** a 1-year per-installation certificate. (b) ACME with `_acme-challenge.<id>` delegated by CNAME. Under O5(a), the edge certificate does not cover `archi.<id>`. |
 | O7 | More than one ingress per installation. | Publication is single-edge today, so DNS points at one ingress. *"Edge replicado"* / *"cloud replica"* reads as Cloud mirroring Archi. To confirm. |

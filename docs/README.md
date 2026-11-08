@@ -78,6 +78,8 @@ Decisions as they were taken, with the operator's reasons. Dated; not rewritten 
 - [router-stream-v1](router-stream-v1.md): the router stream, cognition per communication, LLM
   usage records (A-70).
 - [ilk-tenant-model-v1](ilk-tenant-model-v1.md): the ILK as the actor, the tenant as a cost center.
+- [agent-tools-v1](agent-tools-v1.md): what an AI agent can do, declared once in the code: each
+  tool's card, the catalog and `NODE_HELP` (0.1.86 to 0.1.89).
 - [wf-standard-path-v1](wf-standard-path-v1.md): workflows through SY.admin (A-68).
 - [host-posture-and-exposure-spec-v1](host-posture-and-exposure-spec-v1.md): host posture, exposure,
   certificates.
@@ -86,8 +88,7 @@ Decisions as they were taken, with the operator's reasons. Dated; not rewritten 
 
 ## Future
 
-Designs not built yet: [agent-tools-v1](agent-tools-v1.md) (what an AI agent can do, declared
-once), [solution-manifest-spec_1](solution-manifest-spec_1.md),
+Designs not built yet: [solution-manifest-spec_1](solution-manifest-spec_1.md),
 [scope-binding-energy-spec](scope-binding-energy-spec.md),
 [future_implementations/](future_implementations/).
 

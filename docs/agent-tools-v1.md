@@ -136,7 +136,7 @@ whether the model receives images. It is about the model, not a tool.
 
 ## 4. Related
 
-- FINDINGS A-93: an AI node cannot choose its provider (pending).
+- FINDINGS A-93: an AI node chooses its provider (`behavior.provider`) since 0.1.86.
 - FINDINGS A-94: the cleanup of "capabilities".
 - FINDINGS A-95: `ai.generic` logs the full link of a page it publishes.
 

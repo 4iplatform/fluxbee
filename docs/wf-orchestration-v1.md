@@ -2159,5 +2159,6 @@ definition in the docs (go/pkg/wfcel/shipped_definitions_test.go). The list as i
   person and the conversation), A-117 to A-119 (§3, resolved in 0.1.90), A-123 (an instance's
   thread and its senders).
 - [wf-standard-path-v1](wf-standard-path-v1.md) (A-68, the deploy path).
-- docs/audits/2026-07-23-sy-timer-wf-audit.md: G1, G2, G4, G5 and G9 are still open.
+- docs/audits/2026-07-23-sy-timer-wf-audit.md: G1, G4, G5 and G9 are still open. G3 and G7 were
+  fixed on 2026-07-23 (`0d9200e`), and G2 in 0.1.90 (FINDINGS A-117: a WF always sends `user`).
 - docs/audits/2026-07-24-wf-dynamic-target-opa-design.md: the allowlist was never built.

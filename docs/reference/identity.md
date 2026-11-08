@@ -465,9 +465,9 @@ An `agent` ILK may carry a cognitive definition: hashes of assets, not the asset
   `<blob_root>/agent-assets/<hash>.json` (`load_cognitive_asset`,
   `nodes/ai/ai-generic/src/bin/ai_node_runner.rs`).
 
-**Known gap: FINDINGS A-72.** `blob/agent-assets` is not replicated to the workers; only
-`blob/active` is. An agent with a definition on a worker cannot load its assets. Today an agent
-with a role only works on the motherbee.
+**On the workers:** since 0.1.81 (FINDINGS A-72) the Syncthing folder `fluxbee-dist-agent-assets`
+(send-only on the motherbee, receive-only on every worker) brings `blob/agent-assets` to the
+workers, so an agent with a definition runs on a worker too.
 
 ---
 
@@ -752,5 +752,5 @@ the row's values (`db_error_summary`).
 
 ## 8. Known gaps
 
-A-72, agent assets missing on the workers (§4). Unused today: `TNT_APPROVE` (§3.2),
-`identity_vocabulary` (§5.2) and the `partial` status (§2.3).
+Unused today: `TNT_APPROVE` (§3.2), `identity_vocabulary` (§5.2) and the `partial` status (§2.3).
+A-72, agent assets missing on the workers, is fixed since 0.1.81 (§4).

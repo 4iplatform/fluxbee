@@ -362,10 +362,10 @@ Scope options: `global`, `hive`, `summary`.
 ## 8. Implementation Tasks
 
 Implementation status (2026-03-12):
-- Fase A: completada en código.
-- Fase B: completada en código.
-- Fase C: completada en código.
-- Fase D: pendiente de validación E2E en entorno integrado.
+- Phase A: done in code.
+- Phase B: done in code.
+- Phase C: done in code.
+- Phase D: E2E validation pending in an integrated environment.
 
 ### Phase A — LSA Self-Entry
 
@@ -397,14 +397,17 @@ Implementation status (2026-03-12):
 
 ### Phase D — Validation
 
-- [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`)
+The scripts of D1, D3, D4 and D5 were deleted in the cleanup of 2026-10-17 (0.1.80, `41decbd`);
+only D2's remains.
+
+- [x] D1. E2E: inventory reflects node spawn/kill in real time. (`scripts/inventory_spawn_kill_e2e.sh`, deleted)
 - [x] D2. E2E: inventory reflects add_hive/remove_hive via API (`/inventory`). (`scripts/inventory_add_remove_hive_e2e.sh`)
-  - Cubre explícitamente `DELETE /hives/{id}` -> hive removida (o vista removida) en inventario, y `POST /hives` -> hive presente.
-- [ ] D3. E2E: stale hive appears as stale in inventory. (`scripts/inventory_stale_hive_e2e.sh`)
-  - Estado: bloqueado por contrato operativo actual. `SY.admin` no expone `/hives/{id}/routers*` y aún falta trigger canónico no-legacy para forzar transición `alive -> stale` en pruebas.
-  - Nota: `D3` no valida delete/add; eso ya queda cubierto por `D2`.
-- [x] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica). (`scripts/inventory_identity_primary_routing_e2e.sh`)
-- [x] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback). (`scripts/inventory_identity_primary_routing_e2e.sh`)
+  - It explicitly covers `DELETE /hives/{id}` -> the hive removed (or shown as removed) in the inventory, and `POST /hives` -> the hive present.
+- [ ] D3. E2E: stale hive appears as stale in inventory. (`scripts/inventory_stale_hive_e2e.sh`, deleted)
+  - Status: blocked by the current operational contract. `SY.admin` does not expose `/hives/{id}/routers*`, and a canonical, non-legacy trigger to force the `alive -> stale` transition in tests is still missing.
+  - Note: `D3` does not validate delete/add; `D2` already covers that.
+- [x] D4. E2E: worker identity writes are routed to `SY.identity@motherbee` (no fallback to local replica). (`scripts/inventory_identity_primary_routing_e2e.sh`, deleted)
+- [x] D5. E2E negative: if `SY.identity@motherbee` is unreachable, worker fails identity write routing explicitly (no local fallback). (`scripts/inventory_identity_primary_routing_e2e.sh`, deleted)
 
 ---
 

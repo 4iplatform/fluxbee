@@ -162,9 +162,10 @@ Behavior:
 
 ## 9. Security Notes (pilot)
 
-- Secrets in `config.json` are plaintext for now.
-- Restrict access by filesystem permissions and host hardening.
-- Future work: secret-manager references and encrypted-at-rest handling.
+- Node secrets live in SY.vault, encrypted at rest (AES-256-GCM), not in `config.json`. An IO node
+  that takes credentials names their vault key in its config (`auth.type: vault_ref`,
+  `nodes/io/common`; io.slack since 2026-07-24); an AI node reads its provider key from SY.vault.
+- Restrict access to `config.json` by filesystem permissions and host hardening.
 
 ---
 

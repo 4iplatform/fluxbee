@@ -4,6 +4,8 @@
 0.1.65, validated on the 8.x testbed on 2026-10-14 (`lab/DEPLOYMENTS.md`). Stage 2 is live in 0.1.66,
 validated on 8.x the same day (FINDINGS A-64). Stage 3 is live in 0.1.67, validated on 8.x on
 2026-10-15 (FINDINGS A-66). Stage 4 is live in 0.1.69 (0.1.68 and its gate fixes), validated on 8.x the same day (FINDINGS A-67).
+Stage 5, the tokens, is live in 0.1.79 as stage 3 of the router stream, validated on 8.x on
+2026-10-17 (FINDINGS A-70; [router-stream-v1](router-stream-v1.md) §7).
 This document is the single source for the change; FINDINGS and the ledger point here.
 
 **How it was reached.** It came out of a conversation, not out of the code: the operator, Claude
@@ -472,7 +474,7 @@ cost center; credentials per stage 2.
 
 `docs/io-cloud-api.md` and the Cloud team's note follow each stage.
 
-### 2.5 Tokens (stage 5, designed later)
+### 2.5 Tokens (stage 5, live in 0.1.79)
 
 A consumption record per model call:
 - when;
@@ -484,6 +486,13 @@ It is stored centrally on the motherbee, with admin and Cloud reads by tenant an
 the tenant at the moment keeps history right across reassignments. The gate of §2.3 stops a
 suspended tenant from spending. The operator flagged this as possibly needing "something more
 complex, central"; it gets its own design.
+
+**Built in 0.1.79** (FINDINGS A-70, stage 3; designed in [router-stream-v1](router-stream-v1.md) §7):
+every model call leaves a record in SY.storage's `llm_usage` table on the motherbee, carried by
+each router's stream. SY.storage charges it to a tenant it checks against identity, and keeps the
+node's ILK, the counterpart's ILK (not its tenant), the provider, the model and the token counts
+([reference/storage.md](reference/storage.md) §6.3). The admin, Archi and Cloud read it by tenant
+and period; Cloud reads only its own tenant.
 
 ---
 
@@ -503,7 +512,7 @@ Every stage goes through:
 | 2 | Secrets (§2.2). | On PROD: <br>• a company's token assigned to two of its nodes reaches both and not a third; unassigned, one stops at once; <br>• a general token reaches every node of its company and none of another; <br>• a suspended or deleted tenant's secrets are not handed out, and come back when it is reactivated; <br>• a person's secret assigned to a node reaches it, and the person's reassignment changes nothing; <br>• the genesis tenant refuses an AI node, and the core still reads its keys after a restart; <br>• a node's tenant cannot change; <br>• Cloud stores, assigns and lists through the public door. |
 | 3 | Tenant firm (§2.3). | On PROD: <br>• suspended, a tenant's node does not start or restart and the running one keeps running without secrets; one that dies is not relaunched; reactivated, it is; <br>• deleted with people charged, nobody is marked and they still resolve; a person comes back while it is deleted; restored, it is as it was; <br>• a purge with people charged is refused, and goes once they are charged elsewhere (a temporary included, out of the deleted tenant). |
 | 4 | Cloud (§2.4). | On PROD, through the public door: <br>• Cloud suspends a tenant: its nodes get no secrets and a new one is refused; reactivated, they work; <br>• `get_tenant` and `list_tenants` answer the whole record; <br>• a node Cloud launched shows in `list_nodes`; stopped, it stays down past a relaunch pass; started, it runs; deleted, its own secret and its identity are gone and its name is free; <br>• a node Cloud did not launch is refused to Cloud; <br>• the contract doc checked live; <br>• `a5f1b2a`: a refused `set_ilk_tenant` answers its code alone. |
-| 5 | Tokens (§2.5). | Designed first. |
+| 5 | Tokens (§2.5). | Designed and gated as stage 3 of [router-stream-v1](router-stream-v1.md) §7 (its gates in §7.7); live in 0.1.79, validated on 8.x on 2026-10-17 (FINDINGS A-70). |
 
 ---
 

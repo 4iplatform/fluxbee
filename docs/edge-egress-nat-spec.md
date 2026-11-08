@@ -3,12 +3,14 @@
 **Status:** v1.0 — IMPLEMENTED (was "implementation-ready")
 **Date:** 2026-06-08
 
-> **Actualización 2026-07-21:** the Mode A egress role is BUILT in `src/bin/sy_orchestrator.rs`:
+> **Update 2026-07-21:** the Mode A egress role is BUILT in `src/bin/sy_orchestrator.rs`:
 > `HiveRole::{Motherbee,Worker,Egress}`, the `add_egress_hive_flow` provisioning path, and the
 > self-contained `table inet fluxbee_egress` NAT/forward reconciliation (sysctl + nftables, applied
 > and drift-reconciled) all exist. A single-NIC guard also shipped: `resolve_egress_nat_config`
 > rejects `wan_iface == lan_iface`. The design-tense wording below (§6 "currently binary", §6.5
-> "does not exist today", the §12 unchecked checklist) predates this and no longer reflects the code.
+> "does not exist today") predates this and no longer reflects the code. §10.2, the §12 checklist
+> and the §14 questions were brought up to date on 2026-11-07; the 8.x lab has run an egress hive
+> (`egress1`) since 2026-07-29.
 >
 > **Update 2026-10-06 (design, not yet built): host posture.** `docs/host-posture-and-exposure-spec-v1.md`
 > (stages 4–5) supersedes two statements here once it is built:
@@ -534,11 +536,11 @@ worker egress route reconciled gateway_ip="192.168.8.1" route_applied=true ipv6_
 
 Egress NAT does not touch the `wan` section or `RT.gateway`. WAN is Fluxbee protocol connectivity between hives over sockets; egress NAT is OS-level IP forwarding to the internet. They are orthogonal layers on the same host and coexist without interaction.
 
-### 10.2 With `RT.edge` (ingress, future)
+### 10.2 With `SY.edge` (ingress)
 
-`RT.edge` is the future public ingress runtime (`edge-control-protocol.md`). It handles HTTPS termination, TLS material, JWT validation, tenant cache, and HTTP→L2 translation. It is a **separate responsibility** from egress NAT.
+The public ingress is built: `SY.edge` on a hive with the `ingress` role ([edge-ingress-spec-v6](edge-ingress-spec-v6.md)); the `RT.edge` design it replaced is in `docs/history/rt-edge-spec.md`. It terminates HTTPS and turns HTTP into mesh messages. It is a **separate responsibility** from egress NAT.
 
-The two MAY run on the same host or on different hosts. Running both on one host concentrates trust (internet-facing ingress + LAN NAT + the secrets RT.edge holds). For production, separating them onto different hosts is recommended; for beta, the same host is acceptable. The egress spec does not require or assume co-location either way. When `RT.edge` is introduced, its role profile (identity replica, OPA, etc.) is additive and does not change the egress role defined here.
+A hive has one role, so the ingress and the egress run on separate hives (on 8.x, `ingress1` and `egress1`). The ingress role does not change the egress role defined here.
 
 ---
 
@@ -562,37 +564,40 @@ The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logg
 
 ## 12. Implementation Checklist
 
+**Status (2026-11-07):** built, in `src/bin/sy_orchestrator.rs`. The two boxes left open were never
+recorded as checked live.
+
 ### Orchestrator — role plumbing (mechanical)
 
-- [ ] `is_egress_role()` helper
-- [ ] Accept `egress` at startup role gate (lines 503–512)
-- [ ] `EgressSection` struct, add `egress` to `HiveFile`
-- [ ] Add `egress` to `SystemNodesSection`
-- [ ] `HiveRole` enum; refactor `system_nodes_for_role` to select by role
-- [ ] Update all `is_motherbee` call sites feeding `system_nodes_for_role` / `validate_system_nodes`
-- [ ] `validate_system_nodes`: skip vault checks for non-motherbee; extend "no sy-vault" to egress
-- [ ] Parameterize `render_system_nodes_yaml` to emit the role key
-- [ ] Egress hive `hive.yaml` generation in `add_hive_flow`
+- [x] `is_egress_role()` helper
+- [x] Accept `egress` at startup role gate
+- [x] `EgressSection` struct, add `egress` to `HiveFile`
+- [x] Add `egress` to `SystemNodesSection`
+- [x] `HiveRole` enum; refactor `system_nodes_for_role` to select by role
+- [x] Update all `is_motherbee` call sites feeding `system_nodes_for_role` / `validate_system_nodes`
+- [x] `validate_system_nodes`: skip vault checks for non-motherbee; extend "no sy-vault" to egress
+- [x] Parameterize `render_system_nodes_yaml` to emit the role key
+- [x] Egress hive `hive.yaml` generation (in `add_egress_hive_flow`)
 
 ### Orchestrator — network reconciliation (core work)
 
-- [ ] sysctl writer for `/etc/sysctl.d/99-fluxbee-egress.conf` + `sysctl --system`
-- [ ] nftables ruleset writer (marked, idempotent block) with CIDR/iface substitution
-- [ ] nftables apply + verify ruleset loaded
-- [ ] conntrack tuning (sysctl + modprobe option)
-- [ ] UFW detection: warn/refuse or disable-on-confirm
-- [ ] Egress hive verification payload
-- [ ] Worker default-route injection from motherbee `egress.gateway_ip`
-- [ ] Worker IPv6 block (sysctl disable + accept_ra=0)
-- [ ] Worker verification payload, `EGRESS_IPV6_UNMANAGED` path
+- [x] sysctl writer for `/etc/sysctl.d/99-fluxbee-egress.conf` + `sysctl --system`
+- [x] nftables ruleset writer (marked, idempotent block) with CIDR/iface substitution
+- [x] nftables apply + verify ruleset loaded
+- [x] conntrack tuning (sysctl + modprobe option)
+- [x] UFW detection: built as a report only. Since 0.1.83 an active ufw or firewalld raises the posture alert `host_firewall_active`, and the orchestrator writes no rule to either ([control-path-hardening-v1](control-path-hardening-v1.md) §6)
+- [x] Egress hive verification payload
+- [x] Worker default-route injection from motherbee `egress.gateway_ip` (only into workers that join after it is declared)
+- [x] Worker IPv6 block (sysctl disable + accept_ra=0)
+- [x] Worker verification payload, `EGRESS_IPV6_UNMANAGED` path
 
 ### Validation / tests
 
-- [ ] `role=egress` passes `validate_system_nodes` with `SY.config.routes`-only profile
-- [ ] `role=egress` rejected if it lists `sy-vault`
-- [ ] Idempotent re-apply of nftables/sysctl produces no drift
-- [ ] Worker reaches internet through gateway; IPv6 confirmed blocked
-- [ ] Mode B: workers receive route from `gateway_ip` with no egress hive present
+- [x] `role=egress` passes `validate_system_nodes` with `SY.config.routes`-only profile (unit test; the packaged profile adds `SY.opa.rules`, §14)
+- [x] `role=egress` rejected if it lists `sy-vault` (unit test)
+- [x] Idempotent re-apply of nftables/sysctl produces no drift (the ruleset adds and flushes its own table in one transaction; the watchdog re-applies it every minute)
+- [ ] Worker reaches internet through gateway; IPv6 confirmed blocked (the egress host's NAT, IPv6 block and internet probe were checked on 8.x on 2026-07-29; a worker's route through it was not)
+- [ ] Mode B: workers receive route from `gateway_ip` with no egress hive present (no egress hive is required by the code; not tested)
 
 ---
 
@@ -610,8 +615,8 @@ The v1 nftables `forward` chain (§8.2) is structured so the allow-list and logg
 
 ## 14. Open Questions for Implementation
 
-1. **Egress profile floor**: this spec sets the minimal profile to `SY.config.routes` only (plus `RT.gateway` and `SY.orchestrator` implicit in being a hive). Confirm during implementation that the local router boots cleanly with only `SY.config.routes`. If the router needs another SY node to register/initialize, add it and update §5.1.
+1. ~~**Egress profile floor**~~ — **resolved**: `validate_system_nodes` accepts `SY.config.routes` alone for the egress (unit test), and the egress router runs on 8.x (`egress1`, since 2026-07-29). The packaged profile (`packaging/hive.yaml.example`) adds `SY.opa.rules`, which every role runs so its router enforces the global user policy; it is not a readiness gate.
 2. ~~**`edge_ip` derivation**~~ — **resolved (FINDINGS A-1)**: not derived. The first usable address of the CIDR was a guess that could name an address no interface carried, a gateway no worker reaches; the join reads the address `lan_iface` carries instead (§6.4).
-3. **nftables include mechanism**: dedicated `table inet fluxbee_egress` (self-contained, recommended) vs include file merged into the host's main ruleset. The dedicated table is cleaner for idempotent management; confirm no conflict with any existing host nftables policy.
+3. ~~**nftables include mechanism**~~ — **resolved**: the dedicated `table inet fluxbee_egress` (`EGRESS_NFT_TABLE`). Its file adds and flushes the table in one transaction, so a re-apply never leaves the host without it, and `fluxbee-egress-nft.service` loads it at boot (F17). The orchestrator changes no other host rule: an active ufw or firewalld is reported (`host_firewall_active`), never written.
 4. ~~**IP-echo endpoint for `egress_public_ip`**~~ — **resolved**: v1 verification is an HTTPS GET of the operator's `egress.reachability_url` (`internet_reachable`), confirming reachability only; without the URL there is no probe. Public-IP discovery via IP-echo is deferred to the fuller verification of the complete system.
-5. **conntrack defaults**: 262144 / hashsize 65536 are starting points. Tune to deployment scale.
+5. **conntrack defaults**: 262144 / hashsize 65536 are starting points. Tune to deployment scale. Built with these values as constants (`EGRESS_CONNTRACK_MAX`, `EGRESS_CONNTRACK_HASHSIZE`), not configurable.

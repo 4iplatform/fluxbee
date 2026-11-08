@@ -11,6 +11,12 @@ Base reviewed: `cd2ab140c1c5735ecf0898a5f6a28570c90d40bb`
 Status: implementation finished and validated on Linux/Proxmox, with a documented Edge topology
 limitation and a pending operational upgrade problem.
 
+Status update (2026-11-07): both residuals are fixed. EDGE-H4 since 2026-07-20 (`65a3ff0`): the
+WAN multi-hop reachability plane lets the ingress reach a hive it is not adjacent to through the hub
+([edge-multihop-reachability-spec-v1](../edge-multihop-reachability-spec-v1.md)), so an IO.api on a
+worker can be published. The upgrade timeout since 2026-07-20 (`5c9a23f`): the orchestrator exits
+on SIGTERM without stopping the hive, and every Fluxbee unit has `TimeoutStopSec=15`.
+
 ## Decision applied
 
 `IO.api` stops being a private HTTP server and moves to the current Edge-native model:

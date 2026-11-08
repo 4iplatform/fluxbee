@@ -902,7 +902,7 @@ These are used primarily by Archi's executor. Direct invocation by humans or by 
 | Composition template hardcoded in ai.generic for v1 | Same template for all providers; parameterize later if needed |
 | Agent reports state via CONFIG_GET, not SHM writes | Identity is the only SHM writer; agents are read-only consumers |
 | Default minimal prompt for unconfigured agents | Agent always operational, even if not yet configured |
-| Tools/actions deferred to v2 | Tool registry is its own complexity; not blocking for v1 |
+| Tools/actions deferred to v2 | Tool registry is its own complexity; not blocking for v1. Superseded by [agent-tools-v1](agent-tools-v1.md), built in 0.1.86 to 0.1.89: tools are not part of the definition, and every agent has every base tool (§12) |
 | Legacy roles/capabilities retired | They were only partially implemented and are replaced by hash-based cognitive definition |
 | Personality is a separate asset, not a field on the role | Roles describe function; personalities describe person. Reusable independently — one personality alongside many roles and vice versa. Conflating them blocks reuse. |
 | Personality `system_fields` are projected flat into `data.identity` for OPA | Routing/scheduling need to query timezone/language/country directly. Putting these in the prompt only would make them invisible to the system. |

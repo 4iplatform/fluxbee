@@ -626,11 +626,11 @@ address in its `wan.uplinks` and `ingress.ssh_allow_from` (`inet fluxbee_ingress
 - [cognition.md](cognition.md): memory per communication and the memory package.
 - [docs/nodes/](../nodes/): one page per SY node, named after its unit, for example
   [sy-vault.md](../nodes/sy-vault.md).
-- [13-storage.md](storage.md): SY.storage and its PostgreSQL tables.
+- [storage.md](storage.md): SY.storage and its PostgreSQL tables.
 
 Design documents behind this page, with their history and decisions:
 [router-stream-v1.md](../router-stream-v1.md), [ilk-tenant-model-v1.md](../ilk-tenant-model-v1.md),
 [edge-ingress-spec-v6.md](../edge-ingress-spec-v6.md), [io-cloud-api.md](../io-cloud-api.md),
 [edge-multihop-reachability-spec-v1.md](../edge-multihop-reachability-spec-v1.md),
 [host-posture-and-exposure-spec-v1.md](../host-posture-and-exposure-spec-v1.md) and
-[packaging-and-build.md](../packaging-and-build.md) (Spanish).
+[packaging-and-build.md](../packaging-and-build.md).

@@ -372,20 +372,21 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
 
 ## 14. Static public artifacts: bounded local-serving exception
 
-El path normal del edge sigue siendo `ICH → forward`: webhooks, APIs y comandos viven en nodos IO.
-Los artefactos grandes son la unica excepcion aceptada porque sus bytes no caben ni deben viajar por
-el envelope de la malla. Para `/public/<key>`, `SY.edge` sirve un archivo desde una replica local
-receive-only y solo si existe una row empujada por `SY.admin`.
+The edge's normal path is still `ICH → forward`: webhooks, APIs and commands live in IO nodes.
+Large artifacts are the one accepted exception, because their bytes neither fit in nor should travel
+in the mesh's envelope. For `/public/<key>`, `SY.edge` serves a file from a local receive-only
+replica, and only if a row pushed by `SY.admin` exists for it.
 
-La autoridad no se mueve al edge: el productor llama directo a admin, admin deriva su tenant y ordena
-a `IO.blob` curar el archivo. Edge conserva solo `{capability -> public_name + policy + expiry}` y no
-lista ni resuelve tenants. Ver `io-blob-spec-v1.md` para los limites de esta excepcion.
+Authority does not move to the edge: the producer calls admin directly, admin derives its tenant and
+tells `IO.blob` to curate the file. The edge keeps only `{capability -> public_name + policy + expiry}`
+and neither lists nor resolves tenants. See `io-blob-spec-v1.md` for the limits of this exception.
 
-**Estado 2026-07-17:** implementado y validado en Proxmox desde un clon limpio. `add_ingress`
-instala Syncthing y enlaza únicamente `fluxbee-blob-public` (`sendonly` motherbee, `receiveonly`
-ingress); `/public/:key` sirve el registry ACKeado por admin con expiry, ETag, ranges, semaphore y
-sandbox HTML. El lab verifico replica real, serving tras reboot y teardown simetrico. Resta como
-smoke de producto ejecutar publish/expiry/unpublish desde un AI/IO real.
+**Status 2026-07-17:** implemented and validated on Proxmox from a clean clone. `add_ingress`
+installs Syncthing and links only `fluxbee-blob-public` (`sendonly` on the motherbee, `receiveonly`
+on the ingress); `/public/:key` serves the registry admin acknowledged, with expiry, ETag, ranges, a
+semaphore and an HTML sandbox. The lab verified a real replica, serving after a reboot and a
+symmetric teardown. What remains is a product smoke: publish, expiry and unpublish from a real AI
+or IO node.
 
 ---
 
@@ -409,10 +410,12 @@ smoke de producto ejecutar publish/expiry/unpublish desde un AI/IO real.
    adjacent-hub-or-same-hive limit no longer applies.
 
 **Deferred by design:** the durable-binding shape decision (§12); edge-asks-vault token check;
-`IO.cloud` end-user-ilk subject authz (el bearer Cloud es autoridad alpha); validacion tenant por cada
-GET de artefacto (v1 empieza con link-capability); ~~multi-hop cross-hive~~ (BUILT, `65a3ff0`); JWT/ACME + public-zone
-DNS (wildcard sidesteps); WS/SSE upgrade (501 stub only); the edge `config` subsystem (thread B) if
-not needed for the first proof.
+`IO.cloud` end-user-ilk subject authz (Cloud's bearer is the alpha authority); a tenant check on
+every artifact GET (v1 starts with the link capability); ~~multi-hop cross-hive~~ (BUILT, `65a3ff0`); JWT; ~~ACME~~ (BUILT
+in 0.1.82: SY.admin's ACME client, [acme-edge-certificates-v1](acme-edge-certificates-v1.md)); public-zone
+DNS (wildcard sidesteps); WS/SSE (not served: the door speaks HTTP/1 with no upgrade, and since
+0.1.85 a web host answers an upgrade with 400 `UPGRADE_NOT_ALLOWED`, `src/bin/sy_edge.rs`); the
+edge `config` subsystem (thread B) if not needed for the first proof.
 
 ---
 
@@ -424,9 +427,9 @@ not needed for the first proof.
    and proves the real self-service flow.
 3. **Admin-minted token** → vault owned-by-node, edge-local door check.
 4. **H1 + H2 + H3** — a real from-scratch TLS-serving ingress that boots **zero** and converges.
-5. **`IO.cloud` — DONE para provisioning alpha:** bootstrap externalize autenticado y relay acotado de
-   tenant/token/spawn. El runtime de cada producto y la identidad de usuario final son verticales
-   posteriores.
+5. **`IO.cloud` — DONE for alpha provisioning:** an authenticated bootstrap externalize and a bounded
+   relay of tenant, token and spawn. Each product's runtime and the end user's identity are later
+   verticals.
 6. **M2/M3/M4/L1** — finish the non-deferred alpha surface.
 7. Thread B (`config` subsystem) + spec/checklist cleanup.
 

@@ -1,5 +1,13 @@
 # io.api / io.blob / io.cloud — integration review (2026-07-22)
 
+> **Status (2026-11-07):** FIX-12 and FIX-13, deferred at the end of this review, are fixed.
+> FIX-12 on 2026-07-24 (`3bd8d09`): Cloud's relay vocabulary has one source,
+> `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS`, which IO.cloud translates with and SY.admin's gate and
+> catalog derive from (`CLOUD_EXPOSED_ACTIONS`, pinned to it by a test). FIX-13 in 0.1.81 (a first
+> part on 2026-07-24, `b9fe869`): `scripts/install.sh` builds the `.deb` with
+> `packaging/build-deb.sh`, which reads `packaging/base-nodes.json`, and installs it, so a source
+> install is the package install.
+
 Deep integration review of the three IO nodes now **baked into the `.deb`** (io.api runtime +
 io.blob/io.cloud singletons). Method: 7 integration lenses (edge, vault, authz, lifecycle, config,
 identity, packaging) → each candidate finding **adversarially verified against the actual code** →

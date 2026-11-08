@@ -10,6 +10,8 @@
 > Policy composition note (2026-04-06): the manifest carries only solution-level policy rules. System axioms are shipped separately with Fluxbee core as an immutable policy pack, installed into the `SY.architect` environment, and composed with the manifest policy at apply time.
 >
 > Retirement note (2026-10-17): the `SY.policy` node that ran only counted turns; it was stopped in 0.1.77 and its binary and unit were removed in 0.1.78. Nothing runs the post-facto evaluation this spec assigns to `SY.policy`.
+>
+> Update (2026-11-07): `SY.policy` is gone with NATS (FINDINGS A-70); no node takes its place. Every mention of it below (the `policy` description in §4, §5.7, step 6 of §7.2 and §11) is the old design: nothing receives the effective policy matrix. `sy-policy-beta.md` is in `docs/history/`.
 
 ---
 

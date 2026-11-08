@@ -5,6 +5,16 @@ Commit audited: `78428c5`
 Branch: `daily_onworking_coa`
 Main file: `src/bin/sy_orchestrator.rs` (20562 lines)
 
+> **Status (2026-11-07):** of the five Low findings left pending below, F25 was fixed on
+> 2026-07-01 (`cec4195`, SO-2026-06-30-08 of the next audit: the ruleset adds and flushes its
+> table in one transaction). F23 was fixed then on the egress host, which reads `ip_forward` and
+> IPv6 back from the kernel; the worker's `reconcile_worker_egress` still sets `ipv6_blocked`
+> without a read-back. F19 was fixed in two steps: the workers' `info.yaml` carries `role` since
+> 2026-07-22 (`64117d3`), and a hive lists itself with the role it runs as since 0.1.109 (FINDINGS
+> A-170). F21 is parked: since 0.1.83 the egress input chain drops only SSH on its WAN, with
+> `egress.ssh_from_wan: false`, and full inbound filtering waits for host posture's stage 4. F22
+> stays open: the egress join has no socket-first path.
+
 ## Resolution status (updated 2026-06-26)
 
 Reconciliation of the work done after the audit. Priority agreed with the operator: **operational first, security later** — the network is internal with defined entry points, and SSH is used only for the initial bootstrap. That is why the operational batch + SSH-only-bootstrap was resolved first; the security batch has now been opened, starting with #1 of the suggested order (iface injection, F7/F12/F13).

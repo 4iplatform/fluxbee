@@ -763,8 +763,6 @@ sync status.
 
 ## 11. Known gaps
 
-- **FINDINGS A-72:** agents with a definition only work on the motherbee, since their assets do
-  not reach the workers (`docs/reference/identity.md` §4). Cognition itself runs on the workers.
 - **Acked but not processed:** SY.cognition acks a batch before the worker processes its turns.
   Turns queued when it stops lose their labels, memories and feelings; the stream does not resend
   them. Their text is in the last turns already.

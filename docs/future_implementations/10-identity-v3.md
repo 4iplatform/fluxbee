@@ -1055,21 +1055,21 @@ These items are explicitly out of scope for v3 and deferred to later iterations:
 
 ---
 
-## 16. Decisiones de diseño
+## 16. Design decisions
 
-| Decisión | Razón |
+| Decision | Reason |
 |---|---|
-| Claims reemplazan roles/capabilities | Modelo descriptivo más alineado con entidades de Fluxbee |
-| Tres facets fijos (`domain`, `function`, `responsibility`) | Suficiente para v3, evita complejidad taxonómica |
-| Canonical catalog embedded as code | Elimina archivo separado, versionado paralelo, validación runtime |
-| Defaults por pattern de nombre L2 | Nodos institucionales nacen con claims sin que orchestrator los transporte |
-| Recognition sin autorización | Cualquier ILK puede reconocer; si aparece abuso, se agregan reglas OPA |
-| Sin migración desde v2 | Sistema está en alpha/piloto, no hay datos productivos que preservar |
-| `company` como texto libre | Sin tabla separada hasta que haya necesidad concreta |
-| OPA data bundle projection O(1) | Performance en hot path de routing |
-| Límites 32 claims/ILK, 16 recogn/claim | Dimensionamiento SHM razonable, no genera dolor práctico |
-| Normative layer conceptual, no implementada | Alcance v3 acotado, charters son referencias opacas |
-| `IDENTITY_LIST_CANONICAL_CLAIMS` sin auth | Introspección pública del vocabulario del sistema |
+| Claims replace roles/capabilities | A descriptive model closer to Fluxbee's entities |
+| Three fixed facets (`domain`, `function`, `responsibility`) | Enough for v3; avoids taxonomic complexity |
+| Canonical catalog embedded as code | Removes a separate file, parallel versioning and runtime validation |
+| Defaults by L2 name pattern | Institutional nodes are born with claims without the orchestrator carrying them |
+| Recognition without authorization | Any ILK can recognize; if abuse shows up, OPA rules are added |
+| No migration from v2 | The system is in alpha/pilot; there is no production data to preserve |
+| `company` as free text | No separate table until there is a concrete need |
+| OPA data bundle projection O(1) | Performance on the routing hot path |
+| Limits of 32 claims per ILK, 16 recognitions per claim | A reasonable SHM sizing; causes no practical pain |
+| Normative layer conceptual, not implemented | v3's scope is bounded; charters are opaque references |
+| `IDENTITY_LIST_CANONICAL_CLAIMS` without auth | Public introspection of the system's vocabulary |
 
 ---
 

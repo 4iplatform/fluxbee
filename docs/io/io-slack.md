@@ -638,18 +638,16 @@ Rules:
 
 ## 11. Minimal required configuration
 
-- `SLACK_APP_TOKEN` (xapp)
-- `SLACK_BOT_TOKEN` (xoxb)
-- `SLACK_SIGNING_SECRET` (if the Events API is used)
+The tokens live in SY.vault, never in config or env (since 2026-07-24, the IO family's `vault_ref`
+pattern): one secret with `resource_type: slack` whose value is `{app_token, bot_token}` (`xapp-`
+and `xoxb-`). The node runs Socket Mode only, so it takes no signing secret.
 
 Spawn/orchestrator mode (compliance path):
-- The node can read configuration from the spawn `config.json`:
+- The node reads its configuration from the spawn `config.json`:
   - canonical path: `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-- Tokens supported in config:
-  - `slack.app_token`, `slack.bot_token`
-  - `slack.app_token_ref`, `slack.bot_token_ref` (`env:VAR`)
-- Precedence:
-  - explicit env (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) over the spawn config.
+- Required in config: `slack.auth` (`{type: "vault_ref", resource_type: "slack", key: "<vault key>"}`),
+  `io.workspace_id` and `io.conversation_id`. Inline tokens are not accepted: `slack.auth.type` must
+  be `vault_ref` (`nodes/io/common/src/io_slack_adapter_config.rs`).
 - Active spawn contract:
   - requires `FLUXBEE_NODE_NAME` injected by the orchestrator
   - no legacy `NODE_NAME`/`ISLAND_ID` fallback
@@ -662,14 +660,10 @@ Spawn/orchestrator mode (compliance path):
   - the runtime/business hot reload of `IO.slack` is applied through `CONFIG_SET` (the node's control-plane).
   - `CONFIG_CHANGED` is treated as an informational infrastructure signal; it does not replace `CONFIG_SET` in v1.
 
-- Configuration fallback and process resilience:
-  - today, if credentials are missing (`slack.app_token`/`slack.bot_token`), the process ends with `exit 1`.
-  - expected behavior (pending): no crash; report the state/config error and keep serving the control-plane.
-
-- Operational blocker (high priority):
-  - today the runtime treats missing config/secrets as a fatal startup error (`exit 1`), which causes a restart loop in systemd.
-  - `IO.slack` responsibility: this case must move to a degraded/not-ready mode, without ending the process.
-  - expected state (pending): bring up the runtime, publish a config error state and stay controllable by the orchestrator/admin.
+- Missing config or credentials (settled since 2026-03-30; since 2026-07-24 the tokens come from SY.vault):
+  - the process no longer ends with `exit 1`, so systemd has no restart loop.
+  - without a config the node stays `UNCONFIGURED`, and with an invalid one `FAILED_CONFIG`; either way it keeps serving the control plane.
+  - with a valid config and no tokens in SY.vault yet, it runs degraded: Socket Mode waits, with backoff, and takes the tokens without a restart, on a `VAULT_SECRET_CHANGED` for its key or at the next 60 s refresh.
 
 
 
@@ -717,10 +711,8 @@ This definition replaces any legacy mode or ad-hoc identity logic in the Slack n
 
 ✅ **NORMATIVE**:
 - The Slack node **must** be able to update credentials/config without depending on an orchestrator restart, using the Control Plane (`CONFIG_SET`).
-- Suggested precedence:
-  1) In-memory override received through `CONFIG_SET` (if any)
-  2) Local config (YAML/env)
-- On restart, the in-memory override is lost; if there is no local config, the node may stay `FAILED_CONFIG (missing_secret)` until it receives `CONFIG_SET` again.
+- A `CONFIG_SET` is written to the node's `config.json`, its one config, so it survives a restart (`crates/fluxbee_sdk/src/managed_control_plane.rs`).
+- The tokens are not config: the node re-reads them from SY.vault (§11) on a `VAULT_SECRET_CHANGED` for its key and every 60 s. A missing secret leaves it degraded, not `FAILED_CONFIG` (§12).
 
 Current relay surface in `CONFIG_SET` / effective config:
 

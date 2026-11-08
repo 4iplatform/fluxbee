@@ -186,20 +186,16 @@ Operational interpretation:
   - structural validation,
   - states and errors.
 - Each adapter defines its **minimal required config**:
-  - Slack Socket Mode: `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` (and other fields the adapter declares).
+  - Slack Socket Mode: `slack.auth` (a vault reference to its `app_token` and `bot_token`), `io.workspace_id` and `io.conversation_id` (and other fields the adapter declares).
   - WhatsApp/Email: TBD per adapter.
 
-### 5) Secrets: TODAY vs future
+### 5) Secrets: vault references
 
-✅ **NORMATIVE (TODAY / MVP)**:
-- Credentials (tokens, signing secrets, etc.) are allowed to live in **local config** (YAML/env) and/or travel **inline** in `CONFIG_SET`, to allow changes without a restart.
+✅ **NORMATIVE (the `vault_ref` pattern of `nodes/io/common`: io.linkedhelper since 2026-06-30, io.slack and io.wapp since 2026-07-24)**:
+- Credentials (tokens, signing secrets, etc.) live in **SY.vault**, never in the node's config, env or `CONFIG_SET`. The config names their key: `auth: { type: "vault_ref", resource_type: "<kind>", key: "<vault key>" }` (io.slack's `slack.auth`, io.wapp's `wapp.auth`, io.linkedhelper's `adapter.auth`). Their contracts refuse any other `auth.type`.
+- The node resolves the secret from SY.vault at runtime. io.slack and io.wapp also re-read it on a `VAULT_SECRET_CHANGED` for it and every 60 s, so a rotation needs no restart; until they have it they run degraded, without ending the process.
 - The node **MUST NOT** persist secrets in clear text in `${STATE_DIR}`.
-
-⚠️ **WARNING**:
-- If the secret arrives inline through `CONFIG_SET`, the node can keep it only in memory (and it is lost on restart), unless there is a local source (YAML/env).
-
-🧩 **TO BE SPECIFIED (future)**:
-- `*_key_ref` (env/file/vault/kms) + a secret manager (orchestrator/admin or a dedicated service) for secure rotation/persistence.
+- io.api, io.cloud and io.blob take no secret in their config: SY.admin mints io.api's and io.cloud's bearers, and io.blob holds none.
 
 ### 6) Adoption rule for future IO adapters
 
