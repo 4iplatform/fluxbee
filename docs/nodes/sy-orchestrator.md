@@ -447,7 +447,9 @@ there and renamed into `blob/agent-assets` is never sent half-written.
 
 ## Host posture
 
-What the code does today:
+What the code does today. Each hive's orchestrator records the alerts below in its own
+`drift-alerts.jsonl`; SY.admin's drift alert reads ask the motherbee's, so a spoke's stay on the
+spoke until the system's log (FINDINGS A-175).
 
 - **SSH on the ingress** (`reconcile_ingress_ssh`, [control-path hardening
   §6](../control-path-hardening-v1.md)): a `table inet fluxbee_ingress` whose input chain accepts

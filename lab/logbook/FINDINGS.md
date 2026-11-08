@@ -73,10 +73,11 @@ no change required
          operator's call (2026-11-07): it stays so, so roles do not mix; what matters crosses
          only through the WF, or the person tells it. Nothing to build; Archi's handbook states
          the rule.
-      2. A conversation among people that later reaches an agent. The operator's call
-         (2026-11-07): not now, pending as A-173. For now an agent is told nothing of what
-         people said to each other, nor of other agents' talks; only the facts cross, as news.
-         Whether Juan's part falls under it was asked.
+      2. A conversation among people that later reaches an agent. The operator's first call
+         (2026-11-07) was not now. Asked whether that took Juan's part back too, the operator
+         turned it around the same day: the lines reach the agent, its role decides whether to
+         use them, and the first agent on a thread takes what people said before it (A-173).
+         Built, held back by its review, rebuilt in the sixth release.
       3. A message and its copy split in two batches on a new thread.
 
       Then A-137's case closes: gate0206 run once from zero, and taken down.
@@ -91,7 +92,21 @@ no change required
       A-175 found: an egress's alerts never reach the motherbee.
    4. The docs and FINDINGS texts that drifted, from the sweep (docs only, already on daily).
    5. A-173 held back to a release of its own.
-5. **Design first, one at a time, the largest:**
+5. **Fifth release, 0.1.111, the router alone:**
+   1. A-177 [General/router]: a second rt-gateway started by hand refuses and exits, and leaves the
+      live router's sockets, shared memory and stream alone.
+   2. A-178 [General/router]: `wan.mtls` fails closed: absent or unknown is `required`.
+   3. A-179 [General/CI]: CI compiles the system policy's Rego and compares the baked wasm (no
+      binary).
+6. **Sixth release, 0.1.112:**
+   1. 🧠 A-173 [WF]: rebuilt, each take recorded under the held state's lock (SY.cognition).
+   2. A-180 [General/orchestrator]: a second sy-orchestrator refuses and exits; and A-175's
+      interim, a hive's drift alerts say they hold only what the motherbee recorded
+      (SY.orchestrator).
+7. **Then each SDK alone, from the sweep:** Rust's handshake timeout, Go's HELLO sent twice with
+   no deadline, the AI SDK's provider errors (untyped, OpenAI never retries a 429 or a 5xx,
+   SY.cognition counts one as an invalid output).
+8. **Design first, one at a time, the largest:**
    1. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    2. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -198,7 +213,10 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
-- A-175 🟡 An egress's drift alerts never reach the motherbee: the operator's design.
+- A-175 🟡 A spoke's drift alerts stay on the spoke: with the system's log, later (the operator,
+  2026-11-08; router-stream-v1 §8).
+- A-181 🔵 A blob folder turned on after the joins: how a motherbee setting reaches the hives
+  that joined before it (the operator's).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1276,6 +1294,73 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-181 [General/blob] 🔵 TO EVALUATE, for the operator (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+
+- **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
+  them.
+- **Read in the code, it is more than a bug:**
+  - no action turns the blob's sync on after the install: `set_storage` changes only the storage
+    path, so it is hive.yaml's `blob.sync.enabled`, by hand;
+  - a spoke's hive.yaml is written once, at its join, with the motherbee's blob settings of that
+    moment, and nothing writes it again (SSH lives only inside add_hive, D32);
+  - each hive's reconcile declares the folder, but only a join adds a peer to it, on purpose: a
+    flag turned off for a while strips no one (`folder_forbidden_for_role`).
+- **So turning it on later takes every hive's hive.yaml edited by hand,** and even then no peer
+  is added.
+- **Two halves:**
+  - the members are a fix like A-72's: each blob folder follows the members of the dist folder
+    with its audience;
+  - the setting's way to the spokes is a design question: how a motherbee setting reaches the
+    hives that joined before it.
+
+### A-180 [General/orchestrator] 🔴 OPEN (found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
+
+- **Seen in 0.1.60's verification:** `sy-orchestrator --version` ran for about 11 minutes as a
+  second orchestrator. The router refused it, since its UUID was connected, and it overwrote the
+  PID file.
+- **Why:** the orchestrator takes no argument and no lock. It writes its PID and runs its whole
+  boot before it joins the router (`main`: `write_pid`, `bootstrap_local`, then
+  `connect_with_retry`). That boot acts on the host: it starts the core's units, applies an
+  egress's or an ingress's nftables, and writes Syncthing's config.
+- **Fix:** A-177's, an argument guard and an instance lock taken before the PID, in a release
+  with the orchestrator.
+- **The other SY nodes:** SY.vault, SY.opa.rules and SY.wf-rules hold a lock already; the rest
+  are refused by their router while the live one is connected (A-44).
+
+### A-179 [General/CI] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
+
+- **What happens:** `policy/system.wasm` and `policy/system_route.wasm` are compiled by hand from
+  `policy/system.rego` (`sy-opa-rules compile-file`) and baked into the router. A Rego change
+  committed without its recompile leaves the router enforcing the old policy.
+- **Fix:** a CI check compiles the Rego with the same compiler and compares both files.
+
+### A-178 [General/router] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; read in the code) — A missing or unknown `wan.mtls` runs the WAN in plaintext, silently
+
+- **What happens:** the router's config started from `disabled` and took only `disabled`,
+  `permissive` and `required`. A hive.yaml without the key, or with a typo (`requird`, `true`),
+  ran a plaintext WAN, where a peer's hive is not authenticated. Only the mode line at start said
+  so.
+- **The product never writes that:** the packaged hive.yaml and add_hive's three templates say
+  `required`. The dev `config/hive.yaml` had no key.
+- **Fix:** fail-closed, as `identity.sync.auth` has been since the identity audit's F-01:
+  - an absent, empty or unknown value is `required`, an unknown one with a warning;
+  - only an explicit `disabled` or `permissive` loosens it, `disabled` with a warning;
+  - `config/hive.yaml` says `required`.
+
+### A-177 [General/router] 🔴 OPEN, for 0.1.111 (found 2026-11-07, the sweep of pending items; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second rt-gateway started by hand takes the live router's sockets
+
+- **What happens:** rt-gateway reads no argument. Started by hand, with `--version` or anything
+  else, it runs as a second router with the live one's name, so with its UUID:
+  - it opens the same shared memory and the same stream state;
+  - it deletes the live router's two sockets and binds its own (`listen_local_socket`).
+- **The effect:** the nodes that connect from then on reach the second router. Once it is killed,
+  the socket paths are dead: a node that restarts cannot come back (0.1.60: about 84 seconds).
+- **Fix:**
+  - rt-gateway refuses any argument and exits before it touches anything;
+  - it holds a lock per router (`<state>/<router>/instance.lock`, an flock the process releases
+    when it ends), taken before its shared memory, its stream and its sockets. A second instance
+    of the same router exits and names the lock.
+
 ### A-176 [General] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
 
 - **SY.timer** answered a verb it does not know with `TIMER_INTERNAL`, as if it had broken; now
@@ -1283,17 +1368,30 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **SY.wf-rules** answered an unknown operation "not implemented yet"; now "unknown operation".
 - **Archi's attachment error** named OpenAI whatever the provider; now it names the model.
 
-### A-175 [General/egress] 🟡 OPEN, for the operator's design (found 2026-11-07, the review of the egress alert; read in the code) — An egress's drift alerts never reach the motherbee
+### A-175 [General/logs] 🟡 PARKED for the system's log (the operator's call, 2026-11-08; found 2026-11-07, the review of the egress alert; read in the code) — A spoke's drift alerts never reach the motherbee
 
-- **What happens:** an egress's orchestrator writes its drift alerts (`lan_leg_missing`,
-  `ipv4_forwarding_off`, `ipv6_not_blocked`, and since 0.1.110 `internet_unreachable`) in the
-  egress's own `/var/lib/fluxbee/orchestrator/drift-alerts.jsonl`. SY.admin's `get_drift_alerts`
-  and `list_drift_alerts` read only the motherbee's file, a spoke runs no SY.admin, and that folder
-  is not synced. So `GET /hives/egress1/drift-alerts`, and Archi, answer none of them.
+- **What happens:** every hive's orchestrator writes the alerts it detects in its own
+  `/var/lib/fluxbee/orchestrator/drift-alerts.jsonl`. On a spoke these are:
+  - an egress's: `lan_leg_missing`, `ipv4_forwarding_off`, `ipv6_not_blocked`, and since 0.1.110
+    `internet_unreachable`;
+  - every spoke's posture checks: an active host firewall, the ingress's SSH table, a managed
+    folder that is not one.
+- **Why the motherbee never sees them:** SY.admin's `get_drift_alerts` and `list_drift_alerts`
+  read only the motherbee's file, a spoke runs no SY.admin, and that folder is not synced. So
+  `GET /hives/<spoke>/drift-alerts`, and Archi, show only what the motherbee recorded about the
+  spoke.
 - **A-1's "queryable as drift alerts" was never true** for an egress: only its journal says it.
-- **The call:** the spoke's orchestrator sends the fact to `SY.orchestrator@motherbee` (accepted
-  only from the router-stamped `SY.orchestrator@<that hive>`, the hive taken from the sender), or
-  SY.admin asks the spoke. A cross-hive message must fit the control path's rule (3).
+- **Nothing acts on an alert.** Its only readers are those two reads, for the operator and Archi.
+  The orchestrators correct their drift whether or not they record it, so an alert is a record of
+  what went wrong: a log.
+- **The operator's call (2026-11-08): it is log, so it goes with the system's log.** *"la idea de
+  hacer el log general del sistema es mandar a stream como ahora lo hace el router con los
+  mensajes al storage, a un log general de todo el sistema, mismo mecanismo descentralizado.. eso
+  no está ni planeado.. si es log podemos pensarlo después"* (router-stream-v1 §8).
+  - My first proposal, each alert sent to the motherbee's orchestrator, was per-feature remote
+    logging, which that direction rules out (2026-10-30).
+- **Until then:** a read for another hive says it holds only what the motherbee recorded
+  (SY.orchestrator, with A-180's release).
 
 ### A-174 [General/egress] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; an audit's F23, 2026-06-23, half fixed; found again 2026-11-07 by the docs sweep; read in the code) — A worker reports its IPv6 blocked without reading it back
 
@@ -1329,8 +1427,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   agent.
 - **Next:** rebuilt with each take recorded under the held state's lock (no-agent key → taker),
   which the worker's hold, its write-back and the re-resolution of a queued relay follow; the
-  worker's copy taken under the same lock; the delete in the taker's save transaction. A release
-  of its own (SY.cognition).
+  worker's copy taken under the same lock; the delete in the taker's save transaction. In the
+  sixth release (SY.cognition), beside the orchestrator's A-180.
 
 ### A-172 [Archi] ✅ VALIDATED ON 8.x (0.1.110, 2026-11-07; found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 

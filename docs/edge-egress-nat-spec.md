@@ -368,7 +368,7 @@ fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String
 
 This does not exist today and is the core of the egress feature. On startup and on reconcile, an egress hive's orchestrator must apply the network configuration described in §8. This runs only when `is_egress && egress.enabled`.
 
-After applying it, the orchestrator reads back what it set and checks the LAN leg (`serving_problems`, FINDINGS A-1): IPv4 forwarding on, IPv6 disabled, `wan_iface` and `lan_iface` present, `edge_ip` on `lan_iface`. nftables matches interfaces by name, so the table loads without them. Any of them missing fails the boot; after boot each one is a WARN and an `egress` drift alert on every drift tick.
+After applying it, the orchestrator reads back what it set and checks the LAN leg (`serving_problems`, FINDINGS A-1): IPv4 forwarding on, IPv6 disabled, `wan_iface` and `lan_iface` present, `edge_ip` on `lan_iface`. nftables matches interfaces by name, so the table loads without them. Any of them missing fails the boot; after boot each one is a WARN and an `egress` drift alert on every drift tick, in the egress's own drift-alert file, which the motherbee does not read yet (FINDINGS A-175).
 
 The egress NAT reconciliation is idempotent and targets **nftables** directly (§8). The orchestrator's `ufw allow <port>` helpers (`open_firewall_rules_local` and its peers) were removed in 0.1.83 ([control-path hardening](control-path-hardening-v1.md) §6).
 

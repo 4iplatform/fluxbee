@@ -93,7 +93,8 @@ it builds the package with `packaging/build-deb.sh` and installs it with
 
 The orchestrator writes no rule to `ufw` or `firewalld`. An active one is a `posture` drift alert,
 `host_firewall_active` (at boot and about every minute), since it may close 9000, 9100, 9200, 22000
-or 443 without anyone seeing it. SSH on the DMZ hosts is the product's own
+or 443 without anyone seeing it. A spoke records it in its own drift alerts, which the
+motherbee does not read yet (FINDINGS A-175). SSH on the DMZ hosts is the product's own
 ([control-path-hardening-v1.md](../control-path-hardening-v1.md) §6):
 
 - **The ingress** accepts SSH (the ports `sshd -T` reports, IPv4 and IPv6) only from loopback, the
@@ -592,7 +593,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
-| `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the orchestrators record (`category` `core`, `egress`, `posture`, `syncthing`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes |
+| `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records about every hive (`category` `core`, `egress`, `posture`, `syncthing`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes. A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175) |
 | `GET /acme/status` | the edge's certificate: ACME's configuration, the names, the open conditions ([Certificates](#certificates-acme)) |
 | `GET /web/status` | the web door: the declared host, the certificate's names, the edge's answer to the web routes with its way to io.web, io.web ([The web door](#the-web-door)) |
 | `GET /config/storage/metrics` | SY.storage's inbox |
