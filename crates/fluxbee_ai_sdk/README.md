@@ -38,12 +38,19 @@ It provides:
 
 - **The installation file** ([hive-config-update-v1](../../docs/hive-config-update-v1.md) §4) will
   hold the operator's `ai` for the whole installation, one version on every hive:
-  `/var/lib/fluxbee/dist/installation/installation.json` (`INSTALLATION_FILE_PATH`), written by
-  the motherbee's orchestrator and received through dist. `ai_settings(hive_yaml_ai)` returns its
-  `ai`, with its version and sha256, once the hive holds it, and the `ai` of the hive's own
-  hive.yaml until then (`AiSettingsSource::HiveYaml`). A file that is there and is not a valid one
-  (`InstallationFile::parse`: its schema, a version of 1 or more, an `ai` whose default provider
-  has its model) is an error, never a fallback to an older hive.yaml.
+  `installation/installation.json` in the hive's dist (`installation_file_path(dist_root)`;
+  `INSTALLATION_FILE_PATH` under the default dist), written by the motherbee's orchestrator and
+  received through dist.
+  - `ai_settings_at(path, || hive_yaml_ai)` returns its `ai`, with its version and sha256, once
+    the hive holds it. Until then it returns the `ai` of the hive's own hive.yaml, which the
+    closure reads only in that case (`AiSettingsSource::HiveYaml`; a reader says so).
+  - A file that is there and is not a valid one is an error, never a fallback to an older
+    hive.yaml: whether a reader stops on it or reports it and goes on is the reader's call.
+  - Valid (`InstallationFile::validate`, which `parse` and `render` both apply): this release's
+    schema, a version of 1 or more, and an `ai` whose default provider has its model and whose
+    every provider named has one.
+  - `installation_file_state(path)` tells `/versions` what a hive holds: absent, valid, or invalid
+    with the sha256 of its bytes and why.
 
   ```json
   {

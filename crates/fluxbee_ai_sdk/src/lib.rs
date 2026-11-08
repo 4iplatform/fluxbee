@@ -34,8 +34,10 @@ pub use immediate_memory::{
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
 pub use installation::{
-    ai_settings, ai_settings_at, read_installation_file, AiSettings, AiSettingsSource,
-    InstallationFile, InstalledSettings, INSTALLATION_FILE_PATH, INSTALLATION_SCHEMA_VERSION,
+    ai_settings, ai_settings_at, installation_file_path, installation_file_state,
+    read_installation_file, sha256_hex, AiSettings, AiSettingsSource, InstallationFile,
+    InstallationFileState, InstalledSettings, INSTALLATION_FILE_IN_DIST, INSTALLATION_FILE_PATH,
+    INSTALLATION_SCHEMA_VERSION,
 };
 pub use llm::{
     build_output_schema_fallback_instruction, create_function_calling_model,
