@@ -10961,7 +10961,8 @@ async fn handle_ai_chat(
             })?;
             Some(build_model_user_content_parts(&resolved).await.map_err(
                 |err| -> ArchitectError {
-                    format!("failed to build the model's input parts from attachments: {err}").into()
+                    format!("failed to build the model's input parts from attachments: {err}")
+                        .into()
                 },
             )?)
         };
