@@ -235,7 +235,33 @@ async fn connect_stream(router_socket: &Path, base_name: &str) -> Result<UnixStr
     Err(err.into())
 }
 
+/// How long a node waits for the router's ANNOUNCE after it connects (FINDINGS A-182). The router
+/// answers a HELLO at once; one that took the connection and never answers would otherwise hold the
+/// node in its handshake forever, and its reconnect loop with it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn perform_handshake(
+    stream: &mut UnixStream,
+    cfg: &ManagerConfig,
+) -> Result<NodeAnnouncePayload, NodeError> {
+    perform_handshake_within(stream, cfg, HANDSHAKE_TIMEOUT).await
+}
+
+/// The handshake, bounded by `limit`: past it, a failed handshake the reconnect loop retries.
+async fn perform_handshake_within(
+    stream: &mut UnixStream,
+    cfg: &ManagerConfig,
+    limit: Duration,
+) -> Result<NodeAnnouncePayload, NodeError> {
+    match time::timeout(limit, handshake(stream, cfg)).await {
+        Ok(answered) => answered,
+        Err(_) => Err(NodeError::HandshakeFailed(format!(
+            "the router sent no ANNOUNCE within {limit:?}"
+        ))),
+    }
+}
+
+async fn handshake(
     stream: &mut UnixStream,
     cfg: &ManagerConfig,
 ) -> Result<NodeAnnouncePayload, NodeError> {
@@ -460,6 +486,27 @@ mod tests {
         assert_ne!(first, second);
         assert!(!dir.join("SY.test.uuid").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// FINDINGS A-182: a router that takes the connection and never answers the HELLO fails the
+    /// handshake once its limit passes, so the reconnect loop goes on, where it waited forever.
+    #[tokio::test]
+    async fn a_router_that_never_announces_fails_the_handshake_in_time() {
+        let (mut socket, _router) = UnixStream::pair().expect("socket pair");
+        let cfg = ManagerConfig {
+            router_socket: PathBuf::from("/nonexistent"),
+            base_name: "SY.test".to_string(),
+            uuid: Uuid::new_v4().to_string(),
+            full_name: "SY.test@motherbee".to_string(),
+            version: "1".to_string(),
+        };
+        let started = std::time::Instant::now();
+        let failed = perform_handshake_within(&mut socket, &cfg, Duration::from_millis(200)).await;
+        assert!(
+            matches!(&failed, Err(NodeError::HandshakeFailed(why)) if why.contains("no ANNOUNCE")),
+            "{failed:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
