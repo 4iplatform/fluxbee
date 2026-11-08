@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ live, checked on 8.x | snap `pre-gosdk-0-1-114` (all 4 VMs) · `apt install fluxbee=0.1.113` + core-update of the spokes |
+| **0.1.115** | 2026-11-08 | `02731d26` | motherbee + spokes (core): the AI SDK alone: a provider's error is typed, OpenAI retries like Anthropic and reads the status first, a refusal, a missing key or an answer with nothing to send are their own errors, cognition counts them apart from invalid outputs, and the person gets one fixed English text (A-184) | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-115` (all 4 VMs) · `apt install fluxbee=0.1.114` + core-update of the spokes |
+| **0.1.114** | 2026-11-08 | `f8425df5` | motherbee + spokes (core): the Go SDK alone: a Go node says HELLO once at start, and a 5 s deadline bounds every handshake (A-183) | ✅ replaced by 0.1.115 | snap `pre-gosdk-0-1-114` (deleted 2026-11-08) · `apt install fluxbee=0.1.113` + core-update of the spokes |
 | **0.1.113** | 2026-11-08 | `f72ca82e` | motherbee + spokes (core): the Rust SDK alone: a node's handshake with its router is bounded by 10 s, where a router that never answered held it forever (A-182) | ✅ replaced by 0.1.114 | snap `pre-rustsdk-0-1-113` (deleted 2026-11-08) · `apt install fluxbee=0.1.112` + core-update of the spokes |
 | **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ replaced by 0.1.113; its gate found A-185 | snap `pre-take-0-1-112` (deleted 2026-11-08) · `apt install fluxbee=0.1.111` + core-update of the spokes |
 | **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ replaced by 0.1.112 | snap `pre-router-0-1-111` (deleted 2026-11-08) · `apt install fluxbee=0.1.110` + core-update of the spokes |
@@ -123,6 +124,55 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.115 — A provider's failure reaches the person
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.114 · **Commit:** `02731d26`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** shared code goes alone ([METHOD](logbook/METHOD.md) §9). A-184, from the sweep of
+  pending items, with the operator's calls of 2026-11-08:
+  - SY.cognition does not judge a provider's error;
+  - the person gets one fixed English text, and nothing more.
+- **What changed:**
+  - **`crates/fluxbee_ai_sdk`:**
+    - A provider's error status is `Provider`, carrying its status, kind, type, param and request
+      id, with keys scrubbed.
+    - A refusal (Anthropic's `stop_reason`, OpenAI's refusal or content filter), a missing key and
+      an answer with nothing to send are each their own error.
+    - OpenAI retries a transport error, 408, 409, 429 and 5xx as Anthropic does: one policy, the
+      status read before the body, `retry-after` honored.
+  - **ai.generic and SY.frontdesk.gov:**
+    - They match the type, where they parsed the error's text.
+    - With no contract, the person gets the fixed text as the agent's text.
+    - Under a WF's menu or a response envelope, the error payload carries it in `reply`.
+  - **SY.cognition:** counts provider errors apart (`*_provider_errors_total`).
+  - **SY.architect:** shows the operator the full error. Its two cookbooks' catch sends `reply`
+    (`seed_version` 7). The handbook says so (§4.1, §4.2.4, atom 6).
+- **Checks before the release:**
+  - GitHub's CI green on its branch and on the integrated head.
+  - The review round:
+    - one high finding: under a WF's menu the fixed text reached no one, since WFs forward an
+      agent's answer by its evaluation and catch its error by the payload's type;
+    - an OpenAI answer cut by the content filter went out half;
+    - the retry's log line came after its wait;
+    - a test that did not test its name.
+
+    All four fixed, and the WF's own test runs the catch.
+- **Deploy:**
+  - build of `02731d26` in 22 min; publish in 17 s;
+  - snapshot `pre-aisdk-0-1-115` taken on all 4 VMs, `pre-gosdk-0-1-114` dropped;
+  - 0.1.115 on all 4 in 279 s, health clean.
+- **Checked on 8.x:**
+  - **The fixed text:** a throwaway agent, AI.gate0215@worker1, in a tenant with no key. A person's
+    message through a mesh client playing an IO node got back, as a plain text reply to the
+    person, *"There is a problem with the AI provider this agent uses, so it could not answer.
+    Please contact your administrator."* The IO context's reply target was kept. The agent's log
+    reads `AI runtime request failed … reply="provider_failure_text" error=missing AI api key`.
+    The agent and its tenant were purged.
+  - **AI.pruebas@worker1** answered a plain question in 9 s.
+  - **Archi** replaced both cookbooks' manual entries with the new seeds at its start.
+  - **SY.cognition** on worker1 and the motherbee shows `semantic_tagger_provider_errors_total` and
+    `narrative_summarizer_provider_errors_total`, both 0.
 
 ## 0.1.114 — The Go SDK says HELLO once
 

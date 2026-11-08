@@ -107,9 +107,8 @@ no change required
    1. 0.1.113: A-182, the Rust SDK's handshake bounded ✅ live and checked on 8.x (2026-11-08).
    2. 0.1.114: A-183, the Go SDK's one HELLO and its deadline ✅ live and checked on 8.x
       (2026-11-08).
-   3. A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count; the
-      operator's calls made (2026-11-08): cognition does not judge them, and the person gets one
-      fixed message in English.
+   3. 0.1.115: A-184, the AI SDK's provider errors: typed, OpenAI's retries, cognition's count,
+      and the person's one fixed English text ✅ live and checked on 8.x (2026-11-08).
 8. **Design first, one at a time, the largest:**
    1. In design now, A-181: a hive's shared config travels in the update
       ([hive-config-update-v1](../../docs/hive-config-update-v1.md)).
@@ -225,7 +224,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   operator approved the second draft's shape (2026-11-08); the build goes by stages, A-186 first.
 - A-186 🔴 A spoke that restarts while a release syncs never starts again: its start checks dist
   before it starts Syncthing.
-- A-187 🔴 CI skips the Rust tests that read `packaging/` files when only those files change.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1318,13 +1316,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Fix (proposed):** the GC runs only where it can pin, the motherbee. hive-config-update-v1 keeps
   `blob.gc` the motherbee's own (§12).
 
-### A-187 [General/CI] 🔴 OPEN (found 2026-11-08 by hive-config-update-v1's DTAP panel, T-14; read in the workflow) — A change to packaging files alone runs none of the Rust tests that read them
+### A-187 [General/CI] ✅ FIXED (2026-11-08, CI only: `98ef73cc`; found 2026-11-08 by hive-config-update-v1's DTAP panel, T-14; read in the workflow) — A change to packaging files alone runs none of the Rust tests that read them
 
 - **What happens:** `rust-tests.yml`'s path filters leave out `packaging/**`. Yet Rust tests read
   three packaging files: `packaging/hive.yaml.example`, `deb-postinst` and `deb-preinst`
   (`include_str!` at `src/bin/sy_orchestrator.rs:32679`, `:35316` and `:35323`). A branch that
   edits only those files gets no Rust test.
 - **Fix:** add `packaging/**` to both path lists.
+- **Fixed:** both lists have it. The fix's own branch ran rust-tests with no Rust change in it.
 
 ### A-186 [General/orchestrator] 🔴 OPEN (found 2026-11-08 by hive-config-update-v1's DTAP panel, P-1 and A-8; read in the code) — A spoke that restarts while a release is still syncing never starts again
 
@@ -1365,7 +1364,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **The operator's call (2026-11-08):** as it is, *"185 déjalo así"*. The docs say so
   (reference/cognition.md §1, cognition-hands-v1 §12.6).
 
-### A-184 [General/AI SDK] 🔴 OPEN (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A provider's HTTP error is untyped, OpenAI never retries a 429 or a 5xx, and SY.cognition counts one as an invalid output
+### A-184 [General/AI SDK] ✅ VALIDATED ON 8.x (0.1.115, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A provider's HTTP error is untyped, OpenAI never retries a 429 or a 5xx, and SY.cognition counts one as an invalid output
 
 - **OpenAI never retries:** both of its paths, the plain answer and the tool turn
   (`crates/fluxbee_ai_sdk/src/llm.rs`), return the first 429 or 5xx as an error. Anthropic's path
@@ -1393,6 +1392,29 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     problem, and they should contact the administrator. *"Sería un mensaje fijo y no mucho
     más."* It goes out for every provider error that leaves the person with no answer, the
     refusal included. The other fixed replies, in Spanish, stay on the sweep's list.
+- **Built:**
+  - `Provider` errors with their status, kind and request id.
+  - `Refused`, `MissingKey` and `NoAnswer`, each its own error.
+  - OpenAI's retries, one policy with Anthropic's, with the status read first.
+  - The runners match the type, not the text.
+  - The fixed text goes as the agent's text with no contract. Under a WF's menu or a response
+    envelope it rides inside the error payload's `reply`, and the cookbooks' catch and atom 6 send
+    it.
+  - SY.cognition's `*_provider_errors_total` counters.
+- **Its review round:**
+  - One high finding: under a menu, the fixed text reached no one.
+  - Three lesser ones: OpenAI's content filter, the retry's log line, and a test.
+
+  All were fixed before the release.
+- **Validated on 8.x (0.1.115):**
+  - A throwaway agent in a tenant with no key answered a person's message with the fixed text, as
+    a plain text reply. Its log names the missing key.
+  - AI.pruebas answered.
+  - Archi took the new seeds.
+  - Cognition shows the new counters.
+- **Left for SY.admin's next release:** its help text says that with no key every message fails
+  with `missing_ai_api_key`. That holds for an envelope and for the log, but no longer for a
+  person (`src/bin/sy_admin.rs:14604` and `:14644`, `docs/nodes/sy-admin.md:21`).
 
 ### A-183 [General/Go SDK] ✅ VALIDATED ON 8.x (0.1.114, 2026-11-08; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
 
