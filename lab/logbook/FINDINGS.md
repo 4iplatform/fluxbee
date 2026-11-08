@@ -1750,7 +1750,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     all from the table;
   - its join failed at the finalize, for a reason stage 2 does not touch: A-190 🔴.
 - **Stage 3, in three releases** (2026-11-08; the AI SDK goes alone, METHOD §9):
-  - **3a, built for 0.1.120, the AI SDK alone:** the installation file's type and reader
+  - **3a, ✅ 0.1.120 on 8.x (deploy neutral, AI.pruebas answering), the AI SDK alone:** the installation file's type and reader
     (`fluxbee_ai_sdk::installation`). It is valid as every reader needs it, with every provider
     named having its model. Its state (absent, valid, or invalid with its hash) is there for
     `/versions`. `ai_settings` reads hive.yaml's `ai` only while the file is absent. No reader

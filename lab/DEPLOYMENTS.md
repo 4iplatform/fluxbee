@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ live, checked on 8.x | snap `pre-watch-0-1-119` (all 4 VMs) · `apt install fluxbee=0.1.118` + core-update of the spokes |
+| **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-120` (all 4 VMs) · `apt install fluxbee=0.1.119` + core-update of the spokes |
+| **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ replaced by 0.1.120 | snap `pre-watch-0-1-119` (deleted 2026-11-08) · `apt install fluxbee=0.1.118` + core-update of the spokes |
 | **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ replaced by 0.1.119 | snap `pre-join-0-1-118` (deleted 2026-11-08) · `apt install fluxbee=0.1.117` + core-update of the spokes |
 | **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ replaced by 0.1.118 | snap `pre-relkeys-0-1-117` (deleted 2026-11-08) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
 | **0.1.116** | 2026-11-08 | `9616278d` | motherbee + spokes (core): the orchestrator alone, hive-config-update-v1's stage 1: the start never stops on a dist mismatch, it reports it in /versions (`core.awaiting_update`) and checks again every minute (A-186); a hive whose vendored Syncthing does not match its manifest runs the one installed and reports it (`vendor.awaiting_update`, A-189) | ✅ replaced by 0.1.117 | snap `pre-start-0-1-116` (deleted 2026-11-08) · `apt install fluxbee=0.1.115` + core-update of the spokes |
@@ -128,6 +129,31 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.120 — The AI SDK reads the installation file
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.119 · **Commit:** `0f516fdd`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** hive-config-update-v1's stage 3a. The AI SDK goes alone in its release ([METHOD](logbook/METHOD.md) §9), ahead of the readers that will use it (3b).
+- **What changed** (`crates/fluxbee_ai_sdk/src/installation.rs`):
+  - `InstallationFile`: schema 1, a version, and the operator's `ai`. It is validated as every
+    reader needs it (each provider named has its model), and rendered as the motherbee will write
+    it.
+  - The file's state for `/versions`: absent, valid, or invalid with the hash of its bytes.
+  - `ai_settings`: the file's `ai` with its version and hash, else the hive's own hive.yaml `ai`,
+    read only while the file is absent.
+  - No reader uses it yet.
+- **Checks before the release:**
+  - GitHub's CI green on its branch, twice (`cargo test --workspace` runs the SDK's tests).
+  - The review round found no high. The SDK's API was made what 3b needs, since a later SDK change
+    would need a release of its own.
+- **Deploy:** build of `0f516fdd`; publish in 13 s; snapshot `pre-aisdk-0-1-120` taken on all 4
+  VMs, `pre-watch-0-1-119` dropped; 0.1.120 on all 4 in 290 s; each spoke settled; health clean.
+  - The phase "the spokes installed" read 54 s. The timeline shows worker1's restarts took 3.5 s
+    and its settle came 7 s after the call. The 54 s is when the script saw it: the motherbee's
+    `/versions` forward is slow while a spoke's orchestrator restarts, and the script checks the
+    spokes one after another.
+- **Checked on 8.x:** AI.pruebas@worker1 answered a plain question in 9 s, on the new SDK.
 
 ## 0.1.119 — The Syncthing watchdog leaves a join alone
 
