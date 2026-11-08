@@ -792,7 +792,8 @@ ops run 100 script.sh [args]    # a local script (bash or .py) on a VM
 4. Waits for each spoke's orchestrator to answer: the motherbee's admin answers before its router
    has the spokes back, and an update sent at that moment fails with `TRANSPORT_ERROR` (0.1.56).
 5. core-update of the spokes in parallel; it retries one that did not get through, up to 3 times.
-   Since 0.1.55 each spoke answers `status=ok phase=restarting`.
+   Since 0.1.55 each spoke answers `status=ok phase=restarting`; one whose binaries and units
+   are already the release's answers `ok` at once and restarts nothing (since 0.1.118).
 6. Waits for each spoke to have the motherbee's hash **installed** (`core.installed`). On a spoke,
    `core.manifest_hash` and the component versions are what dist brought, which Syncthing
    updates before any update: in 0.1.56 they made spokes that were still on the previous version

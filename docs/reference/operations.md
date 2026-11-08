@@ -175,7 +175,7 @@ What a worker join does (`add_hive_flow`):
    (`add_hive_finalize_via_socket`). The spoke checks what step 3 copied against the manifests,
    restarting nothing when nothing is new; a vendor still on its way does not stop it, and is
    reported in `vendor.awaiting_update` until it arrives. Its answer comes within the
-   motherbee's wait (45 s), with `timings_ms` for each step.
+   motherbee's wait (45 to 75 s, by the probe's timeout), with `timings_ms` for each step.
 7. Marks the hive `connected` and revokes its own SSH access: removes the motherbee key from
    `authorized_keys` and the temporary sudoers file (`revoke_bootstrap_ssh_access`).
 
@@ -294,9 +294,11 @@ The orchestrator declares one Syncthing folder per kind of content (`dist_sync_f
 
 The motherbee rebuilds `dist/core/<role>` at every start of its orchestrator
 (`materialize_role_core_trees`). A spoke's receive-only copy is never edited locally: the
-orchestrator reverts local changes through Syncthing's `/rest/db/revert`, once the folder has its
-source. A new spoke's folders, filled by its join before the motherbee's peer is linked, have none
-yet, and are left as they are (FINDINGS A-190).
+orchestrator reverts local changes through Syncthing's `/rest/db/revert`, once the folder's
+source has been connected and sharing it for 60 s, so its index is in (FINDINGS A-190). Until then
+they stay: a new spoke's folders are filled by its join before the motherbee's peer is linked, and
+a revert before the source's index arrives deletes them. With the index in, the copies that match
+it stop counting as local changes.
 
 **Announcing a package to workers.** There is no announce message: the motherbee's Syncthing
 announces a change after its own scan. To make a worker pull a package now, scan the folder **on
@@ -348,7 +350,8 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   `/var/lib/fluxbee/orchestrator/core-bin.prev.local/`, swaps them into `/usr/bin` and re-renders
   the units (`regen_local_core_units`).
 - It answers first (`phase: restarting`), then restarts `rt-gateway` and the system services in
-  order but the left-out ones, checking each; a failed check rolls the binaries back. A replaced
+  order but the left-out ones, checking each; a failed check rolls the binaries back. With no
+  binary and no unit new it restarts nothing and answers `ok` at once (FINDINGS A-190). A replaced
   `sy-orchestrator` restarts itself through a transient `systemd-run` timer. The outcome is in
   `core-update-last.json`; what is installed, in `core-installed.json`.
 - The update runs in the spoke's previous orchestrator, which knows only its own release's list.

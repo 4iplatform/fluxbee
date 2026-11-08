@@ -10104,45 +10104,144 @@ fn syncthing_folder_status_from_payload(payload: &serde_json::Value) -> Syncthin
 /// changes gets them reverted first (FINDINGS A-16): Syncthing neither sends nor undoes them, so a
 /// spoke's mirror that something touched would stay diverged from its source, in silence.
 ///
-/// Only a folder with a source to revert to (FINDINGS A-190). A join's bootstrap fills a new
-/// spoke's dist folders before its peer is linked: with no source, a revert would delete them, and
-/// the join's finalize needs them.
+/// Only once its source is there to revert to (FINDINGS A-190): a member other than this device,
+/// connected, sharing the folder (`remoteState: valid`), for `RECEIVE_ONLY_REVERT_SETTLE_SECS` in a
+/// row. A join's bootstrap fills a new spoke's dist folders before its peer is linked, and before
+/// the source's index arrives a revert deletes them; with the index in, the copies that match it
+/// stop counting as local changes, and only a real divergence is left to revert.
 fn check_syncthing_folder(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
 ) -> Result<bool, OrchestratorError> {
     let status = syncthing_folder_status(sync, folder_id)?;
-    if status.receive_only_total_items > 0 {
-        match syncthing_folder_has_source(sync, folder_id) {
-            Ok(true) => {
-                tracing::warn!(
-                    folder = folder_id,
-                    local_items = status.receive_only_total_items,
-                    "receive-only folder has local changes; reverting it to its source"
-                );
-                if let Err(err) = syncthing_revert_folder(sync, folder_id) {
-                    tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
-                }
-            }
-            Ok(false) => tracing::info!(
+    if status.receive_only_total_items == 0 {
+        receive_only_holds().forget(folder_id);
+        return Ok(status.is_healthy());
+    }
+    let source_ready = match syncthing_folder_source_ready(sync, folder_id) {
+        Ok(ready) => ready,
+        Err(err) => {
+            receive_only_holds().report_once(folder_id, &format!("source unreadable: {err}"));
+            false
+        }
+    };
+    let ready_for = receive_only_holds().ready_for(folder_id, source_ready);
+    match receive_only_action(source_ready, ready_for) {
+        ReceiveOnlyAction::Hold => receive_only_holds().report_once(
+            folder_id,
+            &format!(
+                "{} local items, left as they are until its source is connected and shares it",
+                status.receive_only_total_items
+            ),
+        ),
+        ReceiveOnlyAction::Wait => receive_only_holds().report_once(
+            folder_id,
+            &format!(
+                "{} local items with its source connected: reverted after {RECEIVE_ONLY_REVERT_SETTLE_SECS} s unless they clear",
+                status.receive_only_total_items
+            ),
+        ),
+        ReceiveOnlyAction::Revert => {
+            tracing::warn!(
                 folder = folder_id,
                 local_items = status.receive_only_total_items,
-                "receive-only folder holds local items and has no source peer yet: left as they \
-                 are until its source is linked"
-            ),
-            Err(err) => tracing::warn!(
-                folder = folder_id,
-                error = %err,
-                "could not read the folder's members; its local items are left as they are"
-            ),
+                "receive-only folder has local changes; reverting it to its source"
+            );
+            if let Err(err) = syncthing_revert_folder(sync, folder_id) {
+                tracing::warn!(folder = folder_id, error = %err, "could not revert the local changes");
+            }
+            receive_only_holds().forget(folder_id);
         }
     }
     Ok(status.is_healthy())
 }
 
-/// Whether a folder has a source to take from: a member other than this device. A folder Fluxbee
-/// creates starts with none, and gets its peer when the join links it.
-fn syncthing_folder_has_source(
+/// How long a receive-only folder's source must stay connected and sharing it before its local
+/// changes are reverted (FINDINGS A-190): its index is in by then.
+const RECEIVE_ONLY_REVERT_SETTLE_SECS: u64 = 60;
+
+/// What the watchdog does with a receive-only folder's local changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveOnlyAction {
+    /// No source to revert to yet: they stay.
+    Hold,
+    /// The source is there, for less than the settle time: its index may still be on its way.
+    Wait,
+    /// The source has been there long enough: what is still a local change is one.
+    Revert,
+}
+
+fn receive_only_action(source_ready: bool, ready_for: Option<Duration>) -> ReceiveOnlyAction {
+    match (source_ready, ready_for) {
+        (false, _) | (true, None) => ReceiveOnlyAction::Hold,
+        (true, Some(elapsed))
+            if elapsed >= Duration::from_secs(RECEIVE_ONLY_REVERT_SETTLE_SECS) =>
+        {
+            ReceiveOnlyAction::Revert
+        }
+        (true, Some(_)) => ReceiveOnlyAction::Wait,
+    }
+}
+
+/// Per receive-only folder with local changes: since when its source has been ready, and whether
+/// its state was logged, so the watchdog logs a held folder once, not every tick.
+#[derive(Default)]
+struct ReceiveOnlyHolds {
+    ready_since: HashMap<String, Instant>,
+    reported: HashMap<String, String>,
+}
+
+struct ReceiveOnlyHoldsRef(std::sync::MutexGuard<'static, ReceiveOnlyHolds>);
+
+fn receive_only_holds() -> ReceiveOnlyHoldsRef {
+    static HOLDS: OnceLock<std::sync::Mutex<ReceiveOnlyHolds>> = OnceLock::new();
+    ReceiveOnlyHoldsRef(
+        HOLDS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
+impl ReceiveOnlyHoldsRef {
+    /// How long the folder's source has been ready, None while it is not.
+    fn ready_for(mut self, folder_id: &str, source_ready: bool) -> Option<Duration> {
+        if !source_ready {
+            self.0.ready_since.remove(folder_id);
+            return None;
+        }
+        Some(
+            self.0
+                .ready_since
+                .entry(folder_id.to_string())
+                .or_insert_with(Instant::now)
+                .elapsed(),
+        )
+    }
+
+    fn report_once(mut self, folder_id: &str, state: &str) {
+        if self.0.reported.get(folder_id).map(String::as_str) != Some(state) {
+            tracing::info!(
+                folder = folder_id,
+                state,
+                "receive-only folder holds local items"
+            );
+            self.0
+                .reported
+                .insert(folder_id.to_string(), state.to_string());
+        }
+    }
+
+    fn forget(mut self, folder_id: &str) {
+        self.0.ready_since.remove(folder_id);
+        self.0.reported.remove(folder_id);
+    }
+}
+
+/// Whether a folder's source is there to revert to: a member other than this device, connected,
+/// sharing the folder with us (`/rest/db/completion`'s `remoteState: valid`). A folder Fluxbee
+/// creates starts with no member, and gets its peer when the join links it.
+fn syncthing_folder_source_ready(
     sync: &BlobRuntimeConfig,
     folder_id: &str,
 ) -> Result<bool, OrchestratorError> {
@@ -10152,13 +10251,49 @@ fn syncthing_folder_has_source(
         return Ok(false);
     }
     let local = local_syncthing_device_id(sync)?;
-    Ok(folder_members_include_a_peer(&members, &local))
+    for peer in members
+        .iter()
+        .filter(|member| !member.trim().eq_ignore_ascii_case(local.trim()))
+    {
+        if syncthing_device_connected(sync, peer)?
+            && syncthing_remote_state(sync, folder_id, peer)? == "valid"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn folder_members_include_a_peer(members: &[String], local_device_id: &str) -> bool {
-    members
-        .iter()
-        .any(|member| !member.trim().eq_ignore_ascii_case(local_device_id.trim()))
+/// `/rest/db/completion`'s `remoteState` for a folder and a peer: `valid` when the peer shares
+/// the folder with us; `unknown`, `notSharing` or `paused` otherwise.
+fn syncthing_remote_state(
+    sync: &BlobRuntimeConfig,
+    folder_id: &str,
+    device_id: &str,
+) -> Result<String, OrchestratorError> {
+    if !valid_syncthing_device_id(device_id) {
+        return Err(format!("invalid syncthing device id '{device_id}'").into());
+    }
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/db/completion?folder={folder_id}&device={device_id}",
+        sync.sync_api_port
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("--max-time")
+        .arg("5")
+        .arg("-H")
+        .arg(format!("X-API-Key: {api_key}"))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, "syncthing db completion")?;
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|err| format!("invalid syncthing completion payload: {err}"))?;
+    Ok(payload
+        .get("remoteState")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string())
 }
 
 /// `POST /rest/db/revert`: a receive-only folder drops its local changes and takes the source's.
@@ -25602,7 +25737,11 @@ async fn add_hive_finalize_local_flow(
     let vendor_result = match apply_system_update_local(state, &vendor_request).await {
         Ok(result) => result,
         Err(err) => {
-            if let Some(mismatch) = vendor_still_arriving(&SyncthingVendorPaths::local()) {
+            if let Some(mismatch) = vendor_still_arriving(
+                &SyncthingVendorPaths::local(),
+                &err.to_string(),
+                systemd_is_active(SYNCTHING_SERVICE_NAME),
+            ) {
                 // FINDINGS A-190: the Syncthing the bootstrap installed runs, and the peer link
                 // below brings dist/vendor; until then `/versions` reports it, and the recheck
                 // closes it.
@@ -25876,10 +26015,18 @@ fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
 }
 
 /// A join's finalize on a spoke whose dist/vendor has not arrived yet (FINDINGS A-190): what it
-/// lacks, when the manifest or the binary is missing and the Syncthing the bootstrap installed is
-/// there to link the peer that brings it. None otherwise, and the vendor step's error stands.
-fn vendor_still_arriving(paths: &SyncthingVendorPaths) -> Option<DistMismatch> {
-    if !paths.installed.is_file() {
+/// lacks, when the vendor step failed on exactly that (its manifest or its binary missing) and a
+/// Syncthing is installed and running to link the peer that brings it. None otherwise, and the
+/// vendor step's error stands.
+fn vendor_still_arriving(
+    paths: &SyncthingVendorPaths,
+    step_error: &str,
+    syncthing_running: bool,
+) -> Option<DistMismatch> {
+    let lower = step_error.to_ascii_lowercase();
+    let missing = lower.contains("vendor manifest missing at")
+        || (lower.contains("vendor binary '") && lower.contains("' missing at '"));
+    if !missing || !syncthing_running || !paths.installed.is_file() {
         return None;
     }
     vendored_syncthing_at(paths)
@@ -38816,32 +38963,44 @@ blob:
     fn a_finalize_goes_on_while_its_vendor_is_still_arriving_and_only_then() {
         let root = a186_temp_root("a190-vendor");
         let installed = Some(&b"syncthing-2"[..]);
+        let manifest_missing =
+            "vendor manifest missing at '/var/lib/fluxbee/dist/vendor/manifest.json'";
+        let binary_missing =
+            "vendor binary 'syncthing' missing at '/var/lib/fluxbee/dist/vendor/syncthing/syncthing'";
         let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
         fs::remove_file(&paths.manifest).expect("the manifest not there yet");
         assert_eq!(
-            vendor_still_arriving(&paths).map(|mismatch| mismatch.reason),
+            vendor_still_arriving(&paths, manifest_missing, true).map(|mismatch| mismatch.reason),
             Some(DistMismatchReason::Missing)
+        );
+        assert_eq!(
+            vendor_still_arriving(&paths, manifest_missing, false),
+            None,
+            "no Syncthing running to link the peer with"
+        );
+        assert_eq!(
+            vendor_still_arriving(&paths, "syncthing folder markers failed: denied", true),
+            None,
+            "the step failed on something else"
         );
         let paths = a189_vendor(&root, b"syncthing-2", None, installed);
         assert_eq!(
-            vendor_still_arriving(&paths).map(|mismatch| mismatch.reason),
+            vendor_still_arriving(&paths, binary_missing, true).map(|mismatch| mismatch.reason),
             Some(DistMismatchReason::Missing),
             "the binary not there yet"
         );
         let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-x"), installed);
         assert_eq!(
-            vendor_still_arriving(&paths),
+            vendor_still_arriving(&paths, binary_missing, true),
             None,
             "another binary than its manifest says"
         );
         let paths = a189_vendor(&root, b"syncthing-2", None, None);
         assert_eq!(
-            vendor_still_arriving(&paths),
+            vendor_still_arriving(&paths, binary_missing, true),
             None,
-            "no Syncthing installed to link the peer with"
+            "no Syncthing installed"
         );
-        let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
-        assert_eq!(vendor_still_arriving(&paths), None, "nothing missing");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -38878,22 +39037,26 @@ blob:
         assert_eq!(finalize_probe_budget_ms(5, 0), 5_000);
     }
 
-    /// FINDINGS A-190: a receive-only folder is reverted only when it has a source, a member other
-    /// than this device. A join leaves a new spoke's folders with no member until it links the peer.
+    /// FINDINGS A-190: a receive-only folder's local changes are reverted only once its source has
+    /// been connected and sharing it for the settle time, its index in; before, they stay. A join
+    /// leaves a new spoke's folders with no member until it links the peer.
     #[test]
-    fn a_folder_without_a_peer_has_nothing_to_revert_to() {
-        let local = "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH";
-        let peer = "IIIIIII-JJJJJJJ-KKKKKKK-LLLLLLL-MMMMMMM-NNNNNNN-OOOOOOO-PPPPPPP";
-        assert!(!folder_members_include_a_peer(&[local.to_string()], local));
-        assert!(!folder_members_include_a_peer(
-            &[local.to_ascii_lowercase()],
-            local
-        ));
-        assert!(folder_members_include_a_peer(
-            &[local.to_string(), peer.to_string()],
-            local
-        ));
-        assert!(folder_members_include_a_peer(&[peer.to_string()], local));
+    fn a_receive_only_folder_is_reverted_only_once_its_source_has_settled() {
+        let settle = Duration::from_secs(RECEIVE_ONLY_REVERT_SETTLE_SECS);
+        assert_eq!(receive_only_action(false, None), ReceiveOnlyAction::Hold);
+        assert_eq!(
+            receive_only_action(false, Some(settle * 2)),
+            ReceiveOnlyAction::Hold
+        );
+        assert_eq!(receive_only_action(true, None), ReceiveOnlyAction::Hold);
+        assert_eq!(
+            receive_only_action(true, Some(Duration::from_secs(5))),
+            ReceiveOnlyAction::Wait
+        );
+        assert_eq!(
+            receive_only_action(true, Some(settle)),
+            ReceiveOnlyAction::Revert
+        );
         let new_spoke = r#"<configuration>
   <folder id="fluxbee-dist-vendor" path="/var/lib/fluxbee/dist/vendor" type="receiveonly"></folder>
   <device id="AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH" name="gate"></device>

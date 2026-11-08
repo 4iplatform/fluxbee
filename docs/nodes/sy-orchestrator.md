@@ -349,9 +349,9 @@ The worker join (`add_hive_flow`), in order:
 5. Write and start the units, wait for the spoke's orchestrator on the mesh, send
    `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked. On the
    spoke the finalize (`add_hive_finalize_local_flow`) runs a core update over what step 4 copied,
-   which restarts nothing when nothing is new, then the vendor's: a vendor still on its way, with
-   the Syncthing step 4 installed running, is reported in `vendor.awaiting_update` and the
-   finalize goes on (FINDINGS A-190). It links the motherbee's Syncthing, and waits for its core
+   which restarts nothing when nothing is new, then the vendor's: a vendor still on its way (its
+   manifest or binary missing), with a Syncthing installed and running, is reported in
+   `vendor.awaiting_update` and the finalize goes on (FINDINGS A-190). It links the motherbee's Syncthing, and waits for its core
    folder with what is left of the motherbee's wait (`finalize_probe_budget_ms`, a 10 s margin
    for the reply). Its answer's `timings_ms` gives each step's time.
 6. Mark the hive `connected`, then revoke the SSH access: remove the sudoers file and the

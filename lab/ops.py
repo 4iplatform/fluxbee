@@ -515,24 +515,26 @@ TIMELINE_MILESTONES = (
     r"\b(Started|Stopped|Stopping|Starting|Failed|Main process exited)\b|connected to router|"
     r"hive ready|lifecycle node|service active|ADD_HIVE|add_hive|finalize|join|bootstrap|"
     r"core update|SYSTEM_UPDATE|update category|settle|revert|receive-only|awaiting_update|"
-    r"dist check|peer|restart|WAN|uplink| WARN | ERROR "
+    r"dist check|peer|restart|WAN|uplink|(^|\s)(WARN|ERROR)\s"
 )
 
-# Runs on each VM: the units' journal lines in the window, as "epoch_us<TAB>unit<TAB>message", the
-# tracing timestamp and ANSI codes dropped, milestones only unless asked for every line.
+# Runs on each VM: the units' journal lines in the window (UTC), as "epoch_us<TAB>unit<TAB>message",
+# the tracing timestamp and ANSI codes dropped, milestones only unless asked for every line. The
+# journal is read as a stream, and at most `limit` lines come back, the cut said in a last line.
 TIMELINE_SCRIPT = r"""
 import json, re, subprocess, sys
-since, until, every, units, pattern, width = sys.argv[1:7]
-args = ["journalctl", "--no-pager", "-o", "json", "--since", since]
+since, until, every, units, pattern, width, limit = sys.argv[1:8]
+args = ["journalctl", "--no-pager", "-o", "json", "--since", since + " UTC"]
 if until:
-    args += ["--until", until]
+    args += ["--until", until + " UTC"]
 for unit in units.split(","):
     args += ["-u", unit]
-out = subprocess.run(args, capture_output=True, text=True).stdout
 milestone = re.compile(pattern)
 ansi = re.compile(r"\x1b\[[0-9;]*m")
 stamp = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+")
-for line in out.splitlines():
+shown, cut = 0, 0
+proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, errors="replace")
+for line in proc.stdout:
     try:
         rec = json.loads(line)
     except ValueError:
@@ -545,7 +547,14 @@ for line in out.splitlines():
         continue
     # systemd's own lines name the unit they are about in UNIT; a service's lines, in _SYSTEMD_UNIT.
     unit = (rec.get("UNIT") or rec.get("_SYSTEMD_UNIT") or rec.get("SYSLOG_IDENTIFIER") or "?")
+    if shown >= int(limit):
+        cut += 1
+        continue
+    shown += 1
     print("%s\t%s\t%s" % (rec.get("__REALTIME_TIMESTAMP", "0"), unit.replace(".service", ""), msg[: int(width)]))
+proc.wait()
+if cut:
+    print("CUT\t%d lines past the first %s" % (cut, limit))
 """
 
 
@@ -566,18 +575,20 @@ def cmd_timeline(a):
         name, vm = extra.split("=")
         targets[name.strip()] = vm.strip()
     b64 = base64.b64encode(TIMELINE_SCRIPT.encode()).decode("ascii")
-    rows, offsets, threads = [], {}, []
+    rows, offsets, cuts, threads = [], {}, {}, []
 
     def one(hive, vm):
         offsets[hive] = clock_offset(vm)
         argv = [a.since, a.until or "", "1" if a.all else "0", ",".join(TIMELINE_UNITS),
-                TIMELINE_MILESTONES, str(a.width)]
+                TIMELINE_MILESTONES, str(a.width), str(a.max_lines)]
         quoted = " ".join("'%s'" % x.replace("'", "'\\''") for x in argv)
         _, out, _ = vm_bash(vm, "echo %s | base64 -d | python3 - %s" % (b64, quoted), quiet=True)
         for line in out.splitlines():
             parts = line.split("\t", 2)
             if len(parts) == 3 and parts[0].isdigit():
                 rows.append((int(parts[0]) / 1e6, hive, parts[1], parts[2]))
+            elif parts[0] == "CUT":
+                cuts[hive] = parts[1]
 
     for hive, vm in targets.items():
         t = threading.Thread(target=one, args=(hive, vm))
@@ -590,6 +601,8 @@ def cmd_timeline(a):
         offset, rtt = offsets.get(hive, (None, 0))
         print("  %-10s %s (round trip %.2fs)" % (
             hive, "%+.3fs" % offset if offset is not None else "unknown", rtt))
+    for hive, note in cuts.items():
+        print("  %-10s CUT: %s (narrow the window, or raise --max-lines)" % (hive, note))
     if a.align:
         rows = [(ts - (offsets.get(hive, (None, 0))[0] or 0), hive, unit, msg)
                 for ts, hive, unit, msg in rows]
@@ -631,6 +644,7 @@ def main():
     s.add_argument("--all", action="store_true", help="every line, not only the milestones")
     s.add_argument("--align", action="store_true", help="shift each hive's lines by its clock offset")
     s.add_argument("--width", type=int, default=170, help="the longest line shown")
+    s.add_argument("--max-lines", type=int, default=20000, help="the most lines a hive returns")
     s.set_defaults(fn=cmd_timeline)
     a = p.parse_args()
     # Progress shows as it happens even when the output goes to a pipe or a file.
