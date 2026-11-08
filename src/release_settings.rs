@@ -83,7 +83,8 @@ pub struct SystemNodes {
 pub struct BlobTopology {
     /// The blob store on this hive.
     pub enabled: bool,
-    /// The `fluxbee-blob` folder (`blob/active`), shared through `sync_tool`.
+    /// Blob sync through `sync_tool`: the `fluxbee-blob` folder (`blob/active`) where the blob
+    /// store is on; on the ingress, which has none, it keeps Syncthing running.
     pub sync_enabled: bool,
     /// The `fluxbee-blob-public` folder (`blob/public`): the motherbee sends, the ingress receives.
     pub public_sync_enabled: bool,

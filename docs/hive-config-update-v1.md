@@ -76,6 +76,11 @@ Three cases bite today:
   - A rollback (`SYSTEM_CORE_ROLLBACK`) or a downgrade takes the list back with the binaries.
   - No orchestrator ever judges another release's settings.
   - Nothing is merged into a file at the install.
+  - **One way across stage 2 (0.1.117):** an orchestrator of 0.1.116 or earlier reads the list
+    and the topology from `hive.yaml`, and does not start without `system_nodes`. The hives
+    joined before keep those keys (ignored, not removed), so they go back as before. A hive
+    joined by 0.1.117 or later has none: going back below 0.1.117 needs them put back by hand
+    first (HANDBOOK, "The rollback").
 - **A node a release drops** is stopped, disabled and removed by the core update, unit and
   binary. The backup generation keeps both, so a rollback brings it back. A rollback stops a node
   it removes before deleting its binary (D-4, P-16, A-9, T-8).
@@ -86,6 +91,19 @@ Three cases bite today:
     start (`settle_core_generation`): it drops each core unit its list no longer names, and installs
     each node of its list `/usr/bin` lacks, a node the release added, recorded as created by the
     update. Both go into the update's generation, so the same rollback undoes them.
+    - The update leaves a dropped node out once Syncthing has deleted its binary from the spoke's
+      dist. Until then dist holds the previous build, and the update refuses it as it refuses any
+      binary still syncing; it goes through when tried again.
+    - A component the previous list names that dist lacks for another reason (a binary set aside
+      by hand) is left out the same way. The new orchestrator, whose list names it, keeps the
+      generation open: `/versions` shows it in `core.awaiting_update` and in
+      `core.last_update.settled.pending` until a core update installs it.
+    - A node still on its way at the start is installed by the dist recheck once dist holds it,
+      for that update only: an update installed while the previous orchestrator still runs is
+      settled by the orchestrator it installs, with its own list.
+    - Not built, since no release needs it yet: a node dropped from the **motherbee's** list. dpkg
+      owns the motherbee's core, so its package has to stop and remove it. A dropped node's
+      system ILK stays registered too: SY.identity's seed only adds.
 - **The frontdesk's name stays as each role has it today:**
   - a worker names `SY.frontdesk.gov@motherbee`;
   - the ingress and the egress have none, so their router defaults to a frontdesk on their own

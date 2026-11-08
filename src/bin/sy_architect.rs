@@ -21234,7 +21234,7 @@ fn validate_manifest_v2(manifest: &SolutionManifestV2) -> Result<(), String> {
                 return Err(format!("desired_state.nodes[{idx}] is a WF node: SY.wf-rules creates and runs WF.<workflow_name>@<hive> from desired_state.wf_deployments; declare the workflow there, not its node"));
             }
             if node.node_name.starts_with("SY.") || node.node_name.starts_with("RT.") {
-                return Err(format!("desired_state.nodes[{idx}] is a core node: it runs with its hive (system_nodes of the hive's role) and is not declared in a manifest"));
+                return Err(format!("desired_state.nodes[{idx}] is a core node: it runs with its hive (the SY nodes the release defines for the hive's role) and is not declared in a manifest"));
             }
             if !pipeline_types::valid_runtime_name(&node.runtime) {
                 return Err(format!(

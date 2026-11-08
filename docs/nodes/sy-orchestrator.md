@@ -467,9 +467,12 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
   - each node of its list `/usr/bin` lacks, one the release added, is installed from dist once
     its binary there matches the manifest, and recorded as created by the update
     (`created_without_backup`);
-  - a node still pending (its binary not yet in dist, or left out while this list names it)
-    keeps the generation open: the dist recheck tries again when `core.awaiting_update` closes,
-    and the next start too. Once nothing is pending the generation records `settled_at_ms`.
+  - a node still pending (its binary not yet in dist, or left out while this list names it), or
+    an error, keeps the generation open. The dist recheck tries again when
+    `core.awaiting_update` closes, for that update only (`open_core_settle`: one installed since,
+    while this orchestrator still runs, is the next orchestrator's to settle); an error with dist
+    already consistent waits for the next start. Once nothing is pending the generation records
+    `settled_at_ms`.
 
   The outcome is logged and added to `core-update-last.json` as `settled` (`/versions`:
   `core.last_update.settled`). The motherbee has no generations (dpkg installs its core): nothing
@@ -489,8 +492,10 @@ meanwhile. It closes when a later check, every minute, or a core update's own ch
 consistent. A release still syncing closes it once Syncthing delivers the rest, and the core
 update then installs it. A node the running orchestrator's list names that dist no longer has
 (`not_in_manifest`, or `missing` once the motherbee pruned it from the role's tree) is one the
-next release dropped: the core update that replaces this orchestrator leaves it out, and the new
-orchestrator's list no longer names it. It lives in the orchestrator's memory: each start checks
+next release dropped: the core update that replaces this orchestrator leaves it out once Syncthing
+has deleted it from dist (while dist still holds the previous build, the update refuses it as any
+binary still syncing, and goes through when tried again), and the new orchestrator's list no
+longer names it. It lives in the orchestrator's memory: each start checks
 again.
 
 **`vendor.awaiting_update`** (FINDINGS A-189) is the same for the vendored Syncthing, in the
@@ -701,16 +706,23 @@ What the release defines for each role is in the code (`json_router::release_set
 [System nodes per role](#system-nodes-per-role)): the role's SY nodes, and the blob's and dist's
 topology (`blob_runtime_from_hive`, `dist_runtime_from_hive`):
 
-| Role | blob store | `fluxbee-blob` sync | `fluxbee-blob-public` | dist sync | tool |
+| Role | blob store | blob sync | `fluxbee-blob-public` | dist sync | tool |
 | --- | --- | --- | --- | --- | --- |
 | motherbee | on | on | on (sends) | on | Syncthing |
 | worker | on | on | off | on | Syncthing |
 | egress | off | off | off | on | Syncthing |
 | ingress | off | on | on (receives) | on | Syncthing |
 
+The `fluxbee-blob` folder exists only where the blob store is on, so the ingress has none: its blob
+sync keeps Syncthing running, as its dist sync does.
+
 These keys of an older hive.yaml (`system_nodes`, `blob.enabled`,
 `blob.sync.enabled|public_enabled|tool`, `dist.sync.enabled|tool`) are ignored; the start names the
-ones it finds in one warning (`warn_superseded_hive_keys`), and they can be removed from the file.
+ones it finds in one warning (`warn_superseded_hive_keys`). Keep them while the hive may go back to
+0.1.116 or earlier: that orchestrator does not start without `system_nodes`, and reads the blob's
+and dist's flags from the file, with defaults that differ by role (a missing `blob.sync.enabled` is
+off). A hive whose hive.yaml never had them, joined by 0.1.117 or later, goes back below 0.1.117
+only after they are put back by hand (lab/logbook/HANDBOOK.md, "The rollback").
 
 Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that names none);
 `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS` and `JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS`

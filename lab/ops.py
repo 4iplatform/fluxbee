@@ -135,6 +135,30 @@ def core_of(hive):
     return core.get("status"), versions, core.get("manifest_hash") or "", "dist"
 
 
+def update_open_items(hive, expect_settle):
+    """What the core update a spoke last ran leaves open, or None while it is not over yet. Since
+    0.1.117 the orchestrator a core update installed finishes it at its start
+    (hive-config-update-v1 §3): the hash the previous orchestrator recorded says the binaries are
+    in, not that the release's list is. Open: components left out, a settle with something
+    pending or an error, and `core.awaiting_update`."""
+    reply = admin("GET", "/hives/%s/versions" % hive)
+    core = ((reply.get("payload") or {}).get("hive") or {}).get("core") or {}
+    last = core.get("last_update") or {}
+    settled = last.get("settled")
+    if expect_settle and "sy-orchestrator" in (last.get("updated") or []) and not settled:
+        return None
+    items = []
+    if last.get("left_out"):
+        items.append("left_out=%s" % ",".join(last["left_out"]))
+    if settled and not settled.get("settled"):
+        items.append("settle pending=%s errors=%s" % (settled.get("pending"), settled.get("errors")))
+    awaiting = core.get("awaiting_update")
+    if awaiting:
+        items.append("awaiting_update=%s" % ",".join(
+            c.get("component", "?") for c in awaiting.get("components") or []))
+    return items
+
+
 def cmd_versions(_a):
     for hive in hives():
         status, versions, digest, source = core_of(hive)
@@ -422,8 +446,24 @@ def cmd_deploy(a):
         wait_for("%s on %s" % (h, v), spoke_ready, 600)
         print("  %s on %s" % (h, v))
 
+    # Each spoke's update over: the new orchestrator settled it, nothing left out or awaiting. A
+    # left-out or awaiting binary clears once Syncthing delivers, so it gets two minutes.
+    print("== core update settled")
+    expect_settle = tuple(int(x) for x in v.split(".")[:3]) >= (0, 1, 117)
+    settled_ok = True
+    for h in spokes:
+        deadline = time.time() + 120
+        items = update_open_items(h, expect_settle)
+        while (items is None or items) and time.time() < deadline:
+            time.sleep(6)
+            items = update_open_items(h, expect_settle)
+        if items is None:
+            items = ["the new orchestrator did not settle the update"]
+        settled_ok &= not items
+        print("  %s %s" % (h, "; ".join(items) if items else "settled"))
+
     print("== health since %s" % since)
-    ok = health(since)
+    ok = health(since) and settled_ok
     print("deploy of %s done in %d s" % (v, time.time() - started))
     sys.exit(0 if ok else 1)
 

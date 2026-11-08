@@ -681,6 +681,11 @@ struct OrchestratorState {
     /// FINDINGS A-189: the vendored Syncthing, when a check found dist/vendor not holding it as its
     /// manifest says while the installed Syncthing ran instead. `/versions`: `vendor.awaiting_update`.
     vendor_awaiting_update: std::sync::Mutex<Option<AwaitingUpdate>>,
+    /// The manifest hash of the core update whose settle this orchestrator's start left open, a
+    /// node of its list still on its way (`settle_core_update`). The dist recheck finishes that
+    /// update only: a later one, installed while this orchestrator still runs, is never settled
+    /// with this orchestrator's list.
+    open_core_settle: std::sync::Mutex<Option<String>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -966,6 +971,7 @@ async fn main() -> Result<(), OrchestratorError> {
         reconcile_pass: Mutex::new(()),
         core_awaiting_update: std::sync::Mutex::new(None),
         vendor_awaiting_update: std::sync::Mutex::new(None),
+        open_core_settle: std::sync::Mutex::new(None),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -1753,7 +1759,8 @@ async fn bootstrap_local(
     // one it added is installed.
     {
         let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
-        settle_core_update(state.role, &core_manifest, &role_components);
+        let open = settle_core_update(state.role, &core_manifest, &role_components, None);
+        *open_core_settle_slot(state) = open;
     }
 
     for node_name in &state.system_nodes.nodes {
@@ -5518,19 +5525,21 @@ fn settle_core_generation(
 /// `settle_core_generation` on this spoke, for the core update recorded as having installed what
 /// `/usr/bin` holds; its outcome is logged and added to the last update's record (`/versions`:
 /// `core.last_update.settled`). The motherbee's core is the package's: nothing to settle there.
-fn settle_core_update(role: HiveRole, manifest: &CoreManifest, components: &[String]) {
+///
+/// `only`: the update the dist recheck finishes, the one this orchestrator's start left open. A
+/// record that names another one, an update installed since, is left to the orchestrator that
+/// update installs. The manifest hash of an update left open, for the recheck; None otherwise.
+fn settle_core_update(
+    role: HiveRole,
+    manifest: &CoreManifest,
+    components: &[String],
+    only: Option<&str>,
+) -> Option<String> {
     if role == HiveRole::Motherbee {
-        return;
+        return None;
     }
-    let Some(record) = read_core_installed_record() else {
-        return;
-    };
-    if record.get("source").and_then(|value| value.as_str()) != Some("update") {
-        return;
-    }
-    let Some(installed_hash) = record.get("manifest_hash").and_then(|value| value.as_str()) else {
-        return;
-    };
+    let record = read_core_installed_record()?;
+    let installed_hash = core_update_to_settle(&record, only)?;
     let outcome = match settle_core_generation(
         &CoreHost::live(),
         &core_backup_root_dir(),
@@ -5541,10 +5550,10 @@ fn settle_core_update(role: HiveRole, manifest: &CoreManifest, components: &[Str
         now_epoch_ms(),
     ) {
         Ok(Some(outcome)) => outcome,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(err) => {
             tracing::warn!(error = %err, "could not settle the core update with this release's list");
-            return;
+            return Some(installed_hash.to_string());
         }
     };
     if outcome.settled {
@@ -5561,8 +5570,8 @@ fn settle_core_update(role: HiveRole, manifest: &CoreManifest, components: &[Str
             installed = ?outcome.installed,
             pending = ?outcome.pending,
             errors = ?outcome.errors,
-            "core update not settled yet: a core update installs what is pending, and the start \
-             and the dist recheck try again"
+            "core update not settled yet: a core update installs what is pending; the dist \
+             recheck tries again once dist holds the role's binaries, and the next start does"
         );
     }
     let mut last = read_core_update_last_record().unwrap_or_else(|| serde_json::json!({}));
@@ -5577,28 +5586,64 @@ fn settle_core_update(role: HiveRole, manifest: &CoreManifest, components: &[Str
         fields.insert("settled".to_string(), settled);
     }
     write_core_update_last_record(&last);
+    (!outcome.settled).then(|| installed_hash.to_string())
+}
+
+/// The manifest hash of the core update `core-installed.json` records, when a core update installed
+/// what `/usr/bin` holds and it is the one `only` names, if any.
+fn core_update_to_settle<'a>(record: &'a serde_json::Value, only: Option<&str>) -> Option<&'a str> {
+    if record.get("source").and_then(|value| value.as_str()) != Some("update") {
+        return None;
+    }
+    let installed_hash = record
+        .get("manifest_hash")
+        .and_then(|value| value.as_str())?;
+    if only.is_some_and(|open| normalize_hash(open) != normalize_hash(installed_hash)) {
+        tracing::info!(
+            installed = %installed_hash,
+            "a core update came after the one this orchestrator's start left open: the \
+             orchestrator it installs settles it"
+        );
+        return None;
+    }
+    Some(installed_hash)
 }
 
 /// The dist recheck's settle: once the role's binaries in dist match the manifest, a node the
 /// start could not install while its binary was on its way gets it, and the watchdog starts it.
+/// Only the update this orchestrator's start left open (`OrchestratorState::open_core_settle`).
 async fn settle_core_update_after_recheck(state: &Arc<OrchestratorState>) {
     if state.role == HiveRole::Motherbee {
         return;
     }
+    let Some(open) = open_core_settle_slot(state).clone() else {
+        return;
+    };
     let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
     let role = state.role;
-    let settled = tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let settled = tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
         let manifest = load_core_manifest().map_err(|err| err.to_string())?;
         let components = core_components_listed_for_role(&manifest, role);
-        settle_core_update(role, &manifest, &components);
-        Ok(())
+        Ok(settle_core_update(
+            role,
+            &manifest,
+            &components,
+            Some(&open),
+        ))
     })
     .await;
     match settled {
-        Ok(Ok(())) => {}
+        Ok(Ok(still_open)) => *open_core_settle_slot(state) = still_open,
         Ok(Err(err)) => tracing::warn!(error = %err, "core update settle could not run"),
         Err(err) => tracing::warn!(error = %err, "core update settle task failed"),
     }
+}
+
+fn open_core_settle_slot(state: &OrchestratorState) -> std::sync::MutexGuard<'_, Option<String>> {
+    state
+        .open_core_settle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A core update with its new binaries and units in place, waiting for its restarts.
@@ -6390,8 +6435,8 @@ fn warn_superseded_hive_keys(config_dir: &Path) {
         tracing::warn!(
             keys = ?keys,
             "hive.yaml holds settings the release defines now (the role's SY nodes, the blob's \
-             and dist's topology); they are ignored, and may be removed from the file \
-             (docs/hive-config-update-v1.md §3)"
+             and dist's topology); they are ignored. Keep them while this hive may go back to \
+             0.1.116 or earlier, whose orchestrator needs them (docs/hive-config-update-v1.md §3)"
         );
     }
 }
@@ -28296,13 +28341,6 @@ async fn add_ingress_hive_flow(
             format!("invalid blob runtime config for ingress hive.yaml: {err}"),
         );
     }
-    if !state.blob.public_sync_enabled || !state.blob.sync_enabled {
-        return err_payload(
-            "CONFIG_FAILED",
-            "motherbee blob.sync.enabled and blob.sync.public_enabled must be true before adding an ingress"
-                .to_string(),
-        );
-    }
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -34481,6 +34519,23 @@ mod tests {
             .expect("settle"),
             None
         );
+    }
+
+    /// The start settles the update `core-installed.json` records; the dist recheck only the one
+    /// the start left open. An update installed since, while the previous orchestrator still runs
+    /// its recheck, is left to the orchestrator it installs, whose list it carries.
+    #[test]
+    fn the_recheck_settles_only_the_update_the_start_left_open() {
+        let record = |source: &str, hash: &str| serde_json::json!({ "source": source, "manifest_hash": hash, "components": [] });
+        let updated = record("update", "ABC");
+        assert_eq!(core_update_to_settle(&updated, None), Some("ABC"));
+        assert_eq!(core_update_to_settle(&updated, Some("abc")), Some("ABC"));
+        assert_eq!(core_update_to_settle(&updated, Some("def")), None);
+        assert_eq!(
+            core_update_to_settle(&record("core_rollback", "ABC"), None),
+            None
+        );
+        assert_eq!(core_update_to_settle(&serde_json::json!({}), None), None);
     }
 
     #[test]
@@ -40960,6 +41015,7 @@ blob:
             reconcile_pass: Mutex::new(()),
             core_awaiting_update: StdMutex::new(None),
             vendor_awaiting_update: StdMutex::new(None),
+            open_core_settle: StdMutex::new(None),
             rpc: OnceLock::new(),
         }
     }

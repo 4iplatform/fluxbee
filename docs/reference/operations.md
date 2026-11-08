@@ -25,7 +25,9 @@ ones the boot waits for, and the blob's and dist's topology. They reach every hi
 update, and a rollback takes them back with the binaries. A hive.yaml an earlier release wrote
 still loads; the keys it holds for these (`system_nodes`, `blob.enabled`,
 `blob.sync.enabled|public_enabled|tool`, `dist.sync.enabled|tool`) are ignored, and the
-orchestrator names them in one warning at its start. The table's tests hold each list to start with
+orchestrator names them in one warning at its start. Keep them while the hive may go back to
+0.1.116 or earlier, which reads them; a hive joined by 0.1.117 or later has none, and goes back
+below 0.1.117 only after they are put back by hand. The table's tests hold each list to start with
 `SY.config.routes`, only the motherbee to run `SY.vault`, and every vault consumer to come before
 it (see [SY.vault](../nodes/sy-vault.md)):
 

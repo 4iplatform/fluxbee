@@ -15,7 +15,7 @@ actions; frontdesk routing) is baked into the router binary (`policy/system.rego
 - **One policy for every hive.** The same compiled policy runs in every router of every role
   (motherbee, worker, ingress, egress). A policy that needs hive-specific behaviour branches on
   the sender (`input.routing.src_l2_name` is `role@hive`, stamped by the router).
-- **SY.opa.rules runs on every hive** (`system_nodes.<role>` in `hive.yaml`). It derives its own
+- **SY.opa.rules runs on every hive** (every role's list in `src/release_settings.rs`). It derives its own
   ILK from its L2 name (Model D'), so it needs no SY.identity (ingress and egress have none).
 - **Only the motherbee compiles.** Its SY.opa.rules compiles the rego, applies it locally and
   **publishes the compiled wasm** — never the rego — for the other hives. The other hives refuse
