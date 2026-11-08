@@ -80,8 +80,8 @@ no change required
       3. A message and its copy split in two batches on a new thread.
 
       Then A-137's case closes: gate0206 run once from zero, and taken down.
-4. **Fourth release, 0.1.110** (each item on a binary of its own, built 2026-11-07, its review
-   rounds' findings fixed):
+4. **Fourth release, 0.1.110** (each item on a binary of its own) ✅ live and checked on 8.x
+   (2026-11-07):
    1. A-172 [Archi], with its family: Archi removes a runtime version and a hive, deletes, restores
       and purges a tenant and lists its nodes, rolls a hive's core back, reads the global
       versions, deployments and drift alerts; `set_node_config` names its binding fields; a CI
@@ -169,8 +169,6 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
 
 ### Archi
 
-- A-172 🟢 Archi cannot remove a runtime version, nor a hive, nor delete a tenant (the executor's
-  fields): built for 0.1.110.
 - A-142 🟡 Archi's chat answers only when its turn ends, and the edge waits 30 s.
 - A-124 🟡 A Cloud token published through Archi reaches the AI provider and stays in its history.
 - The solutions chapter ([wf-orchestration-v1](../../docs/wf-orchestration-v1.md), its status and
@@ -200,9 +198,7 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   later (the operator, 2026-11-06).
 - Security, parked by decision: A-22, A-49, A-51, A-55, A-60.
 - A-171 🔵 The runtime manifest's writers outside SY.admin take no lock (low).
-- A-174 🟢 A worker reports its IPv6 blocked without reading it back: built for 0.1.110.
 - A-175 🟡 An egress's drift alerts never reach the motherbee: the operator's design.
-- A-176 🟢 Three texts that misled: built for 0.1.110.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
 - [PENDING-BUGS.md](PENDING-BUGS.md)'s August rows were checked on 2026-11-07: PB-1 and PB-5 were
@@ -1280,7 +1276,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-176 [General] 🟢 BUILT for 0.1.110 (found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
+### A-176 [General] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; found 2026-11-07, the sweep of pending items; read in the code) — Three texts that misled
 
 - **SY.timer** answered a verb it does not know with `TIMER_INTERNAL`, as if it had broken; now
   `TIMER_UNKNOWN_VERB`, and `TIMER_INTERNAL` means only an internal error.
@@ -1299,7 +1295,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   only from the router-stamped `SY.orchestrator@<that hive>`, the hive taken from the sender), or
   SY.admin asks the spoke. A cross-hive message must fit the control path's rule (3).
 
-### A-174 [General/egress] 🟢 BUILT for 0.1.110 (an audit's F23, 2026-06-23, half fixed; found again 2026-11-07 by the docs sweep; read in the code) — A worker reports its IPv6 blocked without reading it back
+### A-174 [General/egress] ✅ RESOLVED (0.1.110, 2026-11-07, by its tests; an audit's F23, 2026-06-23, half fixed; found again 2026-11-07 by the docs sweep; read in the code) — A worker reports its IPv6 blocked without reading it back
 
 - `reconcile_worker_egress` set `ipv6_blocked = true` once it applied the sysctl, without reading
   the kernel back, as the egress has done since July. A sysctl that did not take left IPv6 on, and
@@ -1336,7 +1332,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   worker's copy taken under the same lock; the delete in the taker's save transaction. A release
   of its own (SY.cognition).
 
-### A-172 [Archi] 🟡 OPEN, for the next release (found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
+### A-172 [Archi] ✅ VALIDATED ON 8.x (0.1.110, 2026-11-07; found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 
 - **Seen on 8.x (0.1.109):** asked to remove `ai.generic 0.1.109-gate1`, Archi staged one
   `remove_runtime_version` step with `version: 0.1.109-gate1`, and on CONFIRM it failed: the
@@ -1360,6 +1356,8 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - My first CI check read too few arms and passed most of the family in silence; the check now
     reads every arm of the help and every form a route stores a segment in, and a test holds that
     an action needing a hive names one and that every path field is in its schema.
+- **Validated on 8.x (0.1.110):** Archi removed a spare runtime version, and deleted and restored a
+  gate tenant, each on CONFIRM and `ok` from the executor.
 - **On 8.x meanwhile:** the gate's version was removed through SY.admin's HTTP route.
 
 ### A-171 [General/upgrade] 🔵 TO EVALUATE, low (found 2026-11-07, A-122's review; read in the code) — The runtime manifest's writers outside SY.admin take no lock

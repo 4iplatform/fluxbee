@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ live, checked on 8.x | snap `pre-reset-0-1-109` (all 4 VMs) · `apt install fluxbee=0.1.108` + core-update of the spokes |
+| **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ live, checked on 8.x | snap `pre-family-0-1-110` (all 4 VMs) · `apt install fluxbee=0.1.109` + core-update of the spokes |
+| **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ replaced by 0.1.110 | snap `pre-reset-0-1-109` (deleted 2026-11-07) · `apt install fluxbee=0.1.108` + core-update of the spokes |
 | **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ replaced by 0.1.109 | snap `pre-contract-0-1-108` (deleted 2026-11-07) · `apt install fluxbee=0.1.107` + core-update of the spokes |
 | **0.1.107** | 2026-11-07 | `6c107a9b` | motherbee + spokes (core): the sprint's second release: the narrator says "the agent" only of the AI agent (A-167); SY.admin's `cognition_clear` has a hive's SY.cognition drop everything it keeps, behind the operator's CONFIRM, and the factory reset clears every hive's cognition with it (A-160) | ✅ replaced by 0.1.108 | snap `pre-train2-0-1-107` (deleted 2026-11-07) · `apt install fluxbee=0.1.106` + core-update of the spokes |
 | **0.1.106** | 2026-11-07 | `9f19bcc5` | motherbee + spokes (core): the sprint's first release, four changes on different binaries ([METHOD](logbook/METHOD.md) §9): the episode gate says why it turns a proposal down (A-163); Archi takes a page down, behind the operator's CONFIRM (A-120); a restore minds the email only in its own tenant (A-80); the tool cards say the code's values (A-103) | ✅ replaced by 0.1.107 | snap `pre-train1-0-1-106` (deleted 2026-11-07) · `apt install fluxbee=0.1.105` + core-update of the spokes |
@@ -118,6 +119,40 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.110 — Archi's executor names what each route stores, three texts, and the egress's alert
+
+- **Date:** 2026-11-07 (ART) · **Previous version:** 0.1.109 · **Commit:** `eb972451`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's fourth release ([METHOD](logbook/METHOD.md) §9), a branch per binary:
+  A-172, found by 0.1.109's gate, with its family; A-176 and the egress's alert from the sweep;
+  A-174 from the docs sweep. A-173 was held back by its review.
+- **What changed:**
+  - **SY.admin (A-172):** the executor's fields are the ones each route stores:
+    `remove_runtime_version`'s `runtime_version`; `get_hive` and `remove_hive`'s `hive_id`; the
+    tenant's delete, restore, purge and node list name `hive` and `tenant_id`; `core_rollback`
+    names its hive; the global reads take none; `set_node_config` names its binding fields. The
+    catalog's CI check and a test hold it.
+  - **SY.timer, SY.wf-rules, SY.architect (A-176):** `TIMER_UNKNOWN_VERB`; "unknown operation";
+    the model, not OpenAI.
+  - **SY.orchestrator:** the egress's `internet_unreachable` drift alert, in its own file
+    (A-175: the motherbee does not read it yet); a worker reads its IPv6 block back (A-174).
+- **Checks before the release:** on the Mac, clippy of every touched binary, Go vet and tests, and
+  the affected SY.admin tests filtered; GitHub's CI green on every branch and on the integrated
+  head; a review round per set, every finding fixed or recorded (A-175).
+- **Deploy:**
+  - build of `eb972451` in 15 min; publish in 14 s;
+  - snapshot `pre-family-0-1-110` taken on all 4 VMs, `pre-reset-0-1-109` dropped;
+  - 0.1.110 on all 4 in 268 s (manifest `5c7cd68ff8827ea5`), health clean.
+- **Checked on 8.x:**
+  - **A-172:** a spare `ai.generic 0.1.110-spare1`, published available only, was removed by
+    Archi on CONFIRM: the command log shows `origin: executor`, `ok`, params `{runtime,
+    runtime_version}`, and Syncthing took it off worker1.
+  - **The family:** a gate tenant, `gate0110`, deleted and restored by Archi on CONFIRM, both `ok`
+    from the executor (0.1.109 had no schema for them); then deleted and purged through the
+    operator's HTTP route.
+  - **A-174, A-176 and the egress alert:** by their tests; worker1 does not route through the
+    egress.
 
 ## 0.1.109 — A base runtime goes back to its package's version, a password join chooses, and four small ones
 
