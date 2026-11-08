@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ live, checked on 8.x | snap `pre-router-0-1-111` (all 4 VMs) · `apt install fluxbee=0.1.110` + core-update of the spokes |
+| **0.1.112** | 2026-11-08 | `1dc2eb40` | motherbee + spokes (core): the sprint's sixth release: the first agent on a thread takes what people said there before it, rebuilt on its review (A-173, SY.cognition); a second sy-orchestrator started by hand refuses and exits (A-180), and a drift alert read for another hive says what it holds, which Archi passes on (A-175's interim) | ✅ live, checked on 8.x; its gate found A-185 | snap `pre-take-0-1-112` (all 4 VMs) · `apt install fluxbee=0.1.111` + core-update of the spokes |
+| **0.1.111** | 2026-11-08 | `cc01f86f` | motherbee + spokes (core): the sprint's fifth release, the router alone: a second rt-gateway started by hand refuses and exits, leaving the live one's sockets, shared memory and stream alone (A-177); `wan.mtls` fails closed (A-178); the baked system policy is checked against its Rego in CI, the policy compile made deterministic for it (A-179, with sy-opa-rules) | ✅ replaced by 0.1.112 | snap `pre-router-0-1-111` (deleted 2026-11-08) · `apt install fluxbee=0.1.110` + core-update of the spokes |
 | **0.1.110** | 2026-11-07 | `eb972451` | motherbee + spokes (core): the sprint's fourth release, each item on its own binary: Archi removes runtime versions and hives, deletes and restores tenants (A-172 and its family, SY.admin); three texts (A-176: SY.timer, SY.wf-rules, SY.architect); the egress's internet alert and a worker's IPv6 read back (A-174, SY.orchestrator) | ✅ replaced by 0.1.111 | snap `pre-family-0-1-110` (deleted 2026-11-08) · `apt install fluxbee=0.1.109` + core-update of the spokes |
 | **0.1.109** | 2026-11-07 | `3f292500` | motherbee + spokes (core): the sprint's third release, on SY.admin, the orchestrator and the seed (one branch): a base runtime goes back to its package's version through Archi (A-122); a join over a password chooses `harden_ssh` (A-165); the vault help's types (A-164); an identity read that names a spoke goes to the primary (A-169); three small ones (A-170) | ✅ replaced by 0.1.110 | snap `pre-reset-0-1-109` (deleted 2026-11-07) · `apt install fluxbee=0.1.108` + core-update of the spokes |
 | **0.1.108** | 2026-11-07 | `7f18a610` | motherbee + spokes (core): the provider holds an agent's answer to its response contract inside the tool loop too (A-150; the shared AI SDK, so alone) | ✅ replaced by 0.1.109 | snap `pre-contract-0-1-108` (deleted 2026-11-07) · `apt install fluxbee=0.1.107` + core-update of the spokes |
@@ -120,6 +121,51 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.112 — The first agent on a thread takes what people said, and one orchestrator per host
+
+- **Date:** 2026-11-08 (ART) · **Previous version:** 0.1.111 · **Commit:** `1dc2eb40`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** the sprint's sixth release ([METHOD](logbook/METHOD.md) §9): A-173, the operator's
+  call of 2026-11-07 (*"si es posible entonces lo que planteaste antes.. hacelo también"*),
+  rebuilt on its first review; A-180, found checking A-177; A-175's interim, the operator's call
+  of 2026-11-08 that a drift alert is log.
+- **What changed:**
+  - **SY.cognition (A-173):** an agent's new communication takes the thread's communication with
+    no agent, when no other agent has one there. The take is recorded under the held state's
+    lock, and every turn of the communication taken is the taker's from then on, at intake and in
+    the worker. The taken row leaves the file in the transaction that writes the agent's.
+  - **SY.orchestrator (A-180):** it refuses any argument and exits 2, and holds
+    `/var/run/fluxbee/sy-orchestrator.lock` (the shared `json_router::instance_lock`) before its
+    PID and its boot.
+  - **SY.orchestrator and SY.architect (A-175's interim):** a drift alert read for another hive,
+    and the global one, carry a `note` that a hive's own checks stay on that hive; Archi says so.
+- **Checks before the release:** on the Mac, clippy of each touched binary and SY.cognition's
+  tests; GitHub's CI green on every branch and on the integrated head; a review round per set,
+  every finding fixed (A-173's second review: every turn of a taken communication now follows it,
+  only the first agent takes, a write-back loads a communication let go from memory).
+- **Deploy:**
+  - build of `1dc2eb40` in 26 min; publish in 13 s;
+  - snapshot `pre-take-0-1-112` taken on all 4 VMs, `pre-router-0-1-111` dropped;
+  - 0.1.112 on all 4 in 258 s, health clean.
+- **Checked on 8.x:**
+  - **A-180, on egress1:** the live orchestrator (PID 1578095) held its lock.
+    `sy-orchestrator --version` exited 2; `sy-orchestrator` alone exited 1, naming the lock and
+    the live PID. The PID file and the live process did not change.
+  - **A-175's interim:** `GET /hives/worker1/drift-alerts` and `GET /drift-alerts` carry the note,
+    the motherbee's own read does not. Asked whether worker1 had drift alerts, Archi said the
+    motherbee recorded none and that worker1's own checks are in its own journal.
+  - **A-173, gate0206 on worker1, thread `gate0206-take`:** A wrote to B through the WF, B
+    answered, then A wrote to the agent. Cognition kept one row, the agent's: the two people's
+    lines and A's message, each with its writer, and no row with no agent; the take counted 1 and
+    the three turns were analyzed.
+    - Asked next what A had asked billing and what billing answered, the agent said it in one
+      line: what people said before it reaches it.
+    - **Found (A-185):** the agent's first message carried no memory package
+      (`memory_package=false`): the router reads the region at delivery, before cognition takes
+      that very message. The lines reach the agent from its second message on.
+    - The gate's first ask, to copy its Recent conversation word by word, was refused by the model
+      (`stop_reason=refusal`), and the runner's error reached no one (A-184).
 
 ## 0.1.111 — One router per name, a WAN that fails closed, and the baked policy checked against its Rego
 

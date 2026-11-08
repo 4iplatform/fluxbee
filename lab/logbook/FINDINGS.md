@@ -98,7 +98,7 @@ no change required
    2. A-178 [General/router]: `wan.mtls` fails closed: absent or unknown is `required`.
    3. A-179 [General/CI]: CI compiles the system policy's Rego and compares the baked wasm (no
       binary).
-6. **Sixth release, 0.1.112:**
+6. **Sixth release, 0.1.112** ✅ live and checked on 8.x (2026-11-08); its gate found A-185:
    1. 🧠 A-173 [WF]: rebuilt, each take recorded under the held state's lock (SY.cognition).
    2. A-180 [General/orchestrator]: a second sy-orchestrator refuses and exits; and A-175's
       interim, a hive's drift alerts say they hold only what the motherbee recorded
@@ -174,8 +174,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   (cognition-hands-v1 §12: the handover's lines, people with no agent, episodes as public
   news), and its gate's A-161 ✅ 0.1.105 and A-163 ✅ 0.1.106.*
 - A-168 🔵 A WF's menu has no schema, so no provider holds an agent's answer to it (from A-150).
-- A-173 🟡 The first agent on a thread takes what people said before it: decided, its first build
-  held back by its review; rebuilt in a release of its own.
+- A-185 🟡 The first agent on a thread gets what people said only from its second message on: the
+  operator's call (A-173 ✅ 0.1.112 found it).
 
 ### io.web
 
@@ -1295,6 +1295,22 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-185 [WF] 🟡 OPEN, for the operator (found 2026-11-08, 0.1.112's gate on 8.x; read in the journal and the code) — The first agent on a thread gets what people said only from its second message on
+
+- **Seen on 8.x (gate0206, thread `gate0206-take`):** A wrote to B through the WF, B answered, then
+  A wrote to the agent. The agent's first message carried no memory package
+  (`memory_package=false` in its journal). Cognition then took the people's communication into the
+  agent's (A-173), and the agent's next message carried it: asked what A had asked billing, the
+  agent answered it.
+- **Why:** the router attaches the agent's package at delivery, from the memory region, keyed by
+  the thread and the agent's node. The agent's communication does not exist yet: cognition makes
+  it, and takes the people's, when that same message reaches it through the stream. The thread's
+  communication with no agent is not in the region (its package reaches no one).
+- **The call:** whether the first message must carry them.
+  - One way: the region keeps a thread's communication with no agent too, and the router hands its
+    package to an agent that has none on the thread. That is the router (alone) and the region.
+  - The other: as it is, from the agent's second message on.
+
 ### A-184 [General/AI SDK] 🔴 OPEN (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A provider's HTTP error is untyped, OpenAI never retries a 429 or a 5xx, and SY.cognition counts one as an invalid output
 
 - **OpenAI never retries:** both of its paths, the plain answer and the tool turn
@@ -1309,8 +1325,13 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **SY.cognition counts it as an invalid output:** `handle_turn` counts `Json` and `Protocol`
   errors in `semantic_tagger_invalid_outputs_total`, so a provider's 429 reads as a model that
   answered badly.
-- **Fix (the AI SDK, alone):** a typed provider error with its status, OpenAI's retries as
-  Anthropic's, the status read first, and the consumers matching the type instead of the text.
+- **A refusal is untyped too (0.1.112's gate):** asked to copy its Recent conversation word by
+  word, Claude answered `stop_reason=refusal`; the runner sent a provider error payload, which the
+  WF did not relay, so the person got nothing. A refusal is the model's answer, not a protocol
+  error.
+- **Fix (the AI SDK, alone):** a typed provider error with its status, a refusal of its own, OpenAI's
+  retries as Anthropic's, the status read first, and the consumers matching the type instead of the
+  text.
 
 ### A-183 [General/Go SDK] 🟡 BUILT, for 0.1.114 (found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A Go node says HELLO twice at start, and a reconnect's handshake has no deadline
 
@@ -1350,7 +1371,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - the setting's way to the spokes is a design question: how a motherbee setting reaches the
     hives that joined before it.
 
-### A-180 [General/orchestrator] 🟡 BUILT for 0.1.112 (2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
+### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
 - **Seen in 0.1.60's verification:** `sy-orchestrator --version` ran for about 11 minutes as a
   second orchestrator. The router refused it, since its UUID was connected, and it overwrote the
@@ -1371,6 +1392,9 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   rows were about every hive, they are about itself but for a spoke's post-sync mismatch; the
   note's examples read as a full list; Archi was not told to pass the note on; a process holding
   two locks would have dropped the second. All fixed.
+- **Validated on 8.x (0.1.112, egress1):** `sy-orchestrator --version` exited 2; `sy-orchestrator`
+  alone exited 1 naming the lock and the live PID; the PID file and the live process did not
+  change. The drift alert reads carry their note, and Archi passed it on.
 
 ### A-179 [General/CI] ✅ VALIDATED ON 8.x (0.1.111, 2026-11-08; found 2026-11-07, the sweep of pending items; read in the code) — Nothing checks that the router's baked policy is compiled from the committed Rego
 
@@ -1485,7 +1509,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   a rogue RA could route around the gateway, while the worker said it was blocked.
 - **Fixed:** it reads it back (`ipv6_disabled_now`), and warns when the block did not take.
 
-### A-173 [WF] 🟡 DECIDED 2026-11-07, its first build held back by its review (cognition-hands-v1 §12.6) — What an agent may know of conversations it was not in
+### A-173 [WF] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; decided 2026-11-07, cognition-hands-v1 §12.6; its gate found A-185) — What an agent may know of conversations it was not in
 
 - **The question:** a conversation that starts among people and later reaches an agent. Should the
   agent start from what they said?
@@ -1520,6 +1544,12 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   thread's first agent takes it (beside another agent's conversation, people's turns stay theirs);
   a write-back to a communication let go from memory loads it first; a row written again in the
   transaction that deletes it stays; the docs say who pays a relay taken while it is analyzed.
+- **Validated on 8.x (0.1.112, gate0206, thread `gate0206-take`):** A wrote to B through the WF, B
+  answered, A wrote to the agent. Cognition kept one row, the agent's, with the two people's lines
+  and A's message, each with its writer, and no row with no agent; one take, three turns analyzed.
+  Asked next what A had asked billing and what billing answered, the agent said it in one line.
+- **Found by the gate:** the agent's first message carried no package, so the lines reach it from
+  its second message on (A-185).
 
 ### A-172 [Archi] ✅ VALIDATED ON 8.x (0.1.110, 2026-11-07; found 2026-11-07, 0.1.109's gate on 8.x; read in the command log) — Archi cannot remove a runtime version: the executor sends `version`, the action reads `runtime_version`
 
