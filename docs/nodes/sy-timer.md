@@ -142,7 +142,7 @@ All requests are `SYSTEM` messages to `SY.timer@<hive>`. Every answer is `TIMER_
 | `TIMER_HELP` | none | anyone; returns the verb and error catalog (`respondTimerHelp`) |
 | `NODE_STATUS_GET` | | answered `HEALTHY` (`BuildDefaultNodeStatusResponse`) |
 
-Any other verb gets `TIMER_INTERNAL` ("verb not implemented in current build"). The router does
+Any other verb gets `TIMER_UNKNOWN_VERB`. The router does
 not gate `TIMER_*` verbs: they are not in `PROTECTED_SYSTEM_ACTIONS`
 (`src/router/system_policy.rs`).
 
@@ -150,7 +150,7 @@ Error codes: `TIMER_BELOW_MINIMUM`, `TIMER_ABOVE_MAXIMUM`, `TIMER_LIMIT_EXCEEDED
 `TIMER_INVALID_PAYLOAD`, `TIMER_INVALID_CRON`,
 `TIMER_INVALID_TIMEZONE`, `TIMER_FORBIDDEN`, `TIMER_NOT_FOUND`, `TIMER_NOT_OWNER`,
 `TIMER_ALREADY_FIRED`, `TIMER_RECURRING_NOT_RESCHEDULABLE`, `TIMER_STORAGE_ERROR`,
-`TIMER_INTERNAL`.
+`TIMER_UNKNOWN_VERB`, `TIMER_INTERNAL`.
 
 ### Teardown
 

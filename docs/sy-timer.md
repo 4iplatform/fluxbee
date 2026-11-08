@@ -1124,7 +1124,8 @@ A node should check that a `TIMER_FIRED` comes from `SY.timer@<its hive>` (the r
 | `TIMER_RECURRING_NOT_RESCHEDULABLE` | Reschedule is not allowed on recurring timers in v1. |
 | `TIMER_FORBIDDEN` | Restricted operation: another node's `target_l2_name` from a requester that is not a SY node, another owner's `TIMER_LIST` from a node that is not `SY.admin`, or `TIMER_PURGE_OWNER` from a node that is not the orchestrator. |
 | `TIMER_STORAGE_ERROR` | Internal SQLite error. Not in `TIMER_HELP`'s list (§9). |
-| `TIMER_INTERNAL` | An unknown verb, a response that does not fit in one 128 KiB frame, or another internal error. A message without the router's `routing.src_l2_name` gets no answer at all (§6.1). |
+| `TIMER_UNKNOWN_VERB` | A verb SY.timer does not know. |
+| `TIMER_INTERNAL` | A response that does not fit in one 128 KiB frame, or another internal error. A message without the router's `routing.src_l2_name` gets no answer at all (§6.1). |
 | `TIMER_UNREACHABLE` | (Go client) `SY.timer` does not answer after the retries of a time operation (§14.4). |
 
 Format of an error response:

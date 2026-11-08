@@ -425,7 +425,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			"state":     "error",
 			"error": map[string]any{
 				"code":   "UNSUPPORTED_OPERATION",
-				"detail": fmt.Sprintf("operation %q not implemented yet", operation),
+				"detail": fmt.Sprintf("unknown operation %q", operation),
 			},
 		})
 	}

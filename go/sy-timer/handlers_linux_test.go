@@ -134,7 +134,7 @@ func TestRefusedTimerResponseIsAnsweredWithAnError(t *testing.T) {
 // SY.timer answers requests only. A message the router made (no src_l2_name), such as the
 // UNREACHABLE for a TIMER_FIRED whose target is not connected, and a reply from a node get no
 // answer: answering the router's UNREACHABLE would bounce between SY.timer and the router forever.
-// An unknown verb from a node is still answered TIMER_INTERNAL.
+// An unknown verb from a node is still answered, with TIMER_UNKNOWN_VERB.
 func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 	notice := func(msgName, srcL2Name string) fluxbeesdk.Message {
 		msg, err := fluxbeesdk.BuildSystemMessage(
@@ -174,7 +174,7 @@ func TestRouterNoticesAndRepliesGetNoAnswer(t *testing.T) {
 				}
 				return
 			}
-			if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" {
+			if response := mustReadTimerResponse(t, tx); response.OK || response.Error == nil || response.Error.Code != "TIMER_UNKNOWN_VERB" {
 				t.Fatalf("unexpected answer to an unknown verb: %+v", response)
 			}
 		})
