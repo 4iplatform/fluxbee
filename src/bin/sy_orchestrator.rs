@@ -14876,8 +14876,9 @@ fn drift_filter_str<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a
 fn drift_alerts_scope_note(hive_id: &str) -> String {
     format!(
         "These are the drift alerts {hive_id}'s orchestrator recorded. Another hive's own checks \
-         (an egress's LAN and internet, a host firewall, the ingress's SSH table) stay in that \
-         hive's journal and its own drift-alerts file, which this read does not reach yet."
+         (such as an egress's LAN and internet, a host firewall, the ingress's SSH table or its \
+         Syncthing folders) stay in that hive's journal and its own drift-alerts file, which \
+         this read does not reach yet."
     )
 }
 

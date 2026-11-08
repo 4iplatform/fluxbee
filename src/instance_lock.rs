@@ -10,16 +10,18 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-/// This process's lock (`hold_for_process`), open until the process ends.
-static HELD: OnceLock<fs::File> = OnceLock::new();
+/// This process's locks (`hold_for_process`), each open until the process ends.
+static HELD: Mutex<Vec<fs::File>> = Mutex::new(Vec::new());
 
 /// Makes this process the only `what` on the host until it ends: `hold`, kept for the process's
 /// whole life. `Err` names the holder.
 pub fn hold_for_process(path: &Path, what: &str) -> Result<(), String> {
     if let Some(file) = hold(path, what)? {
-        let _ = HELD.set(file);
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(file);
     }
     Ok(())
 }
