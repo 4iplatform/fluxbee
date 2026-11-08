@@ -56,7 +56,10 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    5. reports an active ufw or firewalld (`report_active_host_firewalls`), applies the ingress'
       SSH table on the ingress role (`reconcile_ingress_ssh`, never fatal), and reconciles egress
       (fatal only on the egress role);
-   6. starts Syncthing if blob or dist sync is enabled (a failure only warns);
+   6. starts Syncthing if blob or dist sync is enabled (a failure only warns). While
+      `dist/vendor` does not hold the Syncthing its manifest describes, it runs the Syncthing
+      already installed and reports the vendor in `vendor.awaiting_update`; with none installed,
+      Syncthing does not start, as before (FINDINGS A-189, [Syncthing](#syncthing));
    7. checks each core binary of its role in `dist/core/bin` against the manifest, its size and
       sha256 (`check_core_dist_at_start`, FINDINGS A-186). One that is missing, of another size
       or hash, or not in the manifest stops nothing: each is a warning in the journal and an
@@ -71,8 +74,8 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    9. waits up to 60 s for those nodes to appear in the router (`wait_for_lifecycle_nodes`); a
       timeout only warns.
 
-   With `core.awaiting_update` open, `main` then checks dist again every minute
-   (`run_core_dist_recheck_loop`) until it matches.
+   `main` then checks again every minute each report that is open, the core's or the vendor's,
+   until its tree matches (`run_dist_recheck_loop`).
 4. Joins the router as `SY.orchestrator` (`RouterDispatcher::connect_with_retry`, every 1 s).
 5. Starts the admin worker and the system worker (`run_admin_worker`, `run_system_worker`). Each
    handles its messages one at a time, in arrival order.
@@ -418,7 +421,9 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.
 - **vendor**: brings the running Syncthing in line with the vendored one
-  (`ensure_blob_sync_runtime`), when sync is enabled.
+  (`ensure_blob_sync_runtime`), when sync is enabled. It is strict (`VendorPolicy::Strict`): a
+  vendored binary that does not match `dist/vendor/manifest.json` fails the update, and nothing
+  is installed or restarted (FINDINGS A-189). Past that check it closes `vendor.awaiting_update`.
 - **core** (`apply_core_update_replying_first`): checks each core binary of its role in
   `dist/core/bin` against the manifest and fails the update on the first that does not match
   (`compute_local_core_update_sets`, `validate_core_manifest_for_bins`), so an update never
@@ -446,6 +451,15 @@ update then installs it; a node the role lists that dist no longer has (`not_in_
 refuses it, until the hive's `system_nodes` drops it. It lives in the orchestrator's memory: each
 start checks again.
 
+**`vendor.awaiting_update`** (FINDINGS A-189) is the same for the vendored Syncthing, in the
+vendor section of `/versions`, with one component, `syncthing`. It opens when the start, the
+watchdog or a sync probe finds `dist/vendor` not holding the Syncthing its manifest describes
+(the manifest or the binary missing, another size or hash, no `syncthing` entry), and the hive
+keeps running the Syncthing already installed ([Syncthing](#syncthing)). It closes when a later
+check, every minute, or any Syncthing setup that installs or keeps the vendored binary finds it
+matching. The vendored binary then gets installed at the next start or `update
+category=vendor`.
+
 `SYSTEM_SYNC_HINT` (SY.admin's `sync_hint`) asks Syncthing to rescan a folder (`blob` or `dist`)
 and waits until it is idle: default 30 s, at most 300 s.
 
@@ -456,6 +470,20 @@ user `fluxbee`, `UMask=0027`, `/var/lib/fluxbee/vendor/bin/syncthing` with the G
 `127.0.0.1:<api_port>` (default 8384) and its home in `/var/lib/fluxbee/syncthing`. Every link
 is TCP to the motherbee's static address, so only the motherbee listens off loopback, on
 22000/tcp; a spoke only dials (`syncthing_owned_listen_address`).
+
+Before it starts the service (`ensure_blob_sync_runtime`), the orchestrator holds the vendored
+binary, `dist/vendor/syncthing/syncthing`, to `dist/vendor/manifest.json`: its size and sha256
+(`vendored_syncthing_at`). It installs the vendored binary when it matches and the installed
+one differs or is missing (`plan_syncthing_binary`), and never installs one that does not
+match. What happens then is each caller's (`VendorPolicy`, FINDINGS A-189):
+
+- **The start, the watchdog and the sync probes** (`SYSTEM_SYNC_HINT`, a join's finalize probe)
+  run the Syncthing already installed and report the vendor in `vendor.awaiting_update`
+  ([Updates](#updates)). Syncthing is what brings the rest of the vendor, and a spoke does not
+  enable its unit: before this, a spoke restarted while a release that changes the vendored
+  Syncthing was syncing never started Syncthing again. With no Syncthing installed they fail as
+  before, which the start and the watchdog only log.
+- **`update category=vendor`, and the motherbee's setup for an ingress join,** fail.
 
 | Folder | Holds | Who gets it |
 | --- | --- | --- |
@@ -654,6 +682,10 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
   binary, `core.awaiting_update` in `/versions`, and the hive runs what `/usr/bin` holds until a
   core update can install it (FINDINGS A-186). A missing or invalid `dist/core/manifest.json` is
   still fatal.
+- **`dist/vendor` does not hold the Syncthing its manifest describes.** The start and the
+  watchdog run the Syncthing already installed, with a warning and `vendor.awaiting_update`; with
+  none installed Syncthing does not start, logged at each attempt, as before. The orchestrator
+  runs either way (FINDINGS A-189).
 - **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
   within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
   `ORCHESTRATOR_BOOTING`.
@@ -669,7 +701,8 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - `curl -s http://127.0.0.1:8080/hive/status` on the motherbee: `hive_id`, `pid`, `uptime_ms`
   of the motherbee's orchestrator.
 - `GET /hives`, `GET /hives/{hive}` (join status), `GET /versions` (core, runtime and vendor per
-  hive, with the last core update and `core.awaiting_update`), `GET /drift-alerts` on SY.admin.
+  hive, with the last core update, `core.awaiting_update` and `vendor.awaiting_update`),
+  `GET /drift-alerts` on SY.admin.
 
 ## Links
 
@@ -683,4 +716,4 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 - [Host posture spec](../host-posture-and-exposure-spec-v1.md): the posture stages.
 - [Software distribution spec](../history/software-distribution-spec.md) and
   [runtime lifecycle spec](../history/runtime-lifecycle-spec.md): dist and runtimes.
-- `lab/logbook/FINDINGS.md`: A-39, A-45, A-46, A-54, A-186; D32 in the join comments.
+- `lab/logbook/FINDINGS.md`: A-39, A-45, A-46, A-54, A-186, A-189; D32 in the join comments.

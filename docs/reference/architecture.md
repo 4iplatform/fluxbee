@@ -149,8 +149,10 @@ The boot (`bootstrap_local`, then `finish_bootstrap`):
    it matches the manifest).
 3. Start `rt-gateway` and wait for a fresh heartbeat in its shared memory (`wait_for_router_ready`).
    Report an active ufw or firewalld, apply the ingress' SSH table (`reconcile_ingress_ssh`, §9),
-   apply the egress setup (`reconcile_egress`) and start Syncthing. Then check its role's core
-   binaries in `dist/core/bin` against the manifest: one that does not match is a warning and
+   apply the egress setup (`reconcile_egress`) and start Syncthing: the one already installed
+   while `dist/vendor` does not hold the vendored one as its manifest says, reported as
+   `vendor.awaiting_update` (FINDINGS A-189). Then check its role's core binaries in
+   `dist/core/bin` against the manifest: one that does not match is a warning and
    `core.awaiting_update` in `/versions`, never fatal, and the hive runs what `/usr/bin` holds
    (FINDINGS A-186).
 4. Start the `system_nodes.<role>.nodes` units in order, then wait up to 60 s for the `wait_for`

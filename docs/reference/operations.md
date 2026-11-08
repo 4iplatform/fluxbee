@@ -428,7 +428,10 @@ the version into `_system.runtime_version` before it launches the node, so `stat
    check: each core binary of the role in `dist/core/bin` against the manifest. One that does not
    match is a warning and `core.awaiting_update` in `/versions`, never fatal: the hive starts on
    what `/usr/bin` holds, and dist is checked again every minute until it matches (FINDINGS
-   A-186);
+   A-186). Syncthing starts the same way: while `dist/vendor` does not hold the Syncthing its
+   manifest describes, the Syncthing already installed runs, reported as
+   `vendor.awaiting_update` (FINDINGS A-189); `update category=vendor` and the motherbee's setup
+   for an ingress join refuse such a vendor;
 4. starts `system_nodes.<role>.nodes` in order and waits up to 60 s for the `wait_for` list
    (`LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS`; a timeout only warns);
 5. on the motherbee, waits for `sy-storage` (30 s) and for its database to answer
@@ -602,7 +605,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}` | one hive's join record (`status`, `join`) |
 | `GET /inventory`, `/inventory/summary`, `/inventory/{hive}` | the live view from the router's LSA; answers while the orchestrator boots |
 | `GET /hives/{hive}/nodes`, `.../nodes/{name}/status` | nodes and one node's lifecycle and health |
-| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds |
+| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds, and `vendor.awaiting_update` the vendored Syncthing, while it runs the one already installed |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes. A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |

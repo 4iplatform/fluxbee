@@ -727,7 +727,10 @@ struct OrchestratorState {
     /// FINDINGS A-186: the core binaries of this role that the start's dist check, or a later one,
     /// found not matching the manifest; None while dist holds them as it says. `/versions` shows it
     /// as `core.awaiting_update`.
-    awaiting_update: std::sync::Mutex<Option<AwaitingUpdate>>,
+    core_awaiting_update: std::sync::Mutex<Option<AwaitingUpdate>>,
+    /// FINDINGS A-189: the vendored Syncthing, when a check found dist/vendor not holding it as its
+    /// manifest says while the installed Syncthing ran instead. `/versions`: `vendor.awaiting_update`.
+    vendor_awaiting_update: std::sync::Mutex<Option<AwaitingUpdate>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -1009,7 +1012,8 @@ async fn main() -> Result<(), OrchestratorError> {
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         relaunch_waits: std::sync::Mutex::new(HashMap::new()),
         reconcile_pass: Mutex::new(()),
-        awaiting_update: std::sync::Mutex::new(None),
+        core_awaiting_update: std::sync::Mutex::new(None),
+        vendor_awaiting_update: std::sync::Mutex::new(None),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -1042,11 +1046,9 @@ async fn main() -> Result<(), OrchestratorError> {
     write_pid(&run_dir)?;
 
     bootstrap_local(&state, &socket_dir).await?;
-    // FINDINGS A-186: a start whose dist check found binaries that do not match checks again every
-    // minute, until a check or a core update finds dist consistent.
-    if awaiting_update_open(&state) {
-        tokio::spawn(run_core_dist_recheck_loop(Arc::clone(&state)));
-    }
+    // FINDINGS A-186, A-189: a dist report the start or the watchdog opened is checked again every
+    // minute, until a check or an update finds its tree consistent.
+    tokio::spawn(run_dist_recheck_loop(Arc::clone(&state)));
 
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
@@ -1774,8 +1776,11 @@ async fn bootstrap_local(
     if !startup_sync.sync_enabled {
         disable_blob_sync_runtime_local()?;
     } else if startup_sync.sync_enabled {
+        // FINDINGS A-189: a vendor still syncing keeps the installed Syncthing running, since it
+        // is what brings the rest.
         if let Err(err) =
-            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee, state.role).await
+            ensure_blob_sync_runtime(state, &state.blob, &state.dist, VendorPolicy::KeepInstalled)
+                .await
         {
             tracing::warn!(
                 error = %err,
@@ -4039,8 +4044,15 @@ async fn wait_for_syncthing_folder_convergence(
     };
 
     if !service_active || !api_healthy {
-        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee, state.role)
-            .await?;
+        // A probe starts Syncthing as the watchdog does: on the installed binary while the vendor
+        // still syncs (FINDINGS A-189).
+        ensure_blob_sync_runtime(
+            state,
+            desired_blob,
+            desired_dist,
+            VendorPolicy::KeepInstalled,
+        )
+        .await?;
         service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
         api_healthy = if service_active {
             syncthing_api_healthy(desired_sync.sync_api_port).await
@@ -5070,7 +5082,7 @@ fn prepare_core_update(state: &OrchestratorState) -> Result<CorePrepareOutcome, 
     // anything is backed up or swapped. Past it, dist matches, so the start's report closes
     // (FINDINGS A-186).
     let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
-    close_awaiting_update(state);
+    record_dist_check(state, DistTree::Core, Vec::new());
     let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
     // Created LAZILY, on the first binary we actually back up. It used to be created
     // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
@@ -5414,11 +5426,13 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
+                // Strict: a vendored binary that does not match its manifest fails the update,
+                // and nothing is installed (FINDINGS A-189).
                 let outcome = ensure_blob_sync_runtime(
+                    state,
                     &desired_blob,
                     &desired_dist,
-                    state.is_motherbee,
-                    state.role,
+                    VendorPolicy::Strict,
                 )
                 .await?;
                 Ok(vendor_update_result(outcome))
@@ -6850,10 +6864,6 @@ fn own_tree_for_reading(path: &Path, uid: u32, gid: u32) -> Result<(), Orchestra
     Ok(())
 }
 
-fn syncthing_binary_available() -> bool {
-    Path::new(SYNCTHING_INSTALL_PATH).exists()
-}
-
 fn syncthing_install_dir() -> PathBuf {
     Path::new(SYNCTHING_INSTALL_PATH)
         .parent()
@@ -6923,41 +6933,179 @@ fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> 
     Ok(path)
 }
 
+/// The sha256 of the vendored Syncthing in dist/vendor, once it is what its manifest describes;
+/// else an error saying why not (`vendored_syncthing_at`).
 fn local_syncthing_vendor_hash() -> Result<Option<String>, OrchestratorError> {
-    let source = resolve_syncthing_vendor_source_path()?;
-    let mut cmd = Command::new("sha256sum");
-    cmd.arg(&source);
-    let out = run_cmd_output(cmd, "sha256sum local syncthing vendor")?;
-    let hash = out
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if hash.is_empty() {
-        return Ok(None);
-    }
-    if let Some(component) = vendor_syncthing_component()? {
-        let expected = normalize_sha256(&component.hash);
-        if !expected.is_empty() && expected != hash {
-            return Err(format!(
-                "vendor manifest hash mismatch for syncthing: expected={} actual={}",
-                expected, hash
-            )
-            .into());
-        }
-        if let Some(size) = component.size {
-            let actual_size = fs::metadata(&source)?.len();
-            if actual_size != size {
-                return Err(format!(
-                    "vendor manifest size mismatch for syncthing: expected={} actual={}",
-                    size, actual_size
-                )
-                .into());
-            }
+    vendored_syncthing_at(&SyncthingVendorPaths::local())
+        .map(|vendored| Some(vendored.sha256))
+        .map_err(|mismatch| mismatch.detail.into())
+}
+
+/// Where the vendored Syncthing lives: the vendor tree and its manifest in dist, and the binary
+/// that runs. A hive's are fixed (`local`); a test gives its own.
+#[derive(Debug, Clone)]
+struct SyncthingVendorPaths {
+    vendor_root: PathBuf,
+    manifest: PathBuf,
+    installed: PathBuf,
+}
+
+impl SyncthingVendorPaths {
+    fn local() -> Self {
+        SyncthingVendorPaths {
+            vendor_root: PathBuf::from(DIST_VENDOR_ROOT_DIR),
+            manifest: PathBuf::from(DIST_VENDOR_MANIFEST_PATH),
+            installed: PathBuf::from(SYNCTHING_INSTALL_PATH),
         }
     }
-    Ok(Some(hash))
+}
+
+/// The vendored Syncthing that dist/vendor holds as its manifest describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VendoredSyncthing {
+    source: PathBuf,
+    sha256: String,
+}
+
+/// The vendored Syncthing under `paths`, held to its manifest: the manifest, its `syncthing`
+/// component, the file it names, and that file's size and sha256. Why not, as the `syncthing`
+/// entry of `vendor.awaiting_update`, when any of them is missing or does not match (FINDINGS
+/// A-189).
+fn vendored_syncthing_at(paths: &SyncthingVendorPaths) -> Result<VendoredSyncthing, DistMismatch> {
+    let mismatch = |reason: DistMismatchReason, detail: String| DistMismatch {
+        component: "syncthing".to_string(),
+        reason,
+        detail,
+    };
+    let raw = match fs::read_to_string(&paths.manifest) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(mismatch(
+                DistMismatchReason::Missing,
+                format!("vendor manifest missing at '{}'", paths.manifest.display()),
+            ));
+        }
+        Err(err) => {
+            return Err(mismatch(
+                DistMismatchReason::Unreadable,
+                format!(
+                    "vendor manifest at '{}' unreadable: {err}",
+                    paths.manifest.display()
+                ),
+            ));
+        }
+    };
+    let manifest: VendorManifest = serde_json::from_str(&raw).map_err(|err| {
+        mismatch(
+            DistMismatchReason::InvalidEntry,
+            format!("vendor manifest invalid: {err}"),
+        )
+    })?;
+    if manifest.schema_version == 0 {
+        return Err(mismatch(
+            DistMismatchReason::InvalidEntry,
+            "vendor manifest invalid: schema_version must be >= 1".to_string(),
+        ));
+    }
+    let Some(component) = manifest.components.get("syncthing") else {
+        return Err(mismatch(
+            DistMismatchReason::NotInManifest,
+            "vendor manifest missing 'syncthing' component".to_string(),
+        ));
+    };
+    let expected_sha256 = normalize_sha256(&component.hash);
+    if component.path.trim().is_empty()
+        || expected_sha256.is_empty()
+        || component.upstream_version.trim().is_empty()
+    {
+        return Err(mismatch(
+            DistMismatchReason::InvalidEntry,
+            "vendor manifest syncthing component missing path, hash or upstream_version"
+                .to_string(),
+        ));
+    }
+    let source = paths.vendor_root.join(component.path.trim());
+    let sha256 = check_dist_file(
+        DistTree::Vendor,
+        "syncthing",
+        &source,
+        component.size,
+        &expected_sha256,
+    )?;
+    Ok(VendoredSyncthing { source, sha256 })
+}
+
+/// How a caller of `ensure_blob_sync_runtime` takes a vendored Syncthing that dist/vendor does
+/// not hold as its manifest describes (FINDINGS A-189). Neither ever installs such a binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VendorPolicy {
+    /// `update category=vendor`, and the motherbee's setup for an ingress join: an error, and
+    /// Syncthing is neither installed nor started.
+    Strict,
+    /// The start, the watchdog and the sync probes: the Syncthing already installed runs as it
+    /// is, and `vendor.awaiting_update` reports the vendor. With none installed, the same error
+    /// as `Strict`, and the report.
+    KeepInstalled,
+}
+
+/// What `ensure_blob_sync_runtime` does with the Syncthing binary before it starts the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyncthingBinaryPlan {
+    /// The installed binary is the vendored one.
+    Current,
+    /// Install the vendored binary at this path: none is installed, or another one is.
+    Install(PathBuf),
+    /// The vendor does not match its manifest and a Syncthing is installed: it runs as it is.
+    KeepInstalled(DistMismatch),
+}
+
+/// The plan for the Syncthing binary under `paths`, which never installs a vendored binary that
+/// does not match its manifest. The error says why, when `policy` has no installed Syncthing to
+/// keep.
+fn plan_syncthing_binary(
+    paths: &SyncthingVendorPaths,
+    policy: VendorPolicy,
+) -> Result<SyncthingBinaryPlan, DistMismatch> {
+    match vendored_syncthing_at(paths) {
+        Ok(vendored) => {
+            let installed_is_vendored = sha256_file(&paths.installed)
+                .is_ok_and(|hash| hash.eq_ignore_ascii_case(&vendored.sha256));
+            Ok(if installed_is_vendored {
+                SyncthingBinaryPlan::Current
+            } else {
+                SyncthingBinaryPlan::Install(vendored.source)
+            })
+        }
+        Err(mismatch) if policy == VendorPolicy::KeepInstalled && paths.installed.is_file() => {
+            Ok(SyncthingBinaryPlan::KeepInstalled(mismatch))
+        }
+        Err(mismatch) => Err(mismatch),
+    }
+}
+
+/// Installs the vendored Syncthing at `source` as `target`, mode 0755.
+fn install_syncthing_binary(source: &Path, target: &Path) -> Result<(), OrchestratorError> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        tracing::warn!(
+            target = %target.display(),
+            "the installed syncthing is not the vendored one; reinstalling from the vendor source"
+        );
+    }
+    tracing::info!(
+        source = %source.display(),
+        target = %target.display(),
+        "installing syncthing from vendor source"
+    );
+    let mut install = Command::new("install");
+    install.arg("-m").arg("0755").arg(source).arg(target);
+    run_cmd(install, "install syncthing from vendor source")?;
+    if !target.exists() {
+        return Err("syncthing install finished but installed binary is still missing".into());
+    }
+    Ok(())
 }
 
 fn command_exists(name: &str) -> bool {
@@ -9088,64 +9236,6 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
         HiveRole::Ingress => {}
     }
     Ok(())
-}
-
-/// Installs the vendored Syncthing when the installed binary is missing or differs from it.
-/// Returns whether it installed one: a running Syncthing keeps the old binary until it restarts.
-fn ensure_syncthing_installed() -> Result<bool, OrchestratorError> {
-    let source = resolve_syncthing_vendor_source_path()?;
-    let source_hash = local_syncthing_vendor_hash()?.unwrap_or_default();
-    if let Some(parent) = Path::new(SYNCTHING_INSTALL_PATH).parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut install_required = !syncthing_binary_available();
-    if !install_required {
-        let mut cmd = Command::new("sha256sum");
-        cmd.arg(SYNCTHING_INSTALL_PATH);
-        match run_cmd_output(cmd, "sha256sum installed syncthing") {
-            Ok(out) => {
-                let installed_hash = out
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if installed_hash.is_empty()
-                    || (!source_hash.is_empty() && installed_hash != source_hash)
-                {
-                    install_required = true;
-                    tracing::warn!(
-                        installed_hash = installed_hash,
-                        source_hash = source_hash,
-                        "syncthing binary drift detected locally; reinstalling from vendor source"
-                    );
-                }
-            }
-            Err(err) => {
-                install_required = true;
-                tracing::warn!(error = %err, "failed to hash installed syncthing; reinstalling");
-            }
-        }
-    }
-    if !install_required {
-        return Ok(false);
-    }
-    tracing::info!(
-        source = %source.display(),
-        target = SYNCTHING_INSTALL_PATH,
-        "installing syncthing from vendor source"
-    );
-    let mut install = Command::new("install");
-    install
-        .arg("-m")
-        .arg("0755")
-        .arg(&source)
-        .arg(SYNCTHING_INSTALL_PATH);
-    run_cmd(install, "install syncthing from vendor source")?;
-    if !syncthing_binary_available() {
-        return Err("syncthing install finished but installed binary is still missing".into());
-    }
-    Ok(true)
 }
 
 fn syncthing_unit_contents(blob: &BlobRuntimeConfig) -> String {
@@ -12147,12 +12237,16 @@ fn syncthing_runs_stale(
     active && (binary_updated || unit_changed || runs_replaced_binary)
 }
 
+/// Syncthing installed from the vendor, under its unit, running and healthy, with this hive's
+/// folders. `policy` says what a vendored binary that does not match its manifest does: each
+/// caller names its own (FINDINGS A-189).
 async fn ensure_blob_sync_runtime(
+    state: &OrchestratorState,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
-    is_motherbee: bool,
-    role: HiveRole,
+    policy: VendorPolicy,
 ) -> Result<SyncthingRuntimeOutcome, OrchestratorError> {
+    let (is_motherbee, role) = (state.is_motherbee, state.role);
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
         return Ok(SyncthingRuntimeOutcome::default());
@@ -12168,8 +12262,33 @@ async fn ensure_blob_sync_runtime(
     let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
     // Installed before anything is stopped: a vendor that cannot be installed now leaves the
-    // running Syncthing alone, and it is the one that brings the vendor (review F4).
-    let binary_updated = ensure_syncthing_installed()?;
+    // running Syncthing alone, and it is the one that brings the vendor (review F4). A vendored
+    // binary that does not match its manifest is never installed, and Syncthing is what brings
+    // the rest of it (FINDINGS A-189): the start, the watchdog and the sync probes run the
+    // Syncthing already installed and report the vendor, while the vendor update and an ingress
+    // join's setup stop on it.
+    let paths = SyncthingVendorPaths::local();
+    let binary_updated = match plan_syncthing_binary(&paths, policy) {
+        Ok(SyncthingBinaryPlan::Current) => {
+            record_dist_check(state, DistTree::Vendor, Vec::new());
+            false
+        }
+        Ok(SyncthingBinaryPlan::Install(source)) => {
+            record_dist_check(state, DistTree::Vendor, Vec::new());
+            install_syncthing_binary(&source, &paths.installed)?;
+            true
+        }
+        Ok(SyncthingBinaryPlan::KeepInstalled(mismatch)) => {
+            record_dist_check(state, DistTree::Vendor, vec![mismatch]);
+            false
+        }
+        Err(mismatch) => {
+            if policy == VendorPolicy::KeepInstalled {
+                record_dist_check(state, DistTree::Vendor, vec![mismatch.clone()]);
+            }
+            return Err(mismatch.detail.into());
+        }
+    };
     let unit_changed = ensure_syncthing_unit(&sync)?;
     // Restart a stale Syncthing now, before the checks below: they already use the new unit's
     // port and home.
@@ -12520,8 +12639,13 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
-            .await?;
+        ensure_blob_sync_runtime(
+            state,
+            &desired_blob,
+            &desired_dist,
+            VendorPolicy::KeepInstalled,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -12614,7 +12738,14 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role).await?;
+    // FINDINGS A-189: on the installed binary while the vendor still syncs.
+    ensure_blob_sync_runtime(
+        state,
+        &desired_blob,
+        &desired_dist,
+        VendorPolicy::KeepInstalled,
+    )
+    .await?;
     Ok(())
 }
 
@@ -13416,7 +13547,10 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
 
     // FINDINGS A-186: null while dist holds this role's core binaries as the manifest says; else
     // which do not match and why, while the hive runs what /usr/bin holds.
-    let awaiting_update = awaiting_update_json(awaiting_update_slot(state).as_ref());
+    let awaiting_update = awaiting_update_json(
+        DistTree::Core,
+        awaiting_update_slot(state, DistTree::Core).as_ref(),
+    );
     let core = match load_core_manifest() {
         Ok(manifest) => {
             let manifest_hash = local_core_manifest_hash().ok().flatten();
@@ -13486,6 +13620,12 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
         }),
     };
 
+    // FINDINGS A-189: null while dist/vendor holds the Syncthing its manifest describes; else why
+    // not, while the hive runs the Syncthing already installed.
+    let vendor_awaiting_update = awaiting_update_json(
+        DistTree::Vendor,
+        awaiting_update_slot(state, DistTree::Vendor).as_ref(),
+    );
     let vendor = match load_vendor_manifest() {
         Ok(Some(manifest)) => {
             let syncthing_path = manifest
@@ -13502,6 +13642,7 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
                 "manifest_hash": manifest_hash,
                 "syncthing_present": syncthing_present,
                 "components": manifest.components,
+                "awaiting_update": vendor_awaiting_update,
             })
         }
         Ok(None) => {
@@ -13509,11 +13650,13 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             serde_json::json!({
                 "status": "missing",
                 "syncthing_present": syncthing_present,
+                "awaiting_update": vendor_awaiting_update,
             })
         }
         Err(err) => serde_json::json!({
             "status": "error",
             "message": err.to_string(),
+            "awaiting_update": vendor_awaiting_update,
         }),
     };
 
@@ -23245,7 +23388,7 @@ fn validate_core_bins_against_manifest(
 /// Why a core binary in dist is not the one its manifest describes (FINDINGS A-186).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum CoreDistReason {
+enum DistMismatchReason {
     /// The manifest names no such component: the role lists a binary this build does not have.
     NotInManifest,
     /// Its manifest entry lacks a service, a version or a build id, or names another service.
@@ -23260,25 +23403,100 @@ enum CoreDistReason {
     HashMismatch,
 }
 
-impl CoreDistReason {
+impl DistMismatchReason {
     fn as_str(self) -> &'static str {
         match self {
-            CoreDistReason::NotInManifest => "not_in_manifest",
-            CoreDistReason::InvalidEntry => "invalid_entry",
-            CoreDistReason::Missing => "missing",
-            CoreDistReason::Unreadable => "unreadable",
-            CoreDistReason::SizeMismatch => "size_mismatch",
-            CoreDistReason::HashMismatch => "hash_mismatch",
+            DistMismatchReason::NotInManifest => "not_in_manifest",
+            DistMismatchReason::InvalidEntry => "invalid_entry",
+            DistMismatchReason::Missing => "missing",
+            DistMismatchReason::Unreadable => "unreadable",
+            DistMismatchReason::SizeMismatch => "size_mismatch",
+            DistMismatchReason::HashMismatch => "hash_mismatch",
         }
     }
 }
 
-/// One core binary in dist that is not the one its manifest describes, and why.
+/// One binary in dist that is not the one its manifest describes, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct CoreDistMismatch {
+struct DistMismatch {
     component: String,
-    reason: CoreDistReason,
+    reason: DistMismatchReason,
     detail: String,
+}
+
+/// The checks every binary in dist gets against its manifest entry: a regular file at `path`, of
+/// `size` bytes when the entry gives one, and of sha256 `sha256`. Its sha256, or why not; `tree`
+/// names the manifest in the detail.
+fn check_dist_file(
+    tree: DistTree,
+    component: &str,
+    path: &Path,
+    size: Option<u64>,
+    sha256: &str,
+) -> Result<String, DistMismatch> {
+    let mismatch = |reason: DistMismatchReason, detail: String| DistMismatch {
+        component: component.to_string(),
+        reason,
+        detail,
+    };
+    let tree = tree.name();
+    // What the path is, before anything opens it: an open of a FIFO would wait forever.
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(mismatch(
+                DistMismatchReason::Missing,
+                format!(
+                    "{tree} binary '{component}' missing at '{}'",
+                    path.display()
+                ),
+            ));
+        }
+        Err(err) => {
+            return Err(mismatch(
+                DistMismatchReason::Unreadable,
+                format!(
+                    "{tree} binary '{component}' at '{}' unreadable: {err}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if !meta.is_file() {
+        return Err(mismatch(
+            DistMismatchReason::Unreadable,
+            format!(
+                "{tree} binary '{component}' at '{}' is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    // The size before the hash: it reads nothing.
+    if let Some(expected_size) = size {
+        if meta.len() != expected_size {
+            return Err(mismatch(
+                DistMismatchReason::SizeMismatch,
+                format!(
+                    "{tree} manifest size mismatch for '{component}': expected={expected_size} actual={}",
+                    meta.len()
+                ),
+            ));
+        }
+    }
+    match sha256_file(path) {
+        Ok(actual) if actual.eq_ignore_ascii_case(sha256.trim()) => Ok(actual),
+        Ok(actual) => Err(mismatch(
+            DistMismatchReason::HashMismatch,
+            format!("{tree} manifest hash mismatch for '{component}': expected={sha256} actual={actual}"),
+        )),
+        Err(err) => Err(mismatch(
+            DistMismatchReason::Unreadable,
+            format!(
+                "{tree} binary '{component}' at '{}' unreadable: {err}",
+                path.display()
+            ),
+        )),
+    }
 }
 
 /// None when the binary of `component` at `path` is the one `manifest` describes; else why not.
@@ -23287,9 +23505,9 @@ fn core_dist_binary_mismatch(
     manifest: &CoreManifest,
     component: &str,
     path: &Path,
-) -> Option<CoreDistMismatch> {
-    let mismatch = |reason: CoreDistReason, detail: String| {
-        Some(CoreDistMismatch {
+) -> Option<DistMismatch> {
+    let mismatch = |reason: DistMismatchReason, detail: String| {
+        Some(DistMismatch {
             component: component.to_string(),
             reason,
             detail,
@@ -23297,7 +23515,7 @@ fn core_dist_binary_mismatch(
     };
     let Some(expected) = manifest.components.get(component) else {
         return mismatch(
-            CoreDistReason::NotInManifest,
+            DistMismatchReason::NotInManifest,
             format!(
                 "core manifest missing component '{component}' for '{}'",
                 path.display()
@@ -23309,76 +23527,27 @@ fn core_dist_binary_mismatch(
         || expected.build_id.trim().is_empty()
     {
         return mismatch(
-            CoreDistReason::InvalidEntry,
+            DistMismatchReason::InvalidEntry,
             format!("core manifest component '{component}' missing service/version/build_id"),
         );
     }
     if expected.service.trim() != component {
         return mismatch(
-            CoreDistReason::InvalidEntry,
+            DistMismatchReason::InvalidEntry,
             format!(
                 "core manifest component '{component}' has service='{}' (expected '{component}')",
                 expected.service
             ),
         );
     }
-    // What the path is, before anything opens it: an open of a FIFO would wait forever.
-    let meta = match fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return mismatch(
-                CoreDistReason::Missing,
-                format!("core binary '{component}' missing at '{}'", path.display()),
-            );
-        }
-        Err(err) => {
-            return mismatch(
-                CoreDistReason::Unreadable,
-                format!(
-                    "core binary '{component}' at '{}' unreadable: {err}",
-                    path.display()
-                ),
-            );
-        }
-    };
-    if !meta.is_file() {
-        return mismatch(
-            CoreDistReason::Unreadable,
-            format!(
-                "core binary '{component}' at '{}' is not a regular file",
-                path.display()
-            ),
-        );
-    }
-    // The size before the hash: it reads nothing.
-    if let Some(expected_size) = expected.size {
-        if meta.len() != expected_size {
-            return mismatch(
-                CoreDistReason::SizeMismatch,
-                format!(
-                    "core manifest size mismatch for '{component}': expected={expected_size} actual={}",
-                    meta.len()
-                ),
-            );
-        }
-    }
-    match sha256_file(path) {
-        Ok(actual) if actual.eq_ignore_ascii_case(expected.sha256.trim()) => None,
-        Ok(actual) => mismatch(
-            CoreDistReason::HashMismatch,
-            format!(
-                "core manifest hash mismatch for '{component}': expected={} actual={actual}",
-                expected.sha256
-            ),
-        ),
-        Err(err) => mismatch(
-            CoreDistReason::Unreadable,
-            format!(
-                "core binary '{component}' at '{}' unreadable: {err}",
-                path.display()
-            ),
-        ),
-    }
+    check_dist_file(
+        DistTree::Core,
+        component,
+        path,
+        expected.size,
+        &expected.sha256,
+    )
+    .err()
 }
 
 /// The start's dist check, and every later one (FINDINGS A-186): each of `components` in
@@ -23388,35 +23557,69 @@ fn core_dist_mismatches(
     manifest: &CoreManifest,
     components: &[String],
     bin_dir: &Path,
-) -> Vec<CoreDistMismatch> {
+) -> Vec<DistMismatch> {
     components
         .iter()
         .filter_map(|name| core_dist_binary_mismatch(manifest, name, &bin_dir.join(name)))
         .collect()
 }
 
-/// How often dist is checked again while `core.awaiting_update` is open (FINDINGS A-186).
-const CORE_DIST_RECHECK_SECS: u64 = 60;
+/// How often a dist check runs again while a report is open (FINDINGS A-186, A-189).
+const DIST_RECHECK_SECS: u64 = 60;
 
-const AWAITING_UPDATE_MESSAGE: &str = "Core binaries of this hive's role in dist/core/bin do not \
-     match dist/core/manifest.json: a release still syncing, or a binary the role lists that dist \
-     no longer has. The hive runs what /usr/bin holds, and a core update installs dist's binaries \
-     only once they match the manifest.";
+/// The dist trees a check holds to their manifest, each reported in its own section of
+/// `/versions`: `core.awaiting_update` and `vendor.awaiting_update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistTree {
+    /// `dist/core`: the core binaries of this hive's role (FINDINGS A-186).
+    Core,
+    /// `dist/vendor`: the vendored Syncthing (FINDINGS A-189).
+    Vendor,
+}
 
-/// FINDINGS A-186: the core binaries of this hive's role that a dist check found not matching
-/// `dist/core/manifest.json`, since the first check that found any, as of the last one.
+impl DistTree {
+    const ALL: [DistTree; 2] = [DistTree::Core, DistTree::Vendor];
+
+    fn name(self) -> &'static str {
+        match self {
+            DistTree::Core => "core",
+            DistTree::Vendor => "vendor",
+        }
+    }
+
+    /// What its open report says in `/versions`.
+    fn message(self) -> &'static str {
+        match self {
+            DistTree::Core => {
+                "Core binaries of this hive's role in dist/core/bin do not match \
+                 dist/core/manifest.json: a release still syncing, or a binary the role lists that \
+                 dist no longer has. The hive runs what /usr/bin holds, and a core update installs \
+                 dist's binaries only once they match the manifest."
+            }
+            DistTree::Vendor => {
+                "The vendored Syncthing in dist/vendor does not match dist/vendor/manifest.json: a \
+                 release still syncing, or a vendor tree that lacks it. The hive keeps running the \
+                 Syncthing already installed, if there is one, and installs the vendored one only \
+                 once it matches its manifest."
+            }
+        }
+    }
+}
+
+/// FINDINGS A-186, A-189: what a dist check found not matching its tree's manifest, since the
+/// first check that found anything, as of the last one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AwaitingUpdate {
     since_ms: u64,
     checked_at_ms: u64,
-    mismatches: Vec<CoreDistMismatch>,
+    mismatches: Vec<DistMismatch>,
 }
 
 /// The report after a check that found `mismatches` at `now_ms`: none when it found none; else
 /// this check's, open since `previous` opened.
 fn awaiting_update_after(
     previous: Option<&AwaitingUpdate>,
-    mismatches: Vec<CoreDistMismatch>,
+    mismatches: Vec<DistMismatch>,
     now_ms: u64,
 ) -> Option<AwaitingUpdate> {
     if mismatches.is_empty() {
@@ -23429,14 +23632,14 @@ fn awaiting_update_after(
     })
 }
 
-/// `core.awaiting_update` in `/versions`: null while dist matches.
-fn awaiting_update_json(awaiting: Option<&AwaitingUpdate>) -> serde_json::Value {
+/// A tree's `awaiting_update` in `/versions`: null while it matches its manifest.
+fn awaiting_update_json(tree: DistTree, awaiting: Option<&AwaitingUpdate>) -> serde_json::Value {
     let Some(awaiting) = awaiting else {
         return serde_json::Value::Null;
     };
     serde_json::json!({
         "reason": "dist_mismatch",
-        "message": AWAITING_UPDATE_MESSAGE,
+        "message": tree.message(),
         "since_ms": awaiting.since_ms,
         "checked_at_ms": awaiting.checked_at_ms,
         "components": awaiting.mismatches,
@@ -23445,24 +23648,28 @@ fn awaiting_update_json(awaiting: Option<&AwaitingUpdate>) -> serde_json::Value 
 
 fn awaiting_update_slot(
     state: &OrchestratorState,
+    tree: DistTree,
 ) -> std::sync::MutexGuard<'_, Option<AwaitingUpdate>> {
-    state
-        .awaiting_update
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    match tree {
+        DistTree::Core => &state.core_awaiting_update,
+        DistTree::Vendor => &state.vendor_awaiting_update,
+    }
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn awaiting_update_open(state: &OrchestratorState) -> bool {
-    awaiting_update_slot(state).is_some()
+fn awaiting_update_open(state: &OrchestratorState, tree: DistTree) -> bool {
+    awaiting_update_slot(state, tree).is_some()
 }
 
-fn warn_awaiting_update(open: &AwaitingUpdate) {
+fn warn_awaiting_update(tree: DistTree, open: &AwaitingUpdate) {
     for mismatch in &open.mismatches {
         tracing::warn!(
+            tree = tree.name(),
             component = %mismatch.component,
             reason = mismatch.reason.as_str(),
             detail = %mismatch.detail,
-            "core binary in dist/core/bin does not match dist/core/manifest.json"
+            "a binary in dist does not match its manifest"
         );
     }
     let components: Vec<&str> = open
@@ -23470,15 +23677,84 @@ fn warn_awaiting_update(open: &AwaitingUpdate) {
         .iter()
         .map(|mismatch| mismatch.component.as_str())
         .collect();
-    tracing::warn!(
-        components = ?components,
-        "awaiting update: the hive runs what /usr/bin holds, /versions shows these as \
-         core.awaiting_update, and dist is checked again every minute (FINDINGS A-186)"
-    );
+    match tree {
+        DistTree::Core => tracing::warn!(
+            components = ?components,
+            "awaiting update: the hive runs what /usr/bin holds, /versions shows these as \
+             core.awaiting_update, and dist is checked again every minute (FINDINGS A-186)"
+        ),
+        DistTree::Vendor => tracing::warn!(
+            "awaiting update: Syncthing runs the binary already installed, if there is one, \
+             /versions shows the vendor as vendor.awaiting_update, and dist/vendor is checked \
+             again every minute (FINDINGS A-189)"
+        ),
+    }
 }
 
-/// The start's dist check (FINDINGS A-186), once Syncthing runs: it opens `core.awaiting_update`
-/// with a warning when a binary of the role does not match, and stops nothing.
+/// A report's next state after a check that found `mismatches`: it opens, takes the check's
+/// components, or closes when they are none. A warning when it opens or its components change, a
+/// line when it closes.
+fn apply_dist_check(
+    tree: DistTree,
+    slot: &mut Option<AwaitingUpdate>,
+    mismatches: Vec<DistMismatch>,
+) {
+    let previous = slot.take();
+    let next = awaiting_update_after(previous.as_ref(), mismatches, now_epoch_ms());
+    let reasons = |report: &AwaitingUpdate| -> Vec<(String, DistMismatchReason)> {
+        report
+            .mismatches
+            .iter()
+            .map(|mismatch| (mismatch.component.clone(), mismatch.reason))
+            .collect()
+    };
+    match (previous.as_ref(), next.as_ref()) {
+        (Some(_), None) => match tree {
+            DistTree::Core => tracing::info!(
+                "dist/core/bin matches dist/core/manifest.json; core.awaiting_update closed (FINDINGS A-186)"
+            ),
+            DistTree::Vendor => tracing::info!(
+                "dist/vendor holds the Syncthing its manifest describes; vendor.awaiting_update closed (FINDINGS A-189)"
+            ),
+        },
+        (None, Some(open)) => warn_awaiting_update(tree, open),
+        (Some(was), Some(open)) if reasons(was) != reasons(open) => {
+            warn_awaiting_update(tree, open)
+        }
+        _ => {}
+    }
+    *slot = next;
+}
+
+/// A dist check's outcome for `tree`: opens its report on a mismatch, refreshes an open one, and
+/// closes it when the check found none. Whether it is open.
+fn record_dist_check(
+    state: &OrchestratorState,
+    tree: DistTree,
+    mismatches: Vec<DistMismatch>,
+) -> bool {
+    let mut slot = awaiting_update_slot(state, tree);
+    apply_dist_check(tree, &mut slot, mismatches);
+    slot.is_some()
+}
+
+/// A recheck's outcome: as `record_dist_check` for an open report, while a report an update
+/// closed during the check stays closed. Whether it is open.
+fn refresh_awaiting_update(
+    state: &OrchestratorState,
+    tree: DistTree,
+    mismatches: Vec<DistMismatch>,
+) -> bool {
+    let mut slot = awaiting_update_slot(state, tree);
+    if slot.is_none() {
+        return false;
+    }
+    apply_dist_check(tree, &mut slot, mismatches);
+    slot.is_some()
+}
+
+/// The start's dist check of its core (FINDINGS A-186), once Syncthing runs: it opens
+/// `core.awaiting_update` when a binary of the role does not match, and stops nothing.
 fn check_core_dist_at_start(
     state: &OrchestratorState,
     manifest: &CoreManifest,
@@ -23486,89 +23762,66 @@ fn check_core_dist_at_start(
 ) {
     let mismatches =
         core_dist_mismatches(manifest, components, Path::new(DIST_CORE_BIN_SOURCE_DIR));
-    let mut awaiting = awaiting_update_slot(state);
-    *awaiting = awaiting_update_after(None, mismatches, now_epoch_ms());
-    if let Some(open) = awaiting.as_ref() {
-        warn_awaiting_update(open);
+    record_dist_check(state, DistTree::Core, mismatches);
+}
+
+/// What a check of `tree` finds on this hive's dist now. It hashes: callers run it off the async
+/// workers.
+fn local_dist_mismatches(
+    tree: DistTree,
+    role: HiveRole,
+) -> Result<Vec<DistMismatch>, OrchestratorError> {
+    match tree {
+        DistTree::Core => {
+            let manifest = load_core_manifest()?;
+            let components = core_components_listed_for_role(&manifest, role)?;
+            Ok(core_dist_mismatches(
+                &manifest,
+                &components,
+                Path::new(DIST_CORE_BIN_SOURCE_DIR),
+            ))
+        }
+        DistTree::Vendor => Ok(vendored_syncthing_at(&SyncthingVendorPaths::local())
+            .err()
+            .into_iter()
+            .collect()),
     }
 }
 
-/// A later check's outcome: the open report takes its components, or closes when it found none.
-/// A report a core update closed in the meantime stays closed. Whether it is still open.
-fn refresh_awaiting_update(state: &OrchestratorState, mismatches: Vec<CoreDistMismatch>) -> bool {
-    let mut awaiting = awaiting_update_slot(state);
-    let Some(previous) = awaiting.take() else {
-        return false;
-    };
-    let next = awaiting_update_after(Some(&previous), mismatches, now_epoch_ms());
-    let reasons = |report: &AwaitingUpdate| -> Vec<(String, CoreDistReason)> {
-        report
-            .mismatches
-            .iter()
-            .map(|mismatch| (mismatch.component.clone(), mismatch.reason))
-            .collect()
-    };
-    match next.as_ref() {
-        None => tracing::info!(
-            "dist/core/bin matches dist/core/manifest.json; core.awaiting_update closed (FINDINGS A-186)"
-        ),
-        Some(open) if reasons(open) != reasons(&previous) => warn_awaiting_update(open),
-        Some(_) => {}
-    }
-    *awaiting = next;
-    awaiting.is_some()
-}
-
-/// A core update's strict check passed, so dist holds this role's binaries as the manifest says:
-/// closes `core.awaiting_update`.
-fn close_awaiting_update(state: &OrchestratorState) {
-    if awaiting_update_slot(state).take().is_some() {
-        tracing::info!(
-            "a core update found dist/core/bin matching its manifest; core.awaiting_update closed (FINDINGS A-186)"
-        );
-    }
-}
-
-/// FINDINGS A-186: while `core.awaiting_update` is open, dist is checked again every minute, as
-/// Syncthing hands it what it lacked, until a check, or a core update's own, finds it
-/// consistent.
-async fn run_core_dist_recheck_loop(state: Arc<OrchestratorState>) {
-    let mut ticker = time::interval(Duration::from_secs(CORE_DIST_RECHECK_SECS));
+/// FINDINGS A-186, A-189: every minute, each open report is checked again, as Syncthing hands
+/// dist what it lacked, until a check, or an update's own, finds its tree consistent. The core's
+/// opens at the start; the vendor's whenever the start, the watchdog or a sync probe keeps the
+/// installed Syncthing. So it runs for the orchestrator's life, and a tick with no report open
+/// does nothing.
+async fn run_dist_recheck_loop(state: Arc<OrchestratorState>) {
+    let mut ticker = time::interval(Duration::from_secs(DIST_RECHECK_SECS));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     // The start has just checked.
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if !awaiting_update_open(&state) {
-            return;
-        }
-        let role = state.role;
-        let checked = tokio::task::spawn_blocking(
-            move || -> Result<Vec<CoreDistMismatch>, OrchestratorError> {
-                let manifest = load_core_manifest()?;
-                let components = core_components_listed_for_role(&manifest, role)?;
-                Ok(core_dist_mismatches(
-                    &manifest,
-                    &components,
-                    Path::new(DIST_CORE_BIN_SOURCE_DIR),
-                ))
-            },
-        )
-        .await;
-        match checked {
-            Ok(Ok(mismatches)) => {
-                if !refresh_awaiting_update(&state, mismatches) {
-                    return;
-                }
+        for tree in DistTree::ALL {
+            if !awaiting_update_open(&state, tree) {
+                continue;
             }
-            Ok(Err(err)) => tracing::warn!(
-                error = %err,
-                "dist check could not run; core.awaiting_update stays as it was"
-            ),
-            Err(err) => tracing::warn!(
-                error = %err,
-                "dist check task failed; core.awaiting_update stays as it was"
-            ),
+            let role = state.role;
+            let checked =
+                tokio::task::spawn_blocking(move || local_dist_mismatches(tree, role)).await;
+            match checked {
+                Ok(Ok(mismatches)) => {
+                    refresh_awaiting_update(&state, tree, mismatches);
+                }
+                Ok(Err(err)) => tracing::warn!(
+                    tree = tree.name(),
+                    error = %err,
+                    "dist check could not run; its awaiting_update stays as it was"
+                ),
+                Err(err) => tracing::warn!(
+                    tree = tree.name(),
+                    error = %err,
+                    "dist check task failed; its awaiting_update stays as it was"
+                ),
+            }
         }
     }
 }
@@ -28120,8 +28373,10 @@ async fn add_ingress_hive_flow(
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    // Strict, as today: a join stops on a motherbee whose own vendored Syncthing does not match
+    // its manifest, before it links a new hive to it (FINDINGS A-189).
     if let Err(err) =
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role).await
+        ensure_blob_sync_runtime(state, &desired_blob, &desired_dist, VendorPolicy::Strict).await
     {
         return err_payload(
             "SYNC_SETUP_FAILED",
@@ -36782,17 +37037,17 @@ blob:
         .collect();
 
         let report = core_dist_mismatches(&manifest, &components, &root);
-        let found: Vec<(&str, CoreDistReason)> = report
+        let found: Vec<(&str, DistMismatchReason)> = report
             .iter()
             .map(|mismatch| (mismatch.component.as_str(), mismatch.reason))
             .collect();
         assert_eq!(
             found,
             vec![
-                ("sy-cognition", CoreDistReason::Missing),
-                ("sy-timer", CoreDistReason::HashMismatch),
-                ("sy-identity", CoreDistReason::SizeMismatch),
-                ("sy-gone", CoreDistReason::NotInManifest),
+                ("sy-cognition", DistMismatchReason::Missing),
+                ("sy-timer", DistMismatchReason::HashMismatch),
+                ("sy-identity", DistMismatchReason::SizeMismatch),
+                ("sy-gone", DistMismatchReason::NotInManifest),
             ]
         );
         assert!(report[0].detail.contains("missing"), "{}", report[0].detail);
@@ -36863,42 +37118,43 @@ blob:
     /// before it.
     #[test]
     fn awaiting_update_opens_on_a_mismatch_and_closes_once_dist_matches() {
-        let mismatch = |component: &str, reason: CoreDistReason| CoreDistMismatch {
+        let mismatch = |component: &str, reason: DistMismatchReason| DistMismatch {
             component: component.to_string(),
             reason,
             detail: format!("{component}: {}", reason.as_str()),
         };
         let open = awaiting_update_after(
             None,
-            vec![mismatch("sy-timer", CoreDistReason::Missing)],
+            vec![mismatch("sy-timer", DistMismatchReason::Missing)],
             100,
         )
         .expect("a mismatch opens it");
         assert_eq!((open.since_ms, open.checked_at_ms), (100, 100));
         let later = awaiting_update_after(
             Some(&open),
-            vec![mismatch("sy-timer", CoreDistReason::SizeMismatch)],
+            vec![mismatch("sy-timer", DistMismatchReason::SizeMismatch)],
             160,
         )
         .expect("still open");
         assert_eq!((later.since_ms, later.checked_at_ms), (100, 160));
-        assert_eq!(later.mismatches[0].reason, CoreDistReason::SizeMismatch);
+        assert_eq!(later.mismatches[0].reason, DistMismatchReason::SizeMismatch);
         assert!(awaiting_update_after(Some(&later), Vec::new(), 220).is_none());
         // The journal names each reason as /versions does.
         for reason in [
-            CoreDistReason::NotInManifest,
-            CoreDistReason::InvalidEntry,
-            CoreDistReason::Missing,
-            CoreDistReason::Unreadable,
-            CoreDistReason::SizeMismatch,
-            CoreDistReason::HashMismatch,
+            DistMismatchReason::NotInManifest,
+            DistMismatchReason::InvalidEntry,
+            DistMismatchReason::Missing,
+            DistMismatchReason::Unreadable,
+            DistMismatchReason::SizeMismatch,
+            DistMismatchReason::HashMismatch,
         ] {
             assert_eq!(serde_json::json!(reason), reason.as_str());
         }
 
+        let core = DistTree::Core;
         let state = sample_orchestrator_state_for_tests();
         assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
-        *awaiting_update_slot(&state) = Some(later);
+        *awaiting_update_slot(&state, core) = Some(later);
         let shown = local_versions_snapshot(&state)["core"]["awaiting_update"].clone();
         assert_eq!(shown["reason"], "dist_mismatch");
         assert_eq!(shown["since_ms"], 100);
@@ -36910,24 +37166,28 @@ blob:
 
         assert!(refresh_awaiting_update(
             &state,
-            vec![mismatch("sy-timer", CoreDistReason::HashMismatch)]
+            core,
+            vec![mismatch("sy-timer", DistMismatchReason::HashMismatch)]
         ));
-        assert!(!refresh_awaiting_update(&state, Vec::new()));
+        assert!(!refresh_awaiting_update(&state, core, Vec::new()));
         assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
 
-        *awaiting_update_slot(&state) = Some(open);
-        close_awaiting_update(&state);
-        assert!(!awaiting_update_open(&state));
+        // A core update's strict check closes it (`prepare_core_update`), and a recheck that ran
+        // before the update does not open it again.
+        *awaiting_update_slot(&state, core) = Some(open);
+        assert!(!record_dist_check(&state, core, Vec::new()));
+        assert!(!awaiting_update_open(&state, core));
         assert!(!refresh_awaiting_update(
             &state,
-            vec![mismatch("sy-timer", CoreDistReason::Missing)]
+            core,
+            vec![mismatch("sy-timer", DistMismatchReason::Missing)]
         ));
-        assert!(!awaiting_update_open(&state));
+        assert!(!awaiting_update_open(&state, core));
     }
 
     /// FINDINGS A-186: the start checks dist only once Syncthing, which brings what dist lacks,
     /// has started, and runs no strict check of its own: a mismatch is the core update's to
-    /// refuse. `main` checks again while the report is open, before it joins its router.
+    /// refuse. `main` starts the rechecks of an open report before it joins its router.
     #[test]
     fn the_start_checks_dist_after_syncthing_starts_and_never_stops_on_it() {
         let src = include_str!("sy_orchestrator.rs");
@@ -36960,7 +37220,7 @@ blob:
         let before_router = &after_start[..after_start
             .find("RouterDispatcher::connect_with_retry(")
             .expect("the router")];
-        assert!(before_router.contains("run_core_dist_recheck_loop("));
+        assert!(before_router.contains("run_dist_recheck_loop("));
     }
 
     /// FINDINGS A-186 on the motherbee: its start no longer stops on a dist that does not match,
@@ -37015,6 +37275,195 @@ blob:
                 .expect("again")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A vendor tree under `root`: `vendor/manifest.json` names `syncthing/syncthing` with the
+    /// sha256 and size of `described`; that file holds `held`, and the installed binary,
+    /// `bin/syncthing`, holds `installed` (none: no file).
+    fn a189_vendor(
+        root: &Path,
+        described: &[u8],
+        held: Option<&[u8]>,
+        installed: Option<&[u8]>,
+    ) -> SyncthingVendorPaths {
+        let paths = SyncthingVendorPaths {
+            vendor_root: root.join("vendor"),
+            manifest: root.join("vendor").join("manifest.json"),
+            installed: root.join("bin").join("syncthing"),
+        };
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "version": 7,
+            "components": {
+                "syncthing": {
+                    "upstream_version": "1.30.0",
+                    "sha256": format!("sha256:{:x}", Sha256::digest(described)),
+                    "size": described.len(),
+                    "path": "syncthing/syncthing",
+                }
+            }
+        });
+        fs::create_dir_all(paths.vendor_root.join("syncthing")).expect("vendor tree");
+        fs::create_dir_all(root.join("bin")).expect("bin");
+        fs::write(&paths.manifest, manifest.to_string()).expect("vendor manifest");
+        for (path, bytes) in [
+            (paths.vendor_root.join("syncthing").join("syncthing"), held),
+            (paths.installed.clone(), installed),
+        ] {
+            let _ = fs::remove_file(&path);
+            if let Some(bytes) = bytes {
+                fs::write(&path, bytes).expect("binary");
+            }
+        }
+        paths
+    }
+
+    /// FINDINGS A-189: a vendored Syncthing that matches its manifest is installed when none is
+    /// installed or another one is, and left alone when it is the one installed, whichever policy
+    /// asks.
+    #[test]
+    fn the_vendored_syncthing_is_installed_once_it_matches_its_manifest() {
+        let root = a186_temp_root("vendor-ok");
+        let source = root.join("vendor").join("syncthing").join("syncthing");
+        for policy in [VendorPolicy::Strict, VendorPolicy::KeepInstalled] {
+            for installed in [None, Some(&b"syncthing-1"[..])] {
+                let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
+                assert_eq!(
+                    plan_syncthing_binary(&paths, policy),
+                    Ok(SyncthingBinaryPlan::Install(source.clone())),
+                    "{policy:?} with {installed:?} installed"
+                );
+            }
+            let paths = a189_vendor(
+                &root,
+                b"syncthing-2",
+                Some(b"syncthing-2"),
+                Some(b"syncthing-2"),
+            );
+            assert_eq!(
+                plan_syncthing_binary(&paths, policy),
+                Ok(SyncthingBinaryPlan::Current)
+            );
+            let vendored = vendored_syncthing_at(&paths).expect("it matches");
+            assert_eq!(
+                vendored.sha256,
+                format!("{:x}", Sha256::digest(b"syncthing-2"))
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-189: while dist/vendor does not hold the Syncthing its manifest describes
+    /// (another build of the same size, a size of its own, the binary or the manifest not there
+    /// yet, a manifest naming no Syncthing), the start, the watchdog and the sync probes keep the
+    /// installed Syncthing and say why, and the vendor update refuses. Neither installs it.
+    #[test]
+    fn a_vendor_still_syncing_keeps_the_installed_syncthing_and_the_update_refuses_it() {
+        let root = a186_temp_root("vendor-sync");
+        let installed = Some(&b"syncthing-1"[..]);
+        let check = |paths: &SyncthingVendorPaths, reason: DistMismatchReason| {
+            match plan_syncthing_binary(paths, VendorPolicy::KeepInstalled) {
+                Ok(SyncthingBinaryPlan::KeepInstalled(mismatch)) => {
+                    assert_eq!(mismatch.component, "syncthing");
+                    assert_eq!(mismatch.reason, reason, "{}", mismatch.detail);
+                }
+                other => panic!("the installed Syncthing is kept, not {other:?}"),
+            }
+            let refused = plan_syncthing_binary(paths, VendorPolicy::Strict)
+                .expect_err("the vendor update refuses it");
+            assert_eq!(refused.reason, reason, "{}", refused.detail);
+        };
+        check(
+            &a189_vendor(&root, b"syncthing-2", Some(b"syncthing-3"), installed),
+            DistMismatchReason::HashMismatch,
+        );
+        check(
+            &a189_vendor(&root, b"syncthing-2.0", Some(b"syncthing-1"), installed),
+            DistMismatchReason::SizeMismatch,
+        );
+        check(
+            &a189_vendor(&root, b"syncthing-2", None, installed),
+            DistMismatchReason::Missing,
+        );
+        let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-2"), installed);
+        fs::write(&paths.manifest, r#"{"schema_version":1,"components":{}}"#).expect("manifest");
+        check(&paths, DistMismatchReason::NotInManifest);
+        fs::remove_file(&paths.manifest).expect("no manifest");
+        check(&paths, DistMismatchReason::Missing);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-189: with no Syncthing installed there is nothing to keep, so a vendor that does
+    /// not match is an error whichever policy asks, as it was; the start and the watchdog log it
+    /// and go on.
+    #[test]
+    fn with_no_syncthing_installed_a_vendor_that_does_not_match_stays_an_error() {
+        let root = a186_temp_root("vendor-none");
+        for policy in [VendorPolicy::Strict, VendorPolicy::KeepInstalled] {
+            let paths = a189_vendor(&root, b"syncthing-2", Some(b"syncthing-3"), None);
+            let err = plan_syncthing_binary(&paths, policy).expect_err("nothing to keep");
+            assert_eq!(err.reason, DistMismatchReason::HashMismatch, "{policy:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// FINDINGS A-189: `vendor.awaiting_update` reports the vendored Syncthing in the vendor
+    /// section of /versions as `core.awaiting_update` reports the core, and closes on a check that
+    /// finds it matching; the core's report is another one.
+    #[test]
+    fn vendor_awaiting_update_reports_the_vendor_as_core_awaiting_update_reports_the_core() {
+        let state = sample_orchestrator_state_for_tests();
+        let mismatch = DistMismatch {
+            component: "syncthing".to_string(),
+            reason: DistMismatchReason::HashMismatch,
+            detail: "vendor manifest hash mismatch for 'syncthing'".to_string(),
+        };
+        assert!(record_dist_check(&state, DistTree::Vendor, vec![mismatch]));
+        let snapshot = local_versions_snapshot(&state);
+        let shown = &snapshot["vendor"]["awaiting_update"];
+        assert_eq!(shown["reason"], "dist_mismatch");
+        assert_eq!(shown["components"][0]["component"], "syncthing");
+        assert_eq!(shown["components"][0]["reason"], "hash_mismatch");
+        assert!(shown["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("already installed")));
+        assert!(snapshot["core"]["awaiting_update"].is_null());
+        assert!(!record_dist_check(&state, DistTree::Vendor, Vec::new()));
+        assert!(local_versions_snapshot(&state)["vendor"]["awaiting_update"].is_null());
+    }
+
+    /// FINDINGS A-189: every caller of `ensure_blob_sync_runtime` names its policy. Only the vendor
+    /// update and an ingress join's setup on the motherbee are strict; the start, the watchdog and
+    /// the sync probes keep the installed Syncthing.
+    #[test]
+    fn only_the_vendor_update_and_an_ingress_join_stop_on_a_vendor_that_does_not_match() {
+        let src = include_str!("sy_orchestrator.rs");
+        let body = |head: &str| -> &str {
+            let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head}"))..];
+            &rest[..rest.find("\n}\n").expect("its end")]
+        };
+        for (head, strict, keep) in [
+            ("async fn bootstrap_local(", 0, 1),
+            ("async fn watchdog_blob_sync(", 0, 2),
+            ("async fn wait_for_syncthing_folder_convergence(", 0, 1),
+            ("async fn apply_system_update_local(", 1, 0),
+            ("async fn add_ingress_hive_flow(", 1, 0),
+        ] {
+            let body = body(head);
+            assert_eq!(
+                body.matches("VendorPolicy::Strict").count(),
+                strict,
+                "{head}"
+            );
+            assert_eq!(
+                body.matches("VendorPolicy::KeepInstalled").count(),
+                keep,
+                "{head}"
+            );
+        }
+        // No other caller: those six calls and the function's own head.
+        let code = &src[..src.find("#[cfg(test)]\nmod tests {").expect("the tests")];
+        assert_eq!(code.matches("ensure_blob_sync_runtime(").count(), 7);
     }
 
     /// SY.admin names the policy folder to have it scanned at once after a publish; a folder of
@@ -39382,7 +39831,8 @@ blob:
             node_lifecycle_locks: StdMutex::new(HashMap::new()),
             relaunch_waits: StdMutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
-            awaiting_update: StdMutex::new(None),
+            core_awaiting_update: StdMutex::new(None),
+            vendor_awaiting_update: StdMutex::new(None),
             rpc: OnceLock::new(),
         }
     }
