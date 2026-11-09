@@ -448,8 +448,13 @@ sudo apt-get update && sudo apt-get install -y fluxbee    # or fluxbee=<version>
 - **Choose the AI provider in `hive.yaml` before `fluxbee-firstboot`** (since 0.1.121): its `ai`
   becomes version 1 of the installation file (`/var/lib/fluxbee/dist/installation/
   installation.json`) at the orchestrator's first start, and hive.yaml's `ai` is ignored after
-  that. To take it again while version 1 is the only one recorded: delete that file, restart
-  `sy-orchestrator` and the AI nodes. From stage 3c on, the operator's action changes it.
+  that.
+  - After firstboot (since 0.1.122), the operator changes it with SY.admin's `set_installation_ai`:
+    - through Archi, which stages it for the operator's `CONFIRM`;
+    - or on the motherbee's loopback, `PUT /installation/ai` with `{ai, expected_version}`.
+  - `get_installation` reads it: the file, its versions with their values, each hive's state.
+  - Deleting the file and restarting `sy-orchestrator` takes hive.yaml's `ai` again only while
+    version 1 is the only one recorded.
 - **Validated 2026-09-25:** `apt-get install -s fluxbee` from a clean Ubuntu 24.04 on the 8.x
   (it resolves 13 packages), and a download from a machine over VPN (source `10.100.0.2`). The
   box's 8.x leg answers clients from **any** subnet through policy routing (table 108, see the
@@ -814,6 +819,12 @@ reads `pending` until its new orchestrator declares the folder and Syncthing del
 `current`. A worker's SY.cognition, restarted by the update before the file arrives, reads its
 hive.yaml's `ai` (the same values) until its next start, and says so in its log.
 
+Since 0.1.122 each hive's `config` also has `applied`: the version its orchestrator last applied,
+and what it restarted. The motherbee's also lists every version with its values. A core deploy
+never touches the installation file: an operator's change is its own action (`set_installation_ai`),
+and `update` with category `config` re-applies the current version on one hive (its version and
+hash from `get_installation`).
+
 The one-snapshot rule (below) is kept this way: if a VM already has its one, `deploy` does not
 start until you name it with `--drop`. It takes the new one first, then deletes that one and no
 other. The ledger record is still made by hand.
@@ -1101,6 +1112,13 @@ Three paths:
    last release.
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
+
+**Downgrading from 0.1.122 to 0.1.121:**
+- 0.1.121's readers read the installation file as it is, at whatever version the operator left it.
+- Its orchestrator ignores `config-applied.json` and the values in the version records.
+- Nothing in 0.1.121 can write another version. Its delete-and-restart rewrites version 1 only
+  while version 1 is the only one recorded, so after an operator's change the installation's `ai`
+  stays as it is until 0.1.122 is back.
 
 **Downgrading from 0.1.121 or later to an earlier version:** the readers of 0.1.120 or earlier
 read `ai` from each hive's `hive.yaml`, and stop on an invalid one. The hives joined before

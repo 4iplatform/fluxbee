@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ live, checked on 8.x | snap `pre-inst-0-1-121` (all 4 VMs) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
+| **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ live, checked on 8.x | snap `pre-inst-0-1-122` (all 4 VMs) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
+| **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ replaced by 0.1.122 | snap `pre-inst-0-1-121` (deleted 2026-11-09) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
 | **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ replaced by 0.1.121 | snap `pre-aisdk-0-1-120` (deleted 2026-11-09) · `apt install fluxbee=0.1.119` + core-update of the spokes |
 | **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ replaced by 0.1.120 | snap `pre-watch-0-1-119` (deleted 2026-11-08) · `apt install fluxbee=0.1.118` + core-update of the spokes |
 | **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ replaced by 0.1.119 | snap `pre-join-0-1-118` (deleted 2026-11-08) · `apt install fluxbee=0.1.117` + core-update of the spokes |
@@ -130,6 +131,87 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.122 — The operator changes the installation's AI
+
+- **Date:** 2026-11-09 (ART) · **Previous version:** 0.1.121 · **Commit:** `6c6d963d`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:**
+  - hive-config-update-v1's stage 3c: the operator's change of `ai`, one version on every hive.
+  - With it, A-197, found by its review round: Archi's catalog of SY.admin's actions did not fit
+    the mesh's frame. It touches the same binaries.
+- **What changed:**
+  - **SY.admin:**
+    - `get_installation` (Archi's read): the motherbee's file, its versions with their values,
+      and each hive's state.
+    - `set_installation_ai` (the operator's word, closed to the mesh): A-11's checks first.
+      - A node left without its engine refuses the change.
+      - On a switch of the default provider, a reader without the new provider's key refuses it.
+    - Then the write, then the apply on every hive in parallel, with each hive's outcome and the
+      timings in the reply.
+    - `update` takes category `config`.
+  - **The motherbee's orchestrator writes each version:** `SYSTEM_UPDATE` category `config` with
+    a `write`. Recorded first, with its values, then the file atomically. Its refusals: a join
+    running, a hand edit, the version check, invalid or unchanged values.
+  - **Each hive's orchestrator applies it:** `sync_pending` until its copy matches. Then only its
+    start readers restart (SY.cognition, and SY.frontdesk.gov on the motherbee): those whose
+    engine changed, or that became active since its last apply (`config-applied.json`, with
+    systemd's activation stamps).
+  - **SY.admin's executor and Archi** take a new version at their next use, only for another
+    engine, and keep their runtime when the vault is silent. No config update restarts them.
+  - **A-197:** `list_admin_actions` answers its compact view over the mesh, and Archi asks for it.
+- **Checks before the release:**
+  - GitHub's CI green on both branches.
+  - **The review round:** two reviewers, one on regressions and one on the new paths. No high.
+    - Three mediums, fixed: the next-use refresh on a silent vault; a stale apply record; the
+      provider keys on a switch.
+    - Four lows, fixed. Two kept on purpose.
+    - A-197 found, verified in SY.admin's journal on 8.x, fixed in this release (FINDINGS).
+- **Deploy:**
+  - Build of `6c6d963d` in 19.5 min; publish in 18 s.
+  - Snapshot `pre-inst-0-1-122` taken on all 4 VMs, `pre-inst-0-1-121` dropped.
+  - 0.1.122 on all 4 in 319 s, each spoke settled, health clean.
+  - Phases:
+    - apt install on the motherbee: 167.5 s;
+    - the motherbee's admin on the version: 54.3 s;
+    - the update calls: 18.5 s;
+    - by the spokes' own records, installed 14–22 s and settled 23–28 s after the update call.
+- **Checked on 8.x (the gate, with the operator's OK for this PROD change):**
+  - **Before:** every hive `current` on version 1, and the versions list holding version 1's
+    values (anthropic default, claude-sonnet-5-5; openai gpt-5.5).
+  - **A-11's refusal:** a switch of the default provider to openai was refused in 6.7 s
+    (`NODES_LEFT_WITHOUT_ENGINE`), naming SY.architect, whose own model is claude-opus-5-5.
+    Nothing was written.
+    - It was sent with `expected_version` 999, so the version check would have refused it
+      anyway.
+  - **Version 2, through loopback HTTP** (openai's model to gpt-5.5-mini): answered in 4.4 s, the
+    action's own `total` 3.2 s.
+    - Check 486 ms, write 41 ms, the folder scan 173 ms, the apply 2.5 s.
+    - Every hive ok: the motherbee in 0.7 s; the spokes in 2.0–2.5 s, their second attempt.
+    - The restarts, each hive's first config update (no record yet): on the motherbee,
+      sy-cognition and sy-frontdesk-gov; on worker1, sy-cognition; none on the ingress or the
+      egress. SY.admin and SY.architect kept running.
+    - Each restarted reader logged the file v2. AI.pruebas answered in 7 s, reading v2.
+  - **Version 3, the undo, through Archi** (openai back to gpt-5.5):
+    - Archi read `/installation` and staged a one-step plan; `CONFIRM` ran it.
+    - The plan's run took 4.4 s, and the chat answered "Execution completed successfully" 11 s
+      after the `CONFIRM`.
+    - Every hive `current` on v3, with nothing restarted anywhere: the engine was unchanged and
+      the readers' activation stamps matched.
+    - SY.admin's executor and Archi each logged that the file changed and their engine did not:
+      they kept their runtime with no key read.
+    - AI.pruebas answered on v3.
+  - **A-197:** Archi's plan compiler fetched the compact catalog in 13 ms. No FRAME_TOO_LARGE
+    since the deploy.
+  - **At the end:** version 3 holds version 1's values (openai gpt-5.5). The versions list reads
+    1 migration, 2 operator (gpt-5.5-mini), 3 operator (gpt-5.5).
+  - **Timeline of version 2's apply** (`ops timeline`, t=0 at the write):
+    - write answered 40 ms; the apply sent to all four hives 218 ms;
+    - the motherbee's two restarts about 0.1 s each, applied 944 ms;
+    - the spokes, `sync_pending` on the first attempt, applied on the second, 2 s later: egress1
+      2.36 s, ingress1 2.61 s, worker1 2.81 s, with its SY.cognition restart.
+    - Syncthing brought the file in under 2 s; the 2 s retry wait was the slowest phase.
+    - Clock offsets: ingress1 −0.55 s, egress1 −0.48 s (round trips 1.5–1.8 s).
 
 ## 0.1.121 — The installation file in use
 

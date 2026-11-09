@@ -18,9 +18,10 @@
   - 3b, live and checked on 8.x (0.1.121): the motherbee writes the file's first version and
     distributes it, the readers switch to it, and `/versions` shows it, with nothing changed in
     behavior (§4, "As built (stage 3b)").
-  - 3c, built for 0.1.122: the operator's action, SY.admin's `set_installation_ai`, and the update
-    with category `config` (§4, "As built (stage 3c)"), with its review round's fixes (F1 to F7,
-    named there). **Next:** its gate on 8.x (§10).
+  - 3c, live and checked on 8.x (0.1.122): the operator's action, SY.admin's `set_installation_ai`,
+    and the update with category `config` (§4, "As built (stage 3c)"), with its review round's
+    fixes (F1 to F7, named there).
+- **Next:** stage 4, the installation's update in SY.admin, with its automatic step (§6, §10).
 
 This is the single place for the topic.
 
@@ -533,9 +534,18 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
      behavior; 3c, the operator's action and category `config`, with the gate above.
    - ✅ 3a live on 8.x (0.1.120); ✅ 3b live and checked on 8.x (0.1.121): the file current on
      every hive, every reader on it.
-   - 3c built for 0.1.122 (§4, "As built (stage 3c)"): its tests run in CI over temporary roots;
-     the gate above is next. The answer's `timings_ms` and each hive's `elapsed_ms` give the gate
-     its times.
+   - ✅ 3c live and checked on 8.x (0.1.122, 2026-11-09): the gate above, with the operator's OK.
+     - A-11 refused a switch of the default provider, naming SY.architect, and wrote nothing.
+     - Version 2 (openai's model to gpt-5.5-mini) through loopback: every hive applied it in
+       3.2 s, the spokes on their second attempt (Syncthing under 2 s).
+       - Each hive's first config update restarted its readers: the motherbee's SY.cognition and
+         SY.frontdesk.gov, worker1's SY.cognition. Nothing restarted on the ingress or the
+         egress.
+       - SY.admin and Archi were not restarted.
+     - Version 3, the undo, through Archi's confirmed plan: every hive current, nothing
+       restarted anywhere.
+     - AI.pruebas answered on both versions.
+     - The numbers are in lab/DEPLOYMENTS.md's 0.1.122.
 4. **The installation's update in SY.admin,** with the automatic step. `ops.py deploy` calls it.
    - Gate: a deploy through it.
    - Gate: egress1 down across a config change, then back: finished once and reported.

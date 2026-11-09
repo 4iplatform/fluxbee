@@ -113,7 +113,8 @@ no change required
    1. A-181, a hive's shared config travels in the update
       ([hive-config-update-v1](../../docs/hive-config-update-v1.md)), by stages: stage 1 ✅
       0.1.116; stage 2 ✅ 0.1.117, the release's settings in the code; stage 3a ✅ 0.1.120 and
-      3b ✅ 0.1.121, the installation file in use; 3c next, the operator's action.
+      3b ✅ 0.1.121, the installation file in use; 3c ✅ 0.1.122, the operator's action. Next,
+      stage 4: SY.admin's installation update, with its automatic step.
    2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -126,6 +127,9 @@ no change required
 10. **Found by 0.1.118's timed gate:** A-194 [General/orchestrator], the Syncthing watchdog's
     restart during a finalize ✅ 0.1.119, checked with a throwaway worker; A-193 and A-195, to
     evaluate; A-196, latent.
+11. **Found by 0.1.122's review round:** A-197 [Archi], Archi's catalog of SY.admin's actions did
+    not fit the mesh's frame ✅ 0.1.122, checked on 8.x; A-198 [General/admin], other SY.admin mesh
+    replies that can outgrow it, observed.
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -230,12 +234,14 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
   operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
   stage 2 ✅ 0.1.117, the release's settings in the code; 3a ✅ 0.1.120 and 3b ✅ 0.1.121, the
-  installation file in use; 3c next, the operator's action.
+  installation file in use; 3c ✅ 0.1.122, the operator's action. Next, stage 4.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
 - A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
+- A-198 🟡 Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its
+  timeout (observed in the code).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1314,6 +1320,40 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
+### A-198 [General/admin] 🟡 OBSERVED in the code (found 2026-11-09 while fixing A-197; not seen on 8.x) — Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its timeout
+
+- **Why:** the SDK refuses a mesh frame over 128 KiB before sending it (`FRAME_TOO_LARGE`). The
+  caller gets no answer, only its own timeout, and no reason.
+- **Near the limit today (sizes estimated from the code):**
+  - `list_cloud_actions`: 67.7 KB, 53% of a frame, and it grows with each note.
+  - `executor_execute_plan`: each step event carries its whole output and its args.
+  - `list_ilks`: no paging, about 0.5–0.7 KB per ILK. It passes the frame at about 200–250 ILKs,
+    across two hops.
+  - `vault_list`: SY.vault's page of 200 summaries.
+  - `list_recent_commands`: up to 500 entries, each with up to 2 KB of params.
+  - `inventory` and `list_nodes`: about 1 KB per node.
+  - `get_installation` and `/versions`: the list of versions grows without bound.
+- **Proposal:** SY.admin answers `REPLY_TOO_LARGE` whenever a mesh reply would pass the frame, so
+  the caller learns why at once. Paging follows where a list can grow. When is the operator's call.
+
+### A-197 [Archi] ✅ VALIDATED ON 8.x (0.1.122, 2026-11-09; found 2026-11-09 by 0.1.122's review round, seen in SY.admin's journal on 8.x) — Archi's catalog of SY.admin's actions did not fit the mesh's frame
+
+- **Seen on 8.x:** SY.admin logged `FRAME_TOO_LARGE ... frame_len=337116 max=131072` 30 times in
+  7 days, since at least 2026-11-05 (318 KB the first time).
+- **What it broke:**
+  - Archi's `list_admin_actions` over the mesh timed out at 5 s, both its plan compiler's catalog
+    refresh and its tool read.
+  - The plan compiler then ran with an empty catalog (`unwrap_or_default`), naming actions from
+    the handbook alone.
+- **Fix (0.1.122):** `list_admin_actions` takes a `view`.
+  - **Over the mesh and to the executor, the compact one:** each action's name, description and
+    `read_only`, 17.5 KB. The full catalog is 352 KB.
+  - **Over HTTP, the full one.** `full` asked over the mesh is refused
+    (`CATALOG_TOO_LARGE_FOR_MESH`), not left to time out.
+  - **Archi asks for the compact view.** A test keeps that reply under 64 KiB.
+- **Checked on 8.x:** during 0.1.122's gate, Archi's plan compiler fetched the compact catalog in
+  13 ms. No FRAME_TOO_LARGE since the deploy.
+
 ### A-196 [General/join] 🟡 LATENT, low (found 2026-11-08 by A-194's review round; read in the code) — A join's peer link can be written to Syncthing's config and never applied
 
 - **Why:** `ensure_syncthing_peer_link_runtime` writes the peer into config.xml, then restarts
@@ -1649,7 +1689,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117, stage 3 ✅ 0.1.120–0.1.122; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -1780,7 +1820,35 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     - **Left:** rt-gateway's check of hive.yaml `ai` goes with the router's own release. Between
       3b and 3c, the operator's only way to change `ai` is the delete-and-restart above.
       Downgrade notes are in the HANDBOOK.
-  - **3c:** the operator's action and the `config` update.
+  - **3c, ✅ 0.1.122 on 8.x (a change set and undone, the undo through Archi; every hive current in under 3 s; restarts only where a reader's engine is read):**
+    - SY.admin's `get_installation` (Archi's read) and `set_installation_ai` (the operator's word:
+      loopback, or a plan Archi stages and the operator confirms).
+    - A-11 refuses a change that leaves a node without its engine. On a switch of the default
+      provider, it also refuses a reader without the new provider's key (names only).
+    - The motherbee's orchestrator writes the next version: `SYSTEM_UPDATE` category `config` with
+      a `write`, with refusals by code (a join running, a hand edit, the version check).
+    - Every hive applies it in parallel: `sync_pending` until its copy matches. Then only its start
+      readers restart, those whose engine changed or that became active since its last apply
+      (`config-applied.json`).
+    - SY.admin's executor and Archi take a new version at their next use, and no config update
+      restarts them: Archi may be the caller.
+    - `update` takes category `config`.
+  - **3c's review round:** two reviewers, one on what the change could break and one on the new
+    paths. No high.
+    - **Mediums fixed:**
+      - A vault that did not answer at the next-use refresh left Archi or the executor without
+        AI, with no retry. They now rebuild only for another engine, and keep their runtime when
+        the vault is silent.
+      - A stale apply record could leave a reader on the wrong engine after a failure and an
+        undo. A reader now counts as known only while systemd's activation stamp is the one
+        recorded.
+      - A switch of the default provider never checked the tenants' keys.
+    - **Lows fixed:** hives whose join did not finish are named (`skipped`); each hint follows its
+      error code; a copy with the same version and another hash is an error, not `sync_pending`
+      forever; a write that times out says it may still land and how to finish.
+    - **Kept:** a hive's apply restarts its readers inline, so its orchestrator answers other
+      system messages a few seconds later. `NOT_PRIMARY` answers 409.
+    - **Found:** A-197, which went in the same release.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
