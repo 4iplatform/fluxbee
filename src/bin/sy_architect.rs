@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants and /hives/{hive}/vault/secrets take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /hives/motherbee/commands?action=&status=&since_ms= (SY.admin's command log, newest first: each command with its outcome, an executor plan's steps with origin executor), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants, /hives/{hive}/vault/secrets and /hives/{hive}/commands take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -10870,25 +10870,112 @@ fn output_status_is_success(status: Option<&str>) -> bool {
     matches!(status, Some("ok") | Some("sync_pending"))
 }
 
+/// Every node of `hive_id` (`list_nodes`), page after page (`admin_listing_every_page`): one answer
+/// of every node can outgrow the mesh frame (FINDINGS A-198), and an answer that is not ok is an
+/// error, never a hive without nodes.
 async fn list_nodes_for_hive(
     state: &ArchitectState,
     hive_id: &str,
 ) -> Result<Vec<Value>, ArchitectError> {
-    let translation = AdminTranslation {
-        admin_target: format!("SY.admin@{}", state.hive_id),
-        action: "list_nodes".to_string(),
-        target_hive: hive_id.to_string(),
-        params: json!({}),
-    };
-    let output = execute_admin_translation(state, translation).await?;
-    let nodes = output
-        .get("payload")
-        .and_then(|value| value.get("nodes"))
-        .and_then(|value| value.as_array())
+    let context = admin_tool_context(state, None);
+    let admin_target = format!("SY.admin@{}", state.hive_id);
+    let listing = admin_listing_every_page("list_nodes", json!({}), "nodes", |params| {
+        execute_admin_action_with_context(
+            &context,
+            &admin_target,
+            "list_nodes",
+            Some(hive_id),
+            params,
+            "scmd",
+        )
+    })
+    .await?;
+    Ok(listing
+        .get("nodes")
+        .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
-    Ok(nodes)
+        .unwrap_or_default())
 }
+
+/// The rows a paged admin listing holds (FINDINGS A-198), page after page: `ADMIN_LISTING_PAGE_ROWS`
+/// a page, a smaller one when SY.admin answers REPLY_TOO_LARGE with the rows that fit
+/// (`error_detail.suggested_limit`), following `next_cursor` to the last page. `ask` sends one
+/// page's request, `params` with its `limit` and `cursor`, and gives SY.admin's answer
+/// (`{status, payload, error_code, error_detail}`); one that is not ok is an error, never an empty
+/// listing. The answer is the first page's payload with every row under `rows_key`, its `count`
+/// set to them and no `next_cursor`.
+async fn admin_listing_every_page<F, Fut>(
+    action: &str,
+    params: Value,
+    rows_key: &str,
+    mut ask: F,
+) -> Result<Value, ArchitectError>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, ArchitectError>>,
+{
+    let mut limit = ADMIN_LISTING_PAGE_ROWS;
+    let mut cursor: Option<String> = None;
+    let mut first: Option<Value> = None;
+    let mut rows = Vec::new();
+    let mut pages = 0usize;
+    while pages < ADMIN_LISTING_MAX_PAGES {
+        let mut request = params.clone();
+        request["limit"] = json!(limit);
+        if let Some(cursor) = &cursor {
+            request["cursor"] = json!(cursor);
+        }
+        let output = ask(request).await?;
+        if output.get("error_code").and_then(Value::as_str) == Some("REPLY_TOO_LARGE") {
+            if let Some(fits) = output
+                .pointer("/error_detail/suggested_limit")
+                .and_then(Value::as_u64)
+                .filter(|fits| *fits >= 1 && *fits < limit)
+            {
+                limit = fits;
+                continue;
+            }
+        }
+        if !output_status_is_success(output.get("status").and_then(Value::as_str)) {
+            return Err(format!(
+                "{action} failed: {}",
+                response_detail_text(&output).unwrap_or_else(|| "no detail".to_string())
+            )
+            .into());
+        }
+        pages += 1;
+        let payload = output.get("payload").cloned().unwrap_or(Value::Null);
+        if let Some(page) = payload.get(rows_key).and_then(Value::as_array) {
+            rows.extend(page.iter().cloned());
+        }
+        let next = payload
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|next| !next.is_empty())
+            .map(str::to_string);
+        first.get_or_insert(payload);
+        if next.is_none() || next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    let mut answer = first.unwrap_or_else(|| json!({}));
+    if let Some(fields) = answer.as_object_mut() {
+        fields.remove("next_cursor");
+        if fields.contains_key("count") {
+            fields.insert("count".to_string(), json!(rows.len()));
+        }
+        fields.insert(rows_key.to_string(), Value::Array(rows));
+    }
+    Ok(answer)
+}
+
+/// The rows Archi asks a paged listing for in each page (`admin_listing_every_page`): SY.admin's
+/// source bounds each page to half a frame first.
+const ADMIN_LISTING_PAGE_ROWS: u64 = 200;
+/// The most pages Archi reads of one listing.
+const ADMIN_LISTING_MAX_PAGES: usize = 1_000;
 
 async fn get_node_config_for_hive(
     state: &ArchitectState,
@@ -13653,6 +13740,19 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: scmd_page_params(raw_query, json!({}), SCMD_VERSIONS_KEYS),
         }),
+        // SY.admin's command log, newest first (FINDINGS A-201): each command with its outcome,
+        // an executor plan's steps among them (origin executor). ?limit=&cursor= page it (50 a
+        // page without a limit), ?action=&status=&since_ms= filter it.
+        ("GET", ["hives", hive_id, "commands"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_recent_commands".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: scmd_page_params(
+                raw_query,
+                json!({}),
+                &["limit", "cursor", "action", "status", "since_ms"],
+            ),
+        }),
         ("GET", ["hives", hive_id, "usage"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_llm_usage".to_string(),
@@ -14436,6 +14536,15 @@ async fn execute_executor_plan_with_context(
         "executor.run",
     )
     .await?;
+    // The plan ran, but its answer did not fit one mesh frame (FINDINGS A-198): never a failure
+    // of the plan, and never verified, since its steps' answers did not come back.
+    if let Some(mut report) = executor_report_of_an_answer_too_large(&execute_output) {
+        report["validation"] = validate_output
+            .get("payload")
+            .cloned()
+            .unwrap_or(Value::Null);
+        return Ok(report);
+    }
     // A run that answered no summary (the executor failed before its steps) says why, never that
     // the plan finished.
     let status = execute_output
@@ -14466,6 +14575,89 @@ async fn execute_executor_plan_with_context(
         "validation": validate_output.get("payload").cloned().unwrap_or(Value::Null),
         "error_code": execute_output.get("error_code").cloned().unwrap_or(Value::Null),
         "error_detail": execute_output.get("error_detail").cloned().unwrap_or(Value::Null),
+        "message": message,
+    }))
+}
+
+/// An executor run whose answer SY.admin could not send in one mesh frame (FINDINGS A-198):
+/// SY.admin answers REPLY_TOO_LARGE with `action_ran` and the run's outcome (its `execution_id`,
+/// `plan_status`, steps and full log's path). The report Archi makes of it says the plan ran and
+/// where its outcome is, carries the run's summary as SY.admin kept it, with no events, and is
+/// marked `answer_too_large` so its verification never passes (`verify_execution_result`). None for
+/// any other answer.
+fn executor_report_of_an_answer_too_large(output: &Value) -> Option<Value> {
+    let detail = output.get("error_detail")?;
+    if output.get("error_code").and_then(Value::as_str) != Some("REPLY_TOO_LARGE")
+        || detail.get("action_ran").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let outcome = detail.get("outcome").cloned().unwrap_or_else(|| json!({}));
+    let text = |key: &str| outcome.get(key).and_then(Value::as_str).map(str::to_string);
+    let number = |key: &str| outcome.get(key).and_then(Value::as_u64);
+    let execution_id = text("execution_id").unwrap_or_else(|| "its execution".to_string());
+    let plan_status = text("plan_status").unwrap_or_else(|| "unknown".to_string());
+    let log_path = text("log_path");
+    let steps = match (number("completed_steps"), number("total_steps")) {
+        (Some(completed), Some(total)) => format!(", {completed} of {total} steps done"),
+        _ => String::new(),
+    };
+    let stopped = text("failed_step_id")
+        .map(|step| format!(", stopped at step '{step}'"))
+        .unwrap_or_default();
+    let size = detail
+        .get("size")
+        .and_then(Value::as_u64)
+        .map(|size| format!(", {size} bytes,"))
+        .unwrap_or_default();
+    let message = format!(
+        "The plan ran (execution {execution_id}: {plan_status}{steps}{stopped}), but its \
+         answer{size} was too large for one mesh frame, so its steps' answers did not come back. \
+         Each step's outcome is in SY.admin's command log (GET /hives/{{hive}}/commands, origin \
+         executor){}.",
+        log_path
+            .as_deref()
+            .map(|path| format!(", and the run's full log is on the motherbee at {path}"))
+            .unwrap_or_default()
+    );
+    // The step's own error code did not come back: the command log has it.
+    let failure = text("failed_step_id").map(|step| {
+        json!({
+            "code": Value::Null,
+            "detail": message,
+            "source": "executor_answer",
+            "step_id": step,
+            "step_action": Value::Null,
+        })
+    });
+    let status = match plan_status.as_str() {
+        "done" => "ok",
+        _ => "error",
+    };
+    Some(json!({
+        "status": status,
+        "action": "executor_execute_plan",
+        "payload": {
+            "status": plan_status,
+            "execution_id": execution_id,
+            "events": [],
+            "summary": {
+                "execution_id": execution_id,
+                "status": plan_status,
+                "total_steps": outcome.get("total_steps").cloned().unwrap_or(Value::Null),
+                "completed_steps": outcome.get("completed_steps").cloned().unwrap_or(Value::Null),
+                "failed_step_id": outcome.get("failed_step_id").cloned().unwrap_or(Value::Null),
+                "failure": failure,
+                "log_path": log_path,
+                "final_message": message,
+            },
+            "answer_too_large": {
+                "size": detail.get("size").cloned().unwrap_or(Value::Null),
+                "max": detail.get("max").cloned().unwrap_or(Value::Null),
+            },
+        },
+        "error_code": "REPLY_TOO_LARGE",
+        "error_detail": detail.clone(),
         "message": message,
     }))
 }
@@ -14605,27 +14797,35 @@ async fn fetch_inventory_status_data(
     };
     ensure_admin_ok("inventory summary", &summary)?;
 
-    let hive_response = state
-        .rpc
-        .send_admin_rpc(AdminCommandRequest {
-            admin_target: &admin_target,
-            action: "inventory",
-            target: None,
-            params: json!({ "scope": "hive", "filter_hive": state.hive_id }),
-            request_id: None,
-            timeout: Duration::from_secs(5),
-        })
-        .await;
-    let hive_payload = match hive_response {
-        Ok(result) => {
-            if ensure_admin_ok("inventory hive", &result).is_ok() {
-                Some(result.payload)
-            } else {
-                None
-            }
-        }
-        Err(_) => None,
-    };
+    // The hive's nodes page after page (FINDINGS A-198): one answer of every node can outgrow the
+    // mesh frame.
+    let (rpc, admin_target) = (&state.rpc, admin_target.as_str());
+    let hive_payload = admin_listing_every_page(
+        "inventory",
+        json!({ "scope": "hive", "filter_hive": state.hive_id }),
+        "nodes",
+        move |params| async move {
+            let result = rpc
+                .send_admin_rpc(AdminCommandRequest {
+                    admin_target,
+                    action: "inventory",
+                    target: None,
+                    params,
+                    request_id: None,
+                    timeout: Duration::from_secs(5),
+                })
+                .await
+                .map_err(|err| -> ArchitectError { Box::new(err) })?;
+            Ok(json!({
+                "status": result.status,
+                "payload": result.payload,
+                "error_code": result.error_code,
+                "error_detail": result.error_detail,
+            }))
+        },
+    )
+    .await
+    .ok();
 
     Ok((summary.payload, hive_payload))
 }
@@ -23916,7 +24116,13 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     let not_running = wf_deploys_left_not_running(execution_report);
     let not_applied = installation_changes_not_applied(execution_report);
     let (update_not_done, update_notes) = installation_updates_verdict(execution_report);
+    // A run whose answer was too large for one mesh frame (FINDINGS A-198) ran, but its steps'
+    // answers did not come back: nothing of what it did can be verified from them.
+    let answer_too_large = execution_report
+        .pointer("/payload/answer_too_large")
+        .is_some_and(|value| !value.is_null());
     let verified_success = matches!(status, Some("done"))
+        && !answer_too_large
         && !failed_step_present
         && not_running.is_empty()
         && not_applied.is_empty()
@@ -23924,7 +24130,13 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     let eligible_for_cookbook = verified_success
         && matches!((completed_steps, total_steps), (Some(completed), Some(total)) if completed == total);
 
-    let reason = if !not_running.is_empty() {
+    let reason = if answer_too_large {
+        let detail = summary
+            .and_then(|value| value.get("final_message"))
+            .and_then(Value::as_str)
+            .unwrap_or("its answer was too large for one mesh frame");
+        format!("its steps' answers could not be verified: {detail}")
+    } else if !not_running.is_empty() {
         format!(
             "the plan ran, but a workflow it deployed has no node running: {}",
             not_running.join("; ")
@@ -32196,11 +32408,144 @@ mod tests {
             ("/hives/motherbee/identity/ilks", "list_ilks", json!({})),
             ("/versions", "list_versions", json!({})),
             ("/installation", "get_installation", json!({})),
+            // SY.admin's command log (FINDINGS A-201): its pages and its filters.
+            (
+                "/hives/motherbee/commands?limit=5&cursor=12&action=run_node&status=error&since_ms=100",
+                "list_recent_commands",
+                json!({ "limit": 5, "cursor": "12", "action": "run_node", "status": "error", "since_ms": 100 }),
+            ),
+            ("/hives/motherbee/commands", "list_recent_commands", json!({})),
         ] {
             let translated = translate(path);
             assert_eq!(translated.action, action, "{path}");
             assert_eq!(translated.params, params, "{path}");
         }
+        assert_eq!(
+            translate("/hives/worker1/commands").target_hive,
+            "worker1",
+            "the hive filters the log"
+        );
+    }
+
+    /// FINDINGS A-198: a plan whose answer did not fit one mesh frame ran: Archi says so, names its
+    /// execution and where each step's outcome is, never that the plan failed, and its verdict is
+    /// not verified, since its steps' answers did not come back.
+    #[test]
+    fn a_plan_whose_answer_was_too_large_ran_and_is_not_verified() {
+        let too_large = |plan_status: &str, failed_step: Value| {
+            json!({
+                "status": "error",
+                "action": "executor_execute_plan",
+                "payload": null,
+                "error_code": "REPLY_TOO_LARGE",
+                "error_detail": {
+                    "message": "executor_execute_plan ran (status ok) and its answer, 700000 bytes, does not fit one mesh frame",
+                    "action": "executor_execute_plan",
+                    "size": 700_000,
+                    "max": 130_048,
+                    "read_only": false,
+                    "action_ran": true,
+                    "outcome": {
+                        "status": "ok",
+                        "execution_id": "exec-1",
+                        "plan_status": plan_status,
+                        "completed_steps": 2_999,
+                        "total_steps": 3_000,
+                        "failed_step_id": failed_step,
+                        "log_path": "/var/lib/fluxbee/state/admin-executor/motherbee/executions/exec-1.json",
+                    },
+                },
+            })
+        };
+        let report = executor_report_of_an_answer_too_large(&too_large("done", Value::Null))
+            .expect("a run that ran");
+        assert_eq!(report["status"], json!("ok"));
+        let message = report["message"].as_str().expect("message");
+        assert!(
+            message.starts_with("The plan ran (execution exec-1: done"),
+            "{message}"
+        );
+        assert!(message.contains("/hives/{hive}/commands"), "{message}");
+        assert!(message.contains("executions/exec-1.json"), "{message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("failed"),
+            "{message}"
+        );
+        assert!(executor_output_is_successful(&report));
+        let verdict = verify_execution_result(&report);
+        assert!(!verdict.verified_success);
+        assert!(!verdict.eligible_for_cookbook);
+        assert!(
+            verdict.reason.contains("could not be verified"),
+            "{}",
+            verdict.reason
+        );
+
+        let failed = executor_report_of_an_answer_too_large(&too_large("failed", json!("s7")))
+            .expect("a run that ran");
+        assert_eq!(failed["status"], json!("error"));
+        assert!(!executor_output_is_successful(&failed));
+        let text = executor_failure_text(&failed);
+        assert!(text.contains("stopped at step 's7'"), "{text}");
+        assert!(!text.contains("Executor plan failed"), "{text}");
+
+        // Any other answer is not one of these.
+        assert!(executor_report_of_an_answer_too_large(&json!({
+            "status": "error",
+            "error_code": "REPLY_TOO_LARGE",
+            "error_detail": { "action_ran": false },
+        }))
+        .is_none());
+        assert!(executor_report_of_an_answer_too_large(&json!({ "status": "ok" })).is_none());
+    }
+
+    /// FINDINGS A-198: Archi reads a long listing page after page, with a smaller page when
+    /// SY.admin says how many rows fit, and an answer that is not ok is an error, never an empty
+    /// listing.
+    #[tokio::test]
+    async fn archi_reads_a_listing_page_after_page() {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let listing = admin_listing_every_page("list_nodes", json!({}), "nodes", |params| {
+            asked.lock().expect("asked").push(params.clone());
+            let answer = match (params["limit"].as_u64(), params["cursor"].as_str()) {
+                (Some(ADMIN_LISTING_PAGE_ROWS), None) => json!({
+                    "status": "error",
+                    "error_code": "REPLY_TOO_LARGE",
+                    "error_detail": { "suggested_limit": 2 },
+                }),
+                (Some(2), None) => json!({
+                    "status": "ok",
+                    "payload": { "count": 2, "total": 3, "next_cursor": "motherbee|b",
+                                 "nodes": [{ "name": "a" }, { "name": "b" }] },
+                }),
+                (Some(2), Some("motherbee|b")) => json!({
+                    "status": "ok",
+                    "payload": { "count": 1, "total": 3, "nodes": [{ "name": "c" }] },
+                }),
+                other => panic!("unexpected page {other:?}"),
+            };
+            async move { Ok::<Value, ArchitectError>(answer) }
+        })
+        .await
+        .expect("listed");
+        let names: Vec<&str> = listing["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .filter_map(|node| node["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(listing["count"], json!(3));
+        assert!(listing.get("next_cursor").is_none());
+        assert_eq!(asked.lock().expect("asked").len(), 3);
+
+        let refused = admin_listing_every_page("list_nodes", json!({}), "nodes", |_| async {
+            Ok::<Value, ArchitectError>(
+                json!({ "status": "error", "error_code": "TIMEOUT", "error_detail": "no answer" }),
+            )
+        })
+        .await;
+        assert!(refused.is_err());
     }
 
     #[test]

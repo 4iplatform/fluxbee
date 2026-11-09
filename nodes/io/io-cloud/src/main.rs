@@ -829,6 +829,19 @@ fn cloud_error_code(code: &str, detail: &str) -> serde_json::Value {
     json!({ "status": "error", "error_code": code, "error_detail": detail })
 }
 
+/// `params.limit`, the rows of one page (FINDINGS A-198): none when absent or null; anything but a
+/// whole number from 1 is refused.
+fn page_limit(params: &serde_json::Value) -> Result<Option<u64>, serde_json::Value> {
+    match params.get("limit").filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(limit) => limit
+            .as_u64()
+            .filter(|limit| *limit >= 1)
+            .map(Some)
+            .ok_or_else(|| cloud_error("params.limit must be an integer from 1")),
+    }
+}
+
 /// `params.cursor`, the `next_cursor` of the page before (FINDINGS A-198): none when absent, null
 /// or empty; anything but a string is refused.
 fn page_cursor(params: &serde_json::Value) -> Result<Option<String>, serde_json::Value> {
@@ -1335,11 +1348,7 @@ fn translate_cloud_op(
         // before.
         "list_tenants" => {
             let mut admin_params = json!({});
-            if let Some(limit) = params.get("limit").filter(|value| !value.is_null()) {
-                let limit = limit
-                    .as_u64()
-                    .filter(|limit| *limit >= 1)
-                    .ok_or_else(|| cloud_error("params.limit must be an integer from 1"))?;
+            if let Some(limit) = page_limit(params)? {
                 admin_params["limit"] = json!(limit);
             }
             if let Some(cursor) = page_cursor(params)? {
@@ -1347,10 +1356,18 @@ fn translate_cloud_op(
             }
             Ok(("list_tenants", admin_params))
         }
-        // The claimed tenant's nodes on every hive.
+        // The claimed tenant's nodes on every hive, or one page of them (FINDINGS A-198): `limit`
+        // and the `cursor` of the page before.
         "list_nodes" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
-            Ok(("list_tenant_nodes", json!({ "tenant_id": tenant_id })))
+            let mut admin_params = json!({ "tenant_id": tenant_id });
+            if let Some(limit) = page_limit(params)? {
+                admin_params["limit"] = json!(limit);
+            }
+            if let Some(cursor) = page_cursor(params)? {
+                admin_params["cursor"] = json!(cursor);
+            }
+            Ok(("list_tenant_nodes", admin_params))
         }
         // One IO node of the claimed tenant; start, stop and delete only the nodes Cloud launched
         // (SY.admin stamps that requirement, the hive that holds the node checks it).
@@ -1583,13 +1600,20 @@ fn cloud_view(op: &str, payload: Value) -> Value {
                 .and_then(Value::as_array)
                 .map(|nodes| nodes.iter().map(node_view).collect())
                 .unwrap_or_default();
-            json!({
+            let mut view = json!({
                 "status": payload.get("status").cloned().unwrap_or_else(|| json!("ok")),
                 "tenant_id": payload.get("tenant_id").cloned().unwrap_or(Value::Null),
                 "count": nodes.len(),
                 "nodes": nodes,
                 "unreachable_hives": payload.get("unreachable_hives").cloned().unwrap_or_else(|| json!([])),
-            })
+            });
+            // One page of them (FINDINGS A-198): where the next starts, and how many there are.
+            for key in ["next_cursor", "total"] {
+                if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+                    view[key] = value.clone();
+                }
+            }
+            view
         }
         "get_node_status" => match payload.get("node_status") {
             Some(status) => json!({
@@ -2977,6 +3001,37 @@ mod tests {
             translate_cloud_op("list_nodes", Some(tenant), &json!({})).unwrap(),
             ("list_tenant_nodes", json!({"tenant_id": tenant}))
         );
+        // One page of them (FINDINGS A-198): only the page's params go on.
+        assert_eq!(
+            translate_cloud_op(
+                "list_nodes",
+                Some(tenant),
+                &json!({"limit": 20, "cursor": "worker1|IO.a", "x": 1})
+            )
+            .unwrap(),
+            (
+                "list_tenant_nodes",
+                json!({"tenant_id": tenant, "limit": 20, "cursor": "worker1|IO.a"})
+            )
+        );
+        for bad in [
+            json!({"limit": 0}),
+            json!({"limit": "5"}),
+            json!({"cursor": 3}),
+        ] {
+            assert!(
+                translate_cloud_op("list_nodes", Some(tenant), &bad).is_err(),
+                "{bad}"
+            );
+        }
+        let page = cloud_view(
+            "list_nodes",
+            json!({"status": "ok", "tenant_id": tenant, "nodes": [], "next_cursor": "worker1|IO.a", "total": 40}),
+        );
+        assert_eq!(page["next_cursor"], json!("worker1|IO.a"));
+        assert_eq!(page["total"], json!(40));
+        let last = cloud_view("list_nodes", json!({"status": "ok", "nodes": []}));
+        assert!(last.get("next_cursor").is_none());
         let node = json!({"node_name": "IO.slack.acme@motherbee"});
         assert_eq!(
             translate_cloud_op("get_node_status", Some(tenant), &node).unwrap(),
