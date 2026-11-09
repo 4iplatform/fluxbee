@@ -1522,6 +1522,10 @@ fn admin_command_log_params(params: &serde_json::Value) -> serde_json::Value {
 /// Append one entry, rotating `commands.jsonl -> .1 -> .2 -> ...` at the size cap. The caller holds
 /// `ctx.command_log_lock`, so rotate+append is atomic against concurrent commands. Failures are
 /// logged and swallowed: the audit log must never fail the command itself.
+///
+/// Each entry gets its `seq` here, under the lock: one past the newest entry's in the log, so the
+/// entries' order is the order they were written in, whatever their clocks say; it is the place
+/// `list_recent_commands` pages by (FINDINGS A-198).
 fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntry) {
     let dir = admin_command_log_dir(state_dir);
     if let Err(err) = fs::create_dir_all(&dir) {
@@ -1529,11 +1533,13 @@ fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntr
         return;
     }
     let path = admin_command_log_path(state_dir);
-    // Count-based rotation: ~100 entries per file. The file is tiny (≤ ~200KB), so counting lines
-    // per append is negligible next to the admin command it trails.
-    let needs_rotate = fs::read_to_string(&path)
-        .map(|raw| raw.lines().count() >= ADMIN_COMMAND_LOG_ROTATE_ENTRIES)
-        .unwrap_or(false);
+    // Count-based rotation: ~100 entries per file. The file is tiny (≤ ~200KB), so reading it per
+    // append is negligible next to the admin command it trails.
+    let active = fs::read_to_string(&path).ok();
+    let needs_rotate = active
+        .as_deref()
+        .is_some_and(|raw| raw.lines().count() >= ADMIN_COMMAND_LOG_ROTATE_ENTRIES);
+    let seq = admin_command_log_last_seq(&dir, active.as_deref()) + 1;
     if needs_rotate {
         for idx in (1..=ADMIN_COMMAND_LOG_ROTATIONS).rev() {
             let from = if idx == 1 {
@@ -1547,8 +1553,11 @@ fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntr
             }
         }
     }
-    let line = match serde_json::to_string(entry) {
-        Ok(line) => line,
+    let line = match serde_json::to_value(entry) {
+        Ok(mut line) => {
+            line["seq"] = serde_json::json!(seq);
+            line.to_string()
+        }
         Err(err) => {
             tracing::warn!(error = %err, "command-log: serialize failed; entry dropped");
             return;
@@ -1562,6 +1571,31 @@ fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntr
     if let Err(err) = result {
         tracing::warn!(error = %err, "command-log: append failed; entry dropped");
     }
+}
+
+/// The `seq` of the newest entry in the log that has one, 0 when none has: the active file first
+/// (`active`, read already), then its rotations, newest first. The log is the counter, so a restart
+/// goes on from where it was.
+fn admin_command_log_last_seq(dir: &Path, active: Option<&str>) -> u64 {
+    let newest = |raw: &str| {
+        raw.lines().rev().find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("seq")?
+                .as_u64()
+        })
+    };
+    if let Some(seq) = active.and_then(newest) {
+        return seq;
+    }
+    (1..=ADMIN_COMMAND_LOG_ROTATIONS)
+        .find_map(|idx| {
+            fs::read_to_string(dir.join(format!("commands.jsonl.{idx}")))
+                .ok()
+                .as_deref()
+                .and_then(newest)
+        })
+        .unwrap_or(0)
 }
 
 /// Command-log append for an action that bypasses `handle_admin_command` — publish/unpublish/
@@ -1629,15 +1663,22 @@ struct AdminCommandLogQuery {
     cursor: Option<String>,
 }
 
-/// An entry's place in the log, newest first (FINDINGS A-198): its `ts_ms` and how many entries of
-/// that same millisecond came before it, as `<ts_ms>:<n>`. The place holds while the log grows.
-fn command_log_place(cursor: &str) -> Option<(u64, usize)> {
-    let (ts_ms, seen) = cursor.trim().split_once(':')?;
-    Some((ts_ms.parse().ok()?, seen.parse().ok()?))
+/// An entry's place in the log, the key `list_recent_commands` pages by, newest first (FINDINGS
+/// A-198): its `seq`, given under the log's lock in the order the entries were written, whatever
+/// their clocks say. An entry written before entries had a `seq` takes -1, -2, ... counted from the
+/// newest of those, all older than every entry with one; the count holds while the log grows,
+/// since no such entry is written any more. A cursor is a place as text; anything else is none.
+fn command_log_place(cursor: &str) -> Option<i64> {
+    cursor
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|place| *place != 0)
 }
 
 /// Read the most recent entries (newest first), walking the current file then rotations, as one
-/// page: at most `limit`, the entries after the query's cursor, with `next_cursor` while entries
+/// page: at most `limit` and at most half a frame (`mesh_reply::LIST_PAGE_MAX_BYTES`), the entries
+/// after the query's cursor (their place, `command_log_place`), with `next_cursor` while entries
 /// follow and `total`, those the filters match in the whole log (FINDINGS A-198). Filters: exact
 /// action, status ok|error, target hive, since_ms.
 fn read_recent_admin_commands(
@@ -1647,8 +1688,8 @@ fn read_recent_admin_commands(
     let dir = admin_command_log_dir(state_dir);
     let limit = query.limit.clamp(1, ADMIN_COMMAND_LOG_MAX_LIMIT);
     let mut out: Vec<(String, serde_json::Value)> = Vec::new();
-    // The last millisecond seen and how many of its entries came before, for each entry's place.
-    let mut same_ms: (u64, usize) = (u64::MAX, 0);
+    // The entries without a seq seen so far, newest first, for each one's place.
+    let mut without_seq = 0i64;
     let mut files = vec![admin_command_log_path(state_dir)];
     for idx in 1..=ADMIN_COMMAND_LOG_ROTATIONS {
         files.push(dir.join(format!("commands.jsonl.{idx}")));
@@ -1660,6 +1701,14 @@ fn read_recent_admin_commands(
         for line in raw.lines().rev() {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
+            };
+            // Its place whether the filters match it or not, so a place holds under any filter.
+            let place = match value.get("seq").and_then(serde_json::Value::as_u64) {
+                Some(seq) => i64::try_from(seq).unwrap_or(i64::MAX),
+                None => {
+                    without_seq += 1;
+                    -without_seq
+                }
             };
             let matches = query
                 .action
@@ -1681,30 +1730,25 @@ fn read_recent_admin_commands(
                     value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
                 });
             if matches {
-                let ts_ms = value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                same_ms = if ts_ms == same_ms.0 {
-                    (ts_ms, same_ms.1 + 1)
-                } else {
-                    (ts_ms, 0)
-                };
-                out.push((format!("{ts_ms}:{}", same_ms.1), value));
+                out.push((place.to_string(), value));
             }
         }
     }
+    // Newest first by place: the order the entries were written in, backwards.
+    out.sort_by_key(|(place, _)| std::cmp::Reverse(command_log_place(place)));
     let ask = PageAsk {
         limit: Some(limit),
         cursor: query.cursor.clone(),
     };
-    // A local read: the limit bounds the page, and a reply over the mesh past the frame is answered
-    // REPLY_TOO_LARGE with how many fit.
-    mesh_reply::list_page(out, &ask, usize::MAX, |entry, cursor| {
-        match (command_log_place(entry), command_log_place(cursor)) {
-            (Some((ts_ms, seen)), Some((after_ms, after_seen))) => {
-                ts_ms < after_ms || (ts_ms == after_ms && seen > after_seen)
-            }
+    mesh_reply::list_page(
+        out,
+        &ask,
+        mesh_reply::LIST_PAGE_MAX_BYTES,
+        |entry, cursor| match (command_log_place(entry), command_log_place(cursor)) {
+            (Some(entry), Some(cursor)) => entry < cursor,
             _ => true,
-        }
-    })
+        },
+    )
 }
 
 fn load_admin_executor_node_config(
@@ -3931,96 +3975,319 @@ async fn execute_admin_executor_plan(
     }))
 }
 
-/// The most bytes of step outputs and echoed args an executor answer carries over the mesh, every
-/// event's together (FINDINGS A-198): with the events' own fields, the summary and the envelope,
-/// the answer stays within one frame for any plan of a few dozen steps.
-const EXECUTOR_MESH_PREVIEWS_BUDGET: usize = 72 * 1024;
-/// The least any one output or args keeps, however many a run has.
-const EXECUTOR_MESH_PREVIEW_MIN_BYTES: usize = 512;
-/// The longest error text an event or the summary keeps over the mesh.
+/// The most bytes an executor answer's envelope takes over the mesh (FINDINGS A-198): the frame
+/// less the router's reserve, less room for the message around it (routing, meta, request_id).
+const EXECUTOR_MESH_ANSWER_MAX_BYTES: usize = mesh_reply::REPLY_MAX_BYTES - 1024;
+/// The least a cut output or args keeps: under it the outputs are dropped instead (step c).
+const EXECUTOR_MESH_PREVIEW_MIN_BYTES: usize = 256;
+/// The longest error text an event or the summary keeps once the answer is cut.
 const EXECUTOR_MESH_TEXT_MAX_BYTES: usize = 2 * 1024;
+/// The longest error text once the outputs are dropped (step c).
+const EXECUTOR_MESH_DROPPED_TEXT_MAX_BYTES: usize = 256;
+/// What an output or args cut to its share adds: `output_truncated` and `output_bytes`.
+const EXECUTOR_PREVIEW_MARKER_BYTES: usize = 64;
+/// The outputs and args of an executor event, with the flag and the size a cut one gets.
+const EXECUTOR_PREVIEWS: [(&str, &str, &str); 2] = [
+    ("tool_args_preview", "args_truncated", "args_bytes"),
+    ("result_preview", "output_truncated", "output_bytes"),
+];
 
-/// An executor answer as it goes over the mesh (FINDINGS A-198). The plan has already run when it
-/// is sent, so it must arrive: a REPLY_TOO_LARGE in its place would leave Archi blind, and Archi
-/// could run the plan again. Every event keeps its status and its fields; an output
-/// (`result_preview`) or args (`tool_args_preview`) past its share of the budget is cut to it
-/// (`mesh_reply::bounded_value`, which keeps a status, an id or a short list whole), with
-/// `output_truncated`/`args_truncated` and its size before (`output_bytes`/`args_bytes`), and so is
-/// a long error text. When anything was cut, `outputs_bounded` names the share and the run's full
-/// log, which the executor writes on the motherbee with secrets redacted (`summary.log_path`).
-/// True when anything was cut.
-fn bound_executor_answer_for_mesh(payload: &mut serde_json::Value) -> bool {
-    let log_path = payload
-        .pointer("/summary/log_path")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let Some(events) = payload
-        .get_mut("events")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return false;
-    };
-    const PREVIEWS: [(&str, &str, &str); 2] = [
-        ("tool_args_preview", "args_truncated", "args_bytes"),
-        ("result_preview", "output_truncated", "output_bytes"),
-    ];
-    let previews = events
-        .iter()
-        .flat_map(|event| {
-            PREVIEWS
-                .iter()
-                .filter_map(move |(field, _, _)| event.get(*field))
-        })
-        .filter(|preview| !preview.is_null())
-        .count();
-    let share =
-        (EXECUTOR_MESH_PREVIEWS_BUDGET / previews.max(1)).max(EXECUTOR_MESH_PREVIEW_MIN_BYTES);
-    let mut cut = false;
-    for event in events.iter_mut() {
-        for (field, flag, bytes) in PREVIEWS {
-            let Some(preview) = event.get(field).filter(|preview| !preview.is_null()) else {
-                continue;
-            };
-            let size = mesh_reply::serialized_len(preview);
-            if size <= share {
-                continue;
-            }
-            let bounded = mesh_reply::bounded_value(preview, share);
-            event[field] = bounded;
-            event[flag] = serde_json::json!(true);
-            event[bytes] = serde_json::json!(size);
-            cut = true;
-        }
-        cut |= bound_text_field(event, "error_message");
-    }
-    if let Some(failure) = payload.pointer_mut("/summary/failure") {
-        cut |= bound_text_field(failure, "detail");
-    }
-    if cut {
-        payload["outputs_bounded"] = serde_json::json!({
-            "max_bytes_each": share,
-            "full_log": log_path,
-            "note": "Over the mesh each step's output and args are cut to max_bytes_each \
-                     (output_truncated/args_truncated, with output_bytes/args_bytes, the size \
-                     before); the run's full log, secrets redacted, is on the motherbee at full_log.",
-        });
-    }
-    cut
+/// How an executor answer went over the mesh (`fit_executor_answer_for_mesh`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorAnswerFit {
+    /// It fit as it was.
+    Whole,
+    /// The largest outputs and args were cut to one share (step b).
+    Cut,
+    /// Every output and args was dropped, each step keeping its status, ids, error codes and the
+    /// fields Archi reads (step c).
+    OutputsDropped,
+    /// And each step kept only its last event (step c).
+    EventsCollapsed,
+    /// Even so it does not fit: the reply guard answers REPLY_TOO_LARGE, with the run's
+    /// `execution_id` and the path of its full log (step d).
+    TooLarge,
 }
 
-/// `value[field]`, a text, cut to `EXECUTOR_MESH_TEXT_MAX_BYTES`; true when it was cut.
-fn bound_text_field(value: &mut serde_json::Value, field: &str) -> bool {
-    let bounded = match value.get(field) {
-        Some(text)
-            if text
-                .as_str()
-                .is_some_and(|text| text.len() > EXECUTOR_MESH_TEXT_MAX_BYTES) =>
-        {
-            mesh_reply::bounded_value(text, EXECUTOR_MESH_TEXT_MAX_BYTES)
-        }
-        _ => return false,
+/// An executor answer, its envelope, as it goes over the mesh (FINDINGS A-198). The plan has run
+/// when it is sent, so it is cut no more than the frame needs, measured serialized:
+///
+/// - (a) an answer that fits, the router's reserve and the message around it included, goes whole;
+/// - (b) else the largest outputs (`result_preview`) and args (`tool_args_preview`) are cut first,
+///   all to one share, the smaller ones whole (`cut_executor_previews`); a cut one says so,
+///   `output_truncated`/`args_truncated` with `output_bytes`/`args_bytes`, its size before;
+/// - (c) else every output and args is dropped, each step keeping its status, its ids, its error
+///   codes and the small fields Archi reads (`executor_result_essentials`), and then, if need be,
+///   each step keeps only its last event (`collapse_executor_events`);
+/// - (d) else it goes as it is, and the reply guard answers REPLY_TOO_LARGE, keeping the run's
+///   `execution_id`, its status and its full log's path (`admin_reply_outcome_paths`).
+///
+/// A cut answer names how in `payload.outputs_bounded`, with the run's full log, which the
+/// executor writes on the motherbee with secrets redacted (`summary.log_path`).
+fn fit_executor_answer_for_mesh(envelope: &mut serde_json::Value) -> ExecutorAnswerFit {
+    let fits = |value: &serde_json::Value| {
+        mesh_reply::serialized_len(value) <= EXECUTOR_MESH_ANSWER_MAX_BYTES
     };
-    value[field] = bounded;
+    if fits(envelope) {
+        return ExecutorAnswerFit::Whole;
+    }
+    let log_path = envelope
+        .pointer("/payload/summary/log_path")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let original = envelope.clone();
+    if cut_executor_previews(envelope, &log_path) {
+        return ExecutorAnswerFit::Cut;
+    }
+    *envelope = original;
+    drop_executor_previews(envelope);
+    mark_executor_answer(envelope, "outputs_dropped", None, &log_path);
+    if fits(envelope) {
+        return ExecutorAnswerFit::OutputsDropped;
+    }
+    collapse_executor_events(envelope);
+    mark_executor_answer(envelope, "events_collapsed", None, &log_path);
+    if fits(envelope) {
+        return ExecutorAnswerFit::EventsCollapsed;
+    }
+    ExecutorAnswerFit::TooLarge
+}
+
+/// Step (b): the error texts cut to `EXECUTOR_MESH_TEXT_MAX_BYTES`, then every output and args
+/// past one share cut to it, the share the largest under which the answer fits (water-filling:
+/// the smaller ones stay whole). True, with the answer cut and marked, when it fits; false when
+/// the share would fall under `EXECUTOR_MESH_PREVIEW_MIN_BYTES`.
+fn cut_executor_previews(envelope: &mut serde_json::Value, log_path: &serde_json::Value) -> bool {
+    if let Some(events) = envelope
+        .pointer_mut("/payload/events")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for event in events.iter_mut() {
+            bound_text_field(event, "error_message", EXECUTOR_MESH_TEXT_MAX_BYTES);
+        }
+    }
+    if let Some(failure) = envelope.pointer_mut("/payload/summary/failure") {
+        bound_text_field(failure, "detail", EXECUTOR_MESH_TEXT_MAX_BYTES);
+    }
+    let previews: Vec<(usize, &str, &str, &str, usize)> = envelope
+        .pointer("/payload/events")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(index, event)| {
+            EXECUTOR_PREVIEWS
+                .iter()
+                .filter_map(move |(field, flag, bytes)| {
+                    event
+                        .get(*field)
+                        .filter(|preview| !preview.is_null())
+                        .map(|preview| {
+                            (
+                                index,
+                                *field,
+                                *flag,
+                                *bytes,
+                                mesh_reply::serialized_len(preview),
+                            )
+                        })
+                })
+        })
+        .collect();
+    if previews.is_empty() {
+        return false;
+    }
+    // What the answer takes with every output and args a null, and the marks a cut one adds.
+    let mut bare = envelope.clone();
+    for (index, field, _, _, _) in &previews {
+        bare["payload"]["events"][*index][*field] = serde_json::Value::Null;
+    }
+    mark_executor_answer(&mut bare, "cut", Some(usize::MAX), log_path);
+    let fixed = mesh_reply::serialized_len(&bare) + previews.len() * EXECUTOR_PREVIEW_MARKER_BYTES;
+    let Some(mut room) = EXECUTOR_MESH_ANSWER_MAX_BYTES.checked_sub(fixed) else {
+        return false;
+    };
+    // Each preview is in `bare` as a null, 4 bytes, which its content replaces.
+    room += 4 * previews.len();
+    let mut sizes: Vec<usize> = previews.iter().map(|preview| preview.4).collect();
+    sizes.sort_unstable();
+    let mut share = None;
+    for (taken, size) in sizes.iter().enumerate() {
+        let even = room / (sizes.len() - taken);
+        if *size <= even {
+            room -= size;
+        } else {
+            share = Some(even);
+            break;
+        }
+    }
+    let Some(mut share) = share else {
+        return false;
+    };
+    let uncut = envelope.clone();
+    // Each cut lands at or under its share, so the first try fits but for the marks' estimate: a
+    // smaller share covers that.
+    for _ in 0..8 {
+        if share < EXECUTOR_MESH_PREVIEW_MIN_BYTES {
+            return false;
+        }
+        *envelope = uncut.clone();
+        for (index, field, flag, bytes, size) in &previews {
+            if *size <= share {
+                continue;
+            }
+            let event = &mut envelope["payload"]["events"][*index];
+            let cut = mesh_reply::bounded_value(&event[*field], share);
+            event[*field] = cut;
+            event[*flag] = serde_json::json!(true);
+            event[*bytes] = serde_json::json!(size);
+        }
+        mark_executor_answer(envelope, "cut", Some(share), log_path);
+        if mesh_reply::serialized_len(envelope) <= EXECUTOR_MESH_ANSWER_MAX_BYTES {
+            return true;
+        }
+        share = share * 3 / 4;
+    }
+    false
+}
+
+/// Step (c): every output and args dropped. Each event keeps its step, status, tool, error code
+/// and error text (cut short), and of its output what Archi reads (`executor_result_essentials`),
+/// with `output_truncated`/`args_truncated` and their sizes before; its run id, time and summary
+/// line go, as does every field left null. The summary's failure detail is cut short too.
+fn drop_executor_previews(envelope: &mut serde_json::Value) {
+    if let Some(events) = envelope
+        .pointer_mut("/payload/events")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for event in events.iter_mut() {
+            for (field, flag, bytes) in EXECUTOR_PREVIEWS {
+                let Some(preview) = event.get(field).filter(|preview| !preview.is_null()) else {
+                    continue;
+                };
+                let size = mesh_reply::serialized_len(preview);
+                let kept = if field == "result_preview" {
+                    executor_result_essentials(preview)
+                } else {
+                    serde_json::Value::Null
+                };
+                event[field] = kept;
+                event[flag] = serde_json::json!(true);
+                event[bytes] = serde_json::json!(size);
+            }
+            bound_text_field(event, "error_message", EXECUTOR_MESH_DROPPED_TEXT_MAX_BYTES);
+            if let Some(fields) = event.as_object_mut() {
+                for key in ["execution_id", "timestamp", "summary"] {
+                    fields.remove(key);
+                }
+                fields.retain(|_, value| !value.is_null());
+            }
+        }
+    }
+    if let Some(failure) = envelope.pointer_mut("/payload/summary/failure") {
+        bound_text_field(failure, "detail", EXECUTOR_MESH_DROPPED_TEXT_MAX_BYTES * 4);
+    }
+}
+
+/// What a step's output keeps once outputs are dropped: its status and error code, and of its
+/// payload the ids it names and the small fields Archi reads of a step's answer (a deploy's
+/// `wf_node` and `warning`, a change's `version` and `pending`, an installation update's `id` and
+/// `state`), each cut short.
+fn executor_result_essentials(preview: &serde_json::Value) -> serde_json::Value {
+    let mut kept = serde_json::Map::new();
+    for key in ["status", "error_code"] {
+        if let Some(value) = preview
+            .get(key)
+            .filter(|value| mesh_reply::is_outcome_value(value))
+        {
+            kept.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(payload) = preview.get("payload").filter(|payload| payload.is_object()) {
+        let mut small = mesh_reply::reply_outcome(payload);
+        if let Some(fields) = small.as_object_mut() {
+            fields.remove("status");
+            fields.remove("error_code");
+            for (key, max_bytes) in [("wf_node", 512), ("warning", 256), ("pending", 512)] {
+                if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+                    fields.insert(key.to_string(), mesh_reply::bounded_value(value, max_bytes));
+                }
+            }
+            if let Some(update) = payload.get("update").filter(|update| update.is_object()) {
+                let mut id = serde_json::Map::new();
+                for key in ["id", "state"] {
+                    if let Some(value) = update
+                        .get(key)
+                        .filter(|value| mesh_reply::is_outcome_value(value))
+                    {
+                        id.insert(key.to_string(), value.clone());
+                    }
+                }
+                fields.insert("update".to_string(), serde_json::Value::Object(id));
+            }
+        }
+        kept.insert("payload".to_string(), small);
+    }
+    serde_json::Value::Object(kept)
+}
+
+/// Step (c), last: each step keeps only its last event, the steps in their order.
+fn collapse_executor_events(envelope: &mut serde_json::Value) {
+    let Some(events) = envelope
+        .pointer_mut("/payload/events")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut last: HashMap<String, serde_json::Value> = HashMap::new();
+    for event in events.drain(..) {
+        let step = event
+            .get("step_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !last.contains_key(&step) {
+            order.push(step.clone());
+        }
+        last.insert(step, event);
+    }
+    events.extend(order.into_iter().filter_map(|step| last.remove(&step)));
+}
+
+/// How a cut executor answer was cut, and where the whole one is: `payload.outputs_bounded`.
+fn mark_executor_answer(
+    envelope: &mut serde_json::Value,
+    mode: &str,
+    share: Option<usize>,
+    log_path: &serde_json::Value,
+) {
+    let note = match mode {
+        "cut" => "Over the mesh the largest step outputs and args are cut to max_bytes_each (output_truncated/args_truncated, with output_bytes/args_bytes, the size before).",
+        "outputs_dropped" => "Over the mesh every step output and args is dropped: each step keeps its status, ids, error codes and the fields Archi reads (output_truncated/args_truncated, with their sizes before).",
+        _ => "Over the mesh every step output and args is dropped, and each step keeps only its last event, with its status, ids and error codes.",
+    };
+    envelope["payload"]["outputs_bounded"] = serde_json::json!({
+        "mode": mode,
+        "max_bytes_each": share,
+        "full_log": log_path,
+        "note": format!("{note} The run's full log, secrets redacted, is on the motherbee at full_log."),
+    });
+}
+
+/// `value[field]`, a text, cut to `max_bytes`; true when it was cut.
+fn bound_text_field(value: &mut serde_json::Value, field: &str, max_bytes: usize) -> bool {
+    value
+        .get_mut(field)
+        .is_some_and(|text| bound_text_field_value(text, max_bytes))
+}
+
+/// `text`, a text, cut to `max_bytes` serialized; true when it was cut.
+fn bound_text_field_value(text: &mut serde_json::Value, max_bytes: usize) -> bool {
+    if !text.is_string() || mesh_reply::serialized_len(text) <= max_bytes {
+        return false;
+    }
+    *text = mesh_reply::bounded_value(text, max_bytes);
     true
 }
 
@@ -4366,9 +4633,11 @@ fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::
     }
 }
 
-/// Every answer to an `ADMIN_COMMAND` goes out here. One the frame refuses (FINDINGS A-198) is
-/// answered all the same: `REPLY_TOO_LARGE` goes in its place (`reply_too_large_message`), with
-/// the action's own outcome, so the caller learns why at once instead of waiting to its timeout.
+/// Every answer to an `ADMIN_COMMAND` goes out here. One past the frame (FINDINGS A-198), measured
+/// serialized against the frame less the router's reserve (`mesh_reply::oversized`) or refused by
+/// the SDK, is answered all the same: `REPLY_TOO_LARGE` goes in its place
+/// (`reply_too_large_message`), with the action's own outcome, so the caller learns why at once
+/// instead of waiting to its timeout.
 async fn send_admin_command_response(
     client: &RouterDispatcher,
     request_msg: &Message,
@@ -4393,31 +4662,57 @@ async fn send_admin_command_response(
         error_detail,
         request_id.clone(),
     );
-    match sender.send(response).await {
-        Ok(()) => Ok(()),
-        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
-            tracing::warn!(
-                action,
-                caller = request_msg.routing.src_l2_name.as_deref().unwrap_or(""),
-                size,
-                max,
-                "a mesh reply does not fit one frame: REPLY_TOO_LARGE sent in its place"
-            );
-            let reply = reply_too_large_message(
-                sender.uuid(),
-                request_msg,
-                action,
-                outcome,
-                rows,
-                size,
-                max,
-                request_id,
-            );
-            sender.send(reply).await?;
-            Ok(())
-        }
-        Err(err) => Err(err.into()),
+    let size = match mesh_reply::oversized(&response) {
+        Some(size) => size,
+        None => match sender.send(response).await {
+            Ok(()) => return Ok(()),
+            Err(fluxbee_sdk::NodeError::MessageTooLarge { size, .. }) => size,
+            Err(err) => return Err(err.into()),
+        },
+    };
+    let max = mesh_reply::REPLY_MAX_BYTES;
+    let caller = request_msg.routing.src_l2_name.as_deref().unwrap_or("");
+    tracing::warn!(
+        action,
+        caller,
+        size,
+        max,
+        "a mesh reply does not fit one frame: REPLY_TOO_LARGE sent in its place"
+    );
+    let reply = reply_too_large_message(
+        sender.uuid(),
+        request_msg,
+        action,
+        outcome,
+        rows,
+        size,
+        max,
+        admin_reply_hint_reach(caller),
+        request_id,
+    );
+    sender.send(reply).await?;
+    Ok(())
+}
+
+/// Whether a REPLY_TOO_LARGE may point its caller at SY.admin's HTTP routes: not when the caller is
+/// Fluxbee Cloud's relay, which reaches SY.admin only through IO.cloud, so it is told the action's
+/// pages and never a route it cannot ask (FINDINGS A-198).
+fn admin_reply_hint_reach(caller: &str) -> AdminReplyHint {
+    if caller.starts_with("IO.cloud@") {
+        AdminReplyHint::PagesOnly
+    } else {
+        AdminReplyHint::PagesOrHttp
     }
+}
+
+/// What a REPLY_TOO_LARGE may tell its caller to do instead (`admin_reply_too_large_detail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminReplyHint {
+    /// The action's pages, or SY.admin's HTTP route for a read without pages.
+    PagesOrHttp,
+    /// The action's pages only: a caller that cannot reach SY.admin's HTTP (Cloud's relay), or an
+    /// answer that did not fit the hop behind SY.admin, which its HTTP route takes too.
+    PagesOnly,
 }
 
 /// What a REPLY_TOO_LARGE keeps of the reply it replaces (FINDINGS A-198): the action's status and
@@ -4449,15 +4744,16 @@ fn admin_reply_outcome(
 }
 
 /// The outcome an action's answer keeps deeper than its payload's top level, by the name a
-/// REPLY_TOO_LARGE gives it and where it is: an installation update's id, state and opening
-/// (stage 4's `update_installation`, whose payload holds the update as `update`), the id a caller
-/// follows it by with `get_installation_update`.
+/// REPLY_TOO_LARGE gives it and where it is: an executor run's status, steps and full log, which
+/// the executor writes on the motherbee with secrets redacted (its `execution_id` is at the top).
 fn admin_reply_outcome_paths(action: &str) -> &'static [(&'static str, &'static str)] {
     match action {
-        "update_installation" => &[
-            ("update_id", "/update/id"),
-            ("update_state", "/update/state"),
-            ("opening", "/opening"),
+        "executor_execute_plan" => &[
+            ("plan_status", "/status"),
+            ("completed_steps", "/summary/completed_steps"),
+            ("total_steps", "/summary/total_steps"),
+            ("failed_step_id", "/summary/failed_step_id"),
+            ("log_path", "/summary/log_path"),
         ],
         _ => &[],
     }
@@ -4480,7 +4776,9 @@ fn admin_action_paging(action: &str) -> Option<AdminActionPaging> {
         "list_recent_commands" => paging(&["limit", "cursor"], "next_cursor", "commands"),
         "vault_list" => paging(&["filter.limit", "cursor"], "next_cursor", "secrets"),
         "list_versions" => paging(&["limit", "cursor"], "next_cursor", "hives"),
-        "inventory" | "list_nodes" => paging(&["limit", "cursor"], "next_cursor", "nodes"),
+        "inventory" | "list_nodes" | "list_tenant_nodes" => {
+            paging(&["limit", "cursor"], "next_cursor", "nodes")
+        }
         "get_installation" | "get_versions" => paging(
             &["versions_limit", "versions_before"],
             "versions_next_before",
@@ -4518,18 +4816,22 @@ fn admin_reply_reports_a_change(action: &str) -> bool {
 
 /// The `error_detail` of a REPLY_TOO_LARGE (FINDINGS A-198): the reply's size, the frame's, the
 /// action and how to get its answer: its pages, with how many rows fit half a frame when the reply
-/// had rows, or HTTP on the motherbee for a read. An action that changes something says it ran and
-/// keeps its `outcome`.
+/// had rows, or HTTP on the motherbee for a read when `hint` allows it. An action that changes
+/// something says it ran and keeps its `outcome`.
 fn admin_reply_too_large_detail(
     action: &str,
     outcome: serde_json::Value,
     rows: Option<usize>,
     size: usize,
     max: usize,
+    hint: AdminReplyHint,
 ) -> serde_json::Value {
     let changed = admin_reply_reports_a_change(action);
     let paging = admin_action_paging(action);
-    let http = admin_action_path_patterns(action).first().copied();
+    let http = admin_action_path_patterns(action)
+        .first()
+        .copied()
+        .filter(|_| hint == AdminReplyHint::PagesOrHttp);
     // The rows that fit half a frame, at the size the reply's rows had on average.
     let suggested_limit = rows
         .filter(|rows| *rows > 0 && size > 0)
@@ -4592,8 +4894,8 @@ fn admin_reply_too_large_detail(
 }
 
 /// What SY.admin sends in place of a reply of `size` bytes the frame refused (FINDINGS A-198):
-/// `REPLY_TOO_LARGE`, its `admin_reply_too_large_detail`, and the meta of the action's own outcome,
-/// so an action that ran reads as one that ran.
+/// `REPLY_TOO_LARGE`, its `admin_reply_too_large_detail`, and the meta of the action's own outcome
+/// (`admin_command_response_message`), so an action that ran reads as one that ran.
 #[allow(clippy::too_many_arguments)]
 fn reply_too_large_message(
     sender_uuid: &str,
@@ -4603,17 +4905,11 @@ fn reply_too_large_message(
     rows: Option<usize>,
     size: usize,
     max: usize,
+    hint: AdminReplyHint,
     request_id: Option<String>,
 ) -> Message {
-    let (action_result, result_origin) = derive_action_outcome(
-        classify_admin_action(action),
-        outcome.get("status").and_then(serde_json::Value::as_str),
-        outcome
-            .get("error_code")
-            .and_then(serde_json::Value::as_str),
-    );
-    let detail = admin_reply_too_large_detail(action, outcome, rows, size, max);
-    let mut reply = admin_command_response_message(
+    let detail = admin_reply_too_large_detail(action, outcome, rows, size, max, hint);
+    admin_command_response_message(
         sender_uuid,
         request_msg,
         action,
@@ -4622,14 +4918,13 @@ fn reply_too_large_message(
         Some(REPLY_TOO_LARGE.to_string()),
         Some(detail),
         request_id,
-    );
-    reply.meta.action_result = action_result;
-    reply.meta.result_origin = result_origin.map(str::to_string);
-    reply
+    )
 }
 
 /// The `ADMIN_COMMAND_RESPONSE` to `request_msg`, as SY.admin sends it over the mesh: one frame,
-/// at most `MAX_FRAME_SIZE` serialized, or the send refuses it (FINDINGS A-197).
+/// at most `MAX_FRAME_SIZE` serialized, or the send refuses it (FINDINGS A-197). The meta's
+/// `action_result` is the action's: for a REPLY_TOO_LARGE, its kept `outcome`'s, so an action that
+/// ran reads as one that ran whichever hop the answer did not fit (FINDINGS A-198).
 #[allow(clippy::too_many_arguments)]
 fn admin_command_response_message(
     sender_uuid: &str,
@@ -4642,8 +4937,20 @@ fn admin_command_response_message(
     request_id: Option<String>,
 ) -> Message {
     let action_class = classify_admin_action(action);
-    let (action_result, result_origin) =
-        derive_action_outcome(action_class, Some(status), error_code.as_deref());
+    let kept_outcome = error_detail
+        .as_ref()
+        .and_then(|detail| detail.get("outcome"))
+        .filter(|_| error_code.as_deref() == Some(REPLY_TOO_LARGE));
+    let (action_result, result_origin) = match kept_outcome {
+        Some(outcome) => derive_action_outcome(
+            action_class,
+            outcome.get("status").and_then(serde_json::Value::as_str),
+            outcome
+                .get("error_code")
+                .and_then(serde_json::Value::as_str),
+        ),
+        None => derive_action_outcome(action_class, Some(status), error_code.as_deref()),
+    };
     let mut body = serde_json::json!({
         "status": status,
         "action": action,
@@ -8069,7 +8376,7 @@ async fn dispatch_internal_admin_command(
                     ))
                 }
             };
-            let mut payload =
+            let payload =
                 match execute_admin_executor_plan(ctx, client, &request, caller_l2_name).await {
                     Ok(payload) => payload,
                     Err(err) => {
@@ -8085,34 +8392,44 @@ async fn dispatch_internal_admin_command(
                         })
                     }
                 };
-            // The plan has run: its answer must arrive, so over the mesh each step's output and
-            // args are cut to fit the frame (FINDINGS A-198); HTTP has no frame.
+            let done = payload.get("status").and_then(serde_json::Value::as_str) == Some("done");
+            let error_detail = if done {
+                serde_json::Value::Null
+            } else {
+                payload
+                    .get("summary")
+                    .and_then(|summary| summary.get("final_message"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("execution failed"))
+            };
+            let mut envelope = serde_json::json!({
+                "status": if done { "ok" } else { "error" },
+                "action": action,
+                "payload": payload,
+                "error_code": if done { serde_json::Value::Null } else { serde_json::json!("EXECUTION_FAILED") },
+                "error_detail": error_detail,
+            });
+            // The plan has run: over the mesh its answer is cut no more than the frame needs
+            // (FINDINGS A-198); HTTP has no frame.
             if !matches!(origin, AdminOrigin::Http) {
-                bound_executor_answer_for_mesh(&mut payload);
+                if let Some(detail) = envelope
+                    .get_mut("error_detail")
+                    .filter(|detail| detail.is_string())
+                {
+                    bound_text_field_value(detail, EXECUTOR_MESH_TEXT_MAX_BYTES);
+                }
+                let fit = fit_executor_answer_for_mesh(&mut envelope);
+                if fit != ExecutorAnswerFit::Whole {
+                    tracing::info!(
+                        caller = caller_l2_name.unwrap_or(""),
+                        fit = ?fit,
+                        "an executor answer cut to fit the mesh frame"
+                    );
+                }
             }
             return Ok(InternalAdminDispatchResult {
-                http_status: if payload.get("status").and_then(serde_json::Value::as_str)
-                    == Some("done")
-                {
-                    200
-                } else {
-                    409
-                },
-                envelope: serde_json::json!({
-                    "status": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") { "ok" } else { "error" },
-                    "action": action,
-                    "payload": payload,
-                    "error_code": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") { serde_json::Value::Null } else { serde_json::json!("EXECUTION_FAILED") },
-                    "error_detail": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") {
-                        serde_json::Value::Null
-                    } else {
-                        payload
-                            .get("summary")
-                            .and_then(|summary| summary.get("final_message"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!("execution failed"))
-                    }
-                }),
+                http_status: if done { 200 } else { 409 },
+                envelope,
             });
         }
         _ => {}
@@ -8854,10 +9171,15 @@ fn enforce_cloud_relay_content(
                 return Err(format!("IO.cloud {action} settings must be an object"));
             }
         }
-        // Reads of a tenant: the claimed one; the list is stamped (stamp_relay_facts).
-        "get_tenant" | "list_tenant_nodes" => {
+        // Reads of a tenant: the claimed one; the list is stamped (stamp_relay_facts), and may be
+        // asked one page at a time (FINDINGS A-198).
+        "get_tenant" => {
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
             only_fields(Some(params), &["tenant_id"])?;
+        }
+        "list_tenant_nodes" => {
+            cloud_claimed_tenant(params.get("tenant_id"), action)?;
+            only_fields(Some(params), &["tenant_id", "limit", "cursor"])?;
         }
         // Every tenant, or one page of them (FINDINGS A-198).
         "list_tenants" => {
@@ -10052,15 +10374,16 @@ async fn handle_inventory_http(
 ) -> Result<(u16, String), AdminError> {
     let target = format!("SY.orchestrator@{}", ctx.hive_id);
     let target = target.as_str();
-    let timeout_secs = env_timeout_secs("JSR_ADMIN_INVENTORY_TIMEOUT_SECS").unwrap_or(10);
-    let ask = |request: serde_json::Value| {
+    let timeout =
+        Duration::from_secs(env_timeout_secs("JSR_ADMIN_INVENTORY_TIMEOUT_SECS").unwrap_or(10));
+    let ask = |request: serde_json::Value, within: Duration| {
         send_system_request(
             client,
             target,
             "INVENTORY_REQUEST",
             "INVENTORY_RESPONSE",
             request,
-            Duration::from_secs(timeout_secs),
+            within,
         )
     };
     let summary = payload
@@ -10068,17 +10391,20 @@ async fn handle_inventory_http(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("summary"));
     if summary {
-        return Ok(build_admin_http_response("inventory", ask(payload).await));
+        return Ok(build_admin_http_response(
+            "inventory",
+            ask(payload, timeout).await,
+        ));
     }
     let caller = match PageAsk::from_payload(&payload) {
         Ok(caller) => caller,
         Err(detail) => return Ok(admin_invalid_request_response("inventory", &detail)),
     };
     let payload = &payload;
-    let response = assemble_list_pages("nodes", &caller, |page| {
+    let response = assemble_list_pages("nodes", &caller, timeout, |page, left| {
         let mut request = payload.clone();
         page.apply_to(&mut request);
-        ask(request)
+        ask(request, left)
     })
     .await;
     Ok(build_admin_http_response("inventory", response))
@@ -10204,10 +10530,10 @@ async fn handle_hive_paths(
         ("GET", ["commands"]) => {
             // Command audit log: what was done to this backend lately (redacted). Filters via query
             // string; `hive` in the path narrows to commands targeting that hive.
+            // ?limit=&cursor= ask one page (FINDINGS A-198): 50 entries without a limit, and an
+            // empty cursor is none.
             let mut payload = serde_json::Map::new();
-            if let Some(limit) = query.get("limit").and_then(|v| v.parse::<u64>().ok()) {
-                payload.insert("limit".to_string(), serde_json::json!(limit));
-            }
+            page_query_params(query, &mut payload);
             if let Some(action) = query.get("action") {
                 payload.insert("action".to_string(), serde_json::json!(action));
             }
@@ -10216,10 +10542,6 @@ async fn handle_hive_paths(
             }
             if let Some(since) = query.get("since_ms").and_then(|v| v.parse::<u64>().ok()) {
                 payload.insert("since_ms".to_string(), serde_json::json!(since));
-            }
-            // The next page: the next_cursor of the page before (FINDINGS A-198).
-            if let Some(cursor) = query.get("cursor") {
-                payload.insert("cursor".to_string(), serde_json::json!(cursor));
             }
             let (status, resp) = handle_admin_command(
                 ctx,
@@ -10742,12 +11064,18 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants", tenant_id, "nodes"]) => {
-            let payload = serde_json::json!({ "tenant_id": decode_percent(tenant_id) });
+            // ?limit=&cursor= ask one page (FINDINGS A-198).
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "tenant_id".to_string(),
+                serde_json::json!(decode_percent(tenant_id)),
+            );
+            page_query_params(query, &mut payload);
             let (status, resp) = handle_admin_query_with_payload(
                 ctx,
                 client,
                 "list_tenant_nodes",
-                payload,
+                serde_json::Value::Object(payload),
                 Some(hive),
             )
             .await?;
@@ -11649,6 +11977,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "HOST_NOT_SETTLED" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
+        // A cursor its listing did not give (FINDINGS A-198): another listing's, or none at all.
+        "INVALID_CURSOR" => 400,
         "UNAUTHORIZED"
         | "SYSTEM_ILK_PROTECTED"
         | "TENANT_ROOT_PROTECTED"
@@ -12580,7 +12910,7 @@ async fn handle_admin_query(
     if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, serde_json::json!({}), hive).await;
     }
-    if matches!(action, "list_nodes" | "list_versions") {
+    if matches!(action, "list_nodes" | "list_tenant_nodes" | "list_versions") {
         return handle_paged_orchestrator_query(ctx, client, action, serde_json::json!({}), hive)
             .await;
     }
@@ -12599,8 +12929,8 @@ async fn handle_admin_query(
     Ok(build_admin_http_response(action, response))
 }
 
-/// `list_nodes` and `list_versions` (FINDINGS A-198): the orchestrator answers a page of nodes, or
-/// of hives' snapshots, within half a frame, and SY.admin assembles the pages
+/// `list_nodes`, `list_tenant_nodes` and `list_versions` (FINDINGS A-198): the orchestrator answers
+/// a page of nodes, or of hives' snapshots, within half a frame, and SY.admin assembles the pages
 /// (`orchestrator_list_pages`): without a `limit`, every node or hive, as before the pages.
 async fn handle_paged_orchestrator_query(
     ctx: &AdminContext,
@@ -12620,8 +12950,8 @@ async fn handle_paged_orchestrator_query(
     Ok(build_admin_http_response(action, response))
 }
 
-/// An orchestrator listing, `list_nodes` (its `nodes`) or `list_versions` (its `hives`), assembled
-/// from its pages (`assemble_list_pages`) as the caller asks it. `list_versions`' comparison is
+/// An orchestrator listing, `list_nodes` and `list_tenant_nodes` (their `nodes`) or `list_versions`
+/// (its `hives`), assembled from its pages (`assemble_list_pages`) as the caller asks it. `list_versions`' comparison is
 /// each page's against the motherbee's snapshot, joined (`merge_versions_comparisons`).
 async fn orchestrator_list_pages(
     ctx: &AdminContext,
@@ -12638,15 +12968,15 @@ async fn orchestrator_list_pages(
     };
     let comparisons = std::sync::Mutex::new(Vec::new());
     let relay = admin_node_name(&ctx.hive_id);
-    let mut assembled = assemble_list_pages(rows_key, caller, |page| {
+    let within = admin_action_timeout(action);
+    let mut assembled = assemble_list_pages(rows_key, caller, within, |page, left| {
         let mut request = payload.clone();
         page.apply_to(&mut request);
         let request = normalize_admin_payload(action, request, hive.as_deref());
         let request = build_admin_request(ctx, action, request, hive.clone());
         let (comparisons, relay) = (&comparisons, &relay);
         async move {
-            let answer =
-                send_admin_request(client, request, admin_action_timeout(action), relay).await?;
+            let answer = send_admin_request(client, request, left, relay).await?;
             if let Some(comparison) = answer.get("comparison") {
                 comparisons
                     .lock()
@@ -12713,7 +13043,7 @@ async fn handle_admin_query_with_payload(
     if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, payload, hive).await;
     }
-    if matches!(action, "list_nodes" | "list_versions") {
+    if matches!(action, "list_nodes" | "list_tenant_nodes" | "list_versions") {
         return handle_paged_orchestrator_query(ctx, client, action, payload, hive).await;
     }
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
@@ -14777,13 +15107,17 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
         ],
         "list_recent_commands" => vec![
-            admin_action_body_field("limit", "u32", "Max entries returned (default 50, max 500)."),
+            admin_action_body_field(
+                "limit",
+                "u32",
+                "Max entries per page (default 50, max 500), newest first; a page also stays within half a frame (64 KiB), with next_cursor while older entries follow.",
+            ),
             admin_action_body_field("action", "string", "Filter: exact admin action name."),
             admin_action_body_field("status", "string", "Filter: 'ok' or 'error'."),
             admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
             admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
         ],
-        "list_ilks" | "list_tenants" | "list_nodes" | "inventory" => vec![
+        "list_ilks" | "list_tenants" | "list_nodes" | "list_tenant_nodes" | "inventory" => vec![
             admin_action_body_field("limit", "u32", PAGE_LIMIT_FIELD_NOTE),
             admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
         ],
@@ -15628,7 +15962,7 @@ const WF_INSTANCE_ERRORS_NOTE: &str = "The engine answers its instance verbs onl
 /// What the listings that grow with the installation say of their pages (FINDINGS A-198).
 const PAGE_LIMIT_FIELD_NOTE: &str = "Rows per page (FINDINGS A-198): at most this many, from cursor on, with next_cursor while more follow and total, how many there are. Without it, every row, as before.";
 const PAGE_CURSOR_FIELD_NOTE: &str = "The next_cursor of the page before: the rows after it. Follow next_cursor until the answer has none.";
-const PAGE_NOTE: &str = "Pages (FINDINGS A-198): with limit, at most that many rows from cursor on, and next_cursor while rows follow (pass it back as cursor, query parameters ?limit=&cursor= in HTTP); total is how many there are. Without limit, every row, as before. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with the params to page and how many rows fit (error_detail.suggested_limit): ask it again with that limit and follow next_cursor.";
+const PAGE_NOTE: &str = "Pages (FINDINGS A-198): with limit, at most that many rows from cursor on, and next_cursor while rows follow (pass it back as cursor, query parameters ?limit=&cursor= in HTTP; an empty cursor is none); total is how many there are. Without limit, every row, as before. SY.admin assembles the rows from its source page by page, so a listing is no snapshot: a row written, changed or removed meanwhile may be in it or not, never twice. A cursor the listing did not give answers INVALID_CURSOR (400). Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with the params to page and how many rows fit (error_detail.suggested_limit): ask it again with that limit and follow next_cursor.";
 const INSTALLATION_VERSIONS_LIMIT_NOTE: &str = "How many of the installation file's versions the motherbee's config lists (FINDINGS A-198): the newest ones, 1 to 100, 20 without it.";
 const INSTALLATION_VERSIONS_BEFORE_NOTE: &str = "List the versions older than this one: versions_next_before of the answer before, while older versions remain.";
 
@@ -15654,7 +15988,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
             "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
             "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
-            "Pages (FINDINGS A-198): limit entries, newest first, from cursor on, with next_cursor while older entries follow (?cursor= in HTTP) and total, how many the filters match in the log. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many entries fit (error_detail.suggested_limit).",
+            "Pages (FINDINGS A-198): limit entries (50 without it), newest first in the order they were written (each entry's seq, whatever its clock), from cursor on and at most half a frame (64 KiB) per page, with next_cursor while older entries follow (?cursor= in HTTP; an empty one is none) and total, how many the filters match in the log. A cursor the log did not give answers INVALID_CURSOR (400).",
         ],
         "list_ilks" => vec![
             "SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities. ILKs come in the order of their ids.",
@@ -15688,6 +16022,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "list_tenant_nodes" => vec![
             "Every managed node charged to the tenant, on every connected hive: node_name, hive, runtime, lifecycle_state, health_state, identity (ilk_id, tenant_id), launched_by (cloud, archi, operator, system) and relaunch_on_boot (false once stopped).",
             "A hive that does not answer is listed in unreachable_hives. Fluxbee Cloud reads its tenant's nodes this way (list_nodes).",
+            "Nodes come in the order of their hive, then their name.",
+            PAGE_NOTE,
         ],
         "list_nodes" => vec![
             "This endpoint is hive-scoped only.",
@@ -15904,7 +16240,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Lists metadata summaries only; it never returns secret values.",
             "Non-admin callers only see secrets they are authorized to read.",
             "Supports optional filter.prefix, filter.tenant_id, filter.resource_type, filter.ilk, filter.tags, and filter.limit (Model D').",
-            "Pages (FINDINGS A-198): filter.limit secrets (200 without it, at most 1000), the most recently written first, from cursor on, with next_cursor while secrets follow (pass it back as cursor, ?cursor= in HTTP) and total, how many the filter matches. A secret written while you page moves to the front. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many fit (error_detail.suggested_limit): ask again with that filter.limit and follow next_cursor.",
+            "Pages (FINDINGS A-198): filter.limit secrets (200 without it, at most 1000: never every secret at once), the most recently written first, from cursor on, with next_cursor while secrets follow (pass it back as cursor, ?cursor= in HTTP; an empty one is none) and total, how many the filter matches. A filter of null is no filter. A secret written while you page moves to the front, so a listing is no snapshot. A cursor SY.vault did not give answers INVALID_CURSOR (400). Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many fit (error_detail.suggested_limit): ask again with that filter.limit and follow next_cursor.",
         ],
         "vault_put" => vec![
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
@@ -18099,12 +18435,25 @@ async fn handle_admin_command_with_origin(
     // The audit-log reader is handled locally (the log lives on THIS admin; every hive's commands
     // flow through it) — `hive` acts as a filter, not routing.
     if matches!(action, "list_recent_commands") {
+        // A page of the log (FINDINGS A-198): `limit` (50 without it, at most 500) and the
+        // `next_cursor` of the page before; an empty cursor is none.
+        let page = match PageAsk::from_payload(&payload) {
+            Ok(page) => page,
+            Err(detail) => return Ok(admin_invalid_request_response(action, &detail)),
+        };
+        if let Some(cursor) = page
+            .cursor
+            .as_deref()
+            .filter(|cursor| command_log_place(cursor).is_none())
+        {
+            return Ok(admin_error_response(
+                action,
+                mesh_reply::INVALID_CURSOR,
+                &format!("cursor {cursor} is not a next_cursor of list_recent_commands"),
+            ));
+        }
         let query = AdminCommandLogQuery {
-            limit: payload
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(ADMIN_COMMAND_LOG_DEFAULT_LIMIT),
+            limit: page.limit.unwrap_or(ADMIN_COMMAND_LOG_DEFAULT_LIMIT),
             action: payload
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -18119,20 +18468,7 @@ async fn handle_admin_command_with_origin(
                 .map(ToString::to_string),
             hive: hive.clone().filter(|v| !v.is_empty()),
             since_ms: payload.get("since_ms").and_then(|v| v.as_u64()),
-            cursor: match payload.get("cursor") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(cursor)) if command_log_place(cursor).is_some() => {
-                    Some(cursor.trim().to_string())
-                }
-                Some(other) => {
-                    return Ok(admin_invalid_request_response(
-                        action,
-                        &format!(
-                            "cursor must be a next_cursor of list_recent_commands, got {other}"
-                        ),
-                    ))
-                }
-            },
+            cursor: page.cursor,
         };
         // Read under the same lock as rotate+append so a concurrent rotation can't make one response
         // miss or duplicate an entry across the file/rotation boundary.
@@ -18909,17 +19245,11 @@ async fn handle_identity_query(
     };
     let target = target.as_str();
     let payload = &payload;
-    let response = assemble_list_pages(rows_key, &caller, |page| {
+    let within = admin_action_timeout(action);
+    let response = assemble_list_pages(rows_key, &caller, within, |page, left| {
         let mut request = payload.clone();
         page.apply_to(&mut request);
-        send_system_request(
-            client,
-            target,
-            request_msg,
-            response_msg,
-            request,
-            admin_action_timeout(action),
-        )
+        send_system_request(client, target, request_msg, response_msg, request, left)
     })
     .await;
     Ok(build_admin_http_response(action, response))
@@ -19002,41 +19332,47 @@ async fn purge_tenant_vault_block(
             .to_string(),
         ))
     };
-    let response = send_system_request(
+    // Every secret of the tenant, page after page (FINDINGS A-198): one past SY.vault's first page
+    // blocks the purge as much as the first.
+    let response = vault_list_pages(
         client,
         &format!("SY.vault@{}", target_hive),
-        MSG_VAULT_LIST,
-        MSG_VAULT_LIST_RESPONSE,
-        serde_json::json!({"filter": {"tenant_id": tenant_id, "limit": 1000}}),
+        &serde_json::json!({"filter": {"tenant_id": tenant_id}}),
+        &PageAsk::default(),
+        None,
         Duration::from_secs(15),
     )
     .await;
     match response {
-        Ok(listing) => {
-            let keys: Vec<String> = listing
-                .get("secrets")
-                .and_then(|value| value.as_array())
-                .map(|secrets| {
-                    secrets
-                        .iter()
-                        .filter_map(|secret| secret.get("key").and_then(|k| k.as_str()))
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
+        Ok(listing) if payload_is_ok(&listing) => {
+            let keys = vault_listing_keys(&listing);
             if keys.is_empty() {
-                None
-            } else {
-                blocked(
-                    "TENANT_HAS_SECRETS",
-                    format!(
-                        "SY.vault still holds {} secret(s) of {tenant_id}; delete them first: {}",
-                        keys.len(),
-                        keys.join(", ")
-                    ),
-                )
+                return None;
             }
+            // The error names the first keys; a tenant with many says how many more.
+            const NAMED: usize = 20;
+            let more = keys.len().saturating_sub(NAMED);
+            let named = keys[..keys.len().min(NAMED)].join(", ");
+            blocked(
+                "TENANT_HAS_SECRETS",
+                format!(
+                    "SY.vault still holds {} secret(s) of {tenant_id}; delete them first: {named}{}",
+                    keys.len(),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
         }
+        Ok(listing) => blocked(
+            "VAULT_CHECK_FAILED",
+            format!(
+                "could not list SY.vault secrets of {tenant_id} (refusing to purge): {}",
+                payload_error_detail(&listing).unwrap_or_else(|| listing.to_string())
+            ),
+        ),
         Err(err) => blocked(
             "VAULT_CHECK_FAILED",
             format!("could not list SY.vault secrets of {tenant_id} (refusing to purge): {err}"),
@@ -19202,7 +19538,7 @@ async fn handle_vault_command(
 /// `vault_list` (FINDINGS A-198): SY.vault answers a page within the frame, at most the filter's
 /// `limit` (200 when it names none, at most 1000, as before the pages), and SY.admin assembles the
 /// pages up to that limit from the request's `cursor` on, with SY.vault's `next_cursor` while
-/// secrets follow.
+/// secrets follow (`vault_list_pages`).
 async fn handle_vault_list(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -19232,13 +19568,41 @@ async fn handle_vault_list(
         limit: Some(limit),
         cursor,
     };
-    let payload = &payload;
-    let response = assemble_list_pages("secrets", &caller, |page| {
-        let mut request = payload.clone();
+    let response = vault_list_pages(
+        client,
+        target,
+        &payload,
+        &caller,
+        Some(&ctx.self_ilk_id),
+        admin_action_timeout(action),
+    )
+    .await;
+    build_admin_http_response(action, response)
+}
+
+/// SY.vault's listing for `request` (its `filter`), assembled from its pages (FINDINGS A-198):
+/// SY.vault answers a page within the frame, at most the filter's `limit`, and the pages are followed
+/// from `caller`'s cursor on, up to `caller`'s limit, every secret without one. A `"filter": null` is
+/// no filter. `src_ilk` is the ILK SY.vault authorizes the listing for, SY.admin's own for an
+/// action of the admin API (the operator, Archi, Cloud); none for SY.admin's own checks, as they
+/// always asked. The whole listing takes at most `within`.
+async fn vault_list_pages(
+    client: &RouterDispatcher,
+    target: &str,
+    request: &serde_json::Value,
+    caller: &PageAsk,
+    src_ilk: Option<&str>,
+    within: Duration,
+) -> Result<serde_json::Value, AdminError> {
+    assemble_list_pages("secrets", caller, within, |page, left| {
+        let mut request = request.clone();
         if let Some(fields) = request.as_object_mut() {
             let filter = fields
                 .entry("filter")
                 .or_insert_with(|| serde_json::json!({}));
+            if filter.is_null() {
+                *filter = serde_json::json!({});
+            }
             if let Some(filter) = filter.as_object_mut() {
                 filter.insert("limit".to_string(), serde_json::json!(page.limit));
             }
@@ -19254,16 +19618,27 @@ async fn handle_vault_list(
             MSG_VAULT_LIST_RESPONSE,
             request,
             16,
-            Some(ctx.self_ilk_id.clone()),
+            src_ilk.map(str::to_string),
             None,
             Some(target.to_string()),
-            Some(action.to_string()),
+            src_ilk.map(|_| "vault_list".to_string()),
             None,
-            admin_action_timeout(action),
+            left,
         )
     })
-    .await;
-    build_admin_http_response(action, response)
+    .await
+}
+
+/// The keys of an assembled vault listing (`vault_list_pages`).
+fn vault_listing_keys(listing: &serde_json::Value) -> Vec<String> {
+    listing
+        .get("secrets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|secret| secret.get("key").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The admin API (the operator, the executor, Archi, Cloud) never writes SY.admin's ACME accounts
@@ -20307,18 +20682,15 @@ async fn installation_versions_with(
 }
 
 /// The version a `set_installation_ai` names as `expected_version`, as the motherbee's orchestrator
-/// takes it: its file's, or the last one recorded when its file is one no reader can use; none
-/// while it holds no file. `own` is its `/versions`' `config`.
+/// takes it: its file's, or the last one recorded when its file is one no reader can use
+/// (`versions_latest`, the newest of every version recorded, whichever page `versions` lists:
+/// FINDINGS A-198); none while it holds no file. `own` is its `/versions`' `config`.
 fn installation_expected_version(own: &serde_json::Value) -> Option<u64> {
     match own.get("file").and_then(serde_json::Value::as_str) {
         Some("valid") => own.get("version").and_then(serde_json::Value::as_u64),
         Some("invalid") => Some(
-            own.get("versions")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|record| record.get("version").and_then(serde_json::Value::as_u64))
-                .max()
+            own.get("versions_latest")
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
         ),
         _ => None,
@@ -20898,23 +21270,23 @@ fn readers_without_the_key(
         .collect()
 }
 
-/// A tenant's secrets of `provider`, by names only, from SY.vault's listing on the motherbee.
+/// A tenant's secrets of `provider`, by names only, from SY.vault's listing on the motherbee: every
+/// one of them, page after page (FINDINGS A-198).
 async fn list_provider_keys(
     client: &RouterDispatcher,
     admin_hive: &str,
     tenant: &str,
     provider: AiProvider,
 ) -> Result<Vec<ProviderKeyEntry>, String> {
-    let listing = send_system_request(
+    let listing = vault_list_pages(
         client,
         &format!("SY.vault@{admin_hive}"),
-        MSG_VAULT_LIST,
-        MSG_VAULT_LIST_RESPONSE,
-        serde_json::json!({"filter": {
+        &serde_json::json!({"filter": {
             "tenant_id": tenant,
             "resource_type": provider.resource_type().as_str(),
-            "limit": 1000,
         }}),
+        &PageAsk::default(),
+        None,
         Duration::from_secs(15),
     )
     .await
@@ -22175,6 +22547,19 @@ fn build_admin_http_response(
 
             let error_code =
                 payload_error_code(&payload).unwrap_or_else(|| "SERVICE_FAILED".into());
+            if error_code == REPLY_TOO_LARGE {
+                return (
+                    error_code_to_http_status(&error_code),
+                    serde_json::json!({
+                        "status": "error",
+                        "action": action,
+                        "payload": serde_json::Value::Null,
+                        "error_code": error_code,
+                        "error_detail": source_reply_too_large_detail(action, &payload),
+                    })
+                    .to_string(),
+                );
+            }
             let error_detail = payload_error_detail(&payload);
             let status_code = error_code_to_http_status(&error_code);
             (
@@ -22208,6 +22593,53 @@ fn build_admin_http_response(
     }
 }
 
+/// A REPLY_TOO_LARGE from the node behind SY.admin (`mesh_reply::reply_too_large_payload`: the
+/// node's answer did not fit its hop to SY.admin), in SY.admin's own shape
+/// (`admin_reply_too_large_detail`, FINDINGS A-198): the action's pages with how many rows fit when
+/// the node said how many it held, whether the action ran, from its kept outcome, and the outcome.
+/// SY.admin's HTTP route takes the same hop, so it is never offered; the node's own text is kept as
+/// `source`.
+fn source_reply_too_large_detail(action: &str, source: &serde_json::Value) -> serde_json::Value {
+    let number = |key: &str| {
+        source
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    let outcome = source
+        .get("outcome")
+        .filter(|outcome| outcome.is_object())
+        .cloned()
+        .unwrap_or_else(|| mesh_reply::reply_outcome(source));
+    let mut detail = admin_reply_too_large_detail(
+        action,
+        outcome,
+        number("rows"),
+        number("size").unwrap_or(0),
+        number("max").unwrap_or(mesh_reply::REPLY_MAX_BYTES),
+        AdminReplyHint::PagesOnly,
+    );
+    if let Some(message) = payload_error_detail(source) {
+        detail["source"] = serde_json::json!(message);
+    }
+    detail
+}
+
+/// An action refused with `error_code` before anything was asked, as an HTTP route answers it.
+fn admin_error_response(action: &str, error_code: &str, detail: &str) -> (u16, String) {
+    (
+        error_code_to_http_status(error_code),
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": detail,
+        })
+        .to_string(),
+    )
+}
+
 /// An action refused for its request before anything was asked, as an HTTP route answers it.
 fn admin_invalid_request_response(action: &str, detail: &str) -> (u16, String) {
     (
@@ -22237,28 +22669,48 @@ const LIST_SOURCE_PAGE_ROWS: usize = 1_000;
 /// `rows_key`, its `count` set to them, the last page's `next_cursor` and the source's `total`. A
 /// source's error answer comes back as it is. A source older than the pages answers every row at
 /// once and names no next page, which ends the listing.
+///
+/// The whole listing takes at most `within`, the time its caller gives the one request (the
+/// action's own timeout): each page is asked with the time left (`ask_page`'s second argument), and
+/// a listing that is not done by then answers TIMEOUT, naming its pages. The listing is no
+/// snapshot: each page is the source's at the time it is asked, so a row written, changed or
+/// removed meanwhile may be in it or not, though never twice.
 async fn assemble_list_pages<F, Fut>(
     rows_key: &str,
     caller: &PageAsk,
+    within: Duration,
     mut ask_page: F,
 ) -> Result<serde_json::Value, AdminError>
 where
-    F: FnMut(PageAsk) -> Fut,
+    F: FnMut(PageAsk, Duration) -> Fut,
     Fut: future::Future<Output = Result<serde_json::Value, AdminError>>,
 {
+    let deadline = Instant::now() + within;
     let mut first: Option<serde_json::Value> = None;
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut cursor = caller.cursor.clone();
     let mut total = None;
-    for _ in 0..LIST_ASSEMBLY_MAX_PAGES {
+    for asked in 0..LIST_ASSEMBLY_MAX_PAGES {
         let limit = match caller.limit {
             Some(limit) => limit.saturating_sub(rows.len()),
             None => LIST_SOURCE_PAGE_ROWS,
         };
-        let page = ask_page(PageAsk {
-            limit: Some(limit),
-            cursor: cursor.clone(),
-        })
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "the listing of {rows_key} timed out after {asked} pages ({} s): ask it in pages \
+                 with limit and cursor",
+                within.as_secs()
+            )
+            .into());
+        }
+        let page = ask_page(
+            PageAsk {
+                limit: Some(limit),
+                cursor: cursor.clone(),
+            },
+            left,
+        )
         .await?;
         if !payload_is_ok(&page) {
             return Ok(page);
@@ -23765,6 +24217,22 @@ mod tests {
         assert!(check("get_tenant", serde_json::json!({"tenant_id": t})).is_ok());
         assert!(check("get_tenant", serde_json::json!({"tenant_id": root})).is_err());
         assert!(check("list_tenant_nodes", serde_json::json!({"tenant_id": t})).is_ok());
+        // One page of them (FINDINGS A-198); get_tenant takes no page.
+        assert!(check(
+            "list_tenant_nodes",
+            serde_json::json!({"tenant_id": t, "limit": 50, "cursor": "worker1|IO.a"})
+        )
+        .is_ok());
+        assert!(check(
+            "list_tenant_nodes",
+            serde_json::json!({"tenant_id": t, "scope": "all"})
+        )
+        .is_err());
+        assert!(check(
+            "get_tenant",
+            serde_json::json!({"tenant_id": t, "limit": 5})
+        )
+        .is_err());
         assert!(check("list_tenants", serde_json::json!({})).is_ok());
         assert!(check("list_tenants", serde_json::json!({"exclude_root": false})).is_err());
         // One page of them (FINDINGS A-198).
@@ -25198,7 +25666,7 @@ mod tests {
         let detail = &reply.payload["error_detail"];
         assert_eq!(detail["action"], json!("list_ilks"));
         assert!(detail["size"].as_u64() > Some(mesh_reply::MAX_FRAME_SIZE as u64));
-        assert_eq!(detail["max"], json!(mesh_reply::MAX_FRAME_SIZE));
+        assert_eq!(detail["max"], json!(mesh_reply::REPLY_MAX_BYTES));
         assert_eq!(detail["read_only"], json!(true));
         assert!(detail.get("action_ran").is_none());
         assert_eq!(detail["paging"]["params"], json!(["limit", "cursor"]));
@@ -25271,33 +25739,31 @@ mod tests {
         assert!(!admin_reply_reports_a_change("list_ilks"));
     }
 
-    /// FINDINGS A-198 on stage 4's actions: an installation update's answer the frame refuses says
-    /// it ran and keeps the update's id, its state and its opening, which get_installation_update
-    /// follows; get_installation_update's history, a read, is to be read over HTTP.
+    /// FINDINGS A-198: the guard measures the reply itself against the frame less the router's
+    /// reserve, so a reply the SDK would still send, within its last kilobyte, answers
+    /// REPLY_TOO_LARGE too, and that one fits.
     #[tokio::test]
-    async fn the_installation_update_s_reply_too_large_keeps_the_update_s_id() {
-        let (ctx, mut harness) = opa_test_admin("reply-too-large-update");
-        let request = mesh_admin_request("update_installation", "SY.architect@motherbee");
-        let hives: serde_json::Map<String, Value> = (0..600)
-            .map(|n| {
-                (
-                    format!("worker{n}"),
-                    json!({ "role": "worker", "core": { "state": "pending", "detail": "x".repeat(200) } }),
-                )
-            })
-            .collect();
-        let payload = json!({
-            "update": { "id": "upd-7", "state": "open", "hives": hives },
-            "opening": "opened",
-            "pending": ["worker1"],
-            "message": "update upd-7 is open",
-        });
-        assert!(mesh_reply::serialized_len(&payload) > mesh_reply::MAX_FRAME_SIZE);
+    async fn a_reply_within_the_router_s_reserve_answers_reply_too_large() {
+        let (ctx, mut harness) = opa_test_admin("reply-in-the-reserve");
+        let request = mesh_admin_request("get_node_config", "SY.architect@motherbee");
+        let empty = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "get_node_config",
+            "ok",
+            json!({ "status": "ok", "config": "" }),
+            None,
+            None,
+            Some("req-1".to_string()),
+        );
+        // A config that takes the reply to 300 bytes short of the frame: past the reserve.
+        let fill = mesh_reply::MAX_FRAME_SIZE - 300 - mesh_reply::serialized_len(&empty);
+        let payload = json!({ "status": "ok", "config": "c".repeat(fill) });
         send_admin_command_response(
             &ctx.rpc,
             &request,
-            "update_installation",
-            "partial",
+            "get_node_config",
+            "ok",
             payload,
             None,
             None,
@@ -25310,32 +25776,127 @@ mod tests {
             .await
             .expect("a reply");
         assert_eq!(reply.payload["error_code"], json!(REPLY_TOO_LARGE));
-        let detail = &reply.payload["error_detail"];
-        assert_eq!(detail["action_ran"], json!(true));
-        assert_eq!(detail["read_only"], json!(false));
-        assert_eq!(
-            detail["outcome"],
-            json!({
-                "status": "partial",
-                "update_id": "upd-7",
-                "update_state": "open",
-                "opening": "opened",
-            })
+        let size = reply.payload["error_detail"]["size"]
+            .as_u64()
+            .expect("size") as usize;
+        assert!(
+            size > mesh_reply::REPLY_MAX_BYTES && size < mesh_reply::MAX_FRAME_SIZE,
+            "{size}"
         );
-        let message = detail["message"].as_str().expect("message");
-        assert!(message.contains("update_installation ran"), "{message}");
+        assert!(mesh_reply::oversized(&reply).is_none());
+    }
 
+    /// FINDINGS A-198: a read without pages names its HTTP route, but never to Fluxbee Cloud's
+    /// relay, which reaches SY.admin only through IO.cloud: Cloud is told the pages, or that the
+    /// answer has no smaller form.
+    #[test]
+    fn a_read_s_reply_too_large_names_its_route_but_never_to_cloud() {
         let read = admin_reply_too_large_detail(
             "get_installation_update",
             json!({ "status": "ok" }),
             None,
             200_000,
-            mesh_reply::MAX_FRAME_SIZE,
+            mesh_reply::REPLY_MAX_BYTES,
+            AdminReplyHint::PagesOrHttp,
         );
         assert_eq!(read["read_only"], json!(true));
         assert!(read.get("action_ran").is_none());
         assert!(read.get("paging").is_none());
         assert_eq!(read["http"], json!("GET /installation/update"));
+
+        assert_eq!(
+            admin_reply_hint_reach("IO.cloud@motherbee"),
+            AdminReplyHint::PagesOnly
+        );
+        assert_eq!(
+            admin_reply_hint_reach("SY.architect@motherbee"),
+            AdminReplyHint::PagesOrHttp
+        );
+        let cloud_read = admin_reply_too_large_detail(
+            "get_tenant",
+            json!({ "status": "ok", "tenant_id": "tnt:a" }),
+            None,
+            200_000,
+            mesh_reply::REPLY_MAX_BYTES,
+            AdminReplyHint::PagesOnly,
+        );
+        assert!(cloud_read.get("http").is_none(), "{cloud_read}");
+        let message = cloud_read["message"].as_str().expect("message");
+        assert!(!message.contains("HTTP"), "{message}");
+        let cloud_list = admin_reply_too_large_detail(
+            "list_tenant_nodes",
+            json!({ "status": "ok", "tenant_id": "tnt:a" }),
+            Some(800),
+            300_000,
+            mesh_reply::REPLY_MAX_BYTES,
+            AdminReplyHint::PagesOnly,
+        );
+        assert_eq!(cloud_list["paging"]["params"], json!(["limit", "cursor"]));
+        assert!(cloud_list["suggested_limit"].as_u64() > Some(0));
+        assert!(cloud_list.get("http").is_none());
+    }
+
+    /// FINDINGS A-198: a REPLY_TOO_LARGE from the node behind SY.admin (its answer did not fit its
+    /// hop) reaches the caller in SY.admin's own shape: the action's pages, how many rows fit, the
+    /// outcome, never the HTTP route, which takes the same hop; a write's says it ran, and the
+    /// meta's result is the action's own.
+    #[test]
+    fn a_source_s_reply_too_large_takes_sy_admin_s_shape() {
+        let source = mesh_reply::reply_too_large_payload(
+            "TNT_LIST",
+            300_000,
+            mesh_reply::REPLY_MAX_BYTES,
+            json!({ "status": "ok" }),
+            Some(900),
+            "ask it in pages with limit and cursor, following next_cursor",
+        );
+        let (status, body) = build_admin_http_response("list_tenants", Ok(source));
+        assert_eq!(status, 413);
+        let envelope: Value = serde_json::from_str(&body).expect("envelope");
+        assert_eq!(envelope["error_code"], json!(REPLY_TOO_LARGE));
+        assert_eq!(envelope["payload"], Value::Null);
+        let detail = &envelope["error_detail"];
+        assert_eq!(detail["action"], json!("list_tenants"));
+        assert_eq!(detail["paging"]["params"], json!(["limit", "cursor"]));
+        let limit = detail["suggested_limit"].as_u64().expect("how many fit");
+        assert!(limit > 0 && limit < 900, "{limit}");
+        assert!(detail.get("http").is_none());
+        assert!(detail["source"]
+            .as_str()
+            .is_some_and(|text| text.contains("TNT_LIST")));
+
+        let write = mesh_reply::reply_too_large_payload(
+            "set_node_config",
+            200_000,
+            mesh_reply::REPLY_MAX_BYTES,
+            json!({ "status": "ok", "node_name": "AI.sales@worker1" }),
+            None,
+            "it has no smaller form over the mesh",
+        );
+        let (_, body) = build_admin_http_response("set_node_config", Ok(write));
+        let envelope: Value = serde_json::from_str(&body).expect("envelope");
+        let detail = &envelope["error_detail"];
+        assert_eq!(detail["action_ran"], json!(true));
+        assert_eq!(
+            detail["outcome"],
+            json!({ "status": "ok", "node_name": "AI.sales@worker1" })
+        );
+        assert!(detail.get("http").is_none());
+        let request = mesh_admin_request("set_node_config", "SY.architect@motherbee");
+        let reply = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "set_node_config",
+            "error",
+            Value::Null,
+            Some(REPLY_TOO_LARGE.to_string()),
+            Some(detail.clone()),
+            None,
+        );
+        assert_eq!(
+            reply.meta.action_result.map(|result| result.as_str()),
+            Some("applied")
+        );
     }
 
     /// FINDINGS A-198: a reply within the frame goes as it is built, nothing in its place.
@@ -25366,146 +25927,325 @@ mod tests {
         assert_eq!(reply.payload["request_id"], json!("req-2"));
     }
 
-    /// FINDINGS A-198: a plan has run when its answer is sent, so the answer must arrive. Over the
-    /// mesh each step's output and args are cut to their share, every event keeping its status
-    /// and its small fields (what Archi reads: a deploy's wf_node), and the answer fits the frame.
-    #[test]
-    fn an_executor_answer_keeps_every_step_s_status_within_the_frame() {
-        let log_path = "/var/lib/fluxbee/state/admin-executor/motherbee/executions/exec-1.json";
-        let args =
-            json!({ "workflow_name": "big", "definition": { "states": "d".repeat(30_000) } });
-        let events: Vec<Value> = (0..5)
-            .flat_map(|n| {
-                let event = |status: &str, result: Value| {
-                    json!({
-                        "execution_id": "exec-1",
-                        "step_id": format!("s{n}"),
-                        "step_index": n,
-                        "step_action": "wf_rules_compile_apply",
-                        "status": status,
-                        "timestamp": 1,
-                        "summary": format!("step s{n} {status}"),
-                        "tool_name": "wf_rules_compile_apply",
-                        "tool_args_preview": args.clone(),
-                        "result_preview": result,
-                        "error_code": null,
-                        "error_source": null,
-                        "error_message": null,
-                    })
-                };
+    const EXECUTOR_LOG_PATH: &str =
+        "/var/lib/fluxbee/state/admin-executor/motherbee/executions/exec-1.json";
+
+    /// One executor event as SY.admin's executor writes it.
+    fn executor_event(
+        step: usize,
+        action: &str,
+        status: &str,
+        args: Value,
+        result: Value,
+    ) -> Value {
+        json!({
+            "execution_id": "exec-1",
+            "step_id": format!("s{step}"),
+            "step_index": step,
+            "step_action": action,
+            "status": status,
+            "timestamp": 1_700_000_000_000u64 + step as u64,
+            "summary": format!("step s{step} {status}"),
+            "tool_name": action,
+            "tool_args_preview": args,
+            "result_preview": result,
+            "error_code": null,
+            "error_source": null,
+            "error_message": null,
+        })
+    }
+
+    /// The envelope of an executor run of `steps` steps, each a running and a done event.
+    fn executor_envelope(
+        steps: usize,
+        action: &str,
+        args: impl Fn(usize) -> Value,
+        result: impl Fn(usize) -> Value,
+    ) -> Value {
+        let events: Vec<Value> = (0..steps)
+            .flat_map(|step| {
                 vec![
-                    event("running", Value::Null),
-                    event(
-                        "done",
-                        json!({
-                            "status": "ok",
-                            "action": "wf_rules_compile_apply",
-                            "payload": {
-                                "wf_node": { "status": "ok", "node_name": "WF.big@motherbee" },
-                                "compiled": "c".repeat(50_000),
-                            },
-                            "error_code": null,
-                        }),
-                    ),
+                    executor_event(step, action, "running", args(step), Value::Null),
+                    executor_event(step, action, "done", args(step), result(step)),
                 ]
             })
             .collect();
-        let mut payload = json!({
-            "status": "done",
-            "execution_id": "exec-1",
-            "events": events,
-            "summary": {
-                "execution_id": "exec-1",
+        json!({
+            "status": "ok",
+            "action": "executor_execute_plan",
+            "payload": {
                 "status": "done",
-                "total_steps": 5,
-                "completed_steps": 5,
-                "failed_step_id": null,
-                "failed_step_action": null,
-                "failure": null,
-                "log_path": log_path,
-                "final_message": "Execution completed successfully",
+                "execution_id": "exec-1",
+                "events": events,
+                "summary": {
+                    "execution_id": "exec-1",
+                    "status": "done",
+                    "total_steps": steps,
+                    "completed_steps": steps,
+                    "failed_step_id": null,
+                    "failed_step_action": null,
+                    "failure": null,
+                    "log_path": EXECUTOR_LOG_PATH,
+                    "final_message": "Execution completed successfully",
+                },
             },
-        });
-        assert!(mesh_reply::serialized_len(&payload) > 3 * mesh_reply::MAX_FRAME_SIZE);
-        assert!(bound_executor_answer_for_mesh(&mut payload));
+            "error_code": null,
+            "error_detail": null,
+        })
+    }
+
+    /// The mesh reply SY.admin builds of an executor envelope.
+    fn executor_reply(envelope: &Value) -> Message {
         let request = mesh_admin_request("executor_execute_plan", "SY.architect@motherbee");
-        let reply = admin_command_response_message(
+        admin_command_response_message(
             &Uuid::new_v4().to_string(),
             &request,
             "executor_execute_plan",
-            "ok",
-            payload.clone(),
+            envelope["status"].as_str().expect("status"),
+            internal_response_payload_value(envelope),
             None,
             None,
             Some(Uuid::new_v4().to_string()),
-        );
-        let frame = serde_json::to_vec(&reply).expect("frame").len();
-        assert!(frame <= mesh_reply::MAX_FRAME_SIZE, "{frame} bytes");
-        let events = payload["events"].as_array().expect("events");
-        assert_eq!(events.len(), 10);
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event["step_id"], json!(format!("s{}", index / 2)));
-            assert_eq!(event["args_truncated"], json!(true), "{event}");
-            assert!(event["args_bytes"].as_u64() > Some(30_000));
-            if event["status"] == json!("done") {
-                assert_eq!(event["result_preview"]["status"], json!("ok"));
-                assert_eq!(
-                    event["result_preview"]["payload"]["wf_node"],
-                    json!({ "status": "ok", "node_name": "WF.big@motherbee" })
-                );
-                assert_eq!(event["output_truncated"], json!(true));
-                assert!(event["output_bytes"].as_u64() > Some(50_000));
-            } else {
-                assert_eq!(event["status"], json!("running"));
-                assert!(event.get("output_truncated").is_none());
+        )
+    }
+
+    /// The last event of each step, by step id, in the order of the steps.
+    fn executor_last_statuses(envelope: &Value) -> Vec<(String, String)> {
+        let mut last: Vec<(String, String)> = Vec::new();
+        for event in envelope["payload"]["events"].as_array().expect("events") {
+            let step = event["step_id"].as_str().expect("step").to_string();
+            let status = event["status"].as_str().expect("status").to_string();
+            match last.iter_mut().find(|(seen, _)| *seen == step) {
+                Some(entry) => entry.1 = status,
+                None => last.push((step, status)),
             }
         }
-        assert_eq!(payload["summary"]["status"], json!("done"));
-        assert_eq!(payload["outputs_bounded"]["full_log"], json!(log_path));
-        // An answer within its budget is left as it is.
-        let mut small = json!({
-            "events": [{ "status": "done", "result_preview": { "status": "ok" } }],
-            "summary": { "status": "done" },
-        });
-        let before = small.clone();
-        assert!(!bound_executor_answer_for_mesh(&mut small));
-        assert_eq!(small, before);
+        last
+    }
 
-        // A change's answer keeps what Archi reads of it when cut: an installation update's id,
-        // its state and the hives it has not reached yet.
-        let hives: serde_json::Map<String, Value> = (0..400)
-            .map(|n| {
-                (
-                    format!("worker{n}"),
-                    json!({ "role": "worker", "core": { "state": "pending", "detail": "x".repeat(200) } }),
-                )
-            })
-            .collect();
-        let mut update = json!({
-            "status": "done",
-            "events": [{
-                "step_id": "s1",
-                "step_action": "update_installation",
-                "tool_name": "update_installation",
-                "status": "done",
-                "tool_args_preview": { "reason": "the release" },
-                "result_preview": {
-                    "status": "partial",
+    /// FINDINGS A-198, M4 (a): a plan's answer that fits the frame goes as it is.
+    #[test]
+    fn an_executor_answer_that_fits_goes_unchanged() {
+        let mut envelope = executor_envelope(
+            3,
+            "run_node",
+            |step| json!({ "node_name": format!("AI.n{step}@worker1") }),
+            |step| json!({ "status": "ok", "payload": { "node_name": format!("AI.n{step}@worker1") } }),
+        );
+        let before = envelope.clone();
+        assert_eq!(
+            fit_executor_answer_for_mesh(&mut envelope),
+            ExecutorAnswerFit::Whole
+        );
+        assert_eq!(envelope, before);
+        assert!(envelope["payload"].get("outputs_bounded").is_none());
+    }
+
+    /// FINDINGS A-198, M4 (b): past the frame, the largest outputs and args are cut first, all to
+    /// one share, the small ones whole, every event keeping its status and what Archi reads (a
+    /// deploy's wf_node); the answer fits the frame with the router's reserve.
+    #[test]
+    fn an_executor_answer_cuts_its_largest_outputs_first() {
+        let mut envelope = executor_envelope(
+            5,
+            "wf_rules_compile_apply",
+            |step| {
+                if step == 0 {
+                    json!({ "workflow_name": "big", "definition": { "states": "d".repeat(60_000) } })
+                } else {
+                    json!({ "workflow_name": format!("w{step}") })
+                }
+            },
+            |step| {
+                json!({
+                    "status": "ok",
+                    "action": "wf_rules_compile_apply",
                     "payload": {
-                        "update": { "id": "upd-1", "state": "open", "hives": hives },
-                        "pending": ["worker7"],
+                        "wf_node": { "status": "ok", "node_name": format!("WF.w{step}@motherbee") },
+                        "compiled": "c".repeat(if step == 0 { 80_000 } else { 100 }),
                     },
-                },
-            }],
-            "summary": { "status": "done", "log_path": log_path },
+                })
+            },
+        );
+        assert!(mesh_reply::serialized_len(&envelope) > mesh_reply::MAX_FRAME_SIZE);
+        assert_eq!(
+            fit_executor_answer_for_mesh(&mut envelope),
+            ExecutorAnswerFit::Cut
+        );
+        let reply = executor_reply(&envelope);
+        assert!(mesh_reply::oversized(&reply).is_none());
+        let events = envelope["payload"]["events"].as_array().expect("events");
+        assert_eq!(events.len(), 10);
+        for (index, event) in events.iter().enumerate() {
+            let step = index / 2;
+            assert_eq!(event["step_id"], json!(format!("s{step}")));
+            assert_eq!(event["execution_id"], json!("exec-1"), "kept when cut");
+            if step == 0 {
+                assert_eq!(event["args_truncated"], json!(true), "{event}");
+                assert!(event["args_bytes"].as_u64() > Some(60_000));
+            } else {
+                // A small one stays whole.
+                assert_eq!(
+                    event["tool_args_preview"],
+                    json!({ "workflow_name": format!("w{step}") })
+                );
+                assert!(event.get("args_truncated").is_none());
+            }
+            if event["status"] == json!("done") {
+                assert_eq!(
+                    event["result_preview"]["payload"]["wf_node"],
+                    json!({ "status": "ok", "node_name": format!("WF.w{step}@motherbee") })
+                );
+                if step == 0 {
+                    assert_eq!(event["output_truncated"], json!(true));
+                } else {
+                    assert!(event.get("output_truncated").is_none(), "{event}");
+                }
+            }
+        }
+        let bounded = &envelope["payload"]["outputs_bounded"];
+        assert_eq!(bounded["mode"], json!("cut"));
+        assert!(bounded["max_bytes_each"].as_u64() >= Some(EXECUTOR_MESH_PREVIEW_MIN_BYTES as u64));
+        assert_eq!(bounded["full_log"], json!(EXECUTOR_LOG_PATH));
+    }
+
+    /// FINDINGS A-198, M4 (c): a 300-step plan with an output and args of its own in every step
+    /// arrives with every step's status: the outputs and args are dropped, each step keeping its
+    /// status, its ids and what Archi reads, and then each step its last event.
+    #[test]
+    fn a_three_hundred_step_plan_arrives_with_every_status() {
+        let mut envelope = executor_envelope(
+            300,
+            "run_node",
+            |step| json!({ "node_name": format!("AI.n{step}@worker1"), "config": { "prompt": "p".repeat(1_000) } }),
+            |step| {
+                json!({
+                    "status": "ok",
+                    "payload": {
+                        "node_name": format!("AI.n{step}@worker1"),
+                        "config": { "prompt": "p".repeat(2_000) },
+                    },
+                })
+            },
+        );
+        let before = executor_last_statuses(&envelope);
+        let fit = fit_executor_answer_for_mesh(&mut envelope);
+        assert!(
+            matches!(
+                fit,
+                ExecutorAnswerFit::OutputsDropped | ExecutorAnswerFit::EventsCollapsed
+            ),
+            "{fit:?}"
+        );
+        let reply = executor_reply(&envelope);
+        assert!(
+            mesh_reply::oversized(&reply).is_none(),
+            "{} bytes",
+            mesh_reply::serialized_len(&reply)
+        );
+        assert_eq!(executor_last_statuses(&envelope), before);
+        assert_eq!(before.len(), 300);
+        let summary = &envelope["payload"]["summary"];
+        assert_eq!(summary["completed_steps"], json!(300));
+        assert_eq!(summary["log_path"], json!(EXECUTOR_LOG_PATH));
+        let last = envelope["payload"]["events"]
+            .as_array()
+            .expect("events")
+            .last()
+            .expect("an event")
+            .clone();
+        assert_eq!(last["step_id"], json!("s299"));
+        assert_eq!(last["result_preview"]["status"], json!("ok"));
+        assert_eq!(
+            last["result_preview"]["payload"]["node_name"],
+            json!("AI.n299@worker1")
+        );
+        assert_eq!(last["output_truncated"], json!(true));
+        assert!(last.get("timestamp").is_none());
+        let mode = envelope["payload"]["outputs_bounded"]["mode"].clone();
+        assert!(
+            mode == json!("outputs_dropped") || mode == json!("events_collapsed"),
+            "{mode}"
+        );
+    }
+
+    /// FINDINGS A-198, M4 (c): with its outputs dropped, a change's answer keeps what Archi reads
+    /// of it: an installation update's id and state, the hives it has not reached yet, a
+    /// version.
+    #[test]
+    fn an_executor_answer_without_its_outputs_keeps_what_archi_reads() {
+        let preview = json!({
+            "status": "partial",
+            "action": "update_installation",
+            "payload": {
+                "update": { "id": "upd-1", "state": "open", "hives": { "w": { "detail": "x".repeat(5_000) } } },
+                "pending": ["worker7"],
+                "version": 4,
+                "wf_node": { "status": "error", "node_name": "WF.a@motherbee", "error": "spawn failed" },
+                "warning": "the node did not start",
+                "noise": "n".repeat(5_000),
+            },
         });
-        assert!(bound_executor_answer_for_mesh(&mut update));
-        let preview = &update["events"][0]["result_preview"];
-        assert_eq!(preview["status"], json!("partial"));
-        assert_eq!(preview["payload"]["update"]["id"], json!("upd-1"));
-        assert_eq!(preview["payload"]["update"]["state"], json!("open"));
-        assert_eq!(preview["payload"]["pending"], json!(["worker7"]));
-        assert!(mesh_reply::serialized_len(&update) < mesh_reply::MAX_FRAME_SIZE);
+        let kept = executor_result_essentials(&preview);
+        assert_eq!(kept["status"], json!("partial"));
+        assert_eq!(
+            kept["payload"]["update"],
+            json!({ "id": "upd-1", "state": "open" })
+        );
+        assert_eq!(kept["payload"]["pending"], json!(["worker7"]));
+        assert_eq!(kept["payload"]["version"], json!(4));
+        assert_eq!(
+            kept["payload"]["wf_node"],
+            json!({ "status": "error", "node_name": "WF.a@motherbee", "error": "spawn failed" })
+        );
+        assert_eq!(kept["payload"]["warning"], json!("the node did not start"));
+        assert!(kept["payload"].get("noise").is_none());
+        assert!(mesh_reply::serialized_len(&kept) < 1_024);
+    }
+
+    /// FINDINGS A-198, M4 (d): an answer too large even with each step's last event goes as
+    /// REPLY_TOO_LARGE, which says the plan ran and keeps its execution_id, its status, its steps
+    /// and its full log's path.
+    #[tokio::test]
+    async fn an_executor_answer_past_every_cut_keeps_the_run_s_id_and_log() {
+        let (ctx, mut harness) = opa_test_admin("executor-too-large");
+        let mut envelope = executor_envelope(
+            3_000,
+            "run_node",
+            |step| json!({ "node_name": format!("AI.n{step}@worker1") }),
+            |step| json!({ "status": "ok", "payload": { "node_name": format!("AI.n{step}@worker1") } }),
+        );
+        assert_eq!(
+            fit_executor_answer_for_mesh(&mut envelope),
+            ExecutorAnswerFit::TooLarge
+        );
+        let request = mesh_admin_request("executor_execute_plan", "SY.architect@motherbee");
+        send_admin_command_response(
+            &ctx.rpc,
+            &request,
+            "executor_execute_plan",
+            "ok",
+            internal_response_payload_value(&envelope),
+            None,
+            None,
+            Some("req-9".to_string()),
+        )
+        .await
+        .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.payload["error_code"], json!(REPLY_TOO_LARGE));
+        let detail = &reply.payload["error_detail"];
+        assert_eq!(detail["action_ran"], json!(true));
+        assert_eq!(detail["outcome"]["execution_id"], json!("exec-1"));
+        assert_eq!(detail["outcome"]["plan_status"], json!("done"));
+        assert_eq!(detail["outcome"]["completed_steps"], json!(3_000));
+        assert_eq!(detail["outcome"]["total_steps"], json!(3_000));
+        assert_eq!(detail["outcome"]["log_path"], json!(EXECUTOR_LOG_PATH));
+        let message = detail["message"].as_str().expect("message");
+        assert!(message.contains("executor_execute_plan ran"), "{message}");
     }
 
     /// FINDINGS A-198: the provisioning catalog IO.cloud reads over the mesh stays within 100 KiB,
@@ -25621,6 +26361,143 @@ mod tests {
                 .await
                 .expect("answered");
         assert_eq!(status, 400);
+    }
+
+    /// FINDINGS A-198: SY.admin's own vault checks see every secret, page after page: the provider
+    /// keys a reader may read and the secrets that block a tenant's purge, past SY.vault's first
+    /// page.
+    #[tokio::test]
+    async fn sy_admin_s_vault_checks_read_every_page() {
+        let (ctx, mut harness) = opa_test_admin("vault-check-pages");
+        let wait = Duration::from_secs(5);
+        let secret = |key: &str, ilk: &str| json!({ "key": key, "metadata": { "ilk": ilk, "assigned_ilks": [] } });
+        let keys = list_provider_keys(&ctx.rpc, "motherbee", "tnt:x", AiProvider::Anthropic);
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("page 1");
+            assert_eq!(first.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+            assert_eq!(first.payload["filter"]["tenant_id"], json!("tnt:x"));
+            assert_eq!(
+                first.payload["filter"]["limit"],
+                json!(LIST_SOURCE_PAGE_ROWS)
+            );
+            assert!(first.payload.get("cursor").is_none());
+            let page = json!({
+                "status": "ok", "count": 1, "total": 2, "next_cursor": "0a",
+                "secrets": [secret("anthropic_a", "ilk:a")],
+            });
+            harness
+                .inject(reply_to(&first, MSG_VAULT_LIST_RESPONSE, page))
+                .await
+                .unwrap();
+            let second = harness.next_outgoing_within(wait).await.expect("page 2");
+            assert_eq!(second.payload["cursor"], json!("0a"));
+            let page = json!({
+                "status": "ok", "count": 1, "total": 2,
+                "secrets": [secret("anthropic_b", "ilk:b")],
+            });
+            harness
+                .inject(reply_to(&second, MSG_VAULT_LIST_RESPONSE, page))
+                .await
+                .unwrap();
+        };
+        let (keys, ()) = tokio::join!(keys, drive);
+        let keys = keys.expect("listed");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|key| key.read_by(Some("ilk:b"))));
+
+        let purge = json!({ "tenant_id": "tnt:x" });
+        let block = purge_tenant_vault_block(&ctx.rpc, "motherbee", &purge);
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("page 1");
+            let page = json!({
+                "status": "ok", "count": 1, "total": 2, "next_cursor": "0a",
+                "secrets": [secret("slack_a", "ilk:a")],
+            });
+            harness
+                .inject(reply_to(&first, MSG_VAULT_LIST_RESPONSE, page))
+                .await
+                .unwrap();
+            let second = harness.next_outgoing_within(wait).await.expect("page 2");
+            let page = json!({
+                "status": "ok", "count": 1, "total": 2, "secrets": [secret("slack_b", "ilk:b")],
+            });
+            harness
+                .inject(reply_to(&second, MSG_VAULT_LIST_RESPONSE, page))
+                .await
+                .unwrap();
+        };
+        let (block, ()) = tokio::join!(block, drive);
+        let (status, body) = block.expect("blocked");
+        assert_eq!(status, 409);
+        assert!(
+            body.contains("2 secret(s)") && body.contains("slack_b"),
+            "{body}"
+        );
+
+        // A listing SY.vault refuses blocks the purge too: it fails closed.
+        let block = purge_tenant_vault_block(&ctx.rpc, "motherbee", &purge);
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("listing");
+            let refusal =
+                json!({ "status": "error", "error_code": "UNAUTHORIZED", "message": "no" });
+            harness
+                .inject(reply_to(&first, MSG_VAULT_LIST_RESPONSE, refusal))
+                .await
+                .unwrap();
+        };
+        let (block, ()) = tokio::join!(block, drive);
+        let (_, body) = block.expect("blocked");
+        assert!(body.contains("VAULT_CHECK_FAILED"), "{body}");
+    }
+
+    /// FINDINGS A-198: vault_list with `"filter": null` is a listing without a filter, each page
+    /// asked with its limit.
+    #[tokio::test]
+    async fn vault_list_with_a_null_filter_asks_its_pages() {
+        let (ctx, mut harness) = opa_test_admin("vault-null-filter");
+        let wait = Duration::from_secs(5);
+        let listing = handle_vault_list(
+            &ctx,
+            &ctx.rpc,
+            "SY.vault@motherbee",
+            json!({ "filter": null }),
+        );
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("page 1");
+            assert_eq!(first.payload["filter"], json!({ "limit": 200 }));
+            let page = json!({ "status": "ok", "count": 0, "total": 0, "secrets": [] });
+            harness
+                .inject(reply_to(&first, MSG_VAULT_LIST_RESPONSE, page))
+                .await
+                .unwrap();
+        };
+        let ((status, body), ()) = tokio::join!(listing, drive);
+        assert_eq!(status, 200, "{body}");
+    }
+
+    /// FINDINGS A-198: an assembled listing takes at most its caller's own time: each page is
+    /// asked with the time left, and one not done by then answers TIMEOUT.
+    #[tokio::test]
+    async fn a_listing_past_its_deadline_answers_timeout() {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let within = Duration::from_millis(80);
+        let listing = assemble_list_pages("nodes", &PageAsk::default(), within, |_, left| {
+            let page = asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                assert!(left <= within);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(json!({
+                    "status": "ok",
+                    "nodes": [{ "name": format!("n{page}") }],
+                    "next_cursor": format!("motherbee|n{page}"),
+                }))
+            }
+        })
+        .await;
+        let err = listing.expect_err("past its deadline");
+        assert_eq!(infer_transport_error_code(&err.to_string()), "TIMEOUT");
+        let pages = asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=4).contains(&pages), "{pages} pages");
     }
 
     /// FINDINGS A-198: `list_versions`' pages each compare their hives with the motherbee's
@@ -27621,8 +28498,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// FINDINGS A-198: the log's pages follow their cursor, newest first, two entries of one
-    /// millisecond included, and a page asked while the log grows keeps its place.
+    /// Every page of the command log from the newest on, `limit` entries each: the seqs listed.
+    fn command_log_every_page(dir: &Path, limit: usize) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = read_recent_admin_commands(
+                dir,
+                &AdminCommandLogQuery {
+                    limit,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                },
+            );
+            seqs.extend(page.rows.iter().filter_map(|entry| entry["seq"].as_u64()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return seqs,
+            }
+        }
+    }
+
+    /// FINDINGS A-198: the log's pages follow their cursor, newest first by each entry's seq, two
+    /// entries of one millisecond included, and a page asked while the log grows keeps its place.
     #[test]
     fn command_log_pages_follow_their_cursor() {
         let dir = command_log_test_state_dir("pages");
@@ -27639,27 +28537,218 @@ mod tests {
                 },
             )
         };
-        let times = |page: &mesh_reply::ListPage| -> Vec<u64> {
+        let seqs = |page: &mesh_reply::ListPage| -> Vec<u64> {
             page.rows
                 .iter()
-                .filter_map(|entry| entry["ts_ms"].as_u64())
+                .filter_map(|entry| entry["seq"].as_u64())
                 .collect()
         };
         let first = page(2, None);
-        assert_eq!(times(&first), vec![5, 4]);
-        assert_eq!(first.next_cursor.as_deref(), Some("4:0"));
+        assert_eq!(seqs(&first), vec![6, 5]);
+        assert_eq!(first.next_cursor.as_deref(), Some("5"));
         assert_eq!(first.total, 6);
         // A command logged meanwhile does not move the next page.
         append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", 6));
         let second = page(2, first.next_cursor.clone());
-        assert_eq!(times(&second), vec![4, 3]);
-        assert_eq!(second.next_cursor.as_deref(), Some("3:0"));
+        assert_eq!(seqs(&second), vec![4, 3]);
+        assert_eq!(second.next_cursor.as_deref(), Some("3"));
         let last = page(5, second.next_cursor.clone());
-        assert_eq!(times(&last), vec![2, 1]);
+        assert_eq!(seqs(&last), vec![2, 1]);
         assert_eq!(last.next_cursor, None);
-        assert_eq!(command_log_place("4:1"), Some((4, 1)));
+        assert_eq!(command_log_place("4"), Some(4));
+        assert_eq!(command_log_place("-2"), Some(-2));
+        assert_eq!(command_log_place("4:1"), None);
+        assert_eq!(command_log_place("0"), None);
         assert_eq!(command_log_place("not a cursor"), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: the order is the order the entries were written in, so a clock that steps
+    /// back (an entry older by its ts_ms than the one before) neither hides nor repeats one.
+    #[test]
+    fn command_log_pages_hold_when_the_clock_steps_back() {
+        let dir = command_log_test_state_dir("clock-back");
+        for ts in [100u64, 200, 300, 50, 60, 250, 10] {
+            append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", ts));
+        }
+        assert_eq!(command_log_every_page(&dir, 2), vec![7, 6, 5, 4, 3, 2, 1]);
+        let newest = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery {
+                limit: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(newest.rows[0]["ts_ms"], json!(10));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: entries appended at once, each under the log's lock as SY.admin appends
+    /// them, get every seq once, across the log's rotations, and the pages list each one once.
+    #[test]
+    fn command_log_concurrent_appends_page_every_entry_once() {
+        let dir = command_log_test_state_dir("concurrent");
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let writers: Vec<_> = (0..8u64)
+            .map(|writer| {
+                let (dir, lock) = (dir.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    for n in 0..20u64 {
+                        // Clocks that disagree: each writer's own, some going back.
+                        let ts = 1_000 + (n * 7 + writer * 13) % 50;
+                        let entry = command_log_entry("run_node", None, "ok", ts);
+                        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        append_admin_command_log_locked(&dir, &entry);
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("a writer");
+        }
+        // 160 entries: the active file and one rotation.
+        let seqs = command_log_every_page(&dir, 7);
+        assert_eq!(seqs, (1..=160).rev().collect::<Vec<u64>>());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: entries written before the seqs (none has one) page after every entry with
+    /// one, newest first, and their places hold while the log grows.
+    #[test]
+    fn command_log_entries_without_a_seq_page_after_the_others() {
+        let dir = command_log_test_state_dir("without-seq");
+        fs::create_dir_all(admin_command_log_dir(&dir)).expect("log dir");
+        let old: String = (1..=3u64)
+            .map(|ts| {
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&command_log_entry("old_action", None, "ok", ts))
+                        .expect("entry")
+                )
+            })
+            .collect();
+        fs::write(admin_command_log_path(&dir), old).expect("old entries");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", 4));
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", 5));
+        let first = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery {
+                limit: 3,
+                ..Default::default()
+            },
+        );
+        let seq_of = |entry: &Value| entry["seq"].as_u64();
+        assert_eq!(
+            first.rows.iter().map(seq_of).collect::<Vec<_>>(),
+            vec![Some(2), Some(1), None]
+        );
+        assert_eq!(first.rows[2]["ts_ms"], json!(3));
+        assert_eq!(first.next_cursor.as_deref(), Some("-1"));
+        // A new entry does not move the old ones' places.
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", 6));
+        let rest = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery {
+                limit: 5,
+                cursor: first.next_cursor.clone(),
+                ..Default::default()
+            },
+        );
+        let times: Vec<u64> = rest
+            .rows
+            .iter()
+            .filter_map(|entry| entry["ts_ms"].as_u64())
+            .collect();
+        assert_eq!(times, vec![2, 1]);
+        assert_eq!(rest.next_cursor, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: a page of the log stays within half a frame whatever its entries' params
+    /// (each params cut to 2 KiB of text, which serialized again doubles), so list_recent_commands'
+    /// default page of 50 always fits a mesh reply, with next_cursor to the rest.
+    #[test]
+    fn command_log_default_page_fits_the_frame() {
+        let dir = command_log_test_state_dir("budget");
+        // A params whose cut preview is all quotes: every byte escaped once more in the entry.
+        let params = admin_command_log_params(&json!({ "note": "\"".repeat(10_000) }));
+        assert_eq!(params["_truncated"], json!(true));
+        for ts in 0..50u64 {
+            let mut entry = command_log_entry("set_node_config", None, "ok", ts);
+            entry.params = params.clone();
+            append_admin_command_log_locked(&dir, &entry);
+        }
+        let page = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery {
+                limit: ADMIN_COMMAND_LOG_DEFAULT_LIMIT,
+                ..Default::default()
+            },
+        );
+        assert!(page.rows.len() < 50, "{} entries", page.rows.len());
+        assert!(page.next_cursor.is_some());
+        assert_eq!(page.total, 50);
+        let count = page.rows.len();
+        let answer = page.into_answer("commands", json!({ "count": count }));
+        let request = mesh_admin_request("list_recent_commands", "SY.architect@motherbee");
+        let reply = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "list_recent_commands",
+            "ok",
+            answer,
+            None,
+            None,
+            Some(Uuid::new_v4().to_string()),
+        );
+        assert!(mesh_reply::oversized(&reply).is_none());
+        assert!(mesh_reply::serialized_len(&reply) <= mesh_reply::LIST_PAGE_MAX_BYTES + 4 * 1024);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: list_recent_commands refuses a cursor the log did not give
+    /// (INVALID_CURSOR, 400) and takes an empty one as none.
+    #[tokio::test]
+    async fn list_recent_commands_checks_its_cursor() {
+        let (ctx, _harness) = opa_test_admin("commands-cursor");
+        append_admin_command_log_locked(
+            &ctx.state_dir,
+            &command_log_entry("run_node", None, "ok", 1),
+        );
+        let (status, body) = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "list_recent_commands",
+            json!({ "cursor": "4:0" }),
+            None,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 400);
+        let envelope: Value = serde_json::from_str(&body).expect("envelope");
+        assert_eq!(envelope["error_code"], json!(mesh_reply::INVALID_CURSOR));
+        let (status, body) = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "list_recent_commands",
+            json!({ "cursor": "", "limit": 5 }),
+            None,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 200);
+        let envelope: Value = serde_json::from_str(&body).expect("envelope");
+        assert_eq!(envelope["payload"]["count"], json!(1));
+        let (status, _) = handle_admin_command(
+            &ctx,
+            &ctx.rpc,
+            "list_recent_commands",
+            json!({ "limit": 0 }),
+            None,
+        )
+        .await
+        .expect("answered");
+        assert_eq!(status, 400);
     }
 
     #[test]
@@ -33435,6 +34524,8 @@ mod tests {
                             {"version": 1, "sha256": "aaa", "written_at_ms": 1, "source": "migration", "ai": claude_installation()},
                             {"version": 2, "sha256": "bbb", "written_at_ms": 2, "source": "operator", "ai": claude_installation()},
                         ],
+                        "versions_total": 2,
+                        "versions_latest": 2,
                         "applied": {"version": 2, "sha256": "bbb", "applied_at_ms": 3, "ai": claude_installation(), "restarted": []},
                     },
                 },
@@ -33486,6 +34577,11 @@ mod tests {
             installation_current_values(&broken),
             Some(claude_installation())
         );
+        // A page of older versions (versions_before) still names the newest one recorded.
+        let mut older_page = broken.clone();
+        older_page["versions"] = json!([older_page["versions"][0].clone()]);
+        older_page["versions_next_before"] = json!(1);
+        assert_eq!(installation_expected_version(&older_page), Some(2));
         broken["versions"][1]["ai"] = Value::Null;
         assert_eq!(installation_current_values(&broken), None);
         // No file: nothing to name.
