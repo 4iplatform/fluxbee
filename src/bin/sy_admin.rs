@@ -4381,7 +4381,7 @@ async fn send_admin_command_response(
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
     // Taken before the reply takes the payload: what a REPLY_TOO_LARGE keeps of it.
-    let outcome = admin_reply_outcome(status, error_code.as_deref(), &payload);
+    let outcome = admin_reply_outcome(action, status, error_code.as_deref(), &payload);
     let rows = admin_reply_rows(action, &payload);
     let response = admin_command_response_message(
         sender.uuid(),
@@ -4421,14 +4421,24 @@ async fn send_admin_command_response(
 }
 
 /// What a REPLY_TOO_LARGE keeps of the reply it replaces (FINDINGS A-198): the action's status and
-/// error code, and the ids its payload names (`mesh_reply::reply_outcome`).
+/// error code, the ids its payload names (`mesh_reply::reply_outcome`), and the ones an action keeps
+/// deeper in it (`admin_reply_outcome_paths`).
 fn admin_reply_outcome(
+    action: &str,
     status: &str,
     error_code: Option<&str>,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let mut outcome = mesh_reply::reply_outcome(payload);
     if let Some(fields) = outcome.as_object_mut() {
+        for (name, pointer) in admin_reply_outcome_paths(action) {
+            if let Some(value) = payload
+                .pointer(pointer)
+                .filter(|value| mesh_reply::is_outcome_value(value))
+            {
+                fields.insert((*name).to_string(), value.clone());
+            }
+        }
         fields.insert("status".to_string(), serde_json::json!(status));
         match error_code {
             Some(code) => fields.insert("error_code".to_string(), serde_json::json!(code)),
@@ -4436,6 +4446,21 @@ fn admin_reply_outcome(
         };
     }
     outcome
+}
+
+/// The outcome an action's answer keeps deeper than its payload's top level, by the name a
+/// REPLY_TOO_LARGE gives it and where it is: an installation update's id, state and opening
+/// (stage 4's `update_installation`, whose payload holds the update as `update`), the id a caller
+/// follows it by with `get_installation_update`.
+fn admin_reply_outcome_paths(action: &str) -> &'static [(&'static str, &'static str)] {
+    match action {
+        "update_installation" => &[
+            ("update_id", "/update/id"),
+            ("update_state", "/update/state"),
+            ("opening", "/opening"),
+        ],
+        _ => &[],
+    }
 }
 
 /// How a caller pages an action whose answer grows with the installation (FINDINGS A-198): the
@@ -25244,6 +25269,73 @@ mod tests {
             assert!(!admin_action_is_read_only(action), "{action}");
         }
         assert!(!admin_reply_reports_a_change("list_ilks"));
+    }
+
+    /// FINDINGS A-198 on stage 4's actions: an installation update's answer the frame refuses says
+    /// it ran and keeps the update's id, its state and its opening, which get_installation_update
+    /// follows; get_installation_update's history, a read, is to be read over HTTP.
+    #[tokio::test]
+    async fn the_installation_update_s_reply_too_large_keeps_the_update_s_id() {
+        let (ctx, mut harness) = opa_test_admin("reply-too-large-update");
+        let request = mesh_admin_request("update_installation", "SY.architect@motherbee");
+        let hives: serde_json::Map<String, Value> = (0..600)
+            .map(|n| {
+                (
+                    format!("worker{n}"),
+                    json!({ "role": "worker", "core": { "state": "pending", "detail": "x".repeat(200) } }),
+                )
+            })
+            .collect();
+        let payload = json!({
+            "update": { "id": "upd-7", "state": "open", "hives": hives },
+            "opening": "opened",
+            "pending": ["worker1"],
+            "message": "update upd-7 is open",
+        });
+        assert!(mesh_reply::serialized_len(&payload) > mesh_reply::MAX_FRAME_SIZE);
+        send_admin_command_response(
+            &ctx.rpc,
+            &request,
+            "update_installation",
+            "partial",
+            payload,
+            None,
+            None,
+            Some("req-1".to_string()),
+        )
+        .await
+        .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.payload["error_code"], json!(REPLY_TOO_LARGE));
+        let detail = &reply.payload["error_detail"];
+        assert_eq!(detail["action_ran"], json!(true));
+        assert_eq!(detail["read_only"], json!(false));
+        assert_eq!(
+            detail["outcome"],
+            json!({
+                "status": "partial",
+                "update_id": "upd-7",
+                "update_state": "open",
+                "opening": "opened",
+            })
+        );
+        let message = detail["message"].as_str().expect("message");
+        assert!(message.contains("update_installation ran"), "{message}");
+
+        let read = admin_reply_too_large_detail(
+            "get_installation_update",
+            json!({ "status": "ok" }),
+            None,
+            200_000,
+            mesh_reply::MAX_FRAME_SIZE,
+        );
+        assert_eq!(read["read_only"], json!(true));
+        assert!(read.get("action_ran").is_none());
+        assert!(read.get("paging").is_none());
+        assert_eq!(read["http"], json!("GET /installation/update"));
     }
 
     /// FINDINGS A-198: a reply within the frame goes as it is built, nothing in its place.

@@ -93,6 +93,12 @@ pub fn reply_outcome(reply: &Value) -> Value {
     Value::Object(outcome)
 }
 
+/// Whether `value` is what an outcome keeps: a number, a boolean, or a text of at most 256
+/// characters, never an object, a list or a long text.
+pub fn is_outcome_value(value: &Value) -> bool {
+    short_scalar(&value)
+}
+
 fn short_scalar(value: &&Value) -> bool {
     match value {
         Value::String(text) => !text.is_empty() && text.chars().count() <= OUTCOME_ID_MAX_CHARS,

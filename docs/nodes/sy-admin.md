@@ -165,7 +165,11 @@ the caller then waited to its own timeout, with no reason (FINDINGS A-198). Now:
   `read_only`, and the mesh-only `executor_execute_plan`, `externalize` and `unexternalize`
   (`admin_reply_reports_a_change`), `error_detail.action_ran` is `true`, `read_only` is `false`,
   the message says it ran and must not be run again to see its answer, and the reply's
-  `meta.action_result` is the action's own (`applied` for an `ok`).
+  `meta.action_result` is the action's own (`applied` for an `ok`). An `update_installation`'s
+  `outcome` also keeps the update's `update_id`, `update_state` and `opening`
+  (`admin_reply_outcome_paths`), which `get_installation_update` follows
+  ([The installation's update](#the-installations-update)); `get_installation_update` itself is a
+  read, and its `history=true` answer past the frame names `GET /installation/update` in `http`.
 - **The nodes behind SY.admin answer the same way.** SY.identity, SY.orchestrator and SY.vault
   send `REPLY_TOO_LARGE` in place of an answer the frame refuses, in their own payload shape
   (`status`, `error_code`, `message`, `size`, `max`, `outcome`), and SY.admin passes it on at once
