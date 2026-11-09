@@ -10261,7 +10261,9 @@ async fn handle_chat_message(
                         }
                         // As the pipeline does: a run is done once its report verifies, a failed
                         // step and a deployed WF node that does not run included, and only then
-                        // does the plan teach the cookbook.
+                        // does the plan teach the cookbook. An installation update the plan ran is
+                        // followed to its end first.
+                        follow_installation_updates(&tool_ctx, &mut output).await;
                         let verdict = verify_execution_result(&output);
                         if verdict.eligible_for_cookbook {
                             if let Some(entry) = prog_pending.cookbook_entry {
@@ -10269,6 +10271,7 @@ async fn handle_chat_message(
                             }
                         }
                         let status = if verdict.verified_success {
+                            note_held_installation_updates(&mut output);
                             "ok"
                         } else {
                             if executor_output_is_successful(&output) {
@@ -12862,10 +12865,19 @@ const EXECUTOR_INSTALLATION_WAIT_SECS: u64 = 240;
 /// What Archi waits for SY.admin's executor per installation update in a plan
 /// (docs/hive-config-update-v1.md §6, stage 4): SY.admin's ceiling for `update_installation`
 /// (`admin_action_timeout` in sy_admin.rs: the motherbee's /versions, 30 s, then each hive's pass
-/// at once, the wait for its answer, 60 s, and a core update and a config update, each up to 90 s of
-/// sync_pending and an update's last answer, 60 s, 390 s in all), with a margin. Its answer comes
-/// once the cores answer restarting, about 20 s on 8.x; SY.admin follows the rest.
-const EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS: u64 = 420;
+/// at once, the wait for its answer, 120 s, two reads of its /versions, 50 s each, and a core
+/// update and a config update, each up to 90 s of sync_pending and an update's last answer, 60 s,
+/// 550 s in all), with a margin. Its answer comes once the cores answer restarting, about 20 s on
+/// 8.x; Archi then follows the update to its end ([`INSTALLATION_UPDATE_FOLLOW_SECS`]).
+const EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS: u64 = 580;
+
+/// How long Archi follows an installation update its plan ran, past the executor's answer, while
+/// its hives only move (a core in flight to its settle and its config after it, or a hive not read
+/// yet): twice SY.admin's settle bound (300 s). A run is verified once the update is done or held.
+const INSTALLATION_UPDATE_FOLLOW_SECS: u64 = 600;
+
+/// Archi's reads of `get_installation_update` while it follows an update: one every so often.
+const INSTALLATION_UPDATE_POLL_SECS: u64 = 10;
 
 /// The steps of an executor plan named `action`.
 fn plan_steps_named(plan: Option<&Value>, action: &str) -> u64 {
@@ -23463,63 +23475,42 @@ fn wf_deploys_left_not_running(execution_report: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The hives a change of the installation's `ai` in the run has not reached yet
-/// (docs/hive-config-update-v1.md §4, stage 3c). SY.admin writes the version and answers `partial`,
-/// naming each hive whose apply is not ok (sync_pending at its bound, an error, or no answer): a
-/// change Archi made is done only once every hive applied it. Each `set_installation_ai` step's
-/// last answer in the run's events is read (`payload.events[*].result_preview`, SY.admin's answer),
-/// as a deploy's is (`wf_deploys_left_not_running`). An `update_installation` step (§6, stage 4) is
-/// the same: `partial` while its update stays open, naming the hives not on its target.
-fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
+/// Each step of the run named `action` that ran, with its last answer in the run's events
+/// (`payload.events[*].result_preview`, SY.admin's answer), by step id: a step the executor ran
+/// again counts by its last run.
+fn executor_step_answers<'a>(execution_report: &'a Value, action: &str) -> Vec<&'a Value> {
     let Some(events) = execution_report
         .pointer("/payload/events")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
-    let mut answers: BTreeMap<&str, (&str, &Value)> = BTreeMap::new();
+    let mut answers: BTreeMap<&str, &Value> = BTreeMap::new();
     for event in events {
         let field = |key: &str| event.get(key).and_then(Value::as_str);
-        // The installation's update (stage 4) is the same: done once every hive is on its target.
-        let Some(action @ ("set_installation_ai" | "update_installation")) = field("step_action")
-        else {
-            continue;
-        };
-        if field("tool_name") == Some(action)
+        if field("step_action") == Some(action)
+            && field("tool_name") == Some(action)
             && field("status").is_some_and(|status| status.eq_ignore_ascii_case("done"))
         {
             if let (Some(step), Some(answer)) = (field("step_id"), event.get("result_preview")) {
-                answers.insert(step, (action, answer));
+                answers.insert(step, answer);
             }
         }
     }
-    answers
-        .into_values()
-        .filter(|(_, answer)| answer.get("status").and_then(Value::as_str) != Some("ok"))
-        .map(|(action, answer)| {
+    answers.into_values().collect()
+}
+
+/// The hives a change of the installation's `ai` in the run has not reached yet
+/// (docs/hive-config-update-v1.md §4, stage 3c). SY.admin writes the version and answers `partial`,
+/// naming each hive whose apply is not ok (sync_pending at its bound, an error, or no answer): a
+/// change Archi made is done only once every hive applied it. Each `set_installation_ai` step's
+/// last answer is read, as a deploy's is (`wf_deploys_left_not_running`).
+fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
+    executor_step_answers(execution_report, "set_installation_ai")
+        .into_iter()
+        .filter(|answer| answer.get("status").and_then(Value::as_str) != Some("ok"))
+        .map(|answer| {
             let payload = answer.get("payload");
-            if action == "update_installation" {
-                let id = payload
-                    .and_then(|payload| payload.pointer("/update/id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("its update");
-                let hives = payload
-                    .and_then(|payload| payload.get("pending"))
-                    .and_then(Value::as_array)
-                    .map(|pending| {
-                        pending
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .filter(|hives| !hives.is_empty())
-                    .unwrap_or_else(|| "some hives".to_string());
-                return format!(
-                    "the installation update {id} is not finished on {hives} yet \
-                     (get_installation_update follows it)"
-                );
-            }
             let version = payload
                 .and_then(|payload| payload.get("version"))
                 .and_then(Value::as_u64)
@@ -23544,6 +23535,318 @@ fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Where an installation update stands for a run's verdict (docs/hive-config-update-v1.md §6,
+/// stage 4), from SY.admin's view of it (`get_installation_update`'s `update`, or the `update` of
+/// `update_installation`'s answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallationUpdateStanding {
+    /// Done; or held: every hive on the target but those the operator rolled back (named), A-5's
+    /// one allowed divergence.
+    Finished { held: Vec<String> },
+    /// Its hives off the target only move on their own: a core in flight to its settle (its config
+    /// after it), or a hive not read yet. Each named.
+    Moving(Vec<String>),
+    /// What the update leaves off the target until someone acts (an error, a hive that did not
+    /// answer, sync_pending at its bound, a hive left as it is, a stale target): each hive with its
+    /// next. The moving ones are named too.
+    Stuck(Vec<String>),
+    /// Closed as superseded by another update (another target) before it finished.
+    Superseded(String),
+}
+
+fn installation_update_standing(update: &Value) -> InstallationUpdateStanding {
+    let names = |value: Option<&Value>| -> Vec<String> {
+        value
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match update.get("state").and_then(Value::as_str) {
+        Some("done") => return InstallationUpdateStanding::Finished { held: Vec::new() },
+        Some("held") => {
+            return InstallationUpdateStanding::Finished {
+                held: names(update.get("held")),
+            }
+        }
+        Some("superseded") => {
+            return InstallationUpdateStanding::Superseded(
+                update
+                    .get("superseded_by")
+                    .and_then(Value::as_str)
+                    .unwrap_or("another update")
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    if update
+        .get("stale_target")
+        .is_some_and(|stale| !stale.is_null())
+    {
+        return InstallationUpdateStanding::Stuck(vec![
+            "the motherbee holds another target than the update's (stale_target): nothing acts on \
+             it until update_installation runs again"
+                .to_string(),
+        ]);
+    }
+    let state = |slot: &Value| {
+        slot.get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let failed = |slot: &Value| {
+        slot.pointer("/outcome/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "error" | "not_answered" | "sync_pending"))
+    };
+    // A category that moves on its own: in flight, or not read yet.
+    let moves = |slot: &Value| {
+        let state = state(slot);
+        state == "in_flight" || (state == "unknown" && !failed(slot))
+    };
+    let rolled_back = |slot: &Value| {
+        state(slot) == "excluded"
+            && slot.get("exclusion").and_then(Value::as_str) == Some("rolled_back")
+    };
+    // A category that waits for the other one: on the target, moving, a config after its core, or
+    // a core the operator rolled back.
+    let waits = |slot: &Value| {
+        let state = state(slot);
+        state == "on_target"
+            || moves(slot)
+            || (state == "pending" && slot.get("outcome").is_none_or(Value::is_null))
+            || rolled_back(slot)
+    };
+    let (mut moving, mut stuck, mut held) = (Vec::new(), Vec::new(), Vec::new());
+    let hives = update.get("hives").and_then(Value::as_object);
+    for (hive, entry) in hives.into_iter().flatten() {
+        let (core, config) = (
+            entry.get("core").unwrap_or(&Value::Null),
+            entry.get("config").unwrap_or(&Value::Null),
+        );
+        let (core_state, config_state) = (state(core), state(config));
+        if core_state == "on_target" && config_state == "on_target" {
+            continue;
+        }
+        let line = format!("{hive} (core {core_state}, config {config_state})");
+        if rolled_back(core) && config_state == "on_target" {
+            held.push(hive.clone());
+        } else if (moves(core) || moves(config)) && waits(core) && waits(config) {
+            moving.push(line);
+        } else {
+            let next = [core, config]
+                .into_iter()
+                .filter(|slot| state(slot) != "on_target")
+                .find_map(|slot| slot.get("next").and_then(Value::as_str))
+                .unwrap_or("get_installation_update shows what moves it");
+            stuck.push(format!("{line}: {next}"));
+        }
+    }
+    if !stuck.is_empty() {
+        stuck.extend(
+            moving
+                .into_iter()
+                .map(|line| format!("{line}: still moving")),
+        );
+        return InstallationUpdateStanding::Stuck(stuck);
+    }
+    if !moving.is_empty() {
+        return InstallationUpdateStanding::Moving(moving);
+    }
+    InstallationUpdateStanding::Finished { held }
+}
+
+/// The installation updates a run's `update_installation` steps opened or resumed, by id, with
+/// SY.admin's view of each in their answer.
+fn executor_installation_updates(execution_report: &Value) -> Vec<(String, Value)> {
+    executor_step_answers(execution_report, "update_installation")
+        .into_iter()
+        .filter_map(|answer| {
+            let update = answer.pointer("/payload/update")?;
+            let id = update.get("id").and_then(Value::as_str)?;
+            Some((id.to_string(), update.clone()))
+        })
+        .collect()
+}
+
+/// Follows each installation update the run's `update_installation` steps left moving (stage 4,
+/// FINDINGS review F3): SY.admin answers once the cores answer restarting, and follows the rest; a
+/// run is verified once its update is done or held. `read` is one `get_installation_update` with
+/// its history; each update is read again every `period` while its hives only move, up to `bound`,
+/// and the last view of each is kept in the report's `installation_updates` (by id: the view and
+/// how long it was followed), which [`installation_updates_verdict`] judges.
+async fn follow_installation_updates_with<F, Fut>(
+    execution_report: &mut Value,
+    bound: Duration,
+    period: Duration,
+    mut read: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Value>>,
+{
+    let updates = executor_installation_updates(execution_report);
+    if updates.is_empty() {
+        return;
+    }
+    let started = time::Instant::now();
+    let mut latest: BTreeMap<String, Value> = updates.into_iter().collect();
+    loop {
+        let moving: Vec<String> = latest
+            .iter()
+            .filter(|(_, update)| {
+                matches!(
+                    installation_update_standing(update),
+                    InstallationUpdateStanding::Moving(_)
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if moving.is_empty() || started.elapsed() + period > bound {
+            break;
+        }
+        time::sleep(period).await;
+        let Some(view) = read().await else {
+            continue;
+        };
+        for id in moving {
+            if let Some(update) = installation_update_in_view(&view, &id) {
+                latest.insert(id, update);
+            }
+        }
+    }
+    let followed_s = started.elapsed().as_secs();
+    execution_report["installation_updates"] = Value::Object(
+        latest
+            .into_iter()
+            .map(|(id, update)| (id, json!({"update": update, "followed_s": followed_s})))
+            .collect(),
+    );
+}
+
+/// The update `id` in `get_installation_update`'s answer (with its history): the current one, or a
+/// closed one, whose history entry says only how it closed.
+fn installation_update_in_view(view: &Value, id: &str) -> Option<Value> {
+    if let Some(update) = view
+        .get("update")
+        .filter(|update| update.get("id").and_then(Value::as_str) == Some(id))
+    {
+        return Some(update.clone());
+    }
+    view.get("history")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|closed| closed.get("id").and_then(Value::as_str) == Some(id))
+        .map(|closed| {
+            json!({
+                "id": id,
+                "state": closed.get("state").cloned().unwrap_or(Value::Null),
+                "superseded_by": closed.get("superseded_by").cloned().unwrap_or(Value::Null),
+            })
+        })
+}
+
+/// A verified run's message names what its held installation updates leave: the hives on the core
+/// the operator rolled back to.
+fn note_held_installation_updates(output: &mut Value) {
+    let (_, notes) = installation_updates_verdict(output);
+    if notes.is_empty() {
+        return;
+    }
+    let message = output
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Executor plan finished")
+        .trim_end_matches('.')
+        .to_string();
+    output["message"] = json!(format!("{message}. Note: {}.", notes.join("; ")));
+}
+
+/// [`follow_installation_updates_with`] through SY.admin: its `get_installation_update`, Archi's
+/// read.
+async fn follow_installation_updates(context: &ArchitectAdminToolContext, report: &mut Value) {
+    let admin_target = format!("SY.admin@{}", context.hive_id);
+    follow_installation_updates_with(
+        report,
+        Duration::from_secs(INSTALLATION_UPDATE_FOLLOW_SECS),
+        Duration::from_secs(INSTALLATION_UPDATE_POLL_SECS),
+        || {
+            let admin_target = admin_target.clone();
+            async move {
+                let out = execute_admin_action_with_context(
+                    context,
+                    &admin_target,
+                    "get_installation_update",
+                    None,
+                    json!({"history": true}),
+                    "installation_update.follow",
+                )
+                .await
+                .ok()?;
+                (out.get("status").and_then(Value::as_str) == Some("ok"))
+                    .then(|| out.get("payload").cloned())
+                    .flatten()
+            }
+        },
+    )
+    .await;
+}
+
+/// What a run's installation updates leave (stage 4): what keeps the run from being done, each
+/// update with the hives it leaves and their next; and what the operator should know of one that
+/// is done (a held update's hives, on the core the operator rolled back to). The last view Archi
+/// followed counts ([`follow_installation_updates_with`]), else the step's answer.
+fn installation_updates_verdict(execution_report: &Value) -> (Vec<String>, Vec<String>) {
+    let followed = execution_report.get("installation_updates");
+    let (mut not_done, mut notes) = (Vec::new(), Vec::new());
+    for (id, answered) in executor_installation_updates(execution_report) {
+        let follow = followed.and_then(|followed| followed.get(&id));
+        let update = follow
+            .and_then(|follow| follow.get("update"))
+            .unwrap_or(&answered);
+        match installation_update_standing(update) {
+            InstallationUpdateStanding::Finished { held } if held.is_empty() => {}
+            InstallationUpdateStanding::Finished { held } => notes.push(format!(
+                "the installation update {id} is held: {} keep the core the operator rolled back to \
+                 (core_rollback, the one allowed divergence; each one's per-hive update closes it)",
+                held.join(", ")
+            )),
+            InstallationUpdateStanding::Moving(hives) => not_done.push(
+                match follow
+                    .and_then(|follow| follow.get("followed_s"))
+                    .and_then(Value::as_u64)
+                {
+                    Some(secs) => format!(
+                        "the installation update {id} still moves after {secs} s of following it: \
+                         {} (get_installation_update follows it)",
+                        hives.join(", ")
+                    ),
+                    None => format!(
+                        "the installation update {id} is not finished on {} yet \
+                         (get_installation_update follows it)",
+                        hives.join(", ")
+                    ),
+                },
+            ),
+            InstallationUpdateStanding::Stuck(hives) => not_done.push(format!(
+                "the installation update {id} is not finished: {}",
+                hives.join("; ")
+            )),
+            InstallationUpdateStanding::Superseded(by) => not_done.push(format!(
+                "the installation update {id} was superseded by {by} (another target) before it \
+                 finished"
+            )),
+        }
+    }
+    (not_done, notes)
+}
+
 fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     let summary = execution_report
         .get("payload")
@@ -23564,10 +23867,12 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
 
     let not_running = wf_deploys_left_not_running(execution_report);
     let not_applied = installation_changes_not_applied(execution_report);
+    let (update_not_done, update_notes) = installation_updates_verdict(execution_report);
     let verified_success = matches!(status, Some("done"))
         && !failed_step_present
         && not_running.is_empty()
-        && not_applied.is_empty();
+        && not_applied.is_empty()
+        && update_not_done.is_empty();
     let eligible_for_cookbook = verified_success
         && matches!((completed_steps, total_steps), (Some(completed), Some(total)) if completed == total);
 
@@ -23582,6 +23887,12 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
              config finishes a hive; get_installation_update shows the installation's update, each \
              hive's state and what moves it",
             not_applied.join("; ")
+        )
+    } else if !update_not_done.is_empty() {
+        format!(
+            "the plan ran, but {}: get_installation_update shows each hive's state, its last \
+             outcome and what moves it",
+            update_not_done.join("; ")
         )
     } else if !verified_success {
         match status {
@@ -23604,6 +23915,12 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
             _ => "execution verified but cookbook write skipped: step counts are missing"
                 .to_string(),
         }
+    };
+    // A held update is done for the run: the operator's rollbacks are said.
+    let reason = if verified_success && !update_notes.is_empty() {
+        format!("{reason}; {}", update_notes.join("; "))
+    } else {
+        reason
     };
 
     VerificationVerdict {
@@ -26051,7 +26368,7 @@ async fn handle_pipeline_confirm2(
     )
     .await
     {
-        Ok(output) => {
+        Ok(mut output) => {
             if !executor_output_is_successful(&output) {
                 let failure_text = executor_failure_text(&output);
                 let failure_class = classify_failure_deterministic(
@@ -26136,6 +26453,8 @@ async fn handle_pipeline_confirm2(
                     );
                 }
             }
+            // An installation update the plan ran is followed to its end before the verdict.
+            follow_installation_updates(&tool_ctx, &mut output).await;
             let verification = verify_execution_result(&output);
             let _ = advance_pipeline_run(
                 state,
@@ -30618,31 +30937,256 @@ mod tests {
             change("s1", "ok", Value::Null),
         ]));
         assert!(verdict.verified_success, "{}", verdict.reason);
+    }
 
-        // The installation's update (stage 4): verified once it is done; while it stays open, the
-        // reason names it and the hives not on its target.
-        let update = |status: &str, pending: Value| {
-            json!({
+    /// One hive's place in SY.admin's view of an installation update.
+    fn update_hive(core: Value, config: Value) -> Value {
+        json!({ "role": "worker", "core": core, "config": config, "automatic": null })
+    }
+
+    /// SY.admin's view of an installation update (`get_installation_update`'s `update`).
+    fn update_view(state: &str, hives: Value) -> Value {
+        json!({ "id": "upd-1731160000000", "state": state, "stale_target": null, "held": [],
+                "superseded_by": null, "hives": hives })
+    }
+
+    /// A run whose one step is `update_installation`, answered with `update`.
+    fn update_run(status: &str, update: Value) -> Value {
+        json!({ "status": "ok", "payload": {
+            "events": [{
                 "step_id": "s1", "step_action": "update_installation",
                 "tool_name": "update_installation", "status": "done",
                 "result_preview": { "status": status, "action": "update_installation",
-                    "payload": { "update": { "id": "upd-1731160000000" }, "pending": pending } }
-            })
-        };
-        let verdict = verify_execution_result(&report(vec![update("ok", Value::Null)]));
+                    "payload": { "update": update } }
+            }],
+            "summary": { "status": "done", "failed_step_id": null,
+                         "completed_steps": 1, "total_steps": 1 }
+        } })
+    }
+
+    /// The installation's update (stage 4, review F3): a run is verified once its update is done or
+    /// held (the held hives named, the operator's divergence); while its hives only move it is not
+    /// finished; a hive left in error, without an answer or sync_pending, a stale target or a
+    /// superseded update is not verified, each hive named with its next.
+    #[test]
+    fn an_installation_update_is_verified_once_done_or_held() {
+        let on = json!({ "state": "on_target" });
+        let in_flight = json!({ "state": "in_flight", "outcome": { "status": "restarting" } });
+        let after_core = json!({ "state": "pending", "reason": "its core first" });
+        let rolled_back = json!({ "state": "excluded", "exclusion": "rolled_back",
+            "next": "POST /hives/egress1/update" });
+
+        let done = update_view(
+            "done",
+            json!({ "worker1": update_hive(on.clone(), on.clone()) }),
+        );
+        let verdict = verify_execution_result(&update_run("ok", done));
+        assert!(verdict.verified_success && verdict.eligible_for_cookbook);
+        assert!(!verdict.reason.contains("held"), "{}", verdict.reason);
+
+        let mut held = update_view(
+            "held",
+            json!({ "worker1": update_hive(on.clone(), on.clone()),
+                    "egress1": update_hive(rolled_back.clone(), on.clone()) }),
+        );
+        held["held"] = json!(["egress1"]);
+        let verdict = verify_execution_result(&update_run("ok", held.clone()));
         assert!(verdict.verified_success, "{}", verdict.reason);
-        let verdict = verify_execution_result(&report(vec![update(
-            "partial",
-            json!(["egress1 (core in_flight (restarting), config pending)"]),
-        )]));
+        for part in [
+            "the installation update upd-1731160000000 is held",
+            "egress1 keep the core the operator rolled back to",
+        ] {
+            assert!(verdict.reason.contains(part), "{}", verdict.reason);
+        }
+        let mut output = update_run("ok", held);
+        note_held_installation_updates(&mut output);
+        assert!(output["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("egress1 keep the core")));
+
+        // Only moving: a core in flight with its config after it, a hive not read yet.
+        let moving = update_view(
+            "open",
+            json!({ "worker1": update_hive(in_flight.clone(), after_core.clone()),
+                    "worker2": update_hive(json!({"state": "unknown"}), json!({"state": "unknown"})) }),
+        );
+        assert_eq!(
+            installation_update_standing(&moving),
+            InstallationUpdateStanding::Moving(vec![
+                "worker1 (core in_flight, config pending)".to_string(),
+                "worker2 (core unknown, config unknown)".to_string(),
+            ])
+        );
+        let verdict = verify_execution_result(&update_run("partial", moving));
         assert!(!verdict.verified_success);
         for part in [
             "the installation update upd-1731160000000 is not finished on",
-            "egress1 (core in_flight (restarting), config pending)",
+            "worker1 (core in_flight, config pending)",
             "get_installation_update",
         ] {
             assert!(verdict.reason.contains(part), "{}", verdict.reason);
         }
+
+        // Left off the target until someone acts: each hive with its next, the moving ones named.
+        for (slot, says) in [
+            (
+                json!({ "state": "pending", "outcome": { "status": "error" },
+                        "next": "GET /hives/egress1/versions shows why" }),
+                "GET /hives/egress1/versions shows why",
+            ),
+            (
+                json!({ "state": "pending", "outcome": { "status": "not_answered" },
+                        "next": "the automatic step finishes it once it answers again" }),
+                "the automatic step finishes it",
+            ),
+            (
+                json!({ "state": "pending", "outcome": { "status": "sync_pending" },
+                        "next": "Syncthing brings dist" }),
+                "Syncthing brings dist",
+            ),
+            (
+                json!({ "state": "excluded", "exclusion": "hand_edited",
+                        "next": "restore its copy" }),
+                "restore its copy",
+            ),
+        ] {
+            let stuck = update_view(
+                "open",
+                json!({ "egress1": update_hive(on.clone(), slot),
+                        "worker1": update_hive(in_flight.clone(), after_core.clone()) }),
+            );
+            let verdict = verify_execution_result(&update_run("partial", stuck));
+            assert!(!verdict.verified_success);
+            for part in [
+                "the installation update upd-1731160000000 is not finished",
+                "egress1 (core on_target, config ",
+                says,
+                "worker1 (core in_flight, config pending): still moving",
+            ] {
+                assert!(verdict.reason.contains(part), "{}", verdict.reason);
+            }
+        }
+        let mut stale = update_view("open", json!({}));
+        stale["stale_target"] = json!({ "since_ms": 1 });
+        let verdict = verify_execution_result(&update_run("partial", stale));
+        assert!(
+            verdict.reason.contains("stale_target"),
+            "{}",
+            verdict.reason
+        );
+        let mut superseded = update_view("superseded", json!({}));
+        superseded["superseded_by"] = json!("upd-1731160009999");
+        let verdict = verify_execution_result(&update_run("partial", superseded));
+        assert!(!verdict.verified_success);
+        assert!(
+            verdict.reason.contains("superseded by upd-1731160009999"),
+            "{}",
+            verdict.reason
+        );
+
+        // Nothing to do: no update, nothing to judge.
+        let nothing = json!({ "status": "ok", "payload": {
+            "events": [{ "step_id": "s1", "step_action": "update_installation",
+                "tool_name": "update_installation", "status": "done",
+                "result_preview": { "status": "ok", "payload": { "nothing_to_do": true } } }],
+            "summary": { "status": "done", "failed_step_id": null,
+                         "completed_steps": 1, "total_steps": 1 } } });
+        assert!(verify_execution_result(&nothing).verified_success);
+    }
+
+    /// Archi follows an update its run left moving, reading it again until it is done or held, or
+    /// until nothing moves on its own, within its bound; the last view counts.
+    #[tokio::test]
+    async fn archi_follows_an_installation_update_to_its_end() {
+        let on = json!({ "state": "on_target" });
+        let in_flight = json!({ "state": "in_flight", "outcome": { "status": "restarting" } });
+        let after_core = json!({ "state": "pending" });
+        let moving = update_view(
+            "open",
+            json!({ "worker1": update_hive(in_flight.clone(), after_core.clone()) }),
+        );
+        let done = update_view(
+            "done",
+            json!({ "worker1": update_hive(on.clone(), on.clone()) }),
+        );
+        let period = Duration::from_millis(5);
+
+        // Moving, then done (now in the history as the last closed one is the current one).
+        let mut report = update_run("partial", moving.clone());
+        let views = std::sync::Mutex::new(vec![
+            json!({ "update": moving.clone(), "open": true, "history": [] }),
+            json!({ "update": done.clone(), "open": false, "history": [] }),
+        ]);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        follow_installation_updates_with(&mut report, Duration::from_secs(10), period, || {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = {
+                let mut views = views.lock().expect("views");
+                (!views.is_empty()).then(|| views.remove(0))
+            };
+            async move { next }
+        })
+        .await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            report["installation_updates"]["upd-1731160000000"]["update"]["state"],
+            json!("done")
+        );
+        let verdict = verify_execution_result(&report);
+        assert!(verdict.verified_success, "{}", verdict.reason);
+
+        // Superseded meanwhile: found in the history.
+        let mut report = update_run("partial", moving.clone());
+        follow_installation_updates_with(&mut report, Duration::from_secs(10), period, || async {
+            Some(
+                json!({ "update": { "id": "upd-2", "state": "open", "hives": {} }, "history": [
+                { "id": "upd-1731160000000", "state": "superseded", "superseded_by": "upd-2" } ] }),
+            )
+        })
+        .await;
+        let verdict = verify_execution_result(&report);
+        assert!(
+            verdict.reason.contains("superseded by upd-2"),
+            "{}",
+            verdict.reason
+        );
+
+        // Still moving at the bound: not verified, and said how long it was followed.
+        let mut report = update_run("partial", moving.clone());
+        let still = moving.clone();
+        follow_installation_updates_with(&mut report, Duration::from_millis(30), period, || {
+            let still = still.clone();
+            async move { Some(json!({ "update": still, "history": [] })) }
+        })
+        .await;
+        let verdict = verify_execution_result(&report);
+        assert!(!verdict.verified_success);
+        assert!(
+            verdict.reason.contains("still moves after"),
+            "{}",
+            verdict.reason
+        );
+
+        // Nothing moves on its own: decided at once, no read; a run with no update is left as it is.
+        let no_read = || -> std::future::Ready<Option<Value>> { panic!("no read") };
+        let stuck = update_view(
+            "open",
+            json!({ "egress1": update_hive(on.clone(), json!({ "state": "pending",
+                "outcome": { "status": "not_answered" }, "next": "the automatic step" })) }),
+        );
+        let mut report = update_run("partial", stuck.clone());
+        follow_installation_updates_with(&mut report, Duration::from_secs(10), period, no_read)
+            .await;
+        assert_eq!(
+            report["installation_updates"]["upd-1731160000000"]["update"],
+            stuck
+        );
+        assert!(!verify_execution_result(&report).verified_success);
+        let mut report = json!({ "status": "ok", "payload": { "events": [] } });
+        let before = report.clone();
+        follow_installation_updates_with(&mut report, Duration::from_secs(10), period, no_read)
+            .await;
+        assert_eq!(report, before);
     }
 
     /// Archi waits for SY.admin's ceiling of each change of the installation's `ai` in a plan, and
@@ -30678,14 +31222,16 @@ mod tests {
         assert!(!admin_action_allows_ai_write("set_installation_ai"));
 
         // The installation's update (stage 4): SY.admin's ceiling for each update_installation
-        // step, and its read, Archi's in its chat and while it compiles a plan.
+        // step (550 s) with a margin, and its read, Archi's in its chat and while it compiles a
+        // plan. Archi then follows the update to its end, up to twice SY.admin's settle bound.
         assert_eq!(
             architect_admin_action_timeout(
                 "executor_execute_plan",
                 &request(&["get_installation_update", "update_installation"])
             ),
-            base + Duration::from_secs(420)
+            base + Duration::from_secs(580)
         );
+        assert_eq!(INSTALLATION_UPDATE_FOLLOW_SECS, 600);
         let translated = translate_scmd(
             "motherbee",
             parse("curl -X GET /installation/update?history=true"),
