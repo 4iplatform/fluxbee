@@ -2,6 +2,7 @@ pub mod ai_settings;
 pub mod config;
 pub mod instance_lock;
 pub mod mesh_hmac;
+pub mod mesh_reply;
 mod opa;
 pub mod paths;
 pub mod release_settings;

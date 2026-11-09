@@ -24,6 +24,7 @@ use fluxbee_sdk::{
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
     MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
+use json_router::mesh_reply::{self, PageAsk};
 use json_router::release_settings::HiveRole;
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
@@ -763,15 +764,83 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// VAULT_LIST: one page of the secrets the filter matches (`VaultStore::list_page`), the page after
+/// the request's `cursor`, with `next_cursor` while secrets follow (FINDINGS A-198).
 fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
     let request: VaultListRequest = serde_json::from_value(msg.payload.clone())?;
-    let secrets = store.list(request.filter.unwrap_or_default(), caller)?;
+    // The cursor beside the SDK's filter, which has no field for one.
+    let cursor = match msg.payload.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) => {
+            Some(cursor.trim().to_string()).filter(|cursor| !cursor.is_empty())
+        }
+        Some(_) => {
+            return Err(VaultError::InvalidRequest(
+                "cursor must be the next_cursor of the page before, a string".to_string(),
+            ))
+        }
+    };
+    if cursor
+        .as_deref()
+        .is_some_and(|cursor| VaultListPlace::parse(cursor).is_none())
+    {
+        return Err(VaultError::InvalidRequest(
+            "cursor is not a next_cursor of VAULT_LIST".to_string(),
+        ));
+    }
+    let page = store.list_page(request.filter.unwrap_or_default(), caller, cursor)?;
     store.audit(MSG_VAULT_LIST, None, caller, "success", None)?;
-    Ok(json!({
-        "status": "ok",
-        "count": secrets.len(),
-        "secrets": secrets,
-    }))
+    let count = page.rows.len();
+    Ok(page.into_answer("secrets", json!({ "status": "ok", "count": count })))
+}
+
+/// VAULT_LIST's page when its filter names no limit, and the most it may name.
+fn vault_list_limit(filter: &VaultFilter) -> usize {
+    filter.limit.unwrap_or(200).clamp(1, 1000) as usize
+}
+
+/// The most bytes of secrets one VAULT_LIST answer carries (FINDINGS A-198): what would not fit the
+/// mesh's frame goes in the next page, after `next_cursor`. A caller that asks no more than fits
+/// gets its whole limit, as before the pages.
+const VAULT_LIST_PAGE_MAX_BYTES: usize = 96 * 1024;
+
+/// A secret's place in VAULT_LIST's order: the newest write first (`updated_at` descending), then
+/// `created_at` descending and `key` ascending. Its `cursor` is the hex of the three, so a caller
+/// passes it back as it is, in a query string too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VaultListPlace {
+    updated_at: String,
+    created_at: String,
+    key: String,
+}
+
+impl VaultListPlace {
+    fn cursor(&self) -> String {
+        hex::encode(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            self.updated_at, self.created_at, self.key
+        ))
+    }
+
+    fn parse(cursor: &str) -> Option<Self> {
+        let text = String::from_utf8(hex::decode(cursor.trim()).ok()?).ok()?;
+        let mut parts = text.splitn(3, '\u{1f}');
+        Some(Self {
+            updated_at: parts.next()?.to_string(),
+            created_at: parts.next()?.to_string(),
+            key: parts.next()?.to_string(),
+        })
+    }
+
+    /// Whether this place comes after `other` in the listing's order.
+    fn after(&self, other: &Self) -> bool {
+        other
+            .updated_at
+            .cmp(&self.updated_at)
+            .then_with(|| other.created_at.cmp(&self.created_at))
+            .then_with(|| self.key.cmp(&other.key))
+            .is_gt()
+    }
 }
 
 fn handle_delete(
@@ -1359,7 +1428,55 @@ impl VaultStore {
     }
 
     fn list(&self, filter: VaultFilter, caller: &Caller) -> VaultResult<Vec<VaultSecretSummary>> {
-        let limit = filter.limit.unwrap_or(200).clamp(1, 1000) as usize;
+        let limit = vault_list_limit(&filter);
+        Ok(self
+            .matching(&filter, caller)?
+            .into_iter()
+            .take(limit)
+            .map(|(_, summary)| summary)
+            .collect())
+    }
+
+    /// One page of the secrets `filter` matches (FINDINGS A-198): after `cursor` (a `next_cursor`
+    /// of the page before), at most the filter's limit, and at most `VAULT_LIST_PAGE_MAX_BYTES`,
+    /// so the answer always fits the mesh's frame; `next_cursor` while secrets follow and `total`,
+    /// how many it matches in all. A secret written while its caller pages moves to the front, so
+    /// a later page does not list it again.
+    fn list_page(
+        &self,
+        filter: VaultFilter,
+        caller: &Caller,
+        cursor: Option<String>,
+    ) -> VaultResult<mesh_reply::ListPage> {
+        let ask = PageAsk {
+            limit: Some(vault_list_limit(&filter)),
+            cursor,
+        };
+        let rows = self
+            .matching(&filter, caller)?
+            .into_iter()
+            .map(|(place, summary)| {
+                serde_json::to_value(summary).map(|summary| (place.cursor(), summary))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(mesh_reply::list_page(
+            rows,
+            &ask,
+            VAULT_LIST_PAGE_MAX_BYTES,
+            |row, cursor| match (VaultListPlace::parse(row), VaultListPlace::parse(cursor)) {
+                (Some(row), Some(cursor)) => row.after(&cursor),
+                // A cursor this vault did not write starts nothing: every row follows it.
+                _ => true,
+            },
+        ))
+    }
+
+    /// Every secret `filter` matches, each with its place in the listing's order.
+    fn matching(
+        &self,
+        filter: &VaultFilter,
+        caller: &Caller,
+    ) -> VaultResult<Vec<(VaultListPlace, VaultSecretSummary)>> {
         // Order most-recently-WRITTEN first so the consumer-resolution path (VaultClient
         // ::resolve_resource -> list_then_get_first, which takes the FIRST match) selects
         // the freshest secret when several share the same (resource_type, tenant, ilk) — the
@@ -1372,7 +1489,8 @@ impl VaultStore {
         // NOT NULL and RFC3339, so lexical DESC == chronological DESC.
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT key, metadata_json, version, access_count, last_accessed_at
+            SELECT key, metadata_json, version, access_count, last_accessed_at,
+                   updated_at, created_at
               FROM secrets
              ORDER BY updated_at DESC, created_at DESC, key ASC
             "#,
@@ -1435,16 +1553,21 @@ impl VaultStore {
             // any secret. The protection is on `vault_get` plaintext, not on
             // the list of keys.
             let _ = caller; // silence unused warning in this loop scope
-            summaries.push(VaultSecretSummary {
-                key,
-                metadata,
-                version: row.get(2)?,
-                access_count: row.get(3)?,
-                last_accessed_at: row.get(4)?,
-            });
-            if summaries.len() >= limit {
-                break;
-            }
+            let place = VaultListPlace {
+                updated_at: row.get(5)?,
+                created_at: row.get(6)?,
+                key: key.clone(),
+            };
+            summaries.push((
+                place,
+                VaultSecretSummary {
+                    key,
+                    metadata,
+                    version: row.get(2)?,
+                    access_count: row.get(3)?,
+                    last_accessed_at: row.get(4)?,
+                },
+            ));
         }
         Ok(summaries)
     }
@@ -2053,13 +2176,17 @@ async fn send_error_response(
     send_system_response(sender, request, msg_name, error_payload(err)).await
 }
 
+/// Every SY.vault answer goes out here. One the frame refuses (FINDINGS A-198), a value too large
+/// for one frame, is answered all the same: `REPLY_TOO_LARGE` goes in its place with the answer's
+/// outcome (`mesh_reply::reply_too_large_payload`), so the caller learns why at once and a write's
+/// notices still go out.
 async fn send_system_response(
     sender: &NodeSender,
     request: &Message,
     msg_name: &str,
     payload: Value,
 ) -> VaultResult<()> {
-    let reply = Message {
+    let reply = |payload: Value| Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
@@ -2074,8 +2201,29 @@ async fn send_system_response(
         },
         payload,
     };
-    sender.send(reply).await?;
-    Ok(())
+    let outcome = mesh_reply::reply_outcome(&payload);
+    match sender.send(reply(payload)).await {
+        Ok(()) => Ok(()),
+        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
+            let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
+            tracing::warn!(
+                request = request_msg,
+                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+                size,
+                max,
+                "a vault answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+            );
+            let how = if request_msg == MSG_VAULT_LIST {
+                "ask it in pages with filter.limit and cursor, following next_cursor"
+            } else {
+                "the secret's value is too large for one frame; read its metadata with VAULT_GET_METADATA"
+            };
+            let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, how);
+            sender.send(reply(small)).await?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn response_action_for(action: &str) -> &'static str {
@@ -2338,6 +2486,135 @@ mod tests {
 
     fn cleanup(dir: PathBuf) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// FINDINGS A-198: VAULT_LIST answers its filter's limit within the frame; past it, the page
+    /// ends with next_cursor, and the pages that follow it list every secret once, newest write
+    /// first, as one answer would.
+    #[test]
+    fn the_vault_listing_pages_within_the_frame() {
+        let (mut store, dir) = open_test_store([7u8; 32]);
+        let admin = admin_caller();
+        for n in 0..120 {
+            let mut meta = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
+            meta.description = Some("d".repeat(1_000));
+            store
+                .put(&format!("infra:k{n:03}"), json!("v"), meta, &admin)
+                .expect("put");
+        }
+        let list = |store: &mut VaultStore, payload: Value| {
+            handle_list(store, &vault_request(MSG_VAULT_LIST, payload), &admin).expect("list")
+        };
+        // A limit within the frame comes whole, with how many there are.
+        let first = list(&mut store, json!({ "filter": { "limit": 10 } }));
+        assert_eq!(first["count"], json!(10));
+        assert_eq!(first["total"], json!(120));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("next page")
+            .to_string();
+        assert!(VaultListPlace::parse(&cursor).is_some());
+        // Its whole limit would pass the frame: the page stops within it.
+        let whole = list(&mut store, json!({ "filter": { "limit": 1000 } }));
+        let rows = whole["secrets"].as_array().expect("secrets").len();
+        assert!(rows < 120, "{rows} secrets in one page");
+        assert!(mesh_reply::serialized_len(&whole) <= VAULT_LIST_PAGE_MAX_BYTES + 1_024);
+        // Following the cursor lists every secret once, in the same order.
+        let mut keys = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut payload = json!({ "filter": { "limit": 1000 } });
+            if let Some(cursor) = &cursor {
+                payload["cursor"] = json!(cursor);
+            }
+            let page = list(&mut store, payload);
+            keys.extend(
+                page["secrets"]
+                    .as_array()
+                    .expect("secrets")
+                    .iter()
+                    .filter_map(|secret| secret["key"].as_str().map(str::to_string)),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        let every: Vec<String> = store
+            .list(
+                VaultFilter {
+                    limit: Some(1000),
+                    ..VaultFilter::default()
+                },
+                &admin,
+            )
+            .expect("list")
+            .into_iter()
+            .map(|summary| summary.key)
+            .collect();
+        assert_eq!(keys.len(), 120);
+        assert_eq!(keys, every);
+        // A cursor this vault did not write is refused.
+        let err = handle_list(
+            &mut store,
+            &vault_request(MSG_VAULT_LIST, json!({ "cursor": "not-hex" })),
+            &admin,
+        )
+        .expect_err("refused");
+        assert_eq!(err.code(), "INVALID_REQUEST");
+        cleanup(dir);
+    }
+
+    /// FINDINGS A-198: an answer the frame refuses goes as REPLY_TOO_LARGE in its place, with its
+    /// outcome (the key and its version, never the value), never left for the caller to wait out.
+    #[tokio::test]
+    async fn a_vault_answer_past_the_frame_goes_as_reply_too_large() {
+        let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.vault@motherbee",
+            build_vault_rpc_profile().expect("profile"),
+        );
+        let sender = client.sender_snapshot();
+        let request = vault_request(MSG_VAULT_GET, json!({ "key": "infra:big" }));
+        let huge = json!({
+            "status": "ok",
+            "key": "infra:big",
+            "version": 3,
+            "value": "v".repeat(200_000),
+        });
+        send_system_response(&sender, &request, MSG_VAULT_GET_RESPONSE, huge)
+            .await
+            .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some(MSG_VAULT_GET_RESPONSE));
+        assert_eq!(
+            reply.payload["error_code"],
+            json!(mesh_reply::REPLY_TOO_LARGE)
+        );
+        assert_eq!(
+            reply.payload["outcome"],
+            json!({ "status": "ok", "key": "infra:big", "version": 3 })
+        );
+        assert!(!reply.payload.to_string().contains("vvvv"));
+    }
+
+    /// FINDINGS A-198: a secret's place in the listing's order, newest write first.
+    #[test]
+    fn a_vault_place_comes_after_the_newer_ones() {
+        let place = |updated: &str, created: &str, key: &str| VaultListPlace {
+            updated_at: updated.to_string(),
+            created_at: created.to_string(),
+            key: key.to_string(),
+        };
+        let newest = place("2026-11-09T10:00:00Z", "2026-01-01T00:00:00Z", "b");
+        let older = place("2026-11-08T10:00:00Z", "2026-01-01T00:00:00Z", "a");
+        assert!(older.after(&newest));
+        assert!(!newest.after(&older));
+        let same_time_next_key = place("2026-11-09T10:00:00Z", "2026-01-01T00:00:00Z", "c");
+        assert!(same_time_next_key.after(&newest));
+        assert_eq!(VaultListPlace::parse(&newest.cursor()), Some(newest));
     }
 
     // ---- Secrets, stage 2 (docs/ilk-tenant-model-v1.md §2.2) ----

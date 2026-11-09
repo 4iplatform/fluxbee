@@ -46,6 +46,7 @@ use fluxbee_sdk::{
 };
 use json_router::{
     ai_settings,
+    mesh_reply::{self, PageAsk},
     release_settings::{self, HiveRole},
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared, RuntimeManifest,
@@ -3323,7 +3324,8 @@ async fn send_admin_error(
 }
 
 /// An admin command's answer, `payload`, to the SY.admin that sent `msg`, with the outcome its
-/// status and error code say.
+/// status and error code say. One the frame refuses goes as `REPLY_TOO_LARGE` instead
+/// (`send_within_frame`, FINDINGS A-198).
 async fn send_admin_reply(
     sender: &NodeSender,
     msg: &Message,
@@ -3358,8 +3360,52 @@ async fn send_admin_reply(
         },
         payload,
     };
-    sender.send(reply).await?;
-    Ok(())
+    send_within_frame(sender, msg, action, reply).await
+}
+
+/// Sends `reply`, this orchestrator's answer to `request`. One the frame refuses (FINDINGS A-198)
+/// is answered all the same: the same message goes with `REPLY_TOO_LARGE` as its payload, the
+/// answer's outcome in it (`mesh_reply::reply_too_large_payload`), so SY.admin, or the motherbee's
+/// orchestrator, learns why at once instead of waiting to its timeout; the meta keeps the outcome
+/// of what ran. `what` names the request.
+async fn send_within_frame(
+    sender: &NodeSender,
+    request: &Message,
+    what: &str,
+    reply: Message,
+) -> Result<(), OrchestratorError> {
+    let outcome = mesh_reply::reply_outcome(&reply.payload);
+    let mut small = Message {
+        routing: reply.routing.clone(),
+        meta: reply.meta.clone(),
+        payload: serde_json::Value::Null,
+    };
+    match sender.send(reply).await {
+        Ok(()) => Ok(()),
+        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
+            tracing::warn!(
+                request = what,
+                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+                size,
+                max,
+                "an orchestrator answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+            );
+            let how = match what {
+                "list_versions" => "ask it in pages with limit and cursor, following next_cursor",
+                "list_nodes" | "LIST_NODES" | "INVENTORY_REQUEST" => {
+                    "ask it in pages with limit and cursor, following next_cursor"
+                }
+                "get_versions" | "GET_VERSIONS" => {
+                    "ask the installation's versions in pages with versions_limit and versions_before"
+                }
+                _ => "it has no smaller form over the mesh",
+            };
+            small.payload = mesh_reply::reply_too_large_payload(what, size, max, outcome, how);
+            sender.send(small).await?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn handle_admin(
@@ -3431,7 +3477,7 @@ async fn handle_admin(
         }
         "list_nodes" => list_nodes_flow(state, &msg.payload).await,
         "list_tenant_nodes" => list_tenant_nodes_flow(state, &msg.payload).await,
-        "list_versions" => list_versions_flow(state).await,
+        "list_versions" => list_versions_flow(state, &msg.payload).await,
         "get_versions" => get_versions_flow(state, &msg.payload).await,
         "list_runtimes" => list_runtimes_flow(state, &msg.payload).await,
         "get_runtime" => get_runtime_flow(state, &msg.payload).await,
@@ -6482,8 +6528,8 @@ async fn send_system_action_response(
         },
         payload,
     };
-    sender.send(reply).await?;
-    Ok(())
+    let what = request.meta.msg.as_deref().unwrap_or(msg_name);
+    send_within_frame(sender, request, what, reply).await
 }
 
 async fn wait_for_service_active(
@@ -7032,14 +7078,75 @@ fn installation_spoke_state(
     }
 }
 
+/// The versions of the installation file the motherbee's `/versions` lists when its caller names
+/// none (FINDINGS A-198): the newest, so the answer stays bounded however many it recorded.
+const INSTALLATION_VERSIONS_DEFAULT_LIMIT: usize = 20;
+/// The most versions one answer lists.
+const INSTALLATION_VERSIONS_MAX_LIMIT: usize = 100;
+
+/// Which recorded versions of the installation file a `/versions` answer lists (FINDINGS A-198):
+/// the newest `limit` older than `before`. Asked as `versions_limit` and `versions_before`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallationVersionsAsk {
+    limit: usize,
+    before: Option<u64>,
+}
+
+impl Default for InstallationVersionsAsk {
+    fn default() -> Self {
+        Self {
+            limit: INSTALLATION_VERSIONS_DEFAULT_LIMIT,
+            before: None,
+        }
+    }
+}
+
+impl InstallationVersionsAsk {
+    /// `versions_limit` (1 to `INSTALLATION_VERSIONS_MAX_LIMIT`, 20 without it) and
+    /// `versions_before` of a request, as numbers or a query string's text of one.
+    fn from_payload(payload: &serde_json::Value) -> Result<Self, String> {
+        let number = |key: &str| -> Result<Option<u64>, String> {
+            match payload.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(value) => match value {
+                    serde_json::Value::Number(number) => number.as_u64(),
+                    serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+                    _ => None,
+                }
+                .map(Some)
+                .ok_or_else(|| format!("{key} must be a whole number, got {value}")),
+            }
+        };
+        let limit = match number("versions_limit")? {
+            None => INSTALLATION_VERSIONS_DEFAULT_LIMIT,
+            Some(limit) if (1..=INSTALLATION_VERSIONS_MAX_LIMIT as u64).contains(&limit) => {
+                limit as usize
+            }
+            Some(limit) => {
+                return Err(format!(
+                    "versions_limit must be 1 to {INSTALLATION_VERSIONS_MAX_LIMIT}, got {limit}"
+                ))
+            }
+        };
+        Ok(Self {
+            limit,
+            before: number("versions_before")?,
+        })
+    }
+}
+
 /// The motherbee's `config` section of its own `/versions`: its copy, its `state`, why its start
-/// did not write the file when it did not (`not_written`), and every version it recorded with its
-/// sha256, when, why and its values (`versions`, stage 3c), so SY.admin and Archi read the history
-/// without reading the orchestrator's files.
+/// did not write the file when it did not (`not_written`), and the versions it recorded with their
+/// sha256, when, why and their values (`versions`, stage 3c), so SY.admin and Archi read the
+/// history without reading the orchestrator's files. `versions` holds the newest `ask.limit` older
+/// than `ask.before`, oldest first (FINDINGS A-198); `versions_total` counts every version
+/// recorded, and `versions_next_before`, while older ones remain, is the `versions_before` that
+/// lists them.
 fn installation_motherbee_section(
     own: &InstallationCopy,
     records: &Result<InstallationVersions, String>,
     not_written: Option<&str>,
+    ask: InstallationVersionsAsk,
 ) -> serde_json::Value {
     let mut section = own.to_json();
     section["state"] = serde_json::json!(installation_motherbee_state(own, records.as_ref()));
@@ -7048,8 +7155,20 @@ fn installation_motherbee_section(
     }
     match records {
         Ok(records) => {
-            section["versions"] =
-                serde_json::to_value(&records.versions).unwrap_or(serde_json::Value::Null)
+            let older: Vec<&InstallationVersionRecord> = records
+                .versions
+                .iter()
+                .filter(|record| ask.before.is_none_or(|before| record.version < before))
+                .collect();
+            let first = older.len().saturating_sub(ask.limit);
+            let listed = &older[first..];
+            section["versions"] = serde_json::to_value(listed).unwrap_or(serde_json::Value::Null);
+            section["versions_total"] = serde_json::json!(records.versions.len());
+            if first > 0 {
+                if let Some(oldest) = listed.first() {
+                    section["versions_next_before"] = serde_json::json!(oldest.version);
+                }
+            }
         }
         Err(err) => section["records_error"] = serde_json::json!(err),
     }
@@ -15233,14 +15352,27 @@ async fn list_nodes_flow(
             }),
         };
     }
+    // Asked for a page (FINDINGS A-198), the nodes by hive, then name, after `cursor`
+    // (`node_rows_page`), with `next_cursor` while nodes follow and `total`.
+    let page = match PageAsk::from_payload(payload) {
+        Ok(page) => page,
+        Err(detail) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": detail,
+            })
+        }
+    };
     if target_hive == state.hive_id {
-        let inventory_payload = serde_json::json!({
+        let mut inventory_payload = serde_json::json!({
             "scope": "hive",
             "filter_hive": state.hive_id,
         });
+        page.apply_to(&mut inventory_payload);
         let inventory = inventory_flow(state, &inventory_payload);
         if inventory.get("status").and_then(|value| value.as_str()) == Some("ok") {
-            return serde_json::json!({
+            let mut answer = serde_json::json!({
                 "status": "ok",
                 "target": state.hive_id,
                 "hive": state.hive_id,
@@ -15249,15 +15381,23 @@ async fn list_nodes_flow(
                 "node_count": inventory.get("node_count").cloned().unwrap_or(serde_json::json!(0)),
                 "nodes": inventory.get("nodes").cloned().unwrap_or_else(|| serde_json::json!([])),
             });
+            for field in ["next_cursor", "total"] {
+                if let Some(value) = inventory.get(field) {
+                    answer[field] = value.clone();
+                }
+            }
+            return answer;
         }
         return match managed_node_inventory(state) {
-            Ok(nodes) => serde_json::json!({
-                "status": "ok",
-                "target": state.hive_id,
-                "hive": state.hive_id,
-                "inventory_source": "managed_instances_fallback",
-                "nodes": nodes,
-            }),
+            Ok(nodes) => node_rows_page(nodes, &page).into_answer(
+                "nodes",
+                serde_json::json!({
+                    "status": "ok",
+                    "target": state.hive_id,
+                    "hive": state.hive_id,
+                    "inventory_source": "managed_instances_fallback",
+                }),
+            ),
             Err(err) => serde_json::json!({
                 "status": "error",
                 "error_code": "NODE_INVENTORY_READ_FAILED",
@@ -15272,6 +15412,8 @@ async fn list_nodes_flow(
         if let Some(tenant_id) = payload.get("tenant_id") {
             forwarded_payload["tenant_id"] = tenant_id.clone();
         }
+    } else {
+        page.apply_to(&mut forwarded_payload);
     }
     match forward_system_action_to_hive(
         state,
@@ -15449,7 +15591,52 @@ fn hive_is_registered_for_inventory(state: &OrchestratorState, hive_id: &str) ->
         && (hive_id == state.hive_id || hives_root().join(hive_id).join("info.yaml").exists())
 }
 
+/// One page of a node listing (`inventory`, `list_nodes`; FINDINGS A-198): its nodes in the order
+/// of their hive, then their name, each keyed `<hive>|<name>`; asked for a page (`limit`,
+/// `cursor`), those after the cursor, at most `limit` and within half a frame.
+fn node_rows_page(nodes: Vec<serde_json::Value>, page: &PageAsk) -> mesh_reply::ListPage {
+    let text = |node: &serde_json::Value, field: &str| {
+        node.get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut keyed: Vec<((String, String), serde_json::Value)> = nodes
+        .into_iter()
+        .map(|node| ((text(&node, "hive"), text(&node, "name")), node))
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let rows = keyed
+        .into_iter()
+        .map(|((hive, name), node)| (format!("{hive}|{name}"), node))
+        .collect();
+    let place = |key: &str| {
+        let (hive, name) = key.split_once('|').unwrap_or((key, ""));
+        (hive.to_string(), name.to_string())
+    };
+    mesh_reply::list_page(
+        rows,
+        page,
+        mesh_reply::LIST_PAGE_MAX_BYTES,
+        |row, cursor| place(row) > place(cursor),
+    )
+}
+
+/// The inventory of the nodes the router sees, from the LSA: a `summary` of counts, one hive's
+/// nodes (`hive`) or every hive's (`global`). The nodes go by hive, then name; asked for a page
+/// (`limit`, `cursor`, FINDINGS A-198), a page of them (`node_rows_page`) with `next_cursor` while
+/// nodes follow and `total`, while `node_count`/`total_nodes` still count every node.
 fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
+    let page_ask = match PageAsk::from_payload(payload) {
+        Ok(page_ask) => page_ask,
+        Err(detail) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": detail,
+            });
+        }
+    };
     let snapshot = match load_lsa_snapshot(state) {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -15578,6 +15765,7 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
 
     let total_hives = hives.len() as u32;
     let total_nodes = nodes.len() as u32;
+    let nodes_page = node_rows_page(nodes, &page_ask);
 
     match scope.as_str() {
         "summary" => serde_json::json!({
@@ -15608,32 +15796,39 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
                     "target": filter_hive,
                 });
             };
+            nodes_page.into_answer(
+                "nodes",
+                serde_json::json!({
+                    "status": "ok",
+                    "scope": "hive",
+                    "hive_id": hive.get("hive_id").cloned().unwrap_or(serde_json::Value::Null),
+                    "is_local": hive.get("is_local").cloned().unwrap_or(serde_json::Value::Null),
+                    "hive_status": hive.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                    "router_name": hive.get("router_name").cloned().unwrap_or(serde_json::Value::Null),
+                    "last_seen": hive.get("last_seen").cloned().unwrap_or(serde_json::Value::Null),
+                    "node_count": total_nodes,
+                    "updated_at": now,
+                }),
+            )
+        }
+        _ => nodes_page.into_answer(
+            "nodes",
             serde_json::json!({
                 "status": "ok",
-                "scope": "hive",
-                "hive_id": hive.get("hive_id").cloned().unwrap_or(serde_json::Value::Null),
-                "is_local": hive.get("is_local").cloned().unwrap_or(serde_json::Value::Null),
-                "hive_status": hive.get("status").cloned().unwrap_or(serde_json::Value::Null),
-                "router_name": hive.get("router_name").cloned().unwrap_or(serde_json::Value::Null),
-                "last_seen": hive.get("last_seen").cloned().unwrap_or(serde_json::Value::Null),
-                "node_count": total_nodes,
-                "nodes": nodes,
+                "scope": "global",
                 "updated_at": now,
-            })
-        }
-        _ => serde_json::json!({
-            "status": "ok",
-            "scope": "global",
-            "updated_at": now,
-            "total_hives": total_hives,
-            "total_nodes": total_nodes,
-            "hives": hives,
-            "nodes": nodes,
-        }),
+                "total_hives": total_hives,
+                "total_nodes": total_nodes,
+                "hives": hives,
+            }),
+        ),
     }
 }
 
-fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
+fn local_versions_snapshot(
+    state: &OrchestratorState,
+    versions: InstallationVersionsAsk,
+) -> serde_json::Value {
     // What can this hive roll back to, newest first. Answering it here means `core_rollback`
     // needs no discovery action of its own — GET /versions already covers both hops.
     let rollback_generations: Vec<serde_json::Value> = {
@@ -15796,6 +15991,7 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
             &own_copy,
             &read_installation_versions(&installation_versions_path()),
             installation_not_written_slot(state).as_deref(),
+            versions,
         )
     } else {
         own_copy.to_json()
@@ -16250,10 +16446,17 @@ async fn get_versions_flow(
 ) -> serde_json::Value {
     let target_hive = target_hive_from_payload(payload, &state.hive_id);
     if target_hive == state.hive_id {
-        return serde_json::json!({
-            "status": "ok",
-            "hive": local_versions_snapshot(state),
-        });
+        return match InstallationVersionsAsk::from_payload(payload) {
+            Ok(versions) => serde_json::json!({
+                "status": "ok",
+                "hive": local_versions_snapshot(state, versions),
+            }),
+            Err(detail) => serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": detail,
+            }),
+        };
     }
 
     let forwarded = forward_system_action_to_hive(
@@ -16288,12 +16491,35 @@ async fn get_versions_flow(
     }
 }
 
-async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
-    let mut hives = Vec::new();
-    hives.push(local_versions_snapshot(state));
+/// `/versions` over every hive: the motherbee's snapshot and each connected spoke's, and the
+/// comparison against the motherbee's. Asked for a page (`limit`, `cursor`, FINDINGS A-198), the
+/// hives after the cursor in the order motherbee first, then the spokes by id, at most `limit` and
+/// at most half a frame of snapshots, with `next_cursor` while hives follow; the page's
+/// comparison is still against the motherbee's snapshot. `total` is how many hives the answer
+/// covers in all. `versions_limit` and `versions_before` pick the motherbee's installation
+/// versions (`InstallationVersionsAsk`).
+async fn list_versions_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let (page, versions) = match (
+        PageAsk::from_payload(payload),
+        InstallationVersionsAsk::from_payload(payload),
+    ) {
+        (Ok(page), Ok(versions)) => (page, versions),
+        (Err(detail), _) | (_, Err(detail)) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": detail,
+            })
+        }
+    };
+    let motherbee = state.hive_id.clone();
+    let mut order = vec![motherbee.clone()];
     let root = hives_root();
     for hive_id in list_managed_hive_ids() {
-        if hive_id == state.hive_id {
+        if hive_id == motherbee {
             continue;
         }
         // Only hives that actually joined. `list_managed_hive_ids` filters on `is_dir` alone, so
@@ -16304,46 +16530,100 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
         if hive_status(&root, &hive_id).as_deref() != Some("connected") {
             continue;
         }
-        let response = get_versions_flow(
-            state,
-            &serde_json::json!({
-                "target": hive_id,
-            }),
-        )
-        .await;
-        if response
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
-        {
-            if let Some(snapshot) = response.get("hive") {
-                hives.push(snapshot.clone());
-            } else {
-                hives.push(serde_json::json!({
-                    "hive_id": hive_id,
-                    "status": "error",
-                    "message": "remote GET_VERSIONS returned ok without hive payload",
-                }));
-            }
-        } else {
-            let message = response
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("versions request failed");
-            hives.push(serde_json::json!({
-                "hive_id": hive_id,
-                "status": "error",
-                "message": message,
-                "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
-            }));
-        }
+        order.push(hive_id);
     }
-    let comparison = versions_comparison(&state.hive_id, &hives);
-    serde_json::json!({
+    let total = order.len();
+    let mut hives = Vec::new();
+    let mut bytes = 0usize;
+    let mut last: Option<String> = None;
+    let mut next_cursor = None;
+    for hive_id in order.into_iter().filter(|hive_id| {
+        page.cursor
+            .as_deref()
+            .is_none_or(|cursor| versions_hive_after(hive_id, cursor, &motherbee))
+    }) {
+        if page.limit.is_some_and(|limit| hives.len() >= limit) {
+            next_cursor = last.clone();
+            break;
+        }
+        let snapshot = if hive_id == motherbee {
+            local_versions_snapshot(state, versions)
+        } else {
+            remote_versions_snapshot(state, &hive_id).await
+        };
+        let size = mesh_reply::serialized_len(&snapshot);
+        if page.is_page() && !hives.is_empty() && bytes + size > mesh_reply::LIST_PAGE_MAX_BYTES {
+            next_cursor = last.clone();
+            break;
+        }
+        bytes += size;
+        last = Some(hive_id);
+        hives.push(snapshot);
+    }
+    // Every comparison is against the motherbee's snapshot, on the page or not.
+    let comparison = if hives
+        .iter()
+        .any(|hive| hive.get("hive_id").and_then(|value| value.as_str()) == Some(&motherbee))
+    {
+        versions_comparison(&motherbee, &hives)
+    } else {
+        let mut with_reference = vec![local_versions_snapshot(state, versions)];
+        with_reference.extend(hives.iter().cloned());
+        versions_comparison(&motherbee, &with_reference)
+    };
+    let mut answer = serde_json::json!({
         "status": "ok",
         "hives": hives,
         "comparison": comparison,
-    })
+        "total": total,
+    });
+    if let Some(cursor) = next_cursor {
+        answer["next_cursor"] = serde_json::json!(cursor);
+    }
+    answer
+}
+
+/// Whether `hive_id` comes after `cursor` in `/versions`' order: the motherbee first, then the
+/// spokes by id. A spoke removed since the cursor was given does not lose the place.
+fn versions_hive_after(hive_id: &str, cursor: &str, motherbee: &str) -> bool {
+    hive_id != motherbee && (cursor == motherbee || hive_id > cursor)
+}
+
+/// A spoke's `/versions` snapshot, asked of its orchestrator, or what failed in its place.
+async fn remote_versions_snapshot(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
+    let response = get_versions_flow(
+        state,
+        &serde_json::json!({
+            "target": hive_id,
+        }),
+    )
+    .await;
+    if response
+        .get("status")
+        .and_then(|v| v.as_str())
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    {
+        if let Some(snapshot) = response.get("hive") {
+            snapshot.clone()
+        } else {
+            serde_json::json!({
+                "hive_id": hive_id,
+                "status": "error",
+                "message": "remote GET_VERSIONS returned ok without hive payload",
+            })
+        }
+    } else {
+        let message = response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("versions request failed");
+        serde_json::json!({
+            "hive_id": hive_id,
+            "status": "error",
+            "message": message,
+            "error_code": response.get("error_code").cloned().unwrap_or(serde_json::Value::Null),
+        })
+    }
 }
 
 /// Compare every hive's snapshot against motherbee's and emit a VERDICT.
@@ -40443,6 +40723,7 @@ blob:
             &copy(Absent, None, None),
             &Ok(InstallationVersions::default()),
             Some("hive.yaml's ai is not one every reader can use (x)"),
+            InstallationVersionsAsk::default(),
         );
         assert_eq!(section["state"], serde_json::json!("pending"));
         assert_eq!(
@@ -40450,11 +40731,212 @@ blob:
             serde_json::json!("hive.yaml's ai is not one every reader can use (x)")
         );
         assert_eq!(section["version"], serde_json::Value::Null);
-        let section =
-            installation_motherbee_section(&motherbee, &Err("bad record".to_string()), None);
+        let section = installation_motherbee_section(
+            &motherbee,
+            &Err("bad record".to_string()),
+            None,
+            InstallationVersionsAsk::default(),
+        );
         assert_eq!(section["state"], serde_json::json!("unknown"));
         assert_eq!(section["records_error"], serde_json::json!("bad record"));
         assert!(section.get("not_written").is_none());
+    }
+
+    /// FINDINGS A-198: the motherbee's `/versions` lists the newest 20 versions of the
+    /// installation file, with how many there are and where the older ones start, so its config
+    /// section stays within half a frame however many it recorded, each version at its largest.
+    #[test]
+    fn the_installation_versions_come_newest_first_in_pages_within_half_a_frame() {
+        // A version at its largest plausible: both providers with long model names.
+        let model = "m".repeat(64);
+        let ai: HiveAiConfig = serde_json::from_value(serde_json::json!({
+            "default_provider": "anthropic",
+            "providers": {
+                "openai": { "model": model },
+                "anthropic": { "model": model },
+            },
+        }))
+        .expect("ai");
+        let records = InstallationVersions {
+            versions: (1..=500u64)
+                .map(|version| InstallationVersionRecord {
+                    version,
+                    sha256: "a".repeat(64),
+                    written_at_ms: 1_800_000_000_000,
+                    source: INSTALLATION_SOURCE_OPERATOR.to_string(),
+                    ai: Some(ai.clone()),
+                })
+                .collect(),
+        };
+        let own = InstallationCopy {
+            file: InstallationCopyFile::Valid,
+            version: Some(500),
+            sha256: Some("a".repeat(64)),
+            error: None,
+            ai: Some(ai.clone()),
+        };
+        let listed = |section: &serde_json::Value| -> Vec<u64> {
+            section["versions"]
+                .as_array()
+                .expect("versions")
+                .iter()
+                .filter_map(|record| record["version"].as_u64())
+                .collect()
+        };
+        let section = installation_motherbee_section(
+            &own,
+            &Ok(records.clone()),
+            None,
+            InstallationVersionsAsk::default(),
+        );
+        assert_eq!(listed(&section), (481..=500).collect::<Vec<_>>());
+        assert_eq!(section["versions_total"], serde_json::json!(500));
+        assert_eq!(section["versions_next_before"], serde_json::json!(481));
+        let bytes = mesh_reply::serialized_len(&section);
+        assert!(bytes <= 64 * 1024, "the default section is {bytes} bytes");
+        // Older ones on request, and the largest count asked still within half a frame.
+        let ask = InstallationVersionsAsk::from_payload(&serde_json::json!({
+            "versions_limit": INSTALLATION_VERSIONS_MAX_LIMIT,
+            "versions_before": "481",
+        }))
+        .expect("ask");
+        let older = installation_motherbee_section(&own, &Ok(records.clone()), None, ask);
+        assert_eq!(listed(&older), (381..=480).collect::<Vec<_>>());
+        assert_eq!(older["versions_next_before"], serde_json::json!(381));
+        let bytes = mesh_reply::serialized_len(&older);
+        assert!(bytes <= 64 * 1024, "the largest page is {bytes} bytes");
+        let first = installation_motherbee_section(
+            &own,
+            &Ok(records),
+            None,
+            InstallationVersionsAsk {
+                limit: 20,
+                before: Some(11),
+            },
+        );
+        assert_eq!(listed(&first), (1..=10).collect::<Vec<_>>());
+        assert!(first.get("versions_next_before").is_none());
+        for refused in [
+            serde_json::json!({ "versions_limit": 0 }),
+            serde_json::json!({ "versions_limit": 101 }),
+            serde_json::json!({ "versions_before": "soon" }),
+        ] {
+            assert!(
+                InstallationVersionsAsk::from_payload(&refused).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// FINDINGS A-198: an answer the frame refuses goes as REPLY_TOO_LARGE in its place, the
+    /// outcome of what ran kept in it and in the meta, never left for SY.admin to wait out.
+    #[tokio::test]
+    async fn an_orchestrator_answer_past_the_frame_goes_as_reply_too_large() {
+        let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new_with_uuid(
+            "orchestrator-test-uuid",
+            "SY.orchestrator@motherbee",
+            build_orchestrator_rpc_profile().expect("profile"),
+        );
+        let sender = client.sender_snapshot();
+        let request = test_admin_command("trace-a198", "set_node_config", serde_json::json!({}));
+        let huge = serde_json::json!({
+            "status": "ok",
+            "node_name": "AI.sales@motherbee",
+            "config": { "prompt": "p".repeat(200_000) },
+        });
+        send_admin_reply(&sender, &request, "set_node_config", huge)
+            .await
+            .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.meta.action.as_deref(), Some("set_node_config"));
+        assert_eq!(
+            reply.payload["error_code"],
+            serde_json::json!(mesh_reply::REPLY_TOO_LARGE)
+        );
+        assert_eq!(
+            reply.payload["outcome"],
+            serde_json::json!({ "status": "ok", "node_name": "AI.sales@motherbee" })
+        );
+        assert_eq!(
+            reply.meta.action_result.map(|result| result.as_str()),
+            Some("applied")
+        );
+        // A system answer the same way, under its own message name.
+        let request = test_system_message("trace-a198-2", "LIST_NODES", serde_json::json!({}));
+        let huge = serde_json::json!({
+            "status": "ok",
+            "nodes": [{ "blob": "x".repeat(200_000) }],
+        });
+        send_system_action_response(&sender, &request, "LIST_NODES_RESPONSE", huge)
+            .await
+            .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some("LIST_NODES_RESPONSE"));
+        assert_eq!(
+            reply.payload["error_code"],
+            serde_json::json!(mesh_reply::REPLY_TOO_LARGE)
+        );
+        let message = reply.payload["message"].as_str().expect("message");
+        assert!(message.contains("limit and cursor"), "{message}");
+    }
+
+    /// FINDINGS A-198: `/versions`' pages go motherbee first, then the spokes by id, and a node
+    /// listing's by hive, then name; a cursor whose row has gone keeps its place.
+    #[test]
+    fn the_versions_and_node_pages_keep_their_order() {
+        assert!(versions_hive_after("worker1", "motherbee", "motherbee"));
+        assert!(!versions_hive_after("motherbee", "motherbee", "motherbee"));
+        assert!(versions_hive_after("worker2", "worker1", "motherbee"));
+        assert!(!versions_hive_after("worker1", "worker1", "motherbee"));
+        assert!(!versions_hive_after("motherbee", "worker1", "motherbee"));
+
+        let node = |hive: &str, name: &str| serde_json::json!({ "hive": hive, "name": name });
+        let nodes = vec![
+            node("worker1", "SY.b@worker1"),
+            node("motherbee", "SY.z@motherbee"),
+            node("worker1", "AI.a@worker1"),
+            node("motherbee", "AI.c@motherbee"),
+        ];
+        let names = |page: &mesh_reply::ListPage| -> Vec<String> {
+            page.rows
+                .iter()
+                .filter_map(|row| row["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let whole = node_rows_page(nodes.clone(), &PageAsk::default());
+        assert_eq!(
+            names(&whole),
+            vec![
+                "AI.c@motherbee",
+                "SY.z@motherbee",
+                "AI.a@worker1",
+                "SY.b@worker1"
+            ]
+        );
+        let first = node_rows_page(
+            nodes.clone(),
+            &PageAsk {
+                limit: Some(3),
+                cursor: None,
+            },
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("worker1|AI.a@worker1"));
+        let rest = node_rows_page(
+            nodes,
+            &PageAsk {
+                limit: Some(3),
+                cursor: first.next_cursor,
+            },
+        );
+        assert_eq!(names(&rest), vec!["SY.b@worker1"]);
+        assert_eq!(rest.next_cursor, None);
+        assert_eq!(rest.total, 4);
     }
 
     /// The join copies the motherbee's installation file to the spoke's dist, at the same place
@@ -40607,7 +41089,12 @@ blob:
         assert_eq!(installation_motherbee_state(&own, Ok(&recorded)), "current");
         assert_eq!(own.ai, Some(openai_set));
         // /versions lists every version with its values.
-        let section = installation_motherbee_section(&own, &Ok(recorded.clone()), None);
+        let section = installation_motherbee_section(
+            &own,
+            &Ok(recorded.clone()),
+            None,
+            InstallationVersionsAsk::default(),
+        );
         assert_eq!(
             section["versions"][0]["ai"]["default_provider"],
             "anthropic"
@@ -41404,9 +41891,15 @@ blob:
 
         let core = DistTree::Core;
         let state = sample_orchestrator_state_for_tests();
-        assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
+        assert!(
+            local_versions_snapshot(&state, InstallationVersionsAsk::default())["core"]
+                ["awaiting_update"]
+                .is_null()
+        );
         *awaiting_update_slot(&state, core) = Some(later);
-        let shown = local_versions_snapshot(&state)["core"]["awaiting_update"].clone();
+        let shown = local_versions_snapshot(&state, InstallationVersionsAsk::default())["core"]
+            ["awaiting_update"]
+            .clone();
         assert_eq!(shown["reason"], "dist_mismatch");
         assert_eq!(shown["since_ms"], 100);
         assert_eq!(shown["components"][0]["component"], "sy-timer");
@@ -41421,7 +41914,11 @@ blob:
             vec![mismatch("sy-timer", DistMismatchReason::HashMismatch)]
         ));
         assert!(!refresh_awaiting_update(&state, core, Vec::new()));
-        assert!(local_versions_snapshot(&state)["core"]["awaiting_update"].is_null());
+        assert!(
+            local_versions_snapshot(&state, InstallationVersionsAsk::default())["core"]
+                ["awaiting_update"]
+                .is_null()
+        );
 
         // A core update's strict check closes it (`prepare_core_update`), and a recheck that ran
         // before the update does not open it again.
@@ -41670,7 +42167,7 @@ blob:
             detail: "vendor manifest hash mismatch for 'syncthing'".to_string(),
         };
         assert!(record_dist_check(&state, DistTree::Vendor, vec![mismatch]));
-        let snapshot = local_versions_snapshot(&state);
+        let snapshot = local_versions_snapshot(&state, InstallationVersionsAsk::default());
         let shown = &snapshot["vendor"]["awaiting_update"];
         assert_eq!(shown["reason"], "dist_mismatch");
         assert_eq!(shown["components"][0]["component"], "syncthing");
@@ -41680,7 +42177,11 @@ blob:
             .is_some_and(|m| m.contains("already installed")));
         assert!(snapshot["core"]["awaiting_update"].is_null());
         assert!(!record_dist_check(&state, DistTree::Vendor, Vec::new()));
-        assert!(local_versions_snapshot(&state)["vendor"]["awaiting_update"].is_null());
+        assert!(
+            local_versions_snapshot(&state, InstallationVersionsAsk::default())["vendor"]
+                ["awaiting_update"]
+                .is_null()
+        );
     }
 
     /// FINDINGS A-189: every caller of `ensure_blob_sync_runtime` names its policy. Only the vendor

@@ -26,6 +26,7 @@ use fluxbee_sdk::{
     NodeConfig, NodeSender, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
     VaultCallerOwned, VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
+use json_router::mesh_reply::{self, PageAsk};
 use json_router::release_settings::{self, HiveRole};
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
@@ -752,12 +753,18 @@ impl IdentityStore {
 
     /// Every ILK, or only the pending signups (`pending_only`): a temporary person holding a Fluxbee
     /// Cloud account's key, wherever it is charged, deleted tenants included (docs/ilk-tenant-model-v1.md
-    /// D11).
-    fn list_ilks_payload(&self, include_deleted: bool, pending_only: bool) -> Value {
+    /// D11). In the order of their ids, and asked for a page (`limit`, `cursor`), one page of them
+    /// within half a frame, with `next_cursor` while ILKs follow and `total` (FINDINGS A-198).
+    fn list_ilks_payload(
+        &self,
+        include_deleted: bool,
+        pending_only: bool,
+        page: &PageAsk,
+    ) -> Value {
         let mut ilk_ids: Vec<&String> = self.ilks.keys().collect();
         ilk_ids.sort_unstable();
 
-        let ilks: Vec<Value> = ilk_ids
+        let ilks: Vec<(String, Value)> = ilk_ids
             .into_iter()
             .filter_map(|ilk_id| {
                 let ilk = self.ilks.get(ilk_id)?;
@@ -795,14 +802,16 @@ impl IdentityStore {
                     "deleted_at_ms": ilk.deleted_at_ms,
                     "deleted_reason": ilk.deleted_reason,
                 }))
+                .map(|row| (ilk_id.to_string(), row))
             })
             .collect();
 
-        json!({
-            "status": "ok",
-            "count": ilks.len(),
-            "ilks": ilks,
-        })
+        let page =
+            mesh_reply::list_page(ilks, page, mesh_reply::LIST_PAGE_MAX_BYTES, |id, cursor| {
+                id > cursor
+            });
+        let count = page.rows.len();
+        page.into_answer("ilks", json!({ "status": "ok", "count": count }))
     }
 
     fn get_tenant_payload(&self, tenant_id: &str) -> Result<Value, String> {
@@ -853,12 +862,18 @@ impl IdentityStore {
     }
 
     /// `exclude_root` leaves the genesis tenant out: Fluxbee Cloud manages every tenant but that one
-    /// (docs/ilk-tenant-model-v1.md §2.4).
-    fn list_tenants_payload(&self, include_deleted: bool, exclude_root: bool) -> Value {
+    /// (docs/ilk-tenant-model-v1.md §2.4). In the order of their ids, and asked for a page, one page
+    /// of them as `list_ilks_payload` gives (FINDINGS A-198).
+    fn list_tenants_payload(
+        &self,
+        include_deleted: bool,
+        exclude_root: bool,
+        page: &PageAsk,
+    ) -> Value {
         let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
         tenant_ids.sort_unstable();
 
-        let tenants: Vec<Value> = tenant_ids
+        let tenants: Vec<(String, Value)> = tenant_ids
             .into_iter()
             .filter_map(|tenant_id| {
                 let tenant = self.tenants.get(tenant_id)?;
@@ -868,15 +883,18 @@ impl IdentityStore {
                 if exclude_root && tenant.tenant_id == DEFAULT_ROOT_TENANT_ID {
                     return None;
                 }
-                Some(self.tenant_summary_value(tenant))
+                Some((tenant.tenant_id.clone(), self.tenant_summary_value(tenant)))
             })
             .collect();
 
-        json!({
-            "status": "ok",
-            "count": tenants.len(),
-            "tenants": tenants,
-        })
+        let page = mesh_reply::list_page(
+            tenants,
+            page,
+            mesh_reply::LIST_PAGE_MAX_BYTES,
+            |id, cursor| id > cursor,
+        );
+        let count = page.rows.len();
+        page.into_answer("tenants", json!({ "status": "ok", "count": count }))
     }
 
     fn find_active_ilk_by_identification_key(&self, key: &str, expected: &str) -> Option<String> {
@@ -3398,10 +3416,14 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
-            MSG_ILK_LIST => self.store.list_ilks_payload(
-                payload_include_deleted(&msg.payload),
-                msg.payload.get("pending_signup").and_then(Value::as_bool) == Some(true),
-            ),
+            MSG_ILK_LIST => match PageAsk::from_payload(&msg.payload) {
+                Ok(page) => self.store.list_ilks_payload(
+                    payload_include_deleted(&msg.payload),
+                    msg.payload.get("pending_signup").and_then(Value::as_bool) == Some(true),
+                    &page,
+                ),
+                Err(detail) => error_payload("INVALID_REQUEST", &detail),
+            },
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self
                     .store
@@ -3412,10 +3434,14 @@ impl IdentityRuntime {
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
-            MSG_TNT_LIST => self.store.list_tenants_payload(
-                payload_include_deleted(&msg.payload),
-                msg.payload.get("exclude_root").and_then(Value::as_bool) == Some(true),
-            ),
+            MSG_TNT_LIST => match PageAsk::from_payload(&msg.payload) {
+                Ok(page) => self.store.list_tenants_payload(
+                    payload_include_deleted(&msg.payload),
+                    msg.payload.get("exclude_root").and_then(Value::as_bool) == Some(true),
+                    &page,
+                ),
+                Err(detail) => error_payload("INVALID_REQUEST", &detail),
+            },
             MSG_TNT_GET => match serde_json::from_value::<TntGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self.store.get_tenant_payload(&req.tenant_id) {
                     Ok(ok) => ok,
@@ -6903,13 +6929,17 @@ fn is_lifecycle_action(action: &str) -> bool {
     )
 }
 
+/// Every SY.identity answer goes out here. One the frame refuses (FINDINGS A-198) is answered all
+/// the same: `REPLY_TOO_LARGE` goes in its place with the answer's outcome
+/// (`mesh_reply::reply_too_large_payload`), so the caller learns why at once and a write's deltas
+/// still go out.
 async fn send_system_response(
     sender: &NodeSender,
     request: &Message,
     msg_name: &str,
     payload: Value,
 ) -> Result<(), IdentityError> {
-    let reply = Message {
+    let reply = |payload: Value| Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
@@ -6930,8 +6960,29 @@ async fn send_system_response(
         },
         payload,
     };
-    sender.send(reply).await?;
-    Ok(())
+    let outcome = mesh_reply::reply_outcome(&payload);
+    match sender.send(reply(payload)).await {
+        Ok(()) => Ok(()),
+        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
+            let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
+            tracing::warn!(
+                request = request_msg,
+                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+                size,
+                max,
+                "an identity answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+            );
+            let how = if matches!(request_msg, MSG_ILK_LIST | MSG_TNT_LIST) {
+                "ask it in pages with limit and cursor, following next_cursor"
+            } else {
+                "it has no smaller form; read the record it names with its own read"
+            };
+            let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, how);
+            sender.send(reply(small)).await?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 const RPC_CH_SYSTEM: &str = "system";
@@ -9634,7 +9685,7 @@ mod tests {
             },
         );
 
-        let payload = store.list_tenants_payload(false, false);
+        let payload = store.list_tenants_payload(false, false, &PageAsk::default());
         let tenants = payload
             .get("tenants")
             .and_then(Value::as_array)
@@ -10578,7 +10629,7 @@ mod tests {
             },
         );
 
-        let payload = store.list_ilks_payload(false, false);
+        let payload = store.list_ilks_payload(false, false, &PageAsk::default());
         assert_eq!(payload.get("count").and_then(Value::as_u64), Some(1));
         let rows = payload
             .get("ilks")
@@ -10596,6 +10647,148 @@ mod tests {
             rows[0].get("registration_status").and_then(Value::as_str),
             Some("temporary")
         );
+    }
+
+    /// FINDINGS A-198: asked for pages, the ILKs come in pages within half a frame, in the order of
+    /// their ids; following next_cursor lists every ILK once, as the whole listing does.
+    #[test]
+    fn the_ilk_listing_pages_within_half_a_frame() {
+        let mut store = IdentityStore::with_default_tenant();
+        for n in 0..300u32 {
+            let ilk_id = format!("ilk:{:08x}-0000-4000-8000-000000000000", n);
+            store.ilks.insert(
+                ilk_id.clone(),
+                IlkRecord {
+                    ilk_id,
+                    ilk_type: "human".to_string(),
+                    registration_status: "complete".to_string(),
+                    tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                    identification: json!({ "display_name": "d".repeat(300) }),
+                    definition: json!({}),
+                    channels: Vec::new(),
+                    deleted_at_ms: None,
+                    deleted_reason: None,
+                },
+            );
+        }
+        let whole = store.list_ilks_payload(false, false, &PageAsk::default());
+        assert_eq!(whole["count"], json!(300));
+        assert_eq!(whole["total"], json!(300));
+        assert!(whole.get("next_cursor").is_none());
+
+        let mut listed = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0;
+        loop {
+            let page = store.list_ilks_payload(
+                false,
+                false,
+                &PageAsk {
+                    limit: Some(1_000),
+                    cursor: cursor.clone(),
+                },
+            );
+            pages += 1;
+            assert_eq!(page["total"], json!(300));
+            let rows = page["ilks"].as_array().expect("ilks").clone();
+            assert_eq!(page["count"], json!(rows.len()));
+            let bytes: usize = rows
+                .iter()
+                .map(|row| mesh_reply::serialized_len(row) + 1)
+                .sum();
+            assert!(bytes <= mesh_reply::LIST_PAGE_MAX_BYTES, "{bytes} bytes");
+            listed.extend(rows);
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert!(
+            pages > 1,
+            "300 ILKs of some 400 bytes take more than one page"
+        );
+        assert_eq!(Value::Array(listed), whole["ilks"]);
+
+        // A limit gives that many, from the cursor on.
+        let page = store.list_ilks_payload(
+            false,
+            false,
+            &PageAsk {
+                limit: Some(2),
+                cursor: Some(format!("ilk:{:08x}-0000-4000-8000-000000000000", 9)),
+            },
+        );
+        let ids: Vec<&str> = page["ilks"]
+            .as_array()
+            .expect("ilks")
+            .iter()
+            .filter_map(|row| row["ilk_id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ilk:0000000a-0000-4000-8000-000000000000",
+                "ilk:0000000b-0000-4000-8000-000000000000"
+            ]
+        );
+        assert_eq!(
+            page["next_cursor"],
+            json!("ilk:0000000b-0000-4000-8000-000000000000")
+        );
+        let tenants = store.list_tenants_payload(
+            false,
+            false,
+            &PageAsk {
+                limit: Some(1),
+                cursor: None,
+            },
+        );
+        assert_eq!(tenants["count"], json!(1));
+        assert_eq!(tenants["total"], json!(1));
+        assert!(tenants.get("next_cursor").is_none());
+    }
+
+    /// FINDINGS A-198: an answer the frame refuses goes as REPLY_TOO_LARGE in its place, with its
+    /// outcome, never left for the caller to wait out.
+    #[tokio::test]
+    async fn an_identity_answer_past_the_frame_goes_as_reply_too_large() {
+        let (client, mut harness) = fluxbee_sdk::RouterDispatcherTestHarness::new(
+            "SY.identity@motherbee",
+            build_identity_rpc_profile().expect("profile"),
+        );
+        let sender = client.sender_snapshot();
+        let request = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                dst: Destination::Unicast("SY.identity@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_ILK_LIST.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        let huge = json!({ "status": "ok", "count": 1, "ilks": [{ "blob": "x".repeat(200_000) }] });
+        send_system_response(&sender, &request, MSG_ILK_LIST_RESPONSE, huge)
+            .await
+            .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some(MSG_ILK_LIST_RESPONSE));
+        assert_eq!(
+            reply.payload["error_code"],
+            json!(mesh_reply::REPLY_TOO_LARGE)
+        );
+        assert_eq!(reply.payload["outcome"], json!({ "status": "ok" }));
+        assert!(reply.payload["size"].as_u64() > Some(mesh_reply::MAX_FRAME_SIZE as u64));
+        let message = reply.payload["message"].as_str().expect("message");
+        assert!(message.contains("limit and cursor"), "{message}");
     }
 
     /// A canonical ILK id for a readable test label: the store and its authority checks take ids
@@ -11092,10 +11285,10 @@ mod tests {
         store.delete_ilk(lc_ilk(&ilk), 5).expect("mark");
 
         // hidden: not listed by default, listed with include_deleted
-        let listed = store.list_ilks_payload(false, false);
+        let listed = store.list_ilks_payload(false, false, &PageAsk::default());
         assert!(!listed.to_string().contains(&ilk));
         assert!(store
-            .list_ilks_payload(true, false)
+            .list_ilks_payload(true, false, &PageAsk::default())
             .to_string()
             .contains(&ilk));
 
@@ -13169,9 +13362,11 @@ mod tests {
                 .map(|tenant| tenant["tenant_id"].as_str().unwrap().to_string())
                 .collect()
         };
-        assert!(ids(store.list_tenants_payload(false, false))
-            .contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
-        let without_root = ids(store.list_tenants_payload(false, true));
+        assert!(
+            ids(store.list_tenants_payload(false, false, &PageAsk::default()))
+                .contains(&DEFAULT_ROOT_TENANT_ID.to_string())
+        );
+        let without_root = ids(store.list_tenants_payload(false, true, &PageAsk::default()));
         assert!(!without_root.contains(&DEFAULT_ROOT_TENANT_ID.to_string()));
         assert!(without_root.contains(&LC_TENANT.to_string()));
     }
@@ -13899,7 +14094,7 @@ mod tests {
         let lee = sc_account(&mut store, SC_OTHER, "lee@acme.com");
         let slack = rg_provision(&mut store, LC_TENANT, "slack", "U20");
         let listed = |store: &IdentityStore| -> Vec<(String, bool)> {
-            store.list_ilks_payload(false, false)["ilks"]
+            store.list_ilks_payload(false, false, &PageAsk::default())["ilks"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -13916,7 +14111,7 @@ mod tests {
             assert!(rows.contains(&(ilk.clone(), pending)), "{ilk} {pending}");
         }
         // The filter keeps only the pending ones; the channel shows where its address lives.
-        let only = store.list_ilks_payload(false, true);
+        let only = store.list_ilks_payload(false, true, &PageAsk::default());
         assert_eq!(only["count"], 1);
         assert_eq!(only["ilks"][0]["ilk_id"], kim.as_str());
         assert_eq!(only["ilks"][0]["channels"][0]["scope"], INSTALLATION_SCOPE);
@@ -13928,10 +14123,16 @@ mod tests {
         store
             .delete_tenant(lc_tenant(LC_TENANT), 1)
             .expect("delete the tenant");
-        assert_eq!(store.list_ilks_payload(false, true)["count"], 1);
+        assert_eq!(
+            store.list_ilks_payload(false, true, &PageAsk::default())["count"],
+            1
+        );
         // Marked, it is no longer pending.
         store.delete_ilk(lc_ilk(&kim), 2).expect("mark the signup");
-        assert_eq!(store.list_ilks_payload(true, true)["count"], 0);
+        assert_eq!(
+            store.list_ilks_payload(true, true, &PageAsk::default())["count"],
+            0
+        );
     }
 
     #[test]
