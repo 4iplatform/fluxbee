@@ -831,20 +831,30 @@ Over HTTP on the motherbee an answer has no size limit. Over the mesh (Archi, IO
 node's `ADMIN_COMMAND`) an answer is one frame, at most 128 KiB (FINDINGS A-198):
 
 - **A list that grows with the installation answers in pages** when asked to: `/inventory`,
-  `/inventory/{hive}`, `/hives/{hive}/status`, `/hives/{hive}/nodes`, `/versions` (a page of
-  hives), `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`, `/hives/{hive}/commands`
-  and `/hives/{hive}/vault/secrets` take `?limit=&cursor=`. The answer has `next_cursor` while
-  rows follow (pass it back as `cursor`) and `total`. Without `limit` every row comes, as before
-  (`vault_list`: its `limit`, 200 by default). The installation's versions in `/installation` and
-  `/hives/motherbee/versions` are the newest 20 (`versions_total`;
+  `/inventory/{hive}`, `/hives/{hive}/status`, `/hives/{hive}/nodes`,
+  `/hives/{hive}/identity/tenants/{tenant_id}/nodes`, `/versions` (a page of hives),
+  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`, `/hives/{hive}/commands` and
+  `/hives/{hive}/vault/secrets` take `?limit=&cursor=` (an empty `cursor` is none). The answer has
+  `next_cursor` while rows follow (pass it back as `cursor`) and `total`. Without `limit` every
+  row comes, as before, but for two lists that never gave every row: `/hives/{hive}/vault/secrets`
+  gives its `limit`, 200 by default, and `/hives/{hive}/commands` 50 by default. A cursor the list
+  did not give is refused, `INVALID_CURSOR` (400). The installation's versions in `/installation`
+  and `/hives/motherbee/versions` are the newest 20 (`versions_total`;
   `?versions_before=<versions_next_before>` lists older ones).
+- **A list is no snapshot.** SY.admin gathers a long list from the node behind it page by page,
+  within the time the action gives one request: a row written or removed meanwhile may be in it or
+  not, though never twice, and a list not gathered in that time answers `TIMEOUT` (read it in
+  pages).
 - **An answer past the frame is never lost**: the caller gets `REPLY_TOO_LARGE` at once, with
   the answer's size, how to page it and how many rows fit (`error_detail.suggested_limit`), or,
   for a change, that it ran and its outcome. The node that sent it logs `a mesh reply does not
   fit one frame: REPLY_TOO_LARGE sent in its place` (SY.admin), or the same of an identity,
-  vault or orchestrator answer, with the action, the caller and the size; the SDK also logs
-  `FRAME_TOO_LARGE`. An executor plan's answer always arrives, each step's output cut to fit
-  (`output_truncated`); its full log is on the motherbee
+  vault or orchestrator answer, with the action, the caller and the size. An executor plan's
+  answer is cut only as far as the frame needs: the largest step outputs first
+  (`output_truncated`), then every output, each step keeping its status and ids, then each step's
+  last event; past all of it `REPLY_TOO_LARGE` says the plan ran and keeps its `execution_id` and
+  `log_path`. The run's full log is on the motherbee, and each step's outcome is in the command
+  log (`/hives/motherbee/commands`, origin `executor`)
   ([SY.admin](../nodes/sy-admin.md#replies-that-do-not-fit-a-frame)).
 
 ## Links

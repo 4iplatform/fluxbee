@@ -1658,26 +1658,40 @@ An answer reaches you in one mesh frame, at most 128 KiB. The lists that grow wi
 installation answer in pages:
 
 - **Which**: `/inventory`, `/inventory/{hive}`, `/hives/{hive}/nodes`, `/versions` (a page of hives),
-  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants` and
-  `/hives/{hive}/vault/secrets` take `?limit=&cursor=`. `list_recent_commands` takes `limit` and
-  `cursor` too.
-- **How**: read without them first; you get every row, as always. When an answer has
-  `next_cursor`, more rows follow: read the same path again with `?cursor=<next_cursor>` (and the
-  same `limit`), until an answer has none. `total` says how many rows there are in all. Pass the
-  cursor exactly as it came.
-- **`REPLY_TOO_LARGE`** means the answer did not fit one frame, so SY.admin sent this small error
-  in its place. It is not a failure of the system and nothing is wrong with the data:
+  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
+  `/hives/{hive}/vault/secrets` and `/hives/{hive}/commands` (SY.admin's command log) take
+  `?limit=&cursor=`.
+- **How**: read without them first. Most lists then give every row, as always; two give one page
+  even so: `/hives/{hive}/vault/secrets` 200 secrets and `/hives/{hive}/commands` 50 commands.
+  When an answer has `next_cursor`, more rows follow: read the same path again with
+  `?cursor=<next_cursor>` (and the same `limit`), until an answer has none. `total` says how many
+  rows there are in all. Pass the cursor exactly as it came: a cursor of another list is refused
+  with `INVALID_CURSOR`.
+- **A list is no snapshot.** SY.admin gathers a long list page by page, so a row written or removed
+  while it reads may be in it or not, though never twice. A list that would take longer than one
+  request answers `TIMEOUT`: read it in pages.
+- **`REPLY_TOO_LARGE`** means the answer did not fit one frame, so a small error came in its place.
+  It is not a failure of the system and nothing is wrong with the data:
   - for a list, `error_detail.paging` names the params and `error_detail.suggested_limit` how
     many rows fit: read it again with `?limit=<suggested_limit>` and follow `next_cursor`;
-  - for another read, say so to the operator: the answer is readable over HTTP on the motherbee
-    (`error_detail.http`);
+  - for another read, say so to the operator: when `error_detail.http` names a route, the answer
+    is readable over HTTP on the motherbee;
   - for a change, `error_detail.action_ran` is `true` and `error_detail.outcome` holds its status
     and ids: the change ran. Never run it again to see its answer; read what it changed back.
 - **The installation's versions**: `/installation` and `/hives/{hive}/versions` list the newest 20;
   `?versions_before=<versions_next_before>` lists older ones.
-- **A plan's answer** always arrives. When a step's output was too large for the frame it is cut,
-  and its event says `output_truncated`, with `output_bytes`, its size before; its status and its
-  small fields are whole. Read what a step changed back with the read that shows it.
+- **A plan's answer** is cut only as far as the frame needs. First the largest step outputs are
+  cut: such an event says `output_truncated`, with `output_bytes`, its size before, and keeps its
+  status and small fields whole. A larger answer drops every step's output, keeping each step's
+  status, its ids and what you read of it (a deploy's `wf_node`, a change's `version` and
+  `pending`, an installation update's `id`), and then keeps only each step's last event.
+  `payload.outputs_bounded` says how it was cut. Read what a step changed back with the read that
+  shows it.
+- **A plan whose answer is still too large** comes back as `REPLY_TOO_LARGE` with
+  `action_ran: true`: the plan ran. Say so, never that it failed: name its `execution_id` and its
+  `plan_status` from `error_detail.outcome`, and read each step's outcome in the command log
+  (`/hives/motherbee/commands?limit=`, the steps with origin `executor`); the run's full log is on
+  the motherbee at `outcome.log_path`. Never run the plan again to see its answer.
 
 ### 10.2 Prefer existing platform primitives
 

@@ -223,11 +223,15 @@ request gets `UNAUTHORIZED_REGISTRAR`.
   the id of the page's last row, while rows follow, and `total`, how many match in all. Asked with
   neither, they answer every row, as before (`list_ilks_payload`, `list_tenants_payload`). A
   limit that is not a whole number from 1, or a cursor that is not a string, answers
-  `INVALID_REQUEST`. SY.admin always asks in pages and assembles them
-  ([SY.admin](sy-admin.md#pages)).
+  `INVALID_REQUEST`; a cursor that is not the listing's own, `ilk:<uuid>` for `ILK_LIST` and
+  `tnt:<uuid>` for `TNT_LIST`, answers `INVALID_CURSOR`, never an empty page (`list_page_ask`).
+  Each page rebuilds the listing from the registry and sorts it before it cuts the page, a cost
+  that grows with the registry and is paid once a page. SY.admin always asks in pages and
+  assembles them ([SY.admin](sy-admin.md#pages)).
 - **An answer too large for one frame** goes as `REPLY_TOO_LARGE` in its place, with the answer's
-  `size`, the frame's `max`, and its `outcome` (status, error code, ids), so the caller learns why
-  at once and a write's deltas still go out (`send_system_response`).
+  `size`, `max` (the frame less the router's 1 KiB reserve, against which each answer is measured
+  serialized), its `outcome` (status, error code, ids) and, for a listing, its `rows`, so the
+  caller learns why at once and a write's deltas still go out (`send_system_response`).
 
 The callers in the code: IO nodes provision against `SY.identity@motherbee`
 (`nodes/io/common/src/provision.rs`); the orchestrator registers the ILK of each node it

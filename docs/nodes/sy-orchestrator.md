@@ -816,23 +816,30 @@ orchestrator for the reads, rule (3); `SY.admin@motherbee` for
 
 - **`list_versions`** asked with `limit` or `cursor` answers a page of hives: the hives after the
   cursor in the order motherbee first, then the connected spokes by id (`versions_hive_after`), at
-  most `limit` and at most half a mesh frame of snapshots (`mesh_reply::LIST_PAGE_MAX_BYTES`), with
-  `next_cursor`, the page's last hive, while hives follow. Only the page's spokes are asked for
-  their `GET_VERSIONS`. The page's `comparison` is still against the motherbee's snapshot, taken
-  locally when the motherbee is not on the page. `total` is how many hives the answer covers.
-  Asked with neither, every hive, as before.
-- **`list_nodes`, `LIST_NODES` and `INVENTORY_REQUEST`** (`global` and `hive` scopes) list nodes
-  in the order of their hive, then their name, and asked with `limit` or `cursor` answer a page of
-  them (`node_rows_page`): after the cursor (`<hive>|<name>`), at most `limit` and half a frame,
-  with `next_cursor` and `total`. `node_count` and `total_nodes` still count every node. The
-  motherbee passes `limit` and `cursor` on to another hive's `LIST_NODES`. The `managed` listing
-  of one tenant's nodes (`list_tenant_nodes`) has no pages.
-- **Every answer is sent within the frame or replaced.** When the send of an admin reply or a
-  `*_RESPONSE` fails with `MessageTooLarge`, the orchestrator sends the same message with
-  `REPLY_TOO_LARGE` as its payload, `{status, error_code, message, size, max, outcome}`, `outcome`
-  being the answer's own status, error code and ids, and its meta keeps that outcome
-  (`send_within_frame`). SY.admin, or the motherbee's orchestrator, learns why at once instead of
-  waiting to its timeout.
+  most `limit`, with `next_cursor`, the page's last hive, while hives follow. Only the page's
+  spokes are asked for their `GET_VERSIONS`, one at a time: the page stops asking once its
+  snapshots pass half a mesh frame (`mesh_reply::LIST_PAGE_MAX_BYTES`), and keeps a snapshot it
+  fetched while the page stays under 100 KiB (`VERSIONS_PAGE_HARD_MAX_BYTES`), so no spoke is
+  asked twice for one page boundary. The page's `comparison` is still against the motherbee's
+  snapshot, taken locally when the motherbee is not on the page. `total` is how many hives the
+  answer covers. Asked with neither, every hive, as before. A cursor that is not a hive id answers
+  `INVALID_CURSOR`. The motherbee's `config` lists the installation's newest 20 versions with
+  `versions_total`, `versions_latest` (the newest recorded, whatever the page) and
+  `versions_next_before` (`installation_motherbee_section`).
+- **`list_nodes`, `list_tenant_nodes`, `LIST_NODES` and `INVENTORY_REQUEST`** (`global` and `hive`
+  scopes) list nodes in the order of their hive, then their name, and asked with `limit` or
+  `cursor` answer a page of them (`node_rows_page`): after the cursor (`<hive>|<name>`), at most
+  `limit` and half a frame, with `next_cursor` and `total`. `node_count` and `total_nodes` still
+  count every node. The motherbee passes `limit` and `cursor` on to another hive's `LIST_NODES`.
+  `list_tenant_nodes` asks every connected hive for the tenant's nodes on each page. A cursor that
+  is not a `<hive>|<name>` answers `INVALID_CURSOR`, never an empty page (`node_page_ask`).
+- **Every answer is sent within the frame or replaced.** Each admin reply and `*_RESPONSE` is
+  measured serialized against the frame less the router's 1 KiB reserve (`mesh_reply::oversized`),
+  and the SDK's `MessageTooLarge` is taken the same way: the orchestrator sends the same message
+  with `REPLY_TOO_LARGE` as its payload, `{status, error_code, message, size, max, outcome, rows}`,
+  `outcome` being the answer's own status, error code and ids and `rows` the rows of a listing it
+  held, and its meta keeps that outcome (`send_within_frame`). SY.admin, or the motherbee's
+  orchestrator, learns why at once instead of waiting to its timeout.
 
 **`node_help` and `NODE_HELP`** (`node_help_flow`): a node's self-description
 ([agent-tools-v1](../agent-tools-v1.md) §3.3), asked the way its status is.

@@ -222,22 +222,26 @@ except `NODE_STATUS_GET`.
   (`updated_at`, `created_at` and `key`, hex-encoded: `VaultListPlace`). Passed back as `cursor`,
   beside the filter, it lists the secrets after that place, so a secret deleted since keeps the
   place. A secret written while its caller pages moves to the front, and a later page does not
-  list it again. A cursor this vault did not write answers `INVALID_REQUEST`.
+  list it again. A cursor this vault did not write answers `INVALID_CURSOR`
+  (`VaultError::InvalidCursor`), never an empty page.
 - `total` is how many secrets the filter matches in all; `count`, how many this page holds.
-- SY.admin's `vault_list` asks page after page up to its caller's limit
-  ([SY.admin](sy-admin.md#pages)).
+- SY.admin's `vault_list` asks page after page up to its caller's limit, and SY.admin's own reads
+  (the provider keys a reader may read, the secrets that block a tenant's purge) follow every page
+  ([SY.admin](sy-admin.md#pages)). A caller that reads `VAULT_LIST` itself, without pages, gets the
+  first page: at most its `limit` and 96 KiB.
 
 ### Error codes
 
-`VaultError::code`: `INVALID_REQUEST`, `UNAUTHORIZED`, `KEY_NOT_FOUND`, `KEY_TAKEN`,
-`NO_PREVIOUS_VERSION`, `IDENTITY_UNAVAILABLE` (the only one worth retrying), `STORAGE_ERROR`,
-`ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, `IO_ERROR`, `INVALID_VALUE`, `NODE_ERROR`. An
-error answer is `{status: "error", error_code, message}`.
+`VaultError::code`: `INVALID_REQUEST`, `INVALID_CURSOR`, `UNAUTHORIZED`, `KEY_NOT_FOUND`,
+`KEY_TAKEN`, `NO_PREVIOUS_VERSION`, `IDENTITY_UNAVAILABLE` (the only one worth retrying),
+`STORAGE_ERROR`, `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, `IO_ERROR`, `INVALID_VALUE`,
+`NODE_ERROR`. An error answer is `{status: "error", error_code, message}`.
 
 An answer too large for one frame, a value too large for it, goes as `REPLY_TOO_LARGE` in its
-place, `{status: "error", error_code, message, size, max, outcome}`, `outcome` being the answer's
-status, error code and ids (`key`, `version`), never its value; a write's notices still go out
-(`send_system_response`, FINDINGS A-198).
+place, `{status: "error", error_code, message, size, max, outcome, rows}`, `outcome` being the
+answer's status, error code and ids (`key`, `version`), never its value, and `rows` the secrets a
+listing held; a write's notices still go out (`send_system_response`, FINDINGS A-198). Each answer
+is measured serialized against the frame less the router's 1 KiB reserve (`max`).
 
 ### Reserved keys
 

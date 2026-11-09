@@ -169,21 +169,29 @@ The service codes of each op are in §5.
 
 ### 4.4 An answer too large for one frame: `REPLY_TOO_LARGE`
 
-The hive's answer reaches IO.cloud in one mesh frame, at most 128 KiB. When an answer does not
-fit, the hive sends `error_code: "REPLY_TOO_LARGE"` in its place (HTTP 200, like every hive
-error), at once, never a silent timeout. Its `error_detail` is an object:
+The hive's answer reaches IO.cloud in one mesh frame, at most 128 KiB, less 1 KiB the router keeps
+for itself. When an answer does not fit, the hive sends `error_code: "REPLY_TOO_LARGE"` in its
+place (HTTP 200, like every hive error), at once, never a silent timeout. Its `error_detail` is an
+object:
 
 | field | what |
 |---|---|
 | `message`, `action` | what was too large |
-| `size`, `max` | the answer's bytes and the frame's |
+| `size`, `max` | the answer's bytes and the most an answer may take |
 | `paging` | for a list: the params to page (`params`) and the field naming the next page (`next`) |
 | `suggested_limit` | for a list: about how many rows fit half a frame |
 | `outcome` | the action's own `status`, `error_code` and ids |
 | `action_ran` | `true` for an action that changed something: **it ran**; read its effect back, never send it again to see its answer |
 
-For `list_tenants` and `list_tokens`, send the op again with `params.limit` set to
-`suggested_limit` and follow `next_cursor`. `get_usage` pages already (§5.5).
+It never names one of the hive's own HTTP routes: Cloud reaches the hive only through IO.cloud.
+For `list_tenants`, `list_tokens` and `list_nodes`, send the op again with `params.limit` set to
+`suggested_limit` and follow `next_cursor`. Another op's answer has no smaller form. `get_usage`
+pages already (§5.5).
+
+A `params.cursor` that is not a `next_cursor` of the same op is refused with
+`INVALID_CURSOR`. A `params.limit` that is not a whole number from 1 is refused with
+`INVALID_REQUEST` by IO.cloud, before the hive is asked. A list the hive gathers page by page is no
+snapshot: a row written or removed meanwhile may be in it or not, though never twice.
 
 ---
 
@@ -309,8 +317,8 @@ is_root, is_sponsor, deleted_at_ms}, …]}`, in the order of their ids.
 
 | field | | |
 |---|---|---|
-| `params.limit` | optional | at most this many tenants (from 1); without it, every one, as before |
-| `params.cursor` | optional | the `next_cursor` of the page before |
+| `params.limit` | optional | at most this many tenants, a whole number from 1 (IO.cloud refuses anything else with `INVALID_REQUEST`); without it, every one, as before |
+| `params.cursor` | optional | the `next_cursor` of the page before, a string (anything else is refused) |
 
 With `limit`, `result.next_cursor` is there while more tenants follow: send the same op with
 `params.cursor` set to it, until a page has none. `total` is how many there are in all. See
@@ -539,10 +547,12 @@ while the hive cannot tell (its identity registry still loading), they keep what
 | `params.limit` | optional | 1–1000; the vault's default is 200 |
 | `params.cursor` | optional | the `next_cursor` of the page before |
 
-The newest-written credentials come first. While more follow, `result.next_cursor` is there:
-send the same op with `params.cursor` set to it (and the same filter) until a page has none.
-`result.total` is how many credentials the filter matches. A page also stays within one mesh
-frame, so it can hold fewer than `limit` with a `next_cursor`.
+The newest-written credentials come first, `params.limit` of them (200 without it), never every
+credential at once. While more follow, `result.next_cursor` is there: send the same op with
+`params.cursor` set to it (and the same filter) until a page has none. `result.total` is how many
+credentials the filter matches. A page too large for one mesh frame comes back as
+`REPLY_TOO_LARGE` (§4.4): send it again with `params.limit` set to its `suggested_limit`. A
+credential written while you page moves to the front, so the pages are no snapshot.
 
 **Never the value.** `result` is the vault's reply:
 
@@ -642,8 +652,17 @@ operator's work, through Archi.
 
 #### `list_nodes`
 
-`tenant_id` at the root, no params. Every node charged to your tenant, on every hive: the ones you
-launched and the ones the operator launched.
+`tenant_id` at the root. Every node charged to your tenant, on every hive: the ones you launched
+and the ones the operator launched, in the order of their hive, then their name.
+
+| field | | |
+|---|---|---|
+| `params.limit` | optional | at most this many nodes, a whole number from 1; without it, every one, as before |
+| `params.cursor` | optional | the `next_cursor` of the page before |
+
+With `limit`, `result.next_cursor` is there while more nodes follow: send the same op with
+`params.cursor` set to it, until a page has none. `result.total` is how many there are in all. See
+§4.4 for an answer too large for one frame.
 
 ```json
 {"status":"ok","op":"list_nodes","result":{"status":"ok","tenant_id":"tnt:…","count":1,
@@ -900,9 +919,10 @@ post '{"op":"list_cloud_actions"}'
 
 - **New error code `REPLY_TOO_LARGE`** (§4.4): an answer too large for one mesh frame comes back
   as this error at once, with how to page it, instead of a timeout (`ADMIN_UNAVAILABLE`).
-- **Pages** for `list_tenants` (`params.limit`, `params.cursor`, §5.1) and `list_tokens`
-  (`params.cursor`, §5.3): `next_cursor` while more follow, and `total`. Without them every answer
-  is what it was.
+- **Pages** for `list_tenants` (`params.limit`, `params.cursor`, §5.1), `list_tokens`
+  (`params.cursor`, §5.3) and `list_nodes` (`params.limit`, `params.cursor`, §5.4): `next_cursor`
+  while more follow, and `total`. Without them every answer is what it was. A cursor the op did
+  not give is refused with the new code `INVALID_CURSOR`.
 
 ### 0.1.79
 

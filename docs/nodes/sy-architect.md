@@ -131,12 +131,26 @@ actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
 **Pages** (FINDINGS A-198): the reads of lists that grow with the installation take
 `?limit=&cursor=` (`/inventory`, `/inventory/{hive}`, `/hives/{hive}/status`,
 `/hives/{hive}/nodes`, `/versions`, `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
-and `cursor` beside the filter of `/hives/{hive}/vault/secrets`), and the installation's
-versions `?versions_limit=&versions_before=` (`/installation`, `/versions`,
+`/hives/{hive}/commands`, and `cursor` beside the filter of `/hives/{hive}/vault/secrets`), and the
+installation's versions `?versions_limit=&versions_before=` (`/installation`, `/versions`,
 `/hives/{hive}/versions`); `translate_scmd` passes them to SY.admin, the numbers as numbers
 (`scmd_page_params`, `scmd_vault_list_params`). The path's description tells the model to follow
 `next_cursor`, and on `REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit`
-([SY.admin](sy-admin.md#pages)).
+([SY.admin](sy-admin.md#pages)). `GET /hives/{hive}/commands` (FINDINGS A-201) reads SY.admin's
+command log (`list_recent_commands`), newest first, with `?action=&status=&since_ms=`: each
+command with its outcome, an executor plan's steps among them (origin `executor`). Archi's own
+reads of a list, the nodes of a hive a redeploy reads (`list_nodes_for_hive`) and the motherbee's
+nodes its status shows, go page after page with a smaller page when SY.admin says how many rows fit
+(`admin_listing_every_page`); an answer that is not ok is an error, never an empty list.
+
+**A plan whose answer was too large** (FINDINGS A-198): SY.admin cuts an executor run's answer as
+far as the frame needs, and past that answers `REPLY_TOO_LARGE` with `action_ran` and the run's
+outcome. Archi takes it as a run that ran, never as a failed plan
+(`executor_report_of_an_answer_too_large`): its message names the execution, its status and steps,
+the command log where each step's outcome is and the run's full log on the motherbee; the report
+carries the run's summary with no events and `answer_too_large`, so its verdict is never verified
+(`verify_execution_result`) and the plan teaches no cookbook. A plan that stopped at a step fails
+as before, naming that step.
 
 **What an agent can do**: the base tools every AI agent has ([agent-tools-v1](../agent-tools-v1.md)
 T4). Their catalog is first `GET /hives/motherbee/runtimes/ai.generic` → `get_runtime`, whose

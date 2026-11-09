@@ -256,8 +256,10 @@ The operator's change and the update with category `config`, built for 0.1.122; 
   - `get_installation`, `GET /installation`: a read, which Archi may ask for over the mesh
     (`MeshAccess::Archi`). It is a view of the motherbee's `/versions` (`installation_view`): the
     motherbee's file (`file`, `version`, `sha256`, `state`, `ai`, `not_written`),
-    `expected_version`, every version recorded with its values (`versions`), and each hive's copy
-    (`state`, `version`, `sha256`, `applied`).
+    `expected_version`, the versions recorded with their values (`versions`: the newest 20 unless
+    asked for others with `versions_limit` and `versions_before`, with `versions_total` and
+    `versions_next_before`, FINDINGS A-198), and each hive's copy (`state`, `version`, `sha256`,
+    `applied`).
   - `set_installation_ai`, `PUT /installation/ai`, body `{ai, expected_version,
     replace_hand_edit?}`: the operator's word, confirmed first and closed to the whole mesh, Archi
     included (`MeshAccess::Nobody`). The operator calls it on loopback, or Archi stages it as one
@@ -679,9 +681,12 @@ design); its gates are next (§10). The machinery is SY.admin's
     (§4, "As built (stage 3b)"). A state no version record can decide is `unknown`.
 - **As built (stage 3c):** each hive's `config` adds `ai`, a valid copy's values, and `applied`, the
   config update it applied last (`{version, sha256, applied_at_ms, ai, restarted}`, null before its
-  first). The motherbee's adds `versions`: every version it recorded, with its sha256,
+  first). The motherbee's adds `versions`: the versions it recorded, with their sha256,
   `written_at_ms`, `source` (`migration` or `operator`) and `ai`, so SY.admin and Archi read the
-  history without reading the orchestrator's files.
+  history without reading the orchestrator's files. Since 0.1.123 (FINDINGS A-198) it lists the
+  newest 20, oldest first, with `versions_total`, `versions_latest` (the newest recorded) and,
+  while older ones remain, `versions_next_before`; `versions_limit` (1 to 100) and
+  `versions_before` list others.
 - **An update's result says `not_answered`** for a hive that did not answer, never "not applied",
   and points to `/versions` (P-13). As built (stage 3c): `set_installation_ai`'s answer, with
   `sync_pending` and `error` beside it.
