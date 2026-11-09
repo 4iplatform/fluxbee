@@ -60,6 +60,7 @@ use fluxbee_sdk::{
     NODE_SECRET_REDACTION_TOKEN, USAGE_QUERY_MAX_DAYS, USAGE_QUERY_MAX_LIMIT,
 };
 use json_router::ai_settings;
+use json_router::mesh_reply::{self, PageAsk, REPLY_TOO_LARGE};
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
@@ -1624,32 +1625,39 @@ struct AdminCommandLogQuery {
     status: Option<String>,
     hive: Option<String>,
     since_ms: Option<u64>,
+    /// The `next_cursor` of the page before (FINDINGS A-198): the entries older than it.
+    cursor: Option<String>,
 }
 
-/// Read the most recent entries (newest first), walking the current file then rotations until the
-/// limit fills. Filters: exact action, status ok|error, target hive, since_ms.
+/// An entry's place in the log, newest first (FINDINGS A-198): its `ts_ms` and how many entries of
+/// that same millisecond came before it, as `<ts_ms>:<n>`. The place holds while the log grows.
+fn command_log_place(cursor: &str) -> Option<(u64, usize)> {
+    let (ts_ms, seen) = cursor.trim().split_once(':')?;
+    Some((ts_ms.parse().ok()?, seen.parse().ok()?))
+}
+
+/// Read the most recent entries (newest first), walking the current file then rotations, as one
+/// page: at most `limit`, the entries after the query's cursor, with `next_cursor` while entries
+/// follow and `total`, those the filters match in the whole log (FINDINGS A-198). Filters: exact
+/// action, status ok|error, target hive, since_ms.
 fn read_recent_admin_commands(
     state_dir: &Path,
     query: &AdminCommandLogQuery,
-) -> Vec<serde_json::Value> {
+) -> mesh_reply::ListPage {
     let dir = admin_command_log_dir(state_dir);
     let limit = query.limit.clamp(1, ADMIN_COMMAND_LOG_MAX_LIMIT);
-    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut out: Vec<(String, serde_json::Value)> = Vec::new();
+    // The last millisecond seen and how many of its entries came before, for each entry's place.
+    let mut same_ms: (u64, usize) = (u64::MAX, 0);
     let mut files = vec![admin_command_log_path(state_dir)];
     for idx in 1..=ADMIN_COMMAND_LOG_ROTATIONS {
         files.push(dir.join(format!("commands.jsonl.{idx}")));
     }
     for file in files {
-        if out.len() >= limit {
-            break;
-        }
         let Ok(raw) = fs::read_to_string(&file) else {
             continue;
         };
         for line in raw.lines().rev() {
-            if out.len() >= limit {
-                break;
-            }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
@@ -1673,11 +1681,30 @@ fn read_recent_admin_commands(
                     value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
                 });
             if matches {
-                out.push(value);
+                let ts_ms = value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                same_ms = if ts_ms == same_ms.0 {
+                    (ts_ms, same_ms.1 + 1)
+                } else {
+                    (ts_ms, 0)
+                };
+                out.push((format!("{ts_ms}:{}", same_ms.1), value));
             }
         }
     }
-    out
+    let ask = PageAsk {
+        limit: Some(limit),
+        cursor: query.cursor.clone(),
+    };
+    // A local read: the limit bounds the page, and a reply over the mesh past the frame is answered
+    // REPLY_TOO_LARGE with how many fit.
+    mesh_reply::list_page(out, &ask, usize::MAX, |entry, cursor| {
+        match (command_log_place(entry), command_log_place(cursor)) {
+            (Some((ts_ms, seen)), Some((after_ms, after_seen))) => {
+                ts_ms < after_ms || (ts_ms == after_ms && seen > after_seen)
+            }
+            _ => true,
+        }
+    })
 }
 
 fn load_admin_executor_node_config(
@@ -3904,6 +3931,99 @@ async fn execute_admin_executor_plan(
     }))
 }
 
+/// The most bytes of step outputs and echoed args an executor answer carries over the mesh, every
+/// event's together (FINDINGS A-198): with the events' own fields, the summary and the envelope,
+/// the answer stays within one frame for any plan of a few dozen steps.
+const EXECUTOR_MESH_PREVIEWS_BUDGET: usize = 72 * 1024;
+/// The least any one output or args keeps, however many a run has.
+const EXECUTOR_MESH_PREVIEW_MIN_BYTES: usize = 512;
+/// The longest error text an event or the summary keeps over the mesh.
+const EXECUTOR_MESH_TEXT_MAX_BYTES: usize = 2 * 1024;
+
+/// An executor answer as it goes over the mesh (FINDINGS A-198). The plan has already run when it
+/// is sent, so it must arrive: a REPLY_TOO_LARGE in its place would leave Archi blind, and Archi
+/// could run the plan again. Every event keeps its status and its fields; an output
+/// (`result_preview`) or args (`tool_args_preview`) past its share of the budget is cut to it
+/// (`mesh_reply::bounded_value`, which keeps a status, an id or a short list whole), with
+/// `output_truncated`/`args_truncated` and its size before (`output_bytes`/`args_bytes`), and so is
+/// a long error text. When anything was cut, `outputs_bounded` names the share and the run's full
+/// log, which the executor writes on the motherbee with secrets redacted (`summary.log_path`).
+/// True when anything was cut.
+fn bound_executor_answer_for_mesh(payload: &mut serde_json::Value) -> bool {
+    let log_path = payload
+        .pointer("/summary/log_path")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let Some(events) = payload
+        .get_mut("events")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    const PREVIEWS: [(&str, &str, &str); 2] = [
+        ("tool_args_preview", "args_truncated", "args_bytes"),
+        ("result_preview", "output_truncated", "output_bytes"),
+    ];
+    let previews = events
+        .iter()
+        .flat_map(|event| {
+            PREVIEWS
+                .iter()
+                .filter_map(move |(field, _, _)| event.get(*field))
+        })
+        .filter(|preview| !preview.is_null())
+        .count();
+    let share =
+        (EXECUTOR_MESH_PREVIEWS_BUDGET / previews.max(1)).max(EXECUTOR_MESH_PREVIEW_MIN_BYTES);
+    let mut cut = false;
+    for event in events.iter_mut() {
+        for (field, flag, bytes) in PREVIEWS {
+            let Some(preview) = event.get(field).filter(|preview| !preview.is_null()) else {
+                continue;
+            };
+            let size = mesh_reply::serialized_len(preview);
+            if size <= share {
+                continue;
+            }
+            let bounded = mesh_reply::bounded_value(preview, share);
+            event[field] = bounded;
+            event[flag] = serde_json::json!(true);
+            event[bytes] = serde_json::json!(size);
+            cut = true;
+        }
+        cut |= bound_text_field(event, "error_message");
+    }
+    if let Some(failure) = payload.pointer_mut("/summary/failure") {
+        cut |= bound_text_field(failure, "detail");
+    }
+    if cut {
+        payload["outputs_bounded"] = serde_json::json!({
+            "max_bytes_each": share,
+            "full_log": log_path,
+            "note": "Over the mesh each step's output and args are cut to max_bytes_each \
+                     (output_truncated/args_truncated, with output_bytes/args_bytes, the size \
+                     before); the run's full log, secrets redacted, is on the motherbee at full_log.",
+        });
+    }
+    cut
+}
+
+/// `value[field]`, a text, cut to `EXECUTOR_MESH_TEXT_MAX_BYTES`; true when it was cut.
+fn bound_text_field(value: &mut serde_json::Value, field: &str) -> bool {
+    let bounded = match value.get(field) {
+        Some(text)
+            if text
+                .as_str()
+                .is_some_and(|text| text.len() > EXECUTOR_MESH_TEXT_MAX_BYTES) =>
+        {
+            mesh_reply::bounded_value(text, EXECUTOR_MESH_TEXT_MAX_BYTES)
+        }
+        _ => return false,
+    };
+    value[field] = bounded;
+    true
+}
+
 /// Section H5 — origin authorization for protected admin system actions.
 ///
 /// Returns the matching `_RESPONSE` msg name for any action that must be
@@ -4246,6 +4366,9 @@ fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::
     }
 }
 
+/// Every answer to an `ADMIN_COMMAND` goes out here. One the frame refuses (FINDINGS A-198) is
+/// answered all the same: `REPLY_TOO_LARGE` goes in its place (`reply_too_large_message`), with
+/// the action's own outcome, so the caller learns why at once instead of waiting to its timeout.
 async fn send_admin_command_response(
     client: &RouterDispatcher,
     request_msg: &Message,
@@ -4257,6 +4380,9 @@ async fn send_admin_command_response(
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
+    // Taken before the reply takes the payload: what a REPLY_TOO_LARGE keeps of it.
+    let outcome = admin_reply_outcome(status, error_code.as_deref(), &payload);
+    let rows = admin_reply_rows(action, &payload);
     let response = admin_command_response_message(
         sender.uuid(),
         request_msg,
@@ -4265,10 +4391,216 @@ async fn send_admin_command_response(
         payload,
         error_code,
         error_detail,
+        request_id.clone(),
+    );
+    match sender.send(response).await {
+        Ok(()) => Ok(()),
+        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
+            tracing::warn!(
+                action,
+                caller = request_msg.routing.src_l2_name.as_deref().unwrap_or(""),
+                size,
+                max,
+                "a mesh reply does not fit one frame: REPLY_TOO_LARGE sent in its place"
+            );
+            let reply = reply_too_large_message(
+                sender.uuid(),
+                request_msg,
+                action,
+                outcome,
+                rows,
+                size,
+                max,
+                request_id,
+            );
+            sender.send(reply).await?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// What a REPLY_TOO_LARGE keeps of the reply it replaces (FINDINGS A-198): the action's status and
+/// error code, and the ids its payload names (`mesh_reply::reply_outcome`).
+fn admin_reply_outcome(
+    status: &str,
+    error_code: Option<&str>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let mut outcome = mesh_reply::reply_outcome(payload);
+    if let Some(fields) = outcome.as_object_mut() {
+        fields.insert("status".to_string(), serde_json::json!(status));
+        match error_code {
+            Some(code) => fields.insert("error_code".to_string(), serde_json::json!(code)),
+            None => fields.remove("error_code"),
+        };
+    }
+    outcome
+}
+
+/// How a caller pages an action whose answer grows with the installation (FINDINGS A-198): the
+/// parameters it asks a page with, the field of the answer that names the next page, and the
+/// field that holds the rows.
+struct AdminActionPaging {
+    params: &'static [&'static str],
+    next: &'static str,
+    rows: &'static str,
+}
+
+fn admin_action_paging(action: &str) -> Option<AdminActionPaging> {
+    let paging = |params, next, rows| Some(AdminActionPaging { params, next, rows });
+    match action {
+        "list_ilks" => paging(&["limit", "cursor"], "next_cursor", "ilks"),
+        "list_tenants" => paging(&["limit", "cursor"], "next_cursor", "tenants"),
+        "list_recent_commands" => paging(&["limit", "cursor"], "next_cursor", "commands"),
+        "vault_list" => paging(&["filter.limit", "cursor"], "next_cursor", "secrets"),
+        "list_versions" => paging(&["limit", "cursor"], "next_cursor", "hives"),
+        "inventory" | "list_nodes" => paging(&["limit", "cursor"], "next_cursor", "nodes"),
+        "get_installation" | "get_versions" => paging(
+            &["versions_limit", "versions_before"],
+            "versions_next_before",
+            "versions",
+        ),
+        "get_llm_usage" => paging(&["limit", "after"], "next", "records"),
+        "timer_list" => paging(&["limit", "cursor"], "next_cursor", "timers"),
+        _ => None,
+    }
+}
+
+/// How many rows the reply of a paged action holds, so a REPLY_TOO_LARGE can say how many fit.
+fn admin_reply_rows(action: &str, payload: &serde_json::Value) -> Option<usize> {
+    let paging = admin_action_paging(action)?;
+    let rows = if paging.rows == "versions" {
+        payload
+            .get("versions")
+            .or_else(|| payload.pointer("/hive/config/versions"))
+    } else {
+        payload.get(paging.rows)
+    };
+    rows.and_then(serde_json::Value::as_array).map(Vec::len)
+}
+
+/// Whether `action`'s answer reports a change it made: what the registry does not mark read_only,
+/// and the mesh-only actions outside the registry that change something. A REPLY_TOO_LARGE in its
+/// place says it ran, so the caller does not run it again to see its answer.
+fn admin_reply_reports_a_change(action: &str) -> bool {
+    !admin_action_is_read_only(action)
+        || matches!(
+            action,
+            "executor_execute_plan" | "externalize" | "unexternalize"
+        )
+}
+
+/// The `error_detail` of a REPLY_TOO_LARGE (FINDINGS A-198): the reply's size, the frame's, the
+/// action and how to get its answer: its pages, with how many rows fit half a frame when the reply
+/// had rows, or HTTP on the motherbee for a read. An action that changes something says it ran and
+/// keeps its `outcome`.
+fn admin_reply_too_large_detail(
+    action: &str,
+    outcome: serde_json::Value,
+    rows: Option<usize>,
+    size: usize,
+    max: usize,
+) -> serde_json::Value {
+    let changed = admin_reply_reports_a_change(action);
+    let paging = admin_action_paging(action);
+    let http = admin_action_path_patterns(action).first().copied();
+    // The rows that fit half a frame, at the size the reply's rows had on average.
+    let suggested_limit = rows
+        .filter(|rows| *rows > 0 && size > 0)
+        .map(|rows| ((rows * (max / 2)) / size).max(1));
+    let how = match (&paging, http) {
+        (Some(paging), _) => format!(
+            "ask it in pages with {} and follow {} until it is absent{}",
+            paging.params.join(" and "),
+            paging.next,
+            suggested_limit
+                .map(|limit| format!(" (about {limit} rows fit half a frame)"))
+                .unwrap_or_default()
+        ),
+        (None, Some(http)) if !changed => {
+            format!("read it over HTTP on the motherbee, which has no frame: {http}")
+        }
+        (None, _) if changed => {
+            "read what it changed back with the action that reads it".to_string()
+        }
+        (None, _) => "this answer has no smaller form over the mesh".to_string(),
+    };
+    let status = outcome
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let message = if changed {
+        format!(
+            "{action} ran (status {status}) and its answer, {size} bytes, does not fit one mesh \
+             frame ({max} bytes): its outcome is kept in outcome, so do not run it again to see \
+             it; {how}"
+        )
+    } else {
+        format!("{action}'s answer, {size} bytes, does not fit one mesh frame ({max} bytes): {how}")
+    };
+    let mut detail = serde_json::json!({
+        "message": message,
+        "action": action,
+        "size": size,
+        "max": max,
+        "read_only": !changed,
+        "outcome": outcome,
+    });
+    if changed {
+        detail["action_ran"] = serde_json::json!(true);
+    }
+    if let Some(paging) = paging {
+        detail["paging"] = serde_json::json!({
+            "params": paging.params,
+            "next": paging.next,
+            "rows": paging.rows,
+        });
+        if let Some(limit) = suggested_limit {
+            detail["suggested_limit"] = serde_json::json!(limit);
+        }
+    } else if let Some(http) = http.filter(|_| !changed) {
+        detail["http"] = serde_json::json!(http);
+    }
+    detail
+}
+
+/// What SY.admin sends in place of a reply of `size` bytes the frame refused (FINDINGS A-198):
+/// `REPLY_TOO_LARGE`, its `admin_reply_too_large_detail`, and the meta of the action's own outcome,
+/// so an action that ran reads as one that ran.
+#[allow(clippy::too_many_arguments)]
+fn reply_too_large_message(
+    sender_uuid: &str,
+    request_msg: &Message,
+    action: &str,
+    outcome: serde_json::Value,
+    rows: Option<usize>,
+    size: usize,
+    max: usize,
+    request_id: Option<String>,
+) -> Message {
+    let (action_result, result_origin) = derive_action_outcome(
+        classify_admin_action(action),
+        outcome.get("status").and_then(serde_json::Value::as_str),
+        outcome
+            .get("error_code")
+            .and_then(serde_json::Value::as_str),
+    );
+    let detail = admin_reply_too_large_detail(action, outcome, rows, size, max);
+    let mut reply = admin_command_response_message(
+        sender_uuid,
+        request_msg,
+        action,
+        "error",
+        serde_json::Value::Null,
+        Some(REPLY_TOO_LARGE.to_string()),
+        Some(detail),
         request_id,
     );
-    sender.send(response).await?;
-    Ok(())
+    reply.meta.action_result = action_result;
+    reply.meta.result_origin = result_origin.map(str::to_string);
+    reply
 }
 
 /// The `ADMIN_COMMAND_RESPONSE` to `request_msg`, as SY.admin sends it over the mesh: one frame,
@@ -7712,7 +8044,7 @@ async fn dispatch_internal_admin_command(
                     ))
                 }
             };
-            let payload =
+            let mut payload =
                 match execute_admin_executor_plan(ctx, client, &request, caller_l2_name).await {
                     Ok(payload) => payload,
                     Err(err) => {
@@ -7728,6 +8060,11 @@ async fn dispatch_internal_admin_command(
                         })
                     }
                 };
+            // The plan has run: its answer must arrive, so over the mesh each step's output and
+            // args are cut to fit the frame (FINDINGS A-198); HTTP has no frame.
+            if !matches!(origin, AdminOrigin::Http) {
+                bound_executor_answer_for_mesh(&mut payload);
+            }
             return Ok(InternalAdminDispatchResult {
                 http_status: if payload.get("status").and_then(serde_json::Value::as_str)
                     == Some("done")
@@ -8497,8 +8834,9 @@ fn enforce_cloud_relay_content(
             cloud_claimed_tenant(params.get("tenant_id"), action)?;
             only_fields(Some(params), &["tenant_id"])?;
         }
+        // Every tenant, or one page of them (FINDINGS A-198).
         "list_tenants" => {
-            only_fields(Some(params), &[])?;
+            only_fields(Some(params), &["limit", "cursor"])?;
         }
         // The claimed tenant's LLM usage (docs/router-stream-v1.md §7.6), never every tenant's:
         // the root tenant's spending (Archi, the admin's executor) stays with the operator.
@@ -8590,7 +8928,8 @@ fn enforce_cloud_relay_content(
             let filter = params.get("filter");
             cloud_claimed_tenant(filter.and_then(|f| f.get("tenant_id")), action)?;
             only_fields(filter, &["tenant_id", "resource_type", "prefix", "limit"])?;
-            only_fields(Some(params), &["filter"])?;
+            // The next page's cursor, beside the filter (FINDINGS A-198).
+            only_fields(Some(params), &["filter", "cursor"])?;
         }
         "vault_assign" => {
             // The key's tenant; the nodes are checked against it (resolve_assigned_ilks).
@@ -9154,6 +9493,9 @@ async fn handle_http(
                 payload["scope"] = serde_json::Value::String("hive".to_string());
                 payload["filter_hive"] = serde_json::Value::String(hive_id.to_string());
             }
+            if let Some(fields) = payload.as_object_mut() {
+                page_query_params(&query, fields);
+            }
             let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
             respond_json(stream, status, &resp).await?;
             return Ok(());
@@ -9172,6 +9514,9 @@ async fn handle_http(
                 .filter(|value| !value.is_empty())
             {
                 payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            if let Some(fields) = payload.as_object_mut() {
+                page_query_params(&query, fields);
             }
             let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
             respond_json(stream, status, &resp).await?;
@@ -9193,6 +9538,9 @@ async fn handle_http(
                 .filter(|value| !value.is_empty())
             {
                 payload["filter_type"] = serde_json::Value::String(kind.to_ascii_uppercase());
+            }
+            if let Some(fields) = payload.as_object_mut() {
+                page_query_params(&query, fields);
             }
             let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
             respond_json(stream, status, &resp).await?;
@@ -9412,23 +9760,44 @@ async fn handle_http(
         }
         ("GET", "/versions") => {
             let hive = query.get("hive").cloned();
+            // ?versions_limit=&versions_before= pick the installation's versions; over every hive,
+            // ?limit=&cursor= ask one page of hives (FINDINGS A-198).
+            let mut payload = serde_json::Map::new();
+            versions_query_params(&query, &mut payload);
             if hive.is_some() {
-                let (status, resp) = handle_admin_query(ctx, client, "get_versions", hive).await?;
+                let (status, resp) = handle_admin_query_with_payload(
+                    ctx,
+                    client,
+                    "get_versions",
+                    serde_json::Value::Object(payload),
+                    hive,
+                )
+                .await?;
                 respond_json(stream, status, &resp).await?;
             } else {
-                let (status, resp) = handle_admin_query(ctx, client, "list_versions", None).await?;
+                page_query_params(&query, &mut payload);
+                let (status, resp) = handle_admin_query_with_payload(
+                    ctx,
+                    client,
+                    "list_versions",
+                    serde_json::Value::Object(payload),
+                    None,
+                )
+                .await?;
                 respond_json(stream, status, &resp).await?;
             }
         }
         // The installation file and the operator's change of its ai
         // (docs/hive-config-update-v1.md §4, stage 3c).
         ("GET", "/installation") => {
+            let mut payload = serde_json::Map::new();
+            versions_query_params(&query, &mut payload);
             let internal = dispatch_internal_admin_command(
                 ctx,
                 client,
                 "get_installation",
                 None,
-                serde_json::json!({}),
+                serde_json::Value::Object(payload),
                 AdminOrigin::Http,
             )
             .await?;
@@ -9648,21 +10017,44 @@ fn acme_http_body(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice(body).unwrap_or_else(|_| serde_json::Value::String("unparsable".into()))
 }
 
+/// `inventory` (FINDINGS A-198): the orchestrator answers a page of nodes within half a frame, and
+/// SY.admin assembles the pages (`assemble_list_pages`): every node without a `limit`, as before.
+/// The summary has no nodes and goes as it is.
 async fn handle_inventory_http(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     let target = format!("SY.orchestrator@{}", ctx.hive_id);
+    let target = target.as_str();
     let timeout_secs = env_timeout_secs("JSR_ADMIN_INVENTORY_TIMEOUT_SECS").unwrap_or(10);
-    let response = send_system_request(
-        client,
-        &target,
-        "INVENTORY_REQUEST",
-        "INVENTORY_RESPONSE",
-        payload,
-        Duration::from_secs(timeout_secs),
-    )
+    let ask = |request: serde_json::Value| {
+        send_system_request(
+            client,
+            target,
+            "INVENTORY_REQUEST",
+            "INVENTORY_RESPONSE",
+            request,
+            Duration::from_secs(timeout_secs),
+        )
+    };
+    let summary = payload
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("summary"));
+    if summary {
+        return Ok(build_admin_http_response("inventory", ask(payload).await));
+    }
+    let caller = match PageAsk::from_payload(&payload) {
+        Ok(caller) => caller,
+        Err(detail) => return Ok(admin_invalid_request_response("inventory", &detail)),
+    };
+    let payload = &payload;
+    let response = assemble_list_pages("nodes", &caller, |page| {
+        let mut request = payload.clone();
+        page.apply_to(&mut request);
+        ask(request)
+    })
     .await;
     Ok(build_admin_http_response("inventory", response))
 }
@@ -9720,11 +10112,12 @@ async fn handle_hive_paths(
     }
     match (method, rest) {
         ("GET", ["status"]) => {
-            let payload = serde_json::json!({
-                "scope": "hive",
-                "filter_hive": hive,
-            });
-            let (status, resp) = handle_inventory_http(ctx, client, payload).await?;
+            let mut payload = serde_json::Map::new();
+            payload.insert("scope".to_string(), serde_json::json!("hive"));
+            payload.insert("filter_hive".to_string(), serde_json::json!(hive));
+            page_query_params(query, &mut payload);
+            let (status, resp) =
+                handle_inventory_http(ctx, client, serde_json::Value::Object(payload)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["inventory", "summary"]) => {
@@ -9799,6 +10192,10 @@ async fn handle_hive_paths(
             if let Some(since) = query.get("since_ms").and_then(|v| v.parse::<u64>().ok()) {
                 payload.insert("since_ms".to_string(), serde_json::json!(since));
             }
+            // The next page: the next_cursor of the page before (FINDINGS A-198).
+            if let Some(cursor) = query.get("cursor") {
+                payload.insert("cursor".to_string(), serde_json::json!(cursor));
+            }
             let (status, resp) = handle_admin_command(
                 ctx,
                 client,
@@ -9832,7 +10229,17 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["nodes"]) => {
-            let (status, resp) = handle_admin_query(ctx, client, "list_nodes", Some(hive)).await?;
+            // ?limit=&cursor= ask one page (FINDINGS A-198).
+            let mut payload = serde_json::Map::new();
+            page_query_params(query, &mut payload);
+            let (status, resp) = handle_admin_query_with_payload(
+                ctx,
+                client,
+                "list_nodes",
+                serde_json::Value::Object(payload),
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["nodes"]) => {
@@ -10155,13 +10562,15 @@ async fn handle_hive_paths(
         }
         ("GET", ["identity", "ilks"]) => {
             // ?include_deleted=true adds the marked ILKs; ?pending_signup=true keeps only the
-            // signups nobody finished, wherever they are charged.
+            // signups nobody finished, wherever they are charged; ?limit=&cursor= ask one page
+            // (FINDINGS A-198).
             let mut filter = serde_json::Map::new();
             for flag in ["include_deleted", "pending_signup"] {
                 if query_flag(query, flag) {
                     filter.insert(flag.to_string(), serde_json::Value::Bool(true));
                 }
             }
+            page_query_params(query, &mut filter);
             if !filter.is_empty() {
                 let (status, resp) = handle_identity_query(
                     ctx,
@@ -10264,12 +10673,17 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants"]) => {
+            let mut filter = serde_json::Map::new();
             if query_flag(query, "include_deleted") {
+                filter.insert("include_deleted".to_string(), serde_json::Value::Bool(true));
+            }
+            page_query_params(query, &mut filter);
+            if !filter.is_empty() {
                 let (status, resp) = handle_identity_query(
                     ctx,
                     client,
                     "list_tenants",
-                    serde_json::json!({"include_deleted": true}),
+                    serde_json::Value::Object(filter),
                     Some(hive),
                 )
                 .await?;
@@ -10418,11 +10832,15 @@ async fn handle_hive_paths(
                     serde_json::Value::Number(serde_json::Number::from(limit)),
                 );
             }
-            let payload = if filter.is_empty() {
+            let mut payload = if filter.is_empty() {
                 serde_json::json!({})
             } else {
                 serde_json::json!({ "filter": filter })
             };
+            // The next page: the next_cursor of the page before (FINDINGS A-198).
+            if let Some(cursor) = query.get("cursor") {
+                payload["cursor"] = serde_json::json!(cursor);
+            }
             let (status, resp) =
                 handle_admin_command(ctx, client, "vault_list", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
@@ -10544,8 +10962,17 @@ async fn handle_hive_paths(
             Ok(Some((status, resp)))
         }
         ("GET", ["versions"]) => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
+            // ?versions_limit=&versions_before= pick the installation's versions (FINDINGS A-198).
+            let mut payload = serde_json::Map::new();
+            versions_query_params(query, &mut payload);
+            let (status, resp) = handle_admin_query_with_payload(
+                ctx,
+                client,
+                "get_versions",
+                serde_json::Value::Object(payload),
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["streams"]) => {
@@ -11277,8 +11704,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // the stamped backup does not match its bytes: refuse rather than restore garbage
         | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
-        // The full action catalog asked over the mesh, where it never fits a frame (A-197).
-        "CATALOG_TOO_LARGE_FOR_MESH" => 413,
+        // The full action catalog asked over the mesh, where it never fits a frame (A-197), and
+        // a node's answer the frame refused, sent as REPLY_TOO_LARGE in its place (A-198).
+        "CATALOG_TOO_LARGE_FOR_MESH" | "REPLY_TOO_LARGE" => 413,
         "WORKFLOW_NOT_FOUND" => 404,
         // A WF engine's refusals of its instance verbs (`node_verb_answer`): an instance it does
         // not have, and one already ended.
@@ -12127,6 +12555,10 @@ async fn handle_admin_query(
     if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, serde_json::json!({}), hive).await;
     }
+    if matches!(action, "list_nodes" | "list_versions") {
+        return handle_paged_orchestrator_query(ctx, client, action, serde_json::json!({}), hive)
+            .await;
+    }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(
@@ -12140,6 +12572,105 @@ async fn handle_admin_query(
     let response =
         installation_update::with_update_summary(&ctx.installation_update, action, response);
     Ok(build_admin_http_response(action, response))
+}
+
+/// `list_nodes` and `list_versions` (FINDINGS A-198): the orchestrator answers a page of nodes, or
+/// of hives' snapshots, within half a frame, and SY.admin assembles the pages
+/// (`orchestrator_list_pages`): without a `limit`, every node or hive, as before the pages.
+async fn handle_paged_orchestrator_query(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let caller = match PageAsk::from_payload(&payload) {
+        Ok(caller) => caller,
+        Err(detail) => return Ok(admin_invalid_request_response(action, &detail)),
+    };
+    let response = orchestrator_list_pages(ctx, client, action, &payload, hive, &caller).await;
+    // /versions carries the installation's update (docs/hive-config-update-v1.md §7, stage 4).
+    let response =
+        installation_update::with_update_summary(&ctx.installation_update, action, response);
+    Ok(build_admin_http_response(action, response))
+}
+
+/// An orchestrator listing, `list_nodes` (its `nodes`) or `list_versions` (its `hives`), assembled
+/// from its pages (`assemble_list_pages`) as the caller asks it. `list_versions`' comparison is
+/// each page's against the motherbee's snapshot, joined (`merge_versions_comparisons`).
+async fn orchestrator_list_pages(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: &serde_json::Value,
+    hive: Option<String>,
+    caller: &PageAsk,
+) -> Result<serde_json::Value, AdminError> {
+    let rows_key = if action == "list_versions" {
+        "hives"
+    } else {
+        "nodes"
+    };
+    let comparisons = std::sync::Mutex::new(Vec::new());
+    let relay = admin_node_name(&ctx.hive_id);
+    let mut assembled = assemble_list_pages(rows_key, caller, |page| {
+        let mut request = payload.clone();
+        page.apply_to(&mut request);
+        let request = normalize_admin_payload(action, request, hive.as_deref());
+        let request = build_admin_request(ctx, action, request, hive.clone());
+        let (comparisons, relay) = (&comparisons, &relay);
+        async move {
+            let answer =
+                send_admin_request(client, request, admin_action_timeout(action), relay).await?;
+            if let Some(comparison) = answer.get("comparison") {
+                comparisons
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(comparison.clone());
+            }
+            Ok(answer)
+        }
+    })
+    .await?;
+    let comparisons = comparisons
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if comparisons.len() > 1 && payload_is_ok(&assembled) {
+        assembled["comparison"] = merge_versions_comparisons(&comparisons);
+    }
+    Ok(assembled)
+}
+
+/// `list_versions`' comparison over its pages (FINDINGS A-198): every page compares its hives with
+/// the motherbee's snapshot, so the hives' verdicts join, and the verdict is the worst of the
+/// pages': `differs`, then `unknown`, then `match`.
+fn merge_versions_comparisons(pages: &[serde_json::Value]) -> serde_json::Value {
+    let verdict_of = |page: &serde_json::Value| {
+        page.get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let verdict = if pages.iter().any(|page| verdict_of(page) == "differs") {
+        "differs"
+    } else if pages.iter().any(|page| verdict_of(page) != "match") {
+        "unknown"
+    } else {
+        "match"
+    };
+    let hives: Vec<serde_json::Value> = pages
+        .iter()
+        .filter_map(|page| page.get("hives").and_then(serde_json::Value::as_array))
+        .flatten()
+        .cloned()
+        .collect();
+    let mut merged = pages
+        .first()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    merged["verdict"] = serde_json::json!(verdict);
+    merged["hives"] = serde_json::Value::Array(hives);
+    merged
 }
 
 async fn handle_admin_query_with_payload(
@@ -12156,6 +12687,9 @@ async fn handle_admin_query_with_payload(
     // SY.identity, as the HTTP route does.
     if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, payload, hive).await;
+    }
+    if matches!(action, "list_nodes" | "list_versions") {
+        return handle_paged_orchestrator_query(ctx, client, action, payload, hive).await;
     }
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
@@ -12764,6 +13298,20 @@ fn admin_action_is_read_only(action: &str) -> bool {
     !matches!(
         action,
         "add_hive"
+            // It mints the endpoint's bearer token and answers it once (FINDINGS A-198 found it
+            // and the identity writes below listed as reads).
+            | "publish_cloud_endpoint"
+            | "set_ilk_definition"
+            | "delete_ilk"
+            | "restore_ilk"
+            | "set_ilk_tenant"
+            | "purge_ilk"
+            | "create_tenant"
+            | "update_tenant"
+            | "set_tenant_sponsor"
+            | "delete_tenant"
+            | "restore_tenant"
+            | "purge_tenant"
             | "publish_runtime_package"
             | "publish_artifact"
             | "unpublish_artifact"
@@ -12958,7 +13506,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_versions" => "Read core and runtime versions for one hive, and its installation file.",
         "get_installation" => {
-            "Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), every version recorded with its values, and each hive's copy with the config update it applied last."
+            "Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), the versions recorded with their values (the newest 20 unless asked), and each hive's copy with the config update it applied last."
         }
         "set_installation_ai" => {
             "Change the installation's ai (the default provider and each provider's model) on every hive: the motherbee's orchestrator writes the next version of the installation file, and each hive restarts only the readers whose engine changed. Refuses a change that leaves a node unable to resolve its engine, and names it."
@@ -14029,11 +14577,14 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional hive override when using internal admin dispatch.",
             ),
         ],
-        "vault_list" => vec![admin_action_body_field(
-            "filter",
-            "object",
-            "Optional filter object. Fields: prefix (string), tenant_id (string, canonical tnt:<uuid>; defaults to the hive's root tenant when admin caller and omitted), resource_type (string — canonical Model D' lowercase snake_case), ilk (string for dedicated secrets; pass empty string to match pool secrets explicitly), tags (string[]), limit (number).",
-        )],
+        "vault_list" => vec![
+            admin_action_body_field(
+                "filter",
+                "object",
+                "Optional filter object. Fields: prefix (string), tenant_id (string, canonical tnt:<uuid>; defaults to the hive's root tenant when admin caller and omitted), resource_type (string — canonical Model D' lowercase snake_case), ilk (string for dedicated secrets; pass empty string to match pool secrets explicitly), tags (string[]), limit (number: the page, 200 without it, at most 1000).",
+            ),
+            admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
+        ],
         "run_node" => vec![
             admin_action_body_field(
                 "runtime",
@@ -14205,6 +14756,25 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("action", "string", "Filter: exact admin action name."),
             admin_action_body_field("status", "string", "Filter: 'ok' or 'error'."),
             admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
+            admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
+        ],
+        "list_ilks" | "list_tenants" | "list_nodes" | "inventory" => vec![
+            admin_action_body_field("limit", "u32", PAGE_LIMIT_FIELD_NOTE),
+            admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
+        ],
+        "list_versions" => vec![
+            admin_action_body_field(
+                "limit",
+                "u32",
+                "Hives per page (FINDINGS A-198): at most this many hives' snapshots from cursor on, the motherbee first, with next_cursor while hives follow. Without it, every hive, as before.",
+            ),
+            admin_action_body_field("cursor", "string", PAGE_CURSOR_FIELD_NOTE),
+            admin_action_body_field("versions_limit", "u32", INSTALLATION_VERSIONS_LIMIT_NOTE),
+            admin_action_body_field("versions_before", "u64", INSTALLATION_VERSIONS_BEFORE_NOTE),
+        ],
+        "get_versions" | "get_installation" => vec![
+            admin_action_body_field("versions_limit", "u32", INSTALLATION_VERSIONS_LIMIT_NOTE),
+            admin_action_body_field("versions_before", "u64", INSTALLATION_VERSIONS_BEFORE_NOTE),
         ],
         "send_node_message" => vec![
             admin_action_body_field("msg", "string", "Optional message name."),
@@ -15030,6 +15600,13 @@ const NODE_ON_PATH_HIVE_NOTE: &str = "node_name is a node of the path's hive: a 
 const WF_INSTANCE_NODE_NOTE: &str = "The hive comes from the /hives/{hive} path in HTTP; over the mesh, from payload.target or a node_name@hive. node_name is the WF node, WF.<workflow>@<hive>, and a bare WF.<workflow> is a node of that hive. A name of another hive, or of a node that is not WF.*, is refused with INVALID_REQUEST.";
 const WF_INSTANCE_ERRORS_NOTE: &str = "The engine answers its instance verbs only to SY.admin@motherbee and to its hive's SY.wf-rules. A refusal, {ok: false, error, detail}, keeps that payload and gives error_code and error_detail: INVALID_REQUEST 400, node_not_configured 409 (a WF node without its definition in use), STORE_ERROR 502. A node that does not answer is TIMEOUT or TRANSPORT_ERROR (the detail says NODE_NOT_FOUND when the router knows no such node).";
 
+/// What the listings that grow with the installation say of their pages (FINDINGS A-198).
+const PAGE_LIMIT_FIELD_NOTE: &str = "Rows per page (FINDINGS A-198): at most this many, from cursor on, with next_cursor while more follow and total, how many there are. Without it, every row, as before.";
+const PAGE_CURSOR_FIELD_NOTE: &str = "The next_cursor of the page before: the rows after it. Follow next_cursor until the answer has none.";
+const PAGE_NOTE: &str = "Pages (FINDINGS A-198): with limit, at most that many rows from cursor on, and next_cursor while rows follow (pass it back as cursor, query parameters ?limit=&cursor= in HTTP); total is how many there are. Without limit, every row, as before. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with the params to page and how many rows fit (error_detail.suggested_limit): ask it again with that limit and follow next_cursor.";
+const INSTALLATION_VERSIONS_LIMIT_NOTE: &str = "How many of the installation file's versions the motherbee's config lists (FINDINGS A-198): the newest ones, 1 to 100, 20 without it.";
+const INSTALLATION_VERSIONS_BEFORE_NOTE: &str = "List the versions older than this one: versions_next_before of the answer before, while older versions remain.";
+
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
         "list_admin_actions" => vec![
@@ -15052,6 +15629,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
             "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
             "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
+            "Pages (FINDINGS A-198): limit entries, newest first, from cursor on, with next_cursor while older entries follow (?cursor= in HTTP) and total, how many the filters match in the log. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many entries fit (error_detail.suggested_limit).",
+        ],
+        "list_ilks" => vec![
+            "SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities. ILKs come in the order of their ids.",
+            PAGE_NOTE,
         ],
         "unpublish_artifact" => vec![
             "The operator takes down any page, whoever published it: POST /artifacts/unpublish on loopback, or a step of an executor plan, which Archi stages with fluxbee_plan_compiler and SY.admin runs only after the operator confirms it (A-120).",
@@ -15086,6 +15668,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This endpoint is hive-scoped only.",
             "For all nodes across the system, use GET /inventory or GET /inventory/summary instead.",
             "For node software versions, use GET /versions or GET /hives/{hive}/versions and map node names to core/runtime entries.",
+            "Nodes come in the order of their name; node_count counts every node of the hive.",
+            PAGE_NOTE,
         ],
         "run_node" => vec![
             "Use this only when creating/spawning a new managed instance.",
@@ -15264,6 +15848,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use this when you need to discover root/default tenants, candidate sponsors, or tenant ids before spawning identity-aware software.",
             "This returns tenant summaries including sponsor_tenant_id, child_count, ilk_count, is_root, and is_sponsor.",
             "Use get_tenant for one specific tenant, its resolved sponsor record, and its child tenant summaries.",
+            "Tenants come in the order of their ids.",
+            PAGE_NOTE,
         ],
         "get_tenant" => vec![
             "SY.admin asks the primary's SY.identity, the motherbee's, whatever hive the /hives/{hive} path names: every hive's replica holds the same identities.",
@@ -15293,6 +15879,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Lists metadata summaries only; it never returns secret values.",
             "Non-admin callers only see secrets they are authorized to read.",
             "Supports optional filter.prefix, filter.tenant_id, filter.resource_type, filter.ilk, filter.tags, and filter.limit (Model D').",
+            "Pages (FINDINGS A-198): filter.limit secrets (200 without it, at most 1000), the most recently written first, from cursor on, with next_cursor while secrets follow (pass it back as cursor, ?cursor= in HTTP) and total, how many the filter matches. A secret written while you page moves to the front. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many fit (error_detail.suggested_limit): ask again with that filter.limit and follow next_cursor.",
         ],
         "vault_put" => vec![
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
@@ -15335,6 +15922,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use GET /inventory for the full global inventory view.",
             "Use GET /inventory/summary for global counts only.",
             "Use GET /inventory/{hive} or GET /hives/{hive}/status for one hive, and GET /hives/{hive}/inventory/summary for its counts.",
+            "Nodes come in the order of their hive, then their name; total_nodes (global) and node_count (one hive) count every node. The summary has no nodes and no pages.",
+            PAGE_NOTE,
         ],
         "list_versions" | "get_versions" => vec![
             "These endpoints report core component versions and runtime availability/current selections.",
@@ -15342,12 +15931,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
             "For runtime-backed nodes, use the runtime the node was spawned from (get_node_config -> config._system.runtime): every AI.* node runs ai.generic, so AI.sales@motherbee -> runtimes.runtimes['ai.generic'].current.",
             "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
-            "config is the hive's copy of the installation file, which holds the installation's ai settings (docs/hive-config-update-v1.md §7): file (absent, valid or invalid), version, sha256, a valid copy's ai values, applied (the config update the hive applied last: version, sha256, applied_at_ms, ai, restarted; null before its first), and state against the motherbee's file: current (its hash), behind (an older version the motherbee recorded), pending (not arrived yet) or edited_by_hand; unknown when the motherbee's record of its versions cannot be read. The motherbee's own config adds not_written when its start did not write the file, and why, and versions: every version it recorded with its sha256, written_at_ms, source and ai. get_installation shows the same as the installation's view.",
+            "config is the hive's copy of the installation file, which holds the installation's ai settings (docs/hive-config-update-v1.md §7): file (absent, valid or invalid), version, sha256, a valid copy's ai values, applied (the config update the hive applied last: version, sha256, applied_at_ms, ai, restarted; null before its first), and state against the motherbee's file: current (its hash), behind (an older version the motherbee recorded), pending (not arrived yet) or edited_by_hand; unknown when the motherbee's record of its versions cannot be read. The motherbee's own config adds not_written when its start did not write the file, and why, and versions: the newest 20 versions it recorded (versions_limit, 1 to 100, asks another count), oldest first, each with its sha256, written_at_ms, source and ai; versions_total counts them all, and versions_next_before, while older ones remain, is the versions_before that lists them (FINDINGS A-198). get_installation shows the same as the installation's view.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
+            "list_versions pages by hive (FINDINGS A-198): with limit, at most that many hives' snapshots from cursor on, the motherbee first, then the others by id, with next_cursor while hives follow (?limit=&cursor= in HTTP) and total, how many hives there are. Each page's comparison is against the motherbee's snapshot. Without limit, every hive, as before. Over the mesh an answer larger than one frame (128 KiB) comes back as REPLY_TOO_LARGE with how many hives fit (error_detail.suggested_limit).",
         ],
         "get_installation" => vec![
             "The installation file holds the installation's ai: the default provider and each provider's model, the same on every hive (docs/hive-config-update-v1.md §4). Credentials are never in it: each provider's key is in SY.vault.",
-            "The answer, from the motherbee's GET /versions: motherbee {file, version, sha256, state, ai, not_written}, expected_version (the version a set_installation_ai names: the file's, or the last one recorded when the file is one no reader can use), versions (every version recorded: version, sha256, written_at_ms, source migration or operator, ai) and hives {<hive>: {state, version, sha256, applied}}.",
+            "The answer, from the motherbee's GET /versions: motherbee {file, version, sha256, state, ai, not_written}, expected_version (the version a set_installation_ai names: the file's, or the last one recorded when the file is one no reader can use), versions (the newest 20 recorded, oldest first: version, sha256, written_at_ms, source migration or operator, ai), versions_total (how many were recorded), versions_next_before (while older ones remain: pass it as versions_before to list them; versions_limit, 1 to 100, asks another count) and hives {<hive>: {state, version, sha256, applied}} (FINDINGS A-198).",
             "state is the copy against the motherbee's file: current, behind (an older version), pending (not arrived yet), edited_by_hand (on the motherbee: a hash its version was not written with, or a file no reader can use) or unknown. applied is the config update the hive applied last: {version, sha256, applied_at_ms, ai, restarted}, null before its first.",
             "To undo a change, set a previous version's ai (from versions) with set_installation_ai: it becomes the next version. A core rollback never touches the installation file.",
         ],
@@ -17504,16 +18094,32 @@ async fn handle_admin_command_with_origin(
                 .map(ToString::to_string),
             hive: hive.clone().filter(|v| !v.is_empty()),
             since_ms: payload.get("since_ms").and_then(|v| v.as_u64()),
+            cursor: match payload.get("cursor") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(cursor)) if command_log_place(cursor).is_some() => {
+                    Some(cursor.trim().to_string())
+                }
+                Some(other) => {
+                    return Ok(admin_invalid_request_response(
+                        action,
+                        &format!(
+                            "cursor must be a next_cursor of list_recent_commands, got {other}"
+                        ),
+                    ))
+                }
+            },
         };
         // Read under the same lock as rotate+append so a concurrent rotation can't make one response
         // miss or duplicate an entry across the file/rotation boundary.
-        let commands = {
+        let page = {
             let _guard = ctx
                 .command_log_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             read_recent_admin_commands(&ctx.state_dir, &query)
         };
+        let count = page.rows.len();
+        let answer = page.into_answer("commands", serde_json::json!({ "count": count }));
         return Ok((
             200u16,
             serde_json::json!({
@@ -17521,7 +18127,7 @@ async fn handle_admin_command_with_origin(
                 "action": "list_recent_commands",
                 "error_code": serde_json::Value::Null,
                 "error_detail": serde_json::Value::Null,
-                "payload": { "count": commands.len(), "commands": commands },
+                "payload": answer,
             })
             .to_string(),
         ));
@@ -18265,19 +18871,31 @@ async fn handle_identity_query(
     let _ = hive;
     let target_hive = identity_command_hive(&ctx.hive_id);
     let target = format!("SY.identity@{}", target_hive);
-    let (request_msg, response_msg) = match action {
-        "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE"),
-        "list_tenants" => ("TNT_LIST", "TNT_LIST_RESPONSE"),
+    let (request_msg, response_msg, rows_key) = match action {
+        "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE", "ilks"),
+        "list_tenants" => ("TNT_LIST", "TNT_LIST_RESPONSE", "tenants"),
         _ => return Err(format!("unsupported identity admin query: {action}").into()),
     };
-    let response = send_system_request(
-        client,
-        &target,
-        request_msg,
-        response_msg,
-        payload,
-        admin_action_timeout(action),
-    )
+    // SY.identity answers in pages within half a frame, and SY.admin assembles them: every one
+    // without a limit, as before (FINDINGS A-198).
+    let caller = match PageAsk::from_payload(&payload) {
+        Ok(caller) => caller,
+        Err(detail) => return Ok(admin_invalid_request_response(action, &detail)),
+    };
+    let target = target.as_str();
+    let payload = &payload;
+    let response = assemble_list_pages(rows_key, &caller, |page| {
+        let mut request = payload.clone();
+        page.apply_to(&mut request);
+        send_system_request(
+            client,
+            target,
+            request_msg,
+            response_msg,
+            request,
+            admin_action_timeout(action),
+        )
+    })
     .await;
     Ok(build_admin_http_response(action, response))
 }
@@ -18293,6 +18911,33 @@ fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// `?limit=&cursor=` of a listing's route (FINDINGS A-198), as the action's payload takes them: the
+/// limit a number when it is one, the cursor as it came.
+fn page_query_params(
+    query: &HashMap<String, String>,
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(limit) = query.get("limit") {
+        payload.insert("limit".to_string(), query_number(limit));
+    }
+    if let Some(cursor) = query.get("cursor") {
+        payload.insert("cursor".to_string(), serde_json::json!(cursor));
+    }
+}
+
+/// `?versions_limit=&versions_before=` of a route that answers the installation's versions
+/// (FINDINGS A-198), as the action's payload takes them.
+fn versions_query_params(
+    query: &HashMap<String, String>,
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    for key in ["versions_limit", "versions_before"] {
+        if let Some(value) = query.get(key) {
+            payload.insert(key.to_string(), query_number(value));
+        }
+    }
 }
 
 /// A number of a query string as the action's payload takes it. Anything else stays text, for the
@@ -18508,6 +19153,9 @@ async fn handle_vault_command(
     // stamped into `meta.src_ilk`, otherwise vault sees `None` and replies
     // UNAUTHORIZED. The HTTP operator never supplies this — admin uses its
     // own self_ilk_id (resolved from identity SHM at boot).
+    if action == "vault_list" {
+        return Ok(handle_vault_list(ctx, client, &target, normalized_payload).await);
+    }
     let response = send_system_request_with_meta(
         client,
         &target,
@@ -18524,6 +19172,73 @@ async fn handle_vault_command(
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// `vault_list` (FINDINGS A-198): SY.vault answers a page within the frame, at most the filter's
+/// `limit` (200 when it names none, at most 1000, as before the pages), and SY.admin assembles the
+/// pages up to that limit from the request's `cursor` on, with SY.vault's `next_cursor` while
+/// secrets follow.
+async fn handle_vault_list(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    target: &str,
+    payload: serde_json::Value,
+) -> (u16, String) {
+    let action = "vault_list";
+    let limit = match payload.pointer("/filter/limit") {
+        None | Some(serde_json::Value::Null) => 200,
+        Some(limit) => match limit.as_u64() {
+            Some(limit) => limit.clamp(1, 1000) as usize,
+            None => {
+                return admin_invalid_request_response(
+                    action,
+                    &format!("filter.limit must be a whole number, got {limit}"),
+                )
+            }
+        },
+    };
+    let cursor = match PageAsk::from_payload(&serde_json::json!({
+        "cursor": payload.get("cursor").cloned().unwrap_or(serde_json::Value::Null),
+    })) {
+        Ok(ask) => ask.cursor,
+        Err(detail) => return admin_invalid_request_response(action, &detail),
+    };
+    let caller = PageAsk {
+        limit: Some(limit),
+        cursor,
+    };
+    let payload = &payload;
+    let response = assemble_list_pages("secrets", &caller, |page| {
+        let mut request = payload.clone();
+        if let Some(fields) = request.as_object_mut() {
+            let filter = fields
+                .entry("filter")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(filter) = filter.as_object_mut() {
+                filter.insert("limit".to_string(), serde_json::json!(page.limit));
+            }
+            match page.cursor {
+                Some(cursor) => fields.insert("cursor".to_string(), serde_json::json!(cursor)),
+                None => fields.remove("cursor"),
+            };
+        }
+        send_system_request_with_meta(
+            client,
+            target,
+            MSG_VAULT_LIST,
+            MSG_VAULT_LIST_RESPONSE,
+            request,
+            16,
+            Some(ctx.self_ilk_id.clone()),
+            None,
+            Some(target.to_string()),
+            Some(action.to_string()),
+            None,
+            admin_action_timeout(action),
+        )
+    })
+    .await;
+    build_admin_http_response(action, response)
 }
 
 /// The admin API (the operator, the executor, Archi, Cloud) never writes SY.admin's ACME accounts
@@ -19527,17 +20242,33 @@ async fn installation_versions(
     client: &RouterDispatcher,
     action: &str,
 ) -> Result<serde_json::Value, (String, String)> {
-    let hive = (action == "get_versions").then(|| ctx.hive_id.clone());
-    let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
-    let request = build_admin_request(ctx, action, payload, hive);
-    match send_admin_request(
-        client,
-        request,
-        admin_action_timeout(action),
-        &admin_node_name(&ctx.hive_id),
-    )
-    .await
-    {
+    installation_versions_with(ctx, client, action, &serde_json::json!({})).await
+}
+
+/// `installation_versions` with `params`, the installation's versions asked
+/// (`versions_limit`, `versions_before`: FINDINGS A-198). Every hive's `/versions` comes in pages
+/// of hives, assembled (`orchestrator_list_pages`).
+async fn installation_versions_with(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, (String, String)> {
+    let answer = if action == "list_versions" {
+        orchestrator_list_pages(ctx, client, action, params, None, &PageAsk::default()).await
+    } else {
+        let hive = (action == "get_versions").then(|| ctx.hive_id.clone());
+        let payload = normalize_admin_payload(action, params.clone(), hive.as_deref());
+        let request = build_admin_request(ctx, action, payload, hive);
+        send_admin_request(
+            client,
+            request,
+            admin_action_timeout(action),
+            &admin_node_name(&ctx.hive_id),
+        )
+        .await
+    };
+    match answer {
         Ok(answer) if payload_is_ok(&answer) => Ok(answer),
         Ok(answer) => Err((
             payload_error_code(&answer).unwrap_or_else(|| "SERVICE_FAILED".to_string()),
@@ -19585,9 +20316,10 @@ fn installation_current_values(own: &serde_json::Value) -> Option<HiveAiConfig> 
 }
 
 /// `get_installation`'s answer, from the motherbee's `/versions` (`list_versions`): the motherbee's
-/// file, `expected_version`, every version recorded with its values, and each hive's copy with the
-/// config update it applied last. A hive whose `/versions` failed is `unknown`; one on an
-/// orchestrator older than the installation file reports no copy.
+/// file, `expected_version`, the versions recorded with their values (the newest 20 unless asked,
+/// with how many there are: FINDINGS A-198), and each hive's copy with the config update it
+/// applied last. A hive whose `/versions` failed is `unknown`; one on an orchestrator older than
+/// the installation file reports no copy.
 fn installation_view(versions: &serde_json::Value, motherbee: &str) -> serde_json::Value {
     let mut hives = serde_json::Map::new();
     let mut own = serde_json::Value::Null;
@@ -19648,26 +20380,63 @@ fn installation_view(versions: &serde_json::Value, motherbee: &str) -> serde_jso
         "motherbee": motherbee_file,
         "expected_version": installation_expected_version(&own),
         "versions": own.get("versions").cloned().unwrap_or(serde_json::Value::Null),
+        // The newest 20 unless asked otherwise, how many there are, and where the older ones start
+        // (FINDINGS A-198).
+        "versions_total": own.get("versions_total").cloned().unwrap_or(serde_json::Value::Null),
+        "versions_next_before": own
+            .get("versions_next_before")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "hives": hives,
     })
 }
 
-/// `get_installation`: a read, so not in the audit log. It takes no parameter.
+/// `get_installation`: a read, so not in the audit log. It takes only which of the installation's
+/// versions to list (FINDINGS A-198): `versions_limit` (the newest 20 without it) and
+/// `versions_before`; a null one is an absent one, as the executor sends it.
 async fn handle_get_installation(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     params: &serde_json::Value,
 ) -> (u16, String) {
     let action = "get_installation";
-    if let Some(field) = unexpected_parameter(params) {
-        return installation_refusal(
-            action,
-            "INVALID_REQUEST",
-            format!("{action} takes no parameters (got {field})"),
-            serde_json::Value::Null,
-        );
-    }
-    match installation_versions(ctx, client, "list_versions").await {
+    let versions: serde_json::Map<String, serde_json::Value> = match params {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(fields) => {
+            if let Some(other) = fields
+                .keys()
+                .find(|key| !matches!(key.as_str(), "versions_limit" | "versions_before"))
+            {
+                return installation_refusal(
+                    action,
+                    "INVALID_REQUEST",
+                    format!("{action} takes versions_limit and versions_before only (got {other})"),
+                    serde_json::Value::Null,
+                );
+            }
+            fields
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }
+        _ => {
+            return installation_refusal(
+                action,
+                "INVALID_REQUEST",
+                format!("{action} takes an object: versions_limit and versions_before"),
+                serde_json::Value::Null,
+            )
+        }
+    };
+    match installation_versions_with(
+        ctx,
+        client,
+        "list_versions",
+        &serde_json::Value::Object(versions),
+    )
+    .await
+    {
         Ok(versions) => {
             let mut view = installation_view(&versions, &ctx.hive_id);
             // The installation's update, its summary (docs/hive-config-update-v1.md §6, stage 4).
@@ -21414,6 +22183,102 @@ fn build_admin_http_response(
     }
 }
 
+/// An action refused for its request before anything was asked, as an HTTP route answers it.
+fn admin_invalid_request_response(action: &str, detail: &str) -> (u16, String) {
+    (
+        400,
+        serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "INVALID_REQUEST",
+            "error_detail": detail,
+        })
+        .to_string(),
+    )
+}
+
+/// The most pages SY.admin asks a source for one listing: a bound on a source that never stops
+/// naming a next page.
+const LIST_ASSEMBLY_MAX_PAGES: usize = 1_000;
+/// The rows SY.admin asks a source for in each page when its caller names no limit: the source's
+/// half frame (`mesh_reply::LIST_PAGE_MAX_BYTES`) bounds each page first.
+const LIST_SOURCE_PAGE_ROWS: usize = 1_000;
+
+/// A listing SY.admin assembles from its source's pages (FINDINGS A-198), so no answer between
+/// them outgrows the mesh's frame. Without a `limit` from its caller, every row, as before there
+/// were pages; with one, at most that many from the caller's `cursor` on, with the source's
+/// `next_cursor` while rows follow. The answer is the source's first page with every row under
+/// `rows_key`, its `count` set to them, the last page's `next_cursor` and the source's `total`. A
+/// source's error answer comes back as it is. A source older than the pages answers every row at
+/// once and names no next page, which ends the listing.
+async fn assemble_list_pages<F, Fut>(
+    rows_key: &str,
+    caller: &PageAsk,
+    mut ask_page: F,
+) -> Result<serde_json::Value, AdminError>
+where
+    F: FnMut(PageAsk) -> Fut,
+    Fut: future::Future<Output = Result<serde_json::Value, AdminError>>,
+{
+    let mut first: Option<serde_json::Value> = None;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut cursor = caller.cursor.clone();
+    let mut total = None;
+    for _ in 0..LIST_ASSEMBLY_MAX_PAGES {
+        let limit = match caller.limit {
+            Some(limit) => limit.saturating_sub(rows.len()),
+            None => LIST_SOURCE_PAGE_ROWS,
+        };
+        let page = ask_page(PageAsk {
+            limit: Some(limit),
+            cursor: cursor.clone(),
+        })
+        .await?;
+        if !payload_is_ok(&page) {
+            return Ok(page);
+        }
+        let next = page
+            .get("next_cursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|next| !next.is_empty())
+            .map(str::to_string);
+        if next.is_some() && next == cursor {
+            return Err(format!(
+                "the source of {rows_key} named the page it was asked for as the next one ({}): \
+                 the listing stops here",
+                next.unwrap_or_default()
+            )
+            .into());
+        }
+        if let Some(page_rows) = page.get(rows_key).and_then(serde_json::Value::as_array) {
+            rows.extend(page_rows.iter().cloned());
+        }
+        total = page.get("total").cloned().or(total);
+        first.get_or_insert(page);
+        cursor = next;
+        if cursor.is_none() || caller.limit.is_some_and(|limit| rows.len() >= limit) {
+            break;
+        }
+    }
+    let mut answer = first.unwrap_or_else(|| serde_json::json!({ "status": "ok" }));
+    if answer.get("count").is_some() {
+        answer["count"] = serde_json::json!(rows.len());
+    }
+    answer[rows_key] = serde_json::Value::Array(rows);
+    if let Some(fields) = answer.as_object_mut() {
+        match cursor {
+            Some(cursor) => fields.insert("next_cursor".to_string(), serde_json::json!(cursor)),
+            None => fields.remove("next_cursor"),
+        };
+        if let Some(total) = total {
+            fields.insert("total".to_string(), total);
+        }
+    }
+    Ok(answer)
+}
+
 fn action_routes_via_local_orchestrator(action: &str) -> bool {
     matches!(
         action,
@@ -22877,6 +23742,12 @@ mod tests {
         assert!(check("list_tenant_nodes", serde_json::json!({"tenant_id": t})).is_ok());
         assert!(check("list_tenants", serde_json::json!({})).is_ok());
         assert!(check("list_tenants", serde_json::json!({"exclude_root": false})).is_err());
+        // One page of them (FINDINGS A-198).
+        assert!(check(
+            "list_tenants",
+            serde_json::json!({"limit": 50, "cursor": "tnt:a"})
+        )
+        .is_ok());
         // Node actions: an IO.* node of the claimed tenant; a kill may purge.
         let node = |name: &str| serde_json::json!({"tenant_id": t, "node_name": name});
         for action in ["get_node_status", "start_node", "kill_node"] {
@@ -23662,6 +24533,17 @@ mod tests {
             check("vault_list", serde_json::json!({})).is_err(),
             "never unfiltered"
         );
+        // The next page's cursor beside the filter (FINDINGS A-198), and nothing else.
+        assert!(check(
+            "vault_list",
+            serde_json::json!({"filter":{"tenant_id":t},"cursor":"0a1b"})
+        )
+        .is_ok());
+        assert!(check(
+            "vault_list",
+            serde_json::json!({"filter":{"tenant_id":t},"page":1})
+        )
+        .is_err());
         // vault_delete: the key and the tenant only.
         assert!(check(
             "vault_delete",
@@ -24236,6 +25118,448 @@ mod tests {
             "the compact catalog's reply is {} bytes, past half a mesh frame",
             frame.len()
         );
+    }
+
+    /// An `ADMIN_COMMAND` of `action` as a mesh caller sends it.
+    fn mesh_admin_request(action: &str, caller: &str) -> Message {
+        Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some(caller.to_string()),
+                dst: Destination::Unicast(format!("SY.admin@{PRIMARY_HIVE_ID}")),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "admin".to_string(),
+                msg: Some(MSG_ADMIN_COMMAND.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({ "action": action, "params": {}, "request_id": "req-1" }),
+        }
+    }
+
+    /// FINDINGS A-198: a reply the frame refuses is answered all the same, with REPLY_TOO_LARGE:
+    /// its size, the frame's, the action, and how to page it, with how many rows fit.
+    #[tokio::test]
+    async fn a_mesh_reply_past_the_frame_answers_reply_too_large_with_how_to_page() {
+        let (ctx, mut harness) = opa_test_admin("reply-too-large-read");
+        let request = mesh_admin_request("list_ilks", "SY.architect@motherbee");
+        let ilks: Vec<Value> = (0..400)
+            .map(|n| json!({ "ilk_id": format!("ilk:{n:036}"), "display_name": "x".repeat(560) }))
+            .collect();
+        let payload = json!({ "status": "ok", "count": ilks.len(), "ilks": ilks });
+        assert!(mesh_reply::serialized_len(&payload) > mesh_reply::MAX_FRAME_SIZE);
+        send_admin_command_response(
+            &ctx.rpc,
+            &request,
+            "list_ilks",
+            "ok",
+            payload,
+            None,
+            None,
+            Some("req-1".to_string()),
+        )
+        .await
+        .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.meta.msg.as_deref(), Some(MSG_ADMIN_COMMAND_RESPONSE));
+        assert_eq!(reply.payload["status"], json!("error"));
+        assert_eq!(reply.payload["error_code"], json!(REPLY_TOO_LARGE));
+        assert_eq!(reply.payload["request_id"], json!("req-1"));
+        let detail = &reply.payload["error_detail"];
+        assert_eq!(detail["action"], json!("list_ilks"));
+        assert!(detail["size"].as_u64() > Some(mesh_reply::MAX_FRAME_SIZE as u64));
+        assert_eq!(detail["max"], json!(mesh_reply::MAX_FRAME_SIZE));
+        assert_eq!(detail["read_only"], json!(true));
+        assert!(detail.get("action_ran").is_none());
+        assert_eq!(detail["paging"]["params"], json!(["limit", "cursor"]));
+        assert_eq!(detail["paging"]["next"], json!("next_cursor"));
+        let limit = detail["suggested_limit"].as_u64().expect("how many fit");
+        assert!(limit > 0 && limit < 400, "{limit}");
+        assert_eq!(detail["outcome"], json!({ "status": "ok" }));
+        let message = detail["message"].as_str().expect("message");
+        assert!(message.contains("limit and cursor"), "{message}");
+        // One reply in the original's place, and a small one.
+        assert!(serde_json::to_vec(&reply).expect("frame").len() < 4 * 1024);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+        assert_eq!(error_code_to_http_status(REPLY_TOO_LARGE), 413);
+    }
+
+    /// FINDINGS A-198: an action that changed something says it ran and keeps its own outcome
+    /// (status and ids, and the meta's result), so its caller does not run it again blind.
+    #[tokio::test]
+    async fn a_write_s_reply_too_large_keeps_its_outcome() {
+        let (ctx, mut harness) = opa_test_admin("reply-too-large-write");
+        let request = mesh_admin_request("set_node_config", "SY.architect@motherbee");
+        let payload = json!({
+            "status": "ok",
+            "node_name": "AI.sales@worker1",
+            "config_version": 4,
+            "config": { "prompt": "p".repeat(200_000) },
+        });
+        send_admin_command_response(
+            &ctx.rpc,
+            &request,
+            "set_node_config",
+            "ok",
+            payload,
+            None,
+            None,
+            Some("req-1".to_string()),
+        )
+        .await
+        .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.payload["error_code"], json!(REPLY_TOO_LARGE));
+        let detail = &reply.payload["error_detail"];
+        assert_eq!(detail["read_only"], json!(false));
+        assert_eq!(detail["action_ran"], json!(true));
+        assert_eq!(
+            detail["outcome"],
+            json!({ "status": "ok", "node_name": "AI.sales@worker1" })
+        );
+        let message = detail["message"].as_str().expect("message");
+        assert!(message.contains("set_node_config ran"), "{message}");
+        assert!(message.contains("do not run it again"), "{message}");
+        assert!(detail.get("http").is_none());
+        assert_eq!(
+            reply.meta.action_result.map(|result| result.as_str()),
+            Some("applied")
+        );
+        // The mesh-only actions outside the registry that change something say so too.
+        for action in ["executor_execute_plan", "externalize", "unexternalize"] {
+            assert!(admin_reply_reports_a_change(action), "{action}");
+        }
+        for action in ["create_tenant", "publish_cloud_endpoint", "delete_ilk"] {
+            assert!(!admin_action_is_read_only(action), "{action}");
+        }
+        assert!(!admin_reply_reports_a_change("list_ilks"));
+    }
+
+    /// FINDINGS A-198: a reply within the frame goes as it is built, nothing in its place.
+    #[tokio::test]
+    async fn a_mesh_reply_within_the_frame_goes_as_it_is() {
+        let (ctx, mut harness) = opa_test_admin("reply-within-frame");
+        let request = mesh_admin_request("list_ilks", "SY.architect@motherbee");
+        let payload = json!({ "status": "ok", "count": 1, "ilks": [{ "ilk_id": "ilk:a" }] });
+        send_admin_command_response(
+            &ctx.rpc,
+            &request,
+            "list_ilks",
+            "ok",
+            payload.clone(),
+            None,
+            None,
+            Some("req-2".to_string()),
+        )
+        .await
+        .expect("answered");
+        let reply = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("a reply");
+        assert_eq!(reply.payload["status"], json!("ok"));
+        assert_eq!(reply.payload["payload"], payload);
+        assert_eq!(reply.payload["error_code"], Value::Null);
+        assert_eq!(reply.payload["request_id"], json!("req-2"));
+    }
+
+    /// FINDINGS A-198: a plan has run when its answer is sent, so the answer must arrive. Over the
+    /// mesh each step's output and args are cut to their share, every event keeping its status
+    /// and its small fields (what Archi reads: a deploy's wf_node), and the answer fits the frame.
+    #[test]
+    fn an_executor_answer_keeps_every_step_s_status_within_the_frame() {
+        let log_path = "/var/lib/fluxbee/state/admin-executor/motherbee/executions/exec-1.json";
+        let args =
+            json!({ "workflow_name": "big", "definition": { "states": "d".repeat(30_000) } });
+        let events: Vec<Value> = (0..5)
+            .flat_map(|n| {
+                let event = |status: &str, result: Value| {
+                    json!({
+                        "execution_id": "exec-1",
+                        "step_id": format!("s{n}"),
+                        "step_index": n,
+                        "step_action": "wf_rules_compile_apply",
+                        "status": status,
+                        "timestamp": 1,
+                        "summary": format!("step s{n} {status}"),
+                        "tool_name": "wf_rules_compile_apply",
+                        "tool_args_preview": args.clone(),
+                        "result_preview": result,
+                        "error_code": null,
+                        "error_source": null,
+                        "error_message": null,
+                    })
+                };
+                vec![
+                    event("running", Value::Null),
+                    event(
+                        "done",
+                        json!({
+                            "status": "ok",
+                            "action": "wf_rules_compile_apply",
+                            "payload": {
+                                "wf_node": { "status": "ok", "node_name": "WF.big@motherbee" },
+                                "compiled": "c".repeat(50_000),
+                            },
+                            "error_code": null,
+                        }),
+                    ),
+                ]
+            })
+            .collect();
+        let mut payload = json!({
+            "status": "done",
+            "execution_id": "exec-1",
+            "events": events,
+            "summary": {
+                "execution_id": "exec-1",
+                "status": "done",
+                "total_steps": 5,
+                "completed_steps": 5,
+                "failed_step_id": null,
+                "failed_step_action": null,
+                "failure": null,
+                "log_path": log_path,
+                "final_message": "Execution completed successfully",
+            },
+        });
+        assert!(mesh_reply::serialized_len(&payload) > 3 * mesh_reply::MAX_FRAME_SIZE);
+        assert!(bound_executor_answer_for_mesh(&mut payload));
+        let request = mesh_admin_request("executor_execute_plan", "SY.architect@motherbee");
+        let reply = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "executor_execute_plan",
+            "ok",
+            payload.clone(),
+            None,
+            None,
+            Some(Uuid::new_v4().to_string()),
+        );
+        let frame = serde_json::to_vec(&reply).expect("frame").len();
+        assert!(frame <= mesh_reply::MAX_FRAME_SIZE, "{frame} bytes");
+        let events = payload["events"].as_array().expect("events");
+        assert_eq!(events.len(), 10);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["step_id"], json!(format!("s{}", index / 2)));
+            assert_eq!(event["args_truncated"], json!(true), "{event}");
+            assert!(event["args_bytes"].as_u64() > Some(30_000));
+            if event["status"] == json!("done") {
+                assert_eq!(event["result_preview"]["status"], json!("ok"));
+                assert_eq!(
+                    event["result_preview"]["payload"]["wf_node"],
+                    json!({ "status": "ok", "node_name": "WF.big@motherbee" })
+                );
+                assert_eq!(event["output_truncated"], json!(true));
+                assert!(event["output_bytes"].as_u64() > Some(50_000));
+            } else {
+                assert_eq!(event["status"], json!("running"));
+                assert!(event.get("output_truncated").is_none());
+            }
+        }
+        assert_eq!(payload["summary"]["status"], json!("done"));
+        assert_eq!(payload["outputs_bounded"]["full_log"], json!(log_path));
+        // An answer within its budget is left as it is.
+        let mut small = json!({
+            "events": [{ "status": "done", "result_preview": { "status": "ok" } }],
+            "summary": { "status": "done" },
+        });
+        let before = small.clone();
+        assert!(!bound_executor_answer_for_mesh(&mut small));
+        assert_eq!(small, before);
+
+        // A change's answer keeps what Archi reads of it when cut: an installation update's id,
+        // its state and the hives it has not reached yet.
+        let hives: serde_json::Map<String, Value> = (0..400)
+            .map(|n| {
+                (
+                    format!("worker{n}"),
+                    json!({ "role": "worker", "core": { "state": "pending", "detail": "x".repeat(200) } }),
+                )
+            })
+            .collect();
+        let mut update = json!({
+            "status": "done",
+            "events": [{
+                "step_id": "s1",
+                "step_action": "update_installation",
+                "tool_name": "update_installation",
+                "status": "done",
+                "tool_args_preview": { "reason": "the release" },
+                "result_preview": {
+                    "status": "partial",
+                    "payload": {
+                        "update": { "id": "upd-1", "state": "open", "hives": hives },
+                        "pending": ["worker7"],
+                    },
+                },
+            }],
+            "summary": { "status": "done", "log_path": log_path },
+        });
+        assert!(bound_executor_answer_for_mesh(&mut update));
+        let preview = &update["events"][0]["result_preview"];
+        assert_eq!(preview["status"], json!("partial"));
+        assert_eq!(preview["payload"]["update"]["id"], json!("upd-1"));
+        assert_eq!(preview["payload"]["update"]["state"], json!("open"));
+        assert_eq!(preview["payload"]["pending"], json!(["worker7"]));
+        assert!(mesh_reply::serialized_len(&update) < mesh_reply::MAX_FRAME_SIZE);
+    }
+
+    /// FINDINGS A-198: the provisioning catalog IO.cloud reads over the mesh stays within 100 KiB,
+    /// so its growth fails here and not on a hive.
+    #[test]
+    fn the_cloud_catalog_s_mesh_reply_stays_within_100_kib() {
+        let (status, body) = build_cloud_actions_catalog_response();
+        assert_eq!(status, 200);
+        let envelope: Value = serde_json::from_str(&body).expect("envelope");
+        let request = mesh_admin_request("list_cloud_actions", "IO.cloud@motherbee");
+        let reply = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "list_cloud_actions",
+            "ok",
+            internal_response_payload_value(&envelope),
+            None,
+            None,
+            Some(Uuid::new_v4().to_string()),
+        );
+        let frame = serde_json::to_vec(&reply).expect("frame").len();
+        assert!(
+            frame <= 100 * 1024,
+            "the cloud catalog's reply is {frame} bytes, past 100 KiB"
+        );
+    }
+
+    /// FINDINGS A-198: SY.admin asks SY.identity in pages and assembles them: every ILK without a
+    /// limit, as before, and with one at most that many, with SY.identity's next_cursor.
+    #[tokio::test]
+    async fn sy_admin_assembles_the_identity_pages() {
+        let (ctx, mut harness) = opa_test_admin("identity-pages");
+        let wait = Duration::from_secs(5);
+        let whole = handle_identity_query(
+            &ctx,
+            &ctx.rpc,
+            "list_ilks",
+            json!({ "include_deleted": true }),
+            None,
+        );
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("page 1");
+            assert_eq!(first.meta.msg.as_deref(), Some("ILK_LIST"));
+            assert_eq!(first.payload["include_deleted"], json!(true));
+            assert_eq!(first.payload["limit"], json!(LIST_SOURCE_PAGE_ROWS));
+            assert!(first.payload.get("cursor").is_none());
+            let page = json!({
+                "status": "ok", "count": 2, "total": 3, "next_cursor": "ilk:b",
+                "ilks": [{ "ilk_id": "ilk:a" }, { "ilk_id": "ilk:b" }],
+            });
+            harness
+                .inject(reply_to(&first, "ILK_LIST_RESPONSE", page))
+                .await
+                .unwrap();
+            let second = harness.next_outgoing_within(wait).await.expect("page 2");
+            assert_eq!(second.payload["cursor"], json!("ilk:b"));
+            let page = json!({
+                "status": "ok", "count": 1, "total": 3, "ilks": [{ "ilk_id": "ilk:c" }],
+            });
+            harness
+                .inject(reply_to(&second, "ILK_LIST_RESPONSE", page))
+                .await
+                .unwrap();
+        };
+        let (answer, ()) = tokio::join!(whole, drive);
+        let (status, body) = answer.expect("answered");
+        assert_eq!(status, 200, "{body}");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        let ilks: Vec<&str> = body["payload"]["ilks"]
+            .as_array()
+            .expect("ilks")
+            .iter()
+            .filter_map(|ilk| ilk["ilk_id"].as_str())
+            .collect();
+        assert_eq!(ilks, vec!["ilk:a", "ilk:b", "ilk:c"]);
+        assert_eq!(body["payload"]["count"], json!(3));
+        assert_eq!(body["payload"]["total"], json!(3));
+        assert!(body["payload"].get("next_cursor").is_none());
+
+        // With a limit, one page of that many, and where the next one starts.
+        let paged = handle_identity_query(
+            &ctx,
+            &ctx.rpc,
+            "list_tenants",
+            json!({ "limit": "2" }),
+            None,
+        );
+        let drive = async {
+            let first = harness.next_outgoing_within(wait).await.expect("page 1");
+            assert_eq!(first.meta.msg.as_deref(), Some("TNT_LIST"));
+            assert_eq!(first.payload["limit"], json!(2));
+            let page = json!({
+                "status": "ok", "count": 2, "total": 5, "next_cursor": "tnt:b",
+                "tenants": [{ "tenant_id": "tnt:a" }, { "tenant_id": "tnt:b" }],
+            });
+            harness
+                .inject(reply_to(&first, "TNT_LIST_RESPONSE", page))
+                .await
+                .unwrap();
+        };
+        let (answer, ()) = tokio::join!(paged, drive);
+        let (_, body) = answer.expect("answered");
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(body["payload"]["count"], json!(2));
+        assert_eq!(body["payload"]["next_cursor"], json!("tnt:b"));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+        // A limit that is no number of rows is refused before anything is asked.
+        let (status, _) =
+            handle_identity_query(&ctx, &ctx.rpc, "list_ilks", json!({ "limit": 0 }), None)
+                .await
+                .expect("answered");
+        assert_eq!(status, 400);
+    }
+
+    /// FINDINGS A-198: `list_versions`' pages each compare their hives with the motherbee's
+    /// snapshot; joined, the hives' verdicts add up and the worst one wins.
+    #[test]
+    fn the_versions_pages_comparisons_join() {
+        let page = |verdict: &str, hives: Value| json!({ "reference_hive": "motherbee", "verdict": verdict, "hives": hives });
+        let merged = merge_versions_comparisons(&[
+            page(
+                "match",
+                json!([{ "hive_id": "worker1", "verdict": "match" }]),
+            ),
+            page(
+                "differs",
+                json!([{ "hive_id": "worker2", "verdict": "differs" }]),
+            ),
+        ]);
+        assert_eq!(merged["verdict"], json!("differs"));
+        assert_eq!(merged["reference_hive"], json!("motherbee"));
+        assert_eq!(merged["hives"].as_array().map(Vec::len), Some(2));
+        let merged = merge_versions_comparisons(&[
+            page("match", json!([])),
+            page(
+                "unknown",
+                json!([{ "hive_id": "worker3", "verdict": "unknown" }]),
+            ),
+        ]);
+        assert_eq!(merged["verdict"], json!("unknown"));
+        let merged =
+            merge_versions_comparisons(&[page("match", json!([])), page("match", json!([]))]);
+        assert_eq!(merged["verdict"], json!("match"));
     }
 
     #[test]
@@ -24932,10 +26256,12 @@ mod tests {
                     dst_of(&sent),
                     json!(format!("SY.orchestrator@{PRIMARY_HIVE_ID}"))
                 );
-                assert_eq!(
-                    sent.payload,
-                    json!({ "scope": scope, "filter_hive": "worker1" })
-                );
+                // The hive's nodes come in pages SY.admin assembles (A-198); the summary has none.
+                let mut expected = json!({ "scope": scope, "filter_hive": "worker1" });
+                if scope == "hive" {
+                    expected["limit"] = json!(LIST_SOURCE_PAGE_ROWS);
+                }
+                assert_eq!(sent.payload, expected);
                 let done = reply_to(
                     &sent,
                     "INVENTORY_RESPONSE",
@@ -26037,7 +27363,8 @@ mod tests {
                 limit: 3,
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(out.len(), 3);
         // newest first
         assert_eq!(out[0]["ts_ms"], json!(4));
@@ -26065,7 +27392,8 @@ mod tests {
                 limit: 20,
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(out.len(), 20);
         assert_eq!(out[0]["ts_ms"], json!(total - 1));
         assert_eq!(out[19]["ts_ms"], json!(total - 20));
@@ -26094,7 +27422,8 @@ mod tests {
                 action: Some("run_node".into()),
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(by_action.len(), 2);
         let by_status = read_recent_admin_commands(
             &dir,
@@ -26103,7 +27432,8 @@ mod tests {
                 status: Some("error".into()),
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(by_status.len(), 1);
         assert_eq!(by_status[0]["action"], json!("run_node"));
         let by_hive = read_recent_admin_commands(
@@ -26113,7 +27443,8 @@ mod tests {
                 hive: Some("motherbee".into()),
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(by_hive.len(), 2);
         let by_since = read_recent_admin_commands(
             &dir,
@@ -26122,7 +27453,8 @@ mod tests {
                 since_ms: Some(21),
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(by_since.len(), 1);
         assert_eq!(by_since[0]["action"], json!("vault_put"));
         let _ = fs::remove_dir_all(&dir);
@@ -26186,13 +27518,55 @@ mod tests {
                 hive: Some("motherbee".into()),
                 ..Default::default()
             },
-        );
+        )
+        .rows;
         let actions: Vec<&str> = out.iter().filter_map(|c| c["action"].as_str()).collect();
         assert!(
             actions.contains(&"add_hive"),
             "hive-less add_hive must be visible: {actions:?}"
         );
         assert!(actions.contains(&"run_node"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS A-198: the log's pages follow their cursor, newest first, two entries of one
+    /// millisecond included, and a page asked while the log grows keeps its place.
+    #[test]
+    fn command_log_pages_follow_their_cursor() {
+        let dir = command_log_test_state_dir("pages");
+        for ts in [1u64, 2, 3, 4, 4, 5] {
+            append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", ts));
+        }
+        let page = |limit: usize, cursor: Option<String>| {
+            read_recent_admin_commands(
+                &dir,
+                &AdminCommandLogQuery {
+                    limit,
+                    cursor,
+                    ..Default::default()
+                },
+            )
+        };
+        let times = |page: &mesh_reply::ListPage| -> Vec<u64> {
+            page.rows
+                .iter()
+                .filter_map(|entry| entry["ts_ms"].as_u64())
+                .collect()
+        };
+        let first = page(2, None);
+        assert_eq!(times(&first), vec![5, 4]);
+        assert_eq!(first.next_cursor.as_deref(), Some("4:0"));
+        assert_eq!(first.total, 6);
+        // A command logged meanwhile does not move the next page.
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", None, "ok", 6));
+        let second = page(2, first.next_cursor.clone());
+        assert_eq!(times(&second), vec![4, 3]);
+        assert_eq!(second.next_cursor.as_deref(), Some("3:0"));
+        let last = page(5, second.next_cursor.clone());
+        assert_eq!(times(&last), vec![2, 1]);
+        assert_eq!(last.next_cursor, None);
+        assert_eq!(command_log_place("4:1"), Some((4, 1)));
+        assert_eq!(command_log_place("not a cursor"), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -31440,7 +32814,14 @@ mod tests {
         assert_eq!(doc["read_only"], json!(true));
         assert_eq!(doc["confirmation_required"], json!(false));
         assert_eq!(doc["path_patterns"], json!(["GET /installation"]));
-        assert_eq!(doc["request_contract"]["body"]["kind"], json!("none"));
+        // Which of the installation's versions it lists, the newest 20 without them (A-198).
+        let optional: Vec<&str> = doc["request_contract"]["body"]["optional_fields"]
+            .as_array()
+            .expect("optional fields")
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect();
+        assert_eq!(optional, vec!["versions_limit", "versions_before"]);
         assert!(admin_action_request_notes("get_installation").len() >= 3);
         assert_eq!(admin_methods_allowed_for_path("/installation"), vec!["GET"]);
         assert_eq!(mesh_access("get_installation"), Some(MeshAccess::Archi));
@@ -32329,7 +33710,8 @@ mod tests {
                 action: Some("set_installation_ai".to_string()),
                 ..AdminCommandLogQuery::default()
             },
-        );
+        )
+        .rows;
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert_eq!(logged[0]["origin"], json!("http"));
 
