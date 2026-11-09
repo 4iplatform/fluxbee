@@ -3643,6 +3643,8 @@ async fn follow_add_hive_join(
     };
     match outcome {
         Ok(hive) => {
+            // The join ended: the installation's update looks at the new hive at once (stage 4).
+            installation_update::look_after_action(&ctx.installation_update, hive_id.as_deref());
             event.result_preview = Some(hive);
             (event, None)
         }
@@ -11260,6 +11262,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "PROVIDER_KEYS_MISSING"
         // A hive's copy of a version with another hash (update with category config).
         | "INSTALLATION_HASH_MISMATCH"
+        // The installation's update: one explicit run at a time; a motherbee whose own core is
+        // rolled back names no target.
+        | "INSTALLATION_UPDATE_RUNNING"
+        | "MOTHERBEE_ROLLED_BACK"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -11325,6 +11331,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // its checks: retry once they answer.
         | "HIVES_NOT_CHECKED"
         | "KEYS_NOT_CHECKED"
+        // The hive registry cannot be read: the hives an installation update reaches are unknown.
+        | "HIVE_REGISTRY_UNREADABLE"
         | "MASTER_KEY_NOT_AVAILABLE" => 503,
         _ => 500,
     }
@@ -15356,17 +15364,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "update_installation" => vec![
             "Confirm with the operator first: every hive moves to the motherbee's core release and installation file, and a hive whose core changes restarts its services. Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler as one step, and the executor runs it once the operator confirms.",
             "When: after a release is installed on the motherbee (apt), to bring every hive to it; or to finish an open update (get_installation_update shows what is left). The installation's rollback is the same: install the previous release on the motherbee, then run it.",
-            "The target is what the motherbee holds now: its core (the manifest hash it runs, and its version) and its installation file's version and sha256. A hive is on it when it runs that core with its update settled and nothing open (left_out, awaiting_update, a settle pending), and its config.applied names that version and sha256. The motherbee is the core's reference.",
-            "One update at a time, kept on disk: a run with the same target resumes the open update; one with another target closes it as superseded (kept in the history) and opens a new one. With no update open and every hive on the target, it answers ok with nothing_to_do and records nothing. The hives are the motherbee and each one the registry calls connected; the others are named in skipped.",
-            "Per hive, in parallel: it waits until the hive's orchestrator answers (60 s), then sends update with category core when its core is not on the target, asked again while sync_pending or unreachable (90 s); the call answers once the binaries are in place (restarting), and SY.admin follows the hive until the new orchestrator settled it (300 s). Then update with category config when its applied version is not the target's, asked again while its copy has not arrived (first after 0.5 s, then half again as long, up to 5 s, for 90 s).",
+            "The target is what the motherbee holds now: its core (the manifest hash it runs, and its version) and its installation file's version and sha256. A hive is on it when it runs that core with its update settled and nothing open (a settle pending or with errors, awaiting_update; left_out only with no settle to judge it), and its config.applied names that version and sha256. The motherbee is the core's reference. A motherbee whose own core is rolled back names no target: 409 MOTHERBEE_ROLLED_BACK (install a release on it first).",
+            "One update at a time, kept on disk: a run with the same target resumes the open update; one with another target closes it as superseded (kept in the history) and opens a new one. With no update open and every hive on the target, it answers ok with nothing_to_do and records nothing. The hives are the motherbee and each one the registry calls connected; the others are named in skipped. A registry that cannot be read refuses the run (503 HIVE_REGISTRY_UNREADABLE). One run at a time: a second one, or a set_installation_ai, answers 409 INSTALLATION_UPDATE_RUNNING, naming the run under way.",
+            "Per hive, in parallel: it waits until the hive's orchestrator answers (120 s from the run's start; each read of a hive's /versions waits 50 s, past the motherbee orchestrator's own 45 s, and a hive has one read outstanding at most), then sends update with category core when its core is not on the target, asked again while sync_pending or unreachable (90 s); the call answers once the binaries are in place (restarting), and SY.admin follows the hive until the new orchestrator settled it (300 s). A core update that does not answer within 60 s is followed the same way, and is not_answered only when /versions never shows it. Then update with category config when its applied version is not the target's, asked again while its copy has not arrived (first after 0.5 s, then half again as long, up to 5 s, for 90 s).",
             "Left as they are, each with its reason and the per-hive action that moves it: a hive the operator rolled back (core.installed.source core_rollback, the one allowed divergence) keeps its core unless include_rolled_back names it (its config is still applied); a copy edited by hand (config.state edited_by_hand) gets no config; a hive whose orchestrator takes no category config (before 0.1.122) gets its core first, and nothing when its core is left as it is. update for one hive moves any of them, a rolled-back one included.",
-            "The answer: ok (200) when every hive is on the target, the update done; partial (202) while it stays open, with pending naming each hive not on the target and how it stands. payload {update: {id, state, opened_at_ms, origin, reason, target: {core: {manifest_hash, version}, config: {version, sha256}}, hives: {<hive>: {role, core, config, automatic}}, pending, skipped}, opening (opened or resumed), superseded, include_rolled_back, message}. Each category is {state, reason, outcome, next}: state on_target, pending, in_flight (a core restarting or settling), excluded or unknown; outcome {status, by, started_at_ms, at_ms, elapsed_ms, attempts, error_code, detail, answered_ms, installed_ms, settled_ms, restarted}, status ok, restarting, settled, sync_pending, error, not_answered (never read as not applied) or excluded.",
-            "After the answer, while the update is open, SY.admin follows each hive in flight to its settle and then applies its config, and reads again every 30 s a hive not on the target. The automatic step: a hive whose outcome was not_answered gets the update finished once when it answers again, never a rolled-back hive, one ahead of the motherbee, or one with a hand-edited copy. An error, or sync_pending at its bound, is left for the operator with its next. Every outcome is one line of SY.admin's log (installation update: outcome).",
+            "The answer: ok (200) when every hive is on the target, the update done, or when every hive is on it but those the operator rolled back, each with its config on it (state held, payload held naming them: the one allowed divergence; each one's per-hive update closes it); partial (202) while it stays open, with pending naming each hive not on the target and how it stands. payload {update: {id, state, opened_at_ms, last_run_at_ms, origin, reason, target: {core: {manifest_hash, version}, config: {version, sha256}}, stale_target, held, hives: {<hive>: {role, core, config, automatic}}, pending, skipped}, opening (opened or resumed), superseded, include_rolled_back, message}. Each category is {state, reason, exclusion, outcome, next}: state on_target, pending, in_flight (a core restarting or settling, an update being sent), excluded or unknown; outcome {status, by, started_at_ms, at_ms, elapsed_ms, attempts, error_code, detail, answered_ms, installed_ms, settled_ms, restarted}, status sent, ok, restarting, settled, sync_pending, error, not_answered (never read as not applied) or excluded, by explicit, automatic or background.",
+            "After the answer, while the update is open, SY.admin follows each hive in flight to its settle (every 3 s) and then applies its config; checks shared memory every 30 s for a hive that did not answer or was not read yet, and reads it once its orchestrator shows; and reads again every 10 min a hive left as it is or whose last attempt failed. A per-hive update or core_rollback, a join or a removal, and each read of get_installation_update or GET /versions make it look at once. The automatic step: a hive whose outcome was not_answered gets the update finished once when it answers again, never a rolled-back hive, one ahead of the motherbee, or one with a hand-edited copy. An error, or sync_pending at its bound, is left for the operator with its next. While the motherbee holds another target than the update's (stale_target), nothing acts on it: update_installation supersedes it. Every outcome is one line of SY.admin's log (installation update: outcome).",
         ],
         "get_installation_update" => vec![
-            "A read of SY.admin's own record: no hive is asked. history (?history=true in HTTP) adds the closed updates, newest first, at most 20, each with its target and the hives it left off it.",
-            "The answer: payload {update, open, history?}: update is the open update, or the last closed one, with its target and each hive's {role, core, config, automatic}, as update_installation answers it; open says whether it is open. Each category's next says what moves it.",
-            "GET /versions and get_installation carry its summary: its id, state, target and each hive's state.",
+            "A read of SY.admin's own record: no hive is asked here; the background task looks at once at the hives off the target it has not looked at for 30 s. history (?history=true in HTTP) adds the closed updates, newest first, at most 20, each with its target and the hives it left off it.",
+            "The answer: payload {update, open, history?}: update is the open update (state open or held), or the last closed one (done or superseded), with its target and each hive's {role, core, config, automatic}, as update_installation answers it; open says whether it is open; held names the hives the operator rolled back, when only those are off the target; stale_target, what the motherbee holds when it is another target. Each category's next says what moves it.",
+            "GET /versions and get_installation carry its summary: its id, state, target, held and each hive's state.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
@@ -17521,8 +17529,21 @@ async fn handle_admin_command_with_origin(
 
     let started = Instant::now();
     let logged_params = admin_command_log_params(&payload);
+    // The hive a rollback, a removal or a join acts on: the installation's update looks at it at
+    // once (stage 4), never blocking the command.
+    let moved_hive = matches!(action, "core_rollback" | "remove_hive" | "add_hive").then(|| {
+        hive.clone().or_else(|| {
+            payload
+                .get("hive_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+    });
     let result =
         handle_admin_command_inner(ctx, client, action, payload, hive.clone(), origin).await;
+    if let Some(moved_hive) = moved_hive {
+        installation_update::look_after_action(&ctx.installation_update, moved_hive.as_deref());
+    }
 
     // Audit append — never fails the command; a hard AdminError is logged as status=error too.
     let (http_status, status, error_code) = match &result {
@@ -19231,9 +19252,21 @@ fn owner_node_has_deterministic_ilk(handler_node: &str) -> bool {
 }
 
 async fn handle_hive_update_command(
-    _ctx: &AdminContext,
+    ctx: &AdminContext,
     client: &RouterDispatcher,
     hive_id: String,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    let answered = handle_hive_update_request(client, &hive_id, payload).await;
+    // The installation's update looks at the hive at once (stage 4): a per-hive update can move a
+    // hive it holds, a rolled-back one included.
+    installation_update::look_after_action(&ctx.installation_update, Some(&hive_id));
+    answered
+}
+
+async fn handle_hive_update_request(
+    client: &RouterDispatcher,
+    hive_id: &str,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     let invalid_request = |detail: &str| {
@@ -20485,6 +20518,12 @@ async fn handle_set_installation_ai(
             return installation_refusal(action, code, detail, serde_json::Value::Null)
         }
     };
+    // One explicit run of the installation's update at a time (stage 4): its apply is one, so it is
+    // refused, nothing written, while update_installation runs.
+    let _run = match ctx.installation_update.start_run("set_installation_ai") {
+        Ok(run) => run,
+        Err(running) => return installation_update::run_under_way(action, &running),
+    };
 
     // 1. A-11, against what the motherbee's file holds now. Its core is the installation update's
     // target core (stage 4).
@@ -20715,7 +20754,13 @@ async fn handle_set_installation_ai(
     // its target's core. The apply below is its pass; a hive that does not answer stays pending in
     // it, and the automatic step finishes it once when the hive answers again.
     let target = installation_update::target_after_write(&motherbee, version, &sha256);
-    let update_id = installation_update::open_for_installation_change(ctx, &target);
+    let update_id = installation_update::open_for_installation_change(ctx, &motherbee, &target);
+    if let Err(why) = &update_id {
+        tracing::warn!(
+            reason = %why,
+            "installation: no installation update opened for this change"
+        );
+    }
 
     // 3. Every hive applies it, at once; each ends by the change's ceiling.
     let apply_started = Instant::now();
@@ -20751,20 +20796,30 @@ async fn handle_set_installation_ai(
             version,
             "installation: a hive's apply"
         );
-        installation_update::record_config_applied(
-            &ctx.installation_update,
-            &update_id,
-            hive,
-            &target,
-            applied,
-            installation_update::RunKind::Explicit,
-            apply_started_ms,
-        );
+        if let Ok(update_id) = &update_id {
+            installation_update::record_config_applied(
+                &ctx.installation_update,
+                update_id,
+                hive,
+                &target,
+                applied,
+                installation_update::RunKind::Explicit,
+                apply_started_ms,
+            );
+        }
         hive_ms.insert(hive.clone(), serde_json::json!(elapsed.as_millis() as u64));
         lines.insert(hive.clone(), line);
     }
-    ctx.installation_update.close_if_done();
-    let update_state = ctx.installation_update.state_of(&update_id);
+    let update = match &update_id {
+        Ok(update_id) => {
+            ctx.installation_update.settle_state();
+            serde_json::json!({
+                "id": update_id,
+                "state": ctx.installation_update.state_of(update_id),
+            })
+        }
+        Err(why) => serde_json::json!({ "id": null, "not_opened": why }),
+    };
     // The registry's hives whose join did not finish: never applied, each named (F4).
     let skipped = installation_skipped_hives(&hive_registry(ctx), false, Some((version, &sha256)));
     let skipped_names: Vec<String> = skipped
@@ -20789,8 +20844,8 @@ async fn handle_set_installation_ai(
             "total": elapsed_ms(started),
         },
         // The installation's update this change opened (stage 4): get_installation_update shows
-        // it, each hive's core included.
-        "update": {"id": update_id, "state": update_state},
+        // it, each hive's core included; why none was opened, when none was.
+        "update": update,
     });
     let skipped_note = if skipped_names.is_empty() {
         String::new()
@@ -20810,12 +20865,17 @@ async fn handle_set_installation_ai(
         return installation_answer(action, 200, "ok", payload, None);
     }
     payload["pending"] = serde_json::json!(pending);
+    let update_note = match &update_id {
+        Ok(update_id) => format!(
+            " The installation's update {update_id} stays open: a hive that did not answer gets it \
+             finished once when it answers again (get_installation_update)."
+        ),
+        Err(_) => String::new(),
+    };
     payload["message"] = serde_json::json!(format!(
         "version {version} is written, and not every hive has applied it yet: {}. GET /versions \
          shows each hive's copy; update with category config, manifest_version {version} and \
-         manifest_hash {sha256} finishes a hive. The installation's update {update_id} stays open: \
-         a hive that did not answer gets it finished once when it answers again \
-         (get_installation_update).{skipped_note}",
+         manifest_hash {sha256} finishes a hive.{update_note}{skipped_note}",
         pending.join(", ")
     ));
     installation_answer(action, 202, "partial", payload, None)
@@ -21236,10 +21296,11 @@ fn admin_action_timeout(action: &str) -> Duration {
             2 * orchestrator + installation_apply_bound() + admin_action_timeout("update")
         }
         // Its ceiling (docs/hive-config-update-v1.md §6, stage 4): the motherbee's /versions, then
-        // each hive's pass at once, the wait for its answer, a core update and a config update,
-        // each asked again up to the apply bound with an update's last answer (390 s by default).
-        // What it leaves in flight, the background task follows; SY.architect waits longer for a
-        // plan that runs it (EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS).
+        // each hive's pass at once: the wait for its answer and the read under way at its end, a
+        // core update and a config update, each asked again up to the apply bound with an update's
+        // last answer, and the read after a core that restarted nothing (550 s by default). What
+        // it leaves in flight, the background task follows; SY.architect waits longer for a plan
+        // that runs it (EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS).
         "update_installation" => {
             let orchestrator =
                 Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30));
@@ -31471,16 +31532,23 @@ mod tests {
             );
         }
         assert!(!IO_CLOUD_EXPOSED_ACTIONS.contains(&"update_installation"));
-        // Its ceiling: the motherbee's read, then each hive's pass (390 s by default).
+        // Its ceiling: the motherbee's read, then each hive's pass (550 s by default).
         let bounds = installation_update::Bounds::from_env();
         assert!(admin_action_timeout("update_installation") > bounds.explicit_pass());
         assert_eq!(
             admin_action_timeout("update_installation"),
-            Duration::from_secs(390)
+            Duration::from_secs(550)
         );
         assert_eq!(bounds.first_wait, Duration::from_millis(500));
         assert_eq!(bounds.settle, Duration::from_secs(300));
+        assert_eq!(bounds.answer, Duration::from_secs(120));
+        assert_eq!(bounds.flight_check, Duration::from_secs(3));
         assert_eq!(bounds.retry_check, Duration::from_secs(30));
+        assert_eq!(bounds.slow_check, Duration::from_secs(600));
+        // A read outlasts the motherbee orchestrator's forward of GET_VERSIONS (45 s by default,
+        // JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS), so that a read SY.admin gave up is not followed by
+        // a second one queued behind it.
+        assert_eq!(bounds.read, Duration::from_secs(50));
     }
 
     /// The update's read is Archi's over the mesh, IO.cloud's never; a read of SY.admin's own record.
@@ -31609,6 +31677,110 @@ mod tests {
         )
         .expect("ok");
         assert!(other.get("installation_update").is_none());
+    }
+
+    /// The explicit run's refusals, before it changes anything: a run already under way, which
+    /// set_installation_ai's is too (F8); a hive registry that cannot be read (F1; a missing one is
+    /// the motherbee alone); and a motherbee whose own core is rolled back (F10).
+    #[tokio::test]
+    async fn update_installation_refuses_before_it_changes_anything() {
+        let (ctx, mut harness) = opa_test_admin("installation-update-refusals");
+        let run = || {
+            dispatch_internal_admin_command(
+                &ctx,
+                &ctx.rpc,
+                "update_installation",
+                None,
+                json!({"reason": "deploy 0.1.123"}),
+                AdminOrigin::Http,
+            )
+        };
+
+        // One explicit run at a time.
+        let running = ctx
+            .installation_update
+            .start_run("executor")
+            .expect("the first run");
+        let second = run().await.expect("answered");
+        assert_eq!(second.http_status, 409, "{}", second.envelope);
+        assert_eq!(
+            second.envelope["error_code"],
+            json!("INSTALLATION_UPDATE_RUNNING")
+        );
+        assert_eq!(
+            second.envelope["payload"]["running"]["origin"],
+            json!("executor")
+        );
+        assert!(second.envelope["payload"]["running"]["since_ms"].is_u64());
+        let change = installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        let (status, body) = handle_set_installation_ai(
+            &ctx,
+            &ctx.rpc,
+            &json!({"ai": change, "expected_version": 2}),
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("INSTALLATION_UPDATE_RUNNING"), "{body}");
+        drop(running);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+
+        // A registry that cannot be read (a file where its directory goes): no hive can be named.
+        let registry = ctx.state_dir.parent().expect("root").join("hives");
+        fs::write(&registry, b"not a directory").expect("registry");
+        let unreadable = run().await.expect("answered");
+        assert_eq!(unreadable.http_status, 503, "{}", unreadable.envelope);
+        assert_eq!(
+            unreadable.envelope["error_code"],
+            json!("HIVE_REGISTRY_UNREADABLE")
+        );
+        fs::remove_file(&registry).expect("registry");
+
+        // The motherbee's own core rolled back: its installed hash is not its dist's release.
+        let answer = async {
+            let sent = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the motherbee's /versions");
+            assert_eq!(sent.meta.action.as_deref(), Some("get_versions"));
+            let mut answer = reply_to(
+                &sent,
+                "",
+                json!({"status": "ok", "hive": {
+                    "hive_id": "motherbee",
+                    "role": "motherbee",
+                    "core": {
+                        "status": "ok",
+                        "manifest_hash": "abc",
+                        "components": {},
+                        "installed": {"manifest_hash": "old", "source": "core_rollback", "installed_at_ms": "1"},
+                    },
+                    "config": {"state": "current", "version": 3, "sha256": "ccc", "applied": null},
+                }}),
+            );
+            answer.meta.msg_type = "admin".to_string();
+            answer.meta.msg = None;
+            harness.inject(answer).await.unwrap();
+        };
+        let (refused, ()) = tokio::join!(run(), answer);
+        let refused = refused.expect("answered");
+        assert_eq!(refused.http_status, 409, "{}", refused.envelope);
+        assert_eq!(
+            refused.envelope["error_code"],
+            json!("MOTHERBEE_ROLLED_BACK")
+        );
+        assert!(refused.envelope["error_detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Install a release on the motherbee first")));
+        assert!(ctx
+            .installation_update
+            .read(|file| file.open.is_none() && file.closed.is_empty()));
     }
 
     /// The body is taken exactly: the whole `ai`, the version it was decided on, and the operator's

@@ -12,20 +12,26 @@
 //! - **The state** ([`Updates`]): `installation-update.json` in SY.admin's state directory,
 //!   written atomically: the open update, each hive's state, last outcome and next step, and the
 //!   last [`HISTORY_KEPT`] closed ones. A run whose target differs closes the open update as
-//!   superseded; one with the same target resumes it.
+//!   superseded; one with the same target resumes it. An update whose only hives off the target
+//!   are the operator's core rollbacks is `held` (A-5's one allowed divergence).
+//! - **The reads** of a hive's `/versions` go through the motherbee's orchestrator, which takes its
+//!   admin messages one at a time and forwards a spoke's read within 45 s: SY.admin waits past that
+//!   bound, and keeps at most one read of a hive outstanding ([`Updates::read_versions`]).
 //! - **The background task** ([`run_background`]), while an update is open: it follows a hive in
-//!   flight (a core restarting or settling) to its settle and then applies its config, re-checks a
-//!   hive not on the target, and finishes the update once for a hive that did not answer and now
-//!   does (the automatic step, §6), never for an excluded one.
+//!   flight to its settle and then sends its config, finishes the update once for a hive that did
+//!   not answer and now does (the automatic step, §6), never for an excluded one, and reads again
+//!   the hives off the target, at a cadence by where each stands. It acts on nothing while the
+//!   motherbee holds another target than the open update's (`stale_target`).
 //!
 //! Every outcome is one log line, `installation update: outcome`, with the update's id, the hive,
 //! the category, the outcome and its duration (`ops.py timeline` reads it).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -47,6 +53,9 @@ const UPDATES_SCHEMA_VERSION: u32 = 1;
 /// stays well inside one mesh frame (128 KiB).
 const TEXT_MAX: usize = 400;
 
+/// What a task holding a hive does while it reads its `/versions`: an explicit run waits for it.
+const READING: &str = "reading its /versions";
+
 /// Where SY.admin keeps the installation's update.
 pub(crate) fn updates_path(state_dir: &Path) -> PathBuf {
     state_dir.join("sy-admin").join("installation-update.json")
@@ -62,10 +71,25 @@ pub(crate) fn updates_path(state_dir: &Path) -> PathBuf {
 pub(crate) enum UpdateState {
     /// Some hive is not on the target yet.
     Open,
+    /// Every hive is on the target but those the operator rolled back (`core_rollback`, A-5's one
+    /// allowed divergence), each with its config on the target. Still the open update: the hive's
+    /// per-hive update closes it.
+    Held,
     /// Every hive reached the target.
     Done,
     /// A run with another target closed it.
     Superseded,
+}
+
+impl UpdateState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            UpdateState::Open => "open",
+            UpdateState::Held => "held",
+            UpdateState::Done => "done",
+            UpdateState::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,12 +137,30 @@ impl Standing {
     }
 }
 
+/// Why a hive's category is left as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Exclusion {
+    /// The operator rolled its core back (`core_rollback`, A-5).
+    RolledBack,
+    /// Its core is a newer release than the motherbee's.
+    Ahead,
+    /// Its copy of the installation file is edited by hand.
+    HandEdited,
+    /// Its orchestrator takes no category config, and its core is left as it is.
+    OldOrchestrator,
+    /// The target names nothing to apply (the motherbee's file is not a recorded version).
+    NoTarget,
+}
+
 /// What an attempt (or an exclusion) left. Never "not applied" (P-13): a hive that did not answer
 /// may hold the target already.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutcomeStatus {
     Ok,
+    /// An update sent, its answer not in yet.
+    Sent,
     /// A core update whose binaries are in place, its services restarting.
     Restarting,
     /// A core update installed and settled by the new orchestrator, nothing open.
@@ -134,6 +176,7 @@ impl OutcomeStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             OutcomeStatus::Ok => "ok",
+            OutcomeStatus::Sent => "sent",
             OutcomeStatus::Restarting => "restarting",
             OutcomeStatus::Settled => "settled",
             OutcomeStatus::SyncPending => "sync_pending",
@@ -145,12 +188,15 @@ impl OutcomeStatus {
 }
 
 /// Who ran an attempt: an explicit run (`update_installation`, `set_installation_ai`, and the
-/// background task following what it started), or the automatic step.
+/// background task finishing what that run started), the automatic step (and the background task
+/// finishing what it started), or the background task on its own, finishing an update it found
+/// under way (a core it did not send, a config apply SY.admin's restart cut).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunKind {
     Explicit,
     Automatic,
+    Background,
 }
 
 impl RunKind {
@@ -158,6 +204,7 @@ impl RunKind {
         match self {
             RunKind::Explicit => "explicit",
             RunKind::Automatic => "automatic",
+            RunKind::Background => "background",
         }
     }
 }
@@ -188,11 +235,15 @@ pub(crate) struct Outcome {
     /// A config update: the readers it restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) restarted: Option<Vec<String>>,
-    /// A core update: the hive's last core update before it (`core.last_update.started_at_ms`), so
-    /// the watch tells this update's record from an older one. None for an update this run did not
-    /// send.
+    /// A core update SY.admin sent: the hive's last core update before it
+    /// (`core.last_update.started_at_ms`, `none` without one), so the watch tells this update's
+    /// record from an older one. None for an update it found under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) previous_update: Option<String>,
+    /// A core update that did not settle: the hive's record of it then
+    /// ([`core_record_signature`]). The hive is in flight again only once that record changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) record_seen: Option<String>,
 }
 
 impl Outcome {
@@ -210,6 +261,7 @@ impl Outcome {
             settled_ms: None,
             restarted: None,
             previous_update: None,
+            record_seen: None,
         }
     }
 
@@ -225,6 +277,9 @@ pub(crate) struct CategoryEntry {
     /// Why it stands so (an exclusion's reason, what it waits for).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// Why it is excluded, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) exclusion: Option<Exclusion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) outcome: Option<Outcome>,
     /// What moves it, when it is not on the target.
@@ -237,6 +292,7 @@ impl Default for CategoryEntry {
         CategoryEntry {
             state: Standing::Unknown,
             reason: Some("not checked yet".to_string()),
+            exclusion: None,
             outcome: None,
             next: None,
         }
@@ -247,9 +303,10 @@ impl Default for CategoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AutomaticAttempt {
     pub(crate) started_at_ms: u64,
+    /// When what it started ended: none while a core it sent is still followed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at_ms: Option<u64>,
-    /// What it left, in a few words.
+    /// Where it left the hive, in a few words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) result: Option<String>,
 }
@@ -285,6 +342,18 @@ impl HiveEntry {
         self.core.state == Standing::OnTarget && self.config.state == Standing::OnTarget
     }
 
+    /// Off the target only by the operator's core rollback: its core excluded as rolled back, its
+    /// config on the target.
+    fn held(&self) -> bool {
+        self.core.state == Standing::Excluded
+            && self.core.exclusion == Some(Exclusion::RolledBack)
+            && self.config.state == Standing::OnTarget
+    }
+
+    fn in_flight(&self) -> bool {
+        self.core.state == Standing::InFlight || self.config.state == Standing::InFlight
+    }
+
     /// The automatic step finishes the update for this hive: it did not answer an attempt of this
     /// update, it is not on the target, and the step has not tried it yet (once per hive and
     /// target).
@@ -297,6 +366,14 @@ impl HiveEntry {
                         .as_ref()
                         .is_some_and(|outcome| outcome.status == OutcomeStatus::NotAnswered)
             })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "core {}, config {}",
+            self.core.state.as_str(),
+            self.config.state.as_str()
+        )
     }
 }
 
@@ -370,6 +447,15 @@ impl Target {
     }
 }
 
+/// The motherbee holds another target than the open update's (its release or its file changed):
+/// nothing acts on the update until the next explicit run supersedes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StaleTarget {
+    /// What the motherbee holds now.
+    pub(crate) target: Target,
+    pub(crate) since_ms: u64,
+}
+
 /// One installation update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UpdateRecord {
@@ -383,6 +469,12 @@ pub(crate) struct UpdateRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
     pub(crate) target: Target,
+    /// When the last explicit run on it started, on the motherbee's clock: what a reader counts the
+    /// outcomes' times from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stale_target: Option<StaleTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) superseded_by: Option<String>,
     #[serde(default)]
@@ -395,6 +487,35 @@ pub(crate) struct UpdateRecord {
 impl UpdateRecord {
     fn all_on_target(&self) -> bool {
         !self.hives.is_empty() && self.hives.values().all(HiveEntry::on_target)
+    }
+
+    /// The hives off the target only by the operator's core rollback, when nothing else is off it.
+    pub(crate) fn held_hives(&self) -> Option<Vec<String>> {
+        let mut held = Vec::new();
+        for (hive, entry) in &self.hives {
+            if entry.on_target() {
+                continue;
+            }
+            if !entry.held() {
+                return None;
+            }
+            held.push(hive.clone());
+        }
+        (!held.is_empty()).then_some(held)
+    }
+
+    /// What the update's state is by its hives: done, held, or open; never done or held while the
+    /// motherbee holds another target.
+    fn state_by_hives(&self) -> UpdateState {
+        if self.stale_target.is_some() {
+            UpdateState::Open
+        } else if self.all_on_target() {
+            UpdateState::Done
+        } else if self.held_hives().is_some() {
+            UpdateState::Held
+        } else {
+            UpdateState::Open
+        }
     }
 }
 
@@ -446,7 +567,7 @@ impl UpdatesFile {
 
     /// One update at a time (§6): the open one when its target is `target`; otherwise a new one,
     /// the open one closed as superseded and kept in the history. A new update's hives start
-    /// unknown.
+    /// unknown. The run's start is recorded either way.
     pub(crate) fn open_or_resume(
         &mut self,
         target: &Target,
@@ -454,8 +575,10 @@ impl UpdatesFile {
         reason: Option<&str>,
         now_ms: u64,
     ) -> (String, Opening) {
-        if let Some(open) = &self.open {
+        if let Some(open) = self.open.as_mut() {
             if open.target.same_as(target) {
+                open.last_run_at_ms = Some(now_ms);
+                open.stale_target = None;
                 return (open.id.clone(), Opening::Resumed);
             }
         }
@@ -486,6 +609,8 @@ impl UpdatesFile {
             origin: origin.to_string(),
             reason: reason.map(cut),
             target: target.clone(),
+            last_run_at_ms: Some(now_ms),
+            stale_target: None,
             superseded_by: None,
             hives: BTreeMap::new(),
             skipped: Vec::new(),
@@ -506,17 +631,25 @@ impl UpdatesFile {
         update.skipped = skipped;
     }
 
-    /// Closes the open update as done once every hive is on the target: its id.
-    pub(crate) fn close_if_done(&mut self, now_ms: u64) -> Option<String> {
-        if !self.open.as_ref().is_some_and(UpdateRecord::all_on_target) {
+    /// The open update's state set by its hives: closed as done once every hive is on the target,
+    /// `held` while only the operator's rollbacks are off it, `open` otherwise. The new state when
+    /// it changed.
+    pub(crate) fn settle_state(&mut self, now_ms: u64) -> Option<(String, UpdateState)> {
+        let open = self.open.as_mut()?;
+        let state = open.state_by_hives();
+        if state == open.state {
             return None;
         }
-        let mut update = self.open.take()?;
-        update.state = UpdateState::Done;
-        update.closed_at_ms = Some(now_ms);
-        let id = update.id.clone();
-        self.close(update);
-        Some(id)
+        let id = open.id.clone();
+        if state == UpdateState::Done {
+            let mut update = self.open.take()?;
+            update.state = UpdateState::Done;
+            update.closed_at_ms = Some(now_ms);
+            self.close(update);
+        } else {
+            open.state = state;
+        }
+        Some((id, state))
     }
 
     /// The core versions SY.admin has seen as targets, by hash: how it tells a hive ahead of the
@@ -565,6 +698,17 @@ fn text_of<'a>(value: Option<&'a Value>, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
+}
+
+/// A field that is a time in ms, as the orchestrator's records write it (a string or a number).
+fn stamp_of(value: Option<&Value>) -> Option<String> {
+    let value = value.filter(|value| !value.is_null())?;
+    Some(
+        value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| value.to_string()),
+    )
 }
 
 /// The hash of the core a hive runs (`ops.py`'s `core_of`): what it recorded installing when it
@@ -618,8 +762,8 @@ pub(crate) fn version_newer(a: &str, b: &str) -> Option<bool> {
 pub(crate) enum Settle {
     /// Not over: its services restarting, or the orchestrator it installed has not settled it.
     NotOver,
-    /// Over, with something open: components left out, a settle pending or with errors, binaries
-    /// awaiting their update.
+    /// Over, with something open: a settle pending or with errors, components left out (with no
+    /// settle to judge them), binaries awaiting their update.
     Open(Vec<String>),
     Settled,
 }
@@ -652,17 +796,23 @@ pub(crate) fn core_settle(core: &Value) -> Settle {
             .collect()
     };
     let mut items = Vec::new();
-    let left_out = names(last.and_then(|last| last.get("left_out")));
-    if !left_out.is_empty() {
-        items.push(format!("left_out={}", left_out.join(",")));
-    }
-    if let Some(settled) = settled {
-        if settled.get("settled").and_then(Value::as_bool) == Some(false) {
-            items.push(format!(
-                "settle pending={} errors={}",
-                names(settled.get("pending")).join(","),
-                names(settled.get("errors")).join("; ")
-            ));
+    match settled {
+        // The settle judges what the update left out: the orchestrator it installed dropped a
+        // node its release no longer names, or keeps it pending; `left_out` is never rewritten.
+        Some(settled) => {
+            if settled.get("settled").and_then(Value::as_bool) == Some(false) {
+                items.push(format!(
+                    "settle pending={} errors={}",
+                    names(settled.get("pending")).join(","),
+                    names(settled.get("errors")).join("; ")
+                ));
+            }
+        }
+        None => {
+            let left_out = names(last.and_then(|last| last.get("left_out")));
+            if !left_out.is_empty() {
+                items.push(format!("left_out={}", left_out.join(",")));
+            }
         }
     }
     let awaiting = core.get("awaiting_update").filter(|value| !value.is_null());
@@ -682,6 +832,30 @@ pub(crate) fn core_settle(core: &Value) -> Settle {
     } else {
         Settle::Open(items)
     }
+}
+
+/// The hive's last core update's record, by when it started and when it settled: what tells a
+/// record that changed from one that did not.
+pub(crate) fn core_record_signature(core: &Value) -> String {
+    let last = core.get("last_update").filter(|last| last.is_object());
+    format!(
+        "{}|{}",
+        stamp_of(last.and_then(|last| last.get("started_at_ms"))).unwrap_or_else(|| "none".into()),
+        stamp_of(
+            last.and_then(|last| last.get("settled"))
+                .and_then(|settled| settled.get("at_ms"))
+        )
+        .unwrap_or_else(|| "none".into())
+    )
+}
+
+/// The hive's last core update, by when it started (`none` without one).
+fn last_update_stamp(core: &Value) -> String {
+    stamp_of(
+        core.get("last_update")
+            .and_then(|last| last.get("started_at_ms")),
+    )
+    .unwrap_or_else(|| "none".to_string())
 }
 
 /// The hive's services are restarting onto a core update.
@@ -712,6 +886,12 @@ fn config_applied(snapshot: &Value, target: &ConfigTarget) -> bool {
 
 fn config_edited_by_hand(snapshot: &Value) -> bool {
     text_of(snapshot.get("config"), "state") == Some("edited_by_hand")
+}
+
+/// The motherbee's own core is rolled back (a mesh `core_rollback` on it): its installed hash and
+/// its dist's version disagree, so it names no target.
+pub(crate) fn motherbee_rolled_back(motherbee: &Value) -> bool {
+    motherbee.get("core").is_some_and(core_rolled_back)
 }
 
 /// The target from the motherbee's `/versions` (its `hive`): its core, the reference, and its
@@ -830,11 +1010,25 @@ pub(crate) enum Step {
     AfterCore(String),
     /// Left as it is: why, and the per-hive action that moves it.
     Excluded {
+        kind: Exclusion,
         reason: String,
         next: String,
     },
     /// Not known: why.
     Unknown(String),
+}
+
+impl Step {
+    fn label(&self) -> &'static str {
+        match self {
+            Step::OnTarget => "on_target",
+            Step::Act => "act",
+            Step::InFlight(_) => "in_flight",
+            Step::AfterCore(_) => "after_core",
+            Step::Excluded { .. } => "excluded",
+            Step::Unknown(_) => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -890,8 +1084,9 @@ fn rolled_back_next(hive: &str, target: &Target) -> String {
 /// target, the run's kind and the hives an explicit run names in `include_rolled_back`. `known`
 /// holds the core versions SY.admin saw as targets, by hash.
 ///
-/// - The automatic step leaves alone, both categories, a hive the operator rolled back, one ahead
-///   of the motherbee and one whose copy is edited by hand.
+/// - The automatic step, and the background task acting on its own, leave alone, both categories, a
+///   hive the operator rolled back, one ahead of the motherbee and one whose copy is edited by
+///   hand.
 /// - An installation-wide run changes no rolled-back hive's core unless it names it; it still
 ///   applies the config (a config apply replaces no binary).
 /// - No run applies config to a copy edited by hand.
@@ -934,19 +1129,25 @@ pub(crate) fn decide(
         };
     let edited = config_edited_by_hand(snapshot);
 
-    if kind == RunKind::Automatic {
+    if kind != RunKind::Explicit {
+        let who = match kind {
+            RunKind::Automatic => "the automatic step",
+            _ => "the background task",
+        };
         let left_alone = if rolled_back {
             Some((
-                "the operator rolled its core back (core_rollback, the one allowed divergence): the \
-                 automatic step leaves it alone"
-                    .to_string(),
+                Exclusion::RolledBack,
+                format!(
+                    "the operator rolled its core back (core_rollback, the one allowed \
+                     divergence): {who} leaves it alone"
+                ),
                 rolled_back_next(hive, target),
             ))
         } else if ahead {
             Some((
+                Exclusion::Ahead,
                 format!(
-                    "its core ({}) is newer than the motherbee's ({}): the automatic step leaves \
-                     it alone",
+                    "its core ({}) is newer than the motherbee's ({}): {who} leaves it alone",
                     installed_version.map(String::as_str).unwrap_or("?"),
                     target
                         .core
@@ -960,9 +1161,10 @@ pub(crate) fn decide(
             ))
         } else if edited {
             Some((
-                "its copy of the installation file is edited by hand: the automatic step leaves \
-                 it alone"
-                    .to_string(),
+                Exclusion::HandEdited,
+                format!(
+                    "its copy of the installation file is edited by hand: {who} leaves it alone"
+                ),
                 format!(
                     "restore its copy to the motherbee's bytes (GET /versions shows it), then \
                      update_installation, or {}",
@@ -972,8 +1174,8 @@ pub(crate) fn decide(
         } else {
             None
         };
-        if let Some((reason, next)) = left_alone {
-            let step = Step::Excluded { reason, next };
+        if let Some((kind, reason, next)) = left_alone {
+            let step = Step::Excluded { kind, reason, next };
             return Decision {
                 core: step.clone(),
                 config: step,
@@ -1010,12 +1212,14 @@ fn decide_core(
         return Step::OnTarget;
     }
     let Some(core_target) = &target.core else {
-        return Step::Unknown(
-            target
+        return Step::Excluded {
+            kind: Exclusion::NoTarget,
+            reason: target
                 .core_note
                 .clone()
                 .unwrap_or_else(|| "the motherbee's core is not known".to_string()),
-        );
+            next: "install a release on the motherbee, then update_installation".to_string(),
+        };
     };
     if text_of(Some(core), "status") != Some("ok") {
         return Step::Unknown(format!(
@@ -1024,9 +1228,10 @@ fn decide_core(
         ));
     }
     let left_alone = rolled_back
-        && (kind == RunKind::Automatic
+        && (kind != RunKind::Explicit
             || !include_rolled_back.iter().any(|named| named == facts.hive));
     let rolled_back_step = || Step::Excluded {
+        kind: Exclusion::RolledBack,
         reason:
             "the operator rolled its core back (core_rollback, the one allowed divergence): an \
                  installation-wide update leaves its core as it is unless it names the hive in \
@@ -1065,6 +1270,7 @@ fn decide_config(
 ) -> Step {
     let Some(config_target) = &target.config else {
         return Step::Excluded {
+            kind: Exclusion::NoTarget,
             reason: target
                 .config_note
                 .clone()
@@ -1080,7 +1286,8 @@ fn decide_config(
             Step::Act | Step::InFlight(_) => {
                 Step::AfterCore(format!("{why}: its core update comes first"))
             }
-            Step::Excluded { reason, next } => Step::Excluded {
+            Step::Excluded { reason, next, .. } => Step::Excluded {
+                kind: Exclusion::OldOrchestrator,
                 reason: format!("{why}, and its core is left as it is: {reason}"),
                 next: next.clone(),
             },
@@ -1090,6 +1297,7 @@ fn decide_config(
     }
     if edited {
         return Step::Excluded {
+            kind: Exclusion::HandEdited,
             reason: "its copy of the installation file is edited by hand (config.state \
                      edited_by_hand): no update applies config to it"
                 .to_string(),
@@ -1118,16 +1326,23 @@ fn decide_config(
 /// Where a core update under way stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CoreWatch {
-    /// Still under way. `installed`: the hive runs the target; `open`: what its settle leaves open.
-    Waiting { installed: bool, open: Vec<String> },
+    /// Still under way. `installed`: the hive runs the target; `open`: what its settle leaves open;
+    /// `seen`: its record shows the update (a record newer than the one before it, or the target
+    /// installed).
+    Waiting {
+        installed: bool,
+        open: Vec<String>,
+        seen: bool,
+    },
     /// On the target, settled, nothing open.
     Settled,
     /// The update ended without the target installed.
     Failed { code: String, detail: String },
 }
 
-/// The watch: `previous` is the hive's last core update before this one, so an older record is
-/// never read as this one's (None: any record that ended counts).
+/// The watch: `previous` is the hive's last core update before this one (`none` without one), so
+/// an older record is never read as this one's; None for an update found under way, whose record
+/// counts as this one's.
 pub(crate) fn watch_core(snapshot: &Value, target_hash: &str, previous: Option<&str>) -> CoreWatch {
     let core = snapshot.get("core").unwrap_or(&Value::Null);
     if installed_core_hash(core).as_deref() == Some(normalize_hash(target_hash).as_str()) {
@@ -1136,25 +1351,17 @@ pub(crate) fn watch_core(snapshot: &Value, target_hash: &str, previous: Option<&
             Settle::NotOver => CoreWatch::Waiting {
                 installed: true,
                 open: Vec::new(),
+                seen: true,
             },
             Settle::Open(open) => CoreWatch::Waiting {
                 installed: true,
                 open,
+                seen: true,
             },
         };
     }
     let last = core.get("last_update").filter(|last| last.is_object());
-    let this_one = previous.is_none_or(|previous| {
-        last.and_then(|last| last.get("started_at_ms"))
-            .map(|started| {
-                started
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| started.to_string())
-            })
-            .as_deref()
-            != Some(previous)
-    });
+    let this_one = previous.is_none_or(|previous| last_update_stamp(core) != previous);
     if this_one && text_of(last, "phase") == Some("done") {
         let errors: Vec<String> = last
             .and_then(|last| last.get("errors"))
@@ -1189,33 +1396,21 @@ pub(crate) fn watch_core(snapshot: &Value, target_hash: &str, previous: Option<&
     CoreWatch::Waiting {
         installed: false,
         open: Vec::new(),
+        seen: this_one && last.is_some(),
     }
-}
-
-/// The hive's last core update before this one, as its record names it.
-fn previous_update_of(snapshot: &Value) -> Option<String> {
-    snapshot
-        .get("core")
-        .and_then(|core| core.get("last_update"))
-        .and_then(|last| last.get("started_at_ms"))
-        .map(|started| {
-            started
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| started.to_string())
-        })
 }
 
 // ---------------------------------------------------------------------------------------------
 // The state, on disk
 // ---------------------------------------------------------------------------------------------
 
-/// The bounds of the machinery (environment overrides in the style of `JSR_ADMIN_*`).
+/// The bounds and cadences of the machinery (environment overrides in the style of `JSR_ADMIN_*`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Bounds {
-    /// How long a run waits for a hive's orchestrator to answer before its core update
-    /// (`JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`, 60): the motherbee's router may not have the
-    /// spokes back right after an install.
+    /// How long an explicit run waits for a hive's orchestrator to answer before its core update,
+    /// counted from the run's start (`JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS`, 120): the
+    /// motherbee's router may not have the spokes back right after an install, and one read may
+    /// take a whole `read`.
     pub(crate) answer: Duration,
     /// Between two reads while it waits.
     pub(crate) answer_poll: Duration,
@@ -1233,10 +1428,16 @@ pub(crate) struct Bounds {
     /// The background task's look at a hive in flight (`JSR_ADMIN_INSTALLATION_FLIGHT_CHECK_SECS`,
     /// 3).
     pub(crate) flight_check: Duration,
-    /// Its look at a hive not on the target, an unreachable one with a cheap read first
-    /// (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`, 30).
+    /// Its shared-memory check of a hive that did not answer, or not read yet
+    /// (`JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS`, 30): read once its orchestrator shows.
     pub(crate) retry_check: Duration,
-    /// Its `/versions` read (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`, 10).
+    /// Its read of a hive left as it is, or whose last attempt failed
+    /// (`JSR_ADMIN_INSTALLATION_SLOW_CHECK_SECS`, 600).
+    pub(crate) slow_check: Duration,
+    /// One read of a hive's `/versions` (`JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS`, 50): past the
+    /// motherbee's orchestrator's own bound for forwarding it (45 s,
+    /// `JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`), so a read SY.admin gives up is no longer queued
+    /// there.
     pub(crate) read: Duration,
 }
 
@@ -1246,7 +1447,7 @@ impl Bounds {
             Duration::from_secs(env_timeout_secs(name).unwrap_or(default))
         };
         Bounds {
-            answer: secs("JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS", 60),
+            answer: secs("JSR_ADMIN_INSTALLATION_ANSWER_TIMEOUT_SECS", 120),
             answer_poll: Duration::from_secs(3),
             apply: installation_apply_bound(),
             first_wait: super::INSTALLATION_APPLY_FIRST_WAIT,
@@ -1257,16 +1458,41 @@ impl Bounds {
                 .max(Duration::from_secs(1)),
             retry_check: secs("JSR_ADMIN_INSTALLATION_RETRY_CHECK_SECS", 30)
                 .max(Duration::from_secs(1)),
-            read: secs("JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS", 10),
+            slow_check: secs("JSR_ADMIN_INSTALLATION_SLOW_CHECK_SECS", 600)
+                .max(Duration::from_secs(1)),
+            read: secs("JSR_ADMIN_INSTALLATION_READ_TIMEOUT_SECS", 50),
         }
     }
 
-    /// The longest an explicit run's own pass takes on one hive: the wait for its answer, then a
-    /// core update and a config update, each asked again up to the apply bound and its last
-    /// answer an update's.
+    /// The longest an explicit run's own pass takes on one hive: the wait for its answer and the
+    /// read under way at its end, a core update asked again up to the apply bound with an update's
+    /// last answer, the read after a core update that restarted nothing, and a config update.
     pub(crate) fn explicit_pass(&self) -> Duration {
-        self.answer + 2 * (self.apply + self.update_call)
+        self.answer + 2 * self.read + 2 * (self.apply + self.update_call)
     }
+}
+
+/// Who reads a hive's `/versions`: an explicit run, or the background task, one hive at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reader {
+    Run,
+    Background,
+}
+
+/// A task acting on a hive: what it does, for which update, since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Holder {
+    pub(crate) what: String,
+    pub(crate) update: String,
+    pub(crate) since_ms: u64,
+}
+
+/// The explicit run under way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Running {
+    pub(crate) origin: String,
+    pub(crate) since_ms: u64,
+    pub(crate) update: Option<String>,
 }
 
 /// The installation's update: its state on disk, and what is being acted on now.
@@ -1274,10 +1500,23 @@ pub(crate) struct Updates {
     path: PathBuf,
     file: Mutex<UpdatesFile>,
     /// The hives a task acts on now: another run, or the background task, leaves them.
-    busy: Mutex<HashSet<String>>,
-    /// When the background task looks at each hive next (ms), in memory: a restart looks at once.
+    busy: Mutex<HashMap<String, Holder>>,
+    /// When the background task looks at each hive next, and when it last did (ms), in memory: a
+    /// restart looks at once.
     due: Mutex<HashMap<String, u64>>,
-    /// Wakes the background task: an update opened, or something to follow.
+    looked: Mutex<HashMap<String, u64>>,
+    /// One read of a hive's `/versions` at a time, and until when a read SY.admin gave up may
+    /// still be queued at the motherbee's orchestrator.
+    reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    quiet_until: Mutex<HashMap<String, u64>>,
+    /// The background task reads one hive at a time.
+    background_reads: tokio::sync::Semaphore,
+    /// One explicit run at a time.
+    running: Mutex<Option<Running>>,
+    /// The open update's target checked once after SY.admin's start; the registry's failure said.
+    resume_checked: AtomicBool,
+    registry_said: AtomicBool,
+    /// Wakes the background task: an update opened, something to look at now.
     wake: tokio::sync::Notify,
 }
 
@@ -1361,66 +1600,64 @@ pub(crate) struct Claim<'a> {
     hive: String,
 }
 
+impl Claim<'_> {
+    /// What the holder does now.
+    fn doing(&self, what: &str) {
+        if let Some(holder) = lock(&self.updates.busy).get_mut(&self.hive) {
+            holder.what = what.to_string();
+        }
+    }
+}
+
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
         lock(&self.updates.busy).remove(&self.hive);
     }
 }
 
+/// The explicit run's mark, released when it answers.
+pub(crate) struct RunGuard<'a> {
+    updates: &'a Updates,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        *lock(&self.updates.running) = None;
+    }
+}
+
 impl Updates {
-    /// The state SY.admin's start finds, the open update resumed, every hive looked at at once. A
-    /// core whose update answered stays in flight, and is followed; an update a previous process
-    /// sent with no answer recorded (a config apply, a core update not answered yet) is
-    /// `not_answered`: the hive may hold it, and the automatic step finishes it once.
+    /// The state SY.admin's start finds, the open update resumed and every hive looked at at once:
+    /// a core or a config found in flight is followed (a core to its settle, or past the bound with
+    /// no sign of it, `not_answered`; a config apply sent again).
     pub(crate) fn load(state_dir: &Path) -> Arc<Updates> {
         let path = updates_path(state_dir);
-        let now = now_epoch_ms();
-        let (mut file, note) = load_file(&path, now);
+        let (file, note) = load_file(&path, now_epoch_ms());
         if let Some(note) = note {
             tracing::warn!(note = %note, "installation update: its state starts empty");
         }
-        if let Some(open) = file.open.as_mut() {
-            for entry in open.hives.values_mut() {
-                for slot in [&mut entry.core, &mut entry.config] {
-                    let answered = slot
-                        .outcome
-                        .as_ref()
-                        .is_some_and(|outcome| outcome.answered_ms.is_some());
-                    if slot.state != Standing::InFlight || answered {
-                        continue;
-                    }
-                    let mut outcome = Outcome::new(
-                        OutcomeStatus::NotAnswered,
-                        slot.outcome
-                            .as_ref()
-                            .map_or(RunKind::Explicit, |outcome| outcome.by),
-                        slot.outcome
-                            .as_ref()
-                            .map_or(now, |outcome| outcome.started_at_ms),
-                        now,
-                    );
-                    outcome.detail = Some(
-                        "SY.admin restarted before its update answered; the hive may hold it"
-                            .to_string(),
-                    );
-                    slot.state = Standing::Unknown;
-                    slot.reason = Some("SY.admin restarted while its update ran".to_string());
-                    slot.outcome = Some(outcome);
-                }
-            }
+        if let Some(open) = file.open.as_ref() {
             tracing::info!(
                 update = %open.id,
+                state = open.state.as_str(),
                 target = %open.target.describe(),
                 hives = open.hives.len(),
-                "installation update: an open update resumed at SY.admin's start; its hives are \
-                 checked again"
+                "installation update: an open update resumed at SY.admin's start; its target is \
+                 checked against the motherbee's, and its hives are looked at again"
             );
         }
         Arc::new(Updates {
             path,
             file: Mutex::new(file),
-            busy: Mutex::new(HashSet::new()),
+            busy: Mutex::new(HashMap::new()),
             due: Mutex::new(HashMap::new()),
+            looked: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
+            quiet_until: Mutex::new(HashMap::new()),
+            background_reads: tokio::sync::Semaphore::new(1),
+            running: Mutex::new(None),
+            resume_checked: AtomicBool::new(false),
+            registry_said: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
         })
     }
@@ -1442,45 +1679,169 @@ impl Updates {
         result
     }
 
-    fn claim(&self, hive: &str) -> Option<Claim<'_>> {
-        lock(&self.busy).insert(hive.to_string()).then(|| Claim {
+    fn claim(&self, hive: &str, what: &str, update: &str) -> Option<Claim<'_>> {
+        let mut busy = lock(&self.busy);
+        if busy.contains_key(hive) {
+            return None;
+        }
+        busy.insert(
+            hive.to_string(),
+            Holder {
+                what: what.to_string(),
+                update: update.to_string(),
+                since_ms: now_epoch_ms(),
+            },
+        );
+        Some(Claim {
             updates: self,
             hive: hive.to_string(),
         })
     }
 
-    /// The hive's mark, waited for up to `wait`: the background task holds it for a read; a task
-    /// that acts on the hive holds it longer, and the caller then leaves the hive to it.
-    async fn claim_within(&self, hive: &str, wait: Duration) -> Option<Claim<'_>> {
-        let deadline = tokio::time::Instant::now() + wait;
-        loop {
-            if let Some(claim) = self.claim(hive) {
-                return Some(claim);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+    pub(crate) fn holder(&self, hive: &str) -> Option<Holder> {
+        lock(&self.busy).get(hive).cloned()
     }
 
     fn is_busy(&self, hive: &str) -> bool {
-        lock(&self.busy).contains(hive)
+        lock(&self.busy).contains_key(hive)
     }
 
-    fn due_now(&self, hive: &str, now_ms: u64) -> bool {
-        lock(&self.due).get(hive).is_none_or(|due| *due <= now_ms)
+    /// One explicit run at a time: the run's mark, or the one under way.
+    pub(crate) fn start_run(&self, origin: &str) -> Result<RunGuard<'_>, Running> {
+        let mut running = lock(&self.running);
+        if let Some(under_way) = running.as_ref() {
+            return Err(under_way.clone());
+        }
+        *running = Some(Running {
+            origin: origin.to_string(),
+            since_ms: now_epoch_ms(),
+            update: None,
+        });
+        Ok(RunGuard { updates: self })
+    }
+
+    /// The update the explicit run under way opened or resumed, which a refused run names.
+    fn note_run_update(&self, id: &str) {
+        if let Some(running) = lock(&self.running).as_mut() {
+            running.update = Some(id.to_string());
+        }
+    }
+
+    /// When the background task looks at `hive` next (0: at once).
+    fn due_at(&self, hive: &str) -> u64 {
+        lock(&self.due).get(hive).copied().unwrap_or(0)
     }
 
     fn look_again(&self, hive: &str, after: Duration) {
+        let now = now_epoch_ms();
         lock(&self.due).insert(
             hive.to_string(),
-            now_epoch_ms().saturating_add(after.as_millis() as u64),
+            now.saturating_add(after.as_millis() as u64),
         );
+        lock(&self.looked).insert(hive.to_string(), now);
+    }
+
+    /// An immediate look at `hive`: due now, and the background task woken. Never blocks.
+    pub(crate) fn look_now(&self, hive: &str) {
+        lock(&self.due).insert(hive.to_string(), 0);
+        self.wake();
+    }
+
+    /// An immediate look at every hive of the open update the background task has not looked at
+    /// for `min_age` (a reader of the update or of `/versions` sees it fresh, and polling does not
+    /// read a hive more often than that). Never blocks.
+    pub(crate) fn look_soon_all(&self, min_age: Duration) {
+        let hives: Vec<String> = self.read(|file| {
+            file.open
+                .as_ref()
+                .map(|update| {
+                    update
+                        .hives
+                        .iter()
+                        .filter(|(_, entry)| !entry.on_target())
+                        .map(|(hive, _)| hive.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if hives.is_empty() {
+            return;
+        }
+        let now = now_epoch_ms();
+        let min_age = min_age.as_millis() as u64;
+        let mut any = false;
+        {
+            let looked = lock(&self.looked);
+            let mut due = lock(&self.due);
+            for hive in hives {
+                let stale = looked
+                    .get(&hive)
+                    .is_none_or(|at| now.saturating_sub(*at) >= min_age);
+                if stale && due.get(&hive).is_some_and(|at| *at > now) {
+                    due.insert(hive, 0);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            self.wake();
+        }
     }
 
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    fn read_lock(&self, hive: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            lock(&self.reads)
+                .entry(hive.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// One read of `hive`'s `/versions`, at most one outstanding for the hive, everywhere: the
+    /// motherbee's orchestrator takes its admin messages one at a time and forwards a spoke's read
+    /// within its own bound, which `bounds.read` waits past. A read that timed out anyway may still
+    /// be queued there: the hive is not read again for another `bounds.read`. The background task
+    /// reads one hive at a time.
+    pub(crate) async fn read_versions(
+        &self,
+        mesh: &dyn UpdateMesh,
+        hive: &str,
+        reader: Reader,
+        bounds: &Bounds,
+    ) -> Result<Value, String> {
+        let _background = match reader {
+            Reader::Background => Some(
+                self.background_reads
+                    .acquire()
+                    .await
+                    .map_err(|err| err.to_string())?,
+            ),
+            Reader::Run => None,
+        };
+        let hive_lock = self.read_lock(hive);
+        let _one = hive_lock.lock().await;
+        let now = now_epoch_ms();
+        let quiet_until = lock(&self.quiet_until).get(hive).copied();
+        if let Some(until) = quiet_until.filter(|until| *until > now) {
+            return Err(format!(
+                "a read of its /versions SY.admin gave up may still be queued at the motherbee's \
+                 orchestrator: not read again for {} s",
+                (until - now) / 1000 + 1
+            ));
+        }
+        let read = mesh.versions(hive, bounds.read).await;
+        if let Err(why) = &read {
+            if super::infer_transport_error_code(why) == "TIMEOUT" {
+                lock(&self.quiet_until).insert(
+                    hive.to_string(),
+                    now_epoch_ms().saturating_add(bounds.read.as_millis() as u64),
+                );
+            }
+        }
+        read
     }
 
     /// Sets one hive's category in the update `id`, while it is the open one; logs an outcome on
@@ -1492,6 +1853,21 @@ impl Updates {
         hive: &str,
         category: Category,
         state: Standing,
+        reason: Option<String>,
+        outcome: Option<Outcome>,
+        next: Option<String>,
+    ) -> bool {
+        self.record_with(id, hive, category, state, None, reason, outcome, next)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_with(
+        &self,
+        id: &str,
+        hive: &str,
+        category: Category,
+        state: Standing,
+        exclusion: Option<Exclusion>,
         reason: Option<String>,
         outcome: Option<Outcome>,
         next: Option<String>,
@@ -1509,6 +1885,7 @@ impl Updates {
                 .or_default()
                 .category_mut(category);
             slot.state = state;
+            slot.exclusion = exclusion.filter(|_| state == Standing::Excluded);
             slot.reason = reason.map(cut);
             if let Some(outcome) = outcome {
                 slot.outcome = Some(Outcome {
@@ -1545,6 +1922,42 @@ impl Updates {
         });
     }
 
+    fn entry(&self, id: &str, hive: &str) -> Option<HiveEntry> {
+        self.read(|file| {
+            file.open
+                .as_ref()
+                .filter(|update| update.id == id)
+                .and_then(|update| update.hives.get(hive))
+                .cloned()
+        })
+    }
+
+    /// The open update's state set by its hives (done, held or open), and said when it changed.
+    pub(crate) fn settle_state(&self) -> Option<UpdateState> {
+        let changed = self.change(|file| file.settle_state(now_epoch_ms()));
+        let (id, state) = changed?;
+        match state {
+            UpdateState::Done => {
+                tracing::info!(update = %id, "installation update: done, every hive on the target")
+            }
+            UpdateState::Held => {
+                let held = self
+                    .read(|file| file.open.as_ref().and_then(UpdateRecord::held_hives))
+                    .unwrap_or_default();
+                tracing::warn!(
+                    update = %id,
+                    held = ?held,
+                    "installation update: held, every hive on the target but those the operator \
+                     rolled back (core_rollback, the one allowed divergence)"
+                )
+            }
+            UpdateState::Open | UpdateState::Superseded => {
+                tracing::info!(update = %id, state = state.as_str(), "installation update: open again")
+            }
+        }
+        Some(state)
+    }
+
     /// The state of the update `id`, open or in the history.
     pub(crate) fn state_of(&self, id: &str) -> Option<UpdateState> {
         self.read(|file| {
@@ -1554,15 +1967,6 @@ impl Updates {
                 .find(|update| update.id == id)
                 .map(|update| update.state)
         })
-    }
-
-    /// Closes the open update once every hive is on the target, and says so.
-    pub(crate) fn close_if_done(&self) -> Option<String> {
-        let closed = self.change(|file| file.close_if_done(now_epoch_ms()));
-        if let Some(id) = &closed {
-            tracing::info!(update = %id, "installation update: done, every hive on the target");
-        }
-        closed
     }
 
     /// The summary `/versions` and `get_installation` carry: the current or last update, its
@@ -1575,6 +1979,8 @@ impl Updates {
                 "opened_at_ms": update.opened_at_ms,
                 "closed_at_ms": update.closed_at_ms,
                 "target": target_view(&update.target),
+                "stale_target": update.stale_target.is_some(),
+                "held": update.held_hives().filter(|_| update.state == UpdateState::Held),
                 "hives": update
                     .hives
                     .iter()
@@ -1657,6 +2063,7 @@ fn category_view(entry: &CategoryEntry) -> Value {
         out["elapsed_ms"] = json!(outcome.elapsed_ms());
         if let Some(fields) = out.as_object_mut() {
             fields.remove("previous_update");
+            fields.remove("record_seen");
         }
     }
     view
@@ -1703,10 +2110,18 @@ pub(crate) fn record_view(update: &UpdateRecord) -> Value {
         "state": update.state,
         "opened_at_ms": update.opened_at_ms,
         "closed_at_ms": update.closed_at_ms,
+        "last_run_at_ms": update.last_run_at_ms,
         "origin": update.origin,
         "reason": update.reason,
         "superseded_by": update.superseded_by,
         "target": target_view(&update.target),
+        "stale_target": update.stale_target.as_ref().map(|stale| json!({
+            "target": target_view(&stale.target),
+            "since_ms": stale.since_ms,
+            "note": "the motherbee holds another target than this update's: nothing acts on it; \
+                     update_installation supersedes it",
+        })),
+        "held": update.held_hives().filter(|_| update.state == UpdateState::Held).unwrap_or_default(),
         "hives": update
             .hives
             .iter()
@@ -1775,9 +2190,10 @@ pub(crate) trait UpdateMesh: Send + Sync {
     /// Whether the hive's orchestrator is connected now, from shared memory, asking no one: None
     /// when it cannot be read.
     fn orchestrator_connected(&self, hive: &str) -> Option<bool>;
-    /// The hives an update reaches now, the motherbee and each one the registry calls connected
-    /// (`connected_hives_with`), and the registry's others, named (`installation_skipped_hives`).
-    fn hives(&self) -> (Vec<String>, Vec<Value>);
+    /// The hives an update reaches now, the motherbee and each one the registry calls connected,
+    /// and the registry's others, named; an error when the registry cannot be read (never "the
+    /// motherbee alone").
+    fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String>;
     /// The motherbee's name.
     fn motherbee(&self) -> &str;
 }
@@ -1799,6 +2215,46 @@ impl LiveMesh {
             connected_nodes: Arc::clone(&ctx.connected_nodes),
         })
     }
+}
+
+/// The motherbee and each hive the registry calls connected (`connected_hives_with`'s rule), and
+/// the registry's others; the registry's read error, never a list without the spokes.
+fn registry_hives(
+    admin_hive: &str,
+    registry: &fluxbee_sdk::mesh::HiveRegistry,
+) -> Result<(Vec<String>, Vec<Value>), String> {
+    // No registry directory at all: no hive was ever added (the orchestrator creates it with the
+    // first), so the motherbee alone. Any other error is a registry that cannot be read.
+    let entries = match registry.entries() {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(format!(
+                "the hive registry ({}) cannot be read: {err}",
+                registry.root().display()
+            ))
+        }
+    };
+    let mut hives = vec![admin_hive.to_string()];
+    for entry in &entries {
+        if entry.field("status") != Some("connected") {
+            continue;
+        }
+        if let Some(hive) = entry
+            .field("hive_id")
+            .map(str::trim)
+            .filter(|hive| !hive.is_empty())
+        {
+            if !hives.iter().any(|known| known == hive) {
+                hives.push(hive.to_string());
+            }
+        }
+    }
+    hives.sort();
+    Ok((
+        hives,
+        skipped_hives(super::installation_skipped_hives(registry, false, None)),
+    ))
 }
 
 #[async_trait]
@@ -1849,12 +2305,8 @@ impl UpdateMesh for LiveMesh {
             .map(|nodes| nodes.contains(&name))
     }
 
-    fn hives(&self) -> (Vec<String>, Vec<Value>) {
-        let registry = super::hive_registry_for(&self.state_dir);
-        (
-            super::connected_hives_with(&self.admin_hive, &registry),
-            skipped_hives(super::installation_skipped_hives(&registry, false, None)),
-        )
+    fn hives(&self) -> Result<(Vec<String>, Vec<Value>), String> {
+        registry_hives(&self.admin_hive, &super::hive_registry_for(&self.state_dir))
     }
 
     fn motherbee(&self) -> &str {
@@ -1881,13 +2333,14 @@ fn skipped_hives(mut skipped: Vec<Value>) -> Vec<Value> {
 /// How one hive's core update ended in a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoreEnd {
-    /// Its services restart: the background task follows it, then applies the config.
+    /// Its services restart, or its answer did not come in time: the background task follows it,
+    /// then applies the config.
     InFlight,
     /// On the target: the config may go now.
     Settled,
     /// It refused or failed, and its orchestrator answers.
     Failed,
-    /// It did not answer.
+    /// It never reached the hive.
     NotAnswered,
 }
 
@@ -1895,10 +2348,10 @@ enum CoreEnd {
 /// error code.
 fn next_after(hive: &str, category: Category, target: &Target, code: Option<&str>) -> String {
     match (category, code) {
-        (Category::Core, Some("CORE_NOT_SETTLED")) => format!(
-            "what the settle leaves open clears once dist holds the release's binaries; GET \
-             /hives/{hive}/versions shows it (core.last_update, core.awaiting_update), and {} \
-             installs what is pending",
+        (Category::Core, Some("CORE_NOT_SETTLED" | "CORE_NOT_INSTALLED")) => format!(
+            "it stays pending until its record changes: run update_installation again, which sends \
+             its core update again (it installs what is pending), or {}; GET /hives/{hive}/versions \
+             shows its record (core.last_update, core.awaiting_update)",
             core_update_step(hive, target)
         ),
         (Category::Core, Some("CORE_UPDATE_ROLLED_BACK")) => format!(
@@ -1919,7 +2372,17 @@ fn next_after(hive: &str, category: Category, target: &Target, code: Option<&str
     }
 }
 
-/// An apply's outcome, as an [`Outcome`], with how long it took.
+/// What a hive that did not answer gets as its `next`.
+fn next_unanswered(hive: &str, category: Category, target: &Target) -> String {
+    format!(
+        "once it answers again, the automatic step finishes the update for it, once, unless it \
+         leaves the hive alone (rolled back by the operator, ahead of the motherbee, or a copy \
+         edited by hand); or update_installation. {}",
+        next_after(hive, category, target, None)
+    )
+}
+
+/// An apply's outcome, as an [`Outcome`], with its error code.
 fn applied_outcome(
     applied: &InstallationApplied,
     by: RunKind,
@@ -2001,18 +2464,17 @@ async fn ask(
     .await
 }
 
-/// The hive's `/versions`, read until its orchestrator answers, within `wait`.
+/// The hive's `/versions`, read until its orchestrator answers, up to `deadline` (a read under way
+/// then ends on its own bound).
 async fn read_until_it_answers(
+    updates: &Updates,
     mesh: &dyn UpdateMesh,
     hive: &str,
-    wait: Duration,
+    deadline: tokio::time::Instant,
     bounds: &Bounds,
 ) -> Result<Value, String> {
-    let deadline = tokio::time::Instant::now() + wait;
     loop {
-        let read = mesh
-            .versions(hive, bounds.read.max(Duration::from_secs(1)))
-            .await;
+        let read = updates.read_versions(mesh, hive, Reader::Run, bounds).await;
         match read {
             Ok(snapshot) => return Ok(snapshot),
             Err(why) if tokio::time::Instant::now() + bounds.answer_poll > deadline => {
@@ -2025,20 +2487,23 @@ async fn read_until_it_answers(
 
 /// A step that is not an act, as the state it leaves.
 fn record_step(updates: &Updates, id: &str, hive: &str, category: Category, step: &Step) {
-    let (state, reason, next) = match step {
-        Step::OnTarget => (Standing::OnTarget, None, None),
+    let (state, exclusion, reason, next) = match step {
+        Step::OnTarget => (Standing::OnTarget, None, None, None),
         Step::Act => return,
-        Step::InFlight(why) => (Standing::InFlight, Some(why.clone()), None),
-        Step::AfterCore(why) => (Standing::Pending, Some(why.clone()), None),
-        Step::Excluded { reason, next } => {
-            (Standing::Excluded, Some(reason.clone()), Some(next.clone()))
-        }
-        Step::Unknown(why) => (Standing::Unknown, Some(why.clone()), None),
+        Step::InFlight(why) => (Standing::InFlight, None, Some(why.clone()), None),
+        Step::AfterCore(why) => (Standing::Pending, None, Some(why.clone()), None),
+        Step::Excluded { kind, reason, next } => (
+            Standing::Excluded,
+            Some(*kind),
+            Some(reason.clone()),
+            Some(next.clone()),
+        ),
+        Step::Unknown(why) => (Standing::Unknown, None, Some(why.clone()), None),
     };
-    updates.record(id, hive, category, state, reason, None, next);
+    updates.record_with(id, hive, category, state, exclusion, reason, None, next);
 }
 
-/// An exclusion an explicit run or the automatic step made, as an outcome too.
+/// An exclusion a run made, as an outcome too.
 fn record_exclusion(
     updates: &Updates,
     id: &str,
@@ -2047,15 +2512,16 @@ fn record_exclusion(
     step: &Step,
     by: RunKind,
 ) {
-    if let Step::Excluded { reason, next } = step {
+    if let Step::Excluded { kind, reason, next } = step {
         let now = now_epoch_ms();
         let mut outcome = Outcome::new(OutcomeStatus::Excluded, by, now, now);
         outcome.detail = Some(reason.clone());
-        updates.record(
+        updates.record_with(
             id,
             hive,
             category,
             Standing::Excluded,
+            Some(*kind),
             Some(reason.clone()),
             Some(outcome),
             Some(next.clone()),
@@ -2063,7 +2529,21 @@ fn record_exclusion(
     }
 }
 
-/// One explicit run's pass on one hive, once no other task acts on it: [`run_claimed_hive`].
+/// The hive's core outcome says its update did not settle, and its record is still the one it
+/// saw then: nothing new to follow.
+fn core_unchanged_since_not_settled(entry: &HiveEntry, snapshot: &Value) -> bool {
+    let core = snapshot.get("core").unwrap_or(&Value::Null);
+    entry.core.outcome.as_ref().is_some_and(|outcome| {
+        matches!(
+            outcome.error_code.as_deref(),
+            Some("CORE_NOT_SETTLED" | "CORE_NOT_INSTALLED")
+        ) && outcome.record_seen.as_deref() == Some(core_record_signature(core).as_str())
+    })
+}
+
+/// One explicit run's pass on one hive, once no other task acts on it: [`run_claimed_hive`]. A
+/// holder that is only reading the hive is waited for, within its read's bound; one that acts on
+/// it is not, and the hive is recorded as left to it, never left unrecorded.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_hive(
     updates: &Updates,
@@ -2071,17 +2551,26 @@ pub(crate) async fn run_hive(
     id: &str,
     hive: &str,
     target: &Target,
-    kind: RunKind,
     include_rolled_back: &[String],
     first: Option<Value>,
+    answer_deadline: tokio::time::Instant,
     bounds: &Bounds,
 ) {
-    let Some(_claim) = updates.claim_within(hive, bounds.read).await else {
-        tracing::info!(
-            update = %id,
-            hive = %hive,
-            "installation update: another task acts on this hive now; this run leaves it to it"
-        );
+    let wait_until = tokio::time::Instant::now() + bounds.read + Duration::from_secs(5);
+    let claim = loop {
+        if let Some(claim) = updates.claim(hive, "the explicit run", id) {
+            break Some(claim);
+        }
+        let reading = updates
+            .holder(hive)
+            .is_some_and(|holder| holder.what == READING);
+        if !reading || tokio::time::Instant::now() >= wait_until {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let Some(_claim) = claim else {
+        left_to_holder(updates, id, hive);
         return;
     };
     run_claimed_hive(
@@ -2090,12 +2579,53 @@ pub(crate) async fn run_hive(
         id,
         hive,
         target,
-        kind,
+        RunKind::Explicit,
         include_rolled_back,
         first,
+        answer_deadline,
         bounds,
     )
     .await;
+}
+
+/// A hive another task acts on: the run leaves it to that task and says so in the record.
+fn left_to_holder(updates: &Updates, id: &str, hive: &str) {
+    let holder = updates.holder(hive);
+    let since = holder.as_ref().map_or(0, |holder| {
+        now_epoch_ms().saturating_sub(holder.since_ms) / 1000
+    });
+    let reason = match &holder {
+        Some(holder) if holder.update == id => format!(
+            "this run left it to {} of this update, under way for {since} s",
+            holder.what
+        ),
+        Some(holder) => format!(
+            "this run left it to {} of the superseded update {}, under way for {since} s",
+            holder.what, holder.update
+        ),
+        None => "this run left it to another task, which has just ended".to_string(),
+    };
+    tracing::info!(update = %id, hive = %hive, reason = %reason, "installation update: a hive left to another task");
+    updates.change(|file| {
+        let Some(entry) = file
+            .open_mut(id)
+            .and_then(|update| update.hives.get_mut(hive))
+        else {
+            return;
+        };
+        for slot in [&mut entry.core, &mut entry.config] {
+            if slot.state == Standing::OnTarget {
+                continue;
+            }
+            slot.reason = Some(cut(&reason));
+            slot.next = Some(
+                "GET /installation/update follows it; run update_installation again once that \
+                 task ends"
+                    .to_string(),
+            );
+        }
+    });
+    updates.look_now(hive);
 }
 
 /// One run on one hive (an explicit run's pass, or the automatic step), whose mark the caller
@@ -2111,19 +2641,14 @@ async fn run_claimed_hive(
     kind: RunKind,
     include_rolled_back: &[String],
     first: Option<Value>,
+    answer_deadline: tokio::time::Instant,
     bounds: &Bounds,
 ) {
     let started = now_epoch_ms();
     let is_motherbee = hive == mesh.motherbee();
     let snapshot = match first {
         Some(snapshot) => Ok(snapshot),
-        None => {
-            let wait = match kind {
-                RunKind::Explicit => bounds.answer,
-                RunKind::Automatic => Duration::ZERO,
-            };
-            read_until_it_answers(mesh, hive, wait, bounds).await
-        }
+        None => read_until_it_answers(updates, mesh, hive, answer_deadline, bounds).await,
     };
     let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
@@ -2139,11 +2664,7 @@ async fn run_claimed_hive(
                     Standing::Pending,
                     Some("it did not answer".to_string()),
                     Some(outcome),
-                    Some(format!(
-                        "once it answers, the automatic step finishes it (once); or \
-                         update_installation. {}",
-                        next_after(hive, category, target, None)
-                    )),
+                    Some(next_unanswered(hive, category, target)),
                 );
             }
             return;
@@ -2151,7 +2672,7 @@ async fn run_claimed_hive(
     };
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));
     let known = updates.read(UpdatesFile::known_cores);
-    let decision = decide(
+    let mut decision = decide(
         HiveFacts {
             hive,
             is_motherbee,
@@ -2162,6 +2683,29 @@ async fn run_claimed_hive(
         include_rolled_back,
         &known,
     );
+    // A core that did not settle, its record unchanged since: an explicit run sends its core
+    // update again (it installs what is pending, and writes a new record).
+    if kind == RunKind::Explicit && matches!(decision.core, Step::InFlight(_)) {
+        if let Some(entry) = updates.entry(id, hive) {
+            if core_unchanged_since_not_settled(&entry, &snapshot) {
+                decision.core = Step::Act;
+            }
+        }
+    }
+    if kind == RunKind::Automatic {
+        let left_alone = match &decision.core {
+            Step::Excluded { reason, .. } => reason.as_str(),
+            _ => "",
+        };
+        tracing::info!(
+            update = %id,
+            hive = %hive,
+            core = decision.core.label(),
+            config = decision.config.label(),
+            left_alone = %left_alone,
+            "installation update: automatic step decided"
+        );
+    }
     for (category, step) in [
         (Category::Core, &decision.core),
         (Category::Config, &decision.config),
@@ -2188,13 +2732,13 @@ async fn run_claimed_hive(
                 Some("its core update is under way".to_string()),
                 Some(Outcome::new(
                     OutcomeStatus::Restarting,
-                    kind,
+                    RunKind::Background,
                     started,
                     now_epoch_ms(),
                 )),
                 None,
             );
-            updates.look_again(hive, Duration::ZERO);
+            updates.look_now(hive);
             Some(CoreEnd::InFlight)
         }
         _ => None,
@@ -2211,7 +2755,7 @@ async fn run_claimed_hive(
     } else if core_end == Some(CoreEnd::NotAnswered) {
         let now = now_epoch_ms();
         let mut outcome = Outcome::new(OutcomeStatus::NotAnswered, kind, started, now);
-        outcome.detail = Some("its core update did not answer".to_string());
+        outcome.detail = Some("its core update did not reach it".to_string());
         updates.record(
             id,
             hive,
@@ -2219,13 +2763,14 @@ async fn run_claimed_hive(
             Standing::Pending,
             Some("after its core".to_string()),
             Some(outcome),
-            Some(next_after(hive, Category::Config, target, None)),
+            Some(next_unanswered(hive, Category::Config, target)),
         );
     }
 }
 
 /// The core update of one hive: sent, asked again while `sync_pending` or unreachable, and, when its
-/// services restart, left in flight for the background task to follow.
+/// services restart or its answer does not come in time, left in flight for the background task to
+/// follow through `/versions`.
 #[allow(clippy::too_many_arguments)]
 async fn core_update(
     updates: &Updates,
@@ -2241,22 +2786,22 @@ async fn core_update(
         return CoreEnd::Failed;
     };
     let started = now_epoch_ms();
-    let previous = previous_update_of(snapshot);
-    let mut sending = Outcome::new(OutcomeStatus::Restarting, kind, started, started);
-    sending.previous_update = previous.clone();
-    updates.change(|file| {
-        if let Some(update) = file.open_mut(id) {
-            let slot = update
-                .hives
-                .entry(hive.to_string())
-                .or_default()
-                .category_mut(Category::Core);
-            slot.state = Standing::InFlight;
-            slot.reason = Some("its core update is being sent".to_string());
-            slot.outcome = None;
-            slot.next = None;
-        }
-    });
+    // What the hive's record said before: after a restart of SY.admin, the follow tells this
+    // update's record from it.
+    let previous = Some(last_update_stamp(
+        snapshot.get("core").unwrap_or(&Value::Null),
+    ));
+    let mut sent = Outcome::new(OutcomeStatus::Sent, kind, started, started);
+    sent.previous_update = previous.clone();
+    updates.record(
+        id,
+        hive,
+        Category::Core,
+        Standing::InFlight,
+        Some("its core update is being sent".to_string()),
+        Some(sent),
+        None,
+    );
     let payload = json!({
         "category": "core",
         "manifest_version": 0,
@@ -2285,75 +2830,76 @@ async fn core_update(
                 return CoreEnd::InFlight;
             }
             // Nothing to restart (FINDINGS A-190): it is on the target once its record says so.
-            match mesh.versions(hive, bounds.read).await {
-                Ok(after) => {
-                    match watch_core(
-                        &after,
-                        &core_target.manifest_hash,
-                        outcome.previous_update.as_deref(),
-                    ) {
-                        CoreWatch::Settled => {
-                            outcome.status = OutcomeStatus::Settled;
-                            outcome.at_ms = now_epoch_ms();
-                            outcome.installed_ms = outcome.answered_ms;
-                            outcome.settled_ms = Some(outcome.elapsed_ms());
-                            updates.record(
-                                id,
-                                hive,
-                                Category::Core,
-                                Standing::OnTarget,
-                                None,
-                                Some(outcome),
-                                None,
-                            );
-                            CoreEnd::Settled
-                        }
-                        _ => {
-                            outcome.status = OutcomeStatus::Ok;
-                            updates.record(
-                                id,
-                                hive,
-                                Category::Core,
-                                Standing::InFlight,
-                                Some(
-                                    "its core update answered; its settle is followed".to_string(),
-                                ),
-                                Some(outcome),
-                                None,
-                            );
-                            updates.look_again(hive, Duration::ZERO);
-                            updates.wake();
-                            CoreEnd::InFlight
-                        }
-                    }
-                }
-                Err(_) => {
-                    outcome.status = OutcomeStatus::Ok;
-                    updates.record(
-                        id,
-                        hive,
-                        Category::Core,
-                        Standing::InFlight,
-                        Some("its core update answered; its settle is followed".to_string()),
-                        Some(outcome),
-                        None,
-                    );
-                    updates.look_again(hive, bounds.flight_check);
-                    updates.wake();
-                    CoreEnd::InFlight
-                }
+            let after = updates.read_versions(mesh, hive, Reader::Run, bounds).await;
+            let settled = after.as_ref().ok().map(|after| {
+                watch_core(
+                    after,
+                    &core_target.manifest_hash,
+                    outcome.previous_update.as_deref(),
+                )
+            }) == Some(CoreWatch::Settled);
+            if settled {
+                outcome.status = OutcomeStatus::Settled;
+                outcome.at_ms = now_epoch_ms();
+                outcome.installed_ms = outcome.answered_ms;
+                outcome.settled_ms = Some(outcome.elapsed_ms());
+                updates.record(
+                    id,
+                    hive,
+                    Category::Core,
+                    Standing::OnTarget,
+                    None,
+                    Some(outcome),
+                    None,
+                );
+                return CoreEnd::Settled;
             }
+            outcome.status = OutcomeStatus::Ok;
+            updates.record(
+                id,
+                hive,
+                Category::Core,
+                Standing::InFlight,
+                Some("its core update answered; its settle is followed".to_string()),
+                Some(outcome),
+                None,
+            );
+            updates.look_again(hive, bounds.flight_check);
+            updates.wake();
+            CoreEnd::InFlight
+        }
+        // No answer within an update's 60 s: the hive may still be applying it. Its /versions is
+        // followed until the settle bound; only a hive whose record never shows the update is
+        // `not_answered`.
+        InstallationApplyOutcome::NotAnswered(detail)
+            if super::infer_transport_error_code(detail) == "TIMEOUT" =>
+        {
+            updates.record(
+                id,
+                hive,
+                Category::Core,
+                Standing::InFlight,
+                Some(
+                    "its core update did not answer in time: its /versions is followed until the \
+                     settle bound, for a sign it took it"
+                        .to_string(),
+                ),
+                Some(outcome),
+                None,
+            );
+            updates.look_again(hive, bounds.flight_check);
+            updates.wake();
+            CoreEnd::InFlight
         }
         InstallationApplyOutcome::NotAnswered(_) => {
-            let next = next_after(hive, Category::Core, target, None);
             updates.record(
                 id,
                 hive,
                 Category::Core,
                 Standing::Pending,
-                Some("it did not answer its core update".to_string()),
+                Some("its core update did not reach it".to_string()),
                 Some(outcome),
-                Some(next),
+                Some(next_unanswered(hive, Category::Core, target)),
             );
             CoreEnd::NotAnswered
         }
@@ -2404,19 +2950,15 @@ async fn config_update(
         return;
     };
     let started = now_epoch_ms();
-    updates.change(|file| {
-        if let Some(update) = file.open_mut(id) {
-            let slot = update
-                .hives
-                .entry(hive.to_string())
-                .or_default()
-                .category_mut(Category::Config);
-            slot.state = Standing::InFlight;
-            slot.reason = Some("its config update is being applied".to_string());
-            slot.outcome = None;
-            slot.next = None;
-        }
-    });
+    updates.record(
+        id,
+        hive,
+        Category::Config,
+        Standing::InFlight,
+        Some("its config update is being applied".to_string()),
+        Some(Outcome::new(OutcomeStatus::Sent, kind, started, started)),
+        None,
+    );
     let payload = json!({
         "category": "config",
         "manifest_version": config.version,
@@ -2451,12 +2993,20 @@ pub(crate) fn record_config_applied(
             );
         }
         status => {
-            let reason = match status {
-                OutcomeStatus::SyncPending => "its copy had not arrived at the bound",
-                OutcomeStatus::NotAnswered => "it did not answer",
-                _ => "its config update failed",
+            let (reason, next) = match status {
+                OutcomeStatus::SyncPending => (
+                    "its copy had not arrived at the bound",
+                    next_after(hive, Category::Config, target, None),
+                ),
+                OutcomeStatus::NotAnswered => (
+                    "it did not answer",
+                    next_unanswered(hive, Category::Config, target),
+                ),
+                _ => (
+                    "its config update failed",
+                    next_after(hive, Category::Config, target, code.as_deref()),
+                ),
             };
-            let next = next_after(hive, Category::Config, target, code.as_deref());
             updates.record(
                 id,
                 hive,
@@ -2474,33 +3024,60 @@ pub(crate) fn record_config_applied(
 // The background task
 // ---------------------------------------------------------------------------------------------
 
-/// What the background task does with one hive of the open update now.
+/// What the background task does with one hive of the open update, and how often.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Look {
-    /// Its core is in flight: follow it to its settle, then its config.
+    /// A core or a config in flight: followed every few seconds.
     Follow,
-    /// It did not answer an attempt of this update: once it answers, the automatic step.
+    /// It did not answer an attempt of this update: once shared memory shows its orchestrator,
+    /// the automatic step.
     Automatic,
-    /// Not on the target, nothing in flight: read it again, act on nothing.
-    Recheck,
+    /// It did not answer, or was not read yet: the shared-memory check, and a read once it shows
+    /// its orchestrator; nothing sent.
+    AnswerCheck,
+    /// Left as it is, or its last attempt failed: read again now and then; nothing sent.
+    Slow,
     Nothing,
+}
+
+impl Look {
+    fn period(self, bounds: &Bounds) -> Duration {
+        match self {
+            Look::Follow => bounds.flight_check,
+            Look::Automatic | Look::AnswerCheck => bounds.retry_check,
+            Look::Slow | Look::Nothing => bounds.slow_check,
+        }
+    }
 }
 
 pub(crate) fn look_at(entry: &HiveEntry) -> Look {
     if entry.on_target() {
         return Look::Nothing;
     }
-    if entry.core.state == Standing::InFlight {
+    if entry.in_flight() {
         return Look::Follow;
     }
     if entry.awaits_automatic_step() {
         return Look::Automatic;
     }
-    Look::Recheck
+    let unanswered = [&entry.core, &entry.config].into_iter().any(|slot| {
+        slot.state == Standing::Unknown
+            || (slot.state == Standing::Pending
+                && slot
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.status == OutcomeStatus::NotAnswered))
+    });
+    if unanswered {
+        Look::AnswerCheck
+    } else {
+        Look::Slow
+    }
 }
 
-/// The background task: while an update is open, every `flight_check` it looks at each hive whose
-/// time came, each in a task of its own; the motherbee only, as SY.admin runs nowhere else.
+/// The background task: while an update is open, it looks at each hive when its time comes (in a
+/// task of its own), and sleeps until the next one is due or something wakes it; the motherbee
+/// only, as SY.admin runs nowhere else.
 pub(crate) async fn run_background(
     updates: Arc<Updates>,
     mesh: Arc<dyn UpdateMesh>,
@@ -2508,13 +3085,15 @@ pub(crate) async fn run_background(
 ) {
     loop {
         let open = updates.read(|file| file.open.is_some());
-        if open {
-            tick(&updates, &mesh, &bounds).await;
-        }
-        let pause = if open {
-            bounds.flight_check
+        let next_due = if open {
+            tick(&updates, &mesh, &bounds).await
         } else {
-            bounds.retry_check
+            None
+        };
+        let pause = match next_due {
+            Some(due) => Duration::from_millis(due.saturating_sub(now_epoch_ms()))
+                .clamp(Duration::from_millis(200), bounds.slow_check),
+            None => bounds.slow_check,
         };
         tokio::select! {
             _ = tokio::time::sleep(pause) => {}
@@ -2523,18 +3102,41 @@ pub(crate) async fn run_background(
     }
 }
 
-/// One look at the open update: each hive due is followed, finished by the automatic step, or read
-/// again, in a task of its own; then the update closes if every hive is on the target.
-pub(crate) async fn tick(updates: &Arc<Updates>, mesh: &Arc<dyn UpdateMesh>, bounds: &Bounds) {
-    let Some((id, target)) = updates.read(|file| {
+/// One look at the open update: the hive list refreshed (never on a registry the task cannot read),
+/// each hive due looked at in a task of its own, then the update's state settled. When the next
+/// hive is due.
+pub(crate) async fn tick(
+    updates: &Arc<Updates>,
+    mesh: &Arc<dyn UpdateMesh>,
+    bounds: &Bounds,
+) -> Option<u64> {
+    let (id, target) = updates.read(|file| {
         file.open
             .as_ref()
             .map(|update| (update.id.clone(), update.target.clone()))
-    }) else {
-        return;
+    })?;
+    // SY.admin's start: the target is checked before anything acts on the update.
+    if !updates.resume_checked.swap(true, Ordering::SeqCst) {
+        target_is_current(updates, mesh.as_ref(), &id, &target, bounds).await;
+    }
+    let listed = match mesh.hives() {
+        Ok((hives, skipped)) => {
+            updates.registry_said.store(false, Ordering::SeqCst);
+            updates.change(|file| file.refresh_hives(&id, &hives, skipped));
+            true
+        }
+        Err(why) => {
+            if !updates.registry_said.swap(true, Ordering::SeqCst) {
+                tracing::warn!(
+                    update = %id,
+                    error = %why,
+                    "installation update: the hive registry cannot be read: the update keeps its \
+                     hives, and is not closed, until it can"
+                );
+            }
+            false
+        }
     };
-    let (hives, skipped) = mesh.hives();
-    updates.change(|file| file.refresh_hives(&id, &hives, skipped));
     let now = now_epoch_ms();
     let looks: Vec<(String, Look)> = updates.read(|file| {
         file.open
@@ -2548,15 +3150,24 @@ pub(crate) async fn tick(updates: &Arc<Updates>, mesh: &Arc<dyn UpdateMesh>, bou
             })
             .unwrap_or_default()
     });
+    let mut next_due: Option<u64> = None;
+    let mut sooner = |at: u64| next_due = Some(next_due.map_or(at, |due| due.min(at)));
     for (hive, look) in looks {
-        if look == Look::Nothing || updates.is_busy(&hive) || !updates.due_now(&hive, now) {
+        if look == Look::Nothing {
             continue;
         }
-        let period = match look {
-            Look::Follow => bounds.flight_check,
-            _ => bounds.retry_check,
-        };
+        if updates.is_busy(&hive) {
+            sooner(now.saturating_add(bounds.flight_check.as_millis() as u64));
+            continue;
+        }
+        let due = updates.due_at(&hive);
+        if due > now {
+            sooner(due);
+            continue;
+        }
+        let period = look.period(bounds);
         updates.look_again(&hive, period);
+        sooner(now.saturating_add(period.as_millis() as u64));
         let (updates, mesh, id, target, bounds) = (
             Arc::clone(updates),
             Arc::clone(mesh),
@@ -2570,19 +3181,111 @@ pub(crate) async fn tick(updates: &Arc<Updates>, mesh: &Arc<dyn UpdateMesh>, bou
                 Look::Automatic => {
                     automatic_step(&updates, mesh.as_ref(), &id, &hive, &target, &bounds).await
                 }
-                Look::Recheck => {
-                    recheck(&updates, mesh.as_ref(), &id, &hive, &target, &bounds).await
+                Look::AnswerCheck | Look::Slow => {
+                    recheck(&updates, mesh.as_ref(), &id, &hive, &target, &bounds, look).await
                 }
                 Look::Nothing => {}
             }
-            updates.close_if_done();
+            updates.settle_state();
         });
     }
-    updates.close_if_done();
+    if listed {
+        updates.settle_state();
+    }
+    next_due
 }
 
-/// A hive in flight: its `/versions` read again; once settled, its config goes (the run that sent
-/// the core goes on); past the settle bound, what stopped it.
+/// Whether the open update `id`'s target is still what the motherbee holds. While it is not (its
+/// release or its file changed, a downgrade included), the update is marked `stale_target`, said
+/// once, and nothing acts on it: the next explicit run supersedes it. A motherbee that cannot be
+/// read is no verdict: nothing acts this time.
+pub(crate) async fn target_is_current(
+    updates: &Updates,
+    mesh: &dyn UpdateMesh,
+    id: &str,
+    target: &Target,
+    bounds: &Bounds,
+) -> bool {
+    let motherbee = mesh.motherbee().to_string();
+    let now_target = match updates
+        .read_versions(mesh, &motherbee, Reader::Background, bounds)
+        .await
+    {
+        Ok(snapshot) => target_of(&snapshot),
+        Err(why) => {
+            tracing::info!(
+                update = %id,
+                error = %why,
+                "installation update: the motherbee's /versions did not answer: nothing acts on \
+                 the update this time"
+            );
+            return false;
+        }
+    };
+    let current = now_target.same_as(target);
+    let now = now_epoch_ms();
+    let changed = updates.change(|file| {
+        let update = file.open_mut(id)?;
+        if current {
+            return update.stale_target.take().map(|_| false);
+        }
+        let first = update.stale_target.is_none();
+        update.stale_target = Some(StaleTarget {
+            target: now_target.clone(),
+            since_ms: update
+                .stale_target
+                .as_ref()
+                .map_or(now, |stale| stale.since_ms),
+        });
+        if update.state == UpdateState::Held {
+            update.state = UpdateState::Open;
+        }
+        first.then_some(true)
+    });
+    match changed {
+        Some(true) => tracing::warn!(
+            update = %id,
+            target = %target.describe(),
+            motherbee_holds = %now_target.describe(),
+            "installation update: the motherbee holds another target than the open update's: \
+             nothing acts on it until update_installation supersedes it"
+        ),
+        Some(false) => tracing::info!(
+            update = %id,
+            "installation update: the motherbee holds the open update's target again"
+        ),
+        None => {}
+    }
+    current
+}
+
+/// Where the automatic step left a hive, said in its attempt: finished once nothing it started is
+/// in flight.
+fn refresh_automatic_result(updates: &Updates, id: &str, hive: &str) {
+    let now = now_epoch_ms();
+    updates.change(|file| {
+        let Some(entry) = file
+            .open_mut(id)
+            .and_then(|update| update.hives.get_mut(hive))
+        else {
+            return;
+        };
+        let summary = entry.summary();
+        let in_flight = entry.in_flight();
+        if let Some(attempt) = entry.automatic.as_mut() {
+            attempt.result = Some(if in_flight {
+                format!("{summary}: followed")
+            } else {
+                summary
+            });
+            attempt.finished_at_ms = (!in_flight).then_some(now);
+        }
+    });
+}
+
+/// A hive in flight: a core read again until it settles, then its config sent (by the run that
+/// sent the core, or, for one found under way, by the background task); past the settle bound,
+/// what stopped it. A config apply a previous process left in flight is sent again.
 pub(crate) async fn follow(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -2591,28 +3294,59 @@ pub(crate) async fn follow(
     target: &Target,
     bounds: &Bounds,
 ) {
+    let Some(claim) = updates.claim(hive, READING, id) else {
+        return;
+    };
+    let Some(entry) = updates.entry(id, hive) else {
+        return;
+    };
+    let automatic = entry.automatic.is_some();
+    if entry.core.state == Standing::InFlight {
+        follow_core(updates, mesh, &claim, id, hive, target, bounds, entry).await;
+    } else if entry.config.state == Standing::InFlight {
+        if !target_is_current(updates, mesh, id, target, bounds).await {
+            return;
+        }
+        let by = entry
+            .config
+            .outcome
+            .as_ref()
+            .map_or(RunKind::Background, |outcome| outcome.by);
+        tracing::info!(
+            update = %id,
+            hive = %hive,
+            "installation update: a config apply under way without its answer (SY.admin restarted): \
+             sent again"
+        );
+        claim.doing("applying its config");
+        config_update(updates, mesh, id, hive, target, by, bounds).await;
+    }
+    if automatic {
+        refresh_automatic_result(updates, id, hive);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn follow_core(
+    updates: &Updates,
+    mesh: &dyn UpdateMesh,
+    claim: &Claim<'_>,
+    id: &str,
+    hive: &str,
+    target: &Target,
+    bounds: &Bounds,
+    entry: HiveEntry,
+) {
     let Some(core_target) = &target.core else {
         return;
     };
-    let Some(_claim) = updates.claim(hive) else {
-        return;
-    };
-    let Some(mut outcome) = updates.read(|file| {
-        file.open
-            .as_ref()
-            .filter(|update| update.id == id)
-            .and_then(|update| update.hives.get(hive))
-            .filter(|entry| entry.core.state == Standing::InFlight)
-            .map(|entry| {
-                entry.core.outcome.clone().unwrap_or_else(|| {
-                    let now = now_epoch_ms();
-                    Outcome::new(OutcomeStatus::Restarting, RunKind::Explicit, now, now)
-                })
-            })
-    }) else {
-        return;
-    };
-    let read = mesh.versions(hive, bounds.read).await;
+    let mut outcome = entry.core.outcome.clone().unwrap_or_else(|| {
+        let now = now_epoch_ms();
+        Outcome::new(OutcomeStatus::Restarting, RunKind::Background, now, now)
+    });
+    let read = updates
+        .read_versions(mesh, hive, Reader::Background, bounds)
+        .await;
     let now = now_epoch_ms();
     let past_bound = now.saturating_sub(outcome.started_at_ms) > bounds.settle.as_millis() as u64;
     let watch = read.as_ref().ok().map(|snapshot| {
@@ -2622,6 +3356,10 @@ pub(crate) async fn follow(
             outcome.previous_update.as_deref(),
         )
     });
+    let signature = read
+        .as_ref()
+        .ok()
+        .map(|snapshot| core_record_signature(snapshot.get("core").unwrap_or(&Value::Null)));
     outcome.at_ms = now;
     match watch {
         Some(CoreWatch::Settled) => {
@@ -2640,10 +3378,14 @@ pub(crate) async fn follow(
                 Some(outcome),
                 None,
             );
-            // The core is on the target: the config of the same run goes now.
+            // The core is on the target: the config of the same run goes now, while the motherbee
+            // still holds this target.
             let Ok(snapshot) = read else {
                 return;
             };
+            if !target_is_current(updates, mesh, id, target, bounds).await {
+                return;
+            }
             let known = updates.read(UpdatesFile::known_cores);
             let decision = decide(
                 HiveFacts {
@@ -2658,6 +3400,7 @@ pub(crate) async fn follow(
             );
             match &decision.config {
                 Step::Act | Step::AfterCore(_) => {
+                    claim.doing("applying its config");
                     config_update(updates, mesh, id, hive, target, by, bounds).await
                 }
                 Step::Excluded { .. } => {
@@ -2670,6 +3413,7 @@ pub(crate) async fn follow(
             outcome.status = OutcomeStatus::Error;
             outcome.error_code = Some(code.clone());
             outcome.detail = Some(detail);
+            outcome.record_seen = signature;
             let next = next_after(hive, Category::Core, target, Some(&code));
             updates.record(
                 id,
@@ -2681,12 +3425,31 @@ pub(crate) async fn follow(
                 Some(next),
             );
         }
-        Some(CoreWatch::Waiting { installed, open }) => {
+        Some(CoreWatch::Waiting {
+            installed,
+            open,
+            seen,
+        }) => {
             let first_installed = installed && outcome.installed_ms.is_none();
             if first_installed {
                 outcome.installed_ms = Some(outcome.elapsed_ms());
             }
-            if past_bound {
+            if past_bound && !seen {
+                outcome.status = OutcomeStatus::NotAnswered;
+                outcome.detail = Some(format!(
+                    "its /versions never showed the core update within {} s",
+                    bounds.settle.as_secs()
+                ));
+                updates.record(
+                    id,
+                    hive,
+                    Category::Core,
+                    Standing::Pending,
+                    Some("its core update never showed".to_string()),
+                    Some(outcome),
+                    Some(next_unanswered(hive, Category::Core, target)),
+                );
+            } else if past_bound {
                 outcome.status = OutcomeStatus::Error;
                 let (code, detail) = if installed {
                     (
@@ -2712,6 +3475,7 @@ pub(crate) async fn follow(
                 };
                 outcome.error_code = Some(code.to_string());
                 outcome.detail = Some(detail);
+                outcome.record_seen = signature;
                 let next = next_after(hive, Category::Core, target, Some(code));
                 updates.record(
                     id,
@@ -2753,7 +3517,6 @@ pub(crate) async fn follow(
                 bounds.settle.as_secs(),
                 read.err().unwrap_or_default()
             ));
-            let next = next_after(hive, Category::Core, target, None);
             updates.record(
                 id,
                 hive,
@@ -2761,7 +3524,7 @@ pub(crate) async fn follow(
                 Standing::Pending,
                 Some("it did not answer after its core update".to_string()),
                 Some(outcome),
-                Some(next),
+                Some(next_unanswered(hive, Category::Core, target)),
             );
         }
         // Not readable while its orchestrator restarts: looked at again.
@@ -2770,9 +3533,10 @@ pub(crate) async fn follow(
 }
 
 /// The automatic step (§6): a hive that did not answer an attempt of this update and now does gets
-/// the update finished, once per hive and target, by the same run as an explicit one's, never for
-/// an excluded hive (the decision leaves those alone). A cheap read of shared memory first: only a
-/// hive whose orchestrator is connected is asked.
+/// the update finished, once per hive and target, by the same pass as an explicit run's, never for
+/// an excluded hive (the decision leaves those alone), and never while the motherbee holds another
+/// target. A cheap read of shared memory first: only a hive whose orchestrator is connected is
+/// asked.
 pub(crate) async fn automatic_step(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -2784,12 +3548,57 @@ pub(crate) async fn automatic_step(
     if mesh.orchestrator_connected(hive) == Some(false) {
         return;
     }
-    let Some(_claim) = updates.claim(hive) else {
+    if !target_is_current(updates, mesh, id, target, bounds).await {
+        return;
+    }
+    let Some(claim) = updates.claim(hive, READING, id) else {
         return;
     };
-    let Ok(snapshot) = mesh.versions(hive, bounds.read).await else {
+    let Ok(snapshot) = updates
+        .read_versions(mesh, hive, Reader::Background, bounds)
+        .await
+    else {
         return;
     };
+    // A core update found under way (one SY.admin's restart or a TIMEOUT left without its answer,
+    // or the operator's own): followed, and the attempt is not spent on it.
+    let known = updates.read(UpdatesFile::known_cores);
+    let found = decide(
+        HiveFacts {
+            hive,
+            is_motherbee: hive == mesh.motherbee(),
+            snapshot: Some(&snapshot),
+        },
+        target,
+        RunKind::Automatic,
+        &[],
+        &known,
+    );
+    if matches!(found.core, Step::InFlight(_)) {
+        let now = now_epoch_ms();
+        tracing::info!(
+            update = %id,
+            hive = %hive,
+            "installation update: the hive answers again with its core update under way: followed, \
+             the automatic step kept for later"
+        );
+        updates.record(
+            id,
+            hive,
+            Category::Core,
+            Standing::InFlight,
+            Some("its core update is under way".to_string()),
+            Some(Outcome::new(
+                OutcomeStatus::Restarting,
+                RunKind::Background,
+                now,
+                now,
+            )),
+            None,
+        );
+        updates.look_now(hive);
+        return;
+    }
     // Once per hive and target: the attempt is recorded before it acts.
     let started = now_epoch_ms();
     let first = updates.change(|file| {
@@ -2815,9 +3624,9 @@ pub(crate) async fn automatic_step(
     tracing::info!(
         update = %id,
         hive = %hive,
-        "installation update: automatic step, the hive answers again: the update is finished for it \
-         (once)"
+        "installation update: automatic step, the hive answers again: deciding what it finishes"
     );
+    claim.doing("the automatic step");
     run_claimed_hive(
         updates,
         mesh,
@@ -2827,36 +3636,29 @@ pub(crate) async fn automatic_step(
         RunKind::Automatic,
         &[],
         Some(snapshot),
+        tokio::time::Instant::now(),
         bounds,
     )
     .await;
-    let finished = now_epoch_ms();
-    let result = updates.change(|file| {
-        let entry = file
-            .open_mut(id)
-            .and_then(|update| update.hives.get_mut(hive))?;
-        let result = format!(
-            "core {}, config {}",
-            entry.core.state.as_str(),
-            entry.config.state.as_str()
-        );
-        if let Some(attempt) = entry.automatic.as_mut() {
-            attempt.finished_at_ms = Some(finished);
-            attempt.result = Some(result.clone());
-        }
-        Some(result)
-    });
+    refresh_automatic_result(updates, id, hive);
+    let result = updates
+        .entry(id, hive)
+        .and_then(|entry| entry.automatic)
+        .and_then(|attempt| attempt.result);
     tracing::info!(
         update = %id,
         hive = %hive,
         result = %result.unwrap_or_else(|| "the update is no longer open".to_string()),
-        elapsed_ms = finished.saturating_sub(started),
-        "installation update: automatic step ended"
+        elapsed_ms = now_epoch_ms().saturating_sub(started),
+        "installation update: automatic step ended its pass"
     );
 }
 
 /// A hive not on the target, nothing in flight: read again, its states set as a run would decide
-/// them, nothing sent. An unreachable hive is read only when shared memory shows its orchestrator.
+/// them, nothing sent. A hive that did not answer, or was not read yet, is read only once shared
+/// memory shows its orchestrator (read anyway when shared memory cannot be read). A core it finds
+/// under way becomes in flight, for the follow; one that did not settle stays pending until its
+/// record changes.
 pub(crate) async fn recheck(
     updates: &Updates,
     mesh: &dyn UpdateMesh,
@@ -2864,22 +3666,18 @@ pub(crate) async fn recheck(
     hive: &str,
     target: &Target,
     bounds: &Bounds,
+    look: Look,
 ) {
-    let unknown = updates.read(|file| {
-        file.open
-            .as_ref()
-            .and_then(|update| update.hives.get(hive))
-            .is_some_and(|entry| {
-                entry.core.state == Standing::Unknown || entry.config.state == Standing::Unknown
-            })
-    });
-    if !unknown && mesh.orchestrator_connected(hive) == Some(false) {
+    if look == Look::AnswerCheck && mesh.orchestrator_connected(hive) == Some(false) {
         return;
     }
-    let Some(_claim) = updates.claim(hive) else {
+    let Some(_claim) = updates.claim(hive, READING, id) else {
         return;
     };
-    let Ok(snapshot) = mesh.versions(hive, bounds.read).await else {
+    let Ok(snapshot) = updates
+        .read_versions(mesh, hive, Reader::Background, bounds)
+        .await
+    else {
         return;
     };
     updates.set_role(id, hive, text_of(Some(&snapshot), "role"));
@@ -2895,20 +3693,14 @@ pub(crate) async fn recheck(
         &[],
         &known,
     );
+    let Some(entry) = updates.entry(id, hive) else {
+        return;
+    };
     for (category, step) in [
         (Category::Core, &decision.core),
         (Category::Config, &decision.config),
     ] {
-        let current = updates.read(|file| {
-            file.open
-                .as_ref()
-                .filter(|update| update.id == id)
-                .and_then(|update| update.hives.get(hive))
-                .map(|entry| entry.category(category).clone())
-        });
-        let Some(current) = current else {
-            return;
-        };
+        let current = entry.category(category);
         match step {
             // Left as it is, with its last outcome: what a run sent, or nothing yet.
             Step::Act | Step::AfterCore(_) => {
@@ -2935,6 +3727,9 @@ pub(crate) async fn recheck(
                 );
             }
             Step::InFlight(_) if category == Category::Core => {
+                if core_unchanged_since_not_settled(&entry, &snapshot) {
+                    continue;
+                }
                 let now = now_epoch_ms();
                 updates.record(
                     id,
@@ -2944,13 +3739,13 @@ pub(crate) async fn recheck(
                     Some("its core update is under way".to_string()),
                     Some(Outcome::new(
                         OutcomeStatus::Restarting,
-                        RunKind::Explicit,
+                        RunKind::Background,
                         now,
                         now,
                     )),
                     None,
                 );
-                updates.look_again(hive, Duration::ZERO);
+                updates.look_now(hive);
             }
             step => record_step(updates, id, hive, category, step),
         }
@@ -2966,6 +3761,8 @@ pub(crate) async fn recheck(
 pub(crate) enum RunEnd {
     /// No update was open, and every hive was on the target: nothing to do, nothing recorded.
     NothingToDo { target: Target, hives: Vec<String> },
+    /// The hive registry could not be read: nothing done.
+    RegistryUnreadable(String),
     /// The update it opened or resumed, as it stands at its answer.
     Update {
         update: Box<UpdateRecord>,
@@ -2989,11 +3786,15 @@ pub(crate) async fn run_explicit(
     bounds: &Bounds,
     within: Duration,
 ) -> RunEnd {
-    let (hives, skipped) = mesh.hives();
+    let (hives, skipped) = match mesh.hives() {
+        Ok(listed) => listed,
+        Err(why) => return RunEnd::RegistryUnreadable(why),
+    };
+    let answer_deadline = tokio::time::Instant::now() + bounds.answer;
     let motherbee_name = mesh.motherbee().to_string();
     // Every hive's /versions, once, at once: the motherbee's is in hand.
     let reads = futures::future::join_all(hives.iter().map(|hive| {
-        let mesh = Arc::clone(mesh);
+        let (updates, mesh) = (Arc::clone(updates), Arc::clone(mesh));
         let hive = hive.clone();
         let motherbee_name = motherbee_name.clone();
         let motherbee = motherbee.clone();
@@ -3001,7 +3802,10 @@ pub(crate) async fn run_explicit(
             if hive == motherbee_name {
                 return Some(motherbee);
             }
-            mesh.versions(&hive, bounds.read).await.ok()
+            updates
+                .read_versions(mesh.as_ref(), &hive, Reader::Run, bounds)
+                .await
+                .ok()
         }
     }))
     .await;
@@ -3033,6 +3837,7 @@ pub(crate) async fn run_explicit(
         file.refresh_hives(&opened.0, &hives, skipped);
         opened
     });
+    updates.note_run_update(&id);
     match &opening {
         Opening::Opened => tracing::info!(
             update = %id,
@@ -3074,9 +3879,9 @@ pub(crate) async fn run_explicit(
                     &id,
                     &hive,
                     &target,
-                    RunKind::Explicit,
                     &include,
                     first,
+                    answer_deadline,
                     &bounds,
                 )
                 .await;
@@ -3084,7 +3889,7 @@ pub(crate) async fn run_explicit(
         })
         .collect();
     let _ = tokio::time::timeout(within, futures::future::join_all(tasks)).await;
-    updates.close_if_done();
+    updates.settle_state();
     let update = updates.read(|file| {
         file.open
             .iter()
@@ -3173,10 +3978,33 @@ pub(crate) fn parse_history_flag(params: &Value) -> Result<bool, String> {
     }
 }
 
+/// A second explicit run's refusal: the one under way, and since when.
+pub(crate) fn run_under_way(action: &str, running: &Running) -> (u16, String) {
+    super::installation_refusal(
+        action,
+        "INSTALLATION_UPDATE_RUNNING",
+        format!(
+            "an installation update run is under way ({}, update {}), for {} s: one at a time. Read \
+             get_installation_update, and run it again once that one answered",
+            running.origin,
+            running.update.as_deref().unwrap_or("not opened yet"),
+            now_epoch_ms().saturating_sub(running.since_ms) / 1000
+        ),
+        json!({
+            "running": {
+                "origin": running.origin,
+                "since_ms": running.since_ms,
+                "update": running.update,
+            }
+        }),
+    )
+}
+
 /// `update_installation` (§6, "As built (stage 4)"), the operator's word: the update to what the
 /// motherbee holds now, opened or resumed, and one pass over the hives not on it, in parallel and
-/// bounded. `ok` (200) when every hive is on the target, `partial` (202) while the update stays open;
-/// a core restarting is a fine answer, which the background task follows to its settle.
+/// bounded. `ok` (200) when every hive is on the target, or held by the operator's rollbacks
+/// (`held`); `partial` (202) while the update stays open. A core restarting is a fine answer,
+/// which the background task follows to its settle. One explicit run at a time.
 pub(crate) async fn handle_update_installation(
     ctx: &AdminContext,
     client: &RouterDispatcher,
@@ -3191,8 +4019,15 @@ pub(crate) async fn handle_update_installation(
             return super::installation_refusal(action, "INVALID_REQUEST", detail, Value::Null)
         }
     };
+    let run = match ctx.installation_update.start_run(origin) {
+        Ok(run) => run,
+        Err(running) => return run_under_way(action, &running),
+    };
     let mesh = LiveMesh::of(ctx);
-    let (hives, _) = mesh.hives();
+    let hives = match mesh.hives() {
+        Ok((hives, _)) => hives,
+        Err(why) => return registry_unreadable(action, &why),
+    };
     if let Some(stranger) = request
         .include_rolled_back
         .iter()
@@ -3220,6 +4055,20 @@ pub(crate) async fn handle_update_installation(
             )
         }
     };
+    // A mesh core_rollback on the motherbee itself: its installed hash and its dist's version
+    // disagree, so it names no target to bring the hives to.
+    if motherbee_rolled_back(&motherbee) {
+        return super::installation_refusal(
+            action,
+            "MOTHERBEE_ROLLED_BACK",
+            "the motherbee's own core is rolled back (core.installed.source core_rollback): the \
+             release it runs and its dist's disagree, so it names no target. Install a release on \
+             the motherbee first (apt-get install fluxbee=<version>), then run the update; nothing \
+             was changed"
+                .to_string(),
+            Value::Null,
+        );
+    }
     let target = target_of(&motherbee);
     if target.core.is_none() {
         return super::installation_refusal(
@@ -3245,7 +4094,20 @@ pub(crate) async fn handle_update_installation(
         within,
     )
     .await;
+    drop(run);
     run_answer(action, end, &request, started.elapsed())
+}
+
+fn registry_unreadable(action: &str, why: &str) -> (u16, String) {
+    super::installation_refusal(
+        action,
+        "HIVE_REGISTRY_UNREADABLE",
+        format!(
+            "{why}: the hives an update reaches cannot be named, and nothing was changed; retry \
+             once it can be read"
+        ),
+        Value::Null,
+    )
 }
 
 /// An explicit run's answer.
@@ -3257,6 +4119,7 @@ fn run_answer(
 ) -> (u16, String) {
     let elapsed_ms = elapsed.as_millis() as u64;
     match end {
+        RunEnd::RegistryUnreadable(why) => registry_unreadable(action, &why),
         RunEnd::NothingToDo { target, hives } => super::installation_answer(
             action,
             200,
@@ -3284,26 +4147,41 @@ fn run_answer(
                 "include_rolled_back": request.include_rolled_back,
                 "elapsed_ms": elapsed_ms,
             });
-            if update.state == UpdateState::Done {
-                payload["message"] = json!(format!(
-                    "every hive is on the target ({}): update {} is done",
-                    update.target.describe(),
-                    update.id
-                ));
-                return super::installation_answer(action, 200, "ok", payload, None);
+            match update.state {
+                UpdateState::Done => {
+                    payload["message"] = json!(format!(
+                        "every hive is on the target ({}): update {} is done",
+                        update.target.describe(),
+                        update.id
+                    ));
+                    return super::installation_answer(action, 200, "ok", payload, None);
+                }
+                UpdateState::Held => {
+                    let held = update.held_hives().unwrap_or_default();
+                    payload["message"] = json!(format!(
+                        "every hive is on the target ({}) but {}, which the operator rolled back \
+                         (core_rollback, the one allowed divergence; their config is on the \
+                         target): update {} is held. Each one's per-hive update closes it",
+                        update.target.describe(),
+                        held.join(", "),
+                        update.id
+                    ));
+                    payload["held"] = json!(held);
+                    return super::installation_answer(action, 200, "ok", payload, None);
+                }
+                UpdateState::Superseded => {
+                    payload["message"] = json!(format!(
+                        "update {} was superseded by {} (another target) while it ran: GET \
+                         /installation/update follows that one",
+                        update.id,
+                        update.superseded_by.as_deref().unwrap_or("another update")
+                    ));
+                    payload["pending"] = json!(pending_of(&update));
+                    return super::installation_answer(action, 202, "partial", payload, None);
+                }
+                UpdateState::Open => {}
             }
             let pending = pending_of(&update);
-            // A run with another target (a set_installation_ai) closed it while this one ran.
-            if update.state == UpdateState::Superseded {
-                payload["message"] = json!(format!(
-                    "update {} was superseded by {} (another target) while it ran: GET \
-                     /installation/update follows that one",
-                    update.id,
-                    update.superseded_by.as_deref().unwrap_or("another update")
-                ));
-                payload["pending"] = json!(pending);
-                return super::installation_answer(action, 202, "partial", payload, None);
-            }
             payload["message"] = json!(format!(
                 "update {} is open: not every hive is on the target ({}) yet: {}. A core restarting \
                  is followed to its settle, and its config goes after it; a hive that did not answer \
@@ -3319,17 +4197,22 @@ fn run_answer(
     }
 }
 
-/// `get_installation_update`: a read of SY.admin's own state, so not in the audit log.
+/// `get_installation_update`: a read of SY.admin's own state, so not in the audit log. The hives off
+/// the target the background task has not looked at lately are looked at at once.
 pub(crate) fn handle_get_installation_update(ctx: &AdminContext, params: &Value) -> (u16, String) {
     let action = "get_installation_update";
     match parse_history_flag(params) {
-        Ok(history) => super::installation_answer(
-            action,
-            200,
-            "ok",
-            ctx.installation_update.view(history),
-            None,
-        ),
+        Ok(history) => {
+            ctx.installation_update
+                .look_soon_all(Bounds::from_env().retry_check);
+            super::installation_answer(
+                action,
+                200,
+                "ok",
+                ctx.installation_update.view(history),
+                None,
+            )
+        }
         Err(detail) => super::installation_refusal(action, "INVALID_REQUEST", detail, Value::Null),
     }
 }
@@ -3337,10 +4220,22 @@ pub(crate) fn handle_get_installation_update(ctx: &AdminContext, params: &Value)
 /// `set_installation_ai`'s update (§4, step 3): the target its write made, opened (a run with
 /// another target), with the motherbee's core on it, the reference. Its explicit pass is the
 /// stage 3c apply, each hive's outcome recorded with [`record_config_applied`]; the background
-/// task reads the other hives' cores. Its id.
-pub(crate) fn open_for_installation_change(ctx: &AdminContext, target: &Target) -> String {
+/// task reads the other hives' cores. Its id; why none was opened, when the hive registry cannot
+/// be read or the motherbee's own core is rolled back.
+pub(crate) fn open_for_installation_change(
+    ctx: &AdminContext,
+    motherbee: &Value,
+    target: &Target,
+) -> Result<String, String> {
+    if motherbee_rolled_back(motherbee) {
+        return Err(
+            "the motherbee's own core is rolled back (core_rollback), so it names no core target: \
+             install a release on the motherbee, then update_installation"
+                .to_string(),
+        );
+    }
     let updates = &ctx.installation_update;
-    let (hives, skipped) = LiveMesh::of(ctx).hives();
+    let (hives, skipped) = LiveMesh::of(ctx).hives()?;
     let now = now_epoch_ms();
     let (id, opening) = updates.change(|file| {
         let opened = file.open_or_resume(target, "set_installation_ai", None, now);
@@ -3360,6 +4255,7 @@ pub(crate) fn open_for_installation_change(ctx: &AdminContext, target: &Target) 
             "installation update: opened by set_installation_ai"
         ),
     }
+    updates.note_run_update(&id);
     updates.record(
         &id,
         &ctx.hive_id,
@@ -3370,11 +4266,12 @@ pub(crate) fn open_for_installation_change(ctx: &AdminContext, target: &Target) 
         None,
     );
     updates.wake();
-    id
+    Ok(id)
 }
 
 /// `/versions` (`list_versions`, `get_versions`) as SY.admin answers it: with the installation's
-/// update, its id, state, target and each hive's state.
+/// update, its id, state, target and each hive's state; the hives off the target the background
+/// task has not looked at lately are looked at at once.
 pub(crate) fn with_update_summary(
     updates: &Updates,
     action: &str,
@@ -3383,12 +4280,22 @@ pub(crate) fn with_update_summary(
     if !matches!(action, "list_versions" | "get_versions") {
         return response;
     }
+    updates.look_soon_all(Bounds::from_env().retry_check);
     response.map(|mut payload| {
         if payload.is_object() && super::payload_is_ok(&payload) {
             payload["installation_update"] = updates.summary();
         }
         payload
     })
+}
+
+/// The hives whose states move the open update: an immediate look at `hive` after SY.admin ran a
+/// per-hive action on it (`update`, `core_rollback`) or a join or a removal, which never blocks.
+pub(crate) fn look_after_action(updates: &Updates, hive: Option<&str>) {
+    match hive.map(str::trim).filter(|hive| !hive.is_empty()) {
+        Some(hive) => updates.look_now(hive),
+        None => updates.wake(),
+    }
 }
 
 #[cfg(test)]
