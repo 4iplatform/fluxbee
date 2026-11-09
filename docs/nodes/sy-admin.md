@@ -143,6 +143,79 @@ Five commands exist only over the mesh and are not in the catalog: `externalize`
 `unexternalize`, `list_externalized` (the operator reaches them through `/channels/*`),
 `executor_validate_plan` and `executor_execute_plan` (`dispatch_internal_admin_command`).
 
+### Replies that do not fit a frame
+
+The SDK refuses a mesh frame over 128 KiB (`MAX_FRAME_SIZE`) before it sends it. Before 0.1.123
+the caller then waited to its own timeout, with no reason (FINDINGS A-198). Now:
+
+- **Every reply is answered.** When the send of an `ADMIN_COMMAND_RESPONSE` fails with
+  `MessageTooLarge`, SY.admin sends `REPLY_TOO_LARGE` in its place and logs it once, with the
+  action, the caller and the size (`send_admin_command_response`, `reply_too_large_message`). The
+  envelope is `status: "error"`, `error_code: "REPLY_TOO_LARGE"` (HTTP status 413), and an
+  `error_detail` object:
+  - `message`, `action`, `size` (the reply's bytes) and `max` (the frame's);
+  - `paging` for an action that pages (`admin_action_paging`): its `params`, the field that names
+    the next page (`next`) and the field of its rows (`rows`), with `suggested_limit`, about how
+    many rows fit half a frame at the size the reply's rows had;
+  - `http`, for a read that does not page: its route, since HTTP on the motherbee has no frame;
+  - `outcome`: the action's own `status` and `error_code`, and the ids its payload named
+    (`request_id`, `execution_id`, `ilk_id`, `tenant_id`, `node_name`, `hive_id`, `key`,
+    `version`, ...; `mesh_reply::reply_outcome`).
+- **An action that changed something says it ran.** For an action the registry does not mark
+  `read_only`, and the mesh-only `executor_execute_plan`, `externalize` and `unexternalize`
+  (`admin_reply_reports_a_change`), `error_detail.action_ran` is `true`, `read_only` is `false`,
+  the message says it ran and must not be run again to see its answer, and the reply's
+  `meta.action_result` is the action's own (`applied` for an `ok`).
+- **The nodes behind SY.admin answer the same way.** SY.identity, SY.orchestrator and SY.vault
+  send `REPLY_TOO_LARGE` in place of an answer the frame refuses, in their own payload shape
+  (`status`, `error_code`, `message`, `size`, `max`, `outcome`), and SY.admin passes it on at once
+  with that code (`mesh_reply::reply_too_large_payload`). Their listings come in pages, so the
+  hop between them and SY.admin stays within the frame (below).
+- `CONFIG_GET` and `CONFIG_SET` answers, the executor's config, have a fixed shape well under a
+  frame and are sent as they are.
+
+### Pages
+
+The listings that grow with the installation answer in pages. Each page names where the next one
+starts, and `total` says how many rows there are in all:
+
+| Action | Ask a page with | Next page | Rows | Order |
+| --- | --- | --- | --- | --- |
+| `list_ilks`, `list_tenants` | `limit`, `cursor` | `next_cursor` | `ilks`, `tenants` | by id |
+| `list_nodes` | `limit`, `cursor` | `next_cursor` | `nodes` | by name |
+| `inventory` (`global`, `hive`) | `limit`, `cursor` | `next_cursor` | `nodes` | by hive, then name |
+| `list_versions` | `limit`, `cursor` | `next_cursor` | `hives` | the motherbee, then the others by id |
+| `list_recent_commands` | `limit`, `cursor` | `next_cursor` | `commands` | newest first |
+| `vault_list` | `filter.limit`, `cursor` | `next_cursor` | `secrets` | newest write first |
+| `get_installation`, `get_versions`, `list_versions` | `versions_limit`, `versions_before` | `versions_next_before` | `versions` | oldest first, the newest 20 |
+| `get_llm_usage` | `limit`, `after` | `next` | `records`, `groups` | SY.storage's, under 64 KiB a page |
+| `timer_list` | `limit`, `cursor` | `next_cursor` | `timers` | by fire time |
+
+- **No caller's default changed.** Without a `limit` a listing answers every row, as before;
+  `vault_list` answers its filter's limit (200 without one, at most 1000), as before. Over HTTP
+  the query parameters are the same names (`?limit=&cursor=`, `?versions_limit=&versions_before=`).
+  A caller whose answer outgrows the frame gets `REPLY_TOO_LARGE` with the params to page and
+  `suggested_limit`: it asks again with that limit and follows the next page until the answer
+  names none.
+- **The one exception is the installation's version history.** The motherbee's `config.versions`
+  in `/versions` and `get_installation`'s `versions` list the newest 20 versions recorded, oldest
+  first, with `versions_total` and, while older ones remain, `versions_next_before`: pass it as
+  `versions_before` (and `versions_limit`, 1 to 100) to list them. The newest version is always on
+  the default page, which is all `set_installation_ai` reads.
+- **SY.admin pages the hops behind it** (`assemble_list_pages`). SY.identity (`ILK_LIST`,
+  `TNT_LIST`), SY.orchestrator (`list_nodes`, `INVENTORY_REQUEST`, `list_versions`) and SY.vault
+  (`VAULT_LIST`) answer a page within a frame: half a frame of rows (`LIST_PAGE_MAX_BYTES`, 64
+  KiB), and for SY.vault 96 KiB, since other nodes read it without pages. SY.admin asks page after
+  page and assembles them into the answer its caller asked for: every row without a `limit`, at
+  most `limit` rows with one, and the source's `next_cursor` while rows follow. A source older
+  than the pages answers every row at once and names no next page, which ends the listing.
+  `list_versions`' pages each compare their hives with the motherbee's snapshot, and SY.admin
+  joins them (`merge_versions_comparisons`): the hives' verdicts add up and the worst wins
+  (`differs`, then `unknown`, then `match`).
+- **Cursors are opaque.** Pass `next_cursor` back as it came. A cursor names a place in the order,
+  not a row, so a row removed since keeps the place, and a row added before it does not move the
+  next page. A secret written while its caller pages moves to the front of `vault_list`'s order.
+
 ## Who may call what
 
 Every command reaches `dispatch_internal_admin_command` with its origin (`AdminOrigin`): the HTTP
@@ -524,15 +597,18 @@ model, one version on every hive; the motherbee's orchestrator is its only write
 (`InternalActionRoute::Installation`), and `update` takes category `config` for one hive.
 
 **`GET /installation` (`get_installation`)**, a read, not in the command log; Archi may ask for it
-over the mesh. It takes no parameter. SY.admin reads the motherbee's `/versions` (`list_versions`)
-and answers its view (`installation_view`):
+over the mesh. It takes only `versions_limit` and `versions_before` (`?versions_limit=&versions_before=`
+over HTTP). SY.admin reads the motherbee's `/versions` (`list_versions`, in pages of hives) and
+answers its view (`installation_view`):
 
 - `motherbee`: its file, `file`, `version`, `sha256`, `state`, `ai` (the values its readers run
   on), and `not_written` when its start wrote none;
 - `expected_version`: the version a change names, the file's, or the last one recorded for a file
   no reader can use (`installation_expected_version`); null while the motherbee holds no file;
-- `versions`: every version recorded, `{version, sha256, written_at_ms, source, ai}`, `source`
-  being `migration` (version 1) or `operator`;
+- `versions`: the newest 20 versions recorded, oldest first, `{version, sha256, written_at_ms,
+  source, ai}`, `source` being `migration` (version 1) or `operator`. `versions_total` counts every
+  version recorded, and `versions_next_before`, while older ones remain, is the `versions_before`
+  that lists them; `versions_limit` (1 to 100) asks another count (FINDINGS A-198, [Pages](#pages));
 - `hives`: each hive's copy, `{state, version, sha256, applied}`, `applied` being the config update
   it applied last (`{version, sha256, applied_at_ms, ai, restarted}`, null before its first). A
   hive whose `/versions` failed is `unknown`, with the error; one on an orchestrator older than
@@ -876,6 +952,23 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`. Of an
   `unpublish_artifact` step it keeps the args as the command log does, a link's key only as
   `key_sha256` (`executor_log_step_args`).
+- **Over the mesh the result always arrives** (FINDINGS A-198). The plan has run when its answer
+  is sent: a `REPLY_TOO_LARGE` in its place would leave Archi blind, and Archi could run the plan
+  again. So each step's output (`result_preview`) and the args the answer echoes
+  (`tool_args_preview`) are cut to a share of 72 KiB for all of them together, never under 512
+  bytes each (`bound_executor_answer_for_mesh`, `mesh_reply::bounded_value`):
+  - every event keeps its status and its fields; a value past its share keeps its shape, its small
+    fields whole (a status, an id, a short list: a deploy's `wf_node`, a change's `version` and
+    `pending`, which Archi reads), its large ones cut, a long text with how many bytes it lost and
+    a long list with `{"truncated_items": n}`;
+  - an event that was cut says so: `output_truncated` with `output_bytes`, `args_truncated` with
+    `args_bytes`, the sizes before. An error text past 2 KiB is cut too;
+  - when anything was cut, `outputs_bounded` gives the share (`max_bytes_each`) and `full_log`,
+    the run log above (`summary.log_path`), which keeps every output whole, secrets redacted. No
+    action reads it back: it is read on the motherbee.
+  - The generic guard stays the last resort: a plan of hundreds of steps whose events alone pass
+    the frame answers `REPLY_TOO_LARGE`, with `action_ran` and its `outcome` (`status`,
+    `execution_id`).
 - **Model and key**: provider and model from the hive's `ai` settings (`hive_ai_settings`): the
   installation file once the hive holds one, hive.yaml's `ai` while it holds none (the fallback
   provider without either); CONFIG_GET's `config.ai.source` says which, with the file's version
@@ -1290,7 +1383,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
 | `list_versions` | `GET /versions` | List core and runtime versions across hives, and each hive's installation file. |
 | `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive, and its installation file. |
-| `get_installation` | `GET /installation` | Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), every version recorded with its values, and each hive's copy with the config update it applied last. |
+| `get_installation` | `GET /installation` | Read the installation file: the motherbee's (its version, hash, state and ai: the default provider and each provider's model), the versions recorded with their values (the newest 20 unless asked), and each hive's copy with the config update it applied last. |
 | `set_installation_ai` | `PUT /installation/ai` | Change the installation's ai (the default provider and each provider's model) on every hive: the motherbee's orchestrator writes the next version of the installation file, and each hive restarts only the readers whose engine changed. Closed to the mesh, confirmed by the operator ([The installation's ai](#the-installations-ai)). |
 | `update_installation` | `POST /installation/update` | Bring every hive to what the motherbee holds, its core and its installation file: one update at a time, kept on disk and resumed after SY.admin restarts. Closed to the mesh, confirmed by the operator ([The installation's update](#the-installations-update)). |
 | `get_installation_update` | `GET /installation/update` | Read the installation's update: the current or last one, its target, and each hive's state, last outcome and next step; with history, the closed ones. |

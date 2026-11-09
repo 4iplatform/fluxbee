@@ -1068,7 +1068,10 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
 - **Read it** with `get_installation` (`GET /installation`, a read):
   - `motherbee.ai`, the values now, and `motherbee.state`;
   - `expected_version`, the version a change names;
-  - `versions`, every version with its values and its `source` (`migration`, `operator`);
+  - `versions`, the newest 20 versions with their values and their `source` (`migration`,
+    `operator`), oldest first; `versions_total` says how many there are, and while older ones
+    remain `versions_next_before` is what lists them: `GET /installation?versions_before=<it>`
+    (`versions_limit`, 1 to 100, asks another count);
   - `hives`, each hive's copy: `state` (`current`, `behind`, `pending`, `edited_by_hand`,
     `unknown`), `version`, and `applied`, the version it applied last and what it restarted.
 
@@ -1648,6 +1651,33 @@ Before asking "which tenant?", try these reads first when applicable:
 - `get_node_config` or `node_control_config_get` on an existing tenant-scoped node
 - `list_tenants`
 - `get_tenant`
+
+### 10.1.1 Long lists come in pages
+
+An answer reaches you in one mesh frame, at most 128 KiB. The lists that grow with the
+installation answer in pages:
+
+- **Which**: `/inventory`, `/inventory/{hive}`, `/hives/{hive}/nodes`, `/versions` (a page of hives),
+  `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants` and
+  `/hives/{hive}/vault/secrets` take `?limit=&cursor=`. `list_recent_commands` takes `limit` and
+  `cursor` too.
+- **How**: read without them first; you get every row, as always. When an answer has
+  `next_cursor`, more rows follow: read the same path again with `?cursor=<next_cursor>` (and the
+  same `limit`), until an answer has none. `total` says how many rows there are in all. Pass the
+  cursor exactly as it came.
+- **`REPLY_TOO_LARGE`** means the answer did not fit one frame, so SY.admin sent this small error
+  in its place. It is not a failure of the system and nothing is wrong with the data:
+  - for a list, `error_detail.paging` names the params and `error_detail.suggested_limit` how
+    many rows fit: read it again with `?limit=<suggested_limit>` and follow `next_cursor`;
+  - for another read, say so to the operator: the answer is readable over HTTP on the motherbee
+    (`error_detail.http`);
+  - for a change, `error_detail.action_ran` is `true` and `error_detail.outcome` holds its status
+    and ids: the change ran. Never run it again to see its answer; read what it changed back.
+- **The installation's versions**: `/installation` and `/hives/{hive}/versions` list the newest 20;
+  `?versions_before=<versions_next_before>` lists older ones.
+- **A plan's answer** always arrives. When a step's output was too large for the frame it is cut,
+  and its event says `output_truncated`, with `output_bytes`, its size before; its status and its
+  small fields are whole. Read what a step changed back with the read that shows it.
 
 ### 10.2 Prefer existing platform primitives
 

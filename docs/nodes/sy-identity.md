@@ -217,6 +217,17 @@ request gets `UNAUTHORIZED_REGISTRAR`.
   (`identity_command_hive`).
 - `VAULT_SECRET_CHANGED` is handled before the table (see Failure behavior). `NODE_STATUS_GET` is
   answered by the SDK default handler.
+- **`ILK_LIST` and `TNT_LIST` answer in pages** (FINDINGS A-198). Asked with `limit` or `cursor`,
+  they answer the ILKs (tenants) after `cursor` in the order of their ids, at most `limit` and at
+  most half a mesh frame of rows (`mesh_reply::LIST_PAGE_MAX_BYTES`, 64 KiB), with `next_cursor`,
+  the id of the page's last row, while rows follow, and `total`, how many match in all. Asked with
+  neither, they answer every row, as before (`list_ilks_payload`, `list_tenants_payload`). A
+  limit that is not a whole number from 1, or a cursor that is not a string, answers
+  `INVALID_REQUEST`. SY.admin always asks in pages and assembles them
+  ([SY.admin](sy-admin.md#pages)).
+- **An answer too large for one frame** goes as `REPLY_TOO_LARGE` in its place, with the answer's
+  `size`, the frame's `max`, and its `outcome` (status, error code, ids), so the caller learns why
+  at once and a write's deltas still go out (`send_system_response`).
 
 The callers in the code: IO nodes provision against `SY.identity@motherbee`
 (`nodes/io/common/src/provision.rs`); the orchestrator registers the ILK of each node it
@@ -301,14 +312,14 @@ On the motherbee (`127.0.0.1:8080`), sent to `SY.identity@<hive in the URL>`:
 
 | Route | Message |
 | --- | --- |
-| `GET /hives/{hive}/identity/ilks?include_deleted=&pending_signup=` | `ILK_LIST` |
+| `GET /hives/{hive}/identity/ilks?include_deleted=&pending_signup=&limit=&cursor=` | `ILK_LIST`, in pages |
 | `GET /hives/{hive}/identity/ilks/{ilk_id}` | `ILK_GET` |
 | `POST /hives/{hive}/identity/ilks/{ilk_id}/definition` | `ILK_SET_DEFINITION` |
 | `DELETE /hives/{hive}/identity/ilks/{ilk_id}` | `ILK_DELETE` |
 | `POST /hives/{hive}/identity/ilks/{ilk_id}/restore` | `ILK_RESTORE` |
 | `POST /hives/{hive}/identity/ilks/{ilk_id}/purge` | `ILK_PURGE` |
 | `PUT /hives/{hive}/identity/ilks/{ilk_id}/tenant` | `ILK_SET_TENANT` |
-| `GET /hives/{hive}/identity/tenants?include_deleted=` | `TNT_LIST` |
+| `GET /hives/{hive}/identity/tenants?include_deleted=&limit=&cursor=` | `TNT_LIST`, in pages |
 | `POST /hives/{hive}/identity/tenants` | `TNT_CREATE` |
 | `GET` / `PUT /hives/{hive}/identity/tenants/{tenant_id}` | `TNT_GET` / `TNT_UPDATE` |
 | `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor` | `TNT_SET_SPONSOR` |

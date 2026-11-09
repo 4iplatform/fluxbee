@@ -477,8 +477,9 @@ motherbee's orchestrator ([hive-config-update-v1](../hive-config-update-v1.md) Â
 first version. On the motherbee:
 
 1. **Read it**: `curl -s http://127.0.0.1:8080/installation` (`get_installation`): `motherbee.ai`,
-   `expected_version`, every version recorded with its values (`versions`), and each hive's copy
-   (`hives`).
+   `expected_version`, the newest 20 versions recorded with their values (`versions`, with
+   `versions_total`; `?versions_before=<versions_next_before>` lists older ones), and each hive's
+   copy (`hives`).
 2. **Change it** with the whole new `ai` and the version you read, or ask Archi, which stages it as
    a plan you confirm:
 
@@ -823,6 +824,28 @@ web        host=archi.hive-k3m9x7q2.fluxbee.ai route=acknowledged upstream=ready
   runs only once the operator starts it, and the edge answers again within a minute of a restart.
 
 `lab/ops.py versions` and `lab/ops.py opa-status` print the version and policy view per hive.
+
+### Long lists and the mesh frame
+
+Over HTTP on the motherbee an answer has no size limit. Over the mesh (Archi, IO.cloud, any
+node's `ADMIN_COMMAND`) an answer is one frame, at most 128 KiB (FINDINGS A-198):
+
+- **A list that grows with the installation answers in pages** when asked to: `/inventory`,
+  `/inventory/{hive}`, `/hives/{hive}/status`, `/hives/{hive}/nodes`, `/versions` (a page of
+  hives), `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`, `/hives/{hive}/commands`
+  and `/hives/{hive}/vault/secrets` take `?limit=&cursor=`. The answer has `next_cursor` while
+  rows follow (pass it back as `cursor`) and `total`. Without `limit` every row comes, as before
+  (`vault_list`: its `limit`, 200 by default). The installation's versions in `/installation` and
+  `/hives/motherbee/versions` are the newest 20 (`versions_total`;
+  `?versions_before=<versions_next_before>` lists older ones).
+- **An answer past the frame is never lost**: the caller gets `REPLY_TOO_LARGE` at once, with
+  the answer's size, how to page it and how many rows fit (`error_detail.suggested_limit`), or,
+  for a change, that it ran and its outcome. The node that sent it logs `a mesh reply does not
+  fit one frame: REPLY_TOO_LARGE sent in its place` (SY.admin), or the same of an identity,
+  vault or orchestrator answer, with the action, the caller and the size; the SDK also logs
+  `FRAME_TOO_LARGE`. An executor plan's answer always arrives, each step's output cut to fit
+  (`output_truncated`); its full log is on the motherbee
+  ([SY.admin](../nodes/sy-admin.md#replies-that-do-not-fit-a-frame)).
 
 ## Links
 

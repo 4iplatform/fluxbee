@@ -167,6 +167,24 @@ return body.result;
 
 The service codes of each op are in §5.
 
+### 4.4 An answer too large for one frame: `REPLY_TOO_LARGE`
+
+The hive's answer reaches IO.cloud in one mesh frame, at most 128 KiB. When an answer does not
+fit, the hive sends `error_code: "REPLY_TOO_LARGE"` in its place (HTTP 200, like every hive
+error), at once, never a silent timeout. Its `error_detail` is an object:
+
+| field | what |
+|---|---|
+| `message`, `action` | what was too large |
+| `size`, `max` | the answer's bytes and the frame's |
+| `paging` | for a list: the params to page (`params`) and the field naming the next page (`next`) |
+| `suggested_limit` | for a list: about how many rows fit half a frame |
+| `outcome` | the action's own `status`, `error_code` and ids |
+| `action_ran` | `true` for an action that changed something: **it ran**; read its effect back, never send it again to see its answer |
+
+For `list_tenants` and `list_tokens`, send the op again with `params.limit` set to
+`suggested_limit` and follow `next_cursor`. `get_usage` pages already (§5.5).
+
 ---
 
 ## 5. Operations
@@ -284,10 +302,19 @@ A refused update changes nothing. Keeping the tenant's current name or domain is
 
 #### `list_tenants`
 
-No tenant, no params. Every tenant but the genesis one, deleted ones included (with
-`deleted_at_ms`, so you can restore them): `result: {"status":"ok","count":2,"tenants":[{tenant_id,
+No tenant. Every tenant but the genesis one, deleted ones included (with
+`deleted_at_ms`, so you can restore them): `result: {"status":"ok","count":2,"total":2,"tenants":[{tenant_id,
 name, domain, status, settings, sponsor_tenant_id, child_count, ilk_count, people_count, node_count,
-is_root, is_sponsor, deleted_at_ms}, …]}`.
+is_root, is_sponsor, deleted_at_ms}, …]}`, in the order of their ids.
+
+| field | | |
+|---|---|---|
+| `params.limit` | optional | at most this many tenants (from 1); without it, every one, as before |
+| `params.cursor` | optional | the `next_cursor` of the page before |
+
+With `limit`, `result.next_cursor` is there while more tenants follow: send the same op with
+`params.cursor` set to it, until a page has none. `total` is how many there are in all. See
+§4.4 for an answer too large for one frame.
 
 #### `delete_tenant` / `restore_tenant`
 
@@ -510,6 +537,12 @@ while the hive cannot tell (its identity registry still loading), they keep what
 | `params.resource_type` | optional | exact, in its normalized form |
 | `params.prefix` | optional | key prefix |
 | `params.limit` | optional | 1–1000; the vault's default is 200 |
+| `params.cursor` | optional | the `next_cursor` of the page before |
+
+The newest-written credentials come first. While more follow, `result.next_cursor` is there:
+send the same op with `params.cursor` set to it (and the same filter) until a page has none.
+`result.total` is how many credentials the filter matches. A page also stays within one mesh
+frame, so it can hold fewer than `limit` with a `next_cursor`.
 
 **Never the value.** `result` is the vault's reply:
 
@@ -862,6 +895,14 @@ post '{"op":"list_cloud_actions"}'
 ---
 
 ## 9. What changed for Cloud
+
+### 0.1.123
+
+- **New error code `REPLY_TOO_LARGE`** (§4.4): an answer too large for one mesh frame comes back
+  as this error at once, with how to page it, instead of a timeout (`ADMIN_UNAVAILABLE`).
+- **Pages** for `list_tenants` (`params.limit`, `params.cursor`, §5.1) and `list_tokens`
+  (`params.cursor`, §5.3): `next_cursor` while more follow, and `total`. Without them every answer
+  is what it was.
 
 ### 0.1.79
 

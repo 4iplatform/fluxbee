@@ -128,6 +128,16 @@ conversions. Anything else is refused with "stage it with fluxbee_plan_compiler"
 forms cannot be reached through it. The sub-agents' `query_hive` tool accepts only the read
 actions in `PROGRAMMER_QUERY_ALLOWED_ACTIONS`.
 
+**Pages** (FINDINGS A-198): the reads of lists that grow with the installation take
+`?limit=&cursor=` (`/inventory`, `/inventory/{hive}`, `/hives/{hive}/status`,
+`/hives/{hive}/nodes`, `/versions`, `/hives/{hive}/identity/ilks`, `/hives/{hive}/identity/tenants`,
+and `cursor` beside the filter of `/hives/{hive}/vault/secrets`), and the installation's
+versions `?versions_limit=&versions_before=` (`/installation`, `/versions`,
+`/hives/{hive}/versions`); `translate_scmd` passes them to SY.admin, the numbers as numbers
+(`scmd_page_params`, `scmd_vault_list_params`). The path's description tells the model to follow
+`next_cursor`, and on `REPLY_TOO_LARGE` to ask again with `error_detail.suggested_limit`
+([SY.admin](sy-admin.md#pages)).
+
 **What an agent can do**: the base tools every AI agent has ([agent-tools-v1](../agent-tools-v1.md)
 T4). Their catalog is first `GET /hives/motherbee/runtimes/ai.generic` → `get_runtime`, whose
 `tool_catalog` the installed version ships, with no AI node running; a running AI node answers the

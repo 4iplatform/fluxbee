@@ -625,8 +625,11 @@ the hive holds no file).
   with). Its own `state` is `current` while its file's hash is its version's recorded one,
   `edited_by_hand` otherwise, and `pending` without a file, with `not_written` saying why.
   `unknown` means the record cannot be read (`records_error`). Its own `config` also lists
-  `versions`, every version it recorded with its `sha256`, `written_at_ms`, `source` and `ai`
-  (`installation_motherbee_section`). A hive on an older orchestrator has no `config`. The
+  `versions`, the versions it recorded with their `sha256`, `written_at_ms`, `source` and `ai`
+  (`installation_motherbee_section`): the newest 20, oldest first, with `versions_total`, how many
+  it recorded, and `versions_next_before` while older ones remain (FINDINGS A-198). The request's
+  `versions_limit` (1 to 100) and `versions_before` pick others (`InstallationVersionsAsk`; any
+  other value answers `INVALID_REQUEST`). A hive on an older orchestrator has no `config`. The
   fleet's `comparison` does not include it.
 
 **The operator's change** (stage 3c, [hive-config-update-v1](../hive-config-update-v1.md) §4, "As
@@ -808,6 +811,28 @@ The router delivers these protected actions only from allowed origins (`policy/s
 `SY.orchestrator@motherbee` for the node and handshake actions, and also this hive's own
 orchestrator for the reads, rule (3); `SY.admin@motherbee` for
 `SYSTEM_UPDATE` and `SYSTEM_SYNC_HINT`, rule (2)).
+
+**Pages, and answers that do not fit a frame** (FINDINGS A-198):
+
+- **`list_versions`** asked with `limit` or `cursor` answers a page of hives: the hives after the
+  cursor in the order motherbee first, then the connected spokes by id (`versions_hive_after`), at
+  most `limit` and at most half a mesh frame of snapshots (`mesh_reply::LIST_PAGE_MAX_BYTES`), with
+  `next_cursor`, the page's last hive, while hives follow. Only the page's spokes are asked for
+  their `GET_VERSIONS`. The page's `comparison` is still against the motherbee's snapshot, taken
+  locally when the motherbee is not on the page. `total` is how many hives the answer covers.
+  Asked with neither, every hive, as before.
+- **`list_nodes`, `LIST_NODES` and `INVENTORY_REQUEST`** (`global` and `hive` scopes) list nodes
+  in the order of their hive, then their name, and asked with `limit` or `cursor` answer a page of
+  them (`node_rows_page`): after the cursor (`<hive>|<name>`), at most `limit` and half a frame,
+  with `next_cursor` and `total`. `node_count` and `total_nodes` still count every node. The
+  motherbee passes `limit` and `cursor` on to another hive's `LIST_NODES`. The `managed` listing
+  of one tenant's nodes (`list_tenant_nodes`) has no pages.
+- **Every answer is sent within the frame or replaced.** When the send of an admin reply or a
+  `*_RESPONSE` fails with `MessageTooLarge`, the orchestrator sends the same message with
+  `REPLY_TOO_LARGE` as its payload, `{status, error_code, message, size, max, outcome}`, `outcome`
+  being the answer's own status, error code and ids, and its meta keeps that outcome
+  (`send_within_frame`). SY.admin, or the motherbee's orchestrator, learns why at once instead of
+  waiting to its timeout.
 
 **`node_help` and `NODE_HELP`** (`node_help_flow`): a node's self-description
 ([agent-tools-v1](../agent-tools-v1.md) §3.3), asked the way its status is.

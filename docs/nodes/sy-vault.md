@@ -194,7 +194,7 @@ except `NODE_STATUS_GET`.
 | `VAULT_PUT` → `VAULT_PUT_RESPONSE` | `{key, value, metadata}` | `{status, key, version, changed}`. Same value as stored: `changed: false`, no broadcast. Updating a key keeps its owner and assigned nodes unless the put names an owner or assigned nodes. |
 | `VAULT_GET` → `VAULT_GET_RESPONSE` | `{key}` | `{status, key, value, metadata, version, last_accessed_at, access_count}` |
 | `VAULT_GET_METADATA` → `VAULT_GET_METADATA_RESPONSE` | `{key}` | as `VAULT_GET` without `value` |
-| `VAULT_LIST` → `VAULT_LIST_RESPONSE` | `{filter?}`: `prefix`, `tenant_id`, `resource_type`, `ilk` (`""` = general only), `assigned_ilk`, `tags`, `limit` (default 200, 1..1000) | `{status, count, secrets[]}`, newest `updated_at` first |
+| `VAULT_LIST` → `VAULT_LIST_RESPONSE` | `{filter?, cursor?}`: `filter.prefix`, `tenant_id`, `resource_type`, `ilk` (`""` = general only), `assigned_ilk`, `tags`, `limit` (default 200, 1..1000); `cursor`, the `next_cursor` of the page before | `{status, count, secrets[], total, next_cursor?}`, newest `updated_at` first: at most `limit` secrets and at most 96 KiB of them ([Pages](#pages)) |
 | `VAULT_DELETE` → `VAULT_DELETE_RESPONSE` | `{key, tenant_id}` | `{status, key, deleted: true}` |
 | `VAULT_ROTATE` → `VAULT_ROTATE_RESPONSE` | `{key, tenant_id, value}` | `{status, key, rotated_at, current_version, previous_version}` |
 | `VAULT_ROLLBACK` → `VAULT_ROLLBACK_RESPONSE` | `{key, tenant_id}` | `{status, key, current_version, previous_version}`; `NO_PREVIOUS_VERSION` if there is none |
@@ -211,12 +211,33 @@ except `NODE_STATUS_GET`.
 - Get and get-metadata take no tenant: the key is looked up hive-wide; the read rules above
   decide the value, and get-metadata answers whoever may list.
 
+### Pages
+
+`VAULT_LIST` answers within one mesh frame (FINDINGS A-198, `VaultStore::list_page`):
+
+- A page holds at most the filter's `limit` secrets and at most 96 KiB of them
+  (`VAULT_LIST_PAGE_MAX_BYTES`): what would not fit the frame goes in the next page. A caller whose
+  limit fits gets all of it, as before the pages.
+- `next_cursor`, while secrets follow, names the page's last secret by its place in the order
+  (`updated_at`, `created_at` and `key`, hex-encoded: `VaultListPlace`). Passed back as `cursor`,
+  beside the filter, it lists the secrets after that place, so a secret deleted since keeps the
+  place. A secret written while its caller pages moves to the front, and a later page does not
+  list it again. A cursor this vault did not write answers `INVALID_REQUEST`.
+- `total` is how many secrets the filter matches in all; `count`, how many this page holds.
+- SY.admin's `vault_list` asks page after page up to its caller's limit
+  ([SY.admin](sy-admin.md#pages)).
+
 ### Error codes
 
 `VaultError::code`: `INVALID_REQUEST`, `UNAUTHORIZED`, `KEY_NOT_FOUND`, `KEY_TAKEN`,
 `NO_PREVIOUS_VERSION`, `IDENTITY_UNAVAILABLE` (the only one worth retrying), `STORAGE_ERROR`,
 `ENCRYPTION_ERROR`, `MASTER_KEY_NOT_AVAILABLE`, `IO_ERROR`, `INVALID_VALUE`, `NODE_ERROR`. An
 error answer is `{status: "error", error_code, message}`.
+
+An answer too large for one frame, a value too large for it, goes as `REPLY_TOO_LARGE` in its
+place, `{status: "error", error_code, message, size, max, outcome}`, `outcome` being the answer's
+status, error code and ids (`key`, `version`), never its value; a write's notices still go out
+(`send_system_response`, FINDINGS A-198).
 
 ### Reserved keys
 
@@ -327,7 +348,7 @@ Served by SY.admin on the motherbee (`127.0.0.1:8080`, route table in `src/bin/s
 
 | Route | Admin action |
 | --- | --- |
-| `GET /hives/{hive}/vault/secrets?prefix=&tenant_id=&resource_type=&ilk=&tags=&limit=` | `vault_list` |
+| `GET /hives/{hive}/vault/secrets?prefix=&tenant_id=&resource_type=&ilk=&tags=&limit=&cursor=` | `vault_list`, in pages |
 | `POST /hives/{hive}/vault/secrets` body `{key, value, metadata}` | `vault_put` |
 | `GET /hives/{hive}/vault/secrets/{key}/metadata` | `vault_get_metadata` |
 | `GET /hives/{hive}/vault/secrets/{key}` | `vault_get` |
