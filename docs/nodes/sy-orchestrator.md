@@ -443,7 +443,11 @@ SY.admin's `update` sends `SYSTEM_UPDATE` to `SY.orchestrator@<hive>` with a `ca
 (`runtime`, `core`, `vendor` or `config`) and the `manifest_hash` the hive should have
 (`handle_system_update_message`). If the local manifest does not match yet, the answer is
 `sync_pending` (Syncthing has not delivered it); a local version past the one named is refused
-(`VERSION_MISMATCH`; `manifest_match`).
+(`VERSION_MISMATCH`; `manifest_match`). Since 0.1.123, after a release is installed on the
+motherbee, SY.admin's installation update sends each hive its core update and then its config
+update, and follows each to its settle through `/versions`
+([SY.admin](sy-admin.md#the-installations-update)); the per-hive `update` stays the operator's tool
+for one hive.
 
 - **runtime**: verifies the runtime artifacts (missing ones also give `sync_pending`) and
   applies retention.

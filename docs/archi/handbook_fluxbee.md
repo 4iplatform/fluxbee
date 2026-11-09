@@ -1143,6 +1143,57 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
   the new version's (`get_installation`). The run is not verified until every hive applied it.
   `skipped` names each hive whose join did not finish: no change reaches it. Tell the operator:
   finish its join or remove it, then `update` it the same way.
+- **The change opens the installation's update** (§4.4.4) with the new version as its target:
+  `update` in the answer is its `{id, state}`. A hive that did not answer stays pending in it, and
+  SY.admin finishes it once by itself when the hive answers again.
+
+### 4.4.4 The installation's update
+
+One update brings every hive to what the motherbee holds: its core (the release installed on the
+motherbee) and its installation file (§4.4.3). SY.admin keeps it on disk, one at a time, until
+every hive is on it.
+
+- **Run it** (`update_installation`) only when the operator asks: after a release is installed on
+  the motherbee, to bring every hive to it, or to finish an open update. Stage it with
+  `fluxbee_plan_compiler`: one `update_installation` step, args `reason` (a few words) and, only on
+  the operator's choice, `include_rolled_back` (below). The operator confirms the plan, and
+  SY.admin's executor runs it as the operator. It is closed to the mesh: never send it as an
+  `ADMIN_COMMAND` of your own, nor as SCMD.
+  - Each hive gets its core first (its services restart onto the release), then its config.
+  - The answer comes once every core update answered: `ok` when every hive is on the target, done;
+    `partial` while the update stays open, with `pending` naming each hive not on it. A core that
+    answered `restarting` is normal: SY.admin follows it to its settle and then applies its config.
+  - The run is not verified until the update is done: read `get_installation_update` to follow it.
+- **The installation's rollback:** the operator installs the previous release on the motherbee,
+  then runs the update. It moves every hive back to the motherbee's release.
+- **Read it** with `get_installation_update` (`GET /installation/update`, a read; `history: true`
+  adds the closed ones):
+  - `update`: the open update, or the last one closed: its `id`, `state` (`open`, `done`,
+    `superseded`), `target` (`core.version`, `config.version`), and `hives`;
+  - each hive's `core` and `config`: `state` (`on_target`, `pending`, `in_flight`, `excluded`,
+    `unknown`), `reason`, `outcome` (`status`: `ok`, `restarting`, `settled`, `sync_pending`,
+    `error` with its `error_code`, `not_answered`, `excluded`; `by`: `explicit` or `automatic`),
+    and `next`, what moves it;
+  - `automatic`: the automatic step's one attempt on the hive, when it made one.
+
+  `GET /versions` and `get_installation` carry its summary (`installation_update`, `update`).
+  `not_answered` never means "not applied": the hive may hold the target already.
+- **The exclusions**, each with its reason and the per-hive action that moves it, which only the
+  operator decides:
+  - **A hive the operator rolled back** (`core_rollback`): the update keeps its core as it is, the
+    one divergence the operator chose; its config is still applied. To move its core too: a plan
+    with `include_rolled_back: ["<hive>"]`, or `update` for that hive with `category: core`.
+  - **A copy edited by hand** (`config.state` `edited_by_hand`): no update applies config to it.
+    The operator restores it; then the update, or `update` with `category: config`.
+  - **A hive before 0.1.122** takes no category `config`: its core goes first.
+  - **The motherbee's file edited by hand** gives the update no config to apply, on any hive:
+    `target.config_note` says so. The operator restores it, or makes it a version (§4.4.3).
+- **The automatic step**, SY.admin's own while an update is open: a hive that did not answer
+  (`not_answered`) and answers again gets the update finished, once per hive and target, core then
+  config, with the same waits. It never acts on a hive rolled back by the operator, one ahead of the
+  motherbee (on a newer release), or one with a copy edited by hand: each is recorded `excluded`. It
+  never tries a hive twice: an error, or a copy that did not arrive in time, is left for the
+  operator with its `next`. It opens nothing: only a run opens an update.
 
 ### 4.5 Secrets and vault (Model D')
 

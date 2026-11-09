@@ -353,6 +353,12 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
 
 ### The spokes (core update)
 
+Since 0.1.123 one call brings every spoke to the motherbee's release, core then config, and SY.admin
+keeps the update until each is on it: `POST /installation/update`
+([The installation's update](#the-installations-update)). It sends each spoke the per-hive core
+update below, which stays the operator's tool for one hive (a rolled-back one included), and the
+only way for a release before 0.1.123.
+
 `POST /hives/{hive}/update {"category":"core","manifest_version":0,"manifest_hash":"<sha256 of the motherbee's dist/core/manifest.json>"}`:
 
 - The spoke checks that its synced `dist/core/manifest.json` has that hash; otherwise
@@ -395,10 +401,57 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   `applied`, the config update the hive applied last; the motherbee's lists `versions`
   ([SY.orchestrator](../nodes/sy-orchestrator.md#the-installation-file)).
 
-The lab routine `lab/ops.py deploy <version>` does all of this in order: snapshots every VM,
-installs the version on the motherbee, waits for its core to report it, waits until each spoke's
-orchestrator answers, sends the core update to every spoke, waits until each spoke reports the
-motherbee's hash, then runs `health` (`cmd_deploy`).
+The lab routine `lab/ops.py deploy <version>` does all of this in order (`cmd_deploy`): snapshots
+every VM, installs the version on the motherbee, waits for its core to report it, waits until each
+spoke's orchestrator answers, then:
+
+- from 0.1.123, calls `POST /installation/update` with `{"reason": "deploy <version>"}` and reads
+  `GET /installation/update` every 3 s until the update is done, or until nothing moves a hive any
+  more (900 s at most), printing each hive's transitions as they happen (answered, installed,
+  settled, config applied) and each hive left out with what moves it;
+- below 0.1.123 (deploying an older release again, the rollback), sends the core update to every
+  spoke and waits until each spoke reports the motherbee's hash and settles;
+
+then runs `health`, and prints the phases and each spoke's own records.
+
+## The installation's update
+
+One update brings every hive to what the motherbee holds, its core release and its installation
+file ([hive-config-update-v1](../hive-config-update-v1.md) §6, "As built (stage 4)";
+[SY.admin](../nodes/sy-admin.md#the-installations-update)). SY.admin keeps it in
+`/var/lib/fluxbee/state/sy-admin/installation-update.json`, one at a time, until every hive is on it.
+On the motherbee:
+
+1. **Run it** after a release is installed on the motherbee (`apt-get install fluxbee=<version>`),
+   or to finish an open update; or ask Archi, which stages it as a plan you confirm:
+
+   ```bash
+   curl -sS -X POST http://127.0.0.1:8080/installation/update \
+     -H 'content-type: application/json' -d '{"reason":"deploy 0.1.123"}'
+   ```
+
+   Each hive gets its core first (`SYSTEM_UPDATE` category core), then its config. It answers once
+   every core update answered: `ok` when every hive is on the target, `partial` (202) while the
+   update stays open, with `pending`. A core `restarting` is followed by SY.admin to its settle,
+   then its config goes. With every hive on the target and no update open, `nothing_to_do`.
+2. **Read it**: `curl -s http://127.0.0.1:8080/installation/update` (add `?history=true` for the
+   closed ones). Each hive's `core` and `config` have a `state` (`on_target`, `pending`,
+   `in_flight`, `excluded`, `unknown`), the last `outcome` with its times, and `next`, what moves
+   it. `GET /versions` carries the summary (`installation_update`).
+3. **What it leaves as it is**, with why: a hive rolled back with `core_rollback` keeps its core
+   (its config still goes) unless the run names it, `{"include_rolled_back": ["egress1"]}`; a copy
+   edited by hand gets no config (restore it first); a hive before 0.1.122 gets its core first.
+   `POST /hives/{hive}/update` moves any one hive.
+4. **Finishing it**: a hive that did not answer (`not_answered`) gets the update finished by
+   SY.admin, once, when it answers again (the automatic step), never a rolled-back hive, one ahead
+   of the motherbee or one with a hand-edited copy. An error, or a copy that did not arrive in
+   time, waits for you: fix what its `next` says, then run the update again (the same target
+   resumes the open update) or update that hive.
+5. **The installation's rollback**: install the previous release on the motherbee, then run the
+   update (a release before 0.1.123 has none: `ops.py deploy` sends the per-spoke core update).
+
+Every outcome is one line of SY.admin's journal, `installation update: outcome`, which
+`ops.py timeline` shows.
 
 ## The installation's AI settings
 

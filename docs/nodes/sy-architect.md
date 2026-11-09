@@ -157,7 +157,12 @@ answers `partial` while a hive has not applied it; the run's reason then names t
 (`installation_changes_not_applied`;
 [SY.admin, the installation's ai](sy-admin.md#the-installations-ai)).
 The installation's `ai` is changed only that way: `set_installation_ai` is closed to Archi's own
-`ADMIN_COMMAND`, and its read, `get_installation`, is open to it.
+`ADMIN_COMMAND`, and its read, `get_installation`, is open to it. The installation's update
+(`update_installation`, since 0.1.123) is the same: Archi stages it, its read
+`get_installation_update` (`GET /installation/update`, SCMD and the plan compiler's reads) is
+Archi's, and a run is verified only once the update is done; while it stays open, the reason names
+the update and the hives not on its target
+([SY.admin, the installation's update](sy-admin.md#the-installations-update)).
 
 ## Pipelines
 
@@ -367,7 +372,9 @@ relative `docs/archi/handbook_fluxbee.md`) and `build_archi_prompt` appends it a
   plan it runs, since SY.admin's executor follows each join to its end, for up to 30 min, before
   the next step; 90 s more for each workflow deploy or removal; 240 s more for each
   `set_installation_ai` step (`EXECUTOR_INSTALLATION_WAIT_SECS`), past SY.admin's 210 s ceiling for
-  it; 35 s for `get_installation`, past SY.admin's own 30 s read of `/versions`; 30 s default
+  it; 420 s more for each `update_installation` step (`EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS`),
+  past SY.admin's 390 s ceiling for it; 35 s for `get_installation`, past SY.admin's own 30 s read
+  of `/versions`; 30 s default
   (`JSR_ADMIN_ORCH_TIMEOUT_SECS`) (`architect_admin_action_timeout`).
   While a plan that joins hives runs, the chat's execution hint says so (`execution_hint` on the
   pending confirmation).
