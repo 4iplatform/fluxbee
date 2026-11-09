@@ -6409,11 +6409,16 @@ async fn main() -> Result<(), ArchitectError> {
             VaultWait::UntilReachable,
         ),
     );
-    let (ai_runtime, initial_ai_settings_error) = match ai_runtime {
-        Ok(runtime) => (runtime, None),
-        Err(reason) => (None, Some(reason)),
+    // A vault that never answered is no verdict: no stamp, so the first chat turns ask again.
+    let (ai_runtime, initial_ai_settings_error, verdict) = match ai_runtime {
+        Ok(ArchitectAiBuild::Built(runtime)) => (Some(runtime), None, true),
+        Ok(ArchitectAiBuild::NoKey) => (None, None, true),
+        Ok(ArchitectAiBuild::Unanswered) => (None, None, false),
+        Err(reason) => (None, Some(reason), true),
     };
-    ai_built_from.record(built_from_stamp);
+    if verdict {
+        ai_built_from.record(built_from_stamp);
+    }
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -6750,7 +6755,18 @@ fn log_architect_ai_source(hive: &HiveFile) {
     }
 }
 
-/// Archi's AI runtime: `Ok(None)` without its key; the error is why its `ai` settings cannot be
+/// What a build of Archi's AI runtime reached.
+enum ArchitectAiBuild {
+    /// The runtime.
+    Built(ArchitectAiRuntime),
+    /// The vault answered and gave no key: Archi runs without AI, as at a start.
+    NoKey,
+    /// The vault did not answer (logged): no verdict. A refresh keeps the runtime Archi has, and
+    /// records no stamp, so the next chat turn asks again (stage 3c's review, F1).
+    Unanswered,
+}
+
+/// Archi's AI runtime, its key read from SY.vault; the error is why its `ai` settings cannot be
 /// used, which the chat then answers with.
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
@@ -6759,11 +6775,9 @@ async fn build_architect_ai_runtime(
     hive: &HiveFile,
     own_model: Option<&str>,
     wait: VaultWait,
-) -> Result<Option<ArchitectAiRuntime>, String> {
-    let engine = match architect_hive_ai(hive)
-        .and_then(|settings| architect_ai_engine(settings.ai.as_ref(), own_model))
-    {
-        Ok((engine, _)) => engine,
+) -> Result<ArchitectAiBuild, String> {
+    let engine = match architect_engine_of(hive, own_model) {
+        Ok(engine) => engine,
         Err(err) => {
             tracing::error!(error = %err, "invalid hive ai configuration");
             return Err(err);
@@ -6779,24 +6793,43 @@ async fn build_architect_ai_runtime(
     )
     .await
     {
-        Ok(Some(api_key)) => api_key,
-        Ok(None) => return Ok(None),
-        Err(err) => {
+        ai_settings::ProviderKey::Found(api_key) => api_key,
+        ai_settings::ProviderKey::Missing(reason) => {
             tracing::warn!(
-                error = %err,
+                reason = %reason,
                 provider = %engine.provider,
-                "sy.architect AI vault resource lookup failed"
+                "sy.architect has no AI key for its provider"
             );
-            return Ok(None);
+            return Ok(ArchitectAiBuild::NoKey);
+        }
+        ai_settings::ProviderKey::Unanswered(detail) => {
+            tracing::warn!(
+                error = %detail,
+                provider = %engine.provider,
+                "sy.architect: the vault did not answer for its AI key; it keeps the runtime it \
+                 has, and asks again at its next chat turn"
+            );
+            return Ok(ArchitectAiBuild::Unanswered);
         }
     };
-    Ok(Some(ArchitectAiRuntime {
+    Ok(ArchitectAiBuild::Built(ArchitectAiRuntime {
         provider: engine.provider,
         model: engine.model,
         instructions: build_archi_prompt(read_handbook_text().as_deref()),
         model_settings: architect_model_settings(),
         api_key,
     }))
+}
+
+/// The engine Archi runs on with `hive`'s `ai` and its own model: the installation's default
+/// provider, with its own model or the default's (`architect_ai_engine`).
+fn architect_engine_of(
+    hive: &HiveFile,
+    own_model: Option<&str>,
+) -> Result<fluxbee_ai_sdk::EffectiveAiEngine, String> {
+    architect_hive_ai(hive)
+        .and_then(|settings| architect_ai_engine(settings.ai.as_ref(), own_model))
+        .map(|(engine, _)| engine)
 }
 
 /// What the chat answers without an AI runtime: why Archi cannot use its `ai` settings when that
@@ -6825,6 +6858,8 @@ fn architect_model_settings() -> ModelSettings {
     }
 }
 
+/// Archi's key for `provider`, told apart from a vault that holds none and one that did not answer
+/// (`ai_settings::provider_key`).
 async fn resolve_architect_ai_api_key_from_vault(
     rpc: Arc<RouterDispatcher>,
     hive: &HiveFile,
@@ -6832,15 +6867,12 @@ async fn resolve_architect_ai_api_key_from_vault(
     self_ilk_id: &str,
     provider: AiProvider,
     wait: VaultWait,
-) -> Result<Option<String>, ArchitectError> {
+) -> ai_settings::ProviderKey {
     let vault_client = architect_vault_client(rpc, &hive.hive_id, node_name, self_ilk_id);
-    let value =
+    ai_settings::provider_key(
         resolve_architect_vault_resource(&vault_client, provider.resource_type(), node_name, wait)
-            .await;
-    let Some(value) = value? else {
-        return Ok(None);
-    };
-    Ok(vault_response_openai_api_key(&value))
+            .await,
+    )
 }
 
 /// Wraps the canonical architect dispatcher in a `VaultClient` carrying
@@ -6859,22 +6891,6 @@ fn architect_vault_client(
     )
 }
 
-fn vault_response_openai_api_key(value: &Value) -> Option<String> {
-    if let Some(api_key) = value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(api_key.to_string());
-    }
-    value
-        .get("api_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
     let own_model = architect_own_model(&state.hive_id);
@@ -6891,7 +6907,11 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
     )
     .await;
     let (runtime, settings_error) = match built {
-        Ok(runtime) => (runtime, None),
+        Ok(ArchitectAiBuild::Built(runtime)) => (Some(runtime), None),
+        Ok(ArchitectAiBuild::NoKey) => (None, None),
+        // Stage 3c's review (F1): no verdict. Archi keeps the runtime it has, and no stamp is
+        // recorded, so the next chat turn asks again.
+        Ok(ArchitectAiBuild::Unanswered) => return Ok(state.ai_configured.load(Ordering::Relaxed)),
         Err(reason) => (None, Some(reason)),
     };
     *state
@@ -6908,13 +6928,43 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
 
 /// At each chat turn (docs/hive-config-update-v1.md §4, stage 3c): no config update restarts Archi,
 /// which may be the caller of the very action that wrote the new version, so a turn takes a new
-/// installation file instead. One small file read and hashed; the runtime is rebuilt, its key read
-/// once from the vault, only when the file changed, and the line says once where its `ai` comes
-/// from now. Archi's own `config.ai.model` stays its node config.
+/// installation file instead. One small file read and hashed; only another engine (the default
+/// provider, with Archi's own model or the default's: `architect_engine_of`) rebuilds the runtime,
+/// its key read once from the vault. The same engine takes the new version as it is, with no key
+/// read (stage 3c's review, F1). The line says once where its `ai` comes from now. Archi's own
+/// `config.ai.model` stays its node config.
 async fn architect_takes_new_installation_ai(state: &ArchitectState) {
     let _one_rebuild = state.ai_refresh_lock.lock().await;
     if !state.ai_built_from.changed(&state.installation_file) {
         return;
+    }
+    let stamp = ai_settings::installation_file_stamp(&state.installation_file);
+    let hive = match load_hive(&state.config_dir) {
+        Ok(hive) => hive,
+        Err(err) => {
+            tracing::warn!(error = %err, "hive.yaml unreadable: the next chat turn looks again");
+            return;
+        }
+    };
+    let own_model = architect_own_model(&state.hive_id);
+    if let Ok(engine) = architect_engine_of(&hive, own_model.as_deref()) {
+        let runs = state
+            .ai_runtime
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| (runtime.provider, runtime.model.clone()));
+        if architect_keeps_its_runtime(runs.as_ref(), &engine) {
+            state.ai_built_from.record(stamp);
+            tracing::info!(
+                source = %ai_settings::installation_file_label(&state.installation_file),
+                provider = %engine.provider,
+                model = %engine.model,
+                "the installation file changed, and sy.architect's engine did not: it keeps its \
+                 runtime, with no key read"
+            );
+            return;
+        }
     }
     match refresh_architect_ai_runtime(state).await {
         Ok(configured) => tracing::info!(
@@ -6927,6 +6977,15 @@ async fn architect_takes_new_installation_ai(state: &ArchitectState) {
             "the installation file changed, and sy.architect could not take it"
         ),
     }
+}
+
+/// Whether Archi's runtime, running `runs` (its provider and model, none without a runtime), serves
+/// `engine` as it is: a new installation file that leaves its engine alone rebuilds nothing.
+fn architect_keeps_its_runtime(
+    runs: Option<&(AiProvider, String)>,
+    engine: &fluxbee_ai_sdk::EffectiveAiEngine,
+) -> bool {
+    runs.is_some_and(|(provider, model)| *provider == engine.provider && *model == engine.model)
 }
 
 /// Resolve architect's messages-db Postgres credentials via Model D'
@@ -30517,6 +30576,66 @@ mod tests {
         assert!(system_get_may_run("GET", &translated.action));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation"));
         assert!(!admin_action_allows_ai_write("set_installation_ai"));
+    }
+
+    /// Stage 3c's review (F1): a new installation file rebuilds Archi's runtime only for another
+    /// engine, its provider with its own model or the default's. A change of another provider's
+    /// model, or of the default's while Archi names its own, keeps the runtime with no key read.
+    #[test]
+    fn archi_rebuilds_its_runtime_only_for_another_engine() {
+        // A dist with no installation file: the readers take hive.yaml's ai.
+        let dist = std::env::temp_dir().join(format!("archi-engine-{}", uuid::Uuid::new_v4()));
+        let hive_with = |ai: &str| {
+            let indented: String = ai.lines().map(|line| format!("  {line}\n")).collect();
+            serde_yaml::from_str::<HiveFile>(&format!(
+                "hive_id: motherbee\ndist:\n  path: \"{}\"\nai:\n{indented}",
+                dist.display()
+            ))
+            .expect("hive")
+        };
+        let claude = hive_with(
+            "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+        );
+        let other_openai = hive_with(
+            "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.6\n  anthropic:\n    model: claude-sonnet-5-5\n",
+        );
+        let other_claude = hive_with(
+            "default_provider: anthropic\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-haiku-5-5\n",
+        );
+        let openai_default = hive_with(
+            "default_provider: openai\nproviders:\n  openai:\n    model: gpt-5.5\n  anthropic:\n    model: claude-sonnet-5-5\n",
+        );
+        let runs_on = |hive: &HiveFile, own: Option<&str>| {
+            let engine = architect_engine_of(hive, own).expect("engine");
+            (engine.provider, engine.model)
+        };
+        // On the default's model.
+        let running = runs_on(&claude, None);
+        let keeps = |hive: &HiveFile, own: Option<&str>| {
+            architect_keeps_its_runtime(
+                Some(&running),
+                &architect_engine_of(hive, own).expect("engine"),
+            )
+        };
+        assert!(keeps(&other_openai, None));
+        assert!(!keeps(&other_claude, None));
+        assert!(!keeps(&openai_default, None));
+        // On its own model, as on 8.x: the default's model is not its engine.
+        let running = runs_on(&claude, Some("claude-opus-5-5"));
+        let keeps_own = |hive: &HiveFile| {
+            architect_keeps_its_runtime(
+                Some(&running),
+                &architect_engine_of(hive, Some("claude-opus-5-5")).expect("engine"),
+            )
+        };
+        assert!(keeps_own(&other_openai));
+        assert!(keeps_own(&other_claude));
+        assert!(!keeps_own(&openai_default));
+        // No runtime (no key yet): a new file always looks for one.
+        assert!(!architect_keeps_its_runtime(
+            None,
+            &architect_engine_of(&claude, None).expect("engine")
+        ));
     }
 
     #[test]

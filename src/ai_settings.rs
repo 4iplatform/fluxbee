@@ -224,10 +224,12 @@ pub fn installation_file_stamp(file: &Path) -> Option<String> {
 /// stage 3c). SY.admin's executor and Archi take the installation's `ai` when they build their
 /// runtime, and no config update restarts them: either may be serving the very action that wrote
 /// the new version. Before each use they compare the file with the one their runtime was built
-/// from, and rebuild only when it changed: one small file read and hashed.
+/// from, and look again only when it changed: one small file read and hashed. A build records its
+/// stamp only once it reached a verdict (a runtime, no key, or settings no reader can use): a build
+/// whose vault did not answer records none, so the next use tries again.
 #[derive(Debug, Default)]
 pub struct InstallationBuiltFrom {
-    /// None until a build recorded what it read; then the file's stamp at that build
+    /// None while no build reached a verdict; then the file's stamp at the last one
     /// (`installation_file_stamp`).
     stamp: std::sync::Mutex<Option<Option<String>>>,
 }
@@ -242,16 +244,74 @@ impl InstallationBuiltFrom {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stamp);
     }
 
-    /// Whether `file` is not the one the runtime was built from. False until a build recorded one:
-    /// a build still running at the start reads the file itself.
+    /// Whether the next use should look at `file` again: no build reached a verdict yet, or the file
+    /// is not the one the last verdict was reached on.
     pub fn changed(&self, file: &Path) -> bool {
         let built = self
             .stamp
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        built.is_some_and(|built| built != installation_file_stamp(file))
+        built.is_none_or(|built| built != installation_file_stamp(file))
     }
+}
+
+/// What the vault answered for a reader's provider key (stage 3c's review, F1).
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProviderKey {
+    /// The key.
+    Found(String),
+    /// The vault answered and gave no key: it holds none for the reader, a value without one, or a
+    /// refusal. The reader runs without AI, with the reason, as at a start.
+    Missing(String),
+    /// The vault did not answer (`fluxbee_sdk::vault_failure_is_transport`): the reader keeps what
+    /// it runs, and its next use tries again.
+    Unanswered(String),
+}
+
+// By hand, so that no `{:?}` of it ever prints a key.
+impl std::fmt::Debug for ProviderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderKey::Found(_) => f.write_str("Found(<redacted>)"),
+            ProviderKey::Missing(reason) => f.debug_tuple("Missing").field(reason).finish(),
+            ProviderKey::Unanswered(reason) => f.debug_tuple("Unanswered").field(reason).finish(),
+        }
+    }
+}
+
+/// A reader's key from what `VaultClient::resolve_resource` answered: a vault that did not answer
+/// is told apart from one that answered without a key.
+pub fn provider_key(
+    answer: Result<Option<serde_json::Value>, fluxbee_sdk::VaultError>,
+) -> ProviderKey {
+    match answer {
+        Ok(Some(value)) => match api_key_of(&value) {
+            Some(key) => ProviderKey::Found(key),
+            None => ProviderKey::Missing(
+                "the vault's secret for this provider holds no api_key".to_string(),
+            ),
+        },
+        Ok(None) => ProviderKey::Missing(
+            "the vault holds no key of this provider for it (its own, one assigned to it, or its \
+             tenant's general one)"
+                .to_string(),
+        ),
+        Err(err) if fluxbee_sdk::vault_failure_is_transport(&err) => {
+            ProviderKey::Unanswered(err.to_string())
+        }
+        Err(err) => ProviderKey::Missing(err.to_string()),
+    }
+}
+
+/// The AI key in a vault value: a bare string, or `{"api_key": ...}`.
+pub fn api_key_of(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .or_else(|| value.get("api_key").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
 }
 
 /// Where a reader's `ai` comes from now, for the line it logs once it takes a new installation
@@ -564,7 +624,8 @@ mod tests {
         let dist = temp_dist("built-from");
         let file = installation_file_path(&dist);
         let built = InstallationBuiltFrom::default();
-        assert!(!built.changed(&file), "no build recorded yet");
+        // No build reached a verdict yet (its vault did not answer): the next use looks again.
+        assert!(built.changed(&file), "no verdict yet");
         built.record(installation_file_stamp(&file));
         assert!(!built.changed(&file), "built without a file, and none yet");
         assert_eq!(
@@ -597,5 +658,49 @@ mod tests {
         std::fs::write(&file, b"{\"schema_version\":1,\"version\":0}").expect("edited");
         assert!(installation_file_label(&file).contains("no reader can use"));
         let _ = std::fs::remove_dir_all(&dist);
+    }
+
+    /// A vault that did not answer is told apart from one that holds no key: the first keeps what a
+    /// reader runs, the second takes it down with the reason (stage 3c's review, F1). No `{:?}`
+    /// prints a key.
+    #[test]
+    fn a_vault_that_did_not_answer_is_not_a_missing_key() {
+        let found = provider_key(Ok(Some(serde_json::json!({"api_key": " sk-1 "}))));
+        assert_eq!(found, ProviderKey::Found("sk-1".to_string()));
+        assert_eq!(format!("{found:?}"), "Found(<redacted>)");
+        assert_eq!(
+            provider_key(Ok(Some(serde_json::json!("sk-2")))),
+            ProviderKey::Found("sk-2".to_string())
+        );
+        for answer in [
+            Ok(None),
+            Ok(Some(serde_json::json!({"token": "x"}))),
+            Err(fluxbee_sdk::VaultError::Service {
+                code: "FORBIDDEN".to_string(),
+                message: "not this tenant's".to_string(),
+            }),
+        ] {
+            assert!(
+                matches!(provider_key(answer), ProviderKey::Missing(_)),
+                "a verdict"
+            );
+        }
+        for unanswered in [
+            fluxbee_sdk::VaultError::Unreachable {
+                reason: "NODE_NOT_FOUND".to_string(),
+                original_dst: "SY.vault@motherbee".to_string(),
+            },
+            fluxbee_sdk::VaultError::ActionTimeout {
+                action: "VAULT_LIST".to_string(),
+                trace_id: "t".to_string(),
+                target: "SY.vault@motherbee".to_string(),
+                timeout_ms: 5_000,
+            },
+        ] {
+            assert!(matches!(
+                provider_key(Err(unanswered)),
+                ProviderKey::Unanswered(_)
+            ));
+        }
     }
 }

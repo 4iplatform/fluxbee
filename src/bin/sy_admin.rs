@@ -1699,16 +1699,15 @@ enum VaultWait {
 }
 
 /// The executor's AI key: the secret of `resource` in SY.vault that this node uses (one it owns,
-/// else one assigned to it, else its tenant's general one). `None` when there is none, when its
-/// value carries no `api_key`, or when the vault fails (logged): the executor then runs degraded.
+/// else one assigned to it, else its tenant's general one), told apart from a vault that holds
+/// none and one that did not answer (`ai_settings::provider_key`).
 async fn resolve_admin_executor_api_key(
     vault_client: &fluxbee_sdk::VaultClient,
     resource: fluxbee_sdk::ResourceType,
     my_tenant: &str,
     node_name: &str,
     wait: VaultWait,
-) -> Result<Option<String>, AdminError> {
-    let resource_label = resource.as_str().to_string();
+) -> ai_settings::ProviderKey {
     let timeout = Duration::from_secs(5);
     let value = match wait {
         VaultWait::UntilReachable => {
@@ -1728,26 +1727,15 @@ async fn resolve_admin_executor_api_key(
                 .await
         }
     };
-    match value {
-        Ok(Some(value)) => admin_executor_extract_openai_api_key(&value),
-        Ok(None) => Ok(None),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                resource = %resource_label,
-                "SY.admin executor AI vault resource lookup failed; running degraded"
-            );
-            Ok(None)
-        }
-    }
+    ai_settings::provider_key(value)
 }
 
 /// Build the admin executor AI runtime by discovering the hive provider's resource
 /// in SY.vault (owned → assigned → its tenant's general secret; admin's tenant is the root one).
-/// Returns `Ok(None)` (degraded) on any of:
-/// - vault has no secret of the provider reachable from our (ilk, tenant) match;
-/// - vault unreachable or denies access (at boot, after waiting for it: `wait`);
-/// - the secret value doesn't carry a non-empty `api_key`.
+/// `Ok(None)` (degraded) when the vault answered and gave no key: none of the provider reachable
+/// from our (ilk, tenant) match, a value without an `api_key`, or a refusal. The error is a vault
+/// that did not answer (at boot, after waiting for it: `wait`), on which the caller keeps the
+/// runtime it has (stage 3c's review, F1).
 ///
 /// Async because vault is a router round-trip. Caller (`refresh_*`, which the boot runs too)
 /// logs the outcome, and gives it the engine its `ai` settings name (`hive_ai_settings`).
@@ -1759,48 +1747,35 @@ async fn build_admin_executor_ai_runtime(
     my_tenant: &str,
     engine: EffectiveAiEngine,
     wait: VaultWait,
-) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
+) -> Result<Option<AdminExecutorAiRuntime>, String> {
     let vault_client = fluxbee_sdk::VaultClient::new(
         rpc,
         hive_id.to_string(),
         fluxbee_sdk::VaultCallerOwned::new(self_ilk_id.to_string(), node_name.to_string()),
     );
-    let api_key = resolve_admin_executor_api_key(
-        &vault_client,
-        engine.provider.resource_type(),
-        my_tenant,
-        node_name,
-        wait,
-    )
-    .await?;
-    let Some(api_key) = api_key else {
-        return Ok(None);
-    };
+    let resource = engine.provider.resource_type();
+    let resource_label = resource.as_str().to_string();
+    let api_key =
+        match resolve_admin_executor_api_key(&vault_client, resource, my_tenant, node_name, wait)
+            .await
+        {
+            ai_settings::ProviderKey::Found(api_key) => api_key,
+            ai_settings::ProviderKey::Missing(reason) => {
+                tracing::warn!(
+                    resource = %resource_label,
+                    reason = %reason,
+                    "SY.admin executor has no AI key; running degraded"
+                );
+                return Ok(None);
+            }
+            ai_settings::ProviderKey::Unanswered(detail) => return Err(detail),
+        };
     Ok(Some(AdminExecutorAiRuntime {
         provider: engine.provider,
         model: engine.model,
         model_settings: ModelSettings::default(),
         api_key,
     }))
-}
-
-/// Extract the OpenAI api_key from a vault `value`. Supports both
-/// `{"api_key": "..."}` and a bare string.
-fn admin_executor_extract_openai_api_key(
-    value: &serde_json::Value,
-) -> Result<Option<String>, AdminError> {
-    if let Some(api_key) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
-        return Ok(Some(api_key.to_string()));
-    }
-    if let Some(api_key) = value
-        .get("api_key")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        return Ok(Some(api_key.to_string()));
-    }
-    Ok(None)
 }
 
 /// The executor's `ai` (docs/hive-config-update-v1.md §4): the installation file's once the hive
@@ -1856,16 +1831,11 @@ async fn refresh_admin_executor_ai_runtime(
     // executor as it is, as before: only settings that were read and cannot be used take it down.
     let hive = load_hive(&ctx.config_dir).map_err(|err| format!("hive.yaml: {err}"))?;
     // Stage 3c: the installation file this build reads, stamped before it reads it and recorded
-    // with the runtime it leaves (`executor_takes_new_installation_ai`).
+    // with the verdict it reaches (`executor_takes_new_installation_ai`).
     let stamp = ai_settings::installation_file_stamp(&ctx.installation_file);
     let settings = hive_ai_settings(&hive);
     let engine = match settings {
-        Ok((_, engine)) => {
-            *ctx.executor_ai_error
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            engine
-        }
+        Ok((_, engine)) => engine,
         Err(reason) => {
             *ctx.executor_ai_error
                 .lock()
@@ -1876,7 +1846,7 @@ async fn refresh_admin_executor_ai_runtime(
             return Err(format!("the executor's ai settings cannot be used: {reason}").into());
         }
     };
-    let runtime = build_admin_executor_ai_runtime(
+    let runtime = match build_admin_executor_ai_runtime(
         Arc::clone(&ctx.rpc),
         &ctx.hive_id,
         &ctx.node_name,
@@ -1885,7 +1855,23 @@ async fn refresh_admin_executor_ai_runtime(
         engine,
         wait,
     )
-    .await?;
+    .await
+    {
+        Ok(runtime) => runtime,
+        // Stage 3c's review (F1): a vault that did not answer is no verdict. The executor keeps
+        // the runtime it has, and no stamp is recorded, so its next use tries again.
+        Err(unanswered) => {
+            tracing::warn!(
+                error = %unanswered,
+                "SY.admin executor: the vault did not answer for its AI key; it keeps the runtime \
+                 it has, and its next use asks again"
+            );
+            return Ok(ctx.executor_configured.load(Ordering::Relaxed));
+        }
+    };
+    *ctx.executor_ai_error
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     ctx.executor_configured
         .store(runtime.is_some(), Ordering::Relaxed);
     *ctx.executor_runtime.lock().await = runtime;
@@ -1895,13 +1881,41 @@ async fn refresh_admin_executor_ai_runtime(
 
 /// Before each use of the executor (docs/hive-config-update-v1.md §4, stage 3c): no config update
 /// restarts SY.admin, which may be running the very action that wrote the new version, so the
-/// executor takes a new installation file at its next use. One small file read and hashed; the
-/// runtime is rebuilt, its key read once from the vault, only when the file changed, and the line
-/// says once where its `ai` comes from now.
+/// executor takes a new installation file at its next use. One small file read and hashed; only
+/// another engine (`ai_settings::reader_engine`: the default provider with its model) rebuilds the
+/// runtime, its key read once from the vault. The same engine takes the new version as it is, with
+/// no key read (stage 3c's review, F1). The line says once where its `ai` comes from now.
 async fn executor_takes_new_installation_ai(ctx: &AdminContext) {
     let _one_rebuild = ctx.executor_ai_refresh.lock().await;
     if !ctx.executor_ai_built_from.changed(&ctx.installation_file) {
         return;
+    }
+    let stamp = ai_settings::installation_file_stamp(&ctx.installation_file);
+    let hive = match load_hive(&ctx.config_dir) {
+        Ok(hive) => hive,
+        Err(err) => {
+            tracing::warn!(error = %err, "hive.yaml unreadable: the executor's next use looks again");
+            return;
+        }
+    };
+    if let Ok((_, engine)) = hive_ai_settings(&hive) {
+        let runs = ctx
+            .executor_runtime
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| (runtime.provider, runtime.model.clone()));
+        if runs == Some((engine.provider, engine.model.clone())) {
+            ctx.executor_ai_built_from.record(stamp);
+            tracing::info!(
+                source = %ai_settings::installation_file_label(&ctx.installation_file),
+                provider = %engine.provider,
+                model = %engine.model,
+                "the installation file changed, and the executor's engine did not: it keeps its \
+                 runtime, with no key read"
+            );
+            return;
+        }
     }
     match refresh_admin_executor_ai_runtime(ctx, VaultWait::Once).await {
         Ok(configured) => tracing::info!(
@@ -1919,7 +1933,8 @@ async fn executor_takes_new_installation_ai(ctx: &AdminContext) {
 /// The executor's key at boot, in a task of its own (FINDINGS A-141). On an upgrade the whole hive
 /// restarts at once and the vault may not answer yet, so the read waits for it, up to
 /// `VAULT_BOOT_WAIT`, as its peers' do; the admin serves meanwhile, with the executor unavailable.
-/// A VAULT_SECRET_CHANGED or a CONFIG_SET reads the key again later.
+/// A VAULT_SECRET_CHANGED or a CONFIG_SET reads the key again later, and so does the executor's
+/// next use while no read reached a verdict (`executor_takes_new_installation_ai`).
 async fn boot_admin_executor_ai_runtime(ctx: &AdminContext) {
     match refresh_admin_executor_ai_runtime(ctx, VaultWait::UntilReachable).await {
         Ok(configured) => tracing::info!(
@@ -31165,8 +31180,8 @@ mod tests {
             .is_none());
     }
 
-    /// The executor takes a new installation file at its next use, and only then: one built from a
-    /// file rebuilds once that file changes, and not before a build recorded one.
+    /// The executor takes a new installation file at its next use, and only then: a use looks again
+    /// while no build reached a verdict, and once one did, only when the file changes.
     #[tokio::test]
     async fn the_executor_takes_a_new_installation_file_at_its_next_use() {
         let (ctx, _harness) = opa_test_admin("installation-next-use");
@@ -31188,21 +31203,14 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         };
-        // A file no reader can use, so a rebuild answers with its reason and asks no vault.
+        // A file no reader can use, so a rebuild answers with its reason and asks no vault. No build
+        // reached a verdict yet (the boot's vault did not answer, say): the use looks.
         fs::write(
             &ctx.installation_file,
             b"{\"schema_version\":1,\"version\":0}",
         )
         .expect("v0");
         executor_takes_new_installation_ai(&ctx).await;
-        assert_eq!(
-            reason(),
-            None,
-            "no build recorded yet: the boot's reads the file"
-        );
-        assert!(refresh_admin_executor_ai_runtime(&ctx, VaultWait::Once)
-            .await
-            .is_err());
         assert!(reason().is_some_and(|reason| reason.contains("version 0")));
         // The same file: nothing rebuilt.
         *ctx.executor_ai_error.lock().unwrap() = None;
@@ -31426,7 +31434,7 @@ mod tests {
 
     /// At boot the executor's key waits for a vault that does not answer yet (an upgrade restarts
     /// the whole hive at once), and is read when it does; after boot a lookup asks once, and a
-    /// vault that does not answer is no key (FINDINGS A-141).
+    /// vault that does not answer is no verdict (FINDINGS A-141; stage 3c's review, F1).
     #[tokio::test]
     async fn the_executors_key_at_boot_waits_for_the_vault() {
         let (ctx, mut harness) = opa_test_admin("executor-key-boot");
@@ -31443,7 +31451,10 @@ mod tests {
             VaultWait::UntilReachable,
         );
         let (key, ()) = tokio::join!(boot, answer_executor_key_lookup(&mut harness));
-        assert_eq!(key.expect("lookup").as_deref(), Some("sk-ant-test"));
+        assert_eq!(
+            key,
+            ai_settings::ProviderKey::Found("sk-ant-test".to_string())
+        );
 
         let once = resolve_admin_executor_api_key(
             &vault,
@@ -31460,7 +31471,10 @@ mod tests {
             harness.inject(vault_unreachable(&list)).await.unwrap();
         };
         let (key, ()) = tokio::join!(once, unreachable);
-        assert_eq!(key.expect("lookup"), None);
+        assert!(
+            matches!(key, ai_settings::ProviderKey::Unanswered(_)),
+            "{key:?}"
+        );
         assert!(
             harness
                 .next_outgoing_within(Duration::from_millis(1_500))
@@ -31468,6 +31482,132 @@ mod tests {
                 .is_none(),
             "after boot the vault is asked once"
         );
+    }
+
+    /// Stage 3c's review (F1): when the installation file changes, the executor rebuilds its runtime
+    /// only for another engine. The same engine keeps the runtime with no key read; a vault that
+    /// does not answer keeps the runtime and its next use asks again; a vault that holds no key
+    /// takes the runtime down, as at a start.
+    #[tokio::test]
+    async fn the_executor_rebuilds_only_for_another_engine_and_keeps_its_runtime_on_a_silent_vault()
+    {
+        let (ctx, mut harness) = opa_test_admin("executor-next-use-vault");
+        let root = ctx.config_dir.parent().expect("root").to_path_buf();
+        let dist = root.join("dist");
+        fs::create_dir_all(ctx.installation_file.parent().expect("its dir")).expect("dist");
+        fs::create_dir_all(&ctx.config_dir).expect("config dir");
+        fs::write(
+            ctx.config_dir.join("hive.yaml"),
+            format!(
+                "hive_id: motherbee\nrole: motherbee\ndist:\n  path: \"{}\"\n",
+                dist.display()
+            ),
+        )
+        .expect("hive.yaml");
+        let write_version = |version: u64, ai: HiveAiConfig| {
+            let bytes = fluxbee_ai_sdk::InstallationFile {
+                schema_version: fluxbee_ai_sdk::INSTALLATION_SCHEMA_VERSION,
+                version,
+                ai: Some(ai),
+            }
+            .render()
+            .expect("renders");
+            fs::write(&ctx.installation_file, bytes).expect("the file");
+        };
+        let runs = |provider: AiProvider, model: &str| AdminExecutorAiRuntime {
+            provider,
+            model: model.to_string(),
+            model_settings: ModelSettings::default(),
+            api_key: "sk-ant-running".to_string(),
+        };
+        async fn running_engine(ctx: &AdminContext) -> Option<(AiProvider, String)> {
+            ctx.executor_runtime
+                .lock()
+                .await
+                .as_ref()
+                .map(|runtime| (runtime.provider, runtime.model.clone()))
+        }
+        let ctx_ref = &ctx;
+        let running = move || running_engine(ctx_ref);
+
+        // Version 1, Claude by default, built and running.
+        write_version(1, claude_installation());
+        *ctx.executor_runtime.lock().await = Some(runs(AiProvider::Anthropic, "claude-sonnet-5-5"));
+        ctx.executor_configured.store(true, Ordering::Relaxed);
+        ctx.executor_ai_built_from
+            .record(ai_settings::installation_file_stamp(&ctx.installation_file));
+
+        // Version 2 changes OpenAI's model only: the same engine, no vault asked.
+        write_version(
+            2,
+            installation_ai(
+                AiProvider::Anthropic,
+                Some("gpt-5.6"),
+                Some("claude-sonnet-5-5"),
+            ),
+        );
+        executor_takes_new_installation_ai(&ctx).await;
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+        assert_eq!(
+            running().await,
+            Some((AiProvider::Anthropic, "claude-sonnet-5-5".to_string()))
+        );
+        assert!(!ctx.executor_ai_built_from.changed(&ctx.installation_file));
+
+        // Version 3 changes Claude's model: another engine. The vault does not answer: the runtime
+        // stays, and the next use asks again.
+        write_version(
+            3,
+            installation_ai(
+                AiProvider::Anthropic,
+                Some("gpt-5.6"),
+                Some("claude-opus-5-5"),
+            ),
+        );
+        let silent = async {
+            let list = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the key's list");
+            assert_eq!(list.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+            harness.inject(vault_unreachable(&list)).await.unwrap();
+        };
+        tokio::join!(executor_takes_new_installation_ai(&ctx), silent);
+        assert_eq!(
+            running().await,
+            Some((AiProvider::Anthropic, "claude-sonnet-5-5".to_string()))
+        );
+        assert!(ctx.executor_configured.load(Ordering::Relaxed));
+        assert!(
+            ctx.executor_ai_built_from.changed(&ctx.installation_file),
+            "no verdict: the next use asks again"
+        );
+
+        // The next use: the vault answers and holds no key of the provider for SY.admin. The
+        // runtime goes, as at a start, and the verdict is recorded.
+        let empty = async {
+            let list = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the key's list");
+            harness
+                .inject(reply_to(
+                    &list,
+                    MSG_VAULT_LIST_RESPONSE,
+                    json!({"status": "ok", "count": 0, "secrets": []}),
+                ))
+                .await
+                .unwrap();
+        };
+        tokio::join!(executor_takes_new_installation_ai(&ctx), empty);
+        assert_eq!(running().await, None);
+        assert!(!ctx.executor_configured.load(Ordering::Relaxed));
+        assert!(!ctx.executor_ai_built_from.changed(&ctx.installation_file));
+        assert!(admin_executor_unavailable_reason(&ctx).contains("not configured"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     // --- A-81: a producer's blob reaches the motherbee before its curate -------------------
