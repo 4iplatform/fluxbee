@@ -237,9 +237,12 @@ Postgres is already resolved by the firstboot. The rest is up to the operator:
 curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -H 'content-type: application/json' \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
-# (resource_type "anthropic" for an Anthropic key. CAREFUL: the default_provider is "openai";
-#  if you load an Anthropic key, also set `ai.default_provider: anthropic` in
-#  /etc/fluxbee/hive.yaml and restart the AI nodes, or they keep resolving the openai pool.)
+# (resource_type "anthropic" for an Anthropic key. CAREFUL: the provider is the installation
+#  file's, /var/lib/fluxbee/dist/installation/installation.json, written by the orchestrator's
+#  first start from `ai` in /etc/fluxbee/hive.yaml and ignored there after it. Set
+#  `ai.default_provider: anthropic` in hive.yaml before fluxbee-firstboot; after it, while version
+#  1 is the only one recorded, delete that file, restart sy-orchestrator (it writes version 1
+#  again) and restart the AI nodes, or they keep resolving the openai pool.)
 
 # Slack tokens for an IO.slack binding (its tenant launches it): resource_type "slack", value {app_token, bot_token}.
 ```

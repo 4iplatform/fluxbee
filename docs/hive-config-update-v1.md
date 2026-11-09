@@ -132,7 +132,9 @@ Three cases bite today:
   - on the motherbee: SY.admin (its executor), SY.architect, SY.cognition, SY.frontdesk.gov, and
     ai.generic at each request;
   - on a worker: SY.cognition, and ai.generic at each request;
-  - rt-gateway parses `ai` today only to check it, and stops.
+  - rt-gateway parses `ai` today only to check it, and stops, with the router's own release:
+    until then an invalid hive.yaml `ai` still stops a router at its start, so hive.yaml's
+    `ai` is kept valid even once it is ignored.
 - **The operator's change**, an SY.admin action that Archi can call:
   1. **SY.admin checks the new settings** with every reader's rules: `HiveAiConfig::effective` and
      each provider's model.

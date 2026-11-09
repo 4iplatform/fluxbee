@@ -6702,8 +6702,9 @@ fn ignored_hive_ai_warning(copy: &InstallationFileState, hive_yaml_has_ai: bool)
     };
     Some(format!(
         "hive.yaml holds ai, and this hive holds {holds}: its readers read the file, and \
-         hive.yaml's ai is ignored. Keep it while this hive may go back to a release whose readers \
-         read it (docs/hive-config-update-v1.md §4)"
+         hive.yaml's ai is ignored by them; editing it changes no engine. Keep it, and keep it \
+         valid: rt-gateway still checks it until its own release, and a release whose readers \
+         read it may come back (docs/hive-config-update-v1.md §4)"
     ))
 }
 
@@ -25551,9 +25552,9 @@ fn sync_vendor_to_worker(
 /// new spoke's dist, with its core and vendor, so the spoke's readers read it from their first
 /// start; Syncthing keeps it current from then on. These are the bytes the motherbee's Syncthing
 /// sends, so the spoke's receive-only copy matches its source once the peer is linked. A motherbee
-/// that holds no file (its start did not write one, `/versions` says why) has nothing to copy: the
-/// join goes on, and the spoke's readers read their hive.yaml, which has no `ai`, until the file
-/// arrives. Any other failure fails the join in all three flows (INSTALLATION_SYNC_FAILED).
+/// that holds no file (its start did not write one, `/versions` says why) refuses the join: the
+/// spoke's hive.yaml has no `ai`, so its readers would run the fallback engine. Any failure fails
+/// the join in all three flows (INSTALLATION_SYNC_FAILED).
 fn sync_installation_to_worker(
     hive_id: &str,
     address: &str,
@@ -25566,13 +25567,14 @@ fn sync_installation_to_worker(
         Ok(meta) if meta.file_type().is_file() => {}
         Ok(_) => return Err(format!("'{}' is not a regular file", local.display()).into()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                hive_id = hive_id,
-                file = %local.display(),
-                "the motherbee holds no installation file to copy; the spoke's readers read its \
-                 hive.yaml until Syncthing brings one"
-            );
-            return Ok(());
+            return Err(format!(
+                "the motherbee holds no installation file at '{}' (its config section in \
+                 /versions says why, an ai that is not valid, say): a spoke joined now would run \
+                 the fallback engine; make the motherbee's ai valid and restart its orchestrator, \
+                 then join",
+                local.display()
+            )
+            .into());
         }
         Err(err) => return Err(err.into()),
     }

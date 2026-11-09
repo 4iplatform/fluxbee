@@ -141,9 +141,12 @@ cat <<EOF
     their own tenant's key, never this one):
       curl -sS -X POST $ADMIN/hives/$HIVE_ID/vault/secrets -H 'content-type: application/json' \\
         -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"$ROOT_TENANT","resource_type":"openai"}}'
-    NOTE: the default provider is 'openai'. For an Anthropic key (resource_type "anthropic"),
-    also set 'ai.default_provider: anthropic' in /etc/fluxbee/hive.yaml and restart the AI nodes,
-    or the AI nodes keep resolving the openai pool and stay degraded.
+    NOTE: the provider is the installation file's (/var/lib/fluxbee/dist/installation/
+    installation.json), written by this first start from 'ai' in /etc/fluxbee/hive.yaml, then
+    hive.yaml's 'ai' is ignored. For an Anthropic key (resource_type "anthropic") the file must say
+    'default_provider: anthropic', or the AI nodes keep resolving the openai pool and stay
+    degraded: set it in hive.yaml, delete that file, restart sy-orchestrator (it writes version 1
+    again while it is the only one recorded) and restart the AI nodes.
 
   - IO channel nodes are not started here, and none runs in the root tenant: each one
     (IO.api.<label>, IO.slack.<label>, IO.wapp.<label>, ...) is launched with run_node by the

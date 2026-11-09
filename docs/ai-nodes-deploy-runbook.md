@@ -31,13 +31,15 @@ SY.vault and the identity writes live on the motherbee, so their calls below alw
 ## 2) Prerequisite: the provider's key
 
 - **The provider is the node's** (agent-tools-v1 T8): `behavior.provider`, `openai` or `anthropic`
-  (step 4). Without it, the node uses the hive's: `ai.default_provider` in
-  `/etc/fluxbee/hive.yaml`, or `openai` when there is no `ai:` section, read on each request. One
+  (step 4). Without it, the node uses the installation's: `ai.default_provider` in the installation
+  file (`/var/lib/fluxbee/dist/installation/installation.json`, the same on every hive; the hive's
+  own hive.yaml only while its hive holds no file), or `openai` when there is no `ai`, read on each
+  request. One
   node may run on Claude and another on OpenAI; `CONFIG_GET` shows the one in effect in
   `ai_provider`.
-- **So is the model** (FINDINGS A-104): `behavior.model`, or else the hive's model for the node's
-  provider, `ai.providers.<provider>.model`, read on each request too (`gpt-5.5` for OpenAI when
-  there is no `ai:` section). `CONFIG_GET` shows it in `ai_model`. With neither, every message
+- **So is the model** (FINDINGS A-104): `behavior.model`, or else the installation's model for the
+  node's provider, `ai.providers.<provider>.model`, read on each request too (`gpt-5.5` for OpenAI
+  when there is no `ai`). `CONFIG_GET` shows it in `ai_model`. With neither, every message
   fails with `missing_ai_model`, which names both settings.
 - **The node reads its key on every request,** from SY.vault, by its provider's `resource_type`
   (`openai` or `anthropic`), only in its own tenant:

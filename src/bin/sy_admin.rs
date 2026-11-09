@@ -1842,9 +1842,10 @@ async fn refresh_admin_executor_ai_runtime(
     ctx: &AdminContext,
     wait: VaultWait,
 ) -> Result<bool, AdminError> {
-    let settings = load_hive(&ctx.config_dir)
-        .map_err(|err| format!("hive.yaml: {err}"))
-        .and_then(|hive| hive_ai_settings(&hive));
+    // A hive.yaml that cannot be read right now (`set_storage` rewriting it, say) leaves the
+    // executor as it is, as before: only settings that were read and cannot be used take it down.
+    let hive = load_hive(&ctx.config_dir).map_err(|err| format!("hive.yaml: {err}"))?;
+    let settings = hive_ai_settings(&hive);
     let engine = match settings {
         Ok((_, engine)) => {
             *ctx.executor_ai_error
@@ -14663,8 +14664,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "set_node_config" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "For ai.generic, config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the hive's ai.default_provider and on that provider's model (hive.yaml ai.providers.<provider>.model), as the example does. Name them only when the node needs its own. A provider only when the node's tenant holds a key of that provider in SY.vault: a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. A model must be one of the node's provider; with neither the node's nor the hive's, every message fails with missing_ai_model.",
-            "Naming a provider other than the hive's default needs its config.behavior.model too, unless that hive's hive.yaml lists a model for it (ai.providers.<provider>.model); a worker added by add_hive lists only the default provider's. set_node_config stores the config without checking this; node_control_config_set refuses such a config (invalid_config).",
+            "For ai.generic, config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the installation's ai.default_provider and on that provider's model (the installation file's ai.providers.<provider>.model, the same on every hive), as the example does. Name them only when the node needs its own. A provider only when the node's tenant holds a key of that provider in SY.vault: a tenant's node never uses the root tenant's key, and without a key every message fails with missing_ai_api_key. A model must be one of the node's provider; with neither the node's nor the hive's, every message fails with missing_ai_model.",
+            "Naming a provider other than the installation's default needs its config.behavior.model too, unless the installation file lists a model for it (ai.providers.<provider>.model). set_node_config stores the config without checking this; node_control_config_set refuses such a config (invalid_config).",
         ],
         "node_help" => vec![
             "The hive comes from the /hives/{hive} path in HTTP; the node_name path segment is a fully-qualified node name, for example AI.sales@worker1. Takes no body.",
@@ -14703,8 +14704,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic chat, use config.behavior.kind=ai_chat. config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the hive's ai.default_provider and that provider's model (hive.yaml ai.providers.<provider>.model), as the example does; CONFIG_GET shows both in ai_provider and ai_model. Name them only when the node needs its own: a provider only when the node's tenant holds a key of that provider (without one, every message fails with missing_ai_api_key), and a model always of the node's provider. config.behavior.multimodal (true when absent) says whether the model receives images; config.behavior.capabilities is refused. The key is not config: the node reads its provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
-            "For ai.generic, naming a provider other than the hive's default needs its config.behavior.model too, unless that hive's hive.yaml lists a model for it (ai.providers.<provider>.model); a worker added by add_hive lists only the default provider's. The node refuses a config whose model it cannot resolve (invalid_config, naming behavior.model and ai.providers.<provider>.model), and its ok answer shows ai_provider and ai_model, as CONFIG_GET does.",
+            "For ai.generic chat, use config.behavior.kind=ai_chat. config.behavior.provider (openai or anthropic) and config.behavior.model are optional: without them the node runs on the installation's ai.default_provider and that provider's model (the installation file's ai.providers.<provider>.model, the same on every hive), as the example does; CONFIG_GET shows both in ai_provider and ai_model. Name them only when the node needs its own: a provider only when the node's tenant holds a key of that provider (without one, every message fails with missing_ai_api_key), and a model always of the node's provider. config.behavior.multimodal (true when absent) says whether the model receives images; config.behavior.capabilities is refused. The key is not config: the node reads its provider's key from SY.vault (resource_type openai|anthropic): one it owns, one assigned to it, or its tenant's general one. A tenant's node never falls back to the root tenant's key (that one is the core's).",
+            "For ai.generic, naming a provider other than the installation's default needs its config.behavior.model too, unless the installation file lists a model for it (ai.providers.<provider>.model). The node refuses a config whose model it cannot resolve (invalid_config, naming behavior.model and ai.providers.<provider>.model), and its ok answer shows ai_provider and ai_model, as CONFIG_GET does.",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",

@@ -97,9 +97,9 @@ primary, backed by PostgreSQL; each worker keeps a replica. The full model is in
 An agent is an `AI.*` node on `ai.generic`, the generic AI runtime. Two things define it:
 
 - **Its config:** `behavior.kind` (`ai_chat`, or `echo`, which replies with the input and calls
-  no model). The agent runs on its hive's AI provider and model, picked in `hive.yaml`
-  (`ai.default_provider`, `ai.providers.<provider>.model`); a fresh install uses OpenAI with
-  `gpt-5.5`. An agent that needs its own names them in `behavior.provider` (OpenAI or
+  no model). The agent runs on the installation's AI provider and model, the installation file's
+  `ai` (`default_provider`, `providers.<provider>.model`), the same on every hive; a fresh install
+  uses OpenAI with `gpt-5.5`. An agent that needs its own names them in `behavior.provider` (OpenAI or
   Anthropic) and `behavior.model`, a model of its provider.
 - **Its cognitive definition, on its ILK:** `role_hash`, `skill_hashes`, `handbook_hashes` and
   `personality_hash`. Each hash names a JSON asset in `blob://agent-assets/<hash>.json`, and the
@@ -321,8 +321,13 @@ curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
 ```
 
-For Anthropic, use `"resource_type": "anthropic"`, set `ai.default_provider: anthropic` in
-`/etc/fluxbee/hive.yaml`, and restart the AI nodes.
+For Anthropic, use `"resource_type": "anthropic"`. The provider and its model are the
+installation file's (`/var/lib/fluxbee/dist/installation/installation.json`), which the
+orchestrator's first start writes from `ai` in `/etc/fluxbee/hive.yaml`: set
+`ai.default_provider: anthropic` there before `fluxbee-firstboot`. After it, hive.yaml's `ai` is
+ignored. To take it again, while version 1 is the only one recorded, delete that file on the
+motherbee, restart `sy-orchestrator` (it writes version 1 again from hive.yaml), and restart the AI
+nodes ([hive-config-update-v1](docs/hive-config-update-v1.md) §4).
 
 ### 3. Open Archi
 

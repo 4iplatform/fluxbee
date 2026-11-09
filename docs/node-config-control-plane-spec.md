@@ -245,7 +245,7 @@ Example:
       }
     ],
     "notes": [
-      "The provider is behavior.provider, or the hive's (hive.yaml ai) without it; its key is read from SY.vault by resource_type, in the node's tenant. The model is behavior.model, or the hive's for that provider (ai.providers.<provider>.model) without it.",
+      "The provider is behavior.provider, or the installation's (the installation file's ai) without it; its key is read from SY.vault by resource_type, in the node's tenant. The model is behavior.model, or the installation's for that provider (ai.providers.<provider>.model) without it.",
       "config.runtime.immediate_memory is refused: the agent's memory is the cognition package of its conversation, which the router attaches to its messages; ai.generic keeps none of its own.",
       "CONFIG_SET may override in-memory behavior depending on node implementation."
     ]
