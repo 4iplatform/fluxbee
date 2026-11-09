@@ -771,10 +771,15 @@ bash scripts/apt-repo-publish.sh --serve      # publishes and KEEPS the previous
 # 2. on motherbee
 apt-get update && apt-get install -y fluxbee  # never dpkg -i
 
-# 3. to each spoke (optional; the .deb only updates motherbee)
+# 3. every hive to the motherbee's release, core then config (since 0.1.123; the .deb only updates motherbee)
+POST /installation/update  {"reason":"deploy 0.1.N"}      # follow it: GET /installation/update
+#    one hive, or a release before 0.1.123:
 POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_hash":"<motherbee's>"}
 #    the hash comes from: GET /hives/motherbee/versions  ->  payload.hive.core.manifest_hash
 ```
+
+The installation's update, its states, what it leaves alone and why, and its automatic step are
+in [operations](../../docs/reference/operations.md#the-installations-update).
 
 **Real time:** 6 to 23 min of build depending on the cache, ~9 s for the publish (since 0.1.51
 the index hashes only the new `.deb`; before, it took 8.6 min), ~1 min for the `apt install`, and
@@ -805,7 +810,13 @@ ops run 100 script.sh [args]    # a local script (bash or .py) on a VM
 3. Waits for the admin to report the new version.
 4. Waits for each spoke's orchestrator to answer: the motherbee's admin answers before its router
    has the spokes back, and an update sent at that moment fails with `TRANSPORT_ERROR` (0.1.56).
-5. core-update of the spokes in parallel; it retries one that did not get through, up to 3 times.
+5. **From 0.1.123:** one call, `POST /installation/update`, then `GET /installation/update` every
+   3 s until the update is done or held (a held one passes with a warning naming the rolled-back
+   hives), or until nothing moves a hive twice in a row. It prints each hive's transitions in this
+   run, with the seconds since the call. Steps 5 and 6 below are what SY.admin does for each hive;
+   ops.py runs them itself only for a release before 0.1.123 (deploying an older one again).
+   **Below 0.1.123:**
+   core-update of the spokes in parallel; it retries one that did not get through, up to 3 times.
    Since 0.1.55 each spoke answers `status=ok phase=restarting`; one whose binaries and units
    are already the release's answers `ok` at once and restarts nothing (since 0.1.118).
 6. Waits for each spoke to have the motherbee's hash **installed** (`core.installed`). On a spoke,
@@ -1107,11 +1118,20 @@ Three paths:
    the response may be `FORWARD_UNKNOWN`: check `core.installed.source = core_rollback` in
    `/versions`. Since 0.1.117 it also stops and removes the nodes the update added, including the
    ones the new orchestrator's start installed, and brings back the nodes the release dropped,
-   unit and binary; a dry run lists them in `would_remove` and `would_restore_units`.
+   unit and binary; a dry run lists them in `would_remove` and `would_restore_units`. Since
+   0.1.123 the installation's update leaves a rolled-back hive's core as it is: no run changes it
+   unless the run names it (`include_rolled_back`), the automatic step never touches the hive, and
+   the update is `held`, naming it. Its own `update` brings it back and closes the update `done`.
 2. **Cold snapshot of the VMs** — see §1 on why cold. With one per VM (§12), it undoes only the
    last release.
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
+
+**Downgrading from 0.1.123 to 0.1.122:** 0.1.122's SY.admin has no installation update, so
+`ops deploy 0.1.122` sends the per-spoke core update. `installation-update.json` in SY.admin's
+state dir stays, ignored. Back on 0.1.123, an update still open for the other release reads
+`stale_target`, and the next run replaces it. The command log's `seq` (A-198) is ignored by
+0.1.122.
 
 **Downgrading from 0.1.122 to 0.1.121:**
 - 0.1.121's readers read the installation file as it is, at whatever version the operator left it.

@@ -21,9 +21,11 @@
   - 3c, live and checked on 8.x (0.1.122): the operator's action, SY.admin's `set_installation_ai`,
     and the update with category `config` (§4, "As built (stage 3c)"), with its review round's
     fixes (F1 to F7, named there).
-- **Stage 4, built for 0.1.123:** the installation's update in SY.admin, kept on disk, with its
-  automatic step (§6, "As built (stage 4)"). `ops.py deploy` calls it from 0.1.123 on.
-- **Next:** stage 4's gates on 8.x (§10), then stage 5.
+- **Stage 4 is live and checked on 8.x** (0.1.123): the installation's update in SY.admin, kept
+  on disk, with its automatic step (§6, "As built (stage 4)"). `ops.py deploy` calls it from
+  0.1.123 on. Its gates passed: the deploy through it, egress1 away across a config change and
+  finished once by the automatic step, and a rolled-back egress1 held and left alone by it.
+- **Next:** stage 5 (§10).
 
 This is the single place for the topic.
 
@@ -249,8 +251,8 @@ Nothing changes in behavior: version 1 holds the values every reader ran on.
 
 ### As built (stage 3c)
 
-The operator's change and the update with category `config`, built for 0.1.122; its gate is next
-(§10).
+The operator's change and the update with category `config`, live and checked on 8.x since
+0.1.122 (§10).
 
 - **SY.admin's two actions** (`InternalActionRoute::Installation`), and one more category:
   - `get_installation`, `GET /installation`: a read, which Archi may ask for over the mesh
@@ -465,8 +467,8 @@ The operator's change and the update with category `config`, built for 0.1.122; 
 
 ### As built (stage 4)
 
-Built for 0.1.123, with its review round's fixes (F1 to F12, below where each one changed the
-design); its gates are next (§10). The machinery is SY.admin's
+Live and checked on 8.x since 0.1.123, with its review round's fixes (F1 to F12, below where each
+one changed the design) and its gates (§10). The machinery is SY.admin's
 `src/bin/sy_admin/installation_update.rs`; the actions are wired in `src/bin/sy_admin.rs`.
 
 - **The target is what the motherbee holds now** (`target_of`, read from its `/versions`):
@@ -783,7 +785,8 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
    - Gate: a deploy through it.
    - Gate: egress1 down across a config change, then back: finished once and reported.
    - Gate: a rolled-back egress1 is left alone, and the update is held.
-   - Built for 0.1.123 (§6, "As built (stage 4)"); the gates are next.
+   - Live and checked on 8.x, 0.1.123 (§6, "As built (stage 4)"): the three gates passed
+     (lab/DEPLOYMENTS.md, 0.1.123).
 5. **A-181's blob members, and A-188.**
    - A-72's tests for both blob folders, and a removal without flags.
    - Gate: a throwaway worker. Its device is taken out of `fluxbee-blob` through Syncthing's REST;

@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ live, checked on 8.x | snap `pre-inst-0-1-122` (all 4 VMs) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
+| **0.1.123** | 2026-11-09 | `e6f6c93f` | motherbee + spokes (core): hive-config-update-v1's stage 4: SY.admin's installation update (`update_installation`, the operator's word; `get_installation_update`, Archi's read) brings every hive to the motherbee's core and installation file, core then config, kept in SY.admin's state dir and resumed after a restart; what it leaves alone, with why (a hive rolled back with `core_rollback` keeps its core and the update is `held`; a hand-edited copy gets no config); the automatic step, once per hive and target, for a hive that did not answer and comes back; `set_installation_ai` opens it, Archi follows it, `ops.py deploy` runs it; with A-198: a mesh reply that does not fit the frame answers `REPLY_TOO_LARGE` with its outcome, optional `limit`/`cursor` pages on the listings that grow (every row without them, as before), an executor run's answer cut to fit; and A-201: Archi reads the admin command log | ✅ live, checked on 8.x | snap `pre-inst-0-1-123` (all 4 VMs) · `apt install fluxbee=0.1.122` + `ops deploy 0.1.122`'s per-spoke core update (SY.admin's `installation-update.json` stays, ignored by 0.1.122) |
+| **0.1.122** | 2026-11-09 | `6c6d963d` | motherbee + spokes (core): hive-config-update-v1's stage 3c: the operator changes the installation's `ai` through SY.admin (`get_installation`, Archi's read; `set_installation_ai`, the operator's word, through Archi's confirmed plan or loopback), A-11's checks, the motherbee's orchestrator writes the next version and every hive applies it (`SYSTEM_UPDATE` category `config`), restarting only the start readers whose engine changed; SY.admin's executor and Archi take it at their next use; with A-197: Archi reads SY.admin's catalog in its compact view over the mesh | ✅ replaced by 0.1.123 | snap `pre-inst-0-1-122` (deleted 2026-11-09) · `apt install fluxbee=0.1.121` + core-update of the spokes (the installation file stays at its version, which 0.1.121's readers read the same) |
 | **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ replaced by 0.1.122 | snap `pre-inst-0-1-121` (deleted 2026-11-09) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
 | **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ replaced by 0.1.121 | snap `pre-aisdk-0-1-120` (deleted 2026-11-09) · `apt install fluxbee=0.1.119` + core-update of the spokes |
 | **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ replaced by 0.1.120 | snap `pre-watch-0-1-119` (deleted 2026-11-08) · `apt install fluxbee=0.1.118` + core-update of the spokes |
@@ -131,6 +132,115 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.123 — The installation's update, and replies that fit the frame
+
+- **Date:** 2026-11-09 (ART) · **Previous version:** 0.1.122 · **Commit:** `e6f6c93f`.
+- **Scope:** motherbee and the three spokes, the first deploy through the installation's update.
+- **Why:**
+  - hive-config-update-v1's stage 4: one SY.admin action brings every hive to what the motherbee
+    holds, and keeps the update until each one is on it.
+  - With it, A-198, in the same release by the operator's call since both touch SY.admin: mesh
+    replies that can outgrow the frame. And A-201, found by A-198's build.
+- **What changed:**
+  - **SY.admin, the installation's update:**
+    - `update_installation` (`POST /installation/update`, the operator's word, closed to the
+      mesh) and `get_installation_update` (`GET`, Archi's read).
+    - The target: the motherbee's core (its installed manifest hash, or dist's) and its
+      installation file's version. Each hive gets its core first, then its config; a core
+      restarting is followed to its settle.
+    - The update is kept in SY.admin's state dir, one at a time, and resumed after a restart; the
+      newest 20 closed ones are kept.
+    - What it leaves alone, with why:
+      - a hive rolled back with `core_rollback` keeps its core unless the run names it
+        (`include_rolled_back`), and the update is `held`, naming it;
+      - a copy edited by hand gets no config.
+    - The automatic step: once per hive and target, only for a hive that did not answer and comes
+      back. Never a rolled-back hive, one ahead of the motherbee or one with a hand-edited copy.
+    - Refusals that change nothing: another run under way (409), the hive registry unreadable
+      (503), the motherbee rolled back (409).
+    - `set_installation_ai` opens the update with its version. `/versions` and `get_installation`
+      carry its summary.
+  - **Archi** stages `update_installation` as a plan the operator confirms, and follows the update
+    to its end before its verdict.
+  - **ops.py:** `deploy` from 0.1.123 runs the installation's update and follows it. Below 0.1.123
+    it keeps the per-spoke core update.
+  - **A-198:**
+    - SY.admin, SY.identity, SY.vault and SY.orchestrator measure each reply against the frame
+      less 1 KiB for the router (A-202). One that does not fit answers `REPLY_TOO_LARGE`, with its
+      size and the action's outcome, so a write that ran says so.
+    - Optional `limit`/`cursor` pages on the listings that grow. Without them, every row, as
+      before.
+    - An executor run's answer is cut to fit, largest outputs first. Past that,
+      `REPLY_TOO_LARGE` with the run's id and log path.
+    - IO.cloud relays the pages of the lists Cloud uses.
+  - **A-201:** Archi reads the admin command log (`/hives/{hive}/commands`).
+- **Checks before the release:**
+  - GitHub's CI green: stage 4 on `f7dde147`, A-198 stacked on it at `e6f6c93f`.
+  - **The review round,** one reviewer per item:
+    - stage 4: F1–F12 fixed (the unreadable registry; reads one per hive with a 50 s timeout and a
+      cadence; Archi's follow; the stale target; a timed-out core followed through `/versions`; one
+      explicit run at a time; a rolled-back motherbee; ops.py's follow; the docs);
+    - A-198: H1–H3, M4 and L1–L10 fixed (every vault page in the purge's check and the provider
+      keys; a total order for the command log; the router's reserve; the executor's answer cut by
+      share);
+    - found and recorded for later: A-199, A-200, A-202.
+- **Deploy (G1):**
+  - Build of `e6f6c93f` in 19.9 min; publish in 13 s (the repo keeps 10: 0.1.113 pruned).
+  - Snapshot `pre-inst-0-1-123` taken on all 4 VMs, `pre-inst-0-1-122` dropped.
+  - 0.1.123 on all 4 in 392 s, health clean.
+  - Phases:
+    - snapshots 34.3 s;
+    - apt install on the motherbee 145.8 s;
+    - the motherbee's admin on the version 64.0 s;
+    - the spokes answering 10.8 s;
+    - the update's call 28.8 s (answered `partial` in 24.2 s, the three cores restarting);
+    - the hives on the target 94.3 s.
+  - By the spokes' own records: installed 18–27 s and settled 29–34 s after the call.
+  - SY.admin recorded worker1 and ingress1 settled about 27 s later, and egress1 84 s later:
+    - a read of egress1, sent 0.24 s after its link dropped for the core update, was lost (A-203);
+    - the lost read held the motherbee orchestrator's worker for 45 s (A-199), with the other
+      hives' reads queued behind it;
+    - SY.admin then left egress1 unread for 50 s, as it does after a timed-out read.
+  - The update closed `done` 123 s after the call; without the lost read, about 35 s.
+- **Checked on 8.x (the gates, with the operator's OK for these PROD changes):**
+  - **G2, a hive away during a config change:**
+    - egress1 off the mesh for 2 min 3 s (its orchestrator, then its router).
+    - **Version 4** (openai's model to gpt-5.5-mini): answered in 89.4 s.
+      - The other three applied it in about 2 s.
+      - egress1 was `not_answered` after 85.5 s of retries: the router answered `NODE_NOT_FOUND`
+        each time. The update stayed open.
+      - Restarted: the motherbee's sy-cognition and sy-frontdesk-gov, and worker1's
+        sy-cognition, which the deploy had restarted since their last apply.
+    - **egress1 back:**
+      - its orchestrator showed 20 s later: its sy-config-routes reconnected on the SDK's backoff
+        (A-193);
+      - the automatic step finished it 23.4 s after that, once (`ok by automatic`, 79 ms);
+      - the update closed `done`.
+    - **Version 5, the undo, with every hive up:** answered in 5.1 s. Every hive applied it within
+      2.3 s and nothing restarted. The update closed `done` 32 s later (A-205).
+    - AI.pruebas answered in 8 s (anthropic, claude-sonnet-5-5).
+  - **G3, a hive rolled back by the operator:**
+    - **`core_rollback` of egress1:** the dry run named the deploy's generation and four binaries.
+      The rollback applied and answered `FORWARD_UNKNOWN` after 242 s, as documented when the
+      restore includes sy-orchestrator. egress1 then ran 0.1.122's core (source `core_rollback`)
+      with config v5.
+    - **An explicit run:** `held`, naming egress1. Its core `excluded`, with why; its config on
+      the target.
+    - **egress1 off again,** 2 min 17 s, with an explicit run during it: 122 s, egress1
+      `not_answered` in core and config, the update open.
+    - **egress1 back:** the automatic step left it alone (`core excluded, config excluded`), and
+      the update went back to `held`.
+    - **egress1's own `update`** (category core): answered in 12.8 s. The update closed `done` 32 s
+      later, every hive on 0.1.123.
+  - **A-198, over HTTP:**
+    - pages: ILKs 63 in 7 pages of 10; the command log's 245 in pages of 20; `/versions` 2 hives
+      a page; worker1's 10 nodes in pages of 3; the vault's 12 secrets with a limit of 4.
+    - Without `limit`, every row as before: the ILKs in 24.6 KB (as measured before the
+      release), `/versions` 29.7 KB, the command log's 50.
+  - **A-201:** Archi read `/hives/motherbee/commands?limit=3` and answered with the three entries.
+  - Health clean on every hive after the gates.
+  - **Found:** A-203 (the router), A-204 and A-205 (the update's record): FINDINGS.
 
 ## 0.1.122 — The operator changes the installation's AI
 

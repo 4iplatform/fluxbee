@@ -113,8 +113,9 @@ no change required
    1. A-181, a hive's shared config travels in the update
       ([hive-config-update-v1](../../docs/hive-config-update-v1.md)), by stages: stage 1 ✅
       0.1.116; stage 2 ✅ 0.1.117, the release's settings in the code; stage 3a ✅ 0.1.120 and
-      3b ✅ 0.1.121, the installation file in use; 3c ✅ 0.1.122, the operator's action. Next,
-      stage 4: SY.admin's installation update, with its automatic step.
+      3b ✅ 0.1.121, the installation file in use; 3c ✅ 0.1.122, the operator's action; stage 4
+      ✅ 0.1.123, SY.admin's installation update with its automatic step. Next, stage 5: the blob
+      folders' members (A-181's first half) and A-188.
    2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -129,7 +130,19 @@ no change required
     evaluate; A-196, latent.
 11. **Found by 0.1.122's review round:** A-197 [Archi], Archi's catalog of SY.admin's actions did
     not fit the mesh's frame ✅ 0.1.122, checked on 8.x; A-198 [General/admin], other SY.admin mesh
-    replies that can outgrow it, observed.
+    replies that can outgrow it ✅ 0.1.123, checked on 8.x.
+12. **Found by 0.1.123's review round:** A-199 [General/orchestrator], the motherbee orchestrator's
+    admin worker runs one request at a time, to evaluate. **Found by A-198's build:** A-200
+    [General/vault], the vault's boot re-announcement covers only its newest 200 secrets (latent);
+    A-201 [Archi], Archi could not read `list_recent_commands`, which its handbook tells it to read
+    first ✅ 0.1.123, checked on 8.x. **Found by A-198's review round:** A-202 [General/router], a message just
+    under the frame passes the SDK and the router drops it (latent; the shared code, alone).
+    **Found by 0.1.123's deploy gate:** A-203 [General/router], a WAN session that ends on a read
+    error leaves its hive in the peer table, and frames to that hive are lost without UNREACHABLE
+    (seen on 8.x; the router, alone, with A-202). **Found by 0.1.123's gate:** A-204
+    [General/admin], the installation update's record gives every `set_installation_ai` hive the
+    slowest one's time (low); A-205 [General/admin], a background read taken before a hive applied
+    a config change can mark it pending after it did, so the update stays open (low).
 
 ### The sprint of 2026-11-04 (done; A-137 goes on in the sprint of 2026-11-07)
 
@@ -234,14 +247,25 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
   operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
   stage 2 ✅ 0.1.117, the release's settings in the code; 3a ✅ 0.1.120 and 3b ✅ 0.1.121, the
-  installation file in use; 3c ✅ 0.1.122, the operator's action. Next, stage 4.
+  installation file in use; 3c ✅ 0.1.122, the operator's action; 4 ✅ 0.1.123, the installation's
+  update. Next, stage 5 (the blob folders' members, A-188).
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
   and admin down, 25 s of hashing per start, a join's 67 s SSH copy.
 - A-196 🟡 A join's peer link can be written to Syncthing's config and never applied (latent).
-- A-198 🟡 Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its
-  timeout (observed in the code).
+- A-199 🔵 The motherbee orchestrator's admin worker runs one request at a time, and a request its
+  caller gave up on still runs (a known limit, to evaluate).
+- A-200 🟡 SY.vault's boot re-announcement covers only its newest 200 secrets (latent, low).
+- A-202 🟡 A message just under the frame passes the SDK's check, and the router then drops it
+  without telling the sender (latent; the SDK and the router, a release alone).
+- A-203 🟡 A WAN session that ends on a read error leaves its hive in the router's peer table:
+  frames to that hive are lost without UNREACHABLE until it reconnects (seen on 8.x; the router,
+  alone, with A-202).
+- A-204 🔵 The installation update's record gives every `set_installation_ai` hive the slowest
+  one's time, and keeps an old outcome on a hive moved by its own update (low).
+- A-205 🟡 A background read taken before a hive applied a config change can mark it pending
+  after it did: the update stays open up to 10 min when no one follows it (low).
 - A-195 🔵 WAN frames dropped at each link-up, before the peer's LSA names their sender.
 - The sweep of 2026-11-07 ([logbook](2026-11-07.md)): about 30 small items off the board, those
   that need the operator's call listed apart.
@@ -1320,7 +1344,130 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   `config.xml`.
 - **Status:** built; the next join exercises it (the A-48 one).
 
-### A-198 [General/admin] 🟡 OBSERVED in the code (found 2026-11-09 while fixing A-197; not seen on 8.x) — Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its timeout
+### A-205 [General/admin] 🟡 SEEN on 8.x, low (found 2026-11-09 by 0.1.123's gate; checked in the code) — A background read taken before a hive applied a config change can mark it pending after it did
+
+- **Seen:** version 5 of the installation's `ai`, 2026-11-09 23:03 UTC, every hive up.
+  - SY.admin's background read of worker1 went out at 23:03:39.30. Worker1 applied version 5 at
+    23:03:39.77, and SY.admin recorded its apply `ok` at 23:03:40.314.
+  - The read's answer, taken before the apply, came back just after. It turned worker1's config
+    from on target to `pending`.
+  - Nothing read worker1 again until 23:04:08, when reads of the update made SY.admin look again.
+    The update closed `done` 32 s after the change; every hive had applied it within 2.3 s.
+- **Why:** `set_installation_ai`'s apply (`sy_admin.rs`, the `join_all` over the hives) takes no
+  claim on its hives, while the explicit run does (`installation_update.rs:2561`). The background
+  `recheck` (`3662`) reads a hive it can claim, and records what the read shows without checking
+  whether an outcome came in while the read was under way.
+- **Impact:** no wrong action. A config apply is idempotent, and the hive is read again. But the
+  update stays open, naming a hive that is on the target: about 30 s while someone follows the
+  update, up to 10 min (the pending hive's cadence) when no one does.
+- **Fix:** `set_installation_ai`'s apply claims each hive while it applies, as the explicit run
+  does; and `recheck` drops a read that began before the category's last outcome.
+
+### A-204 [General/admin] 🔵 SEEN on 8.x, low (found 2026-11-09 by 0.1.123's gate; checked in the code) — The installation update's record gives a set_installation_ai hive the slowest hive's time, and keeps an old outcome on a hive moved by its own update
+
+- **Seen in the gate's version 4,** with egress1 away: the record and the journal give ingress1,
+  worker1 and the motherbee about 85.5 s each (`elapsed_ms`, and `at_ms` with it). The action's own
+  answer gives each hive's real time, 2.0–2.1 s (`timings_ms.hives`).
+- **Why:** `set_installation_ai` records every hive's outcome once all the applies ended
+  (`sy_admin.rs`, after the `join_all`), with the apply's start and the time of recording. Each
+  hive's own elapsed is there and is not passed.
+- **The same record, a second case:** after egress1 was moved back by its own `update`, its core
+  read on target with `excluded by automatic` as its last outcome. A look records the new state,
+  and keeps the last outcome a run left.
+- **Fix:** pass each hive's own elapsed, and its end as `at_ms`. A look that finds a hive moved
+  outside the update could record that it saw it on target.
+
+### A-203 [General/router] 🟡 SEEN on 8.x (found 2026-11-09 by 0.1.123's deploy gate; checked in the code) — A WAN session that ends on a read error keeps its hive in the router's peer table, and frames sent to that hive are lost without UNREACHABLE until it reconnects
+
+- **Seen:** 0.1.123's deploy, 2026-11-09 22:52:59 UTC.
+  - Egress1's router restarted for its core update. The motherbee's session with it ended on "peer
+    closed connection without sending TLS close_notify" at 22:52:59.134.
+  - At 22:52:59.372 the motherbee orchestrator forwarded SY.admin's `GET_VERSIONS` to
+    `SY.orchestrator@egress1`. Egress1 never received it.
+  - Egress1's new router connected at 22:53:00.3.
+- **Why (`src/router/mod.rs`):**
+  - `handle_wan_connection` reads with `read_frame(&mut reader) => frame?` (`3202`). A read error
+    returns from the function there and skips its cleanup: removing the hive's `WanPeer` (`3244`)
+    and `writer_task.abort()`. Only a clean close (`None`) reaches that cleanup. The caller only logs
+    "wan connection error" (`2785`).
+  - `send_to_wan_peer` finds the stale entry. It ignores the result of `peer.sender.send(data)`
+    (`1818`) and returns true, so `forward_to_hive` never answers `WAN_UNAVAILABLE`.
+  - The entry stays until the hive reconnects. A router stopped with SIGTERM sends no
+    close_notify, so a hive whose router is down swallows every frame sent to it, and each sender
+    waits out its own timeout.
+- **The cost in the gate:**
+  - The lost read held the motherbee orchestrator's worker for its 45 s forward bound (A-199).
+  - The reads of worker1 and ingress1 queued behind it: SY.admin saw both settled about 27 s after
+    their own records.
+  - SY.admin then left egress1 unread for 50 s, as it does after a timed-out read. It saw egress1
+    settled 84 s after egress1's own record.
+  - The update closed `done` 123 s after the call; without the lost read, about 35 s.
+- **Fix (the router, a release alone, with A-202):**
+  - Run the cleanup on every way out of the session, and remove the entry only while it is still
+    this session's: the clean-close path today removes the hive's entry whichever session wrote it.
+  - `send_to_wan_peer` returns false when the send fails, so the sender gets `WAN_UNAVAILABLE`.
+
+### A-202 [General/router] 🟡 LATENT (found 2026-11-09 by A-198's review round; checked in the code) — A message just under the frame passes the SDK's check, and the router then drops it without telling the sender
+
+- **Why:** the SDK refuses a frame over 128 KiB before sending (`crates/fluxbee_sdk/src/split.rs:144`).
+  The router then adds to the message and serializes it again:
+  - `routing.src_l2_name` (`src/router/mod.rs:1068`), about 35 B for `SY.admin@motherbee`;
+  - `meta.action_class` when absent (`7045-7047`);
+  - for an AI node's delivery, the memory package.
+- **Then:** its link writer skips any frame over 128 KiB (`4127`), with a rate-limited warning.
+  The sender believes the message went out, and a waiting caller gets its own timeout.
+- **0.1.123 (A-198):** the reply guards of SY.admin, SY.identity, SY.vault and SY.orchestrator keep
+  a 1 KiB reserve under the frame for the router's additions.
+- **Fix:** in the shared code, which ships alone. Either the SDK reserves room for the router's
+  additions, or the router answers the sender when it must drop a frame.
+
+### A-201 [Archi] ✅ VALIDATED ON 8.x (0.1.123, 2026-11-09; found 2026-11-09 by A-198's builder; checked) — The handbook tells Archi to read `list_recent_commands` first, and its read tool had no route for it
+
+- **Why:** the handbook (`docs/archi/handbook_fluxbee.md:1558`) says to read the admin's command
+  log first when the state looks unexpected.
+- **But:**
+  - Archi's read tool, `fluxbee_system_get`, sends each path through `translate_scmd`, which has
+    no route for `GET /hives/{hive}/commands`.
+  - SY.admin already admits the action from Archi over the mesh.
+- **Fix:** the route in `translate_scmd`, with A-198's pages. Small; in 0.1.123.
+- **Checked on 8.x (0.1.123's gate):** asked for the motherbee's three newest commands, Archi read
+  `/hives/motherbee/commands?limit=3` (`list_recent_commands`) and answered with each one's
+  action, status and origin.
+
+### A-200 [General/vault] 🟡 LATENT, low (found 2026-11-09 by A-198's builder; checked) — SY.vault's boot re-announcement covers only its newest 200 secrets
+
+- **Why:** `emit_bootstrap_secret_broadcasts` lists with `VaultFilter::default()`.
+  `VaultStore::list` takes 200 rows by default (`sy_vault.rs:1362`).
+- **The case:** a vault holding more than 200 secrets re-announces only the newest 200 at its
+  start. A consumer that relies on the boot notice for an older one does not get it.
+- **On 8.x:** 12 secrets on the motherbee, so not reached.
+- **Fix:** page the boot list with A-198's cursor.
+
+### A-199 [General/orchestrator] 🔵 TO EVALUATE (found 2026-11-09 by stage 4's review round; read in the code) — The motherbee orchestrator's admin worker runs one request at a time, and a request its caller gave up on still runs
+
+- **Why:**
+  - SY.admin relays every hive read and node action through `SY.orchestrator@motherbee`, whose
+    admin worker awaits each request inline (`sy_orchestrator.rs:1198`).
+  - A spoke's `GET_VERSIONS` is forwarded with a 45 s bound (`JSR_ORCH_SYSTEM_FORWARD_TIMEOUT_SECS`).
+    On the spoke it waits again in its own one-at-a-time system worker.
+  - The queue has no expiry: a read whose caller gave up at 10 s is still forwarded later.
+- **The case:** a spoke whose orchestrator is visible but does not answer, while its system worker
+  runs a long action (`core_rollback` up to 240 s, `KILL_NODE` 120 s) or loses frames (A-195).
+  - Every admin read behind it waits up to 45 s, and each read given up on adds to the backlog.
+  - The callers that time out at 30 s include Archi's reads, IO.cloud's `run_node`,
+    `list_tenant_nodes` and `get_node_status`, and `ops.py versions`.
+- **Already known:** `docs/wf-standard-path-v1.md` names it as a known limit. Running node actions
+  concurrently is future work there.
+- **What 0.1.123 does about its own share:** stage 4's background reads keep at most one read per
+  hive, read one hive at a time, and re-read held or failed hives every 10 min. The limit itself
+  stays.
+- **Seen on 8.x (0.1.123's deploy, 2026-11-09):** one read lost by the router (A-203) held the
+  worker for 45 s. The reads of worker1 and ingress1 queued behind it, so SY.admin saw both
+  settled about 27 s late.
+- **Proposal:** answer read forwards (`GET_VERSIONS`, `list_versions`) outside the single worker,
+  and drop a queued request whose caller's deadline has passed. The operator's call on when.
+
+### A-198 [General/admin] ✅ VALIDATED ON 8.x (0.1.123, 2026-11-09; found 2026-11-09 while fixing A-197) — Other SY.admin mesh replies can outgrow the frame, and the caller then waits to its timeout
 
 - **Why:** the SDK refuses a mesh frame over 128 KiB before sending it (`FRAME_TOO_LARGE`). The
   caller gets no answer, only its own timeout, and no reason.
@@ -1335,6 +1482,27 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - `get_installation` and `/versions`: the list of versions grows without bound.
 - **Proposal:** SY.admin answers `REPLY_TOO_LARGE` whenever a mesh reply would pass the frame, so
   the caller learns why at once. Paging follows where a list can grow. When is the operator's call.
+- **The operator (2026-11-09):** in 0.1.123, beside stage 4, since both touch SY.admin.
+- **Fix (0.1.123):**
+  - SY.admin, SY.identity, SY.vault and SY.orchestrator measure each reply against the frame less
+    a 1 KiB reserve for the router (A-202). One that does not fit is answered with
+    `REPLY_TOO_LARGE`: its size, the most it may be, the action's outcome (so a write that ran says
+    so) and how to page.
+  - Optional `limit`/`cursor` pages: SY.identity's ILKs and tenants, SY.vault's list,
+    SY.orchestrator's nodes, inventory and versions, the admin command log (by a sequence number)
+    and the installation's versions. SY.admin assembles the pages, so a caller that asks for no
+    page gets every row, as before.
+  - An executor run's answer is cut to fit, its largest outputs first. Past that, the answer is
+    `REPLY_TOO_LARGE` with the run's id and log path, and Archi says the plan ran.
+  - Archi passes the pages; IO.cloud relays them on the lists Cloud uses.
+- **Checked on 8.x (0.1.123's gate), over HTTP:**
+  - ILKs 63 in 7 pages of 10;
+  - the command log's 245 in pages of 20;
+  - `/versions` 2 hives a page;
+  - worker1's nodes 10 in pages of 3;
+  - the vault's 12 secrets with a limit of 4.
+  - Without `limit`, every row, as before: the ILKs in 24.6 KB (as measured before the release),
+    `/versions` 29.7 KB, the command log's 50.
 
 ### A-197 [Archi] ✅ VALIDATED ON 8.x (0.1.122, 2026-11-09; found 2026-11-09 by 0.1.122's review round, seen in SY.admin's journal on 8.x) — Archi's catalog of SY.admin's actions did not fit the mesh's frame
 
@@ -1416,6 +1584,14 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
   - hash each binary once per role-tree rebuild;
   - time the package's scripts, to see where the 65 s go;
   - add a peer to the motherbee's Syncthing through its REST, without a restart.
+- **0.1.123's deploy (392 s, the first through the installation's update):** snapshots 34 s; apt
+  install 146 s; the motherbee's admin on the version 64 s; the update's call 29 s; the hives on
+  the target 94 s. About 85 s of the last came from one lost read (A-203, with A-199).
+- **A hive back after its router was down a while (0.1.123's gate, 2 min):** the SY nodes that kept
+  running reconnect on the SDK's backoff, 100 ms doubling to 30 s
+  (`node_client.rs:211`). sy-config-routes reconnected 20 s after the router came back. The
+  orchestrator waits for its lifecycle nodes before it connects, so the hive showed to the
+  motherbee 20 s late.
 
 ### A-192 [General/vault] 🟢 LAB NOTE, no change (found 2026-11-08, 0.1.117's deploy on 8.x; read in its journals) — A running IO node's secret read is refused for a moment at a motherbee restart
 
@@ -1689,7 +1865,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
 - **Validated on 8.x (0.1.113):** every node joined its router again after the deploy (36 active,
   as before); a handshake took 11 ms.
 
-### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117, stage 3 ✅ 0.1.120–0.1.122; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
+### A-181 [General/blob] 🔵 BY STAGES, the operator's direction (stage 1 ✅ 0.1.116, stage 2 ✅ 0.1.117, stage 3 ✅ 0.1.120–0.1.122, stage 4 ✅ 0.1.123; 2026-11-08; docs/hive-config-update-v1.md; found 2026-11-07 by the sweep of pending items, read in the code 2026-11-08) — A blob folder turned on after the joins is shared with no spoke
 
 - **The sweep's item:** a blob folder turned on after the spokes joined is never shared with
   them.
@@ -1849,6 +2025,23 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     - **Kept:** a hive's apply restarts its readers inline, so its orchestrator answers other
       system messages a few seconds later. `NOT_PRIMARY` answers 409.
     - **Found:** A-197, which went in the same release.
+- **Stage 4, ✅ 0.1.123 on 8.x (the deploy through it; a hive away during a config change,
+  finished once by the automatic step; a rolled-back hive held, and left alone by it):**
+  - SY.admin's `update_installation` (the operator's word) and `get_installation_update` (Archi's
+    read). It brings every hive to the motherbee's core and installation file, core then config,
+    keeps the update in its state dir and resumes it after a restart.
+  - What it leaves alone, with why: a hive rolled back with `core_rollback` keeps its core unless
+    named, and the update is `held`; a copy edited by hand gets no config.
+  - The automatic step: once per hive and target, only for a hive that did not answer and comes
+    back; never a rolled-back hive, one ahead or one with a hand-edited copy.
+  - `set_installation_ai` opens the update; Archi follows it to its end; `ops.py deploy` runs it
+    from 0.1.123.
+  - **Its review round:** F1–F12 fixed. They covered an unreadable registry, the reads (one per
+    hive, a 50 s timeout and a cadence), Archi's follow, the stale target, a timed-out core
+    followed through `/versions`, one explicit run at a time, a rolled-back motherbee, ops.py's
+    follow and the docs.
+  - **The gate found:** A-203 (the router loses a frame to a hive whose link just dropped), A-204
+    and A-205 (the update's record).
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
 
