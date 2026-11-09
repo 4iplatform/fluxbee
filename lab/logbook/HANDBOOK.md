@@ -445,6 +445,11 @@ sudo apt-get update && sudo apt-get install -y fluxbee    # or fluxbee=<version>
   Ubuntu archive.
 - **`[trusted=yes]` is mandatory** while the repo is not signed (apt rejects unsigned repos).
 - It installs a **full backend** (motherbee): next come `hive.yaml` + `fluxbee-firstboot`.
+- **Choose the AI provider in `hive.yaml` before `fluxbee-firstboot`** (since 0.1.121): its `ai`
+  becomes version 1 of the installation file (`/var/lib/fluxbee/dist/installation/
+  installation.json`) at the orchestrator's first start, and hive.yaml's `ai` is ignored after
+  that. To take it again while version 1 is the only one recorded: delete that file, restart
+  `sy-orchestrator` and the AI nodes. From stage 3c on, the operator's action changes it.
 - **Validated 2026-09-25:** `apt-get install -s fluxbee` from a clean Ubuntu 24.04 on the 8.x
   (it resolves 13 packages), and a download from a machine over VPN (source `10.100.0.2`). The
   box's 8.x leg answers clients from **any** subnet through policy routing (table 108, see the
@@ -521,7 +526,11 @@ sshd -T | grep -i passwordauth        # no
 wc -l < ~fluxops/.ssh/authorized_keys # 0  (the MB key was revoked)
 ls /etc/sudoers.d/                    # no fluxbee-orchestrator
 systemctl list-units 'fluxbee*' 'rt-*' --no-legend | wc -l   # 9 services
+grep -c '^ai:' /etc/fluxbee/hive.yaml # 0: a worker's ai is the installation file's (since 0.1.121)
 ```
+
+And on the motherbee: `GET /hives/<hive>/versions` shows `config.state: current`, the new hive's
+copy of the installation file, which the join copies with core and vendor.
 
 ### egress — it needs more
 
@@ -800,6 +809,11 @@ ops run 100 script.sh [args]    # a local script (bash or .py) on a VM
    count as updated.
 7. `health` since the start of the deploy.
 
+Since 0.1.121 `/versions` also shows each hive's copy of the installation file in `config`: a spoke
+reads `pending` until its new orchestrator declares the folder and Syncthing delivers the file, then
+`current`. A worker's SY.cognition, restarted by the update before the file arrives, reads its
+hive.yaml's `ai` (the same values) until its next start, and says so in its log.
+
 The one-snapshot rule (below) is kept this way: if a VM already has its one, `deploy` does not
 start until you name it with `--drop`. It takes the new one first, then deletes that one and no
 other. The ledger record is still made by hand.
@@ -1065,10 +1079,10 @@ as with SY.opa.rules on the ingress and the egress in 0.1.41.)
   reports anything left out, pending or awaiting (since 0.1.117).
 
 A hive that joins later needs none of this: the join writes no list, and the spoke's orchestrator
-has it. Neither does the `fluxbee-dist-policy` folder: it inherits the peers of
-`fluxbee-dist-vendor` at the next start of the orchestrator on each side. **Only that one:** the
-orchestrator does it by its fixed name; a new folder for all roles needs the same code (or
-generalizing it).
+has it. Neither do the `fluxbee-dist-policy` and `fluxbee-dist-installation` folders: they
+inherit the peers of `fluxbee-dist-vendor` at the next start of the orchestrator on each side.
+**Only those two:** the orchestrator does it by their fixed names; a new folder for all roles needs
+the same code (or generalizing it).
 
 ### The rollback
 
@@ -1087,6 +1101,14 @@ Three paths:
    last release.
 3. **Keep the previous `.deb` published** in the apt repo and downgrade with `apt`. It reaches the
    last 10 versions: `ops publish` keeps the newest 10 in the repo (FINDINGS B-17).
+
+**Downgrading from 0.1.121 or later to an earlier version:** the readers of 0.1.120 or earlier
+read `ai` from each hive's `hive.yaml`, and stop on an invalid one. The hives joined before
+0.1.121 keep theirs (ignored since, never removed): keep it, and keep it as the installation file
+says. A worker joined by 0.1.121 or later has none: put the file's `ai` in its hive.yaml first,
+or its readers run the fallback engine (OpenAI `gpt-5.5`). The folder, the file and
+`installation-versions.json` can stay; nothing rewrites the file when the hive comes forward
+again.
 
 **Downgrading from 0.1.117 or later to an earlier version:** an orchestrator of 0.1.116 or earlier
 reads its role's SY nodes and the blob's and dist's topology from `hive.yaml`, and does not start

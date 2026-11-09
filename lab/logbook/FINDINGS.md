@@ -1760,8 +1760,25 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     fallback must be said and must end. Its lows were fixed in the SDK, since a later SDK change
     would need a release of its own: `validate` in `render` too, the file's state with its hash, a
     lazy fallback, the path from the hive's dist.
-  - **3b:** the motherbee writes the file as version 1 and distributes it, the readers switch to
-    it, and `/versions` shows it. Nothing changes in behavior.
+  - **3b, built for 0.1.121:** the motherbee's orchestrator writes the file as version 1 from its
+    hive.yaml `ai` (recorded first, written atomically, 0644). A new folder,
+    `fluxbee-dist-installation`, follows vendor's members, and the join copies the file and
+    writes no `ai`. SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it,
+    each logging its source. An invalid file fails the AI work with the reason, and never stops
+    SY.admin's or the orchestrator's start. `/versions` gives each hive's `config` (`current`,
+    `behind`, `pending`, `edited_by_hand`). Nothing changes in behavior.
+  - **3b's review round:** no high.
+    - **Medium, fixed:** the install texts still told the operator to edit hive.yaml's `ai` after
+      firstboot, which 3b ignores. They now say to choose it before firstboot, and how to take
+      hive.yaml's `ai` again while version 1 is the only one (delete the file, restart the
+      orchestrator).
+    - **Lows fixed:** the join refuses while the motherbee holds no file; SY.admin keeps its
+      executor when hive.yaml cannot be read during a refresh; the ignored-`ai` warning says
+      rt-gateway still checks it; Archi's handbook and SY.admin's notes name the installation
+      file's `ai`.
+    - **Left:** rt-gateway's check of hive.yaml `ai` goes with the router's own release. Between
+      3b and 3c, the operator's only way to change `ai` is the delete-and-restart above.
+      Downgrade notes are in the HANDBOOK.
   - **3c:** the operator's action and the `config` update.
 
 ### A-180 [General/orchestrator] ✅ VALIDATED ON 8.x (0.1.112, 2026-11-08; found 2026-11-08, checking A-177; lab/DEPLOYMENTS.md's 0.1.60 incident; read in the code) — A second sy-orchestrator started by hand runs beside the live one
