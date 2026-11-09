@@ -651,22 +651,31 @@ built (stage 3c)"). SY.admin's `set_installation_ai` sends two `SYSTEM_UPDATE`s 
 - **The apply**, `{category: "config", manifest_version, manifest_hash}`, on every hive
   (`apply_config_update_local`, under the update lock):
   - `sync_pending` until the hive's copy is that version with that hash
-    (`local_system_manifest_state`);
+    (`local_system_manifest_state`); a copy of that very version with another hash is refused,
+    `INSTALLATION_HASH_MISMATCH` with both hashes (`config_hash_differs_within_version`): within one
+    version the file does not change while it syncs. Category `config` only;
   - it restarts only its start readers (`installation_start_readers`): `sy-cognition` and
     `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker, none on an ingress or an
     egress; and of those, only the ones its role runs that systemd has active, since one that does
     not run reads the file at its next start;
-  - only when their engine changed (`config_update_plan`): the version's default provider with its
-    model (`ai_settings::engine_of`) against the one in
+  - only when their engine changed, or nothing says what they run (`config_update_plan`): the
+    version's default provider with its model (`ai_settings::engine_of`) against the one in
     `/var/lib/fluxbee/orchestrator/config-applied.json`, the update this hive applied last
-    (`{version, sha256, applied_at_ms, ai, restarted}`). Without that record (a hive's first config
-    update, or one it cannot read) every start reader restarts; the same version and hash again
-    restarts nothing;
+    (`{version, sha256, applied_at_ms, ai, restarted, active_since}`). Nothing says what a reader
+    runs without that record (a hive's first config update, or one it cannot read), or when its
+    unit became active since the record: `active_since` keeps when systemd last made each running
+    reader active (`ActiveEnterTimestampMonotonic`, `systemd_active_since`), and a reader active
+    since another time read whatever file it found then. The same version and hash again restarts
+    nothing;
   - each restart behind the core's 30 s health gate (`restart_core_service_with_health_gate`).
     The record is written after the restarts, only when they all succeeded; otherwise the answer is
-    `error` with `RESTART_FAILED`, and running the update again restarts them again. A record that
-    cannot be written once they all restarted is `error` with `CONFIG_RECORD_FAILED`
-    (`config_update_error_code`): the readers run the version, and the next update restarts them.
+    `error` with `RESTART_FAILED`. A record that cannot be written once they all restarted is
+    `error` with `CONFIG_RECORD_FAILED` (`config_update_error_code`): the readers run the version.
+    Either way the readers that restarted are active since another time than the record the hive
+    holds, so the next update restarts them again. `remove_hive`'s cleanup deletes the record, so
+    a box joined again starts with none;
+  - inline: the orchestrator answers its other system messages once the restarts end, a few
+    seconds later.
 
   The answer lists `restarted`, `unchanged` and `errors`. SY.admin and SY.architect are never
   restarted: they take a new version at their next use, and ai.generic at its next request.
@@ -881,9 +890,10 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
   warns and `/versions` shows `config.not_written` or the copy's `state`; the orchestrator runs
   either way, and so do the readers, each failing only its AI work with the reason.
 - **A config update's reader does not restart.** The answer is `error` with `RESTART_FAILED` and
-  the reasons, the record of the update applied last is left as it was, and the same update run
-  again restarts the readers again. When they all restarted and the record cannot be written, the
-  answer is `error` with `CONFIG_RECORD_FAILED`.
+  the reasons, and the record of the update applied last is left as it was. The readers that did
+  restart are active since another time than that record, so the same update run again restarts
+  them again. When they all restarted and the record cannot be written, the answer is `error`
+  with `CONFIG_RECORD_FAILED`, and the next update restarts them for the same reason.
 - **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
   within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
   `ORCHESTRATOR_BOOTING`.

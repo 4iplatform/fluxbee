@@ -3877,6 +3877,21 @@ fn manifest_match(
     }
 }
 
+/// For category `config` only (stage 3c's review, F5): the hive holds the version an update names,
+/// with another hash. The installation file does not change within one version while it syncs, so
+/// that copy is never on its way: the update is refused with both hashes, never `sync_pending`.
+/// The other categories stay as they are.
+fn config_hash_differs_within_version(
+    category: &str,
+    expected_version: u64,
+    local: &LocalSystemManifestState,
+) -> bool {
+    category == "config"
+        && expected_version != 0
+        && local.version == Some(expected_version)
+        && local.hash.is_some()
+}
+
 /// A SYSTEM_UPDATE that writes the installation file rather than applies a version: category
 /// `config` with a `write` (stage 3c).
 fn is_installation_write(payload: &serde_json::Value) -> bool {
@@ -6272,6 +6287,30 @@ async fn handle_system_update_message(
                 "errors": [],
             });
         }
+        // The installation file does not change within one version while it syncs: the version the
+        // update names with another hash is never on its way (stage 3c's review, F5).
+        ManifestMatch::Mismatch
+            if config_hash_differs_within_version(category, expected_version, &local) =>
+        {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INSTALLATION_HASH_MISMATCH",
+                "message": format!(
+                    "this hive holds the installation file's version {expected_version} with sha256 \
+                     {local_hash}, not {}: within one version the file does not change while it \
+                     syncs. Read the version and hash again (get_installation); a copy edited by \
+                     hand shows in /versions as edited_by_hand",
+                    normalize_sha256(expected_hash)
+                ),
+                "category": category,
+                "hive": state.hive_id.as_str(),
+                "manifest_version": expected_version,
+                "manifest_hash": normalize_sha256(expected_hash),
+                "local_manifest_version": local.version,
+                "local_manifest_hash": local_hash,
+                "errors": [],
+            });
+        }
         ManifestMatch::Behind | ManifestMatch::Mismatch => {
             return serde_json::json!({
                 "status": "sync_pending",
@@ -7430,9 +7469,10 @@ fn config_applied_path() -> PathBuf {
 }
 
 /// The config update a hive applied last (stage 3c): the version, its hash, when, its `ai` values
-/// (provider and model names only, `ai_settings::ai_values`) and the readers it restarted. The next
-/// update restarts a reader only when its engine differs from this one's; `/versions` shows it as
-/// the hive's `config.applied`.
+/// (provider and model names only, `ai_settings::ai_values`), the readers it restarted, and when
+/// systemd last made each running reader active. The next update restarts a reader when its
+/// engine differs from this one's, or when its unit became active since this record (stage 3c's
+/// review, F2); `/versions` shows it as the hive's `config.applied`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ConfigAppliedRecord {
     version: u64,
@@ -7441,6 +7481,36 @@ struct ConfigAppliedRecord {
     ai: HiveAiConfig,
     #[serde(default)]
     restarted: Vec<String>,
+    /// Each start reader active once the update applied, by service, with when its unit last
+    /// became active (`systemd_active_since`). A reader active since another time read whatever
+    /// file it found then: a restart for another reason, a restart that failed here, a record that
+    /// could not be written, a box joined again. Its engine is unknown, so the next update restarts
+    /// it.
+    #[serde(default)]
+    active_since: BTreeMap<String, u64>,
+}
+
+/// When systemd last made `service` active, its `ActiveEnterTimestampMonotonic` (µs since the
+/// host's boot): None when it cannot be read or the unit never was. Exact and of this boot, so a
+/// reader restarted for any reason, or a host rebooted, never reads as the one recorded.
+fn systemd_active_since(service: &str) -> Option<u64> {
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(format!("{service}.service"))
+        .arg("--property=ActiveEnterTimestampMonotonic")
+        .arg("--value")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_active_since(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `systemctl show --property=ActiveEnterTimestampMonotonic --value`'s answer: None for a unit
+/// that never became active (0) or an answer that is not a number.
+fn parse_active_since(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|since| *since > 0)
 }
 
 /// The record at `path`: none while it does not exist (no config update applied here yet); an
@@ -7501,19 +7571,28 @@ fn installation_start_reader_services(role: HiveRole) -> Vec<String> {
 enum ConfigUpdatePlan {
     /// This version, with this hash, is the one applied last: nothing restarts.
     AlreadyApplied,
-    /// The readers to restart and those left as they are: all restart when no record says what
-    /// they run (a hive's first config update), and none when their engine is the one applied last.
+    /// The readers to restart and those left as they are.
     Apply {
         restart: Vec<String>,
         unchanged: Vec<String>,
     },
 }
 
+/// A start reader as a config update finds it: its service, and when its unit last became active
+/// (`systemd_active_since`; None when that cannot be read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReaderNow {
+    service: String,
+    active_since: Option<u64>,
+}
+
 /// The restart decision (stage 3c). A reader's engine is `ai_settings::engine_of` its values: the
-/// default provider with its model. Every start reader runs that one engine, so they restart
-/// together or not at all.
+/// default provider with its model. A reader restarts when nothing says what it runs: no record
+/// (a hive's first config update), or a unit active since another time than the record's, which
+/// read whatever file it found then (stage 3c's review, F2). Else it restarts when the engine
+/// differs from the one applied last. The same version and hash again restarts nothing.
 fn config_update_plan(
-    readers: &[String],
+    readers: &[ReaderNow],
     previous: Option<&ConfigAppliedRecord>,
     version: u64,
     sha256: &str,
@@ -7535,25 +7614,30 @@ fn config_update_plan(
         },
         None => true,
     };
-    let readers = readers.to_vec();
-    if engine_changed {
-        ConfigUpdatePlan::Apply {
-            restart: readers,
-            unchanged: Vec::new(),
-        }
-    } else {
-        ConfigUpdatePlan::Apply {
-            restart: Vec::new(),
-            unchanged: readers,
+    let mut restart = Vec::new();
+    let mut unchanged = Vec::new();
+    for reader in readers {
+        let known = previous.is_some_and(|previous| {
+            reader.active_since.is_some()
+                && previous.active_since.get(&reader.service) == reader.active_since.as_ref()
+        });
+        if engine_changed || !known {
+            restart.push(reader.service.clone());
+        } else {
+            unchanged.push(reader.service.clone());
         }
     }
+    ConfigUpdatePlan::Apply { restart, unchanged }
 }
 
 /// SYSTEM_UPDATE category config once this hive holds the version it names (stage 3c): restarts the
-/// start readers whose engine changed (`config_update_plan`), only those this hive runs, each behind
-/// the core's health gate, and then records what it applied. A reader that does not run is left as
-/// it is: it reads the file at its next start. A restart that fails leaves the record as it was, so
-/// the same update run again restarts the readers again.
+/// start readers whose engine changed or is unknown (`config_update_plan`), only those this hive
+/// runs, each behind the core's health gate, and then records what it applied with when each
+/// running reader became active. A reader that does not run is left as it is: it reads the file at
+/// its next start. A restart that fails leaves the record as it was; the readers that did restart
+/// are then active since another time than the record's, so the same update run again restarts
+/// them again. The restarts run inline: this orchestrator answers its other system messages once
+/// they end, a few seconds later.
 async fn apply_config_update_local(
     state: &OrchestratorState,
     request: &SystemUpdateRequest,
@@ -7589,7 +7673,14 @@ async fn apply_config_update_local(
         }
         Err(err) => return Err(ai_settings::plain_error(&err).into()),
     };
-    let readers = installation_start_reader_services(state.role);
+    let services = installation_start_reader_services(state.role);
+    let readers: Vec<ReaderNow> = services
+        .iter()
+        .map(|service| ReaderNow {
+            service: service.clone(),
+            active_since: systemd_active_since(service),
+        })
+        .collect();
     let applied_path = config_applied_path();
     let previous = match read_config_applied(&applied_path) {
         Ok(previous) => previous,
@@ -7619,7 +7710,7 @@ async fn apply_config_update_local(
             return Ok(SystemUpdateApplyResult {
                 status: "ok".to_string(),
                 updated: Vec::new(),
-                unchanged: readers,
+                unchanged: services,
                 left_out: Vec::new(),
                 restarted: Vec::new(),
                 errors: Vec::new(),
@@ -7645,15 +7736,28 @@ async fn apply_config_update_local(
         }
     }
     if errors.is_empty() {
+        // When each running reader became active, now that it runs this version: the next update
+        // tells a reader restarted since from one that still runs it (stage 3c's review, F2).
+        let active_since = services
+            .iter()
+            .filter(|service| systemd_is_active(service))
+            .filter_map(|service| {
+                systemd_active_since(service).map(|since| (service.clone(), since))
+            })
+            .collect();
         let record = ConfigAppliedRecord {
             version,
             sha256: installed.sha256.clone(),
             applied_at_ms: now_epoch_ms(),
             ai: values,
             restarted: restarted.clone(),
+            active_since,
         };
         if let Err(err) = write_config_applied(&applied_path, &record) {
-            errors.push(format!("{CONFIG_RECORD_UNWRITTEN} ({err}); the next config update restarts every reader again"));
+            errors.push(format!(
+                "{CONFIG_RECORD_UNWRITTEN} ({err}); they became active after the record this hive \
+                 holds, so the next config update restarts them again"
+            ));
         }
     }
     tracing::info!(
@@ -17758,7 +17862,8 @@ done; \
 systemctl stop 'fluxbee-node-*' >/dev/null 2>&1 || true; \
 systemctl reset-failed 'fluxbee-node-*' >/dev/null 2>&1 || true; \
 rm -rf /var/lib/fluxbee/nodes/* >/dev/null 2>&1 || true; \
-rm -rf /var/lib/fluxbee/state/nodes/* >/dev/null 2>&1 || true"
+rm -rf /var/lib/fluxbee/state/nodes/* >/dev/null 2>&1 || true; \
+rm -f /var/lib/fluxbee/orchestrator/config-applied.json >/dev/null 2>&1 || true"
 }
 
 /// F11: NAT teardown appended to the cleanup script on a `role: egress` host.
@@ -40803,6 +40908,13 @@ blob:
         );
         fs::write(&file, &other).expect("another v2");
         assert_eq!(check(2, &v2_sha256), ManifestMatch::Mismatch);
+        // Stage 3c's review (F5): for category config, version 2 with another hash is refused,
+        // never sync_pending; another category, or another version, stays as it was.
+        let local = local_system_manifest_state("config", &dist).expect("state");
+        assert!(config_hash_differs_within_version("config", 2, &local));
+        assert!(!config_hash_differs_within_version("core", 2, &local));
+        assert!(!config_hash_differs_within_version("config", 0, &local));
+        assert!(!config_hash_differs_within_version("config", 3, &local));
         fs::write(&file, &v2).expect("v2");
         assert_eq!(check(2, &v2_sha256), ManifestMatch::Matched);
         assert_eq!(
@@ -40850,24 +40962,38 @@ blob:
 
     /// The restart decision: without a record every reader restarts; a change of the engine (the
     /// default provider or its model) restarts them; another provider's model, or the same
-    /// version again, restarts nothing.
+    /// version again, restarts nothing. A reader active since another time than the record's runs
+    /// an engine nothing says, and restarts (stage 3c's review, F2).
     #[test]
     fn a_config_update_restarts_the_readers_only_when_their_engine_changes() {
-        let readers = installation_start_reader_services(HiveRole::Motherbee);
+        let services = installation_start_reader_services(HiveRole::Motherbee);
+        // Both readers active since the times the last update recorded.
+        let readers: Vec<ReaderNow> = services
+            .iter()
+            .enumerate()
+            .map(|(at, service)| ReaderNow {
+                service: service.clone(),
+                active_since: Some(1_000 + at as u64),
+            })
+            .collect();
         let applied = |version: u64, sha256: &str, ai: HiveAiConfig| ConfigAppliedRecord {
             version,
             sha256: sha256.to_string(),
             applied_at_ms: 1,
             ai,
             restarted: Vec::new(),
+            active_since: readers
+                .iter()
+                .map(|reader| (reader.service.clone(), reader.active_since.expect("active")))
+                .collect(),
         };
         let restart_all = ConfigUpdatePlan::Apply {
-            restart: readers.clone(),
+            restart: services.clone(),
             unchanged: Vec::new(),
         };
         let restart_none = ConfigUpdatePlan::Apply {
             restart: Vec::new(),
-            unchanged: readers.clone(),
+            unchanged: services.clone(),
         };
         // A hive's first config update: nothing says what its readers run.
         assert_eq!(
@@ -40918,6 +41044,56 @@ blob:
                 unchanged: Vec::new(),
             }
         );
+
+        // F2's case: v2 (opus) restarted both readers, and its record could not be written, so the
+        // hive still records v1 (sonnet). The operator undoes with v3, v1's values: sonnet against
+        // sonnet, and still both restart, since each became active after the record.
+        let since_v2: Vec<ReaderNow> = readers
+            .iter()
+            .map(|reader| ReaderNow {
+                active_since: reader.active_since.map(|since| since + 50_000),
+                ..reader.clone()
+            })
+            .collect();
+        assert_eq!(
+            config_update_plan(&since_v2, Some(&v1), 3, "ccc", &claude_by_default()),
+            restart_all
+        );
+        // One reader restarted for another reason since; the other still runs what was recorded.
+        let mut one_restarted = readers.clone();
+        one_restarted[1].active_since = Some(99_999);
+        assert_eq!(
+            config_update_plan(&one_restarted, Some(&v1), 2, "bbb", &openai_model),
+            ConfigUpdatePlan::Apply {
+                restart: vec![services[1].clone()],
+                unchanged: vec![services[0].clone()],
+            }
+        );
+        // A reader whose activation cannot be read, or one the record does not name (a box joined
+        // again, a record of before this fix): unknown, restarted.
+        let mut unreadable = readers.clone();
+        unreadable[0].active_since = None;
+        let mut unnamed = v1.clone();
+        unnamed.active_since.clear();
+        for (now, record) in [(&unreadable, &v1), (&readers, &unnamed)] {
+            let ConfigUpdatePlan::Apply { restart, .. } =
+                config_update_plan(now, Some(record), 2, "bbb", &openai_model)
+            else {
+                panic!("a plan");
+            };
+            assert!(restart.contains(&services[0]), "{restart:?}");
+        }
+        // The same version and hash restarts nothing, however the readers came up since.
+        assert_eq!(
+            config_update_plan(&since_v2, Some(&v1), 1, "aaa", &claude_by_default()),
+            ConfigUpdatePlan::AlreadyApplied
+        );
+        assert_eq!(parse_active_since(" 123456789\n"), Some(123_456_789));
+        assert_eq!(parse_active_since("0"), None);
+        assert_eq!(parse_active_since(""), None);
+        // A box removed from the installation forgets what it applied.
+        assert!(remove_hive_cleanup_script()
+            .contains(&format!("rm -f {}", config_applied_path().display())));
         // A reader that did not restart, and a record that could not be written, by their codes.
         let unwritten = format!("{CONFIG_RECORD_UNWRITTEN} (disk full)");
         assert_eq!(
@@ -40946,6 +41122,7 @@ blob:
             applied_at_ms: 42,
             ai: claude_by_default(),
             restarted: vec!["sy-cognition".to_string()],
+            active_since: BTreeMap::from([("sy-cognition".to_string(), 7_000_000)]),
         };
         write_config_applied(&path, &record).expect("written");
         assert_eq!(
