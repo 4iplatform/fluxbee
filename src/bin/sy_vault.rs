@@ -69,6 +69,9 @@ enum VaultError {
     InvalidMasterKey(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// A cursor VAULT_LIST did not give (FINDINGS A-198): another listing's, or not one at all.
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(String),
     #[error("unauthorized")]
     Unauthorized,
     #[error("key not found")]
@@ -115,6 +118,7 @@ impl VaultError {
         match self {
             VaultError::InvalidMasterKey(_) => "MASTER_KEY_NOT_AVAILABLE",
             VaultError::InvalidRequest(_) => "INVALID_REQUEST",
+            VaultError::InvalidCursor(_) => mesh_reply::INVALID_CURSOR,
             VaultError::Unauthorized
             | VaultError::TenantNotActive(_)
             | VaultError::CallerMismatch(_) => "UNAUTHORIZED",
@@ -775,7 +779,7 @@ fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultR
             Some(cursor.trim().to_string()).filter(|cursor| !cursor.is_empty())
         }
         Some(_) => {
-            return Err(VaultError::InvalidRequest(
+            return Err(VaultError::InvalidCursor(
                 "cursor must be the next_cursor of the page before, a string".to_string(),
             ))
         }
@@ -784,7 +788,7 @@ fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultR
         .as_deref()
         .is_some_and(|cursor| VaultListPlace::parse(cursor).is_none())
     {
-        return Err(VaultError::InvalidRequest(
+        return Err(VaultError::InvalidCursor(
             "cursor is not a next_cursor of VAULT_LIST".to_string(),
         ));
     }
@@ -2202,28 +2206,35 @@ async fn send_system_response(
         payload,
     };
     let outcome = mesh_reply::reply_outcome(&payload);
-    match sender.send(reply(payload)).await {
-        Ok(()) => Ok(()),
-        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
-            let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
-            tracing::warn!(
-                request = request_msg,
-                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
-                size,
-                max,
-                "a vault answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
-            );
-            let how = if request_msg == MSG_VAULT_LIST {
-                "ask it in pages with filter.limit and cursor, following next_cursor"
-            } else {
-                "the secret's value is too large for one frame; read its metadata with VAULT_GET_METADATA"
-            };
-            let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, how);
-            sender.send(reply(small)).await?;
-            Ok(())
-        }
-        Err(err) => Err(err.into()),
-    }
+    let rows = mesh_reply::listing_rows(&payload);
+    let message = reply(payload);
+    // Measured against the frame less the router's reserve (FINDINGS A-202), and the SDK's own
+    // refusal taken the same way.
+    let size = match mesh_reply::oversized(&message) {
+        Some(size) => size,
+        None => match sender.send(message).await {
+            Ok(()) => return Ok(()),
+            Err(fluxbee_sdk::NodeError::MessageTooLarge { size, .. }) => size,
+            Err(err) => return Err(err.into()),
+        },
+    };
+    let max = mesh_reply::REPLY_MAX_BYTES;
+    let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
+    tracing::warn!(
+        request = request_msg,
+        caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+        size,
+        max,
+        "a vault answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+    );
+    let how = if request_msg == MSG_VAULT_LIST {
+        "ask it in pages with filter.limit and cursor, following next_cursor"
+    } else {
+        "the secret's value is too large for one frame; read its metadata with VAULT_GET_METADATA"
+    };
+    let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, rows, how);
+    sender.send(reply(small)).await?;
+    Ok(())
 }
 
 fn response_action_for(action: &str) -> &'static str {
@@ -2561,7 +2572,7 @@ mod tests {
             &admin,
         )
         .expect_err("refused");
-        assert_eq!(err.code(), "INVALID_REQUEST");
+        assert_eq!(err.code(), "INVALID_CURSOR");
         cleanup(dir);
     }
 

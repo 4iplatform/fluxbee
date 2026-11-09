@@ -1,13 +1,17 @@
 //! Mesh replies that fit the frame (FINDINGS A-198).
 //!
 //! The SDK refuses a frame over `MAX_FRAME_SIZE` (128 KiB) before it sends it, and the node that
-//! asked waits to its own timeout with no reason. Two rules keep an answer from going missing:
+//! asked waits to its own timeout with no reason. Past the SDK, the router adds to the frame (the
+//! sender's stamped `src_l2_name`, a missing `meta.action_class`) and its link writer drops one past
+//! `MAX_FRAME_SIZE` without telling the sender (FINDINGS A-202). Two rules keep an answer from going
+//! missing:
 //!
-//! - **A reply that does not fit is answered all the same.** When a node's send of a reply fails
-//!   with `NodeError::MessageTooLarge`, the node sends `REPLY_TOO_LARGE` in its place: the reply's
-//!   size, the frame's, and the reply's own outcome (`reply_outcome`: its status, its error code
-//!   and the ids it can be read back by), so an action that ran is never taken for one that did
-//!   not.
+//! - **A reply that does not fit is answered all the same.** A node measures its own reply
+//!   serialized against `REPLY_MAX_BYTES`, the frame less the router's reserve (`oversized`), and
+//!   takes the SDK's `NodeError::MessageTooLarge` the same way. Either way it sends
+//!   `REPLY_TOO_LARGE` in the reply's place: the reply's size, the most it may be, and the reply's
+//!   own outcome (`reply_outcome`: its status, its error code and the ids it can be read back by),
+//!   so an action that ran is never taken for one that did not.
 //! - **A listing that grows with the installation answers in pages.** Asked with `limit` or
 //!   `cursor` (`PageAsk`), a node answers the rows after `cursor`, at most `limit` of them and at
 //!   most `LIST_PAGE_MAX_BYTES`, with `next_cursor` while rows follow and `total`, the rows the
@@ -15,6 +19,7 @@
 
 use std::io;
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 pub use fluxbee_sdk::socket::connection::MAX_FRAME_SIZE;
@@ -22,8 +27,18 @@ pub use fluxbee_sdk::socket::connection::MAX_FRAME_SIZE;
 /// The error code of a reply that did not fit the frame, sent in a small reply's place.
 pub const REPLY_TOO_LARGE: &str = "REPLY_TOO_LARGE";
 
+/// The error code of a cursor the listing did not give (another listing's, or none at all).
+pub const INVALID_CURSOR: &str = "INVALID_CURSOR";
+
+/// What the router may still add to a frame after the SDK measured it: the sender's stamped
+/// `src_l2_name` and a missing `meta.action_class` (FINDINGS A-202).
+pub const ROUTER_RESERVE_BYTES: usize = 1024;
+
+/// The most bytes a reply may take serialized: the frame less the router's reserve.
+pub const REPLY_MAX_BYTES: usize = MAX_FRAME_SIZE - ROUTER_RESERVE_BYTES;
+
 /// The most bytes of rows one page of a listing carries: half a frame, so the rest of the answer
-/// and the envelope SY.admin wraps it in fit with room to spare.
+/// and the envelope SY.admin wraps it in fit with room to spare, the router's reserve included.
 pub const LIST_PAGE_MAX_BYTES: usize = 64 * 1024;
 
 /// The ids a reply's outcome keeps, from its top level or its `payload`, when one is a short
@@ -52,8 +67,15 @@ const OUTCOME_ID_FIELDS: &[&str] = &[
 /// The longest id text an outcome keeps.
 const OUTCOME_ID_MAX_CHARS: usize = 256;
 
+/// The size of `reply`, serialized, when it is past `REPLY_MAX_BYTES`: a reply its node must
+/// answer `REPLY_TOO_LARGE` in place of, though the SDK would still send it.
+pub fn oversized<T: Serialize + ?Sized>(reply: &T) -> Option<usize> {
+    let size = serialized_len(reply);
+    (size > REPLY_MAX_BYTES).then_some(size)
+}
+
 /// The bytes `value` takes serialized, as a frame carries it.
-pub fn serialized_len(value: &Value) -> usize {
+pub fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
     struct Count(usize);
     impl io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -109,16 +131,18 @@ fn short_scalar(value: &&Value) -> bool {
 
 /// What a node answers in place of a reply of `size` bytes the frame refused, in its own replies'
 /// shape (`status`, `error_code`, `message`): the sizes and the reply's `outcome`
-/// (`reply_outcome`, taken before the send took the reply). `request` names what was asked (its
-/// message or action); `how` says how to get the answer.
+/// (`reply_outcome`, taken before the send took the reply), and the rows of a listing it held
+/// (`listing_rows`), so SY.admin can say how many fit. `request` names what was asked (its message
+/// or action); `how` says how to get the answer.
 pub fn reply_too_large_payload(
     request: &str,
     size: usize,
     max: usize,
     outcome: Value,
+    rows: Option<usize>,
     how: &str,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "status": "error",
         "error_code": REPLY_TOO_LARGE,
         "message": format!(
@@ -127,7 +151,20 @@ pub fn reply_too_large_payload(
         "size": size,
         "max": max,
         "outcome": outcome,
-    })
+    });
+    if let Some(rows) = rows {
+        payload["rows"] = json!(rows);
+    }
+    payload
+}
+
+/// The rows of a listing's answer, the nodes' row fields at its top level (`ilks`, `tenants`,
+/// `secrets`, `nodes`, `hives`, `versions`), or none when it holds none of them.
+pub fn listing_rows(answer: &Value) -> Option<usize> {
+    ["ilks", "tenants", "secrets", "nodes", "hives", "versions"]
+        .iter()
+        .find_map(|key| answer.get(*key).and_then(Value::as_array))
+        .map(Vec::len)
 }
 
 /// What a caller asks of a listing: the rows after `cursor` (the `next_cursor` of the page
@@ -278,75 +315,144 @@ where
     }
 }
 
-/// `value` cut to about `max_bytes` serialized, its shape kept: an object keeps every field, the
-/// small ones whole and the large ones cut to their share (smallest first, so a status, an id or a
-/// short list stays as it is); an array keeps the items that fit and counts the rest
-/// (`{"truncated_items": n}`); a string keeps its start and says how many bytes it lost. Numbers,
-/// booleans and null stay. A value already within `max_bytes` comes back as it is.
+/// The least room a field of an object keeps when it is cut, not dropped.
+const BOUNDED_FIELD_MIN_BYTES: usize = 32;
+
+/// `value` cut to at most `max_bytes` serialized, its shape kept as far as it fits. An object keeps
+/// its small fields whole and cuts the large ones to their share, smallest first, so a status, an
+/// id or a short list stays as it is; a field with no room left is dropped and counted
+/// (`"truncated_keys": n`). An array keeps the items that fit, in order, and counts the rest
+/// (`{"truncated_items": n}`). A string keeps its start and says how many bytes it lost, measured
+/// as serialized, escapes included. Numbers, booleans and null stay. A value within `max_bytes`
+/// comes back as it is; one with no room for any shape becomes a short note of its size, or null.
 pub fn bounded_value(value: &Value, max_bytes: usize) -> Value {
     let size = serialized_len(value);
     if size <= max_bytes {
         return value.clone();
     }
-    // Too little room for any of its shape: what it was, in a few bytes.
-    if max_bytes < 48 {
-        return json!(format!("[{size} bytes cut]"));
-    }
-    match value {
-        Value::String(text) => {
-            // The quotes and the note of what was cut, at its longest.
-            let note = format!("…[{} bytes cut]", text.len()).len() + 2;
-            let mut keep = max_bytes.saturating_sub(note);
-            while keep > 0 && !text.is_char_boundary(keep) {
-                keep -= 1;
-            }
-            let keep = keep.min(text.len());
-            json!(format!(
-                "{}…[{} bytes cut]",
-                &text[..keep],
-                text.len() - keep
-            ))
-        }
-        Value::Array(items) => {
-            // Room for the count of what was cut.
-            let mut left = max_bytes.saturating_sub(2 + 32);
-            let mut kept = Vec::new();
-            for item in items {
-                let item_size = serialized_len(item) + 1;
-                if item_size > left {
-                    break;
-                }
-                left -= item_size;
-                kept.push(item.clone());
-            }
-            let cut = items.len() - kept.len();
-            kept.push(json!({ "truncated_items": cut }));
-            Value::Array(kept)
-        }
-        Value::Object(fields) => {
-            let mut by_size: Vec<(&String, &Value, usize)> = fields
-                .iter()
-                .map(|(key, field)| (key, field, serialized_len(field)))
-                .collect();
-            by_size.sort_by_key(|(_, _, size)| *size);
-            let count = by_size.len();
-            let mut left = max_bytes.saturating_sub(2);
-            let mut kept = Map::new();
-            for (index, (key, field, field_size)) in by_size.into_iter().enumerate() {
-                let overhead = key.len() + 4;
-                let share = (left / (count - index)).saturating_sub(overhead);
-                let field = if field_size <= share {
-                    field.clone()
-                } else {
-                    bounded_value(field, share)
-                };
-                left = left.saturating_sub(serialized_len(&field) + overhead);
-                kept.insert(key.clone(), field);
-            }
-            Value::Object(kept)
-        }
+    let cut = match value {
+        Value::String(text) => bounded_text(text, max_bytes),
+        Value::Array(items) => bounded_items(items, max_bytes),
+        Value::Object(fields) => bounded_fields(fields, max_bytes),
         _ => value.clone(),
+    };
+    if serialized_len(&cut) <= max_bytes {
+        return cut;
     }
+    let note = json!(format!("[{size} bytes cut]"));
+    if serialized_len(&note) <= max_bytes {
+        note
+    } else {
+        Value::Null
+    }
+}
+
+/// The longest start of `text` that fits `max_bytes` serialized, escapes included, with its note of
+/// what was cut.
+fn bounded_text(text: &str, max_bytes: usize) -> Value {
+    let with_note = |keep: usize| {
+        json!(format!(
+            "{}…[{} bytes cut]",
+            &text[..keep],
+            text.len() - keep
+        ))
+    };
+    // Where each character ends: a start of the text ends at one of these, or is empty.
+    let ends: Vec<usize> = text
+        .char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .collect();
+    let keep = |characters: usize| {
+        if characters == 0 {
+            0
+        } else {
+            ends[characters - 1]
+        }
+    };
+    // A longer start never serializes shorter (a character adds at least a byte, and the note loses
+    // at most a digit), so a binary search finds the most characters that fit.
+    let (mut low, mut high) = (0usize, ends.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if serialized_len(&with_note(keep(mid))) <= max_bytes {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    with_note(keep(low))
+}
+
+/// The items of an array that fit `max_bytes` in order, then the count of the rest.
+fn bounded_items(items: &[Value], max_bytes: usize) -> Value {
+    let mut kept = Vec::new();
+    // The brackets, and the note of what was cut at its longest.
+    let mut used = 2 + serialized_len(&json!({ "truncated_items": items.len() })) + 1;
+    for item in items {
+        let item_size = serialized_len(item) + 1;
+        if used + item_size > max_bytes {
+            break;
+        }
+        used += item_size;
+        kept.push(item.clone());
+    }
+    let cut = items.len() - kept.len();
+    kept.push(json!({ "truncated_items": cut }));
+    Value::Array(kept)
+}
+
+/// The fields of an object within `max_bytes`: smallest first, each whole within its share of what
+/// is left, else cut to it, else dropped and counted; then, while the whole is still past
+/// `max_bytes`, the largest field kept is dropped too.
+fn bounded_fields(fields: &Map<String, Value>, max_bytes: usize) -> Value {
+    let mut by_size: Vec<(&String, &Value, usize)> = fields
+        .iter()
+        .map(|(key, field)| (key, field, serialized_len(field)))
+        .collect();
+    by_size.sort_by_key(|(_, _, size)| *size);
+    let count = by_size.len();
+    // The braces, and the count of the fields dropped at its longest.
+    let mut left =
+        max_bytes.saturating_sub(2 + serialized_len(&json!({ "truncated_keys": count })));
+    let mut kept = Map::new();
+    let mut dropped = 0usize;
+    for (index, (key, field, field_size)) in by_size.into_iter().enumerate() {
+        // The key, quoted, its colon and the comma before the next.
+        let overhead = serialized_len(key) + 2;
+        let share = (left / (count - index)).saturating_sub(overhead);
+        let field = if field_size <= share {
+            field.clone()
+        } else if share >= BOUNDED_FIELD_MIN_BYTES {
+            bounded_value(field, share)
+        } else {
+            dropped += 1;
+            continue;
+        };
+        left = left.saturating_sub(serialized_len(&field) + overhead);
+        kept.insert(key.clone(), field);
+    }
+    let mut answer = fields_with_dropped(&kept, dropped);
+    while serialized_len(&answer) > max_bytes && !kept.is_empty() {
+        let largest = kept
+            .iter()
+            .max_by_key(|(_, field)| serialized_len(*field))
+            .map(|(key, _)| key.clone());
+        if let Some(largest) = largest {
+            kept.remove(&largest);
+            dropped += 1;
+        }
+        answer = fields_with_dropped(&kept, dropped);
+    }
+    answer
+}
+
+/// `kept`, with the count of the fields dropped when there are some.
+fn fields_with_dropped(kept: &Map<String, Value>, dropped: usize) -> Value {
+    let mut object = kept.clone();
+    if dropped > 0 {
+        object.insert("truncated_keys".to_string(), json!(dropped));
+    }
+    Value::Object(object)
 }
 
 #[cfg(test)]
@@ -503,6 +609,7 @@ mod tests {
             200_000,
             MAX_FRAME_SIZE,
             reply_outcome(&answer),
+            listing_rows(&json!({ "secrets": [1, 2, 3] })),
             "page it",
         );
         assert_eq!(small["error_code"], json!(REPLY_TOO_LARGE));
@@ -510,6 +617,8 @@ mod tests {
             small["outcome"],
             json!({ "status": "error", "error_code": "BUSY", "version": 7 })
         );
+        assert_eq!(small["rows"], json!(3));
+        assert_eq!(listing_rows(&answer), None);
     }
 
     #[test]
@@ -524,7 +633,7 @@ mod tests {
             },
         });
         let bounded = bounded_value(&value, 2_048);
-        assert!(serialized_len(&bounded) <= 2_048 + 64, "{bounded}");
+        assert!(serialized_len(&bounded) <= 2_048, "{bounded}");
         assert_eq!(bounded["status"], json!("ok"));
         assert_eq!(bounded["payload"]["wf_node"], value["payload"]["wf_node"]);
         assert_eq!(bounded["payload"]["pending"], json!(["worker1"]));
@@ -537,5 +646,28 @@ mod tests {
             bounded_value(&value["payload"]["wf_node"], 2_048),
             value["payload"]["wf_node"]
         );
+    }
+
+    #[test]
+    fn a_bounded_value_counts_escapes_and_drops_what_has_no_room() {
+        // Every quote serializes as two bytes, and the cut counts them.
+        let quoted = json!("\"".repeat(10_000));
+        let cut = bounded_value(&quoted, 1_000);
+        assert!(serialized_len(&cut) <= 1_000, "{}", serialized_len(&cut));
+        assert!(cut.as_str().expect("text").ends_with("bytes cut]"));
+        // An object with more fields than fit keeps what fits and counts the fields it dropped.
+        let wide: Map<String, Value> = (0..400)
+            .map(|n| (format!("field_{n:03}"), json!("v".repeat(64))))
+            .collect();
+        let cut = bounded_value(&Value::Object(wide), 2_000);
+        assert!(serialized_len(&cut) <= 2_000, "{cut}");
+        assert!(cut["truncated_keys"].as_u64() > Some(0), "{cut}");
+        // An array keeps the items that fit, in order, and counts the rest.
+        let items = json!((0..1_000).map(|n| json!({ "n": n })).collect::<Vec<_>>());
+        let cut = bounded_value(&items, 500);
+        assert!(serialized_len(&cut) <= 500, "{cut}");
+        assert_eq!(cut[0], json!({ "n": 0 }));
+        // With no room for any shape: null.
+        assert_eq!(bounded_value(&json!("x".repeat(100)), 4), Value::Null);
     }
 }

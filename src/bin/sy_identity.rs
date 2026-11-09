@@ -755,6 +755,9 @@ impl IdentityStore {
     /// Cloud account's key, wherever it is charged, deleted tenants included (docs/ilk-tenant-model-v1.md
     /// D11). In the order of their ids, and asked for a page (`limit`, `cursor`), one page of them
     /// within half a frame, with `next_cursor` while ILKs follow and `total` (FINDINGS A-198).
+    /// Each page builds every row in memory and skips to its cursor, so a listing read in pages
+    /// costs its rows once per page: cheap for the identities one hive holds, and simpler than a
+    /// sorted index kept beside the store.
     fn list_ilks_payload(
         &self,
         include_deleted: bool,
@@ -3416,13 +3419,13 @@ impl IdentityRuntime {
 
         let mut deltas: Vec<IdentityDeltaEnvelope> = Vec::new();
         let payload = match action {
-            MSG_ILK_LIST => match PageAsk::from_payload(&msg.payload) {
+            MSG_ILK_LIST => match list_page_ask(&msg.payload, "ilk") {
                 Ok(page) => self.store.list_ilks_payload(
                     payload_include_deleted(&msg.payload),
                     msg.payload.get("pending_signup").and_then(Value::as_bool) == Some(true),
                     &page,
                 ),
-                Err(detail) => error_payload("INVALID_REQUEST", &detail),
+                Err(refusal) => refusal,
             },
             MSG_ILK_GET => match serde_json::from_value::<IlkGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self
@@ -3434,13 +3437,13 @@ impl IdentityRuntime {
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
-            MSG_TNT_LIST => match PageAsk::from_payload(&msg.payload) {
+            MSG_TNT_LIST => match list_page_ask(&msg.payload, "tnt") {
                 Ok(page) => self.store.list_tenants_payload(
                     payload_include_deleted(&msg.payload),
                     msg.payload.get("exclude_root").and_then(Value::as_bool) == Some(true),
                     &page,
                 ),
-                Err(detail) => error_payload("INVALID_REQUEST", &detail),
+                Err(refusal) => refusal,
             },
             MSG_TNT_GET => match serde_json::from_value::<TntGetRequest>(msg.payload.clone()) {
                 Ok(req) => match self.store.get_tenant_payload(&req.tenant_id) {
@@ -6961,28 +6964,35 @@ async fn send_system_response(
         payload,
     };
     let outcome = mesh_reply::reply_outcome(&payload);
-    match sender.send(reply(payload)).await {
-        Ok(()) => Ok(()),
-        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
-            let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
-            tracing::warn!(
-                request = request_msg,
-                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
-                size,
-                max,
-                "an identity answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
-            );
-            let how = if matches!(request_msg, MSG_ILK_LIST | MSG_TNT_LIST) {
-                "ask it in pages with limit and cursor, following next_cursor"
-            } else {
-                "it has no smaller form; read the record it names with its own read"
-            };
-            let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, how);
-            sender.send(reply(small)).await?;
-            Ok(())
-        }
-        Err(err) => Err(err.into()),
-    }
+    let rows = mesh_reply::listing_rows(&payload);
+    let message = reply(payload);
+    // Measured against the frame less the router's reserve (FINDINGS A-202), and the SDK's own
+    // refusal taken the same way.
+    let size = match mesh_reply::oversized(&message) {
+        Some(size) => size,
+        None => match sender.send(message).await {
+            Ok(()) => return Ok(()),
+            Err(fluxbee_sdk::NodeError::MessageTooLarge { size, .. }) => size,
+            Err(err) => return Err(err.into()),
+        },
+    };
+    let max = mesh_reply::REPLY_MAX_BYTES;
+    let request_msg = request.meta.msg.as_deref().unwrap_or(msg_name);
+    tracing::warn!(
+        request = request_msg,
+        caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+        size,
+        max,
+        "an identity answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+    );
+    let how = if matches!(request_msg, MSG_ILK_LIST | MSG_TNT_LIST) {
+        "ask it in pages with limit and cursor, following next_cursor"
+    } else {
+        "it has no smaller form; read the record it names with its own read"
+    };
+    let small = mesh_reply::reply_too_large_payload(request_msg, size, max, outcome, rows, how);
+    sender.send(reply(small)).await?;
+    Ok(())
 }
 
 const RPC_CH_SYSTEM: &str = "system";
@@ -7441,6 +7451,24 @@ fn normalize_tenant_domain(value: Option<&str>) -> Option<String> {
 /// (uppercase, no hyphens, braces, spaces) would name a second record in memory and an existing
 /// row in the database, which the upsert would then overwrite. Any other spelling answers
 /// INVALID_REQUEST.
+/// The page an `ILK_LIST` or `TNT_LIST` asks for (FINDINGS A-198): its `limit` and `cursor`, the
+/// cursor an id of the listing's own kind (`prefix`, `ilk` or `tnt`), since each page goes on from
+/// the id the page before ended at. Another listing's cursor answers INVALID_CURSOR, never an empty
+/// page.
+fn list_page_ask(payload: &Value, prefix: &str) -> Result<PageAsk, Value> {
+    let page = PageAsk::from_payload(payload)
+        .map_err(|detail| error_payload("INVALID_REQUEST", &detail))?;
+    if let Some(cursor) = page.cursor.as_deref() {
+        if parse_prefixed_uuid(cursor, prefix).is_err() {
+            return Err(error_payload(
+                mesh_reply::INVALID_CURSOR,
+                &format!("cursor {cursor} is not a next_cursor of this listing, a {prefix}:<uuid>"),
+            ));
+        }
+    }
+    Ok(page)
+}
+
 fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
     let uuid = value
         .strip_prefix(prefix)

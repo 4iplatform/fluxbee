@@ -3375,37 +3375,63 @@ async fn send_within_frame(
     reply: Message,
 ) -> Result<(), OrchestratorError> {
     let outcome = mesh_reply::reply_outcome(&reply.payload);
+    let rows = mesh_reply::listing_rows(&reply.payload);
     let mut small = Message {
         routing: reply.routing.clone(),
         meta: reply.meta.clone(),
         payload: serde_json::Value::Null,
     };
-    match sender.send(reply).await {
-        Ok(()) => Ok(()),
-        Err(fluxbee_sdk::NodeError::MessageTooLarge { size, max }) => {
-            tracing::warn!(
-                request = what,
-                caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
-                size,
-                max,
-                "an orchestrator answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
-            );
-            let how = match what {
-                "list_versions" => "ask it in pages with limit and cursor, following next_cursor",
-                "list_nodes" | "LIST_NODES" | "INVENTORY_REQUEST" => {
-                    "ask it in pages with limit and cursor, following next_cursor"
-                }
-                "get_versions" | "GET_VERSIONS" => {
-                    "ask the installation's versions in pages with versions_limit and versions_before"
-                }
-                _ => "it has no smaller form over the mesh",
-            };
-            small.payload = mesh_reply::reply_too_large_payload(what, size, max, outcome, how);
-            sender.send(small).await?;
-            Ok(())
+    // Measured against the frame less the router's reserve (FINDINGS A-202), and the SDK's own
+    // refusal taken the same way.
+    let size = match mesh_reply::oversized(&reply) {
+        Some(size) => size,
+        None => match sender.send(reply).await {
+            Ok(()) => return Ok(()),
+            Err(fluxbee_sdk::NodeError::MessageTooLarge { size, .. }) => size,
+            Err(err) => return Err(err.into()),
+        },
+    };
+    let max = mesh_reply::REPLY_MAX_BYTES;
+    tracing::warn!(
+        request = what,
+        caller = request.routing.src_l2_name.as_deref().unwrap_or(""),
+        size,
+        max,
+        "an orchestrator answer does not fit one frame: REPLY_TOO_LARGE sent in its place"
+    );
+    let how = match what {
+        "list_versions" | "list_nodes" | "list_tenant_nodes" | "LIST_NODES"
+        | "INVENTORY_REQUEST" => "ask it in pages with limit and cursor, following next_cursor",
+        "get_versions" | "GET_VERSIONS" => {
+            "ask the installation's versions in pages with versions_limit and versions_before"
         }
-        Err(err) => Err(err.into()),
+        _ => "it has no smaller form over the mesh",
+    };
+    small.payload = mesh_reply::reply_too_large_payload(what, size, max, outcome, rows, how);
+    sender.send(small).await?;
+    Ok(())
+}
+
+/// The page a node listing asks for (FINDINGS A-198): its `limit` and `cursor`, the cursor a
+/// node's place, `<hive>|<name>` (`node_rows_page`). Another listing's cursor answers
+/// INVALID_CURSOR, never an empty page.
+fn node_page_ask(payload: &serde_json::Value) -> Result<PageAsk, serde_json::Value> {
+    let page = PageAsk::from_payload(payload).map_err(|detail| {
+        serde_json::json!({ "status": "error", "error_code": "INVALID_REQUEST", "message": detail })
+    })?;
+    if let Some(cursor) = page.cursor.as_deref() {
+        let place = cursor.split_once('|');
+        if !place.is_some_and(|(hive, name)| {
+            json_router::mesh_hmac::is_valid_hive_id(hive) && !name.trim().is_empty()
+        }) {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": mesh_reply::INVALID_CURSOR,
+                "message": format!("cursor {cursor} is not a next_cursor of a node listing, a <hive>|<name>"),
+            }));
+        }
     }
+    Ok(page)
 }
 
 async fn handle_admin(
@@ -7140,8 +7166,8 @@ impl InstallationVersionsAsk {
 /// sha256, when, why and their values (`versions`, stage 3c), so SY.admin and Archi read the
 /// history without reading the orchestrator's files. `versions` holds the newest `ask.limit` older
 /// than `ask.before`, oldest first (FINDINGS A-198); `versions_total` counts every version
-/// recorded, and `versions_next_before`, while older ones remain, is the `versions_before` that
-/// lists them.
+/// recorded, `versions_latest` is the newest of them whatever the page, and
+/// `versions_next_before`, while older ones remain, is the `versions_before` that lists them.
 fn installation_motherbee_section(
     own: &InstallationCopy,
     records: &Result<InstallationVersions, String>,
@@ -7164,6 +7190,9 @@ fn installation_motherbee_section(
             let listed = &older[first..];
             section["versions"] = serde_json::to_value(listed).unwrap_or(serde_json::Value::Null);
             section["versions_total"] = serde_json::json!(records.versions.len());
+            // The newest version recorded, whichever page is listed: what a change names when the
+            // file is one no reader can use (SY.admin's expected_version).
+            section["versions_latest"] = serde_json::json!(records.latest_version());
             if first > 0 {
                 if let Some(oldest) = listed.first() {
                     section["versions_next_before"] = serde_json::json!(oldest.version);
@@ -15354,15 +15383,9 @@ async fn list_nodes_flow(
     }
     // Asked for a page (FINDINGS A-198), the nodes by hive, then name, after `cursor`
     // (`node_rows_page`), with `next_cursor` while nodes follow and `total`.
-    let page = match PageAsk::from_payload(payload) {
+    let page = match node_page_ask(payload) {
         Ok(page) => page,
-        Err(detail) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": detail,
-            })
-        }
+        Err(refusal) => return refusal,
     };
     if target_hive == state.hive_id {
         let mut inventory_payload = serde_json::json!({
@@ -15437,7 +15460,10 @@ async fn list_nodes_flow(
 /// The nodes charged to one tenant on every hive (Fluxbee Cloud's `list_nodes`, docs/ilk-tenant-
 /// model-v1.md §2.4): this hive's managed instances plus each connected hive's, asked with
 /// LIST_NODES. A hive that does not answer is listed in `unreachable_hives`, never left out
-/// silently.
+/// silently. The nodes go by hive, then name; asked for a page (`limit`, `cursor`, FINDINGS
+/// A-198), a page of them (`node_rows_page`) with `next_cursor` while nodes follow and `total`.
+/// Each page asks every hive again, so a tenant's nodes read in pages cost a round of LIST_NODES
+/// per page: only a tenant past half a frame of nodes (some 170) is read in more than one.
 async fn list_tenant_nodes_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -15453,6 +15479,10 @@ async fn list_tenant_nodes_flow(
             "error_code": "INVALID_REQUEST",
             "message": "list_tenant_nodes requires tenant_id (tnt:<uuid>)",
         });
+    };
+    let page = match node_page_ask(payload) {
+        Ok(page) => page,
+        Err(refusal) => return refusal,
     };
     let mut nodes = match managed_nodes_of_tenant(state, Some(tenant_id)) {
         Ok(nodes) => nodes,
@@ -15538,13 +15568,17 @@ async fn list_tenant_nodes_flow(
             })),
         }
     }
-    serde_json::json!({
-        "status": "ok",
-        "tenant_id": tenant_id,
-        "count": nodes.len(),
-        "nodes": nodes,
-        "unreachable_hives": unreachable,
-    })
+    let page = node_rows_page(nodes, &page);
+    let count = page.rows.len();
+    page.into_answer(
+        "nodes",
+        serde_json::json!({
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "count": count,
+            "unreachable_hives": unreachable,
+        }),
+    )
 }
 
 fn remote_router_name(entry: &RemoteHiveEntry) -> String {
@@ -15627,15 +15661,9 @@ fn node_rows_page(nodes: Vec<serde_json::Value>, page: &PageAsk) -> mesh_reply::
 /// (`limit`, `cursor`, FINDINGS A-198), a page of them (`node_rows_page`) with `next_cursor` while
 /// nodes follow and `total`, while `node_count`/`total_nodes` still count every node.
 fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> serde_json::Value {
-    let page_ask = match PageAsk::from_payload(payload) {
+    let page_ask = match node_page_ask(payload) {
         Ok(page_ask) => page_ask,
-        Err(detail) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": detail,
-            });
-        }
+        Err(refusal) => return refusal,
     };
     let snapshot = match load_lsa_snapshot(state) {
         Ok(snapshot) => snapshot,
@@ -16491,13 +16519,22 @@ async fn get_versions_flow(
     }
 }
 
+/// The most bytes of snapshots a page of `/versions` holds once one past half a frame is in: a
+/// snapshot already asked of its hive is kept while the page stays under this, so a hive's
+/// GET_VERSIONS is not sent twice at a page's end (the motherbee's admin worker answers one
+/// message at a time, A-199). Under the frame less the router's reserve, with room for the
+/// comparison and the envelope.
+const VERSIONS_PAGE_HARD_MAX_BYTES: usize = 100 * 1024;
+
 /// `/versions` over every hive: the motherbee's snapshot and each connected spoke's, and the
 /// comparison against the motherbee's. Asked for a page (`limit`, `cursor`, FINDINGS A-198), the
-/// hives after the cursor in the order motherbee first, then the spokes by id, at most `limit` and
-/// at most half a frame of snapshots, with `next_cursor` while hives follow; the page's
-/// comparison is still against the motherbee's snapshot. `total` is how many hives the answer
-/// covers in all. `versions_limit` and `versions_before` pick the motherbee's installation
-/// versions (`InstallationVersionsAsk`).
+/// hives after the cursor in the order motherbee first, then the spokes by id: at most `limit`,
+/// and no hive asked once the page holds half a frame of snapshots, with `next_cursor` while hives
+/// follow. A snapshot asked is kept while the page stays under `VERSIONS_PAGE_HARD_MAX_BYTES`.
+/// The page's comparison is still against the motherbee's snapshot. `total` is how many hives
+/// the answer covers in all. `versions_limit` and `versions_before` pick the motherbee's
+/// installation versions (`InstallationVersionsAsk`). A cursor that names no hive answers
+/// INVALID_CURSOR.
 async fn list_versions_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -16515,6 +16552,17 @@ async fn list_versions_flow(
             })
         }
     };
+    if let Some(cursor) = page
+        .cursor
+        .as_deref()
+        .filter(|cursor| !json_router::mesh_hmac::is_valid_hive_id(cursor))
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": mesh_reply::INVALID_CURSOR,
+            "message": format!("cursor {cursor} is not a next_cursor of /versions, a hive id"),
+        });
+    }
     let motherbee = state.hive_id.clone();
     let mut order = vec![motherbee.clone()];
     let root = hives_root();
@@ -16542,7 +16590,10 @@ async fn list_versions_flow(
             .as_deref()
             .is_none_or(|cursor| versions_hive_after(hive_id, cursor, &motherbee))
     }) {
-        if page.limit.is_some_and(|limit| hives.len() >= limit) {
+        // Another hive follows: none is asked past the page's limit or its half frame.
+        if page.limit.is_some_and(|limit| hives.len() >= limit)
+            || (page.is_page() && bytes >= mesh_reply::LIST_PAGE_MAX_BYTES)
+        {
             next_cursor = last.clone();
             break;
         }
@@ -16552,7 +16603,13 @@ async fn list_versions_flow(
             remote_versions_snapshot(state, &hive_id).await
         };
         let size = mesh_reply::serialized_len(&snapshot);
-        if page.is_page() && !hives.is_empty() && bytes + size > mesh_reply::LIST_PAGE_MAX_BYTES {
+        // Only a snapshot too large for what is left of the frame waits for the next page.
+        if page.is_page() && !hives.is_empty() && bytes + size > VERSIONS_PAGE_HARD_MAX_BYTES {
+            tracing::warn!(
+                hive = %hive_id,
+                size,
+                "a hive's /versions snapshot does not fit its page: the next page asks it again"
+            );
             next_cursor = last.clone();
             break;
         }
