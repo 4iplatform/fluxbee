@@ -138,7 +138,13 @@ list.
 
 **Mutations the intended way**: `fluxbee_plan_compiler` asks a plan-compiler agent for an
 `executor_plan`, pre-validates it with SY.admin (`executor_validate_plan`) and keeps it until the
-operator writes `CONFIRM`. Then `execute_executor_plan_with_context` sends
+operator writes `CONFIRM`. The agent's prompt lists SY.admin's action catalog in its compact view,
+each action's name, description and read_only, kept 5 minutes (`get_or_refresh_admin_actions`),
+and it reads an action's schema with `get_admin_action_help` before each step. Archi's reads of
+`/admin/actions` ask the same view (`admin_catalog_compact_params`): the full catalog is larger
+than one mesh frame, and SY.admin answers it over HTTP alone (FINDINGS A-197). A catalog that
+cannot be read is logged, and the agent runs on each action's help alone. Then
+`execute_executor_plan_with_context` sends
 `executor_validate_plan` and `executor_execute_plan` to SY.admin, which runs the steps (see
 [SY.admin, the executor](sy-admin.md#the-executor)). Plans sent to `POST /api/executor/plan` or
 pasted in the chat run without that confirmation, unless one is already pending in the session.

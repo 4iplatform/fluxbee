@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions. Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
                     },
                     "body": {
                         "type": "object",
@@ -1641,6 +1641,14 @@ impl FunctionTool for GetManifestCurrentTool {
 
 // ── Admin actions cache (PROG-T1/T2) ─────────────────────────────────────────
 
+/// What Archi asks `list_admin_actions` for, in the plan compiler's catalog and in its reads of
+/// `/admin/actions`: the compact view, each action's name, description and read_only. The full
+/// catalog is larger than one mesh frame, and SY.admin answers it over HTTP alone (FINDINGS
+/// A-197); one action's schema is `/admin/actions/{action}`.
+fn admin_catalog_compact_params() -> Value {
+    json!({ "view": "compact" })
+}
+
 async fn get_or_refresh_admin_actions(
     context: &ArchitectAdminToolContext,
 ) -> Result<Vec<Value>, ArchitectError> {
@@ -1654,12 +1662,14 @@ async fn get_or_refresh_admin_actions(
         }
     }
 
+    // The compact catalog, what the plan compiler's prompt uses: the full one does not fit in one
+    // mesh frame (FINDINGS A-197).
     let output = execute_admin_action_with_context(
         context,
         &format!("SY.admin@{}", context.hive_id),
         "list_admin_actions",
         None,
-        json!({}),
+        admin_catalog_compact_params(),
         "plan_compiler.cache_refresh",
     )
     .await;
@@ -5667,9 +5677,18 @@ async fn run_plan_compiler_with_context(
                 .into()
         })?;
 
-    let actions = get_or_refresh_admin_actions(context)
-        .await
-        .unwrap_or_default();
+    let actions = match get_or_refresh_admin_actions(context).await {
+        Ok(actions) => actions,
+        // Said, never silent (FINDINGS A-197): the plan compiler then has no catalog in its
+        // prompt, only each action's help.
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "the admin action catalog could not be read: the plan compiler runs without it"
+            );
+            Vec::new()
+        }
+    };
     let cookbook = read_plan_compile_cookbook(&context.state_dir);
     let handbook = read_handbook_text();
 
@@ -13254,7 +13273,7 @@ fn translate_scmd(
             admin_target,
             action: "list_admin_actions".to_string(),
             target_hive: local_hive_id.to_string(),
-            params: json!({}),
+            params: admin_catalog_compact_params(),
         }),
         ("GET", ["admin", "actions", action_name]) => Ok(AdminTranslation {
             admin_target,
@@ -31178,6 +31197,36 @@ mod tests {
         assert_eq!(translated.action, "list_taps");
         assert_eq!(translated.target_hive, "motherbee");
         assert_eq!(translated.params, json!({}));
+    }
+
+    /// FINDINGS A-197: Archi's read of /admin/actions asks the compact catalog, as its plan
+    /// compiler's refresh does: the full one does not fit in one mesh frame. One action's help
+    /// stays as it was.
+    #[test]
+    fn archi_reads_the_compact_action_catalog() {
+        let translated = translate_scmd("motherbee", parse("curl -X GET /admin/actions"))
+            .expect("translation should succeed");
+        assert_eq!(translated.action, "list_admin_actions");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({ "view": "compact" }));
+        assert_eq!(admin_catalog_compact_params(), json!({ "view": "compact" }));
+
+        let help = translate_scmd("motherbee", parse("curl -X GET /admin/actions/run_node"))
+            .expect("translation should succeed");
+        assert_eq!(help.action, "get_admin_action_help");
+        assert_eq!(help.params, json!({ "action_name": "run_node" }));
+
+        // The plan compiler's prompt reads the compact entries whole.
+        let prompt = build_plan_compiler_prompt(
+            &[json!({
+                "name": "run_node",
+                "description": "Launch a managed node.",
+                "read_only": false,
+            })],
+            &[],
+            None,
+        );
+        assert!(prompt.contains("### run_node\nLaunch a managed node.\nKind: mutating"));
     }
 
     /// FINDINGS A-73: the read tool runs reads only. Every POST route that changes something is

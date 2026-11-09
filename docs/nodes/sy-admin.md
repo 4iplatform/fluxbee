@@ -13,7 +13,13 @@ Source: `src/bin/sy_admin.rs`. The Fluxbee Cloud allowlist is `CLOUD_EXPOSED_ACT
 
 **Live schema.** `GET /admin/actions` returns every action with its routes, request contract,
 executor schema and an example; `GET /admin/actions/{action}` returns one
-(`build_admin_actions_catalog_response`, `build_admin_action_help_response`). The
+(`admin_actions_catalog_envelope`, `build_admin_action_help_response`). Over the mesh, and to the
+executor, `list_admin_actions` answers the compact catalog instead, each action's `name`,
+`description` and `read_only` (`view: compact`, `GET /admin/actions?view=compact` over HTTP): the
+full one, some 330 KB, is larger than one mesh frame (128 KiB), so a mesh caller that asks
+`view: full` is refused with `CATALOG_TOO_LARGE_FOR_MESH` rather than left waiting on a reply the
+frame refuses (`admin_catalog_view`, FINDINGS A-197). Archi asks the compact one for its plan
+compiler and its reads, and one action's help for its schema. The
 [action table](#action-table) at the end of this page is generated from the same functions. The
 AI node config examples (`set_node_config`, `node_control_config_set`) name no
 `behavior.provider`, so a copied one runs on the hive's `ai.default_provider`; their notes say
@@ -1092,7 +1098,7 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | --- | --- | --- |
 | `hive_status` | `GET /hive/status` | Read the local hive status summary. |
 | `list_hives` | `GET /hives` | List all known hives. |
-| `list_admin_actions` | `GET /admin/actions` | List the dynamic admin action catalog and help metadata. |
+| `list_admin_actions` | `GET /admin/actions` | List the admin action catalog: in full over HTTP, compact (each action's name, description and read_only) over the mesh. |
 | `list_cloud_actions` | — (no HTTP route) | List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset. |
 | `get_admin_action_help` | `GET /admin/actions/{action}` | Return help metadata for one admin action. |
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |

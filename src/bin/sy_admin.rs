@@ -4239,6 +4239,33 @@ async fn send_admin_command_response(
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
     let sender = client.sender_snapshot();
+    let response = admin_command_response_message(
+        sender.uuid(),
+        request_msg,
+        action,
+        status,
+        payload,
+        error_code,
+        error_detail,
+        request_id,
+    );
+    sender.send(response).await?;
+    Ok(())
+}
+
+/// The `ADMIN_COMMAND_RESPONSE` to `request_msg`, as SY.admin sends it over the mesh: one frame,
+/// at most `MAX_FRAME_SIZE` serialized, or the send refuses it (FINDINGS A-197).
+#[allow(clippy::too_many_arguments)]
+fn admin_command_response_message(
+    sender_uuid: &str,
+    request_msg: &Message,
+    action: &str,
+    status: &str,
+    payload: serde_json::Value,
+    error_code: Option<String>,
+    error_detail: Option<serde_json::Value>,
+    request_id: Option<String>,
+) -> Message {
     let action_class = classify_admin_action(action);
     let (action_result, result_origin) =
         derive_action_outcome(action_class, Some(status), error_code.as_deref());
@@ -4253,9 +4280,9 @@ async fn send_admin_command_response(
         body["request_id"] = serde_json::Value::String(req_id);
     }
 
-    let response = Message {
+    Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: sender_uuid.to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(request_msg.routing.src.clone()),
             ttl: 16,
@@ -4276,9 +4303,7 @@ async fn send_admin_command_response(
             ..Meta::default()
         },
         payload: body,
-    };
-    sender.send(response).await?;
-    Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -7608,6 +7633,33 @@ async fn dispatch_internal_admin_command(
         "list_externalized" => {
             return handle_list_externalized(client, params, caller_l2_name).await;
         }
+        // The catalog in the view the caller names, else its path's: full over HTTP alone, compact
+        // over the mesh and to the executor, where the full one never fits a frame (FINDINGS
+        // A-197).
+        "list_admin_actions" => {
+            let named = match params.get("view") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(view)) => Some(view.as_str()),
+                Some(_) => {
+                    return Ok(internal_invalid_request(
+                        action,
+                        "view must be a string: compact or full",
+                    ))
+                }
+            };
+            return Ok(
+                match admin_catalog_view(named, matches!(origin, AdminOrigin::Http)) {
+                    Ok(view) => InternalAdminDispatchResult {
+                        http_status: 200,
+                        envelope: admin_actions_catalog_envelope(view),
+                    },
+                    Err((code, detail)) => InternalAdminDispatchResult {
+                        http_status: error_code_to_http_status(code),
+                        envelope: admin_catalog_view_refusal(code, &detail),
+                    },
+                },
+            );
+        }
         "executor_execute_plan" => {
             if target.is_some() {
                 return Ok(internal_invalid_request(
@@ -9119,9 +9171,21 @@ async fn handle_http(
     }
     match (method.as_str(), path) {
         ("GET", "/admin/actions") => {
-            let (status, resp) =
-                handle_admin_query(ctx, client, "list_admin_actions", None).await?;
-            respond_json(stream, status, &resp).await?;
+            // The full catalog, or `?view=compact`, the one a mesh caller gets (FINDINGS A-197).
+            let payload = match query.get("view") {
+                Some(view) => serde_json::json!({ "view": view }),
+                None => serde_json::json!({}),
+            };
+            let internal = dispatch_internal_admin_command(
+                ctx,
+                client,
+                "list_admin_actions",
+                None,
+                payload,
+                AdminOrigin::Http,
+            )
+            .await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/admin/executor/functions") => {
             let (status, resp) = build_admin_executor_function_catalog_response(ctx)?;
@@ -11130,6 +11194,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         // the stamped backup does not match its bytes: refuse rather than restore garbage
         | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
+        // The full action catalog asked over the mesh, where it never fits a frame (A-197).
+        "CATALOG_TOO_LARGE_FOR_MESH" => 413,
         "WORKFLOW_NOT_FOUND" => 404,
         // A WF engine's refusals of its instance verbs (`node_verb_answer`): an instance it does
         // not have, and one already ended.
@@ -11966,7 +12032,7 @@ async fn handle_admin_query(
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
     if action == "list_admin_actions" {
-        return Ok(build_admin_actions_catalog_response());
+        return Ok(build_admin_actions_catalog_response(AdminCatalogView::Full));
     }
     if action == "list_cloud_actions" {
         return Ok(build_cloud_actions_catalog_response());
@@ -12013,25 +12079,103 @@ async fn handle_admin_query_with_payload(
     Ok(build_admin_http_response(action, response))
 }
 
-fn build_admin_actions_catalog_response() -> (u16, String) {
+/// What `list_admin_actions` answers (FINDINGS A-197): every field of each action, or its compact
+/// form, which fits one mesh frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminCatalogView {
+    /// Each action's `name`, `description` and `read_only`: what Archi's plan compiler and its
+    /// reads use. An action's schema is its own help (`get_admin_action_help`).
+    Compact,
+    /// Each action's routes, request contract, executor schema and example: some 330 KB in
+    /// 0.1.121, more than one mesh frame (`MAX_FRAME_SIZE`, 128 KiB), so HTTP's alone.
+    Full,
+}
+
+impl AdminCatalogView {
+    fn as_str(self) -> &'static str {
+        match self {
+            AdminCatalogView::Compact => "compact",
+            AdminCatalogView::Full => "full",
+        }
+    }
+}
+
+/// The view a `list_admin_actions` request names (`view`), else its path's: full over HTTP, the one
+/// path with no frame, and compact over the mesh and to the executor, whose answer goes back to
+/// Archi over the mesh inside the plan's result: the full catalog never fits a frame. Asked off
+/// HTTP, `full` is refused (`CATALOG_TOO_LARGE_FOR_MESH`), never answered with a reply the frame
+/// refuses and the caller waits on until its timeout.
+fn admin_catalog_view(
+    named: Option<&str>,
+    over_http: bool,
+) -> Result<AdminCatalogView, (&'static str, String)> {
+    let view = match named.map(str::trim).filter(|view| !view.is_empty()) {
+        None if over_http => AdminCatalogView::Full,
+        None => AdminCatalogView::Compact,
+        Some(view) if view.eq_ignore_ascii_case("compact") => AdminCatalogView::Compact,
+        Some(view) if view.eq_ignore_ascii_case("full") => AdminCatalogView::Full,
+        Some(other) => {
+            return Err((
+                "INVALID_REQUEST",
+                format!("view '{other}' is not one list_admin_actions answers: compact or full"),
+            ))
+        }
+    };
+    if !over_http && view == AdminCatalogView::Full {
+        return Err((
+            "CATALOG_TOO_LARGE_FOR_MESH",
+            "the full action catalog does not fit in one mesh frame (128 KiB): ask view compact \
+             (each action's name, description and read_only), read one action's schema with \
+             get_admin_action_help, or read the full catalog over HTTP (GET /admin/actions)"
+                .to_string(),
+        ));
+    }
+    Ok(view)
+}
+
+/// One action of the compact catalog (FINDINGS A-197).
+fn build_admin_action_compact_doc(spec: &InternalActionSpec) -> serde_json::Value {
+    serde_json::json!({
+        "name": spec.action,
+        "description": admin_action_summary(spec.action),
+        "read_only": admin_action_is_read_only(spec.action),
+    })
+}
+
+fn admin_actions_catalog_envelope(view: AdminCatalogView) -> serde_json::Value {
     let actions: Vec<serde_json::Value> = INTERNAL_ACTION_REGISTRY
         .iter()
-        .map(build_admin_action_doc)
-        .collect();
-    (
-        200,
-        serde_json::json!({
-            "status": "ok",
-            "action": "list_admin_actions",
-            "payload": {
-                "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
-                "actions": actions,
-            },
-            "error_code": serde_json::Value::Null,
-            "error_detail": serde_json::Value::Null,
+        .map(match view {
+            AdminCatalogView::Compact => build_admin_action_compact_doc,
+            AdminCatalogView::Full => build_admin_action_doc,
         })
-        .to_string(),
-    )
+        .collect();
+    serde_json::json!({
+        "status": "ok",
+        "action": "list_admin_actions",
+        "payload": {
+            "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
+            "view": view.as_str(),
+            "actions": actions,
+        },
+        "error_code": serde_json::Value::Null,
+        "error_detail": serde_json::Value::Null,
+    })
+}
+
+fn build_admin_actions_catalog_response(view: AdminCatalogView) -> (u16, String) {
+    (200, admin_actions_catalog_envelope(view).to_string())
+}
+
+/// `list_admin_actions` refused: an unknown view, or the full catalog asked off HTTP.
+fn admin_catalog_view_refusal(code: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "action": "list_admin_actions",
+        "payload": serde_json::Value::Null,
+        "error_code": code,
+        "error_detail": detail,
+    })
 }
 
 /// Capability query for IO.cloud / Fluxbee Cloud: the SAME registry projection as
@@ -12634,7 +12778,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
 
 fn admin_action_summary(action: &str) -> &'static str {
     match action {
-        "list_admin_actions" => "List the dynamic admin action catalog and help metadata.",
+        "list_admin_actions" => "List the admin action catalog: in full over HTTP, compact (each action's name, description and read_only) over the mesh.",
         "list_cloud_actions" => {
             "List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset."
         }
@@ -13594,6 +13738,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "list_admin_actions" => vec![admin_action_body_field(
+            "view",
+            "string",
+            "compact (each action's name, description and read_only) or full (every field). Over HTTP the default is full, and ?view=compact asks the compact one; over the mesh and to the executor the default and the only view is compact, since the full catalog does not fit in one mesh frame (CATALOG_TOO_LARGE_FOR_MESH).",
+        )],
         "vault_delete" | "vault_rotate" | "vault_rollback" => vec![admin_action_body_field(
                 "tenant_id",
                 "string",
@@ -14756,6 +14905,10 @@ const WF_INSTANCE_ERRORS_NOTE: &str = "The engine answers its instance verbs onl
 
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
+        "list_admin_actions" => vec![
+            "The answer is {registry_version, view, actions}. The full view gives each action its routes, request contract, executor schema and example; it is larger than one mesh frame (128 KiB), so only HTTP answers it (FINDINGS A-197).",
+            "The compact view gives each action its name, description and read_only, and is what the mesh and the executor answer. One action's schema and example are its help: get_admin_action_help (GET /admin/actions/{action}).",
+        ],
         "publish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
             "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node on a worker or the motherbee (A-62: a node of an ingress or egress hive asks SY.admin for nothing). The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
@@ -23702,6 +23855,151 @@ mod tests {
             .map(|a| a["action"].as_str().unwrap())
             .collect();
         assert_eq!(got, expected_surface);
+    }
+
+    /// FINDINGS A-197: over the mesh the action catalog is the compact one, each action's name,
+    /// description and read_only, and its reply as SY.admin sends it stays within half a mesh
+    /// frame. The executor gets it too; the full catalog is HTTP's alone, and asked off HTTP it is
+    /// refused, never sent into a frame that refuses it.
+    #[tokio::test]
+    async fn the_mesh_reads_the_compact_action_catalog_within_half_a_frame() {
+        // The view each path names or gets.
+        assert_eq!(admin_catalog_view(None, true), Ok(AdminCatalogView::Full));
+        assert_eq!(
+            admin_catalog_view(Some("compact"), true),
+            Ok(AdminCatalogView::Compact)
+        );
+        assert_eq!(
+            admin_catalog_view(None, false),
+            Ok(AdminCatalogView::Compact)
+        );
+        assert_eq!(
+            admin_catalog_view(Some(" Compact "), false),
+            Ok(AdminCatalogView::Compact)
+        );
+        assert_eq!(
+            admin_catalog_view(Some("full"), false).unwrap_err().0,
+            "CATALOG_TOO_LARGE_FOR_MESH"
+        );
+        assert_eq!(
+            admin_catalog_view(Some("summary"), true).unwrap_err().0,
+            "INVALID_REQUEST"
+        );
+
+        let (ctx, mut harness) = opa_test_admin("admin-catalog-compact");
+        let archi = AdminOrigin::Mesh("SY.architect@motherbee");
+        let ask = |params: Value, origin: AdminOrigin<'static>| {
+            let ctx = &ctx;
+            async move {
+                dispatch_internal_admin_command(
+                    ctx,
+                    &ctx.rpc,
+                    "list_admin_actions",
+                    Some(PRIMARY_HIVE_ID),
+                    params,
+                    origin,
+                )
+                .await
+                .expect("dispatch")
+            }
+        };
+        // Archi's ask, as it sends it: SY.admin answers it itself.
+        let compact = ask(json!({ "view": "compact" }), archi).await;
+        assert_eq!(compact.http_status, 200, "{}", compact.envelope);
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+        let payload = internal_response_payload_value(&compact.envelope);
+        assert_eq!(payload["view"], json!("compact"));
+        let actions = payload["actions"].as_array().expect("actions");
+        assert_eq!(actions.len(), INTERNAL_ACTION_REGISTRY.len());
+        for (action, spec) in actions.iter().zip(INTERNAL_ACTION_REGISTRY) {
+            let mut fields: Vec<&str> = action
+                .as_object()
+                .expect("an action")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            assert_eq!(fields, vec!["description", "name", "read_only"]);
+            assert_eq!(action["name"], json!(spec.action));
+            assert_eq!(
+                action["read_only"],
+                json!(admin_action_is_read_only(spec.action))
+            );
+        }
+        // Without a view the mesh and the executor get the compact one; full is refused off HTTP;
+        // HTTP gets the full one by default.
+        let default = ask(json!({}), archi).await;
+        assert_eq!(
+            internal_response_payload_value(&default.envelope)["view"],
+            json!("compact")
+        );
+        let full = ask(json!({ "view": "full" }), archi).await;
+        assert_eq!(full.http_status, 413);
+        assert_eq!(
+            full.envelope["error_code"],
+            json!("CATALOG_TOO_LARGE_FOR_MESH")
+        );
+        let not_a_view = ask(json!({ "view": 1 }), archi).await;
+        assert_eq!(not_a_view.envelope["error_code"], json!("INVALID_REQUEST"));
+        let executor = ask(json!({}), AdminOrigin::Executor).await;
+        assert_eq!(
+            internal_response_payload_value(&executor.envelope)["view"],
+            json!("compact")
+        );
+        let refused = ask(json!({ "view": "full" }), AdminOrigin::Executor).await;
+        assert_eq!(
+            refused.envelope["error_code"],
+            json!("CATALOG_TOO_LARGE_FOR_MESH")
+        );
+        let http = ask(json!({}), AdminOrigin::Http).await;
+        let http_payload = internal_response_payload_value(&http.envelope);
+        assert_eq!(http_payload["view"], json!("full"));
+        assert!(http_payload["actions"][0].get("request_contract").is_some());
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(100))
+            .await
+            .is_none());
+
+        // The reply as SY.admin sends it over the mesh, serialized as its frame: within half the
+        // frame's 128 KiB, so the catalog has room to grow.
+        let request = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.architect@motherbee".to_string()),
+                dst: Destination::Unicast(format!("SY.admin@{PRIMARY_HIVE_ID}")),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "admin".to_string(),
+                msg: Some(MSG_ADMIN_COMMAND.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "action": "list_admin_actions",
+                "params": { "view": "compact" },
+                "request_id": Uuid::new_v4().to_string(),
+            }),
+        };
+        let reply = admin_command_response_message(
+            &Uuid::new_v4().to_string(),
+            &request,
+            "list_admin_actions",
+            "ok",
+            payload,
+            None,
+            None,
+            Some(Uuid::new_v4().to_string()),
+        );
+        let frame = serde_json::to_vec(&reply).expect("the reply serializes");
+        assert!(
+            frame.len() <= 64 * 1024,
+            "the compact catalog's reply is {} bytes, past half a mesh frame",
+            frame.len()
+        );
     }
 
     #[test]
