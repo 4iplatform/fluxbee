@@ -11116,6 +11116,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "INSTALLATION_UNCHANGED"
         | "INSTALLATION_NOT_WRITTEN"
         | "NODES_LEFT_WITHOUT_ENGINE"
+        | "PROVIDER_KEYS_MISSING"
+        // A hive's copy of a version with another hash (update with category config).
+        | "INSTALLATION_HASH_MISMATCH"
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
@@ -11173,9 +11176,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "VAULT_UNAVAILABLE"
         // The connected nodes cannot be read from shared memory: retry.
         | "INVENTORY_UNAVAILABLE"
-        // set_installation_ai could not read every hive's AI nodes for its check: retry once they
-        // answer.
+        // set_installation_ai could not read every hive's AI nodes, or the vault's key names, for
+        // its checks: retry once they answer.
         | "HIVES_NOT_CHECKED"
+        | "KEYS_NOT_CHECKED"
         | "MASTER_KEY_NOT_AVAILABLE" => 503,
         _ => 500,
     }
@@ -15070,14 +15074,15 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "set_installation_ai" => vec![
             "Confirm with the operator first: every hive's readers take the new ai, and the ones that take it at their start restart where their engine (the default provider and its model) changed. Closed to the mesh, Archi included: Archi stages it with fluxbee_plan_compiler as one step, and the executor runs it once the operator confirms.",
             "Read get_installation first: ai is the whole new ai (send the current one with what changes), and expected_version its expected_version. A change made in between refuses this one with 409 VERSION_CONFLICT: read it again and decide again.",
-            "SY.admin checks first (A-11): when the change switches the default provider or drops a provider, it reads every AI node's config on the motherbee and the workers, and SY.architect's own config.ai.model. It refuses with 409 NODES_LEFT_WITHOUT_ENGINE, naming them, a change that leaves a node naming its model and not its provider on another provider (Archi's own model included), or a node naming its provider and not its model without that provider's model. Give such a node its provider and model (set_node_config), or remove Archi's own model, first. A hive it cannot read refuses with 503 HIVES_NOT_CHECKED, naming it.",
-            "The motherbee's orchestrator, the only writer, writes the next version, recorded with its values. It refuses, writing nothing: 409 JOIN_IN_PROGRESS while a hive joins or is removed; 409 INSTALLATION_EDITED_BY_HAND while the motherbee's file is edited by hand (restore it, or pass replace_hand_edit: true, the operator's choice, to make this change the next version over it); 409 INSTALLATION_UNCHANGED when its version holds these values already; 422 INVALID_AI_SETTINGS for values a reader cannot use (a provider listed without its model, the default provider not listed); 409 INSTALLATION_NOT_WRITTEN while the motherbee holds no file (its orchestrator's start writes version 1 from hive.yaml's ai: /versions config.not_written says why it did not).",
-            "Then every hive applies it, in parallel: the motherbee and each connected spoke get update with category config, retried while the hive's copy has not arrived (sync_pending), up to 90 s (JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS). Each restarts only its start readers whose engine changed: SY.cognition and SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress. ai.generic nodes take it at their next request; SY.admin's executor and Archi at their next use, never restarted (either may be running this very action).",
-            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms}}, node_check, timings_ms: {check, write, scan, apply, hives, total}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail) or not_answered: never read either as not applied. status is ok when every hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive.",
+            "SY.admin checks first (A-11): when the change switches the default provider or drops a provider, it reads every AI node's config on the motherbee and the connected workers, and SY.architect's own config.ai.model. It refuses with 409 NODES_LEFT_WITHOUT_ENGINE, naming them, a change that leaves a node naming its model and not its provider on another provider (Archi's own model included), or a node naming its provider and not its model without that provider's model. Give such a node its provider and model (set_node_config), or remove Archi's own model, first. A hive it cannot read refuses with 503 HIVES_NOT_CHECKED, naming it; a worker whose join did not finish is named in node_check.skipped, never a refusal.",
+            "When the change switches the default provider, SY.admin also checks the new provider's key, by names only (SY.vault's listing, never a value): each AI node that names no provider of its own reads it in its own tenant, and SY.admin's executor, SY.architect, SY.frontdesk.gov and each SY.cognition read theirs in the root tenant; each must find one it reads (its own, one assigned to it, or its tenant's general one). It refuses with 409 PROVIDER_KEYS_MISSING, naming each node, its tenant and the resource_type: put that key in SY.vault first (vault_put), or give the AI node its own provider. A tenant whose keys it cannot list refuses with 503 KEYS_NOT_CHECKED.",
+            "The motherbee's orchestrator, the only writer, writes the next version, recorded with its values. It refuses, writing nothing: 409 JOIN_IN_PROGRESS while a hive joins or is removed; 409 INSTALLATION_EDITED_BY_HAND while the motherbee's file is edited by hand (restore it, or pass replace_hand_edit: true, the operator's choice, to make this change the next version over it); 409 INSTALLATION_UNCHANGED when its version holds these values already; 422 INVALID_AI_SETTINGS for values a reader cannot use (a provider listed without its model, the default provider not listed); 409 INSTALLATION_NOT_WRITTEN while the motherbee holds no file (its orchestrator's start writes version 1 from hive.yaml's ai: /versions config.not_written says why it did not). No answer within 30 s (TIMEOUT) does not mean nothing was written: the write may still land behind the orchestrator's other work; read get_installation, and when its expected_version moved, run update with category config on every hive.",
+            "Then every hive applies it, in parallel: the motherbee and each connected spoke get update with category config, retried while the hive's copy has not arrived (sync_pending), up to 90 s (JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS). Each restarts only its start readers whose engine changed, or that became active since the hive's record of what it applied last (nothing says what those run): SY.cognition and SY.frontdesk.gov on the motherbee, SY.cognition on a worker, none on an ingress or an egress. ai.generic nodes take it at their next request; SY.admin's executor and Archi at their next use, never restarted (either may be running this very action), rebuilding only for another engine.",
+            "The answer: payload {version, sha256, previous_version, previous_sha256, hives: {<hive>: {status, restarted, unchanged, attempts, elapsed_ms, next}}, skipped, node_check, timings_ms: {check, write, scan, apply, hives, total}}. A hive's status is ok, sync_pending (its copy had not arrived at the bound), error (error_code, error_detail) or not_answered: never read either as not applied; its next says what finishes it, by its error_code. status is ok when every connected hive is ok; otherwise partial (202), the version written, with message and pending naming the hives: GET /versions shows each hive's copy, and update with category config, manifest_version and manifest_hash finishes a hive. skipped names each hive the registry holds whose join did not finish (its status and join phase): the change does not reach it; finish its join or remove it, then update it with category config.",
         ],
         "update" => vec![
             "Legacy fields version/hash are rejected; use manifest_version/manifest_hash.",
-            "category=config applies a version of the installation file on the hive (docs/hive-config-update-v1.md §4): manifest_version and manifest_hash from get_installation (its version and sha256). The hive answers sync_pending until its copy is that version, then restarts only its readers whose engine changed and answers restarted and unchanged; the same version again restarts nothing. set_installation_ai runs it on every hive; run it for one hive that did not finish.",
+            "category=config applies a version of the installation file on the hive (docs/hive-config-update-v1.md §4): manifest_version and manifest_hash from get_installation (its version and sha256). The hive answers sync_pending until its copy is that version, then restarts only its readers whose engine changed (or that became active since its last record) and answers restarted and unchanged; the same version again restarts nothing. A copy of that version with another hash is refused with 409 INSTALLATION_HASH_MISMATCH (within one version the file does not change while it syncs), and a later version on the hive with VERSION_MISMATCH. set_installation_ai runs it on every hive; run it for one hive that did not finish.",
             "For category=runtime you may optionally scope the update with runtime + runtime_version.",
             "Scoped runtime update uses targeted readiness for that runtime/version and no longer blocks on unrelated missing runtimes in the same manifest.",
             "The response still includes global_runtime_health so operators can see overall runtime drift without turning it into a hard blocker for the targeted deploy.",
@@ -19410,12 +19415,15 @@ fn parse_installation_ai_change(
 
 /// One node's own AI settings, as A-11 reads them from its config: the provider and the model it
 /// names (`behavior.provider`, `behavior.model`; SY.architect's `ai.model`), each None when it
-/// leaves it to the installation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// leaves it to the installation; and its ILK and tenant, which its provider's key is read by
+/// (the key check, stage 3c's review, F3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct NodeAiNames {
     node: String,
     provider: Option<String>,
     model: Option<String>,
+    ilk: Option<String>,
+    tenant: Option<String>,
 }
 
 /// Whether a change from `current` to `next` can leave a node without its engine: it switches the
@@ -19498,6 +19506,54 @@ fn installation_node_check_hives(self_hive: &str, registry: &HiveRegistry) -> Ve
     hives
 }
 
+/// The hives the registry holds that a change of the installation does not reach (stage 3c's
+/// review, F4): a join that did not finish (joining, failed, interrupted) leaves an entry whose
+/// status is not `connected`, though its join may have copied the file and started SY.cognition.
+/// Each is named with its status, its join's phase, and what finishes it; `workers_only` keeps the
+/// workers, the hives A-11 would read. In name order.
+fn installation_skipped_hives(
+    registry: &HiveRegistry,
+    workers_only: bool,
+    version: Option<(u64, &str)>,
+) -> Vec<serde_json::Value> {
+    let mut skipped = Vec::new();
+    for entry in registry.entries().unwrap_or_default() {
+        if entry.field("status") == Some("connected") {
+            continue;
+        }
+        let role = entry.field("role").map(str::trim).unwrap_or_default();
+        if workers_only && !role.eq_ignore_ascii_case("worker") {
+            continue;
+        }
+        let hive = entry.name();
+        let phase = fs::read_to_string(registry.root().join(hive).join("info.yaml"))
+            .ok()
+            .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+            .and_then(|info| {
+                info.get("join")
+                    .and_then(|join| join.get("phase"))
+                    .and_then(serde_yaml::Value::as_str)
+                    .map(str::to_string)
+            });
+        let finish = match version {
+            Some((version, sha256)) => format!(
+                "finish its join (add_hive again) or remove it (remove_hive); once it is \
+                 connected, POST /hives/{hive}/update with {{\"category\": \"config\", \
+                 \"manifest_version\": {version}, \"manifest_hash\": \"{sha256}\"}}"
+            ),
+            None => "finish its join (add_hive again) or remove it (remove_hive)".to_string(),
+        };
+        skipped.push(serde_json::json!({
+            "hive": hive,
+            "role": if role.is_empty() { serde_json::Value::Null } else { serde_json::json!(role) },
+            "status": entry.field("status"),
+            "join_phase": phase,
+            "next": finish,
+        }));
+    }
+    skipped
+}
+
 /// What the node check read: every node's own AI settings, and the hives (or nodes) it could not
 /// read, each with why.
 #[derive(Debug, Default)]
@@ -19547,17 +19603,25 @@ async fn read_hive_node_ai_names(
     if !payload_is_ok(&listed) {
         return Err(payload_error_detail(&listed).unwrap_or_else(|| listed.to_string()));
     }
-    let names: Vec<String> = listed
+    // Each AI node, with the ILK and tenant the orchestrator launched it with.
+    let names: Vec<(String, Option<String>, Option<String>)> = listed
         .get("nodes")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|node| node.get("node_name").and_then(serde_json::Value::as_str))
-        .filter(|name| name.starts_with("AI."))
-        .map(str::to_string)
+        .filter_map(|node| {
+            let name = node.get("node_name").and_then(serde_json::Value::as_str)?;
+            let identity = node.get("identity");
+            Some((
+                name.to_string(),
+                node_names_text(identity, "ilk_id"),
+                node_names_text(identity, "tenant_id"),
+            ))
+        })
+        .filter(|(name, _, _)| name.starts_with("AI."))
         .collect();
     let mut found = Vec::new();
-    for node in names {
+    for (node, ilk, tenant) in names {
         let answer = installation_admin_read(
             ctx,
             client,
@@ -19581,6 +19645,8 @@ async fn read_hive_node_ai_names(
             node,
             provider: node_names_text(behavior, "provider"),
             model: node_names_text(behavior, "model"),
+            ilk,
+            tenant,
         });
     }
     Ok(found)
@@ -19618,10 +19684,197 @@ async fn read_architect_ai_names(
         return Err(payload_error_detail(&answer).unwrap_or_else(|| answer.to_string()));
     }
     Ok(Some(NodeAiNames {
-        node,
         provider: None,
         model: node_names_text(answer.pointer("/config/ai"), "model"),
+        ..installation_system_reader(&node)
     }))
+}
+
+/// An SY node that reads the installation's default provider's key in the root tenant, as itself:
+/// its ILK is the system one its name gives (`deterministic_system_ilk_id`).
+fn installation_system_reader(node: &str) -> NodeAiNames {
+    NodeAiNames {
+        node: node.to_string(),
+        ilk: Some(fluxbee_sdk::deterministic_system_ilk_id(node)),
+        tenant: Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+        ..NodeAiNames::default()
+    }
+}
+
+/// One vault secret of a provider, by its names only (never its value): the ILK that owns it and
+/// the ILKs it is assigned to, as SY.vault's listing gives them (stage 3c's review, F3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProviderKeyEntry {
+    owner: Option<String>,
+    assigned: Vec<String>,
+}
+
+impl ProviderKeyEntry {
+    /// Whether a node of the secret's tenant, with `ilk`, reads it: its own, one assigned to it, or
+    /// its tenant's general one (no owner, no assigned node), as `VaultClient::resolve_resource`
+    /// looks for it.
+    fn read_by(&self, ilk: Option<&str>) -> bool {
+        let general = self.owner.is_none() && self.assigned.is_empty();
+        general
+            || ilk.is_some_and(|ilk| {
+                self.owner.as_deref() == Some(ilk) || self.assigned.iter().any(|node| node == ilk)
+            })
+    }
+}
+
+/// The nodes that would read the new default provider's key (stage 3c's review, F3): the AI nodes
+/// that name no provider of their own (they follow the default), and the SY readers of the default,
+/// SY.admin's executor, SY.architect, SY.frontdesk.gov and each `cognition_hives`' SY.cognition.
+fn installation_key_readers(
+    admin_hive: &str,
+    nodes: &[NodeAiNames],
+    cognition_hives: &[String],
+) -> Vec<NodeAiNames> {
+    let mut readers: Vec<NodeAiNames> = nodes
+        .iter()
+        .filter(|node| node.node.starts_with("AI.") && node.provider.is_none())
+        .cloned()
+        .collect();
+    for node in [
+        format!("SY.admin@{admin_hive}"),
+        format!("SY.architect@{admin_hive}"),
+        format!("SY.frontdesk.gov@{admin_hive}"),
+    ] {
+        readers.push(installation_system_reader(&node));
+    }
+    for hive in cognition_hives {
+        readers.push(installation_system_reader(&format!("SY.cognition@{hive}")));
+    }
+    readers
+}
+
+/// The key check (stage 3c's review, F3): each reader of the new default `provider`'s key, in its
+/// own tenant, and why it has none. `keys` holds each tenant's secrets of that provider, by names
+/// only; a tenant missing from it was not read, and its readers count as having none.
+fn readers_without_the_key(
+    provider: AiProvider,
+    readers: &[NodeAiNames],
+    keys: &HashMap<String, Vec<ProviderKeyEntry>>,
+) -> Vec<(NodeAiNames, String)> {
+    readers
+        .iter()
+        .filter_map(|reader| {
+            let Some(tenant) = reader.tenant.as_deref() else {
+                return Some((
+                    reader.clone(),
+                    "its tenant is not known, so no key can be checked for it".to_string(),
+                ));
+            };
+            let has_one = keys.get(tenant).is_some_and(|entries| {
+                entries.iter().any(|key| key.read_by(reader.ilk.as_deref()))
+            });
+            (!has_one).then(|| {
+                (
+                    reader.clone(),
+                    format!(
+                        "no {provider} key it reads in {tenant} (its own, one assigned to it, or \
+                         its tenant's general one)"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+/// A tenant's secrets of `provider`, by names only, from SY.vault's listing on the motherbee.
+async fn list_provider_keys(
+    client: &RouterDispatcher,
+    admin_hive: &str,
+    tenant: &str,
+    provider: AiProvider,
+) -> Result<Vec<ProviderKeyEntry>, String> {
+    let listing = send_system_request(
+        client,
+        &format!("SY.vault@{admin_hive}"),
+        MSG_VAULT_LIST,
+        MSG_VAULT_LIST_RESPONSE,
+        serde_json::json!({"filter": {
+            "tenant_id": tenant,
+            "resource_type": provider.resource_type().as_str(),
+            "limit": 1000,
+        }}),
+        Duration::from_secs(15),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    if !payload_is_ok(&listing) {
+        return Err(payload_error_detail(&listing).unwrap_or_else(|| listing.to_string()));
+    }
+    Ok(provider_key_entries(&listing))
+}
+
+/// The secrets of SY.vault's listing, each by the names that say who reads it.
+fn provider_key_entries(listing: &serde_json::Value) -> Vec<ProviderKeyEntry> {
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    listing
+        .get("secrets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|secret| {
+            let metadata = secret.get("metadata");
+            // Its owner as SY.vault reads it (`secret_owner_ilk`): `ilk`, else the legacy
+            // `owner_ilk`.
+            let owner = |key: &str| text(metadata.and_then(|metadata| metadata.get(key)));
+            ProviderKeyEntry {
+                owner: owner("ilk").or_else(|| owner("owner_ilk")),
+                assigned: metadata
+                    .and_then(|metadata| metadata.get("assigned_ilks"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|ilk| text(Some(ilk)))
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// Each reader of the new default `provider`'s key, its tenant's keys listed once each: the readers
+/// without one, or the tenants whose keys could not be listed, each with why.
+async fn check_provider_keys(
+    client: &RouterDispatcher,
+    admin_hive: &str,
+    provider: AiProvider,
+    readers: &[NodeAiNames],
+) -> Result<Vec<(NodeAiNames, String)>, Vec<(String, String)>> {
+    let mut tenants: Vec<&str> = readers
+        .iter()
+        .filter_map(|reader| reader.tenant.as_deref())
+        .collect();
+    tenants.sort_unstable();
+    tenants.dedup();
+    let listed = futures::future::join_all(
+        tenants
+            .iter()
+            .map(|tenant| list_provider_keys(client, admin_hive, tenant, provider)),
+    )
+    .await;
+    let mut keys = HashMap::new();
+    let mut unread = Vec::new();
+    for (tenant, listing) in tenants.into_iter().zip(listed) {
+        match listing {
+            Ok(entries) => {
+                keys.insert(tenant.to_string(), entries);
+            }
+            Err(why) => unread.push((tenant.to_string(), why)),
+        }
+    }
+    if !unread.is_empty() {
+        return Err(unread);
+    }
+    Ok(readers_without_the_key(provider, readers, &keys))
 }
 
 /// A-11's read: the AI nodes of the motherbee and of every connected worker, each hive at once, and
@@ -19793,10 +20046,11 @@ fn installation_hive_json(
     version: u64,
     sha256: &str,
 ) -> serde_json::Value {
-    let next = format!(
-        "GET /versions shows its copy; POST /hives/{hive}/update with {{\"category\": \"config\", \
-         \"manifest_version\": {version}, \"manifest_hash\": \"{sha256}\"}} finishes it"
-    );
+    let error_code = match &applied.outcome {
+        InstallationApplyOutcome::Error { code, .. } => Some(code.as_str()),
+        _ => None,
+    };
+    let next = installation_next_step(hive, error_code, version, sha256);
     let mut line = match &applied.outcome {
         InstallationApplyOutcome::Ok(answer) => serde_json::json!({
             "status": "ok",
@@ -19824,6 +20078,45 @@ fn installation_hive_json(
     line["attempts"] = serde_json::json!(applied.attempts);
     line["elapsed_ms"] = serde_json::json!(elapsed.as_millis() as u64);
     line
+}
+
+/// What finishes a hive that is not ok, by its error code (stage 3c's review, F5): `sync_pending`
+/// and no answer are finished by the same update run again; a refusal names what has to change
+/// first.
+fn installation_next_step(
+    hive: &str,
+    error_code: Option<&str>,
+    version: u64,
+    sha256: &str,
+) -> String {
+    let update = format!(
+        "POST /hives/{hive}/update with {{\"category\": \"config\", \"manifest_version\": \
+         {version}, \"manifest_hash\": \"{sha256}\"}}"
+    );
+    match error_code {
+        Some("VERSION_MISMATCH") => format!(
+            "the hive holds a later version than {version}: read get_installation and apply that \
+             one with POST /hives/{hive}/update, category config, its manifest_version and \
+             manifest_hash"
+        ),
+        Some("MANIFEST_INVALID") => format!(
+            "its orchestrator takes no category config (a release before 0.1.122): update its core \
+             first (POST /hives/{hive}/update with category core), then {update}"
+        ),
+        Some("INSTALLATION_HASH_MISMATCH") => format!(
+            "the hive holds version {version} with another hash, a copy edited by hand: GET \
+             /versions shows it; restore it (the motherbee's bytes), then {update}"
+        ),
+        Some("RESTART_FAILED") => format!(
+            "a reader of the installation's ai did not restart: see its unit on {hive} \
+             (errors names it), then {update} restarts it again"
+        ),
+        Some("CONFIG_RECORD_FAILED") => format!(
+            "its readers run the version, and {hive} could not write its record of it: see its \
+             disk, then {update}"
+        ),
+        _ => format!("GET /versions shows its copy; {update} finishes it"),
+    }
 }
 
 /// The motherbee's Syncthing scans the installation folder at once, not when its watcher gets to the
@@ -19864,6 +20157,19 @@ async fn scan_installation_folder(client: &RouterDispatcher) {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
+}
+
+/// What `set_installation_ai` says when the write's answer did not come (stage 3c's review, F6):
+/// the write may still land, how to tell, and how to finish a version that did.
+fn installation_write_unanswered(detail: &str, expected_version: u64) -> String {
+    format!(
+        "the motherbee's orchestrator did not answer the write ({detail}). The write may still \
+         land: that orchestrator takes its system messages one at a time, and one ahead of it (a \
+         node's purge) can take up to 120 s. Read get_installation: if its expected_version moved \
+         past {expected_version}, that version is written and applied on no hive yet, so run \
+         update with category config, its manifest_version and manifest_hash, on every hive (GET \
+         /versions names them); if it did not, send the change again"
+    )
 }
 
 /// `set_installation_ai` (docs/hive-config-update-v1.md §4, stage 3c), the operator's alone:
@@ -19960,11 +20266,80 @@ async fn handle_set_installation_ai(
                     serde_json::json!({ "unchecked": unchecked }),
                 );
             }
-            serde_json::json!({
+            let mut ran = serde_json::json!({
                 "ran": true,
                 "hives": scan.hives,
                 "nodes": scan.nodes.len(),
-            })
+                // Workers whose join did not finish: named, not read, never a refusal (F4).
+                "skipped": installation_skipped_hives(&hive_registry(ctx), true, None),
+            });
+            // Stage 3c's review (F3): a new default provider needs its key wherever a reader of
+            // the default reads one, read by names only, never values.
+            if current.default_provider != change.ai.default_provider {
+                let provider = change.ai.default_provider;
+                let readers = installation_key_readers(&ctx.hive_id, &scan.nodes, &scan.hives);
+                match check_provider_keys(client, &ctx.hive_id, provider, &readers).await {
+                    Err(unread) => {
+                        let named: Vec<String> = unread
+                            .iter()
+                            .map(|(tenant, why)| format!("{tenant} ({why})"))
+                            .collect();
+                        return installation_refusal(
+                            action,
+                            "KEYS_NOT_CHECKED",
+                            format!(
+                                "this change switches the default provider to {provider}, and \
+                                 SY.vault's {provider} keys of {} could not be listed to check \
+                                 that every reader of the default has one: nothing was written; \
+                                 retry once the vault answers",
+                                named.join(", ")
+                            ),
+                            serde_json::json!({
+                                "unchecked": unread
+                                    .iter()
+                                    .map(|(tenant, why)| serde_json::json!({"tenant": tenant, "why": why}))
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
+                    Ok(missing) if !missing.is_empty() => {
+                        let named: Vec<String> = missing
+                            .iter()
+                            .map(|(reader, why)| format!("{}: {why}", reader.node))
+                            .collect();
+                        return installation_refusal(
+                            action,
+                            "PROVIDER_KEYS_MISSING",
+                            format!(
+                                "this change switches the default provider to {provider}, and \
+                                 readers of the default have no {provider} key: {}. Nothing was \
+                                 written. Put a {provider} key in SY.vault for each (vault_put, \
+                                 resource_type {provider}, in the reader's tenant), or give an AI \
+                                 node its own provider (behavior.provider and behavior.model) first",
+                                named.join("; ")
+                            ),
+                            serde_json::json!({
+                                "missing": missing
+                                    .iter()
+                                    .map(|(reader, why)| serde_json::json!({
+                                        "node": reader.node,
+                                        "tenant": reader.tenant,
+                                        "resource_type": provider.resource_type().as_str(),
+                                        "why": why,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
+                    Ok(_) => {
+                        ran["keys"] = serde_json::json!({
+                            "resource_type": provider.resource_type().as_str(),
+                            "readers": readers.len(),
+                        });
+                    }
+                }
+            }
+            ran
         }
         Some(_) => serde_json::json!({
             "ran": false,
@@ -20005,16 +20380,19 @@ async fn handle_set_installation_ai(
             let detail = payload_error_detail(&answer).unwrap_or_else(|| answer.to_string());
             return installation_refusal(action, &code, detail, answer);
         }
+        // Stage 3c's review (F6): the motherbee's orchestrator takes its system messages one at a
+        // time, and one ahead of the write (a node's purge) can hold it past this window: the
+        // write may still land after this answer, applied nowhere.
         Err(err) => {
             let detail = err.to_string();
             return installation_refusal(
                 action,
                 infer_transport_error_code(&detail),
-                format!(
-                    "the motherbee's orchestrator did not answer the write ({detail}): \
-                     get_installation shows whether a version was written"
-                ),
-                serde_json::Value::Null,
+                installation_write_unanswered(&detail, change.expected_version),
+                serde_json::json!({
+                    "write_may_still_land": true,
+                    "expected_version": change.expected_version,
+                }),
             );
         }
     };
@@ -20074,12 +20452,20 @@ async fn handle_set_installation_ai(
         hive_ms.insert(hive.clone(), serde_json::json!(elapsed.as_millis() as u64));
         lines.insert(hive.clone(), line);
     }
+    // The registry's hives whose join did not finish: never applied, each named (F4).
+    let skipped = installation_skipped_hives(&hive_registry(ctx), false, Some((version, &sha256)));
+    let skipped_names: Vec<String> = skipped
+        .iter()
+        .filter_map(|hive| hive.get("hive").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
     let mut payload = serde_json::json!({
         "version": version,
         "sha256": sha256,
         "previous_version": written.get("previous_version"),
         "previous_sha256": written.get("previous_sha256"),
         "hives": lines,
+        "skipped": skipped,
         "node_check": node_check,
         "timings_ms": {
             "check": check_ms,
@@ -20090,14 +20476,28 @@ async fn handle_set_installation_ai(
             "total": elapsed_ms(started),
         },
     });
+    let skipped_note = if skipped_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The registry also holds hives whose join did not finish, which it does not reach: \
+             {} (skipped names what finishes each).",
+            skipped_names.join(", ")
+        )
+    };
     if pending.is_empty() {
+        if !skipped_note.is_empty() {
+            payload["message"] = serde_json::json!(format!(
+                "version {version} is written and every connected hive applied it.{skipped_note}"
+            ));
+        }
         return installation_answer(action, 200, "ok", payload, None);
     }
     payload["pending"] = serde_json::json!(pending);
     payload["message"] = serde_json::json!(format!(
         "version {version} is written, and not every hive has applied it yet: {}. GET /versions \
          shows each hive's copy; update with category config, manifest_version {version} and \
-         manifest_hash {sha256} finishes a hive",
+         manifest_hash {sha256} finishes a hive.{skipped_note}",
         pending.join(", ")
     ));
     installation_answer(action, 202, "partial", payload, None)
@@ -30590,6 +30990,7 @@ mod tests {
             node: node.to_string(),
             provider: provider.map(str::to_string),
             model: model.map(str::to_string),
+            ..NodeAiNames::default()
         };
         let nodes = vec![
             names("AI.own-model@worker1", None, Some("claude-opus-5-5")),
@@ -30898,32 +31299,46 @@ mod tests {
             (json!(4), json!(1500))
         );
         assert!(ok.get("next").is_none());
-        for (outcome, status) in [
+        let error = |code: &str| InstallationApplyOutcome::Error {
+            code: code.to_string(),
+            detail: "the reason".to_string(),
+            answer: json!({}),
+        };
+        // The hint follows the outcome (stage 3c's review, F5): the same update run again for
+        // what it finishes; what has to change first for a refusal it cannot finish.
+        for (outcome, status, hint) in [
             (
                 InstallationApplyOutcome::SyncPending(json!({"local_manifest_version": 1})),
                 "sync_pending",
-            ),
-            (
-                InstallationApplyOutcome::Error {
-                    code: "RESTART_FAILED".to_string(),
-                    detail: "sy-cognition: bootstrap timeout".to_string(),
-                    answer: json!({}),
-                },
-                "error",
+                "GET /versions shows its copy",
             ),
             (
                 InstallationApplyOutcome::NotAnswered("timeout".to_string()),
                 "not_answered",
+                "GET /versions shows its copy",
             ),
+            (error("RESTART_FAILED"), "error", "did not restart"),
+            (
+                error("CONFIG_RECORD_FAILED"),
+                "error",
+                "could not write its record",
+            ),
+            (error("INSTALLATION_HASH_MISMATCH"), "error", "restore it"),
+            (error("MANIFEST_INVALID"), "error", "update its core first"),
         ] {
             let shown = line(outcome);
             assert_eq!(shown["status"], json!(status));
             let next = shown["next"].as_str().expect("next");
-            assert!(next.contains("GET /versions"), "{next}");
+            assert!(next.contains(hint), "{next}");
             assert!(next.contains("POST /hives/worker1/update"), "{next}");
             assert!(next.contains("\"manifest_hash\": \"bbb\""), "{next}");
             assert!(!shown.to_string().contains("not applied"), "{shown}");
         }
+        // A later version on the hive: this one's update could never finish it.
+        let later = line(error("VERSION_MISMATCH"));
+        let next = later["next"].as_str().expect("next");
+        assert!(next.contains("a later version than 2"), "{next}");
+        assert!(!next.contains("\"manifest_hash\": \"bbb\""), "{next}");
     }
 
     /// Answers one request the change sends, by what it asks: the motherbee's /versions, the
@@ -31261,6 +31676,353 @@ mod tests {
             sent.payload,
             json!({"category": "config", "manifest_version": 3, "manifest_hash": "ccc"})
         );
+    }
+
+    /// Stage 3c's review (F3): who reads a new default provider's key, and who has one. The AI
+    /// nodes that name no provider follow the default, in their own tenant; the SY readers of the
+    /// default read theirs in the root tenant, as themselves. A key is read when it is the
+    /// reader's own, assigned to it, or its tenant's general one.
+    #[test]
+    fn a_new_default_provider_needs_its_key_wherever_a_reader_of_the_default_reads_one() {
+        let ai_node = |node: &str, provider: Option<&str>, ilk: &str, tenant: &str| NodeAiNames {
+            node: node.to_string(),
+            provider: provider.map(str::to_string),
+            model: None,
+            ilk: Some(ilk.to_string()),
+            tenant: Some(tenant.to_string()),
+        };
+        let nodes = vec![
+            ai_node("AI.general@worker1", None, "ilk:general", "tnt:a"),
+            ai_node("AI.owned@worker1", None, "ilk:owned", "tnt:b"),
+            ai_node("AI.assigned@worker1", None, "ilk:assigned", "tnt:b"),
+            ai_node("AI.none@worker1", None, "ilk:none", "tnt:b"),
+            ai_node(
+                "AI.own-provider@worker1",
+                Some("anthropic"),
+                "ilk:own",
+                "tnt:c",
+            ),
+            NodeAiNames {
+                node: "SY.architect@motherbee".to_string(),
+                model: Some("claude-opus-5-5".to_string()),
+                ..NodeAiNames::default()
+            },
+        ];
+        let readers = installation_key_readers(
+            "motherbee",
+            &nodes,
+            &["motherbee".to_string(), "worker1".to_string()],
+        );
+        let names: Vec<&str> = readers.iter().map(|reader| reader.node.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "AI.general@worker1",
+                "AI.owned@worker1",
+                "AI.assigned@worker1",
+                "AI.none@worker1",
+                "SY.admin@motherbee",
+                "SY.architect@motherbee",
+                "SY.frontdesk.gov@motherbee",
+                "SY.cognition@motherbee",
+                "SY.cognition@worker1",
+            ]
+        );
+        let admin = &readers[4];
+        assert_eq!(
+            admin.ilk.as_deref(),
+            Some(fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee").as_str())
+        );
+        assert_eq!(
+            admin.tenant.as_deref(),
+            Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID)
+        );
+
+        let key = |owner: Option<&str>, assigned: &[&str]| ProviderKeyEntry {
+            owner: owner.map(str::to_string),
+            assigned: assigned.iter().map(|ilk| ilk.to_string()).collect(),
+        };
+        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
+        let mut keys = HashMap::new();
+        keys.insert("tnt:a".to_string(), vec![key(None, &[])]);
+        keys.insert(
+            "tnt:b".to_string(),
+            vec![
+                key(Some("ilk:owned"), &[]),
+                key(Some("ilk:person"), &["ilk:assigned"]),
+            ],
+        );
+        // The root tenant: no general key, one owned by SY.admin only.
+        keys.insert(
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
+            vec![key(Some(&admin_ilk), &[])],
+        );
+        let missing: Vec<String> = readers_without_the_key(AiProvider::OpenAi, &readers, &keys)
+            .into_iter()
+            .map(|(reader, why)| {
+                assert!(why.contains("no openai key it reads in"), "{why}");
+                reader.node
+            })
+            .collect();
+        assert_eq!(
+            missing,
+            vec![
+                "AI.none@worker1",
+                "SY.architect@motherbee",
+                "SY.frontdesk.gov@motherbee",
+                "SY.cognition@motherbee",
+                "SY.cognition@worker1",
+            ]
+        );
+        // A general key in the root tenant covers every SY reader; a tenant never listed covers no
+        // one; a reader of unknown tenant is named.
+        keys.insert(
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
+            vec![key(None, &[])],
+        );
+        keys.remove("tnt:a");
+        let mut unknown = readers[0].clone();
+        unknown.tenant = None;
+        let missing: Vec<String> = readers_without_the_key(
+            AiProvider::OpenAi,
+            &[readers[0].clone(), readers[4].clone(), unknown],
+            &keys,
+        )
+        .into_iter()
+        .map(|(reader, why)| format!("{}: {why}", reader.node))
+        .collect();
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing[0].starts_with("AI.general@worker1: no openai key"));
+        assert!(missing[1].contains("its tenant is not known"));
+
+        // SY.vault's listing, by names only: the owner is `ilk`, else the legacy `owner_ilk`, and
+        // empty names are none.
+        let listing = serde_json::json!({"status": "ok", "count": 4, "secrets": [
+            {"key": "openai:general", "metadata": {"tenant_id": "tnt:b", "resource_type": "openai"}},
+            {"key": "openai:own", "metadata": {"tenant_id": "tnt:b", "resource_type": "openai",
+                "ilk": "ilk:owned", "assigned_ilks": ["ilk:assigned", " "]}},
+            {"key": "openai:legacy", "metadata": {"tenant_id": "tnt:b", "resource_type": "openai",
+                "owner_ilk": "ilk:legacy"}},
+            {"key": "openai:blank", "metadata": {"tenant_id": "tnt:b", "resource_type": "openai",
+                "ilk": " ", "assigned_ilks": [""]}},
+        ]});
+        assert_eq!(
+            provider_key_entries(&listing),
+            vec![
+                key(None, &[]),
+                key(Some("ilk:owned"), &["ilk:assigned"]),
+                key(Some("ilk:legacy"), &[]),
+                key(None, &[]),
+            ]
+        );
+        assert!(!key(Some("ilk:legacy"), &[]).read_by(Some("ilk:other")));
+        assert!(key(Some("ilk:legacy"), &[]).read_by(Some("ilk:legacy")));
+    }
+
+    /// Stage 3c's review (F4): the hives the registry holds whose join did not finish are named,
+    /// with their status, their join's phase and what finishes them; A-11 names its workers.
+    #[test]
+    fn hives_whose_join_did_not_finish_are_named_not_left_out() {
+        let root = std::env::temp_dir().join(format!("installation-skipped-{}", Uuid::new_v4()));
+        for (dir, info) in [
+            ("worker1", "hive_id: worker1\nrole: worker\nstatus: connected\n"),
+            (
+                "worker9",
+                "hive_id: worker9\nrole: worker\nstatus: failed\njoin:\n  phase: done\n  error_code: JOIN_FAILED\n",
+            ),
+            (
+                "egress2",
+                "hive_id: egress2\nrole: egress\nstatus: joining\njoin:\n  phase: running\n",
+            ),
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("info.yaml"), info).unwrap();
+        }
+        let registry = HiveRegistry::new(&root);
+        let skipped = installation_skipped_hives(&registry, false, Some((3, "ccc")));
+        let named: Vec<(&str, &str, &str)> = skipped
+            .iter()
+            .map(|hive| {
+                (
+                    hive["hive"].as_str().unwrap_or_default(),
+                    hive["status"].as_str().unwrap_or_default(),
+                    hive["join_phase"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("egress2", "joining", "running"),
+                ("worker9", "failed", "done")
+            ]
+        );
+        let next = skipped[1]["next"].as_str().expect("next");
+        assert!(next.contains("remove_hive"), "{next}");
+        assert!(next.contains("POST /hives/worker9/update"), "{next}");
+        assert!(next.contains("\"manifest_hash\": \"ccc\""), "{next}");
+        // A-11's names only the workers, with no version to apply.
+        let workers = installation_skipped_hives(&registry, true, None);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0]["hive"], json!("worker9"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Stage 3c's review (F3), the whole path: a switch of the default provider that A-11 lets
+    /// through lists each tenant's keys of the new provider by names, and refuses, naming each
+    /// reader and tenant, when one has none; nothing is written.
+    #[tokio::test]
+    async fn set_installation_ai_refuses_a_switch_whose_readers_have_no_key() {
+        let (ctx, mut harness) = opa_test_admin("installation-keys");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let switch = installation_ai(
+            AiProvider::OpenAi,
+            Some("gpt-5.5"),
+            Some("claude-sonnet-5-5"),
+        );
+        let params = json!({"ai": switch, "expected_version": 2});
+        let run = handle_set_installation_ai(&ctx, &ctx.rpc, &params);
+        let drive = async {
+            let mut tenants_listed = Vec::new();
+            // /versions, the nodes, the AI node's and Archi's configs, then each tenant's keys.
+            for _ in 0..6 {
+                let sent = harness
+                    .next_outgoing_within(Duration::from_secs(5))
+                    .await
+                    .expect("a read");
+                if sent.meta.msg_type == "admin" {
+                    let view = match sent.meta.action.as_deref() {
+                        Some("get_versions") => {
+                            json!({"status": "ok", "hive": {"hive_id": "motherbee", "config": own}})
+                        }
+                        Some("list_nodes") => json!({"status": "ok", "nodes": [{
+                            "node_name": "AI.sales@motherbee",
+                            "identity": {"ilk_id": "ilk:sales", "tenant_id": "tnt:acme"},
+                        }]}),
+                        Some("get_node_config") => match sent.payload["node_name"].as_str() {
+                            Some("AI.sales@motherbee") => {
+                                json!({"status": "ok", "config": {"behavior": {"kind": "ai_chat"}}})
+                            }
+                            _ => {
+                                json!({"status": "error", "error_code": "NODE_CONFIG_NOT_FOUND", "message": "none"})
+                            }
+                        },
+                        other => panic!("an unexpected read: {other:?}"),
+                    };
+                    let mut answer = reply_to(&sent, "", view);
+                    answer.meta.msg_type = "admin".to_string();
+                    answer.meta.msg = None;
+                    harness.inject(answer).await.unwrap();
+                } else {
+                    assert_eq!(sent.meta.msg.as_deref(), Some(MSG_VAULT_LIST));
+                    let filter = &sent.payload["filter"];
+                    assert_eq!(filter["resource_type"], json!("openai"));
+                    let tenant = filter["tenant_id"].as_str().unwrap_or_default().to_string();
+                    // The root tenant holds a general openai key; acme holds none.
+                    let secrets = if tenant == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+                        json!([{"key": "openai:root", "metadata": {"tenant_id": tenant, "resource_type": "openai"}}])
+                    } else {
+                        json!([])
+                    };
+                    tenants_listed.push(tenant);
+                    harness
+                        .inject(reply_to(
+                            &sent,
+                            MSG_VAULT_LIST_RESPONSE,
+                            json!({"status": "ok", "count": 0, "secrets": secrets}),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            tenants_listed
+        };
+        let ((status, body), mut tenants_listed) = tokio::join!(run, drive);
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error_code"], json!("PROVIDER_KEYS_MISSING"));
+        assert_eq!(
+            body["payload"]["missing"][0]["node"],
+            json!("AI.sales@motherbee")
+        );
+        assert_eq!(body["payload"]["missing"][0]["tenant"], json!("tnt:acme"));
+        assert_eq!(
+            body["payload"]["missing"][0]["resource_type"],
+            json!("openai")
+        );
+        assert_eq!(body["payload"]["missing"].as_array().map(Vec::len), Some(1));
+        tenants_listed.sort();
+        assert_eq!(
+            tenants_listed,
+            vec![
+                fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
+                "tnt:acme".to_string()
+            ]
+        );
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
+    }
+
+    /// Stage 3c's review (F6): a write whose answer does not come may still land; the answer says
+    /// so, how to tell, and how to finish a version that did.
+    #[tokio::test]
+    async fn a_write_whose_answer_does_not_come_says_it_may_still_land() {
+        let (ctx, mut harness) = opa_test_admin("installation-write-silent");
+        let own = versions_after_a_change()["hives"][0]["config"].clone();
+        let change = installation_ai(
+            AiProvider::Anthropic,
+            Some("gpt-5.6"),
+            Some("claude-sonnet-5-5"),
+        );
+        let params = json!({"ai": change, "expected_version": 2});
+        let run = handle_set_installation_ai(&ctx, &ctx.rpc, &params);
+        let drive = async {
+            let versions = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("/versions");
+            let mut answer = reply_to(
+                &versions,
+                "",
+                json!({"status": "ok", "hive": {"hive_id": "motherbee", "config": own}}),
+            );
+            answer.meta.msg_type = "admin".to_string();
+            answer.meta.msg = None;
+            harness.inject(answer).await.unwrap();
+            let write = harness
+                .next_outgoing_within(Duration::from_secs(5))
+                .await
+                .expect("the write");
+            assert!(write.payload.get("write").is_some());
+            harness
+                .inject(reply_to(
+                    &write,
+                    MSG_UNREACHABLE,
+                    json!({"reason": "NODE_NOT_FOUND", "original_dst": "SY.orchestrator@motherbee"}),
+                ))
+                .await
+                .unwrap();
+        };
+        let ((status, body), ()) = tokio::join!(run, drive);
+        let body: Value = serde_json::from_str(&body).expect("body");
+        assert_eq!(body["status"], json!("error"), "{body}");
+        assert_eq!(status, error_code_to_http_status("TRANSPORT_ERROR"));
+        let detail = body["error_detail"].as_str().expect("detail");
+        for part in [
+            "may still land",
+            "get_installation",
+            "moved past 2",
+            "update with category config",
+        ] {
+            assert!(detail.contains(part), "{detail}");
+        }
+        assert_eq!(body["payload"]["write_may_still_land"], json!(true));
+        assert!(harness
+            .next_outgoing_within(Duration::from_millis(200))
+            .await
+            .is_none());
     }
 
     // --- A-127: a bare node name is a node of the path's hive ----------------------------------

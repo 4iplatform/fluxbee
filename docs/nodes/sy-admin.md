@@ -548,16 +548,32 @@ What it does (`handle_set_installation_ai`):
      dropped. The payload lists `nodes` (`{node, why}`) and `unchecked`;
    - `503 HIVES_NOT_CHECKED`, naming each hive (or SY.architect's config) it could not read.
 
-   When the motherbee's values are not known (its file is one no reader can use, and its last
-   version recorded none), the check is skipped and `node_check` says so.
+   A worker whose join did not finish is named in `node_check.skipped`, never a refusal. When the
+   motherbee's values are not known (its file is one no reader can use, and its last version
+   recorded none), the check is skipped and `node_check` says so.
+   **The key check**, when the change switches the default provider (stage 3c's review, F3): every
+   reader of the default needs a key of the new provider. The readers (`installation_key_readers`)
+   are each AI node that names no provider of its own, in its own tenant, and SY.admin's executor,
+   SY.architect, SY.frontdesk.gov and each SY.cognition, in the root tenant, each as itself.
+   SY.admin lists each tenant's secrets of that provider from SY.vault, by names only, never
+   values (`VAULT_LIST` with `tenant_id` and `resource_type`, `list_provider_keys`), and each reader
+   must find one it reads: its own, one assigned to it, or its tenant's general one
+   (`readers_without_the_key`). It refuses, writing nothing:
+   - `409 PROVIDER_KEYS_MISSING`, naming each node, its tenant and the `resource_type` (payload
+     `missing`): put the key in SY.vault first, or give the AI node its own provider;
+   - `503 KEYS_NOT_CHECKED`, naming each tenant whose keys could not be listed.
 2. **The write.** `SYSTEM_UPDATE {category: "config", write: {ai, expected_version,
    replace_hand_edit}}` to `SY.orchestrator@motherbee`, 30 s. Its refusal passes through with its
    code and payload: `409` `JOIN_IN_PROGRESS`, `INSTALLATION_EDITED_BY_HAND`, `VERSION_CONFLICT`,
    `INSTALLATION_UNCHANGED`, `INSTALLATION_NOT_WRITTEN` or `NOT_PRIMARY`; `422 INVALID_AI_SETTINGS`;
    `502` `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE` or
    `INSTALLATION_WRITE_FAILED`.
-   No answer is `TIMEOUT` (or `TRANSPORT_ERROR`): `get_installation` shows whether a version was
-   written.
+   No answer is `TIMEOUT` (or `TRANSPORT_ERROR`), and not "nothing written": the motherbee's
+   orchestrator takes its system messages one at a time, and one ahead of the write (a node's
+   purge, up to 120 s) can hold it past the window. The answer says the write may still land
+   (`installation_write_unanswered`, payload `{write_may_still_land, expected_version}`): read
+   `get_installation`, and when its `expected_version` moved past the one sent, run `update` with
+   category `config` on every hive, since this change applied it on none.
 3. **The scan.** The motherbee's Syncthing scans `fluxbee-dist-installation` (`SYSTEM_SYNC_HINT`,
    3 s, waited 5 s; `scan_installation_folder`), as a policy's write does: a hint, never a gate.
 4. **The apply.** Every hive at once, the motherbee and each one the registry calls connected
@@ -567,25 +583,35 @@ What it does (`handle_set_installation_ai`):
    (`JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`, `apply_installation_on_hive`); a hive it cannot
    reach is asked again within that bound, and a timeout (60 s, an update's) ends the asking. Each
    hive's apply ends by the action's ceiling (210 s). Each restarts only its readers whose engine
-   changed; SY.admin and SY.architect are never restarted.
+   changed, or that became active since its record of the update applied last; SY.admin and
+   SY.architect are never restarted. A hive the registry holds whose join did not finish (its
+   status not `connected`) is not asked: it is named in `skipped` (stage 3c's review, F4).
 
-The answer's payload is `{version, sha256, previous_version, previous_sha256, hives, node_check,
-timings_ms}`:
+The answer's payload is `{version, sha256, previous_version, previous_sha256, hives, skipped,
+node_check, timings_ms}`:
 
 - `hives.<hive>`: `status` `ok` (with `restarted` and `unchanged`), `sync_pending` (its copy had
   not arrived at the bound; `local_version`, `local_sha256`), `error` (`error_code`,
-  `error_detail`: `VERSION_MISMATCH` for a copy past the version, `RESTART_FAILED`,
-  `CONFIG_RECORD_FAILED` (its readers took the version, and its record could not be written), or
-  `MANIFEST_INVALID` from an orchestrator before 0.1.122, which takes no category `config`) or
-  `not_answered` (`detail`), with `attempts` and `elapsed_ms`; a hive not ok gets `next`, where to
-  look and how to finish it (`installation_hive_json`). Never "not applied" (P-13): a hive that
-  did not answer may hold the version already;
-- `node_check`: `{ran: true, hives, nodes}`, or `{ran: false, reason}`;
+  `error_detail`: `VERSION_MISMATCH` for a copy past the version, `INSTALLATION_HASH_MISMATCH` for
+  a copy of the version with another hash, `RESTART_FAILED`, `CONFIG_RECORD_FAILED` (its readers
+  took the version, and its record could not be written), or `MANIFEST_INVALID` from an
+  orchestrator before 0.1.122, which takes no category `config`) or `not_answered` (`detail`), with
+  `attempts` and `elapsed_ms`; a hive not ok gets `next`, what finishes it by its error code
+  (`installation_next_step`): the same update for `sync_pending`, no answer, `RESTART_FAILED` and
+  `CONFIG_RECORD_FAILED`; the core first for `MANIFEST_INVALID`; the copy restored for
+  `INSTALLATION_HASH_MISMATCH`; the later version for `VERSION_MISMATCH`. Never "not applied"
+  (P-13): a hive that did not answer may hold the version already;
+- `skipped`: each hive the registry holds whose join did not finish, `{hive, role, status,
+  join_phase, next}` (`installation_skipped_hives`): its join may have copied the file and started
+  SY.cognition; finish its join or remove it, then `update` it with category `config`. It does not
+  make the answer `partial`, as `/versions` leaves such a hive out;
+- `node_check`: `{ran: true, hives, nodes, skipped, keys}`, or `{ran: false, reason}`;
 - `timings_ms`: `check`, `write`, `scan`, `apply`, `total`, and `hives`, each hive's time to its
   final answer.
 
-The status is `ok` (200) when every hive is ok, and `partial` (202) otherwise: the version is
-written, `pending` names the hives that are not ok and `message` says what finishes them.
+The status is `ok` (200) when every connected hive is ok, and `partial` (202) otherwise: the
+version is written, `pending` names the hives that are not ok and `message` says what finishes
+them (and names the skipped ones).
 
 ```json
 {
@@ -676,12 +702,17 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   (`handle_vault_secret_changed_admin`).
 - **A new version of the installation file** is taken at the executor's next use, never by a
   restart: no config update restarts SY.admin, which may be running the very change
-  ([The installation's ai](#the-installations-ai)). Each build records the stamp of the file it
+  ([The installation's ai](#the-installations-ai)). Each verdict records the stamp of the file it
   read, the sha256 of its bytes (`ai_settings::InstallationBuiltFrom`); before each plan it runs or
-  reviews, the executor reads that one small file and hashes it, and only a changed file rebuilds
-  the runtime, its key read once from the vault (`executor_takes_new_installation_ai`). The log
-  then says once where its `ai` comes from. Before the boot's build recorded a stamp, nothing is
-  rebuilt: that build reads the file itself.
+  reviews, the executor reads that one small file and hashes it (`executor_takes_new_installation_ai`).
+  A changed file whose engine (the default provider and its model) is the one the runtime runs
+  keeps the runtime, with no key read: the stamp is recorded and nothing else happens. Only
+  another engine rebuilds it, its key read once from the vault (`ai_settings::provider_key`), and
+  the log then says once where its `ai` comes from. A vault that did not answer is no verdict: the
+  runtime it had stays, no stamp is recorded, a warning is logged and the next use asks again. A
+  key the vault does not hold for the new provider, or an `ai` no reader can use, takes the
+  runtime down with the reason, as at start (stage 3c's review, F1). Until a verdict is recorded
+  (a boot that waited on the vault), every use asks.
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, tenant
   source `root`), with work `{execution_id, caller, stage}` where stage is `executor` or
   `executor_review` (`executor_usage_account`). The record goes to the node's router stream
