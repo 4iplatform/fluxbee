@@ -829,6 +829,20 @@ fn cloud_error_code(code: &str, detail: &str) -> serde_json::Value {
     json!({ "status": "error", "error_code": code, "error_detail": detail })
 }
 
+/// `params.cursor`, the `next_cursor` of the page before (FINDINGS A-198): none when absent, null
+/// or empty; anything but a string is refused.
+fn page_cursor(params: &serde_json::Value) -> Result<Option<String>, serde_json::Value> {
+    match params.get("cursor") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(cursor)) => {
+            Ok(Some(cursor.trim().to_string()).filter(|cursor| !cursor.is_empty()))
+        }
+        Some(_) => Err(cloud_error(
+            "params.cursor must be the next_cursor of the page before, a string",
+        )),
+    }
+}
+
 fn required_string(params: &serde_json::Value, field: &str) -> Result<String, serde_json::Value> {
     params
         .get(field)
@@ -1215,7 +1229,12 @@ fn translate_cloud_op(
                     .ok_or_else(|| cloud_error("params.limit must be an integer from 1 to 1000"))?;
                 filter.insert("limit".to_string(), json!(limit));
             }
-            Ok(("vault_list", json!({ "filter": filter })))
+            let mut admin_params = json!({ "filter": filter });
+            // The next page: the next_cursor of the page before (FINDINGS A-198), beside the filter.
+            if let Some(cursor) = page_cursor(params)? {
+                admin_params["cursor"] = json!(cursor);
+            }
+            Ok(("vault_list", admin_params))
         }
         // One credential of the claimed tenant. SY.vault answers KEY_NOT_FOUND for a key of
         // another tenant, exactly like a missing one.
@@ -1312,7 +1331,22 @@ fn translate_cloud_op(
             let tenant_id = claimed_tenant(tenant_id, op)?;
             Ok(("get_tenant", json!({ "tenant_id": tenant_id })))
         }
-        "list_tenants" => Ok(("list_tenants", json!({}))),
+        // Every tenant, or one page of them (FINDINGS A-198): `limit` and the `cursor` of the page
+        // before.
+        "list_tenants" => {
+            let mut admin_params = json!({});
+            if let Some(limit) = params.get("limit").filter(|value| !value.is_null()) {
+                let limit = limit
+                    .as_u64()
+                    .filter(|limit| *limit >= 1)
+                    .ok_or_else(|| cloud_error("params.limit must be an integer from 1"))?;
+                admin_params["limit"] = json!(limit);
+            }
+            if let Some(cursor) = page_cursor(params)? {
+                admin_params["cursor"] = json!(cursor);
+            }
+            Ok(("list_tenants", admin_params))
+        }
         // The claimed tenant's nodes on every hive.
         "list_nodes" => {
             let tenant_id = claimed_tenant(tenant_id, op)?;
@@ -2740,11 +2774,23 @@ mod tests {
         );
         let (_, p) = translate_cloud_op("list_tokens", Some(tenant), &json!({})).unwrap();
         assert_eq!(p, json!({"filter": {"tenant_id": tenant}}));
+        // The next page (FINDINGS A-198): the cursor beside the filter.
+        let (_, p) = translate_cloud_op(
+            "list_tokens",
+            Some(tenant),
+            &json!({"limit": 20, "cursor": "0a1b"}),
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            json!({"filter": {"tenant_id": tenant, "limit": 20}, "cursor": "0a1b"})
+        );
         for bad in [
             json!({"limit": 0}),
             json!({"limit": 1001}),
             json!({"limit": "10"}),
             json!({"prefix": 3}),
+            json!({"cursor": 5}),
         ] {
             assert!(
                 translate_cloud_op("list_tokens", Some(tenant), &bad).is_err(),
@@ -2907,6 +2953,26 @@ mod tests {
             translate_cloud_op("list_tenants", None, &json!({})).unwrap(),
             ("list_tenants", json!({}))
         );
+        // One page of them (FINDINGS A-198).
+        assert_eq!(
+            translate_cloud_op(
+                "list_tenants",
+                None,
+                &json!({"limit": 50, "cursor": "tnt:a", "x": 1})
+            )
+            .unwrap(),
+            ("list_tenants", json!({"limit": 50, "cursor": "tnt:a"}))
+        );
+        for bad in [
+            json!({"limit": 0}),
+            json!({"limit": "5"}),
+            json!({"cursor": []}),
+        ] {
+            assert!(
+                translate_cloud_op("list_tenants", None, &bad).is_err(),
+                "{bad}"
+            );
+        }
         assert_eq!(
             translate_cloud_op("list_nodes", Some(tenant), &json!({})).unwrap(),
             ("list_tenant_nodes", json!({"tenant_id": tenant}))

@@ -1036,7 +1036,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd)."
+                        "description": "Read-only Fluxbee path, for example /inventory, /versions, /hives/motherbee/nodes, or /admin/actions (every action's name, description and read_only). Key paths: /inventory (all nodes), /versions, /hives/{hive}/runtimes, /hives/{hive}/runtimes/{runtime} (for ai.generic, tool_catalog: the base tools of every AI agent), /hives/{hive}/nodes, /hives/{hive}/nodes/{name}/config (persisted), /hives/{hive}/nodes/{name}/help (a running node's self-description: an AI node's tool cards), /hives/{hive}/identity/ilks, /hives/{hive}/identity/ilks/{ilk_id}, /hives/{hive}/identity/tenants, /hives/{hive}/identity/tenants/{tenant_id}, /hives/{hive}/vault/secrets (metadata list), /hives/{hive}/vault/secrets/{key}/metadata, /hives/{hive}/nodes/{name}/control/config-get (live contract), /hives/{hive}/wf-rules, /hives/{hive}/wf-rules/check (POST {workflow_name, definition}: SY.wf-rules compiles it and only answers; each error names its path), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances?status=&limit= (a WF's instances), /hives/{hive}/nodes/WF.{workflow_name}/wf/instances/{instance_id}?log_limit= (one instance: its state, input, variables and last log entries), /hives/{hive}/drift-alerts, /hives/{hive}/routes, /hives/{hive}/vpns, /hives/{hive}/taps, /hives/motherbee/usage?from=&to=&group_by= (LLM token usage), /admin/actions/{action} (schema + example_scmd). Pages: /inventory, /inventory/{hive}, /versions, /hives/{hive}/nodes, /hives/{hive}/identity/ilks, /hives/{hive}/identity/tenants and /hives/{hive}/vault/secrets take ?limit=&cursor=: pass the answer's next_cursor as cursor until it has none. An answer too large for one mesh frame comes back as REPLY_TOO_LARGE: ask again with ?limit= its error_detail.suggested_limit, and follow next_cursor. /installation and /hives/{hive}/versions list the newest 20 installation versions: ?versions_before= its versions_next_before lists older ones."
                     },
                     "body": {
                         "type": "object",
@@ -12802,11 +12802,42 @@ fn scmd_wf_instance_params(
     params
 }
 
+/// The params of a read that answers in pages (FINDINGS A-198): `base`, and from the query `limit`
+/// and `cursor`, and the installation's `versions_limit` and `versions_before`, each only when the
+/// read takes it (`keys`); the numbers as numbers, the cursor decoded. SY.admin checks them, so a
+/// number that is not one goes as it came.
+fn scmd_page_params(raw_query: Option<&str>, base: Value, keys: &[&str]) -> Value {
+    let mut params = base;
+    for (key, value) in scmd_query_params(raw_query) {
+        let Value::String(text) = value else {
+            continue;
+        };
+        if !keys.contains(&key.as_str()) {
+            continue;
+        }
+        let text = percent_decode_simple(&text);
+        params[key.as_str()] = if key == "cursor" {
+            json!(text)
+        } else {
+            text.parse::<u64>()
+                .map_or_else(|_| json!(text), |number| json!(number))
+        };
+    }
+    params
+}
+
+/// The page parameters of the listings that grow with the installation.
+const SCMD_PAGE_KEYS: &[&str] = &["limit", "cursor"];
+/// Which of the installation's versions a versions read lists.
+const SCMD_VERSIONS_KEYS: &[&str] = &["versions_limit", "versions_before"];
+
 fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
     let mut filter = serde_json::Map::new();
     let Some(query) = raw_query else {
         return json!({});
     };
+    // The next page (FINDINGS A-198): beside the filter, as SY.admin's route takes it.
+    let mut cursor = None;
     for pair in query.split('&').filter(|segment| !segment.is_empty()) {
         let (key, value) = match pair.split_once('=') {
             Some(parts) => parts,
@@ -12835,14 +12866,19 @@ fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
                     filter.insert("limit".to_string(), json!(limit));
                 }
             }
+            "cursor" => cursor = Some(percent_decode_simple(value)),
             _ => {}
         }
     }
-    if filter.is_empty() {
+    let mut params = if filter.is_empty() {
         json!({})
     } else {
         json!({ "filter": filter })
+    };
+    if let Some(cursor) = cursor {
+        params["cursor"] = json!(cursor);
     }
+    params
 }
 
 /// What Archi waits for SY.admin's executor per add_hive step of a plan: the executor follows each
@@ -13335,7 +13371,7 @@ fn translate_scmd(
             admin_target,
             action: "inventory".to_string(),
             target_hive: local_hive_id.to_string(),
-            params: json!({ "scope": "global" }),
+            params: scmd_page_params(raw_query, json!({ "scope": "global" }), SCMD_PAGE_KEYS),
         }),
         ("GET", ["inventory", "summary"]) => Ok(AdminTranslation {
             admin_target,
@@ -13347,13 +13383,17 @@ fn translate_scmd(
             admin_target,
             action: "inventory".to_string(),
             target_hive: local_hive_id.to_string(),
-            params: json!({ "scope": "global" }),
+            params: scmd_page_params(raw_query, json!({ "scope": "global" }), SCMD_PAGE_KEYS),
         }),
         ("GET", ["inventory", hive_id]) => Ok(AdminTranslation {
             admin_target,
             action: "inventory".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({ "scope": "hive", "filter_hive": hive_id }),
+            params: scmd_page_params(
+                raw_query,
+                json!({ "scope": "hive", "filter_hive": hive_id }),
+                SCMD_PAGE_KEYS,
+            ),
         }),
         ("GET", ["hives"]) => Ok(AdminTranslation {
             admin_target,
@@ -13377,7 +13417,11 @@ fn translate_scmd(
             admin_target,
             action: "list_versions".to_string(),
             target_hive: local_hive_id.to_string(),
-            params: json!({}),
+            params: scmd_page_params(
+                raw_query,
+                json!({}),
+                &["limit", "cursor", "versions_limit", "versions_before"],
+            ),
         }),
         // The installation's ai, its versions and every hive's copy (docs/hive-config-update-v1.md
         // §4, stage 3c). Its change, set_installation_ai, is closed to the mesh: Archi stages it.
@@ -13385,7 +13429,7 @@ fn translate_scmd(
             admin_target,
             action: "get_installation".to_string(),
             target_hive: local_hive_id.to_string(),
-            params: json!({}),
+            params: scmd_page_params(raw_query, json!({}), SCMD_VERSIONS_KEYS),
         }),
         // The installation's update (§6, stage 4), `?history=true` for the closed ones. Running it,
         // update_installation, is closed to the mesh: Archi stages it.
@@ -13435,7 +13479,11 @@ fn translate_scmd(
             admin_target,
             action: "inventory".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({ "scope": "hive", "filter_hive": hive_id }),
+            params: scmd_page_params(
+                raw_query,
+                json!({ "scope": "hive", "filter_hive": hive_id }),
+                SCMD_PAGE_KEYS,
+            ),
         }),
         ("DELETE", ["hives", hive_id]) => Ok(AdminTranslation {
             admin_target,
@@ -13447,13 +13495,13 @@ fn translate_scmd(
             admin_target,
             action: "list_nodes".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_page_params(raw_query, json!({}), SCMD_PAGE_KEYS),
         }),
         ("GET", ["hives", hive_id, "identity", "tenants"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_tenants".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_page_params(raw_query, json!({}), SCMD_PAGE_KEYS),
         }),
         ("GET", ["hives", hive_id, "identity", "tenants", tenant_id]) => Ok(AdminTranslation {
             admin_target,
@@ -13572,7 +13620,7 @@ fn translate_scmd(
             admin_target,
             action: "list_ilks".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_page_params(raw_query, json!({}), SCMD_PAGE_KEYS),
         }),
         ("GET", ["hives", hive_id, "identity", "ilks", ilk_id]) => Ok(AdminTranslation {
             admin_target,
@@ -13603,7 +13651,7 @@ fn translate_scmd(
             admin_target,
             action: "get_versions".to_string(),
             target_hive: (*hive_id).to_string(),
-            params: json!({}),
+            params: scmd_page_params(raw_query, json!({}), SCMD_VERSIONS_KEYS),
         }),
         ("GET", ["hives", hive_id, "usage"]) => Ok(AdminTranslation {
             admin_target,
@@ -32093,6 +32141,66 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// FINDINGS A-198: the reads that answer in pages take ?limit=&cursor= (and the installation's
+    /// versions ?versions_limit=&versions_before=) to SY.admin, the numbers as numbers; a read
+    /// without them asks what it asked before.
+    #[test]
+    fn translate_paged_reads_pass_limit_and_cursor() {
+        let translate = |path: &str| {
+            translate_scmd("motherbee", parse(&format!("curl -X GET {path}")))
+                .expect("translation should succeed")
+        };
+        for (path, action, params) in [
+            (
+                "/hives/motherbee/identity/ilks?limit=50&cursor=ilk:abc",
+                "list_ilks",
+                json!({ "limit": 50, "cursor": "ilk:abc" }),
+            ),
+            (
+                "/hives/motherbee/identity/tenants?limit=10",
+                "list_tenants",
+                json!({ "limit": 10 }),
+            ),
+            (
+                "/hives/worker1/nodes?cursor=worker1%7CAI.a%40worker1",
+                "list_nodes",
+                json!({ "cursor": "worker1|AI.a@worker1" }),
+            ),
+            (
+                "/inventory?limit=100&cursor=motherbee%7CSY.admin%40motherbee",
+                "inventory",
+                json!({ "scope": "global", "limit": 100, "cursor": "motherbee|SY.admin@motherbee" }),
+            ),
+            (
+                "/versions?limit=2&cursor=worker1&versions_limit=5",
+                "list_versions",
+                json!({ "limit": 2, "cursor": "worker1", "versions_limit": 5 }),
+            ),
+            (
+                "/installation?versions_before=481&versions_limit=100",
+                "get_installation",
+                json!({ "versions_before": 481, "versions_limit": 100 }),
+            ),
+            (
+                "/hives/motherbee/versions?versions_before=481",
+                "get_versions",
+                json!({ "versions_before": 481 }),
+            ),
+            (
+                "/hives/motherbee/vault/secrets?limit=20&cursor=0a1b",
+                "vault_list",
+                json!({ "filter": { "limit": 20 }, "cursor": "0a1b" }),
+            ),
+            ("/hives/motherbee/identity/ilks", "list_ilks", json!({})),
+            ("/versions", "list_versions", json!({})),
+            ("/installation", "get_installation", json!({})),
+        ] {
+            let translated = translate(path);
+            assert_eq!(translated.action, action, "{path}");
+            assert_eq!(translated.params, params, "{path}");
+        }
     }
 
     #[test]
