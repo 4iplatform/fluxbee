@@ -6207,6 +6207,8 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "get_versions",
     // The installation's current ai and expected_version, which a set_installation_ai step names.
     "get_installation",
+    // The installation's update: what is left of it before an update_installation step.
+    "get_installation_update",
     "list_tenants",
     "get_tenant",
 ];
@@ -12857,19 +12859,35 @@ const EXECUTOR_WF_RULES_WAIT_SECS: u64 = 90;
 /// all), with a margin.
 const EXECUTOR_INSTALLATION_WAIT_SECS: u64 = 240;
 
-/// The steps of an executor plan that change the installation's `ai`.
-fn plan_installation_changes(plan: Option<&Value>) -> u64 {
+/// What Archi waits for SY.admin's executor per installation update in a plan
+/// (docs/hive-config-update-v1.md §6, stage 4): SY.admin's ceiling for `update_installation`
+/// (`admin_action_timeout` in sy_admin.rs: the motherbee's /versions, 30 s, then each hive's pass
+/// at once, the wait for its answer, 60 s, and a core update and a config update, each up to 90 s of
+/// sync_pending and an update's last answer, 60 s, 390 s in all), with a margin. Its answer comes
+/// once the cores answer restarting, about 20 s on 8.x; SY.admin follows the rest.
+const EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS: u64 = 420;
+
+/// The steps of an executor plan named `action`.
+fn plan_steps_named(plan: Option<&Value>, action: &str) -> u64 {
     plan.and_then(|plan| plan.pointer("/execution/steps"))
         .and_then(Value::as_array)
         .map(|steps| {
             steps
                 .iter()
-                .filter(|step| {
-                    step.get("action").and_then(Value::as_str) == Some("set_installation_ai")
-                })
+                .filter(|step| step.get("action").and_then(Value::as_str) == Some(action))
                 .count() as u64
         })
         .unwrap_or(0)
+}
+
+/// The steps of an executor plan that change the installation's `ai`.
+fn plan_installation_changes(plan: Option<&Value>) -> u64 {
+    plan_steps_named(plan, "set_installation_ai")
+}
+
+/// The steps of an executor plan that run the installation's update.
+fn plan_installation_updates(plan: Option<&Value>) -> u64 {
+    plan_steps_named(plan, "update_installation")
 }
 
 /// The steps of an executor plan that deploy or remove a workflow.
@@ -12942,7 +12960,9 @@ fn architect_admin_action_timeout(action: &str, params: &Value) -> Duration {
             executor_secs()
                 + plan_hive_joins(params.get("plan")) * EXECUTOR_HIVE_JOIN_WAIT_SECS
                 + plan_wf_rules_writes(params.get("plan")) * EXECUTOR_WF_RULES_WAIT_SECS
-                + plan_installation_changes(params.get("plan")) * EXECUTOR_INSTALLATION_WAIT_SECS,
+                + plan_installation_changes(params.get("plan")) * EXECUTOR_INSTALLATION_WAIT_SECS
+                + plan_installation_updates(params.get("plan"))
+                    * EXECUTOR_INSTALLATION_UPDATE_WAIT_SECS,
         ),
         // SY.admin reads the motherbee's /versions for it, under its own 30 s: wait longer, or a
         // slow read is reported as Archi's timeout.
@@ -13354,6 +13374,14 @@ fn translate_scmd(
             action: "get_installation".to_string(),
             target_hive: local_hive_id.to_string(),
             params: json!({}),
+        }),
+        // The installation's update (§6, stage 4), `?history=true` for the closed ones. Running it,
+        // update_installation, is closed to the mesh: Archi stages it.
+        ("GET", ["installation", "update"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_installation_update".to_string(),
+            target_hive: local_hive_id.to_string(),
+            params: Value::Object(scmd_query_params(raw_query)),
         }),
         ("GET", ["deployments"]) => Ok(AdminTranslation {
             admin_target,
@@ -23440,7 +23468,8 @@ fn wf_deploys_left_not_running(execution_report: &Value) -> Vec<String> {
 /// naming each hive whose apply is not ok (sync_pending at its bound, an error, or no answer): a
 /// change Archi made is done only once every hive applied it. Each `set_installation_ai` step's
 /// last answer in the run's events is read (`payload.events[*].result_preview`, SY.admin's answer),
-/// as a deploy's is (`wf_deploys_left_not_running`).
+/// as a deploy's is (`wf_deploys_left_not_running`). An `update_installation` step (§6, stage 4) is
+/// the same: `partial` while its update stays open, naming the hives not on its target.
 fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
     let Some(events) = execution_report
         .pointer("/payload/events")
@@ -23448,23 +23477,49 @@ fn installation_changes_not_applied(execution_report: &Value) -> Vec<String> {
     else {
         return Vec::new();
     };
-    let mut answers: BTreeMap<&str, &Value> = BTreeMap::new();
+    let mut answers: BTreeMap<&str, (&str, &Value)> = BTreeMap::new();
     for event in events {
         let field = |key: &str| event.get(key).and_then(Value::as_str);
-        if field("step_action") == Some("set_installation_ai")
-            && field("tool_name") == Some("set_installation_ai")
+        // The installation's update (stage 4) is the same: done once every hive is on its target.
+        let Some(action @ ("set_installation_ai" | "update_installation")) = field("step_action")
+        else {
+            continue;
+        };
+        if field("tool_name") == Some(action)
             && field("status").is_some_and(|status| status.eq_ignore_ascii_case("done"))
         {
             if let (Some(step), Some(answer)) = (field("step_id"), event.get("result_preview")) {
-                answers.insert(step, answer);
+                answers.insert(step, (action, answer));
             }
         }
     }
     answers
         .into_values()
-        .filter(|answer| answer.get("status").and_then(Value::as_str) != Some("ok"))
-        .map(|answer| {
+        .filter(|(_, answer)| answer.get("status").and_then(Value::as_str) != Some("ok"))
+        .map(|(action, answer)| {
             let payload = answer.get("payload");
+            if action == "update_installation" {
+                let id = payload
+                    .and_then(|payload| payload.pointer("/update/id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("its update");
+                let hives = payload
+                    .and_then(|payload| payload.get("pending"))
+                    .and_then(Value::as_array)
+                    .map(|pending| {
+                        pending
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|hives| !hives.is_empty())
+                    .unwrap_or_else(|| "some hives".to_string());
+                return format!(
+                    "the installation update {id} is not finished on {hives} yet \
+                     (get_installation_update follows it)"
+                );
+            }
             let version = payload
                 .and_then(|payload| payload.get("version"))
                 .and_then(Value::as_u64)
@@ -23524,7 +23579,8 @@ fn verify_execution_result(execution_report: &Value) -> VerificationVerdict {
     } else if !not_applied.is_empty() {
         format!(
             "the plan ran, but {}: GET /versions shows each hive's copy, and update with category \
-             config finishes a hive",
+             config finishes a hive; get_installation_update shows the installation's update, each \
+             hive's state and what moves it",
             not_applied.join("; ")
         )
     } else if !verified_success {
@@ -30562,6 +30618,31 @@ mod tests {
             change("s1", "ok", Value::Null),
         ]));
         assert!(verdict.verified_success, "{}", verdict.reason);
+
+        // The installation's update (stage 4): verified once it is done; while it stays open, the
+        // reason names it and the hives not on its target.
+        let update = |status: &str, pending: Value| {
+            json!({
+                "step_id": "s1", "step_action": "update_installation",
+                "tool_name": "update_installation", "status": "done",
+                "result_preview": { "status": status, "action": "update_installation",
+                    "payload": { "update": { "id": "upd-1731160000000" }, "pending": pending } }
+            })
+        };
+        let verdict = verify_execution_result(&report(vec![update("ok", Value::Null)]));
+        assert!(verdict.verified_success, "{}", verdict.reason);
+        let verdict = verify_execution_result(&report(vec![update(
+            "partial",
+            json!(["egress1 (core in_flight (restarting), config pending)"]),
+        )]));
+        assert!(!verdict.verified_success);
+        for part in [
+            "the installation update upd-1731160000000 is not finished on",
+            "egress1 (core in_flight (restarting), config pending)",
+            "get_installation_update",
+        ] {
+            assert!(verdict.reason.contains(part), "{}", verdict.reason);
+        }
     }
 
     /// Archi waits for SY.admin's ceiling of each change of the installation's `ai` in a plan, and
@@ -30595,6 +30676,26 @@ mod tests {
         assert!(system_get_may_run("GET", &translated.action));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation"));
         assert!(!admin_action_allows_ai_write("set_installation_ai"));
+
+        // The installation's update (stage 4): SY.admin's ceiling for each update_installation
+        // step, and its read, Archi's in its chat and while it compiles a plan.
+        assert_eq!(
+            architect_admin_action_timeout(
+                "executor_execute_plan",
+                &request(&["get_installation_update", "update_installation"])
+            ),
+            base + Duration::from_secs(420)
+        );
+        let translated = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /installation/update?history=true"),
+        )
+        .expect("the installation's update");
+        assert_eq!(translated.action, "get_installation_update");
+        assert_eq!(translated.params, json!({"history": "true"}));
+        assert!(system_get_may_run("GET", &translated.action));
+        assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"get_installation_update"));
+        assert!(!admin_action_allows_ai_write("update_installation"));
     }
 
     /// Stage 3c's review (F1): a new installation file rebuilds Archi's runtime only for another
