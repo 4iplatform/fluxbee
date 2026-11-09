@@ -112,8 +112,8 @@ no change required
 8. **Design first, one at a time, the largest:**
    1. A-181, a hive's shared config travels in the update
       ([hive-config-update-v1](../../docs/hive-config-update-v1.md)), by stages: stage 1 ✅
-      0.1.116; stage 2 ✅ 0.1.117, the release's settings in the code; stage 3 next, the
-      installation file.
+      0.1.116; stage 2 ✅ 0.1.117, the release's settings in the code; stage 3a ✅ 0.1.120 and
+      3b ✅ 0.1.121, the installation file in use; 3c next, the operator's action.
    2. Archi's chapter: the Cloud token (A-124) and the chat that answers at its turn's end (A-142).
    3. The IO standard (A-149), which unblocks A-91, io.slack's revamp (A-136, A-148), A-114 and
       io.blob's tenant (A-106).
@@ -229,7 +229,8 @@ A-161 with A-162 in 0.1.105 (2026-11-07), each checked on 8.x.
   release's new SY node). In design: one version on every hive, through the update
   ([hive-config-update-v1](../../docs/hive-config-update-v1.md)). After the DTAP panel the
   operator approved the second draft's shape (2026-11-08). Stage 1 (A-186, A-189) ✅ 0.1.116;
-  stage 2 ✅ 0.1.117, the release's settings in the code; stage 3 next, the installation file.
+  stage 2 ✅ 0.1.117, the release's settings in the code; 3a ✅ 0.1.120 and 3b ✅ 0.1.121, the
+  installation file in use; 3c next, the operator's action.
 - A-188 🟡 A worker's blob GC, if turned on, deletes the motherbee's published sources (latent).
 - A-191 🟡 A removed hive's and a retired node's system ILKs stay registered (low; next to A-159).
 - A-193 🔵 Where a deploy and a join spend their time: the motherbee's 65 s with its orchestrator
@@ -1760,7 +1761,7 @@ Seen while fixing the A-37 e2e tests, reading `src/router/mod.rs` and `src/shm/m
     fallback must be said and must end. Its lows were fixed in the SDK, since a later SDK change
     would need a release of its own: `validate` in `render` too, the file's state with its hash, a
     lazy fallback, the path from the hive's dist.
-  - **3b, built for 0.1.121:** the motherbee's orchestrator writes the file as version 1 from its
+  - **3b, ✅ 0.1.121 on 8.x (every hive `current`, every reader on the file, a joined worker on it from its first start):** the motherbee's orchestrator writes the file as version 1 from its
     hive.yaml `ai` (recorded first, written atomically, 0644). A new folder,
     `fluxbee-dist-installation`, follows vendor's members, and the join copies the file and
     writes no `ai`. SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it,

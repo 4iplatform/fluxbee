@@ -21,7 +21,8 @@
 
 | Version | Date (ART) | Commit | Scope | Status | Rollback |
 |---|---|---|---|---|---|
-| **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ live, checked on 8.x | snap `pre-aisdk-0-1-120` (all 4 VMs) · `apt install fluxbee=0.1.119` + core-update of the spokes |
+| **0.1.121** | 2026-11-08 | `84d123ae` | motherbee + spokes (core): hive-config-update-v1's stage 3b: the motherbee writes the installation file's version 1 from its hive.yaml `ai` and distributes it (`fluxbee-dist-installation`, following vendor's members); the join copies it and writes no `ai`; SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic read it; `/versions` shows each hive's `config` | ✅ live, checked on 8.x | snap `pre-inst-0-1-121` (all 4 VMs) · `apt install fluxbee=0.1.120` + core-update of the spokes (keep each hive.yaml `ai`; a worker joined by 0.1.121 needs it put back, HANDBOOK) |
+| **0.1.120** | 2026-11-08 | `0f516fdd` | motherbee + spokes (core): the AI SDK alone, hive-config-update-v1's stage 3a: the installation file's type and reader (`fluxbee_ai_sdk::installation`), used by no reader yet | ✅ replaced by 0.1.121 | snap `pre-aisdk-0-1-120` (deleted 2026-11-09) · `apt install fluxbee=0.1.119` + core-update of the spokes |
 | **0.1.119** | 2026-11-08 | `b7f20c52` | motherbee + spokes (core): the orchestrator alone: the Syncthing watchdog leaves a hive's Syncthing to a join in flight (the motherbee's during an add_hive or remove_hive, a spoke's during its finalize), and asks again right before it restarts it (A-194) | ✅ replaced by 0.1.120 | snap `pre-watch-0-1-119` (deleted 2026-11-08) · `apt install fluxbee=0.1.118` + core-update of the spokes |
 | **0.1.118** | 2026-11-08 | `9ea2f812` | motherbee + spokes (core): a fresh worker joins again (A-190): a receive-only folder is reverted only once its source has been connected and sharing it for 60 s; the join's finalize goes on while its vendor is still arriving, fits its probe in the motherbee's wait and answers each step's time; a core update with nothing new restarts nothing; `ops timeline` and `ops deploy`'s phase times | ✅ replaced by 0.1.119 | snap `pre-join-0-1-118` (deleted 2026-11-08) · `apt install fluxbee=0.1.117` + core-update of the spokes |
 | **0.1.117** | 2026-11-08 | `e1c5e5ab` | motherbee + spokes (core): hive-config-update-v1's stage 2: the release's settings live in the code, by role (`src/release_settings.rs`): each role's SY nodes, their order and waits, and the blob's and dist's topology, with today's values; the orchestrator, SY.identity and SY.vault read the table, the joins stop writing those keys, an old hive.yaml's are ignored and named once; a node a release drops or adds is settled by the new orchestrator's start, and `core_rollback` undoes it; `ops deploy` waits for each spoke's settle (A-181) | ✅ replaced by 0.1.118 | snap `pre-relkeys-0-1-117` (deleted 2026-11-08) · `apt install fluxbee=0.1.116` + core-update of the spokes (the 8.x hives keep their old keys, which 0.1.116 needs) |
@@ -129,6 +130,48 @@
 > (`dpkg-scanpackages -m`) for rollback, but their detail lives in the logbook, not here.
 
 ---
+
+## 0.1.121 — The installation file in use
+
+- **Date:** 2026-11-08 (ART; deployed 2026-11-09 UTC) · **Previous version:** 0.1.120 · **Commit:** `84d123ae`.
+- **Scope:** motherbee and the three spokes (core update).
+- **Why:** hive-config-update-v1's stage 3b. The operator's `ai` moves to one installation file,
+  one version on every hive. Nothing changes in behavior yet.
+- **What changed:**
+  - **The motherbee's orchestrator writes the file:** version 1 from its hive.yaml `ai`,
+    recorded first, written atomically at 0644.
+  - **Distribution:** a new folder, `fluxbee-dist-installation`, follows vendor's members. The
+    join copies the file with core and vendor, and writes no `ai`.
+  - **The readers read it:** SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and
+    ai.generic, each logging its source. An invalid file fails the AI work with the reason, and
+    never stops SY.admin's or the orchestrator's start.
+  - **`/versions`:** each hive's `config` (`current`, `behind`, `pending`, `edited_by_hand`).
+  - **The install texts and the HANDBOOK:** choose the provider in hive.yaml before firstboot.
+- **Checks before the release:**
+  - GitHub's CI green on its branch, twice.
+  - The review round found no high, and one medium, fixed: the install texts on choosing the
+    provider. Its lows were fixed: the join refuses without a file; SY.admin keeps its executor on
+    a hive.yaml read failure; the warning names rt-gateway's check; Archi's handbook.
+- **Deploy:** build of `84d123ae`; publish in 13 s; snapshot `pre-inst-0-1-121` taken on all 4
+  VMs, `pre-aisdk-0-1-120` dropped; 0.1.121 on all 4 in 353 s; each spoke settled; health clean.
+  - By the spokes' own records (new in `ops deploy`), installed 12 to 20 s after the update call
+    and settled 21 to 29 s after it.
+- **Checked on 8.x:**
+  - **The file on the motherbee:** 0644, version 1, the motherbee's `ai` (anthropic default,
+    claude-sonnet-5-5; openai gpt-5.5), its hash recorded as the migration.
+  - **All four hives `current`** at the first check after the deploy, 12 s.
+  - **The motherbee's readers** (SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov) read the
+    file v1, on the same engine as before.
+  - **worker1's SY.cognition,** restarted by the update before the file arrived, read hive.yaml
+    (the same values), as planned. Restarted once the file was there, it read the file v1.
+  - **AI.pruebas** answered in 7 s, its log naming the file v1.
+  - **A throwaway worker `gate0221` on VM 104** joined in 139 s, its finalize in 8.4 s:
+    - its installation file was copied by the join, with the same hash;
+    - its hive.yaml has no `ai`;
+    - its SY.cognition read the file v1 from its first start, never the fallback engine;
+    - `/versions` showed `config: current`;
+    - removed, and the installation folder's members follow vendor's again (4). VM 104 destroyed.
+    Health clean.
 
 ## 0.1.120 — The AI SDK reads the installation file
 
