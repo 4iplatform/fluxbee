@@ -678,10 +678,12 @@ before a WF's block when the message carries one (`render_memory_package_prompt_
 
 ## 8. Configuration
 
-**Provider and model** come from `hive.yaml` `ai` (`HiveAiConfig::effective`). Without that
-section the default is OpenAI with `gpt-5.5` (`HiveAiConfig::fallback`,
-`DEFAULT_HIVE_OPENAI_MODEL` in `crates/fluxbee_ai_sdk/src/llm.rs`). `CONFIG_SET` cannot change
-them.
+**Provider and model** come from the hive's `ai` settings, read at the start
+(`HiveAiConfig::effective`): the installation file once the hive holds one, `hive.yaml`'s `ai`
+while it holds none ([hive-config-update-v1](../hive-config-update-v1.md) §4). Without an `ai`
+the default is OpenAI with `gpt-5.5` (`HiveAiConfig::fallback`, `DEFAULT_HIVE_OPENAI_MODEL` in
+`crates/fluxbee_ai_sdk/src/llm.rs`). Settings it cannot use skip every turn's semantic work with
+their reason. `CONFIG_SET` cannot change them.
 
 **The AI key:** SY.vault's general key for that provider in the root tenant's pool
 (`resolve_cognition_ai_api_key`, `resolve_cognition_resource`).

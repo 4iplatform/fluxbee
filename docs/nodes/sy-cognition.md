@@ -27,7 +27,15 @@ Source: `src/bin/sy_cognition.rs` and `src/bin/sy_cognition/` (the two LLM calls
 - `SY.cognition` is in the release's lists for the motherbee and the worker (and their `wait_for`
   lists, `src/release_settings.rs`). The binary has no role check; the router feeds
   it only on motherbee and worker hives (`role_runs_cognition` in `src/router/stream.rs`).
-- From `hive.yaml` it reads `hive_id` and the `ai` section (provider and model).
+- From `hive.yaml` it reads `hive_id` and `dist.path`. Its provider and model, read at the start
+  (`cognition_ai_settings`), are the installation file's once its hive holds one, and its
+  hive.yaml `ai` section's while it holds none ([hive-config-update-v1](../hive-config-update-v1.md)
+  §4); the start logs which, with the file's version and hash. hive.yaml's `ai` is read untyped,
+  and typed only while the hive holds no file. Settings it cannot use (an installation file no
+  reader can use, never a fallback to hive.yaml; or an invalid hive.yaml `ai` while the hive holds
+  no file) never stop it: it logs the reason as an error and runs on, every turn's semantic work
+  skipped with that reason, as without a key (`degraded_ai_settings_invalid`). A file that
+  arrives after it started is read at its next start.
 - Its AI key comes from SY.vault on the motherbee (`VaultClient::for_primary`): the resource type
   is the hive's provider (`openai` or `anthropic`) in the root tenant. It waits up to 60 s for
   the vault at start. Without a key it runs degraded and skips turns.
@@ -75,7 +83,7 @@ Details: [docs/reference/cognition.md](../reference/cognition.md) §3.4.
 | `VAULT_SECRET_CHANGED` | broadcast | re-probes the AI key and updates its state; it does not exit |
 
 `CONFIG_SET` refuses secrets and any AI provider or model setting (`reject_cognition_secret_fields`;
-those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
+those are the installation's, in its installation file). It accepts `thresholds.context_close`,
 `thresholds.reason_close` and the semantic tagger's `timeout_ms`, `max_tags`,
 `max_reason_signals`.
 
@@ -119,9 +127,13 @@ those are hive-wide, in `hive.yaml`). It accepts `thresholds.context_close`,
 - `systemctl status sy-cognition`; `journalctl -u sy-cognition` (`sy.cognition looked up its AI
   key`, `loaded its most recent communications from its file`, warnings when the key is not
   resolvable or a communication cannot be read or written).
-- `STATUS`/`PING` report `state` (`ready_semantic_ai` or `degraded_no_ai_provider`,
-  `cognition_state_label`) and the turn counters, and the clears it took (`clears`). Through the
-  admin: `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
+- `STATUS`/`PING` report `state` (`ready_semantic_ai`, `degraded_no_ai_provider` or
+  `degraded_ai_settings_invalid`, `cognition_state_label`), the degraded reasons
+  (`ai_settings_invalid`, `ai_provider_missing`), where the provider and the model came from
+  (`ai_provider.settings`: `{from: installation_file, version, sha256}` or `{from: hive_yaml}`,
+  with `error` when they cannot be used; `config.ai.settings` in `CONFIG_GET`), the turn counters,
+  and the clears it took (`clears`). Through the admin:
+  `POST /hives/{hive}/nodes/SY.cognition@{hive}/control/config-get`.
 
 ## Links
 

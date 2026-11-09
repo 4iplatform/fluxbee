@@ -64,7 +64,10 @@ Every role also runs `rt-gateway` (started first) and `sy-orchestrator`. The nod
    - enable `sy-orchestrator`. A fresh install starts nothing; it prints
      `Edit /etc/fluxbee/hive.yaml, then run: sudo fluxbee-firstboot`.
 4. **Edit** `/etc/fluxbee/hive.yaml` (`hive_id: motherbee`, `role: motherbee`, the `ai` provider,
-   `wan.listen`).
+   `wan.listen`). The orchestrator's first start writes its `ai` as version 1 of the installation
+   file, which every hive's readers read from then on and which reaches every hive
+   ([hive-config-update-v1](../hive-config-update-v1.md) §4); after that, this section is
+   ignored.
 5. **First boot**: `sudo fluxbee-firstboot` (`packaging/fluxbee-firstboot`):
    1. starts PostgreSQL, creates the role (`FLUXBEE_DB_USER`/`FLUXBEE_DB_PASSWORD`, default
       `fluxbee`/`fluxbee`) and the databases `fluxbee`, `fluxbee_identity`, `fluxbee_storage`;
@@ -160,13 +163,16 @@ What a worker join does (`add_hive_flow`):
    with the given password or key) and waits for the host to settle, up to 900 s
    (`wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable).
 3. Copies the role's core binaries and `manifest.json` from the motherbee's
-   `/var/lib/fluxbee/dist/core/` (`sync_core_to_worker`) and the vendored Syncthing
-   (`sync_vendor_to_worker`).
+   `/var/lib/fluxbee/dist/core/` (`sync_core_to_worker`), the vendored Syncthing
+   (`sync_vendor_to_worker`) and the installation file (`sync_installation_to_worker`, mode 0644,
+   at the same place in the spoke's dist), so the spoke's readers read it from their first start;
+   a motherbee that holds none has nothing to copy, and the file arrives through Syncthing once it
+   does.
 4. Writes the spoke's `hive.yaml`: uplink to the motherbee's `wan.listen`, `wan.mtls: required`,
-   `identity.sync.upstream` with `auth: required`, the `ai` section, the motherbee's blob and
-   dist paths, Syncthing's port and home and the blob GC (`render_worker_hive_yaml`). It writes
-   nothing the release defines (the role's SY nodes, the blob's and dist's topology): the spoke's
-   orchestrator, of the same release, has them. Pushes the TLS files to
+   `identity.sync.upstream` with `auth: required`, the motherbee's blob and dist paths, Syncthing's
+   port and home and the blob GC (`render_worker_hive_yaml`). It writes nothing the release defines
+   (the role's SY nodes, the blob's and dist's topology): the spoke's orchestrator, of the same
+   release, has them. Nor `ai`: the installation file holds it. Pushes the TLS files to
    `/var/lib/fluxbee/tls/<hive>/`; on a worker, creates and copies the identity sync key
    (`distribute_hive_identity_key_inner`).
 5. Writes one systemd unit per core service (`core_service_unit_contents`), starts `rt-gateway`
@@ -289,6 +295,7 @@ The orchestrator declares one Syncthing folder per kind of content (`dist_sync_f
 | `fluxbee-dist-core-<role>` | `dist/core/<role>` | `dist/core` | every spoke role |
 | `fluxbee-dist-vendor` | `dist/vendor` | `dist/vendor` | every spoke role |
 | `fluxbee-dist-policy` | `dist/policy` | `dist/policy` | every spoke role |
+| `fluxbee-dist-installation` | `dist/installation` | `dist/installation` | every spoke role |
 | `fluxbee-dist-runtimes` | `dist/runtimes` | `dist/runtimes` | workers only |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets` | `blob/agent-assets` | workers only |
 
@@ -299,6 +306,13 @@ source has been connected and sharing it for 60 s, so its index is in (FINDINGS 
 they stay: a new spoke's folders are filled by its join before the motherbee's peer is linked, and
 a revert before the source's index arrives deletes them. With the index in, the copies that match
 it stop counting as local changes.
+
+`dist/installation` holds the installation file (`installation.json`): the installation's `ai`,
+one version on every hive, written only by the motherbee's orchestrator. It reaches the hives that
+joined before it at the next start of each side's orchestrator, which shares the folder with
+vendor's members, and a new spoke gets it from its join
+([SY.orchestrator](../nodes/sy-orchestrator.md#the-installation-file),
+[hive-config-update-v1](../hive-config-update-v1.md) §4).
 
 **Announcing a package to workers.** There is no announce message: the motherbee's Syncthing
 announces a change after its own scan. To make a worker pull a package now, scan the folder **on
@@ -373,7 +387,10 @@ node on `wf.engine`, a config-only AI package on `ai.generic`) still moves to it
   found core binaries in dist that do not match the manifest lists them in
   `core.awaiting_update`, with why each. It runs what `/usr/bin` holds until a core update
   installs the binaries. The check every minute only closes the report once dist is consistent
-  ([SY.orchestrator](../nodes/sy-orchestrator.md#updates)).
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#updates)). Each hive's `config` is its copy of
+  the installation file: `version`, `sha256` and `state` against the motherbee's file (`current`,
+  `behind`, `pending`, `edited_by_hand`), the motherbee's own included
+  ([SY.orchestrator](../nodes/sy-orchestrator.md#the-installation-file)).
 
 The lab routine `lab/ops.py deploy <version>` does all of this in order: snapshots every VM,
 installs the version on the motherbee, waits for its core to report it, waits until each spoke's
@@ -636,7 +653,7 @@ ingress and io.web's on the motherbee say why.
 | `GET /hives/{hive}` | one hive's join record (`status`, `join`) |
 | `GET /inventory`, `/inventory/summary`, `/inventory/{hive}` | the live view from the router's LSA; answers while the orchestrator boots |
 | `GET /hives/{hive}/nodes`, `.../nodes/{name}/status` | nodes and one node's lifecycle and health |
-| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds, and `vendor.awaiting_update` the vendored Syncthing, while it runs the one already installed |
+| `GET /hives/{hive}/versions`, `GET /versions` | core, vendor and runtimes per hive; `core.awaiting_update` names the core binaries a hive's dist does not hold as its manifest says, while it runs what `/usr/bin` holds, and `vendor.awaiting_update` the vendored Syncthing, while it runs the one already installed; `config` the hive's installation file, with its `state` against the motherbee's (`current`, `behind`, `pending`, `edited_by_hand`) |
 | `GET /hives/{hive}/opa/status` | user policy in sync, routers loaded |
 | `GET /hives/{hive}/streams` | the router streams' backlog and sinks |
 | `GET /drift-alerts`, `GET /hives/{hive}/drift-alerts` | the history the motherbee's orchestrator records (`category` `core`, `egress`, `posture`, `syncthing`, about the motherbee itself, apart from a spoke's `core` `post_sync_mismatch`), and `certificate`: SY.admin's certificate conditions (`record_drift_alert`), a row with `state: open` when one opens and an `info` row with `state: closed` when it closes. A spoke's own checks stay in the spoke's file until the system's log (FINDINGS A-175), and the answer's `note` says so |

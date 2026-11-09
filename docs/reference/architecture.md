@@ -55,13 +55,21 @@ to start without it (`ConfigError::MissingHive` in `src/config/mod.rs`). Its key
   `/dev/shm` (`discover_peer_regions` in `src/router/mod.rs`), so a hive is one host.
 
 The file also holds `wan` (§5.1), `admin` and `architect` (§7), `identity.sync` (§5.3), the blob's
-and dist's paths and ports (§5.4), `ai` (the hive's AI provider, `HiveAiConfig` in
-`crates/fluxbee_ai_sdk`), `government.identity_frontdesk` (§7.3), `edge` (§6.1) and `egress` (NAT
-on the egress hive; on the motherbee, the default route `add_hive` gives new workers). What a
-release defines for each role (its system nodes, §2.2, and the blob's and dist's topology, §5.4)
-is in the code, not in the file (`src/release_settings.rs`,
+and dist's paths and ports (§5.4), `government.identity_frontdesk` (§7.3), `edge` (§6.1) and
+`egress` (NAT on the egress hive; on the motherbee, the default route `add_hive` gives new
+workers). What a release defines for each role (its system nodes, §2.2, and the blob's and dist's
+topology, §5.4) is in the code, not in the file (`src/release_settings.rs`,
 [hive-config-update-v1](../hive-config-update-v1.md) §3); a file that still holds those keys
 loads, and they are ignored.
+
+The installation's AI provider and models (`ai`, `HiveAiConfig` in `crates/fluxbee_ai_sdk`) are
+in one installation file, `dist/installation/installation.json`, one version on every hive
+([hive-config-update-v1](../hive-config-update-v1.md) §4; `fluxbee_ai_sdk::installation`). The
+motherbee's orchestrator writes it, the only writer: its first version from the motherbee's
+hive.yaml `ai`. Syncthing takes it to every hive (§5.4), and each hive's readers read their own
+copy: SY.admin, SY.architect, SY.cognition and SY.frontdesk.gov at their start, ai.generic at each
+request that leaves its provider or model to the hive. A hive.yaml `ai` is read only while its
+hive holds no file; a joined spoke's hive.yaml has none.
 
 ### 2.2 Roles
 
@@ -450,12 +458,14 @@ Each spoke pairs with the motherbee only. The folders (`reconcile_syncthing_peer
 | `fluxbee-dist-core-<role>` | `dist/core/<role>/` on the motherbee, `dist/core/` on the spoke | motherbee send-only, spoke receive-only | spokes of that role |
 | `fluxbee-dist-vendor` | `dist/vendor/` | motherbee send-only, spoke receive-only | every spoke |
 | `fluxbee-dist-policy` | `dist/policy/` | motherbee send-only, spoke receive-only | every spoke |
+| `fluxbee-dist-installation` | `dist/installation/` | motherbee send-only, spoke receive-only | every spoke |
 | `fluxbee-dist-runtimes` | `dist/runtimes/` | motherbee send-only, spoke receive-only | workers |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets/` | motherbee send-only, spoke receive-only | workers |
 | `fluxbee-blob` | `blob/active/` | both ways | workers |
 | `fluxbee-blob-public` | `blob/public/` | motherbee send-only, ingress receive-only | ingress |
 
-So only the motherbee writes software, and an egress hive gets core, vendor and policy only.
+So only the motherbee writes software, and an egress hive gets core, vendor, policy and the
+installation file only.
 Which of these each role syncs (the blob store, `fluxbee-blob`, `fluxbee-blob-public`, dist, and
 the tool) is the release's, by role (`HiveRole::settings`, `src/release_settings.rs`); the paths,
 Syncthing's API port and its home are each hive's own, in `hive.yaml`.

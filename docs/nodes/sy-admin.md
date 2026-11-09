@@ -52,8 +52,14 @@ fails with `missing_ai_api_key`.
    1 s), with a persistent UUID under `/var/lib/fluxbee/state/nodes`.
 6. Computes its ILK from its L2 name (`deterministic_system_ilk_id`), without waiting for the
    identity SHM.
-7. Checks the `ai` section of hive.yaml: an invalid one makes `main` return the error, and the
-   process exits. The executor's AI key is read in a task of its own, started with the loops of
+7. Logs once where the executor's `ai` comes from (`log_admin_ai_source`): the installation file,
+   with its version and hash, or hive.yaml while the hive holds none
+   ([hive-config-update-v1](../hive-config-update-v1.md) §4). Settings it cannot use (an
+   installation file no reader can use, which is never a fallback to hive.yaml, or an invalid
+   hive.yaml `ai` while the hive holds no file) never stop the start: a warning with the reason,
+   which the executor then answers with; the orchestrator's `/versions` shows the file's state
+   (`config`). hive.yaml's `ai` is read untyped, and typed only while the hive holds no file. The
+   executor's AI key is read in a task of its own, started with the loops of
    step 9 (`boot_admin_executor_ai_runtime`, see [The executor](#the-executor)): on an upgrade the
    whole hive restarts at once, so the read waits for a vault that does not answer yet, up to 60 s
    (`resolve_resource_awaiting_vault`, `VAULT_BOOT_WAIT`; FINDINGS A-141), and the admin serves
@@ -538,12 +544,16 @@ Plan shape (`AdminExecutorPlan`, unknown fields refused):
   `/var/lib/fluxbee/state/admin-executor/<hive>/executions/<execution_id>.json`. Of an
   `unpublish_artifact` step it keeps the args as the command log does, a link's key only as
   `key_sha256` (`executor_log_step_args`).
-- **Model and key**: provider and model from the hive.yaml `ai` section (fallback provider when
-  it is absent); the key from SY.vault, resource type = the provider, root tenant
+- **Model and key**: provider and model from the hive's `ai` settings (`hive_ai_settings`): the
+  installation file once the hive holds one, hive.yaml's `ai` while it holds none (the fallback
+  provider without either); CONFIG_GET's `config.ai.source` says which, with the file's version
+  and sha256. The key from SY.vault, resource type = the provider, root tenant
   (`build_admin_executor_ai_runtime`). At boot the read waits for the vault, up to 60 s, in a task
   of its own (`boot_admin_executor_ai_runtime`); a later read asks once. Without a key
-  `executor_execute_plan` answers `EXECUTOR_UNAVAILABLE`. A `VAULT_SECRET_CHANGED` for that
-  provider rebuilds the runtime in place (`handle_vault_secret_changed_admin`).
+  `executor_execute_plan` answers `EXECUTOR_UNAVAILABLE`; with settings it cannot use, it answers
+  with their reason (`admin_executor_unavailable_reason`), and CONFIG_GET fails with it. A
+  `VAULT_SECRET_CHANGED` for that provider rebuilds the runtime in place
+  (`handle_vault_secret_changed_admin`).
 - **Usage records**: every model call is charged to the root tenant (`AiAccount::root`, tenant
   source `root`), with work `{execution_id, caller, stage}` where stage is `executor` or
   `executor_review` (`executor_usage_account`). The record goes to the node's router stream
@@ -859,7 +869,8 @@ Times are RFC 3339. A read, so it is not in the audit log; over the mesh only Ar
 | `admin.public_edge_node`, `admin.public_base_url` | public artifacts and the ACME client; the host of `public_base_url` is the certified name (env `SY_ADMIN_PUBLIC_EDGE_NODE`, `SY_ADMIN_PUBLIC_BASE_URL` win) |
 | `acme` | the ACME client ([The ACME client](#the-acme-client)) |
 | `web` | the web hosts, pushed to the public edge and certified after the main name ([The web hosts](#the-web-hosts)) |
-| `ai` | executor provider and model |
+| `ai` | executor provider and model while the hive holds no installation file; ignored once it holds one |
+| `dist.path` | where the installation file is: `<dist.path>/installation/installation.json`, default `/var/lib/fluxbee/dist` |
 | `blob.path` | blob root, default `/var/lib/fluxbee/blob` |
 | `storage.path` | root of the `/modules` store, default `/var/lib/fluxbee` |
 
@@ -928,8 +939,8 @@ sentence; `GET /admin/actions/{action}` has the full text, the fields and an exa
 | `publish_runtime_package` | `POST /admin/runtime-packages/publish` | Publish one runtime package into dist/manifest on motherbee. |
 | `publish_artifact` | — (mesh only) | Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller, on a worker or the motherbee, becomes the publication owner. |
 | `unpublish_artifact` | `POST /artifacts/unpublish` | Take a public page down before it expires, by its publication_id or the key of its link. The operator takes down any page; over the mesh an AI.* node takes down only its own. |
-| `list_versions` | `GET /versions` | List core and runtime versions across hives. |
-| `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive. |
+| `list_versions` | `GET /versions` | List core and runtime versions across hives, and each hive's installation file. |
+| `get_versions` | `GET /hives/{hive}/versions` | Read core and runtime versions for one hive, and its installation file. |
 | `list_runtimes` | `GET /hives/{hive}/runtimes` | List runtimes for one hive. |
 | `get_runtime` | `GET /hives/{hive}/runtimes/{runtime}` | Read one runtime definition in a hive; `tool_catalog` is the tool catalog its version ships (ai.generic's base tools), or null. |
 | `remove_runtime_version` | `DELETE /hives/{hive}/runtimes/{runtime}/versions/{runtime_version}` | Delete one published runtime version from motherbee dist/manifest. |

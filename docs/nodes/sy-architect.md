@@ -23,8 +23,10 @@ Source: `src/bin/sy_architect.rs`, with `src/bin/sy_architect/` (`pipeline_types
 
 - `SY.architect` is in the release's list for the motherbee and in no other role's
   (`src/release_settings.rs`), before `SY.vault` as a vault consumer.
-- The binary does not check the role: `main` reads only `hive_id`, `architect.listen`, `ai` and
-  `blob.path` from hive.yaml, and the unit has no `ExecCondition`.
+- The binary does not check the role: `main` reads only `hive_id`, `architect.listen`, `ai`,
+  `blob.path` and `dist.path` from hive.yaml, and the unit has no `ExecCondition`. `ai` is read
+  untyped, and typed only while the hive holds no installation file
+  ([LLM, key and usage records](#llm-key-and-usage-records)).
 
 ## How it starts
 
@@ -281,12 +283,19 @@ skills, handbooks and a personality.
 
 ## LLM, key and usage records
 
-- **Provider**: the hive.yaml `ai` section's `ai.default_provider`; with no section, `openai`
-  (`HiveAiConfig::fallback`).
+- **Provider**: `ai.default_provider` of the hive's `ai` settings (`architect_hive_ai`): the
+  installation file once the hive holds one, hive.yaml's `ai` section while it holds none
+  ([hive-config-update-v1](../hive-config-update-v1.md) §4); with neither, `openai`
+  (`HiveAiConfig::fallback`). The start logs which, with the file's version and hash
+  (`log_architect_ai_source`), and `CONFIG_GET`'s `ai_provider.settings` says it too.
+- **Settings it cannot use** (an installation file no reader can use, never a fallback to
+  hive.yaml; or an invalid hive.yaml `ai` while the hive holds no file): the AI stays off, the
+  start logs the reason as an error, the chat answers with it
+  (`architect_ai_unavailable_reason`), and `CONFIG_GET` and `CONFIG_SET` fail with it.
 - **Model**: Archi's own, `config.ai.model`, set by `CONFIG_SET` and kept in its node directory's
-  `config.json`; `null` goes back to the hive's, `ai.providers.<provider>.model`. The AI runtime
-  is rebuilt at once, with no restart. `CONFIG_GET` shows the model and its source (`ai.model` or
-  `hive`).
+  `config.json`; `null` goes back to the installation's, `ai.providers.<provider>.model`. The AI
+  runtime is rebuilt at once, with no restart. `CONFIG_GET` shows the model and its source
+  (`ai.model` or `hive`).
 - **Limits**: every model call asks for up to 32,000 output tokens and may take 600 s
   (`ARCHITECT_MODEL_CALL_TIMEOUT`); a pipeline task's budget is 1,000,000 tokens
   (`TASK_AGENT_TOKEN_BUDGET`).

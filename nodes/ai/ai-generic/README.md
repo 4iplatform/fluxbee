@@ -67,8 +67,9 @@ To create and configure a node, follow [docs/ai-nodes-deploy-runbook.md](../../.
   - An equal one changes nothing.
   - A config whose model cannot be resolved then is refused (`invalid_config`, naming
     `behavior.model` and `ai.providers.<provider>.model`): a provider other than the hive's
-    default needs `behavior.model`, unless the hive's hive.yaml lists a model for it. So is one
-    that leaves its provider or its model to a hive.yaml that cannot be read.
+    default needs `behavior.model`, unless the hive's `ai` lists a model for it. So is one that
+    leaves its provider or its model to an installation file no reader can use, or to a hive.yaml
+    that cannot be read while the hive holds no file.
   - Its answer shows `ai_provider` and `ai_model`, as `CONFIG_GET` does.
 
 ### `config.behavior`
@@ -115,13 +116,32 @@ it:
 
 On every request the node reads the key of its provider from SY.vault:
 
-- **the provider** is `behavior.provider`; without it, `ai.default_provider` of
-  `/etc/fluxbee/hive.yaml`, or OpenAI without an `ai:` section;
+- **the provider** is `behavior.provider`; without it, the hive's `ai.default_provider`
+  ([The hive's ai](#the-hives-ai)), or OpenAI without an `ai`;
 - **the lookup** is by `resource_type` `openai` or `anthropic`, only in its tenant: a key the node
   owns, else one assigned to it, else the tenant's general key (no owner, no assigned node);
 - **a failed lookup** is a provider that gives no answer: the person gets the fixed text, and a
   WF's menu or a response envelope a `missing_ai_api_key` error whose `reply` is that text (see
   [Messages](#messages)).
+
+## The hive's ai
+
+What a node leaves to the hive (its provider without `behavior.provider`, its model without
+`behavior.model`) is read on each request that needs it, and only then: a node that names both
+reads nothing of the hive's ([hive-config-update-v1](../../../docs/hive-config-update-v1.md) §4).
+
+- **The installation file** once the hive holds one: `<dist.path>/installation/installation.json`,
+  under the dist its `hive.yaml` names, found at the node's start (`installation_file_of_hive`).
+  The motherbee writes it, and every hive receives it; every provider it names has its model.
+- **`ai:` in `/etc/fluxbee/hive.yaml`** while the hive holds no file. It is read only then, so an
+  old `ai` there never stops a node once the file is there.
+- **A file that is there and that no reader can use** is never a fallback to hive.yaml: the
+  request fails with `installation_ai_settings_invalid`, not retryable, its reason in `details`.
+  A hive.yaml that cannot be read while the hive holds no file fails as before
+  (`hive_ai_config_unreadable`).
+- **The log:** the node logs where the hive's `ai` came from (the file's version and hash, or
+  hive.yaml), or why it could not be read, when that changes; the first request that reads it
+  counts as a change.
 
 ## The agent definition
 

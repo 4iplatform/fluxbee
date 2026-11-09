@@ -12,7 +12,12 @@
   `src/release_settings.rs` (§3). Its gate's throwaway worker got a `hive.yaml` without the
   release's keys and ran its role from the table. Its join failed at the finalize, for a reason
   stage 2 does not touch (FINDINGS A-190).
-- **Next:** stage 3, the installation file (§10).
+- **Stage 3, in three releases** (§10):
+  - 3a, built for 0.1.120: the AI SDK alone, the installation file's type and reader
+    (`fluxbee_ai_sdk::installation`).
+  - 3b, built: the motherbee writes the file's first version and distributes it, the readers
+    switch to it, and `/versions` shows it, with nothing changed in behavior (§4, "As built").
+  - **Next:** 3c, the operator's action and the update with category `config`.
 
 This is the single place for the topic.
 
@@ -150,6 +155,86 @@ Three cases bite today:
     lists both providers, as worker1's hand-edited copy does.
   - The `ai` copies in each `hive.yaml` are then ignored and reported.
 
+### As built (stage 3b)
+
+Nothing changes in behavior: version 1 holds the values every reader ran on.
+
+- **The file:** `<dist.path>/installation/installation.json`, the SDK's type and reader
+  (`fluxbee_ai_sdk::installation`, stage 3a): `{schema_version: 1, version, ai}`, valid when every
+  provider it names has its model.
+- **The writer** is the motherbee's orchestrator, alone (`write_installation_file_at_start`).
+  - At its start, when its dist holds no file, it writes version 1 from its own hive.yaml `ai`
+    (`InstallationFile::render`, which validates). It writes atomically (temp and rename), mode
+    0644, in `dist/installation`, which its start makes root's and readable by the Syncthing
+    user's group, as the rest of dist. A hive.yaml without `ai` gives a file without one: the
+    fallback engine, as before.
+  - The version is recorded before the file is written, in
+    `/var/lib/fluxbee/orchestrator/installation-versions.json`: its sha256, `written_at_ms` and
+    `source: migration`. A file is never there without its record, which is how a hand edit is
+    caught.
+  - An `ai` no reader can use writes nothing. The start warns, `/versions` says why
+    (`config.not_written`), and every reader stays on its hive.yaml. A file missing after a later
+    version was recorded is not written again as version 1.
+  - A file that is there is never rewritten at a start. Nothing here stops the start.
+- **Distribution:** the Syncthing folder `fluxbee-dist-installation`, send-only on the motherbee
+  and receive-only on every spoke of every role. Its members follow the vendor folder's, as
+  `fluxbee-dist-policy`'s do (A-72):
+  - a join links it with the other dist folders;
+  - a hive joined before gets it at the next start of the orchestrator on each side;
+  - `remove_hive` unlinks it with every `fluxbee-dist*` folder.
+- **The join** copies the motherbee's file into the new spoke's dist with its core and vendor
+  (`sync_installation_to_worker`): the same bytes and mode 0644, failing the join with
+  `INSTALLATION_SYNC_FAILED`. A motherbee that holds no file has nothing to copy. The join writes no
+  `ai` into a spoke's `hive.yaml`.
+- **The readers** read `fluxbee_ai_sdk::ai_settings_at(installation_file_path(<the dist its
+  hive.yaml names>), <its hive.yaml ai>)`. The hive.yaml read is lazy, and its `ai` is typed only
+  there, so an old or invalid `ai` never breaks a reader that has the file.
+  - On the motherbee: SY.admin (its executor), SY.architect (Archi's own `config.ai.model` stays
+    its node config), SY.cognition and SY.frontdesk.gov, at their start; ai.generic at each request
+    that leaves its provider or model to the hive.
+  - On a worker: SY.cognition at its start, ai.generic at each request.
+  - Each logs once at its start where its `ai` came from: the installation file's version and
+    hash, or hive.yaml. ai.generic logs it when it changes.
+- **A file no reader can use** is never a fallback to hive.yaml. The same holds for an invalid
+  hive.yaml `ai` while the hive holds no file, which used to stop SY.admin's, SY.cognition's and
+  the orchestrator's start:
+  - SY.cognition logs the reason and runs on; every turn's semantic work is skipped with it, as
+    without a key (`degraded_ai_settings_invalid`).
+  - SY.frontdesk.gov boots `FAILED_CONFIG` with it; handoffs still work.
+  - Archi's AI stays off, and its chat answers with the reason.
+  - ai.generic fails such a request with `installation_ai_settings_invalid` and the reason.
+  - SY.admin and the orchestrator never fail their start on it. SY.admin warns, and its executor
+    answers with the reason; the orchestrator reports the file in `/versions`.
+- **hive.yaml's `ai`, once a hive holds a file,** is ignored. Each orchestrator's start names it
+  once, as stage 2 names the superseded keys. Keep it while the hive may go back to a release
+  whose readers read it.
+- **`/versions`** (§7): each hive's `config` is `{file, version, sha256, state}`, with `error` for
+  an invalid file.
+  - Each hive's orchestrator reports its own copy (`installation_file_state`).
+  - The motherbee's orchestrator, which builds `/versions` for SY.admin, compares each copy with
+    its own file and records: `current` (its hash), `behind` (another version it recorded),
+    `pending` (absent) or `edited_by_hand` (an invalid file, or a hash no version was recorded
+    with).
+  - Its own file is `current` while its hash is its version's recorded one, else
+    `edited_by_hand`, and `pending` with `not_written` when its start wrote none. `unknown` means
+    the records cannot be read.
+  - A hive on an older orchestrator shows no `config`, and the fleet's `comparison` does not
+    include it.
+- **The transition:** a reader falls back to hive.yaml only while its hive holds no file, and
+  its log says which it read.
+  - **On the motherbee it ends at the deploy:** its orchestrator writes the file at its first start
+    of the release, before its boot restarts the SY nodes onto their new binaries, so they read the
+    file from that start.
+  - **On a spoke, the deploy's core update restarts SY.cognition before the file arrives:** the
+    new orchestrator, which the same update installs, declares the folder, and Syncthing then
+    brings the file. ai.generic takes it at its next request, and SY.cognition at its next start.
+    Until then SY.cognition runs on its hive.yaml's `ai`, which holds the same values on 8.x.
+  - **On a new spoke it ends at the join:** the bootstrap copies the file before the readers first
+    start.
+- **Not built yet (3c):** the operator's action and the update with category `config`, which
+  restarts the readers. Until then nothing writes a version past 1, and a hand edit of the
+  motherbee's file shows as `edited_by_hand`.
+
 ## 5. `hive.yaml`, the hive's own
 
 - **It holds** the hive's identity, its control path, and its local paths, ports and sections.
@@ -188,6 +273,8 @@ Three cases bite today:
   - the hash of the hive's copy;
   - its state: current, behind, pending or edited by hand.
 - **Each hive is compared** with the motherbee's file.
+  - **As built (stage 3b):** by the motherbee's orchestrator, which builds `/versions` for SY.admin
+    (§4, "As built"). A state no version record can decide is `unknown`.
 - **An update's result says `not_answered`** for a hive that did not answer, never "not applied",
   and points to `/versions` (P-13).
 
@@ -245,6 +332,9 @@ run in CI over temporary roots, so no sequence runs first on PROD (T-2).
    - Gate: a reversible change on 8.x, `ai.providers.openai.model` (not the default provider's)
      set and back. Every hive must be current, the readers restarted only where they read it,
      AI.pruebas still answering, and the action's reply arriving.
+   - In three releases: 3a, the AI SDK alone (its type and reader); 3b, the file's first version,
+     its folder, the readers and `/versions` (§4, "As built"), with nothing changed in behavior;
+     3c, the operator's action and category `config`, with the gate above.
 4. **The installation's update in SY.admin,** with the automatic step. `ops.py deploy` calls it.
    - Gate: a deploy through it.
    - Gate: egress1 down across a config change, then back: finished once and reported.
@@ -307,7 +397,8 @@ They raised 70 findings, many of them the same seen from several lenses:
   - **The motherbee's lists** decide each role's `dist/core/<role>` tree
     (`materialize_role_core_trees`, `:23366`).
 - **`/versions`** (`local_versions_snapshot`, `:13359`): the core's manifest hash, its components,
-  what is installed, the last update and the rollback generations. It shows nothing of the config.
+  what is installed, the last update and the rollback generations. It shows nothing of the config
+  (since stage 3b, each hive's `config`: §4, "As built").
 - **The join** writes a spoke's whole `hive.yaml` over SSH, from three templates:
   - the worker's: `:25968`, written at `:25992`;
   - the egress's: `:26785`;
@@ -326,5 +417,6 @@ They raised 70 findings, many of them the same seen from several lenses:
     `current_dist_runtime_config`, `:6320`);
   - the watchdog's list: read at the orchestrator's start (`:971`);
   - `ai`: at the start, SY.cognition, SY.admin, SY.architect, SY.frontdesk.gov, and rt-gateway
-    for its check only; ai.generic at each request;
+    for its check only; ai.generic at each request (since stage 3b from the installation file,
+    and from hive.yaml only while a hive holds none: §4, "As built");
   - `government.identity_frontdesk`: the router and SY.identity, at their start.

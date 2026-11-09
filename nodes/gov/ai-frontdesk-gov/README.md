@@ -10,7 +10,10 @@ registers them in SY.identity (`ILK_REGISTER`).
   `ai.generic`, and it is updated with the `.deb`.
 - **Autonomous:**
   - it carries its prompt embedded;
-  - the provider and the model come from the `ai` section of `hive.yaml`;
+  - the provider and the model come from the installation file once its hive holds one, and from
+    the `ai` section of `hive.yaml` while it holds none
+    ([hive-config-update-v1](../../../docs/hive-config-update-v1.md) §4); they are read at the
+    start, which logs which, and settings it cannot use boot it `FAILED_CONFIG` with the reason;
   - the key comes from SY.vault by `resource_type` (root tenant).
   - `CONFIG_SET` accepts no config fields: it only re-reads the key from the vault.
 - **Two inputs:**

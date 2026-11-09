@@ -37,11 +37,15 @@ Source: `src/bin/sy_orchestrator.rs`. Packaging: `packaging/build-deb.sh`, `pack
    takes `/var/run/fluxbee/sy-orchestrator.lock` (`json_router::instance_lock`, an flock until the
    process ends, the holder's PID inside): a second orchestrator exits there, naming the holder's
    PID; any other failure to lock is warned and it runs as before.
-2. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file or an invalid `ai` section ends the
-   process with an error. Its role's SY nodes and the blob's and dist's topology are the
-   release's, in the code ([System nodes per role](#system-nodes-per-role)): a hive.yaml that
-   still holds those keys loads, and one warning at the start names the ones it ignores
-   (`warn_superseded_hive_keys`). Creates its directories (`ensure_dirs`) and writes the PID file.
+2. Reads `/etc/fluxbee/hive.yaml`; a missing or invalid file ends the process with an error. Its
+   `ai` section is read untyped, so no `ai` ends the start. Its role's SY nodes and the blob's and
+   dist's topology are the release's, in the code ([System nodes per role](#system-nodes-per-role)):
+   a hive.yaml that still holds those keys loads, and one warning at the start names the ones it
+   ignores (`warn_superseded_hive_keys`). Creates its directories (`ensure_dirs`), `dist/installation`
+   among them. On the motherbee, writes the installation file's first version when its dist holds
+   none ([The installation file](#the-installation-file)). On every hive, logs what it holds at the
+   installation file's place, and, once it holds a file, warns once that hive.yaml's `ai` is
+   ignored (`report_installation_file_at_start`). Then it writes the PID file.
 3. **`bootstrap_local`**, before joining the router:
    1. reads `dist/core/manifest.json` (missing or invalid, it is fatal) and lists the core
       components of its role (`core_components_listed_for_role`): on the motherbee every
@@ -341,11 +345,11 @@ The worker join (`add_hive_flow`), in order:
    `ssh_password` if needed; wait for the box to settle (cloud-init, apt jobs; up to 900 s,
    `wait_for_host_to_settle`; `HOST_NOT_SETTLED` is retryable); install a temporary sudoers
    grant (`/etc/sudoers.d/fluxbee-orchestrator`).
-4. Copy the role's core binaries and manifest, and the vendored Syncthing
-   (`sync_core_to_worker`, `sync_vendor_to_worker`); write the spoke's hive.yaml with the
-   motherbee as WAN uplink, the motherbee's paths and ports, and no key the release defines
-   (`render_worker_hive_yaml`; the egress' and the ingress' likewise); push the TLS material
-   (`push_hive_tls`) and, for a worker, the identity sync key.
+4. Copy the role's core binaries and manifest, the vendored Syncthing and the installation file
+   (`sync_core_to_worker`, `sync_vendor_to_worker`, `sync_installation_to_worker`); write the
+   spoke's hive.yaml with the motherbee as WAN uplink, the motherbee's paths and ports, and no key
+   the release defines and no `ai` (`render_worker_hive_yaml`; the egress' and the ingress'
+   likewise); push the TLS material (`push_hive_tls`) and, for a worker, the identity sync key.
 5. Write and start the units, wait for the spoke's orchestrator on the mesh, send
    `ADD_HIVE_FINALIZE`, link Syncthing, apply `restrict_ssh` / `harden_ssh` if asked. On the
    spoke the finalize (`add_hive_finalize_local_flow`) runs a core update over what step 4 copied,
@@ -545,6 +549,7 @@ match. What happens then is each caller's (`VendorPolicy`, FINDINGS A-189):
 | `fluxbee-dist-core-<role>` | the core binaries for one role | each spoke its own role's (`folder_forbidden_for_role`) |
 | `fluxbee-dist-vendor` | Syncthing | every spoke |
 | `fluxbee-dist-policy` | the compiled user OPA policy | every spoke |
+| `fluxbee-dist-installation` | `dist/installation`: the installation file ([The installation file](#the-installation-file)) | every spoke |
 | `fluxbee-dist-runtimes` | runtime packages | workers only |
 | `fluxbee-dist-agent-assets` | `blob/agent-assets`: SY.architect's agent assets, which ai.generic reads from disk | workers only |
 | `fluxbee-blob` | `blob/active` | workers only, when the motherbee's blob sync is on, as the release has it (`peer_shares_active_blob`) |
@@ -555,12 +560,59 @@ spokes (`dist_syncthing_folder_type`, `blob_public_syncthing_folder_type`), so a
 writes them. `fluxbee-blob` is `sendreceive`.
 
 A folder added by a later release reaches the hives that joined before it at their next local
-reconcile, without a re-join (`reconcile_syncthing_folders_xml`): `fluxbee-dist-policy` is shared
-with every member of `fluxbee-dist-vendor`, and `fluxbee-dist-agent-assets` with every member of
-`fluxbee-dist-runtimes`. The agent-assets tree is owned like a dist tree (`ensure_dirs`): root's on
+reconcile, without a re-join (`reconcile_syncthing_folders_xml`): `fluxbee-dist-policy` and
+`fluxbee-dist-installation` are shared with every member of `fluxbee-dist-vendor`, and
+`fluxbee-dist-agent-assets` with every member of `fluxbee-dist-runtimes`. A join links a new spoke
+to each, and `remove_hive` takes it out of every `fluxbee-dist*` folder the config holds. The
+agent-assets tree is owned like a dist tree (`ensure_dirs`): root's on
 the motherbee, readable by the `fluxbee` group, and the `fluxbee` user's on a worker, where
 Syncthing writes what it receives (FINDINGS A-72). `blob/` itself is no folder, so a file written
 there and renamed into `blob/agent-assets` is never sent half-written.
+
+## The installation file
+
+The operator's settings for the whole installation, today `ai`: the default provider and each
+provider's model ([hive-config-update-v1](../hive-config-update-v1.md) §4). One file,
+`<dist.path>/installation/installation.json`, one version on every hive. Its type and reader are
+the AI SDK's (`fluxbee_ai_sdk::installation`); each hive's readers read their own copy:
+SY.admin, SY.architect, SY.cognition, SY.frontdesk.gov and ai.generic (a hive.yaml `ai` only while
+the hive holds no file).
+
+- **The writer is the motherbee's orchestrator, alone.** At its start, after `ensure_dirs` and
+  before its boot (re)starts the SY nodes, when its dist holds no file
+  (`write_installation_file_at_start`), it writes version 1 from its own hive.yaml's `ai`, the
+  values every reader ran on: `InstallationFile::render`, which validates, written atomically
+  (temp and rename), mode 0644, in `dist/installation`, which `ensure_dirs` made root's and
+  readable by the `fluxbee` group. A hive.yaml without `ai` gives a file without one, the
+  fallback engine. The version is recorded first, in
+  `/var/lib/fluxbee/orchestrator/installation-versions.json` (its sha256, `written_at_ms`, and
+  `source: migration`), so a file is never there without its record: that record is how a hand
+  edit is caught.
+- **An `ai` no reader can use** (an unknown provider, a default provider or any provider named
+  without its model) writes nothing: a warning, `config.not_written` in `/versions`, and every
+  reader stays on its hive.yaml. A file missing after a later version was recorded is not written
+  again as version 1 either. None of this stops the start.
+- **Once a file is there it is never rewritten at a start**, whatever hive.yaml says. Each start,
+  on every hive, logs what the hive holds there, and once it holds a file warns once that
+  hive.yaml's `ai` is ignored (keep it while the hive may go back to a release whose readers read
+  it).
+- **It reaches the spokes** through `fluxbee-dist-installation` ([Syncthing](#syncthing)), and a
+  joining spoke gets the motherbee's file from its join, with the core and the vendor
+  (`sync_installation_to_worker`, `INSTALLATION_SYNC_FAILED` when it cannot be copied; nothing to
+  copy when the motherbee holds none), so its readers read it from their first start. The join
+  writes no `ai` into a spoke's hive.yaml.
+- **`/versions`:** each hive's snapshot has `config`: `file` (`absent`, `valid` or `invalid`),
+  `version`, `sha256` and, for an invalid one, `error`. The motherbee adds each copy's `state`
+  (`add_installation_state_to_answer`, `installation_spoke_state`): `current` with the
+  motherbee's file's hash, `behind` with another version it recorded, `pending` while the copy has
+  not arrived, `edited_by_hand` otherwise (an invalid file, or a hash no version was recorded
+  with). Its own `state` is `current` while its file's hash is its version's recorded one,
+  `edited_by_hand` otherwise, and `pending` without a file, with `not_written` saying why.
+  `unknown` means the record cannot be read (`records_error`). A hive on an older orchestrator
+  has no `config`. The fleet's `comparison` does not include it.
+- **Not built yet (stage 3c):** the operator's change, through SY.admin, and the update with
+  category `config` that restarts the readers of what changed. Until then nothing writes a
+  version past 1, and a hand edit of the motherbee's file shows as `edited_by_hand`.
 
 ## Host posture
 
@@ -711,7 +763,9 @@ default `RT.gateway`; `listen`; `uplinks`), `storage.path`, `blob` (`path`, defa
 `/var/lib/fluxbee/syncthing`; `gc`), `dist.path` (default `/var/lib/fluxbee/dist`),
 `identity.sync.port` (default 9100), `government`, `egress` (with `reachability_url`, the
 internet probe's target, no default; and `ssh_from_wan`, default true), `ingress.ssh_allow_from`
-(the ingress' extra SSH sources), `ai`.
+(the ingress' extra SSH sources), `ai`, read untyped: on the motherbee it is the installation
+file's first version, and once a hive holds the file it is ignored
+([The installation file](#the-installation-file)).
 
 What the release defines for each role is in the code (`json_router::release_settings`,
 [System nodes per role](#system-nodes-per-role)): the role's SY nodes, and the blob's and dist's
@@ -747,8 +801,8 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
 | `/var/lib/fluxbee/hives/<hive>/info.yaml` | the hive registry (motherbee): role, address, status, join phase, Syncthing device |
 | `/var/lib/fluxbee/nodes/<KIND>/<name@hive>/config.json` | managed node config with `_system` |
 | `/var/lib/fluxbee/state/orchestrator/identity-node-ilk-map.json` | node → ILK and tenant, used on relaunch |
-| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json` |
-| `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees |
+| `/var/lib/fluxbee/orchestrator/` | `core-bin.prev.local/`, `core-installed.json`, `core-update-last.json`, `deployments-history.jsonl`, `drift-alerts.jsonl`, `syncthing-posture.json`, and on the motherbee `installation-versions.json` |
+| `/var/lib/fluxbee/dist/` | core, vendor, runtimes and policy trees, and `installation/installation.json` |
 | `/var/lib/fluxbee/tls/` | mesh CA (motherbee) and the hive's TLS leaf |
 | `/var/lib/fluxbee/ssh/motherbee.key` | the join key (motherbee) |
 | `/etc/nftables.d/fluxbee-egress.nft`, `/etc/nftables.d/fluxbee-ingress.nft` | the egress' and the ingress' tables, loaded at boot by `fluxbee-egress-nft.service` and `fluxbee-ingress-nft.service` |
@@ -766,6 +820,9 @@ Environment: `JSR_LOG_LEVEL`; `ORCH_DEFAULT_TENANT_ID` (tenant for a spawn that 
   watchdog run the Syncthing already installed, with a warning and `vendor.awaiting_update`; with
   none installed Syncthing does not start, logged at each attempt, as before. The orchestrator
   runs either way (FINDINGS A-189).
+- **The installation file cannot be written, or is not valid.** No error: the motherbee's start
+  warns and `/versions` shows `config.not_written` or the copy's `state`; the orchestrator runs
+  either way, and so do the readers, each failing only its AI work with the reason.
 - **No database (motherbee).** If `sy-storage` is not active, or its database does not answer
   within 30 s, `finish_bootstrap` fails and the process exits; until then admin callers get
   `ORCHESTRATOR_BOOTING`.

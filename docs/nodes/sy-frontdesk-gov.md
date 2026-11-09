@@ -42,9 +42,14 @@ Source: `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` (the whole node),
    else `SY.frontdesk.gov@<hive_id>` from hive.yaml (`bootstrap_node_from_args`,
    `infer_frontdesk_node_name_from_hive`). The unit passes no arguments.
 3. Builds its behavior from a baked document: an `ai_chat` behavior with the embedded prompt
-   `FRONTDESK_DEFAULT_SYSTEM_PROMPT`, and the provider and model from the hive.yaml `ai` section.
-   If that fails (hive.yaml unreadable, invalid `ai` section) it boots `FAILED_CONFIG`; otherwise
-   `UNCONFIGURED`.
+   `FRONTDESK_DEFAULT_SYSTEM_PROMPT`, and the provider and model from the hive's `ai` settings
+   (`load_hive_ai_engine`, `frontdesk_ai_settings`): the installation file once its hive holds one,
+   the hive.yaml `ai` section while it holds none ([hive-config-update-v1](../hive-config-update-v1.md)
+   §4). It logs which, with the file's version and hash. hive.yaml's `ai` is read untyped, and
+   typed only while the hive holds no file, so an old `ai` never stops the name or the start. If
+   that fails (hive.yaml unreadable, an installation file no reader can use, which is never a
+   fallback to hive.yaml, or an invalid hive.yaml `ai` while the hive holds no file) it boots
+   `FAILED_CONFIG` with the reason; otherwise `UNCONFIGURED`.
 4. Connects to the router (`RouterDispatcher::connect_with_retry`, every 1 s); every message goes
    to the AI runtime channel (`build_frontdesk_gov_rpc_profile`).
 5. Asks SY.vault for the AI key (`boot_self_configure`). On an upgrade the whole hive restarts at
@@ -229,7 +234,9 @@ SY.identity's own error code is kept. The frontdesk maps outcomes to `REGISTERED
 
 ## LLM, key and usage records
 
-- **Provider and model**: the hive.yaml `ai` section (`HiveAiConfig::effective`).
+- **Provider and model**: the default provider and its model of the hive's `ai` settings
+  (`HiveAiConfig::effective`): the installation file, or the hive.yaml `ai` section while the hive
+  holds none. Read at the start: a file that arrives later is read at the next start.
 - **Key**: from SY.vault, `resolve_resource(<provider resource type>, <root tenant>)` as itself:
   first a secret it owns, then one assigned to it, then the root tenant's general key. The value
   is a string or `{api_key}`.
@@ -245,7 +252,7 @@ There is nothing to configure. `handle_control_plane` answers:
 
 | Request | Reply |
 | --- | --- |
-| `NODE_STATUS_GET` | the SDK's managed answer (`build_node_status_response_payload`): `health_state` `HEALTHY` when `CONFIGURED`, `DEGRADED` (never `ERROR`) when `UNCONFIGURED` or `FAILED_CONFIG`, with `lifecycle_state` and the reason in `last_error`: `missing_secret` (no key) or `invalid_ai_config` (the hive.yaml `ai` section) |
+| `NODE_STATUS_GET` | the SDK's managed answer (`build_node_status_response_payload`): `health_state` `HEALTHY` when `CONFIGURED`, `DEGRADED` (never `ERROR`) when `UNCONFIGURED` or `FAILED_CONFIG`, with `lifecycle_state` and the reason in `last_error`: `missing_secret` (no key) or `invalid_ai_config` (`ai` settings it cannot use: the installation file, or the hive.yaml `ai` section while the hive holds none) |
 | `CONFIG_GET` | `state`, `config_source: "baked"`, `api_key_source`, the provider and model; `error` is the same reason as `last_error` |
 | `CONFIG_SET` | refuses every field under `config` (`config_not_accepted`), the prompt (`behavior`) and `runtime` included; an empty `config` re-reads the key from the vault. Nothing is persisted |
 | `PING`, `STATUS` | `PONG`, `STATUS_RESPONSE` |
@@ -273,7 +280,8 @@ Environment: `RUST_LOG`; `GOV_IDENTITY_TARGET`, `GOV_IDENTITY_FALLBACK_TARGET`,
 
 - **No AI key**: `UNCONFIGURED`. Conversations get `node_not_configured`; handoffs still work.
   A later `VAULT_SECRET_CHANGED` for the key turns the conversation on.
-- **Invalid hive.yaml or `ai` section**: `FAILED_CONFIG`; handoffs still work.
+- **Invalid hive.yaml, installation file or `ai` section**: `FAILED_CONFIG` with the reason;
+  handoffs still work. An installation file no reader can use is never a fallback to hive.yaml.
 - **SY.identity down or slow** (10 s): `IDENTITY_UNAVAILABLE`. A handoff can be sent again; a
   conversation ends as `completed_error` (the prompt's no-loop rule).
 - **Identity SHM unreadable**: the case tenant is unknown, so registration answers that the tenant
