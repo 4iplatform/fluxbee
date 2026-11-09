@@ -22,9 +22,12 @@ Commands
   deploy VERSION --snapshot NAME [--drop OLD]
                                    snapshot every VM (one per VM: the new one replaces the one
                                    named in --drop), apt install on the motherbee, wait for
-                                   its admin, core-update every spoke, wait for all to report
-                                   VERSION, then health; each step carries its time, and a
-                                   summary of the phases ends it
+                                   its admin and for the spokes to answer, then SY.admin's
+                                   installation update (POST /installation/update, from
+                                   0.1.123), followed until every hive is on the release, each
+                                   hive's transitions as they happen; below 0.1.123 a core
+                                   update per spoke; then health. Each step carries its time,
+                                   and a summary of the phases ends it
   timeline --since 'YYYY-MM-DD HH:MM:SS' [--until ...] [--vm NAME=VMID ...] [--all]
                                    one timeline, in time order, of every hive's core units'
                                    journals (UTC): the milestones only (starts, stops,
@@ -449,7 +452,187 @@ def cmd_deploy(a):
     # fails with TRANSPORT_ERROR (0.1.56). Wait until each spoke's orchestrator answers.
     for h in spokes:
         wait_for("%s answering" % h, lambda h=h: core_of(h)[0] == "ok" or None, 300)
-    mark("== core update: %s" % ", ".join(spokes), "the spokes answering the motherbee")
+    # From 0.1.123 SY.admin's installation update brings every hive to the motherbee's release,
+    # core then config (hive-config-update-v1 §6, stage 4). Deploying an older release (the
+    # rollback below 0.1.123) keeps the per-spoke core updates, which its SY.admin knows.
+    if tuple(int(x) for x in v.split(".")[:3]) >= INSTALLATION_UPDATE_SINCE:
+        mark("== installation update: %s" % ", ".join(hives()), "the spokes answering the motherbee")
+        update_sent = time.time()
+        settled_ok = installation_update(v, mark, spoke_times, phases, started)
+    else:
+        mark("== core update: %s" % ", ".join(spokes), "the spokes answering the motherbee")
+        update_sent = time.time()
+        settled_ok = spoke_core_updates(v, digest, spokes, mark, spoke_times, phases, started)
+
+    mark("== health since %s" % since)
+    ok = health(since) and settled_ok
+    phases.append(("health", time.time() - started))
+
+    # Where the deploy spent its time. A hive's times count from the update calls, and are when
+    # this script saw each state, at most one poll late.
+    print("== phases")
+    previous = 0.0
+    for name, ended in phases:
+        print("  %-38s %6.1fs" % (name, ended - previous))
+        previous = ended
+    for h in sorted(spoke_times):
+        times = spoke_times[h]
+        seen = [name for name in TRANSITIONS if name in times]
+        print("  %-10s %s after the update call" % (
+            h, ", ".join("%s %5.1fs" % (name, times[name]) for name in seen) or "no transition seen"))
+    # The spokes' own records, on their clocks: when the script saw a state can lag it, as the
+    # motherbee's /versions forward is slow while a spoke's orchestrator restarts (0.1.120).
+    for h in spokes:
+        print("  %-10s by its own records: %s" % (h, spoke_update_times(h, update_sent)))
+    print("deploy of %s done in %d s" % (v, time.time() - started))
+    sys.exit(0 if ok else 1)
+
+
+# The first release whose SY.admin runs the installation's update (hive-config-update-v1 §6).
+INSTALLATION_UPDATE_SINCE = (0, 1, 123)
+# How long the call waits: SY.admin's ceiling for update_installation, 390 s, and a margin. It
+# answers once every core answered (`restarting`), about 20 s on 8.x.
+INSTALLATION_UPDATE_CALL_TIMEOUT = 420
+# How long the deploy follows the update, until every hive is on the target, or left out.
+INSTALLATION_UPDATE_WAIT = 900
+# The transitions a deploy prints for each hive, in order.
+TRANSITIONS = ("answered", "installed", "settled", "config applied")
+
+
+def update_transitions(hive, entry):
+    """The transitions a hive's record in the installation's update shows: its core update
+    answered, the target installed, its update settled, its config applied. Each with the ms its
+    record gives after the attempt started (None when it gives none). The motherbee is the core's
+    reference: only its config."""
+    core = entry.get("core") or {}
+    config = entry.get("config") or {}
+    outcome = core.get("outcome") or {}
+    seen = {}
+    if hive != PRIMARY:
+        for name, key in (("answered", "answered_ms"), ("installed", "installed_ms")):
+            if outcome.get(key) is not None:
+                seen[name] = outcome[key]
+        if core.get("state") == "on_target":
+            seen["settled"] = outcome.get("settled_ms")
+    if config.get("state") == "on_target":
+        seen["config applied"] = (config.get("outcome") or {}).get("elapsed_ms")
+    return seen
+
+
+def hive_moving(entry):
+    """Whether something still moves a hive: a core restarting or settling, a config being
+    applied, or a state SY.admin has not read yet. A pending hive (an error, sync_pending at its
+    bound, no answer) and an excluded one wait for the operator, or for the automatic step."""
+    return any((entry.get(category) or {}).get("state") in ("in_flight", "unknown")
+               for category in ("core", "config"))
+
+
+def hive_left_as_is(hive, entry):
+    """A line for each category of a hive the update leaves as it is now: excluded, or pending
+    with what its last attempt left, and what moves it."""
+    lines = []
+    for category in ("core", "config"):
+        part = entry.get(category) or {}
+        state = part.get("state")
+        if state not in ("excluded", "pending"):
+            continue
+        outcome = part.get("outcome") or {}
+        status = outcome.get("status")
+        if state == "pending" and status not in ("error", "sync_pending", "not_answered"):
+            continue
+        lines.append("%s %s %s%s%s: %s" % (
+            hive, category, state, " (%s)" % status if status and state == "pending" else "",
+            " %s" % outcome["error_code"] if outcome.get("error_code") else "",
+            part.get("reason") or outcome.get("detail") or ""))
+        if part.get("next"):
+            lines.append("    next: %s" % part["next"])
+    return lines
+
+
+def installation_update(v, mark, spoke_times, phases, started):
+    """The installation's update (hive-config-update-v1 §6, stage 4): one call to SY.admin, which
+    brings every hive to the motherbee's core and installation file; then its record, read every
+    3 s, until the update is done, or until nothing moves a hive any more (each left out is named,
+    with what moves it), or the wait ends. Each hive's transitions print as they happen, with the
+    seconds since the call. True when every hive is on the target."""
+    call_at = time.time()
+    call_at_ms = int(call_at * 1000)
+    replies = {}
+
+    def call():
+        replies["post"] = admin("POST", "/installation/update", {"reason": "deploy %s" % v},
+                                timeout=INSTALLATION_UPDATE_CALL_TIMEOUT)
+        replies["answered_at"] = time.time()
+
+    caller = threading.Thread(target=call)
+    caller.start()
+    seen, reported, quiet, update, printed_post, ours = set(), set(), 0, {}, False, None
+    deadline = call_at + INSTALLATION_UPDATE_WAIT
+    while True:
+        time.sleep(3)
+        if "post" in replies and not printed_post:
+            printed_post = True
+            post = replies["post"]
+            payload = post.get("payload") or {}
+            ours = (payload.get("update") or {}).get("id")
+            mark("  update_installation answered in %.1fs: status=%s%s%s" % (
+                replies["answered_at"] - call_at,
+                post.get("status") or post.get("raw", "")[:60],
+                " error_code=%s" % post["error_code"] if post.get("error_code") else "",
+                " update=%s" % (payload.get("update") or {}).get("id") if payload.get("update") else ""),
+                "the installation update call")
+            for line in (payload.get("message"), post.get("error_detail")):
+                if line:
+                    print("    %s" % line)
+            if post.get("status") == "error" or payload.get("nothing_to_do"):
+                break
+        reply = admin("GET", "/installation/update", timeout=30)
+        current = (reply.get("payload") or {}).get("update") or {}
+        # Only this call's update: the one its answer names, the open one, or one closed since the
+        # call (the motherbee's clock, a few seconds of offset allowed).
+        if (current.get("id") and current.get("id") == ours) or current.get("state") == "open" \
+                or (current.get("closed_at_ms") or 0) >= call_at_ms - 5000:
+            update = current
+        for hive, entry in sorted((update.get("hives") or {}).items()):
+            for name, ms in update_transitions(hive, entry).items():
+                if (hive, name) in seen:
+                    continue
+                seen.add((hive, name))
+                spoke_times.setdefault(hive, {})[name] = time.time() - call_at
+                mark("  %s %s at +%.1fs%s" % (
+                    hive, name, time.time() - call_at,
+                    " (its record: %.1fs)" % (ms / 1000.0) if isinstance(ms, (int, float)) else ""))
+            for line in hive_left_as_is(hive, entry):
+                if (hive, line) not in reported:
+                    reported.add((hive, line))
+                    print("  " + line)
+        if update.get("state") == "done":
+            mark("  update %s done: every hive on the target" % update.get("id"))
+            break
+        if not caller.is_alive():
+            moving = any(hive_moving(entry) for entry in (update.get("hives") or {}).values())
+            # Twice in a row: a config goes in flight right after its core settles.
+            quiet = 0 if moving else quiet + 1
+            if quiet >= 2:
+                mark("  update %s left open: %s" % (
+                    update.get("id"), "; ".join(update.get("pending") or []) or "see GET /installation/update"))
+                break
+        if time.time() > deadline:
+            mark("  the update was followed for %d s: GET /installation/update shows the rest"
+                 % INSTALLATION_UPDATE_WAIT)
+            break
+    caller.join()
+    phases.append(("the hives on the target", time.time() - started))
+    post = replies.get("post") or {}
+    if (post.get("payload") or {}).get("nothing_to_do"):
+        return True
+    return update.get("state") == "done"
+
+
+def spoke_core_updates(v, digest, spokes, mark, spoke_times, phases, started):
+    """The core update of every spoke, one call each (the deploy before 0.1.123, whose SY.admin has
+    no installation update): then each spoke on the version, then settled. True when every spoke
+    settled with nothing open."""
     # Since U-8b the call answers once the spoke has the new binaries in place (phase
     # `restarting`); the restarts run after it. Fire them all at once, retry one that did not
     # get through, print each answer, and still judge each spoke by what it installed.
@@ -507,28 +690,7 @@ def cmd_deploy(a):
         spoke_times[h]["settled"] = time.time() - update_sent
         mark("  %s %s" % (h, "; ".join(items) if items else "settled"))
     phases.append(("the spokes settled", time.time() - started))
-
-    mark("== health since %s" % since)
-    ok = health(since) and settled_ok
-    phases.append(("health", time.time() - started))
-
-    # Where the deploy spent its time. A spoke's times count from the update calls, and are when
-    # this script saw each state, at most one poll late.
-    print("== phases")
-    previous = 0.0
-    for name, ended in phases:
-        print("  %-38s %6.1fs" % (name, ended - previous))
-        previous = ended
-    for h in spokes:
-        times = spoke_times[h]
-        print("  %-10s answered %5.1fs, installed %5.1fs, settled %5.1fs after the update call" % (
-            h, times.get("answered", 0), times.get("installed", 0), times.get("settled", 0)))
-    # The spokes' own records, on their clocks: when the script saw a state can lag it, as the
-    # motherbee's /versions forward is slow while a spoke's orchestrator restarts (0.1.120).
-    for h in spokes:
-        print("  %-10s by its own records: %s" % (h, spoke_update_times(h, update_sent)))
-    print("deploy of %s done in %d s" % (v, time.time() - started))
-    sys.exit(0 if ok else 1)
+    return settled_ok
 
 
 # The units a timeline reads on each hive, and what counts as a milestone among their lines.
@@ -541,6 +703,7 @@ TIMELINE_MILESTONES = (
     r"\b(Started|Stopped|Stopping|Starting|Failed|Main process exited)\b|connected to router|"
     r"hive ready|lifecycle node|service active|ADD_HIVE|add_hive|finalize|join|bootstrap|"
     r"core update|SYSTEM_UPDATE|update category|settle|revert|receive-only|awaiting_update|"
+    r"installation update|automatic step|"
     r"dist check|peer|restart|WAN|uplink|(^|\s)(WARN|ERROR)\s"
 )
 
