@@ -693,8 +693,16 @@ def installation_update(v, mark, spoke_times, phases, started):
         # The update ended before the call answered: its answer still says how the run went.
         print_answer(post, answered_at)
     phases.append(("the hives on the target", time.time() - started))
-    if (post.get("payload") or {}).get("nothing_to_do"):
+    payload = post.get("payload") or {}
+    if post.get("status") == "error":
+        # Refused (another run under way, the registry, the motherbee's core): an update seen
+        # meanwhile is not this call's.
+        return False
+    if payload.get("nothing_to_do"):
         return True
+    ours = (payload.get("update") or {}).get("id")
+    if ours and update.get("id") != ours:
+        return False
     return update.get("state") in ("done", "held")
 
 
