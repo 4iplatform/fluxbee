@@ -313,11 +313,17 @@ skills, handbooks and a personality.
 - **A new version of the installation file** is taken at the next chat turn, never by a restart:
   no config update restarts Archi, which may be the caller of the very change, and a restart would
   cut its reply and the chat ([hive-config-update-v1](../hive-config-update-v1.md) §4, "As built
-  (stage 3c)"). Each build records the stamp of the file it read, the sha256 of its bytes
+  (stage 3c)"). Each verdict records the stamp of the file it read, the sha256 of its bytes
   (`ai_settings::InstallationBuiltFrom`), at the start and at every rebuild; each turn reads that
-  one small file and hashes it, and only a changed file rebuilds the runtime
-  (`refresh_architect_ai_runtime`, its key read once from the vault). The log then says once where
-  its `ai` comes from. Its own `config.ai.model` stays its node config.
+  one small file and hashes it (`architect_takes_new_installation_ai`). A changed file whose
+  engine for Archi (the default provider, and its own `config.ai.model` or else the default's
+  model, `architect_engine_of`) is the one the runtime runs keeps the runtime, with no key read;
+  only another engine rebuilds it (`architect_keeps_its_runtime`, `refresh_architect_ai_runtime`,
+  its key read once from the vault, `ai_settings::provider_key`), and the log then says once where
+  its `ai` comes from. A vault that did not answer is no verdict: the runtime it had stays, no
+  stamp is recorded and the next turn asks again. A key the vault does not hold for the new
+  provider, or an `ai` no reader can use, takes the AI down with the reason, as at start (stage
+  3c's review, F1). Its own `config.ai.model` stays its node config.
 - **Limits**: every model call asks for up to 32,000 output tokens and may take 600 s
   (`ARCHITECT_MODEL_CALL_TIMEOUT`); a pipeline task's budget is 1,000,000 tokens
   (`TASK_AGENT_TOKEN_BUDGET`).

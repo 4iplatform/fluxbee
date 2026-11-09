@@ -19,7 +19,8 @@
     distributes it, the readers switch to it, and `/versions` shows it, with nothing changed in
     behavior (§4, "As built (stage 3b)").
   - 3c, built for 0.1.122: the operator's action, SY.admin's `set_installation_ai`, and the update
-    with category `config` (§4, "As built (stage 3c)"). **Next:** its gate on 8.x (§10).
+    with category `config` (§4, "As built (stage 3c)"), with its review round's fixes (F1 to F7,
+    named there). **Next:** its gate on 8.x (§10).
 
 This is the single place for the topic.
 
@@ -277,9 +278,21 @@ The operator's change and the update with category `config`, built for 0.1.122; 
     provider switches, Archi's own model among them, and a node that names its provider and not its
     model when that provider is dropped;
   - a hive, or SY.architect's config, it cannot read refuses the change, naming it (`503
-    HIVES_NOT_CHECKED`): retry once it answers;
+    HIVES_NOT_CHECKED`): retry once it answers. A worker whose join did not finish is named in
+    `node_check.skipped`, never a refusal;
   - when the motherbee's current values are not known (its file is one no reader can use, and its
     last version recorded none), it skips the check, and the answer's `node_check` says so.
+- **1b. The key check** (the review's F3), when the change switches the default provider: every
+  reader of the default needs a key of the new provider, which A-11's names alone do not show.
+  - The readers (`installation_key_readers`): each AI node that names no provider of its own, in
+    its own tenant (no root fallback); and SY.admin's executor, SY.architect, SY.frontdesk.gov and
+    each SY.cognition, in the root tenant, each as itself.
+  - SY.admin lists each tenant's secrets of the new provider by names only, never values
+    (`VAULT_LIST` with `tenant_id` and `resource_type`), and each reader must find one it reads:
+    its own, one assigned to it, or its tenant's general one (`readers_without_the_key`, the order
+    `VaultClient::resolve_resource` follows).
+  - It refuses, naming each node, its tenant and the `resource_type` (`409 PROVIDER_KEYS_MISSING`);
+    a tenant whose keys cannot be listed refuses too (`503 KEYS_NOT_CHECKED`).
 - **2. The write**, by the motherbee's orchestrator alone: SYSTEM_UPDATE `{category: config,
   write: {ai, expected_version, replace_hand_edit}}` to `SY.orchestrator@motherbee`
   (`write_installation_operator_version`), admitted by policy rule (2) as every update, answered
@@ -304,6 +317,11 @@ The operator's change and the update with category `config`, built for 0.1.122; 
     not bytes, which differ by the version number anyway;
   - `INSTALLATION_RECORDS_UNREADABLE`, `INSTALLATION_UNREADABLE`, `INSTALLATION_WRITE_FAILED`: the
     record or the file cannot be read or written.
+  - No answer in 30 s (`TIMEOUT`) is not "nothing written" (the review's F6): the motherbee's
+    orchestrator takes its system messages one at a time, and one ahead of the write (a node's
+    purge, up to 120 s) can hold it. The answer says the write may still land, to read
+    `get_installation`, and, when its `expected_version` moved, to run the update with category
+    `config` on every hive (`installation_write_unanswered`).
 - **The next version** is one past the last recorded, or past the file's when a hand edit raised it,
   so a version number never goes back. It is recorded first, with `source: operator` and its
   values, then the file is written atomically, mode 0644, as version 1 is; a record whose file could
@@ -324,6 +342,14 @@ The operator's change and the update with category `config`, built for 0.1.122; 
   - a hive answers `sync_pending` until its copy is that version with that hash
     (`local_system_manifest_state`, `manifest_match`), and `VERSION_MISMATCH` for a copy past it;
     an orchestrator older than 0.1.122 takes no category `config` (`MANIFEST_INVALID`);
+  - a copy of that very version with another hash is refused, `INSTALLATION_HASH_MISMATCH` with
+    both hashes, never `sync_pending` (the review's F5): within one version the file does not
+    change while it syncs (`config_hash_differs_within_version`). Category `config` only;
+  - a hive the registry holds whose join did not finish (joining, failed, interrupted) is not
+    asked: the answer names it in `skipped`, with its status, its join's phase and what finishes it
+    (its join, or `remove_hive`, then the update with category `config`), since its join may have
+    copied the file and started SY.cognition (the review's F4). It does not make the answer
+    `partial`: `/versions` leaves such a hive out the same way;
   - SY.admin asks again 2 s later, then half again as long each time, up to 5 s, for up to 90 s
     (`JSR_ADMIN_INSTALLATION_APPLY_TIMEOUT_SECS`). A hive it cannot reach is asked again within that
     bound; a timeout (an update's 60 s) ends the asking, since the hive may still be applying it;
@@ -337,37 +363,56 @@ The operator's change and the update with category `config`, built for 0.1.122; 
     next use;
   - only those its release runs and systemd has active: one that does not run reads the file at its
     next start;
-  - only when their engine changed (`config_update_plan`): `ai_settings::engine_of` the version's
-    values, the default provider with its model, against the one this hive applied last, recorded
-    in `/var/lib/fluxbee/orchestrator/config-applied.json` (`{version, sha256, applied_at_ms, ai,
-    restarted}`). Another provider's model restarts nothing. Without a record (a hive's first
-    config update, or a record it cannot read), every start reader restarts: nothing says what they
-    run. The same version and hash again restarts nothing, and answers ok;
+  - only when their engine changed, or when nothing says what they run (`config_update_plan`).
+    The engine is `ai_settings::engine_of` the version's values, the default provider with its
+    model, against the one this hive applied last, recorded in
+    `/var/lib/fluxbee/orchestrator/config-applied.json` (`{version, sha256, applied_at_ms, ai,
+    restarted, active_since}`). Another provider's model restarts nothing. Nothing says what a
+    reader runs when there is no record (a hive's first config update, or a record it cannot
+    read), or when its unit became active since the record (the review's F2): the record keeps
+    when systemd last made each running reader active (`ActiveEnterTimestampMonotonic`,
+    `systemd_active_since`), and a reader active since another time read whatever file it found
+    then. That covers a restart for another reason, a restart that failed (the others restarted),
+    a record that could not be written, and a box joined again (`remove_hive` deletes the record).
+    The same version and hash again restarts nothing, and answers ok;
   - each behind the core's health gate (`restart_core_service_with_health_gate`, 30 s). The record
     is written after the restarts, and only when they all succeeded: otherwise the answer is
-    `error`, `RESTART_FAILED` with the reasons, and the same update run again restarts them again.
-    A record that cannot be written once they all restarted answers `error`,
-    `CONFIG_RECORD_FAILED`: the readers run the version, and the next update restarts them again.
+    `error`, `RESTART_FAILED` with the reasons. A record that cannot be written once they all
+    restarted answers `error`, `CONFIG_RECORD_FAILED`: the readers run the version. Either way the
+    readers that restarted are active since another time than the record the hive holds, so the
+    next update restarts them again;
+  - inline: the hive's orchestrator answers its other system messages once the restarts end, a
+    few seconds later (the review's F7, kept as it is).
   - The answer lists `restarted`, `unchanged` and `errors`, as the other categories do. A copy no
     reader can use stays `sync_pending`: no version has its hash.
 - **`set_installation_ai`'s answer:** `{version, sha256, previous_version, previous_sha256, hives,
-  node_check, timings_ms}`.
+  skipped, node_check, timings_ms}`.
   - Each hive's `status` is `ok` (with `restarted` and `unchanged`), `sync_pending` (its copy had
     not arrived at the bound; `local_version`, `local_sha256`), `error` (`error_code`,
-    `error_detail`) or `not_answered`, with `attempts` and `elapsed_ms`. A hive not ok gets `next`:
-    `GET /versions`, and the update with category `config` that finishes it. None says "not
-    applied" (P-13): a hive that did not answer may hold the version already.
+    `error_detail`) or `not_answered`, with `attempts` and `elapsed_ms`. A hive not ok gets `next`,
+    by its error code (`installation_next_step`, the review's F5): the update with category
+    `config` run again for `sync_pending`, no answer, `RESTART_FAILED` or `CONFIG_RECORD_FAILED`;
+    the core first for `MANIFEST_INVALID`; the copy restored for `INSTALLATION_HASH_MISMATCH`; the
+    later version for `VERSION_MISMATCH`. None says "not applied" (P-13): a hive that did not
+    answer may hold the version already.
   - `timings_ms`: `check`, `write`, `scan`, `apply`, `total`, and each hive's (`hives`).
   - `ok` (200) when every hive is ok; otherwise `partial` (202), with `pending` naming the hives and
     a `message`. The version is written either way.
 - **SY.admin and Archi take a new version at their next use**, never restarted by a config update
-  (above). Each records the stamp of the file its AI runtime was built from
+  (above). Each records the stamp of the file it reached its last verdict on
   (`ai_settings::InstallationBuiltFrom`), and before each use reads that one small file and hashes
   it: SY.admin's executor before each plan it runs or reviews
   (`executor_takes_new_installation_ai`), Archi at each chat turn
-  (`architect_takes_new_installation_ai`). Only a changed file rebuilds the runtime, its key read
-  once from the vault, and the log says once where its `ai` comes from now.
-  Archi's own `config.ai.model` stays its node config.
+  (`architect_takes_new_installation_ai`). The log says once where its `ai` comes from now.
+  - Only another engine rebuilds the runtime (the review's F1): the executor's
+    `ai_settings::reader_engine`, Archi's default provider with its own model or the default's
+    (`architect_engine_of`). A changed file whose engine is the same (the gate's change of OpenAI's
+    model) keeps the runtime with no key read.
+  - A rebuild reads the key once from the vault (`ai_settings::provider_key`). A vault that does
+    not answer (`vault_failure_is_transport`) is no verdict: the runtime stays, no stamp is
+    recorded, and the next use asks again. A key the vault does not hold, or an `ai` no reader can
+    use, takes the runtime down with the reason, as at a start.
+  - Archi's own `config.ai.model` stays its node config.
 - **Archi** waits 240 s more for each `set_installation_ai` step of a plan
   (`EXECUTOR_INSTALLATION_WAIT_SECS`, past SY.admin's 210 s), and verifies a run only once every
   hive applied the change: a `partial` answer names the hives in the run's reason

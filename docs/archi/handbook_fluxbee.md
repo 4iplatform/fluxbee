@@ -1081,8 +1081,11 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
   - `expected_version` is `get_installation`'s.
   - The operator confirms the plan, and SY.admin's executor runs it as the operator. It is closed
     to the mesh: never send it as an `ADMIN_COMMAND` of your own, nor as SCMD.
-  - Switching the default provider: check first that the root tenant holds that provider's key
-    (`vault_list`), since the SY nodes read theirs there.
+  - Switching the default provider: every reader of the default needs a key of the new provider,
+    and SY.admin refuses the change when one has none (`PROVIDER_KEYS_MISSING`, below). Check it
+    with the operator before staging: `vault_list` with that `resource_type` in the root tenant
+    (you, the executor, SY.cognition and SY.frontdesk.gov read theirs there) and in the tenant of
+    each AI node that names no provider of its own.
 - **Undo a change** by setting a previous version's values: its `ai` from `versions`, with the
   current `expected_version`. It becomes a new version. A core rollback never touches the file.
 - **The refusals** write nothing:
@@ -1095,6 +1098,14 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
     the switch, and to a model of the new provider after it.
   - `HIVES_NOT_CHECKED`: a hive's AI nodes could not be read for that check. Retry once it
     answers.
+  - `PROVIDER_KEYS_MISSING`: the change switches the default provider, and the readers it names
+    (`missing`: each node, its tenant and the `resource_type`) would find no key of the new
+    provider in SY.vault: none of their own, none assigned to them, no general one in their
+    tenant. Tell the operator: they put the key in SY.vault (only the operator handles a key's
+    value), or give that AI node its own `behavior.provider` and `behavior.model` with
+    `set_node_config`. Then stage the change again.
+  - `KEYS_NOT_CHECKED`: SY.vault did not list a tenant's keys for that check. Retry once it
+    answers.
   - `JOIN_IN_PROGRESS`: a hive is joining or being removed. Change it once that ends.
   - `INSTALLATION_EDITED_BY_HAND`: someone edited the motherbee's file by hand (`motherbee.state`
     is `edited_by_hand`). Tell the operator: they restore it, or choose to replace the hand edit
@@ -1106,22 +1117,32 @@ credential: each provider's key is in SY.vault (`resource_type` `openai` or `ant
     or a field `ai` does not take.
   - `INSTALLATION_NOT_WRITTEN`: the motherbee holds no file yet. The operator fixes `ai` in the
     motherbee's hive.yaml and restarts `sy-orchestrator`, which writes version 1.
+  - `TIMEOUT` (or `TRANSPORT_ERROR`): the write did not answer within 30 s. It is no refusal: the
+    write may still land, since the motherbee's orchestrator takes its messages one at a time.
+    Read `get_installation`: when its `expected_version` is past the one you sent, the version
+    was written and applied on no hive, so finish each hive with `update` (below); when it is the
+    same, nothing was written, and you may stage the change again.
 - **What restarts where:** only the nodes that read `ai` at their start, and only when their
   engine, the default provider with its model, changed: SY.cognition and SY.frontdesk.gov on the
   motherbee, SY.cognition on each worker, nothing on an ingress or an egress. AI nodes take it at
   their next message. You and the executor take it at your next use, never restarted, so the
-  change's answer reaches you. Another provider's model restarts nothing, except the first change a
-  hive takes: nothing recorded yet what its readers run, so they restart once.
+  change's answer reaches you. Another provider's model restarts nothing, except where the hive
+  cannot vouch for what a reader runs: the first change a hive takes (nothing recorded yet), and a
+  reader restarted since the hive's last change. Those restart once.
 - **The answer:** `version` and each hive's `status`. `ok` on every hive is done; `partial` names
-  the hives that are not ok:
+  the hives that are not ok, each with a `next` that says what finishes it:
   - `sync_pending`: the file had not reached it within 90 s;
   - `not_answered`: it did not answer, and it may hold the version already;
   - `error`: its `error_code` says why. A hive on a release before 0.1.122 answers
     `MANIFEST_INVALID` (it takes no category `config`): its core update comes first.
+    `INSTALLATION_HASH_MISMATCH`: its copy holds the version with another content (edited by
+    hand): the operator restores it, then `update` that hive.
 
   None of these means "not applied". Check with `GET /versions` (each hive's `config`), and finish
   a hive with `update` for that hive: `category: config`, `manifest_version` and `manifest_hash`
   the new version's (`get_installation`). The run is not verified until every hive applied it.
+  `skipped` names each hive whose join did not finish: no change reaches it. Tell the operator:
+  finish its join or remove it, then `update` it the same way.
 
 ### 4.5 Secrets and vault (Model D')
 

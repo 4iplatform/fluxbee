@@ -420,20 +420,31 @@ first version. On the motherbee:
      -d '{"ai":{"default_provider":"anthropic","providers":{"openai":{"model":"gpt-5.5"},"anthropic":{"model":"claude-sonnet-5-5"}}},"expected_version":1}'
    ```
 
-   A new default provider needs its key in the root tenant first (`resource_type` `openai` or
-   `anthropic`): the core (SY.admin's executor, Archi, SY.cognition, SY.frontdesk.gov) reads its
-   keys there.
+   A new default provider needs its key (`resource_type` `openai` or `anthropic`) wherever a
+   reader of the default reads one, before the change: in the root tenant for the core (SY.admin's
+   executor, Archi, SY.cognition, SY.frontdesk.gov), and in each tenant with an AI node that names
+   no provider of its own. Check with the vault's listing (names only), the same one SY.admin
+   checks before it writes:
+
+   ```bash
+   curl -s 'http://127.0.0.1:8080/hives/<motherbee>/vault/secrets?tenant_id=<tenant>&resource_type=anthropic'
+   ```
+
 3. **What happens**: SY.admin checks the AI nodes when the change switches the default provider or
-   drops a provider (A-11); the motherbee's orchestrator writes the next version; Syncthing takes it
-   to every hive; SY.admin applies it on every hive at once. A hive restarts only what reads `ai` at
-   its start, and only when its engine (the default provider with its model) changed, or at the
-   first change it takes, when nothing recorded yet what they run: `sy-cognition` and
-   `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take it at their next
-   request, SY.admin's executor and Archi at their next use. Nothing else restarts.
+   drops a provider (A-11), and, when it switches the default provider, that every reader of the
+   default finds a key of the new one; the motherbee's orchestrator writes the next version;
+   Syncthing takes it to every hive; SY.admin applies it on every hive at once. A hive restarts only
+   what reads `ai` at its start, and only when its engine (the default provider with its model)
+   changed, or when the hive cannot vouch for what it runs: at the first change it takes, when
+   nothing recorded it yet, and for a reader restarted since its last change. Those readers are
+   `sy-cognition` and `sy-frontdesk-gov` on the motherbee, `sy-cognition` on a worker. AI nodes take
+   it at their next request, SY.admin's executor and Archi at their next use. Nothing else restarts.
 4. **The answer**: `ok` (200) when every hive applied it; `partial` (202) names the hives that have
-   not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered` or `error`.
-   The version is written either way. `GET /versions` shows each hive's copy (`config.state`,
-   `config.applied`), and this finishes one hive:
+   not yet, each `sync_pending` (the file had not arrived within 90 s), `not_answered` or `error`,
+   each with `next`, what finishes it. The version is written either way. `skipped` names each hive
+   whose join did not finish: finish its join or remove it, then update it as below. `GET
+   /versions` shows each hive's copy (`config.state`, `config.applied`), and this finishes one
+   hive:
 
    ```bash
    curl -sS -X POST http://127.0.0.1:8080/hives/worker1/update \
@@ -449,8 +460,14 @@ first version. On the motherbee:
    (read it again), `409 INSTALLATION_EDITED_BY_HAND` (restore the file, or add
    `"replace_hand_edit": true` to make the change over the hand edit), `409 INSTALLATION_UNCHANGED`,
    `409 INSTALLATION_NOT_WRITTEN` (the motherbee holds no file: fix its hive.yaml `ai` and restart
-   `sy-orchestrator`, which writes version 1), `422 INVALID_AI_SETTINGS` and `503
-   HIVES_NOT_CHECKED`.
+   `sy-orchestrator`, which writes version 1), `409 PROVIDER_KEYS_MISSING` (the named readers, each
+   with its tenant, would find no key of the new default provider: put it in SY.vault first, or give
+   the AI node its own provider), `422 INVALID_AI_SETTINGS`, `503 HIVES_NOT_CHECKED` and `503
+   KEYS_NOT_CHECKED` (SY.vault did not list a tenant's keys).
+7. **No answer to the write** (`504 TIMEOUT`) is not "nothing written": the write may still land.
+   Read `GET /installation`: when `expected_version` moved past the one you sent, the version was
+   written and applied on no hive, so update every hive as in step 4; when it did not, nothing was
+   written.
 
 ## Node lifecycle
 
